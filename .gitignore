@@ -1,0 +1,23 @@
+# build outputs
+build/
+*.o
+*.so
+*.ptx
+*.sass
+# python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+# transient run logs / bench results (regenerate with scripts/*.sh)
+results/
+/tmp/
+*.log
+# editor / OS
+.DS_Store
+.vscode/
+# kept, tracked: data/*.csv  figures/*.png  *.md  test/  lib/  python/  scripts/
+
+# Full Qwen-Bailian trace pulls (56MB LFS each) -- fetched via scripts/fetch_trace.sh.
+# The small committed *.sample.jsonl fixtures are the exception (offline tests).
+data/traces/*_blksz_16.jsonl
+!data/traces/*.sample.jsonl

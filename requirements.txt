@@ -1,0 +1,8 @@
+# Pinned to the versions this integration reads private layouts from
+# (DecodePlanInfo, scheduler hooks). Upgrades need re-validation:
+#   python test_serving_gate.py  +  the plan-layout guards fail-soft, but the
+#   tile-binding path assumes flashinfer 0.6.x's 10-int64 DecodePlanInfo.
+torch==2.11.0
+flashinfer-python==0.6.12
+sglang==0.5.14
+matplotlib>=3.7
