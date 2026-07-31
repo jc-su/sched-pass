@@ -55,7 +55,7 @@ std::optional<std::string> validateAcquire(CallInst &call) {
       !isInteger(call.getArgOperand(ir::Offset), 64) ||
       !isInteger(call.getArgOperand(ir::Bytes), 32) ||
       !isInteger(call.getArgOperand(ir::Continuation), 32)) {
-    return "acquisition marker argument types do not match ABI v1";
+    return "acquisition marker argument types do not match the marker contract";
   }
   return std::nullopt;
 }

@@ -9,6 +9,9 @@
 
 namespace nta {
 
+class NvmeBuffer;
+class NvmeTransport;
+
 enum class Placement {
   Hbm,
   HostMapped,
@@ -30,6 +33,7 @@ struct ObjectHandle {
 class HostRuntime {
 public:
   explicit HostRuntime(RuntimeConfig config);
+  HostRuntime(RuntimeConfig config, std::shared_ptr<NvmeTransport> nvme);
   ~HostRuntime();
 
   HostRuntime(const HostRuntime &) = delete;
@@ -46,6 +50,11 @@ public:
                              std::uint32_t version,
                              std::span<const std::byte> contents,
                              Placement placement);
+  ObjectHandle installNvmeObject(std::uint32_t slot, std::uint64_t objectId,
+                                 std::uint32_t version,
+                                 std::uint64_t sourceByteOffset,
+                                 std::size_t bytes,
+                                 std::unique_ptr<NvmeBuffer> destination);
 
   [[nodiscard]] abi::RuntimeView *deviceView() const noexcept;
   [[nodiscard]] const RuntimeConfig &config() const noexcept;

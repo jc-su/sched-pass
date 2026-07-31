@@ -8,6 +8,12 @@
 *.ptx
 *.sass
 *.so
+*.ko
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+.*.cmd
 
 # Generated measurements and traces
 results/

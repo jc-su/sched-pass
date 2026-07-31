@@ -6,11 +6,12 @@ This document defines the problem, claims, system boundary, execution model, and
 implementation gates for the clean `nonresident-acquisition` branch. Decisions
 in this document take precedence over the previous prototype's design notes.
 
-Implementation status (2026-07-31): M0-M3 have a working vertical slice tested
-on an NVIDIA RTX PRO 6000 Blackwell Server Edition. The current external source
-is mapped CPU DRAM, consumed directly or copied into HBM by finite GPU progress
-CTAs. NVMe, RDMA, TMA specialization, and serving-framework integration are not
-implemented and have no placeholder backends.
+Implementation status (2026-07-31): M0-M4 have a working vertical slice tested
+on an NVIDIA RTX PRO 6000 Blackwell Server Edition. CPU DRAM can be consumed
+directly or copied into HBM by finite GPU progress CTAs. A KIOXIA CD8P NVMe
+controller can DMA directly into CUDA HBM registered through DMA-BUF or into
+registered mapped DRAM. RDMA, TMA specialization, and serving-framework
+integration are not implemented and have no placeholder backends.
 
 ## 1. Working thesis
 
@@ -140,7 +141,7 @@ The system therefore needs a continuation that survives the issuing CTA.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v1 registers each staged directory entry as one acquisition tile. Direct
+ABI v2 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
 this makes duplicate suppression exact without a range-readiness bitmap.
 
@@ -419,11 +420,16 @@ backend-specific.
 
 No persistent service is permitted.
 
-The current implementation captures discover, progress, and resume as three
-finite CUDA graph nodes. Each progress CTA owns at most one published intent
-and exits after copying one finite object tile. Kernel completion supplies the
-publication and visibility boundary, so no CTA polls for external completion
-and the CPU does not issue per-object copies.
+The host-staging implementation captures discover, progress, and resume as
+three finite CUDA graph nodes. Each progress CTA owns at most one published
+intent and exits after copying one finite object tile.
+
+The NVMe implementation uses repeated, statically bounded progress/resume nodes
+inside one finite graph launch. An NVMe progress invocation checks at most a
+completion budget, submits at most an issue budget, batches each doorbell, and
+returns immediately when the next CQ phase is absent. It never waits for a new
+completion. This turns external latency into graph-level continuation rather
+than CTA residency.
 
 A future transport integration may instead let one warp at a
 compiler-selected entry or exit point acquire a short-lived progress lease.
@@ -557,6 +563,11 @@ acquisition, not extension of TMA hardware.
 
 DMA-BUF is kernel plumbing for sharing an allocated buffer among device drivers.
 It may register the HBM staging pool with NIC or NVMe drivers.
+
+M4 uses exactly this boundary: CUDA exports an HBM allocation, the bootstrap
+driver attaches and maps it in the NVMe device DMA domain, and the runtime
+publishes the resulting per-page DMA addresses. Queue setup and mapping occur
+once. No DMA-BUF operation occurs in a GPU kernel or per transfer.
 
 DMA-BUF does not provide:
 
@@ -749,6 +760,17 @@ work rather than an implementation claim.
 
 Gate: finite producer/consumer kernels sustain queue progress without a
 persistent poller.
+
+Status: complete for a dedicated read-only experiment. The bootstrap driver
+resets and identifies the controller, owns one depth-64 queue pair, imports HBM
+DMA-BUFs or pins mapped host destinations, and maps coherent queue memory plus
+the MMIO doorbell page into CUDA. A bounded device function constructs NVMe
+READ SQEs and PRP lists, batches the SQ doorbell, consumes phase-tagged CQEs,
+validates object/request generations, and publishes ready continuations. The
+benchmark performs no CPU command submission or completion polling.
+
+The tested program emits only READ commands, but the raw queue is exposed to a
+trusted privileged process and is not a hardware-enforced read-only interface.
 
 ### M5: KV integration
 

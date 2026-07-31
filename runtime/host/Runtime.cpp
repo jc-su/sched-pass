@@ -1,4 +1,5 @@
 #include "nta/HostRuntime.h"
+#include "nta/NvmeRuntime.h"
 
 #include <cuda_runtime_api.h>
 
@@ -51,12 +52,14 @@ struct HostRuntime::Impl {
     void *hostAllocation;
     void *sourceDevice;
     void *stagingDevice;
+    std::unique_ptr<NvmeBuffer> nvmeBuffer;
   };
 
-  explicit Impl(RuntimeConfig runtimeConfig)
+  explicit Impl(RuntimeConfig runtimeConfig,
+                std::shared_ptr<NvmeTransport> nvmeTransport = nullptr)
       : config(runtimeConfig), requestsHost(config.requestCapacity),
         requestInstalled(config.requestCapacity, false),
-        objects(config.objectCapacity) {
+        objects(config.objectCapacity), nvme(std::move(nvmeTransport)) {
     if (config.requestCapacity == 0 || config.objectCapacity == 0 ||
         config.intentCapacity == 0 || config.continuationCapacity == 0) {
       throw std::invalid_argument("all NTA runtime capacities must be nonzero");
@@ -92,6 +95,7 @@ struct HostRuntime::Impl {
           intents,
           continuations,
           intentCount,
+          nvme == nullptr ? nullptr : nvme->deviceQueue(),
           config.requestCapacity,
           config.objectCapacity,
           config.intentCapacity,
@@ -112,7 +116,7 @@ struct HostRuntime::Impl {
   ~Impl() { release(); }
 
   void releaseObject(OwnedObject &object) noexcept {
-    if (object.stagingDevice != nullptr) {
+    if (object.nvmeBuffer == nullptr && object.stagingDevice != nullptr) {
       (void)cudaFree(object.stagingDevice);
     }
     if (object.placement == Placement::Hbm && object.sourceDevice != nullptr) {
@@ -121,7 +125,7 @@ struct HostRuntime::Impl {
     if (object.hostAllocation != nullptr) {
       (void)cudaFreeHost(object.hostAllocation);
     }
-    object = {object.placement, nullptr, nullptr, nullptr};
+    object = {object.placement, nullptr, nullptr, nullptr, nullptr};
   }
 
   void release() noexcept {
@@ -179,10 +183,15 @@ struct HostRuntime::Impl {
   std::vector<abi::RequestContext> requestsHost;
   std::vector<bool> requestInstalled;
   std::vector<std::optional<OwnedObject>> objects;
+  std::shared_ptr<NvmeTransport> nvme;
 };
 
 HostRuntime::HostRuntime(RuntimeConfig config)
     : impl_(std::make_unique<Impl>(config)) {}
+
+HostRuntime::HostRuntime(RuntimeConfig config,
+                         std::shared_ptr<NvmeTransport> nvme)
+    : impl_(std::make_unique<Impl>(config, std::move(nvme))) {}
 
 HostRuntime::~HostRuntime() = default;
 HostRuntime::HostRuntime(HostRuntime &&) noexcept = default;
@@ -226,10 +235,10 @@ ObjectHandle HostRuntime::installObject(std::uint32_t slot,
         "external objects must contain at least one byte");
   }
   if (contents.size() > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::invalid_argument("ABI v1 objects are limited to 4 GiB");
+    throw std::invalid_argument("objects are limited to 4 GiB");
   }
 
-  Impl::OwnedObject allocation{placement, nullptr, nullptr, nullptr};
+  Impl::OwnedObject allocation{placement, nullptr, nullptr, nullptr, nullptr};
   try {
     if (placement == Placement::Hbm) {
       checkCuda(cudaMalloc(&allocation.sourceDevice, contents.size()),
@@ -257,6 +266,8 @@ ObjectHandle HostRuntime::installObject(std::uint32_t slot,
         reinterpret_cast<std::uint64_t>(allocation.sourceDevice),
         reinterpret_cast<std::uint64_t>(allocation.stagingDevice),
         contents.size(),
+        0,
+        0,
         version,
         static_cast<std::uint32_t>(
             placement == Placement::Hbm          ? abi::SourceKind::Hbm
@@ -265,23 +276,64 @@ ObjectHandle HostRuntime::installObject(std::uint32_t slot,
         static_cast<std::uint32_t>(direct ? abi::ObjectState::Ready
                                           : abi::ObjectState::New),
         0,
-        0,
-        0,
     };
 
     uploadOne(impl_->objectEntries, slot, entry);
     if (impl_->objects[slot].has_value()) {
       impl_->releaseObject(*impl_->objects[slot]);
     }
-    impl_->objects[slot] = allocation;
+    void *const directAddress = direct ? allocation.sourceDevice : nullptr;
+    impl_->objects[slot] = std::move(allocation);
     return {
         slot,
-        direct ? allocation.sourceDevice : nullptr,
+        directAddress,
     };
   } catch (...) {
     impl_->releaseObject(allocation);
     throw;
   }
+}
+
+ObjectHandle HostRuntime::installNvmeObject(
+    std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
+    std::uint64_t sourceByteOffset, std::size_t bytes,
+    std::unique_ptr<NvmeBuffer> destination) {
+  impl_->checkObjectSlot(slot);
+  if (impl_->nvme == nullptr || destination == nullptr) {
+    throw std::invalid_argument(
+        "NVMe transport and destination buffer are required");
+  }
+  const NvmeCapabilities &capabilities = impl_->nvme->capabilities();
+  if (bytes == 0 || bytes > destination->bytes() ||
+      bytes % capabilities.lbaSize != 0 ||
+      sourceByteOffset % capabilities.lbaSize != 0 ||
+      sourceByteOffset > capabilities.namespaceBytes ||
+      bytes > capabilities.namespaceBytes - sourceByteOffset) {
+    throw std::invalid_argument("NVMe object range is invalid or unaligned");
+  }
+
+  Impl::OwnedObject allocation{
+      Placement::HostStaged,  nullptr, nullptr, destination->deviceAddress(),
+      std::move(destination),
+  };
+  abi::ObjectEntry entry{
+      objectId,
+      sourceByteOffset,
+      reinterpret_cast<std::uint64_t>(allocation.stagingDevice),
+      bytes,
+      allocation.nvmeBuffer->dmaPageListAddress(),
+      0,
+      version,
+      static_cast<std::uint32_t>(abi::SourceKind::Nvme),
+      static_cast<std::uint32_t>(abi::ObjectState::New),
+      allocation.nvmeBuffer->dmaPageCount(),
+  };
+  uploadOne(impl_->objectEntries, slot, entry);
+  if (impl_->objects[slot].has_value()) {
+    impl_->releaseObject(*impl_->objects[slot]);
+  }
+  impl_->objects[slot] = std::move(allocation);
+  return {slot, nullptr};
 }
 
 abi::RuntimeView *HostRuntime::deviceView() const noexcept {

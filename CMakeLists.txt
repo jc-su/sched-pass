@@ -88,11 +88,14 @@ if(NTA_ENABLE_CUDA)
     get_filename_component(NTA_CUDA_ROOT "${CUDAToolkit_BIN_DIR}/.." ABSOLUTE)
   endif()
 
-  add_library(nta-runtime-host STATIC runtime/host/Runtime.cpp)
+  add_library(nta-runtime-host STATIC
+    runtime/host/NvmeRuntime.cpp
+    runtime/host/Runtime.cpp
+  )
   target_include_directories(nta-runtime-host PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_link_libraries(nta-runtime-host PUBLIC CUDA::cudart)
+  target_link_libraries(nta-runtime-host PUBLIC CUDA::cuda_driver CUDA::cudart)
   if(NTA_WARNINGS_AS_ERRORS)
     target_compile_options(
       nta-runtime-host PRIVATE -Wall -Wextra -Wpedantic -Werror
@@ -187,6 +190,24 @@ if(NTA_ENABLE_CUDA)
     )
   endif()
 
+  add_executable(nta-nvme-bench benchmarks/nvme/NvmeRead.cpp)
+  add_dependencies(nta-nvme-bench nta-kv-kernel)
+  target_include_directories(nta-nvme-bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_compile_definitions(
+    nta-nvme-bench PRIVATE NTA_KV_CUBIN_PATH="${NTA_KV_CUBIN}"
+  )
+  target_link_libraries(
+    nta-nvme-bench PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+  )
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-nvme-bench PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+
   add_executable(nta-runtime-test tests/runtime/RuntimeTest.cpp)
   target_include_directories(nta-runtime-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -212,3 +233,9 @@ if(NTA_ENABLE_CUDA)
   )
   set_tests_properties(nta-kv-gpu PROPERTIES TIMEOUT 60)
 endif()
+
+add_custom_target(
+  nta-nvme-driver
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/nta-nvme-device.sh build
+  USES_TERMINAL
+)
