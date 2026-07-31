@@ -1,23 +1,30 @@
-# build outputs
-build/
+# Build products
+/build/
+/out/
+*.a
+*.bc
+*.cubin
 *.o
-*.so
 *.ptx
 *.sass
-# python caches
+*.so
+
+# Generated measurements and traces
+results/
+traces/
+*.jsonl
+*.log
+*.nsys-rep
+*.sqlite
+
+# Language and tool caches
 __pycache__/
 *.pyc
 .pytest_cache/
-# transient run logs / bench results (regenerate with scripts/*.sh)
-results/
-/tmp/
-*.log
-# editor / OS
-.DS_Store
-.vscode/
-# kept, tracked: data/*.csv  figures/*.png  *.md  test/  lib/  python/  scripts/
+.ruff_cache/
 
-# Full Qwen-Bailian trace pulls (56MB LFS each) -- fetched via scripts/fetch_trace.sh.
-# The small committed *.sample.jsonl fixtures are the exception (offline tests).
-data/traces/*_blksz_16.jsonl
-!data/traces/*.sample.jsonl
+# Local tooling
+/.claude/
+/.codex/
+/.vscode/
+.DS_Store
