@@ -40,6 +40,8 @@ struct Options {
   std::uint32_t cancelStride = 0;
   std::uint32_t staleStride = 0;
   std::uint32_t coalesce = 1;
+  std::uint32_t dependencies = 1;
+  bool baseline = false;
 };
 
 void checkCuda(cudaError_t result, const char *operation) {
@@ -95,6 +97,15 @@ public:
                 "cuModuleGetFunction nta_kv_tile_kernel");
     checkDriver(cuModuleGetFunction(&ready_, module_, "nta_kv_ready_kernel"),
                 "cuModuleGetFunction nta_kv_ready_kernel");
+    checkDriver(cuModuleGetFunction(&dependencyCompute_, module_,
+                                    "nta_dependency_tile_kernel"),
+                "cuModuleGetFunction nta_dependency_tile_kernel");
+    checkDriver(cuModuleGetFunction(&dependencyReady_, module_,
+                                    "nta_dependency_ready_kernel"),
+                "cuModuleGetFunction nta_dependency_ready_kernel");
+    checkDriver(cuModuleGetFunction(&dependencyBaseline_, module_,
+                                    "nta_dependency_baseline_kernel"),
+                "cuModuleGetFunction nta_dependency_baseline_kernel");
     checkDriver(cuModuleGetFunction(&publish_, module_, "nta_publish_ready"),
                 "cuModuleGetFunction nta_publish_ready");
     checkDriver(
@@ -181,11 +192,68 @@ public:
                 "cuLaunchKernel ready compute");
   }
 
+  void launchDependencyCompute(CUstream stream, nta::abi::RuntimeView *runtime,
+                               const nta::benchmark::WorkTask *tasks,
+                               std::uint32_t taskCount,
+                               const nta::abi::AcquireRequirement *requirements,
+                               const float *query, float *output,
+                               std::uint32_t phase) const {
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
+    CUdeviceptr requirementAddress =
+        reinterpret_cast<CUdeviceptr>(requirements);
+    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(query);
+    CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
+    void *arguments[] = {
+        &runtimeAddress, &taskAddress,   &taskCount, &requirementAddress,
+        &queryAddress,   &outputAddress, &phase};
+    checkDriver(cuLaunchKernel(dependencyCompute_, taskCount, 1, 1, 256, 1, 1,
+                               0, stream, arguments, nullptr),
+                "cuLaunchKernel dependency compute");
+  }
+
+  void launchDependencyReady(CUstream stream, nta::abi::RuntimeView *runtime,
+                             const nta::benchmark::WorkTask *tasks,
+                             std::uint32_t taskCount,
+                             const nta::abi::AcquireRequirement *requirements,
+                             const float *query, float *output) const {
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
+    CUdeviceptr requirementAddress =
+        reinterpret_cast<CUdeviceptr>(requirements);
+    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(query);
+    CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
+    void *arguments[] = {&runtimeAddress,     &taskAddress,  &taskCount,
+                         &requirementAddress, &queryAddress, &outputAddress};
+    checkDriver(cuLaunchKernel(dependencyReady_, taskCount, 1, 1, 256, 1, 1, 0,
+                               stream, arguments, nullptr),
+                "cuLaunchKernel dependency ready");
+  }
+
+  void launchDependencyBaseline(
+      CUstream stream, const nta::benchmark::WorkTask *tasks,
+      std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
+      const float *query, float *output) const {
+    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
+    CUdeviceptr requirementAddress =
+        reinterpret_cast<CUdeviceptr>(requirements);
+    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(query);
+    CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
+    void *arguments[] = {&taskAddress, &taskCount, &requirementAddress,
+                         &queryAddress, &outputAddress};
+    checkDriver(cuLaunchKernel(dependencyBaseline_, taskCount, 1, 1, 256, 1, 1,
+                               0, stream, arguments, nullptr),
+                "cuLaunchKernel dependency baseline");
+  }
+
 private:
   CUmodule module_ = nullptr;
   CUfunction reset_ = nullptr;
   CUfunction compute_ = nullptr;
   CUfunction ready_ = nullptr;
+  CUfunction dependencyCompute_ = nullptr;
+  CUfunction dependencyReady_ = nullptr;
+  CUfunction dependencyBaseline_ = nullptr;
   CUfunction publish_ = nullptr;
   CUfunction progress_ = nullptr;
 };
@@ -255,6 +323,13 @@ Options parseOptions(int argc, char **argv) {
       options.staleStride = value == "0" ? 0 : parsePositive(value, name);
     } else if (name == "--coalesce") {
       options.coalesce = parsePositive(value, name);
+    } else if (name == "--dependencies") {
+      options.dependencies = parsePositive(value, name);
+    } else if (name == "--baseline") {
+      if (value != "0" && value != "1") {
+        throw std::invalid_argument("--baseline must be 0 or 1");
+      }
+      options.baseline = value == "1";
     } else {
       throw std::invalid_argument("unknown option " + std::string(name));
     }
@@ -262,6 +337,15 @@ Options parseOptions(int argc, char **argv) {
   if (options.tileBytes % 16 != 0) {
     throw std::invalid_argument(
         "--tile-bytes must be a positive multiple of 16");
+  }
+  if (options.dependencies > 32) {
+    throw std::invalid_argument("--dependencies must not exceed 32");
+  }
+  if (options.baseline &&
+      (options.mode == Mode::HostStaged || options.mode == Mode::Mixed ||
+       options.cancelStride != 0 || options.staleStride != 0)) {
+    throw std::invalid_argument(
+        "--baseline requires a direct placement and live request bindings");
   }
   return options;
 }
@@ -305,17 +389,25 @@ int main(int argc, char **argv) {
               "cudaGetDeviceProperties");
 
     const std::uint32_t elements = options.tileBytes / sizeof(float);
-    const std::uint32_t objectCount =
+    const std::uint32_t objectGroups =
         options.requests / options.coalesce +
         (options.requests % options.coalesce != 0 ? 1U : 0U);
+    if (objectGroups >
+        std::numeric_limits<std::uint32_t>::max() / options.dependencies) {
+      throw std::overflow_error("object count exceeds the NTA ABI");
+    }
+    const std::uint32_t objectCount = objectGroups * options.dependencies;
     std::vector<float> query(elements);
     for (std::uint32_t i = 0; i < elements; ++i) {
       query[i] = 0.25F + static_cast<float>((i * 7U) % 29U) / 31.0F;
     }
 
-    nta::HostRuntime runtime(
-        {options.requests, objectCount, objectCount, options.requests});
+    nta::HostRuntime runtime({options.requests, objectCount, objectCount,
+                              options.requests, 1, options.dependencies});
     std::vector<nta::benchmark::TileTask> tasks(options.requests);
+    std::vector<nta::benchmark::WorkTask> workTasks(options.requests);
+    std::vector<nta::abi::AcquireRequirement> requirements(
+        static_cast<std::size_t>(options.requests) * options.dependencies);
     std::vector<std::vector<float>> objectData(objectCount);
     std::vector<nta::ObjectHandle> objects(objectCount);
     std::vector<float> expected(options.requests, 0.0F);
@@ -348,36 +440,78 @@ int main(int argc, char **argv) {
               : generation;
       stale[task] = taskGeneration != generation;
 
-      const std::uint32_t object = task / options.coalesce;
+      const std::uint32_t objectBegin =
+          (task / options.coalesce) * options.dependencies;
       double reference = 0.0;
-      for (std::uint32_t element = 0; element < elements; ++element) {
-        const float value = objectData[object][element];
-        reference += static_cast<double>(value) * query[element];
+      std::uint32_t directDependencyCount = 0;
+      for (std::uint32_t dependency = 0; dependency < options.dependencies;
+           ++dependency) {
+        const std::uint32_t object = objectBegin + dependency;
+        directDependencyCount +=
+            objects[object].directDeviceBase != nullptr ? 1U : 0U;
+        for (std::uint32_t element = 0; element < elements; ++element) {
+          const float value = objectData[object][element];
+          reference += static_cast<double>(value) * query[element] *
+                       static_cast<double>(dependency + 1U);
+        }
+        requirements[static_cast<std::size_t>(task) * options.dependencies +
+                     dependency] = {
+            reinterpret_cast<std::uint64_t>(objects[object].directDeviceBase),
+            0,
+            200000U + object,
+            0,
+            object,
+            1,
+            options.tileBytes,
+            0,
+        };
       }
       expected[task] = static_cast<float>(reference);
 
       tasks[task] = {
-          reinterpret_cast<std::uint64_t>(objects[object].directDeviceBase),
-          200000U + object,
+          reinterpret_cast<std::uint64_t>(
+              objects[objectBegin].directDeviceBase),
+          200000U + objectBegin,
           0,
           task,
           taskGeneration,
-          object,
+          objectBegin,
           1,
           options.tileBytes,
           task,
           0,
           0,
       };
+      workTasks[task] = {
+          task,
+          taskGeneration,
+          task * options.dependencies,
+          options.dependencies,
+          directDependencyCount,
+          task,
+          task,
+          0,
+      };
     }
 
     DeviceBuffer<nta::benchmark::TileTask> deviceTasks(tasks.size());
+    DeviceBuffer<nta::benchmark::WorkTask> deviceWorkTasks(workTasks.size());
+    DeviceBuffer<nta::abi::AcquireRequirement> deviceRequirements(
+        requirements.size());
     DeviceBuffer<float> deviceQuery(query.size());
     DeviceBuffer<float> deviceOutput(options.requests);
     checkCuda(cudaMemcpy(deviceTasks.get(), tasks.data(),
                          sizeof(tasks.front()) * tasks.size(),
                          cudaMemcpyHostToDevice),
               "upload tasks");
+    checkCuda(cudaMemcpy(deviceWorkTasks.get(), workTasks.data(),
+                         sizeof(workTasks.front()) * workTasks.size(),
+                         cudaMemcpyHostToDevice),
+              "upload work tasks");
+    checkCuda(cudaMemcpy(deviceRequirements.get(), requirements.data(),
+                         sizeof(requirements.front()) * requirements.size(),
+                         cudaMemcpyHostToDevice),
+              "upload acquisition requirements");
     checkCuda(cudaMemcpy(deviceQuery.get(), query.data(),
                          sizeof(float) * query.size(), cudaMemcpyHostToDevice),
               "upload query");
@@ -401,13 +535,32 @@ int main(int argc, char **argv) {
     checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
                               sizeof(float) * options.requests, stream),
               "cudaMemsetAsync output");
-    kernels.launchCompute(driverStream, runtime.deviceView(), deviceTasks.get(),
-                          options.requests, deviceQuery.get(),
-                          deviceOutput.get(), 0);
+    if (options.baseline) {
+      kernels.launchDependencyBaseline(
+          driverStream, deviceWorkTasks.get(), options.requests,
+          deviceRequirements.get(), deviceQuery.get(), deviceOutput.get());
+    } else if (options.dependencies == 1) {
+      kernels.launchCompute(driverStream, runtime.deviceView(),
+                            deviceTasks.get(), options.requests,
+                            deviceQuery.get(), deviceOutput.get(), 0);
+    } else {
+      kernels.launchDependencyCompute(driverStream, runtime.deviceView(),
+                                      deviceWorkTasks.get(), options.requests,
+                                      deviceRequirements.get(),
+                                      deviceQuery.get(), deviceOutput.get(), 0);
+    }
     kernels.launchProgress(driverStream, runtime.deviceView(), objectCount);
     kernels.launchPublish(driverStream, runtime.deviceView(), options.requests);
-    kernels.launchReady(driverStream, runtime.deviceView(), deviceTasks.get(),
-                        options.requests, deviceQuery.get(), deviceOutput.get());
+    if (options.dependencies == 1) {
+      kernels.launchReady(driverStream, runtime.deviceView(), deviceTasks.get(),
+                          options.requests, deviceQuery.get(),
+                          deviceOutput.get());
+    } else {
+      kernels.launchDependencyReady(driverStream, runtime.deviceView(),
+                                    deviceWorkTasks.get(), options.requests,
+                                    deviceRequirements.get(), deviceQuery.get(),
+                                    deviceOutput.get());
+    }
     checkCuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
     checkCuda(cudaGraphInstantiate(&graphExec, graph, 0),
               "cudaGraphInstantiate");
@@ -439,7 +592,13 @@ int main(int argc, char **argv) {
     for (std::uint32_t task = 0; task < options.requests; ++task) {
       const nta::abi::Continuation continuation =
           runtime.readContinuation(task);
-      if (cancelled[task] || stale[task]) {
+      if (options.baseline) {
+        const float tolerance =
+            std::max(0.02F, std::abs(expected[task]) * 2.0e-5F);
+        if (std::abs(output[task] - expected[task]) > tolerance) {
+          ++failures;
+        }
+      } else if (cancelled[task] || stale[task]) {
         if (continuation.state != static_cast<std::uint32_t>(
                                       nta::abi::ContinuationState::Cancelled) ||
             output[task] != 0.0F) {
@@ -462,14 +621,16 @@ int main(int argc, char **argv) {
     const double millisecondsPerBatch =
         elapsedMilliseconds / options.iterations;
     const double gibPerSecond =
-        (static_cast<double>(options.requests) * options.tileBytes /
-         (1024.0 * 1024.0 * 1024.0)) /
+        (static_cast<double>(options.requests) * options.tileBytes *
+         options.dependencies / (1024.0 * 1024.0 * 1024.0)) /
         (millisecondsPerBatch / 1000.0);
 
     std::cout << "device=" << properties.name
               << " mode=" << modeName(options.mode)
               << " requests=" << options.requests << " objects=" << objectCount
               << " coalesce=" << options.coalesce
+              << " dependencies=" << options.dependencies
+              << " baseline=" << (options.baseline ? 1 : 0)
               << " tile_bytes=" << options.tileBytes
               << " graph_ms=" << std::fixed << std::setprecision(3)
               << millisecondsPerBatch

@@ -38,8 +38,84 @@ MDNode *acquisitionMetadata(LLVMContext &context, bool tensorMap) {
   return MDNode::get(context, fields);
 }
 
+MDNode *dependencySetMetadata(LLVMContext &context) {
+  Metadata *fields[] = {
+      MDString::get(context, "request-bound"),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt32Ty(context), abi::Version)),
+      MDString::get(context, "dependency-set"),
+  };
+  return MDNode::get(context, fields);
+}
+
+bool lowerDependencySet(Module &module, const BoundSite &site) {
+  CallInst *marker = site.marker;
+  CallInst *binding = site.binding;
+  Function *function = marker->getFunction();
+  LLVMContext &context = module.getContext();
+
+  Value *runtime = marker->getArgOperand(ir::SetRuntime);
+  Value *requirements = marker->getArgOperand(ir::Requirements);
+  Value *requirementCount = marker->getArgOperand(ir::RequirementCount);
+  Value *directRequirementCount =
+      marker->getArgOperand(ir::DirectRequirementCount);
+  Value *continuation = marker->getArgOperand(ir::SetContinuation);
+  Value *requestSlot = binding->getArgOperand(ir::RequestSlot);
+  Value *generation = binding->getArgOperand(ir::RequestGeneration);
+  Type *i1 = Type::getInt1Ty(context);
+  Type *i32 = Type::getInt32Ty(context);
+
+  FunctionCallee requestLive = module.getOrInsertFunction(
+      ir::RequestLive,
+      FunctionType::get(i1, {runtime->getType(), i32, i32}, false));
+  FunctionCallee acquireSet = module.getOrInsertFunction(
+      ir::AcquireSetSlow,
+      FunctionType::get(
+          i1,
+          {runtime->getType(), i32, i32, requirements->getType(), i32, i32,
+           i32},
+          false));
+
+  BasicBlock *entry = marker->getParent();
+  Instruction *afterMarker = marker->getNextNode();
+  BasicBlock *continuationBlock =
+      entry->splitBasicBlock(afterMarker, "nta.acquire-set.cont");
+  entry->getTerminator()->eraseFromParent();
+  BasicBlock *slowBlock = BasicBlock::Create(context, "nta.acquire-set.slow",
+                                             function, continuationBlock);
+
+  IRBuilder<> entryBuilder(entry);
+  CallInst *live = entryBuilder.CreateCall(
+      requestLive, {runtime, requestSlot, generation}, "nta.request.live");
+  entryBuilder.CreateCondBr(live, slowBlock, continuationBlock);
+
+  IRBuilder<> slowBuilder(slowBlock);
+  CallInst *ready =
+      slowBuilder.CreateCall(acquireSet,
+                             {runtime, requestSlot, generation, requirements,
+                              requirementCount, directRequirementCount,
+                              continuation},
+                             "nta.dependencies.ready");
+  ready->setMetadata(ir::AcquisitionMetadata, dependencySetMetadata(context));
+  slowBuilder.CreateBr(continuationBlock);
+
+  IRBuilder<> continuationBuilder(&continuationBlock->front());
+  PHINode *result = continuationBuilder.CreatePHI(i1, 2, "nta.ready");
+  result->addIncoming(ConstantInt::getFalse(context), entry);
+  result->addIncoming(ready, slowBlock);
+  marker->replaceAllUsesWith(result);
+  marker->eraseFromParent();
+  ++AcquisitionsLowered;
+  return true;
+}
+
 bool lowerAcquisition(Module &module, const BoundSite &site) {
   CallInst *marker = site.marker;
+  const auto *called =
+      dyn_cast<Function>(marker->getCalledOperand()->stripPointerCasts());
+  if (called != nullptr && called->getName() == ir::AcquireSetMarker) {
+    return lowerDependencySet(module, site);
+  }
   CallInst *binding = site.binding;
   Function *function = marker->getFunction();
   LLVMContext &context = module.getContext();
@@ -182,6 +258,7 @@ AcquireLoweringPass::run(Module &module,
     removeUnusedMarker(module, ir::BindMarker);
     removeUnusedMarker(module, ir::AcquireMarker);
     removeUnusedMarker(module, ir::AcquireTensorMapMarker);
+    removeUnusedMarker(module, ir::AcquireSetMarker);
     removeUnusedMarker(module, ir::DeferMarker);
   }
 

@@ -53,12 +53,25 @@ endif()
 
 enable_testing()
 
+add_library(nta-work-plan STATIC
+  runtime/host/WorkPlan.cpp
+)
+target_include_directories(nta-work-plan PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+if(NTA_WARNINGS_AS_ERRORS)
+  target_compile_options(
+    nta-work-plan PRIVATE -Wall -Wextra -Wpedantic -Werror
+  )
+endif()
+
 add_library(nta-flashinfer-adapter STATIC
   runtime/host/FlashInferAdapter.cpp
 )
 target_include_directories(nta-flashinfer-adapter PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+target_link_libraries(nta-flashinfer-adapter PUBLIC nta-work-plan)
 if(NTA_WARNINGS_AS_ERRORS)
   target_compile_options(
     nta-flashinfer-adapter PRIVATE -Wall -Wextra -Wpedantic -Werror
@@ -77,6 +90,15 @@ if(NTA_WARNINGS_AS_ERRORS)
   )
 endif()
 add_test(NAME nta-flashinfer-adapter COMMAND nta-flashinfer-adapter-test)
+
+add_executable(nta-work-plan-test tests/runtime/WorkPlanTest.cpp)
+target_link_libraries(nta-work-plan-test PRIVATE nta-work-plan)
+if(NTA_WARNINGS_AS_ERRORS)
+  target_compile_options(
+    nta-work-plan-test PRIVATE -Wall -Wextra -Wpedantic -Werror
+  )
+endif()
+add_test(NAME nta-work-plan COMMAND nta-work-plan-test)
 
 add_test(
   NAME nta-ir
@@ -374,6 +396,33 @@ if(NTA_ENABLE_CUDA)
       --coalesce=3
   )
   set_tests_properties(nta-kv-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-kv-dependency-set-gpu
+    COMMAND
+      $<TARGET_FILE:nta-kv-bench>
+      --mode=mixed
+      --requests=18
+      --tile-bytes=8192
+      --iterations=3
+      --cancel-stride=11
+      --stale-stride=13
+      --coalesce=2
+      --dependencies=3
+  )
+  set_tests_properties(nta-kv-dependency-set-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-kv-direct-baseline-gpu
+    COMMAND
+      $<TARGET_FILE:nta-kv-bench>
+      --mode=resident
+      --requests=18
+      --tile-bytes=8192
+      --iterations=3
+      --coalesce=2
+      --dependencies=3
+      --baseline=1
+  )
+  set_tests_properties(nta-kv-direct-baseline-gpu PROPERTIES TIMEOUT 60)
   add_test(
     NAME nta-paged-attention-gpu
     COMMAND

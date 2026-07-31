@@ -28,11 +28,26 @@ fi
 "${opt}" \
   -load-pass-plugin="${plugin}" \
   -passes=nta-acquire \
+  -S "${source_dir}/dependency-set.ll" \
+  -o "${output_dir}/dependency-set.lowered.ll"
+rg -q 'call i1 @nta_acquire_set_slow' \
+  "${output_dir}/dependency-set.lowered.ll"
+rg -Fq '!{!"request-bound", i32 8, !"dependency-set"}' \
+  "${output_dir}/dependency-set.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
+  "${output_dir}/dependency-set.lowered.ll"; then
+  echo "lowered dependency-set module still contains an NTA marker" >&2
+  exit 1
+fi
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
   -S "${source_dir}/tensor-map.ll" \
   -o "${output_dir}/tensor-map.lowered.ll"
 rg -q 'call ptr @nta_acquire_tensor_map_slow' \
   "${output_dir}/tensor-map.lowered.ll"
-rg -Fq '!{!"request-bound", i32 7, !"tensor-map"}' \
+rg -Fq '!{!"request-bound", i32 8, !"tensor-map"}' \
   "${output_dir}/tensor-map.lowered.ll"
 rg -q 'phi ptr \[ null, %entry \], \[ %direct.map, %nta.acquire.direct \]' \
   "${output_dir}/tensor-map.lowered.ll"
@@ -43,14 +58,14 @@ if rg -q '__nta_(bind_request|acquire_tensor_map_marker|defer_marker)' \
 fi
 
 for fixture in reject-no-binding reject-live-state reject-wrong-token \
-               reject-pending-use; do
+               reject-pending-use reject-set-live-state; do
   "${opt}" \
     -load-pass-plugin="${plugin}" \
     -passes=nta-acquire \
     -S "${source_dir}/${fixture}.ll" \
     -o "${output_dir}/${fixture}.lowered.ll" \
     2>"${output_dir}/${fixture}.stderr"
-  rg -q '__nta_acquire_marker' "${output_dir}/${fixture}.lowered.ll"
+  rg -q '__nta_acquire_.*marker' "${output_dir}/${fixture}.lowered.ll"
   rg -q 'nta: warning:' "${output_dir}/${fixture}.stderr"
 done
 

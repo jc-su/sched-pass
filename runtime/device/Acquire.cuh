@@ -23,10 +23,72 @@ __device__ __forceinline__ bool requestLive(abi::RuntimeView *runtime,
 __device__ __forceinline__ void failContinuation(abi::RuntimeView *runtime,
                                                  std::uint32_t continuation,
                                                  abi::ContinuationState state) {
-  if (continuation < runtime->continuationCapacity && threadIdx.x == 0) {
+  if (runtime != nullptr && continuation < runtime->continuationCapacity &&
+      threadIdx.x == 0) {
     atomicExch(&runtime->continuations[continuation].state,
                static_cast<std::uint32_t>(state));
   }
+}
+
+__device__ __forceinline__ bool
+dependencyRange(abi::RuntimeView *runtime, std::uint32_t continuation,
+                std::uint32_t dependencyCount, std::uint32_t &dependencyStart) {
+  if (runtime == nullptr || runtime->dependencies == nullptr ||
+      continuation >= runtime->continuationCapacity || dependencyCount == 0 ||
+      dependencyCount > runtime->maxDependenciesPerContinuation ||
+      runtime->maxDependenciesPerContinuation == 0 ||
+      continuation > runtime->dependencyCapacity /
+                         runtime->maxDependenciesPerContinuation) {
+    return false;
+  }
+  dependencyStart = continuation * runtime->maxDependenciesPerContinuation;
+  return dependencyStart <= runtime->dependencyCapacity &&
+         dependencyCount <= runtime->dependencyCapacity - dependencyStart;
+}
+
+__device__ __forceinline__ bool
+initializeContinuation(abi::RuntimeView *runtime, std::uint32_t requestSlot,
+                       std::uint32_t generation, std::uint32_t continuation,
+                       const abi::AcquireRequirement *requirements,
+                       std::uint32_t requirementCount) {
+  std::uint32_t dependencyStart = 0;
+  if (!dependencyRange(runtime, continuation, requirementCount,
+                       dependencyStart) ||
+      requirements == nullptr || requestSlot >= runtime->requestCapacity) {
+    failContinuation(runtime, continuation, abi::ContinuationState::Failed);
+    return false;
+  }
+
+  abi::Continuation &record = runtime->continuations[continuation];
+  const auto state =
+      static_cast<abi::ContinuationState>(atomicAdd(&record.state, 0U));
+  if (state == abi::ContinuationState::Cancelled ||
+      state == abi::ContinuationState::Failed) {
+    return false;
+  }
+  if (state != abi::ContinuationState::New) {
+    return true;
+  }
+
+  for (std::uint32_t index = 0; index < requirementCount; ++index) {
+    runtime->dependencies[dependencyStart + index] = {
+        requirements[index].objectId,
+        requirements[index].objectSlot,
+        requirements[index].objectVersion,
+    };
+  }
+  const abi::RequestContext &request = runtime->requests[requestSlot];
+  record.requestId = request.requestId;
+  record.requestSlot = requestSlot;
+  record.generation = generation;
+  record.dependencyCount = requirementCount;
+  record.logicalTile = continuation;
+  record.dependencyStart = dependencyStart;
+  __threadfence();
+  atomicCAS(&record.state,
+            static_cast<std::uint32_t>(abi::ContinuationState::New),
+            static_cast<std::uint32_t>(abi::ContinuationState::Pending));
+  return true;
 }
 
 __device__ __forceinline__ std::uint32_t
@@ -358,16 +420,10 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
     const auto continuationState =
         static_cast<abi::ContinuationState>(atomicAdd(&record.state, 0U));
     if (continuationState == abi::ContinuationState::New) {
-      const abi::RequestContext &request = runtime->requests[requestSlot];
-      record.requestId = request.requestId;
-      record.requestSlot = requestSlot;
-      record.generation = generation;
-      record.dependencyCount = 1;
-      record.logicalTile = continuation;
-      record.objectSlot = objectSlot;
-      __threadfence();
-      atomicExch(&record.state,
-                 static_cast<std::uint32_t>(abi::ContinuationState::Pending));
+      const abi::AcquireRequirement requirement{
+          0, 0, objectId, offset, objectSlot, objectVersion, bytes, 0};
+      (void)device::initializeContinuation(runtime, requestSlot, generation,
+                                           continuation, &requirement, 1);
     }
   }
 
@@ -444,6 +500,134 @@ nta_acquire_tensor_map_slow(
   nta::device::failContinuation(runtime, continuation,
                                 nta::abi::ContinuationState::Failed);
   return nullptr;
+}
+
+extern "C" __device__ __forceinline__ __attribute__((used)) bool
+nta_acquire_set_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+                     std::uint32_t generation,
+                     const nta::abi::AcquireRequirement *requirements,
+                     std::uint32_t requirementCount,
+                     std::uint32_t directRequirementCount,
+                     std::uint32_t continuation) {
+  using namespace nta;
+  // The compiler-emitted request-live guard dominates this internal helper.
+  // Transport misses revalidate in nta_acquire_slow before publishing work.
+  std::uint32_t dependencyStart = 0;
+  if (requirements == nullptr || directRequirementCount > requirementCount ||
+      !device::dependencyRange(runtime, continuation, requirementCount,
+                               dependencyStart)) {
+    device::failContinuation(runtime, continuation,
+                             abi::ContinuationState::Failed);
+    return false;
+  }
+  (void)dependencyStart;
+  if (directRequirementCount == requirementCount) {
+    return true;
+  }
+  bool allReady = true;
+  for (std::uint32_t index = 0; index < requirementCount; ++index) {
+    const abi::AcquireRequirement &requirement = requirements[index];
+    if (requirement.directBase != 0) {
+      continue;
+    }
+    if (requirement.objectSlot >= runtime->objectCapacity) {
+      allReady = false;
+      continue;
+    }
+    abi::ObjectEntry &object = runtime->objects[requirement.objectSlot];
+    const auto objectState =
+        static_cast<abi::ObjectState>(atomicAdd(&object.state, 0U));
+    allReady &= object.objectId == requirement.objectId &&
+                object.version == requirement.objectVersion &&
+                requirement.offset <= object.bytes &&
+                requirement.bytes <= object.bytes - requirement.offset &&
+                object.stagingAddress != 0 &&
+                objectState == abi::ObjectState::Ready;
+  }
+  if (allReady) {
+    return true;
+  }
+
+  const auto continuationState = static_cast<abi::ContinuationState>(
+      atomicAdd(&runtime->continuations[continuation].state, 0U));
+  if (continuationState == abi::ContinuationState::Cancelled ||
+      continuationState == abi::ContinuationState::Failed) {
+    return false;
+  }
+
+  if (threadIdx.x == 0) {
+    (void)device::initializeContinuation(runtime, requestSlot, generation,
+                                         continuation, requirements,
+                                         requirementCount);
+  }
+
+  bool ready = true;
+  for (std::uint32_t index = 0; index < requirementCount; ++index) {
+    const abi::AcquireRequirement &requirement = requirements[index];
+    if (requirement.directBase != 0) {
+      continue;
+    }
+    ready &= nta_acquire_slow(runtime, requestSlot, generation,
+                              requirement.objectSlot, requirement.objectId,
+                              requirement.objectVersion, requirement.offset,
+                              requirement.bytes, continuation) != nullptr;
+  }
+  return ready;
+}
+
+extern "C" __device__ __forceinline__ __attribute__((used)) const void *
+nta_requirement_address(nta::abi::RuntimeView *runtime,
+                        const nta::abi::AcquireRequirement *requirement) {
+  using namespace nta;
+  if (requirement == nullptr) {
+    return nullptr;
+  }
+  if (requirement->directBase != 0) {
+    return reinterpret_cast<const std::byte *>(requirement->directBase) +
+           requirement->offset;
+  }
+  if (runtime == nullptr ||
+      requirement->objectSlot >= runtime->objectCapacity) {
+    return nullptr;
+  }
+  abi::ObjectEntry &object = runtime->objects[requirement->objectSlot];
+  const auto objectState =
+      static_cast<abi::ObjectState>(atomicAdd(&object.state, 0U));
+  if (object.objectId != requirement->objectId ||
+      object.version != requirement->objectVersion ||
+      objectState != abi::ObjectState::Ready ||
+      requirement->offset > object.bytes ||
+      requirement->bytes > object.bytes - requirement->offset) {
+    return nullptr;
+  }
+  return reinterpret_cast<const std::byte *>(object.stagingAddress) +
+         requirement->offset;
+}
+
+extern "C" __device__ __forceinline__ __attribute__((used)) const void *
+nta_requirement_tensor_map(nta::abi::RuntimeView *runtime,
+                           const nta::abi::AcquireRequirement *requirement) {
+  using namespace nta;
+  if (requirement == nullptr) {
+    return nullptr;
+  }
+  if (requirement->directTensorMap != 0) {
+    return reinterpret_cast<const void *>(requirement->directTensorMap);
+  }
+  if (runtime == nullptr ||
+      requirement->objectSlot >= runtime->objectCapacity) {
+    return nullptr;
+  }
+  abi::ObjectEntry &object = runtime->objects[requirement->objectSlot];
+  const auto objectState =
+      static_cast<abi::ObjectState>(atomicAdd(&object.state, 0U));
+  if (object.objectId != requirement->objectId ||
+      object.version != requirement->objectVersion ||
+      objectState != abi::ObjectState::Ready ||
+      object.stagingTensorMapAddress == 0) {
+    return nullptr;
+  }
+  return reinterpret_cast<const void *>(object.stagingTensorMapAddress);
 }
 
 extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
@@ -828,7 +1012,6 @@ nta_defer(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
   record.requestId = request.requestId;
   record.requestSlot = requestSlot;
   record.generation = generation;
-  record.dependencyCount = 1;
   record.logicalTile = continuation;
   if (currentState == abi::ContinuationState::New) {
     atomicExch(&record.state,
@@ -978,30 +1161,52 @@ nta_publish_ready(nta::abi::RuntimeView *runtime,
               static_cast<std::uint32_t>(abi::ContinuationState::Cancelled));
     return;
   }
-  if (continuation.objectSlot >= runtime->objectCapacity) {
+  std::uint32_t dependencyStart = 0;
+  if (!device::dependencyRange(runtime, continuationIndex,
+                               continuation.dependencyCount, dependencyStart) ||
+      dependencyStart != continuation.dependencyStart) {
     atomicCAS(&continuation.state,
               static_cast<std::uint32_t>(abi::ContinuationState::Pending),
               static_cast<std::uint32_t>(abi::ContinuationState::Failed));
     return;
   }
 
-  const auto objectState = static_cast<abi::ObjectState>(
-      atomicAdd(&runtime->objects[continuation.objectSlot].state, 0U));
-  if (objectState == abi::ObjectState::Failed) {
-    atomicCAS(&continuation.state,
-              static_cast<std::uint32_t>(abi::ContinuationState::Pending),
-              static_cast<std::uint32_t>(abi::ContinuationState::Failed));
-    return;
-  }
-  if (objectState != abi::ObjectState::Ready ||
+  for (std::uint32_t index = 0; index < continuation.dependencyCount; ++index) {
+    const abi::ContinuationDependency dependency =
+        runtime->dependencies[dependencyStart + index];
+    if (dependency.objectSlot >= runtime->objectCapacity) {
       atomicCAS(&continuation.state,
                 static_cast<std::uint32_t>(abi::ContinuationState::Pending),
+                static_cast<std::uint32_t>(abi::ContinuationState::Failed));
+      return;
+    }
+    abi::ObjectEntry &object = runtime->objects[dependency.objectSlot];
+    if (object.objectId != dependency.objectId ||
+        object.version != dependency.objectVersion) {
+      atomicCAS(&continuation.state,
+                static_cast<std::uint32_t>(abi::ContinuationState::Pending),
+                static_cast<std::uint32_t>(abi::ContinuationState::Failed));
+      return;
+    }
+    const auto objectState =
+        static_cast<abi::ObjectState>(atomicAdd(&object.state, 0U));
+    if (objectState == abi::ObjectState::Failed) {
+      atomicCAS(&continuation.state,
+                static_cast<std::uint32_t>(abi::ContinuationState::Pending),
+                static_cast<std::uint32_t>(abi::ContinuationState::Failed));
+      return;
+    }
+    if (objectState != abi::ObjectState::Ready) {
+      return;
+    }
+  }
+  if (atomicCAS(&continuation.state,
+                static_cast<std::uint32_t>(abi::ContinuationState::Pending),
                 static_cast<std::uint32_t>(abi::ContinuationState::Ready)) !=
-          static_cast<std::uint32_t>(abi::ContinuationState::Pending)) {
+      static_cast<std::uint32_t>(abi::ContinuationState::Pending)) {
     return;
   }
 
-  continuation.dependencyCount = 0;
   const std::uint32_t ticket = atomicAdd(runtime->readyCount, 1U);
   if (ticket < runtime->continuationCapacity) {
     runtime->readyContinuations[ticket] = continuationIndex;
@@ -1042,7 +1247,7 @@ extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
     continuation.state =
         static_cast<std::uint32_t>(abi::ContinuationState::New);
     continuation.dependencyCount = 0;
-    continuation.objectSlot = abi::InvalidIndex;
+    continuation.dependencyStart = abi::InvalidIndex;
   }
   if (index == 0 && device::nvmeQueue(runtime) != nullptr) {
     device::nvmeQueue(runtime)->intentCursor = 0;

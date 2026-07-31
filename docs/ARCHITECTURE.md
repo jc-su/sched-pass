@@ -17,6 +17,12 @@ CD8P NVMe controller has DMAed directly into CUDA HBM registered through
 DMA-BUF and into registered mapped DRAM. RDMA is not implemented because this
 host has no RNIC, and there is no placeholder backend.
 
+ABI v8 adds an engine-neutral work plan and fixed-capacity dependency segments.
+One finite CTA continuation can acquire several mixed-tier objects and is
+published only after every object identity, version, and ready state validates.
+This path is exercised by a non-attention kernel; FlashInfer is an optional
+metadata adapter rather than the core execution model.
+
 ## 1. Working thesis
 
 Long-context serving places request-owned KV data across GPU memory, CPU memory,
@@ -145,7 +151,7 @@ The system therefore needs a continuation that survives the issuing CTA.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v7 registers each staged directory entry as one acquisition tile. Direct
+ABI v8 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
 this makes duplicate suppression exact without a range-readiness bitmap.
 
@@ -233,6 +239,28 @@ Continuation {
 }
 ```
 
+```text
+WorkItem {
+    request_slot
+    generation
+    logical_work
+    dependency_begin
+    dependency_count
+    direct_dependency_count
+    continuation_id
+}
+
+AcquireRequirement {
+    direct_address_or_zero
+    direct_tensor_map_or_zero
+    object_id
+    object_version
+    object_slot
+    offset
+    bytes
+}
+```
+
 The implementation uses fixed-size, preallocated tables and an object-keyed
 reusable intent pool. It
 must not allocate memory on the device hot path.
@@ -297,8 +325,8 @@ validate completion
     -> validate request generation and object version
     -> publish destination visibility
     -> recycle transport and staging credits
-    -> decrement continuation dependency count
-    -> enqueue continuation when all dependencies are ready
+    -> scan the continuation's bounded dependency segment
+    -> enqueue the continuation only when every dependency is ready
 ```
 
 A later finite kernel invocation receives the ready continuation and executes
@@ -343,9 +371,10 @@ Recognize:
 - inline PTX `cp.async` global-to-shared operations; and
 - TMA operations or descriptors when visible through IR or frontend metadata.
 
-The clean implementation currently consumes explicit byte-address or tensor-map
-markers and rejects sites without a dominating request binding or canonical
-null/defer/return edge. It does not yet infer arbitrary production load,
+The clean implementation currently consumes explicit byte-address, tensor-map,
+or bounded dependency-set markers and rejects sites without a dominating
+request binding or canonical ready/defer/return edge. Set lowering is independent
+of engine and kernel names. It does not yet infer arbitrary production load,
 `cp.async`, or TMA address cones. The previous branch's recognition experiment
 is not evidence for this branch.
 
@@ -362,7 +391,7 @@ structurally verified address cone. An opaque pointer alone is insufficient.
 
 ### 7.4 Phase D: continuation legality
 
-Prove:
+Required legality conditions are:
 
 - uniform control for the transformed acquisition;
 - no divergent exit across a CTA barrier;
@@ -370,6 +399,11 @@ Prove:
 - idempotent re-entry;
 - reconstructible logical work; and
 - generation-safe batch-slot reuse.
+
+The current pass proves domination, marker ABI, a bounded acyclic pending edge,
+exactly one matching defer, return from the finite kernel, and no value/state
+use on that edge. CTA-uniform marker placement is currently a frontend contract;
+full NVVM uniformity analysis remains an open production gate.
 
 ### 7.5 Phase E: lowering
 
@@ -379,6 +413,7 @@ ordinary function calls so this project does not require an LLVM fork:
 ```llvm
 declare ptr @nta_acquire_slow(...)
 declare ptr @nta_acquire_tensor_map_slow(...)
+declare i1  @nta_acquire_set_slow(...)
 declare i1  @nta_request_live(...)
 declare void @nta_defer(...)
 ```
@@ -806,6 +841,11 @@ real FlashInfer decode wrapper is a differential correctness gate. NTA deferral
 is not yet inside FlashInfer's optimized CTA, nor is it wired into SGLang/vLLM
 request lifecycle and KV management; therefore there is no TTFT/TPOT/SLO claim.
 
+The ABI-v8 dependency-set workload separately acquires up to 32 mixed-tier
+objects per CTA, supports cancellation/stale generations and duplicate
+coalescing, and resumes only after the complete set is ready. This demonstrates
+kernel-neutral mechanics, not a production serving result.
+
 ### M6: TMA specialization
 
 - Census actual production IR/PTX forms.
@@ -838,6 +878,10 @@ Gate: real network hardware, not loopback or emulation, for performance claims.
 Gate: reuse the same compiler/runtime contracts without kernel-name-specific
 logic.
 
+Status: the common `WorkPlan`, compiler lowering, runtime dependency table, and
+multi-object compute fixture meet the mechanism part of this gate without
+attention-specific code. Real MoE and ANNS application baselines remain open.
+
 ## 21. Target repository layout
 
 The implemented tree is:
@@ -853,6 +897,7 @@ include/nta/
     FlashInferAdapter.h
     HostRuntime.h
     RuntimeABI.h
+    WorkPlan.h
     Passes.h
 lib/
     AcquireAnalysis.cpp
@@ -861,12 +906,11 @@ lib/
     Plugin.cpp
 runtime/
     device/Acquire.cuh
-    host/FlashInferAdapter.cpp
-    host/Runtime.cpp
+    host/{FlashInferAdapter,Runtime,WorkPlan}.cpp
 tests/
-    ir/{batched,reject-*}.ll
+    ir/{batched,dependency-set,reject-*}.ll
     flashinfer/differential_decode.py
-    runtime/{AbiTest,FlashInferAdapterTest,RuntimeTest}.cpp
+    runtime/{AbiTest,FlashInferAdapterTest,RuntimeTest,WorkPlanTest}.cpp
 benchmarks/
     kv/{KvAcquire,KvAcquireKernel,KvTypes}
     attention/{PagedAttention,PagedAttentionKernel,PagedAttentionTypes}

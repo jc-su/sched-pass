@@ -60,6 +60,21 @@ std::optional<std::string> validateAcquire(CallInst &call) {
   return std::nullopt;
 }
 
+std::optional<std::string> validateAcquireSet(CallInst &call) {
+  if (call.arg_size() != ir::AcquireSetArgumentCount ||
+      !call.getType()->isIntegerTy(1)) {
+    return "dependency-set marker has an incompatible ABI";
+  }
+  if (!call.getArgOperand(ir::SetRuntime)->getType()->isPointerTy() ||
+      !call.getArgOperand(ir::Requirements)->getType()->isPointerTy() ||
+      !isInteger(call.getArgOperand(ir::RequirementCount), 32) ||
+      !isInteger(call.getArgOperand(ir::DirectRequirementCount), 32) ||
+      !isInteger(call.getArgOperand(ir::SetContinuation), 32)) {
+    return "dependency-set arguments do not match the marker contract";
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> validateDefer(CallInst &call) {
   if (call.arg_size() != ir::DeferArgumentCount ||
       !call.getType()->isVoidTy() ||
@@ -91,12 +106,25 @@ bool isNull(Value *value) {
 }
 
 struct AcquisitionBranch {
-  ICmpInst *comparison;
+  Instruction *condition;
   BasicBlock *pending;
   BasicBlock *ready;
 };
 
 std::optional<AcquisitionBranch> acquisitionBranch(CallInst &marker) {
+  if (marker.getType()->isIntegerTy(1)) {
+    if (!marker.hasOneUse()) {
+      return std::nullopt;
+    }
+    auto *branch = dyn_cast<BranchInst>(*marker.user_begin());
+    if (branch == nullptr || !branch->isConditional() ||
+        branch->getCondition() != &marker) {
+      return std::nullopt;
+    }
+    return AcquisitionBranch{branch, branch->getSuccessor(1),
+                             branch->getSuccessor(0)};
+  }
+
   ICmpInst *nullComparison = nullptr;
   for (User *user : marker.users()) {
     auto *comparison = dyn_cast<ICmpInst>(user);
@@ -147,11 +175,20 @@ std::optional<std::string>
 validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
   std::optional<AcquisitionBranch> branch = acquisitionBranch(marker);
   if (!branch.has_value()) {
-    return "acquired pointer must have one canonical null branch";
+    return marker.getType()->isIntegerTy(1)
+               ? "dependency-set result must directly branch to ready/pending"
+               : "acquired pointer must have one canonical null branch";
   }
+  const bool dependencySet = marker.getType()->isIntegerTy(1);
+  const unsigned runtimeArgument = dependencySet
+                                       ? static_cast<unsigned>(ir::SetRuntime)
+                                       : static_cast<unsigned>(ir::Runtime);
+  const unsigned continuationArgument =
+      dependencySet ? static_cast<unsigned>(ir::SetContinuation)
+                    : static_cast<unsigned>(ir::Continuation);
 
   for (User *user : marker.users()) {
-    if (user == branch->comparison) {
+    if (user == branch->condition) {
       continue;
     }
     auto *instruction = dyn_cast<Instruction>(user);
@@ -178,9 +215,9 @@ validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
       if (auto *call = dyn_cast<CallInst>(&instruction);
           call != nullptr && hasName(*call, ir::DeferMarker)) {
         if (call->getArgOperand(ir::DeferRuntime) !=
-                marker.getArgOperand(ir::Runtime) ||
+                marker.getArgOperand(runtimeArgument) ||
             call->getArgOperand(ir::DeferContinuation) !=
-                marker.getArgOperand(ir::Continuation)) {
+                marker.getArgOperand(continuationArgument)) {
           return "pending edge defers a different acquisition token";
         }
         ++deferCount;
@@ -227,7 +264,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           plan.bindings.push_back(call);
         }
       } else if (hasName(*call, ir::AcquireMarker) ||
-                 hasName(*call, ir::AcquireTensorMapMarker)) {
+                 hasName(*call, ir::AcquireTensorMapMarker) ||
+                 hasName(*call, ir::AcquireSetMarker)) {
         acquireMarkers.push_back(call);
       } else if (hasName(*call, ir::DeferMarker)) {
         deferMarkers.push_back(call);
@@ -241,7 +279,9 @@ FunctionPlan analyzeAcquisitions(Function &function) {
 
   DominatorTree dominatorTree(function);
   for (CallInst *marker : acquireMarkers) {
-    if (std::optional<std::string> error = validateAcquire(*marker)) {
+    const bool set = hasName(*marker, ir::AcquireSetMarker);
+    if (std::optional<std::string> error =
+            set ? validateAcquireSet(*marker) : validateAcquire(*marker)) {
       plan.rejected.push_back({marker, std::move(*error)});
       continue;
     }

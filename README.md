@@ -23,6 +23,8 @@ workloads:
 
 - per-CTA request/generation binding in batched kernels;
 - compiler proof of a canonical finite-kernel deferral boundary;
+- an engine-neutral `WorkPlan` model and ABI-v8 bounded dependency sets, so one
+  continuation can wait for several pages, experts, or object shards;
 - direct HBM and mapped-CPU-DRAM paths with no queue or atomic operation;
 - staged CPU-DRAM acquisition issued and completed by finite GPU CTAs;
 - direct NVMe reads into either DMA-BUF-registered HBM or registered mapped
@@ -34,16 +36,19 @@ workloads:
 - a backend-neutral directory with bounded per-object physical replicas;
 - a numerically checked split-K paged-attention workload with heterogeneous
   request lengths;
-- a validated adapter from FlashInfer's public paged-KV CSR tables to NTA page
-  continuations, FlashInfer-native `(V, LSE)` cascade state, and a differential
-  GPU correctness gate against FlashInfer 0.6.12;
+- an optional adapter from FlashInfer's public paged-KV CSR tables into the
+  common work model, FlashInfer-native `(V, LSE)` cascade state, and a
+  differential GPU correctness gate against FlashInfer 0.6.12;
 - real TMA consumption from direct sources or from HBM after external staging,
   with compiler-proven deferral before barrier creation;
 - one captured CUDA graph containing discover, bounded progress, and resume
   kernels; and
 - an inspectable NVVM IR -> pass -> PTX -> cubin build pipeline.
 
-The FlashInfer compatibility layer does not yet place deferral inside
+The core ABI and compiler pass do not depend on FlashInfer, vLLM, SGLang, or a
+kernel name. A supported kernel must still expose a reconstructible pre-state
+work boundary; arbitrary instruction-level suspension is not implemented. The
+FlashInfer compatibility layer does not yet place deferral inside
 FlashInfer's optimized FMHA CTA, and no vLLM/SGLang request-lifecycle adapter is
 present. The compiler currently consumes explicit acquisition markers; automatic
 recognition of arbitrary production load/cp.async/TMA address cones is an open
@@ -74,6 +79,7 @@ Run the real mixed-placement workload:
   --mode=mixed \
   --requests=96 \
   --coalesce=3 \
+  --dependencies=4 \
   --tile-bytes=65536 \
   --iterations=50 \
   --cancel-stride=17 \
@@ -82,6 +88,9 @@ Run the real mixed-placement workload:
 
 Supported modes are `resident`, `host-direct`, `host-staged`, and `mixed`.
 Generated compiler artifacts are under `build/kernel/`.
+Use `--baseline=1` with a direct placement to run the identical multi-object
+numerical kernel without request/acquisition logic for resident-path overhead
+measurement.
 
 Run the split-K attention workload using hardware TMA after external staging:
 

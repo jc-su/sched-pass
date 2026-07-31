@@ -1,24 +1,15 @@
 #pragma once
 
+#include "nta/WorkPlan.h"
+
 #include <cstdint>
 #include <span>
 #include <vector>
 
 namespace nta::flashinfer {
 
-struct RequestBinding {
-  std::uint32_t requestSlot;
-  std::uint32_t generation;
-};
-
-struct PageBinding {
-  std::uint64_t directBase;
-  std::uint64_t directTensorMap;
-  std::uint64_t objectId;
-  std::uint32_t objectSlot;
-  std::uint32_t objectVersion;
-  std::uint32_t bytes;
-};
+using RequestBinding = nta::RequestBinding;
+using PageBinding = nta::ObjectBinding;
 
 struct DecodeBatchView {
   std::uint32_t pageSize;
@@ -27,6 +18,7 @@ struct DecodeBatchView {
   std::span<const std::int32_t> lastPageLen;
   std::span<const RequestBinding> requests;
   std::span<const PageBinding> physicalPages;
+  std::uint32_t maxPagesPerWorkItem = 1;
 };
 
 struct DecodeChunk {
@@ -48,6 +40,7 @@ struct RequestChunks {
 };
 
 struct DecodePlan {
+  nta::WorkPlan work;
   std::vector<DecodeChunk> chunks;
   std::vector<RequestChunks> requests;
 };

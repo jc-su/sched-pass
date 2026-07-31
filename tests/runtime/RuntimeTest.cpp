@@ -34,6 +34,14 @@ int main() {
     }
     require(undersizedIntentPoolRejected,
             "intent pool must cover every independently queued object");
+    bool dependencyCapacityRejected = false;
+    try {
+      nta::HostRuntime invalid({1, 1, 1, 1, 1, 0});
+    } catch (const std::invalid_argument &) {
+      dependencyCapacityRejected = true;
+    }
+    require(dependencyCapacityRejected,
+            "dependency capacity must be finite and non-zero");
 
     nta::HostRuntime runtime({4, 3, 3, 4, 2});
     bool uninitializedCancelRejected = false;
@@ -57,6 +65,12 @@ int main() {
     require(cudaMemcpy(&hostView, runtime.deviceView(), sizeof(hostView),
                        cudaMemcpyDeviceToHost) == cudaSuccess,
             "runtime view download failed");
+    require(hostView.objectCapacity == 3 && hostView.replicaCapacity == 6,
+            "object and replica capacities were transposed");
+    require(hostView.maxDependenciesPerContinuation == 8 &&
+                hostView.dependencyCapacity == 32 &&
+                hostView.dependencies != nullptr,
+            "continuation dependency storage was not installed");
     const std::uint64_t syntheticOutstanding = 4096;
     require(cudaMemcpy(&hostView.requests[0].outstandingBytes,
                        &syntheticOutstanding, sizeof(syntheticOutstanding),

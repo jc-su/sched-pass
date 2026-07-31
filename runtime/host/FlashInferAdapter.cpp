@@ -1,5 +1,6 @@
 #include "nta/FlashInferAdapter.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,10 @@ DecodePlan planDecode(const DecodeBatchView &batch) {
   if (batch.kvIndptr.empty() || batch.kvIndptr.front() != 0) {
     throw std::invalid_argument("FlashInfer kv_indptr must start at zero");
   }
+  if (batch.maxPagesPerWorkItem == 0) {
+    throw std::invalid_argument(
+        "FlashInfer pages per work item must be non-zero");
+  }
 
   const std::uint32_t referencedPages =
       checkedIndex(batch.kvIndptr.back(), "FlashInfer kv_indptr");
@@ -37,6 +42,7 @@ DecodePlan planDecode(const DecodeBatchView &batch) {
   }
 
   DecodePlan plan;
+  WorkPlanBuilder workBuilder(batch.maxPagesPerWorkItem);
   plan.chunks.reserve(referencedPages);
   plan.requests.reserve(batch.requests.size());
   for (std::uint32_t requestIndex = 0; requestIndex < batch.requests.size();
@@ -63,40 +69,59 @@ DecodePlan planDecode(const DecodeBatchView &batch) {
     }
 
     const RequestBinding binding = batch.requests[requestIndex];
+    const std::uint32_t genericRequest = workBuilder.addRequest(binding);
     const std::uint32_t chunkBegin =
         static_cast<std::uint32_t>(plan.chunks.size());
-    for (std::uint32_t pageOffset = begin; pageOffset < end; ++pageOffset) {
-      const std::uint32_t physicalPage =
-          checkedIndex(batch.kvIndices[pageOffset], "FlashInfer kv_indices");
-      if (physicalPage >= batch.physicalPages.size()) {
-        throw std::invalid_argument(
-            "FlashInfer kv_indices references an unbound physical page");
+    for (std::uint32_t groupBegin = begin; groupBegin < end;) {
+      const std::uint32_t groupEnd =
+          groupBegin + std::min(batch.maxPagesPerWorkItem, end - groupBegin);
+      std::vector<abi::AcquireRequirement> requirements;
+      requirements.reserve(groupEnd - groupBegin);
+      for (std::uint32_t pageOffset = groupBegin; pageOffset < groupEnd;
+           ++pageOffset) {
+        const std::uint32_t physicalPage =
+            checkedIndex(batch.kvIndices[pageOffset], "FlashInfer kv_indices");
+        if (physicalPage >= batch.physicalPages.size()) {
+          throw std::invalid_argument(
+              "FlashInfer kv_indices references an unbound physical page");
+        }
+        const PageBinding page = batch.physicalPages[physicalPage];
+        if (page.bytes == 0) {
+          throw std::invalid_argument(
+              "every referenced FlashInfer page needs a complete NTA binding");
+        }
+        requirements.push_back(makeRequirement(page));
       }
-      const PageBinding page = batch.physicalPages[physicalPage];
-      if (page.bytes == 0) {
-        throw std::invalid_argument(
-            "every referenced FlashInfer page needs a complete NTA binding");
-      }
-      if (plan.chunks.size() >=
-          static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
-        throw std::overflow_error("FlashInfer chunk count exceeds the NTA ABI");
-      }
+
       const std::uint32_t continuation =
-          static_cast<std::uint32_t>(plan.chunks.size());
-      plan.chunks.push_back({
-          requestIndex,
-          binding.requestSlot,
-          binding.generation,
-          pageOffset,
-          physicalPage,
-          pageOffset + 1U == end ? finalPageTokens : batch.pageSize,
-          continuation,
-          page,
-      });
+          workBuilder.addWork(genericRequest, groupBegin - begin, requirements);
+      for (std::uint32_t pageOffset = groupBegin; pageOffset < groupEnd;
+           ++pageOffset) {
+        if (plan.chunks.size() >=
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max())) {
+          throw std::overflow_error(
+              "FlashInfer chunk count exceeds the NTA ABI");
+        }
+        const std::uint32_t physicalPage =
+            checkedIndex(batch.kvIndices[pageOffset], "FlashInfer kv_indices");
+        plan.chunks.push_back({
+            requestIndex,
+            binding.requestSlot,
+            binding.generation,
+            pageOffset,
+            physicalPage,
+            pageOffset + 1U == end ? finalPageTokens : batch.pageSize,
+            continuation,
+            batch.physicalPages[physicalPage],
+        });
+      }
+      groupBegin = groupEnd;
     }
     plan.requests.push_back(
         {chunkBegin, pageCount, binding.requestSlot, binding.generation});
   }
+  plan.work = workBuilder.finish();
   return plan;
 }
 

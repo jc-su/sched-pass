@@ -70,13 +70,18 @@ struct HostRuntime::Impl {
         config.intentCapacity == 0 || config.continuationCapacity == 0 ||
         config.intentCapacity < config.objectCapacity ||
         config.maxReplicasPerObject == 0 ||
-        config.objectCapacity >
+        config.maxDependenciesPerContinuation == 0 ||
+        config.objectCapacity > std::numeric_limits<std::uint32_t>::max() /
+                                    config.maxReplicasPerObject ||
+        config.continuationCapacity >
             std::numeric_limits<std::uint32_t>::max() /
-                config.maxReplicasPerObject) {
-      throw std::invalid_argument(
-          "runtime capacities are invalid or intent capacity is below object capacity");
+                config.maxDependenciesPerContinuation) {
+      throw std::invalid_argument("runtime capacities overflow or intent "
+                                  "capacity is below object capacity");
     }
     replicaCapacity = config.objectCapacity * config.maxReplicasPerObject;
+    dependencyCapacity =
+        config.continuationCapacity * config.maxDependenciesPerContinuation;
 
     cudaError_t flagsResult = cudaSetDeviceFlags(cudaDeviceMapHost);
     if (flagsResult != cudaSuccess &&
@@ -103,6 +108,8 @@ struct HostRuntime::Impl {
       intents = deviceAllocate<abi::IntentSlot>(config.intentCapacity);
       continuations =
           deviceAllocate<abi::Continuation>(config.continuationCapacity);
+      dependencies =
+          deviceAllocate<abi::ContinuationDependency>(dependencyCapacity);
       intentPool = deviceAllocate<abi::IntentPool>(1);
       readyContinuations =
           deviceAllocate<std::uint32_t>(config.continuationCapacity);
@@ -171,19 +178,21 @@ struct HostRuntime::Impl {
           backendEntries,
           intents,
           continuations,
+          dependencies,
           intentPool,
           readyContinuations,
           readyCount,
           readyHead,
           config.requestCapacity,
           config.requestCapacity,
-          replicaCapacity,
           config.objectCapacity,
+          replicaCapacity,
           abi::BackendCount,
           config.intentCapacity,
           config.continuationCapacity,
+          dependencyCapacity,
+          config.maxDependenciesPerContinuation,
           abi::Version,
-          0,
       };
       view = deviceAllocate<abi::RuntimeView>(1);
       checkCuda(
@@ -244,6 +253,10 @@ struct HostRuntime::Impl {
       (void)cudaFree(continuations);
       continuations = nullptr;
     }
+    if (dependencies != nullptr) {
+      (void)cudaFree(dependencies);
+      dependencies = nullptr;
+    }
     if (intents != nullptr) {
       (void)cudaFree(intents);
       intents = nullptr;
@@ -284,6 +297,7 @@ struct HostRuntime::Impl {
 
   RuntimeConfig config;
   std::uint32_t replicaCapacity = 0;
+  std::uint32_t dependencyCapacity = 0;
   abi::RequestContext *requests = nullptr;
   abi::TenantContext *tenants = nullptr;
   abi::ObjectEntry *objectEntries = nullptr;
@@ -291,6 +305,7 @@ struct HostRuntime::Impl {
   abi::BackendView *backendEntries = nullptr;
   abi::IntentSlot *intents = nullptr;
   abi::Continuation *continuations = nullptr;
+  abi::ContinuationDependency *dependencies = nullptr;
   abi::IntentPool *intentPool = nullptr;
   std::uint32_t *readyContinuations = nullptr;
   std::uint32_t *readyCount = nullptr;
@@ -630,6 +645,18 @@ abi::Continuation HostRuntime::readContinuation(std::uint32_t slot) const {
     throw std::out_of_range("continuation slot exceeds runtime capacity");
   }
   return downloadOne(impl_->continuations, slot);
+}
+
+abi::ContinuationDependency HostRuntime::readContinuationDependency(
+    std::uint32_t continuation, std::uint32_t relativeDependency) const {
+  if (continuation >= impl_->config.continuationCapacity ||
+      relativeDependency >= impl_->config.maxDependenciesPerContinuation) {
+    throw std::out_of_range("continuation dependency exceeds runtime capacity");
+  }
+  const std::uint32_t index =
+      continuation * impl_->config.maxDependenciesPerContinuation +
+      relativeDependency;
+  return downloadOne(impl_->dependencies, index);
 }
 
 abi::IntentPool HostRuntime::readIntentPool() const {

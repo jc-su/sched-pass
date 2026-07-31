@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 7;
+inline constexpr std::uint32_t Version = 8;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 5;
 
@@ -138,6 +138,27 @@ struct alignas(64) IntentPool {
 };
 static_assert(sizeof(IntentPool) == 64);
 
+// A kernel work item may require several independently resident objects. The
+// compiler treats an array of these records as one finite deferral boundary.
+struct alignas(16) AcquireRequirement {
+  std::uint64_t directBase;
+  std::uint64_t directTensorMap;
+  std::uint64_t objectId;
+  std::uint64_t offset;
+  std::uint32_t objectSlot;
+  std::uint32_t objectVersion;
+  std::uint32_t bytes;
+  std::uint32_t flags;
+};
+static_assert(sizeof(AcquireRequirement) == 48);
+
+struct alignas(16) ContinuationDependency {
+  std::uint64_t objectId;
+  std::uint32_t objectSlot;
+  std::uint32_t objectVersion;
+};
+static_assert(sizeof(ContinuationDependency) == 16);
+
 struct alignas(32) Continuation {
   std::uint64_t requestId;
   std::uint32_t requestSlot;
@@ -145,7 +166,7 @@ struct alignas(32) Continuation {
   std::uint32_t state;
   std::uint32_t dependencyCount;
   std::uint32_t logicalTile;
-  std::uint32_t objectSlot;
+  std::uint32_t dependencyStart;
 };
 static_assert(sizeof(Continuation) == 32);
 
@@ -208,6 +229,7 @@ struct alignas(64) RuntimeView {
   BackendView *backends;
   IntentSlot *intents;
   Continuation *continuations;
+  ContinuationDependency *dependencies;
   IntentPool *intentPool;
   std::uint32_t *readyContinuations;
   std::uint32_t *readyCount;
@@ -219,10 +241,11 @@ struct alignas(64) RuntimeView {
   std::uint32_t backendCapacity;
   std::uint32_t intentCapacity;
   std::uint32_t continuationCapacity;
+  std::uint32_t dependencyCapacity;
+  std::uint32_t maxDependenciesPerContinuation;
   std::uint32_t abiVersion;
-  std::uint32_t reserved0;
 };
-static_assert(sizeof(RuntimeView) == 128);
+static_assert(sizeof(RuntimeView) == 192);
 
 static_assert(std::is_standard_layout_v<RequestContext>);
 static_assert(std::is_standard_layout_v<TenantContext>);
@@ -232,9 +255,13 @@ static_assert(std::is_standard_layout_v<BackendView>);
 static_assert(std::is_standard_layout_v<AcquireIntent>);
 static_assert(std::is_standard_layout_v<IntentSlot>);
 static_assert(std::is_standard_layout_v<IntentPool>);
+static_assert(std::is_standard_layout_v<AcquireRequirement>);
+static_assert(std::is_standard_layout_v<ContinuationDependency>);
 static_assert(std::is_standard_layout_v<Continuation>);
 static_assert(std::is_standard_layout_v<NvmeQueueView>);
 static_assert(std::is_standard_layout_v<RuntimeView>);
+static_assert(std::is_trivially_copyable_v<AcquireRequirement>);
+static_assert(std::is_trivially_copyable_v<ContinuationDependency>);
 static_assert(std::is_trivially_copyable_v<RuntimeView>);
 
 } // namespace nta::abi

@@ -36,21 +36,27 @@ runs memcheck, racecheck, and synccheck. Generated evidence is written under
 
 ## Compiler And Runtime Correctness
 
-`ctest --test-dir build --output-on-failure` passes eight tests:
+`ctest --test-dir build --output-on-failure` passes eleven tests:
 
-1. FlashInfer CSR-to-NTA adapter validation, including malformed metadata;
-2. byte-address and tensor-map LLVM lowering plus rejected unsafe IR;
-3. host/device ABI v7 layout;
-4. runtime allocation, replicated-object publication, tensor-map binding, and
-   cancellation state;
-5. mixed HBM/mapped/staged KV acquisition with duplicate coalescing, stale
-   generations, cancellation, and repeated intent-slot reuse;
-6. staged split-K paged attention with one-page request credit;
-7. the same staged attention path using hardware TMA; and
-8. a differential GPU run against FlashInfer 0.6.12.
+1. FlashInfer CSR-to-common-work-plan validation, including grouped pages and
+   malformed metadata;
+2. engine-neutral work-plan construction and bounded dependency validation;
+3. byte-address, tensor-map, and dependency-set LLVM lowering plus rejected
+   unsafe IR;
+4. host/device ABI v8 layout;
+5. runtime allocation, corrected object/replica capacities, dependency storage,
+   replicated-object publication, tensor-map binding, and cancellation state;
+6. mixed HBM/mapped/staged single-object acquisition with duplicate coalescing,
+   stale generations, cancellation, and repeated intent-slot reuse;
+7. a three-object-per-CTA mixed-tier dependency-set workload;
+8. the matching direct-address baseline kernel;
+9. staged split-K paged attention with one-page request credit;
+10. the same staged attention path using hardware TMA; and
+11. a differential GPU run against FlashInfer 0.6.12.
 
 The lowered modules contain no bind/acquire/defer marker calls. Tensor-map sites
-carry `!nta.acquire` metadata identifying ABI v7 and the `tensor-map` flavor.
+carry `!nta.acquire` metadata identifying ABI v8 and either the `tensor-map` or
+`dependency-set` flavor.
 The direct branch does not enter the intent pool. NVMe progress uses one warp,
 bounds submission and completion work, and has no CTA barrier.
 
@@ -61,6 +67,40 @@ memcheck:  ERROR SUMMARY: 0 errors
 racecheck: 0 hazards displayed (0 errors, 0 warnings)
 synccheck: ERROR SUMMARY: 0 errors
 ```
+
+The ABI-v8 mixed-tier dependency-set workload also reports zero memcheck errors,
+zero racecheck hazards, and zero synccheck errors. Its acquisition path adds no
+CTA barrier; the one barrier reported for the fixture kernel belongs to its
+numerical reduction. PTXAS reports 62/64 registers, no spills, and 128/132 bytes
+of shared memory for initial/ready kernels; the direct baseline uses 32 registers
+and 128 bytes.
+
+One local 96-CTA, four-dependency, 64-KiB-per-object run produced:
+
+| Placement | Graph ms | Logical GiB/s | Verification failures |
+| --- | ---: | ---: | ---: |
+| HBM | 0.061 | 382.43 | 0 |
+| mapped CPU DRAM | 1.110 | 21.11 | 0 |
+| mixed tiers | 0.422 | 55.60 | 0 |
+
+These are mechanism samples, not controlled confidence intervals. A separate
+mixed cancellation/stale-generation run completed with 12 cancelled or stale
+work items and zero verification failures.
+
+For a direct-path comparison, ten alternating process-level trials ran 200
+captured-graph iterations each. Both variants used the same graph topology and
+four-object numerical work; the baseline bypassed only request/acquisition
+logic:
+
+| Variant | Mean logical GiB/s | 95% t interval |
+| --- | ---: | ---: |
+| direct-address baseline | 397.27 | +/- 0.28 |
+| ABI-v8 dependency set | 383.82 | +/- 0.28 |
+
+The paired throughput reduction was 3.39% +/- 0.08 percentage points. This is a
+measured, nonzero mechanism cost, so the production direct-path gate remains
+open. GPU clocks were not fixed, and this microbenchmark is not a serving
+kernel or end-to-end SLO result.
 
 ## Paged Attention
 
@@ -138,7 +178,7 @@ completed and every checksum matched the block-device reference:
 
 The controller is currently owned by the host's `vmem_sw` consumer and has been
 restored to its original driver. The safety helper refuses to rebind it while
-that consumer is active, so ABI v7 and the latest scheduler changes have not
+that consumer is active, so ABI v8 and the latest dependency-set changes have not
 been revalidated on NVMe hardware. This is a required regression gate.
 
 ## Production Gates

@@ -23,7 +23,7 @@ upstream `main` commit `668a1ba1ca86432c79f6adad37ecfce8d06ec083`.
 kv_indptr, kv_indices, last_page_len
     + request slot/generation bindings
     + physical page/object bindings
-    -> request-owned NTA page continuations
+    -> engine-neutral NTA work items and bounded dependency segments
 ```
 
 The adapter validates CSR dimensions, monotonic offsets, final-page lengths,
@@ -71,13 +71,13 @@ CTA has accumulated softmax state or entered a barrier protocol. Polling inside
 the attention CTA is also excluded: storage and network latency can outlive a
 finite CTA by orders of magnitude.
 
-A FlashInfer chunk may span several pages. Therefore the production hook needs
-one continuation with a bounded dependency set, not one independent relaunch
-per load. The next runtime revision must add a page-object list and an atomic
-remaining-dependency count. Ready publication occurs only after every required
-page is resident in its reserved HBM KV slot. For already resident pages, the
-hook is a read-only validation/direct branch and the original FlashInfer pointer
-and data-movement path remain unchanged.
+A FlashInfer chunk may span several pages. The implemented ABI-v8 adapter can
+group a configured number of pages into one continuation with a bounded
+dependency segment. Runtime publication scans the complete segment and validates
+object identity, version, and readiness before enqueueing that continuation.
+For already resident pages, the set hook bypasses the intent queue and the
+original pointer and data-movement path remain unchanged. The optimized
+FlashInfer CTA has not yet been modified to consume that work item.
 
 This hook should be a small upstreamable template extension, such as an optional
 `begin_kv_chunk(...)` policy on the attention variant. NTA's variant emits the
@@ -114,7 +114,8 @@ The FlashInfer path is not production-ready until all of these pass:
 
 - the optional chunk hook is implemented in decode and paged prefill without a
   persistent kernel or CTA-wide completion polling;
-- multi-page dependency continuations are race- and cancellation-safe;
+- multi-page dependency continuations remain safe under production CUDA-graph
+  reuse and engine cancellation races;
 - direct-resident overhead is statistically indistinguishable from untouched
   FlashInfer or is small enough to justify with end-to-end benefit;
 - real SGLang and vLLM batches pass output, reuse, cancellation, CUDA-graph, and

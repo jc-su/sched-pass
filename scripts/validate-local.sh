@@ -17,6 +17,12 @@ cmake -S "${root}" -B "${build}" -GNinja \
 cmake --build "${build}" -j"${NTA_BUILD_JOBS:-2}"
 ctest --test-dir "${build}" --output-on-failure
 
+"${build}/nta-kv-bench" \
+  --mode=mixed --requests=96 --coalesce=3 --dependencies=4 \
+  --tile-bytes=65536 --iterations="${iterations}" \
+  --cancel-stride=17 --stale-stride=19 | \
+  tee "${results}/dependency-set.log"
+
 matrix_log="${results}/attention-matrix.log"
 : >"${matrix_log}"
 for copy in global tma; do
@@ -46,5 +52,10 @@ if [[ ${NTA_SANITIZE:-0} == 1 ]]; then
       --mode=mixed --copy=tma --requests=3 --min-pages=2 --max-pages=3 \
       --iterations=1 --progress-passes=3 \
       2>&1 | tee "${results}/${tool}.log"
+    "${sanitizer}" --tool "${tool}" --error-exitcode 99 \
+      "${build}/nta-kv-bench" \
+      --mode=mixed --requests=6 --coalesce=2 --dependencies=3 \
+      --tile-bytes=8192 --iterations=1 \
+      2>&1 | tee "${results}/dependency-set-${tool}.log"
   done
 fi

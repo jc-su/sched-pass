@@ -24,6 +24,7 @@ struct RuntimeConfig {
   std::uint32_t intentCapacity;
   std::uint32_t continuationCapacity;
   std::uint32_t maxReplicasPerObject = 1;
+  std::uint32_t maxDependenciesPerContinuation = 8;
 };
 
 struct HostReplicaSpec {
@@ -82,6 +83,9 @@ public:
   readReplica(std::uint32_t objectSlot,
               std::uint32_t relativeReplica = 0) const;
   [[nodiscard]] abi::Continuation readContinuation(std::uint32_t slot) const;
+  [[nodiscard]] abi::ContinuationDependency
+  readContinuationDependency(std::uint32_t continuation,
+                             std::uint32_t relativeDependency) const;
   [[nodiscard]] abi::IntentPool readIntentPool() const;
 
 private:

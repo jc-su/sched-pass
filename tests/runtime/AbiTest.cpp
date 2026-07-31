@@ -16,6 +16,8 @@ int main() {
   static_assert(alignof(AcquireIntent) == 64);
   static_assert(alignof(IntentSlot) == 128);
   static_assert(alignof(IntentPool) == 64);
+  static_assert(alignof(AcquireRequirement) == 16);
+  static_assert(alignof(ContinuationDependency) == 16);
   static_assert(alignof(Continuation) == 32);
   static_assert(alignof(NvmeQueueView) == 64);
   static_assert(alignof(RuntimeView) == 64);
@@ -23,14 +25,15 @@ int main() {
   static_assert(offsetof(ObjectEntry, state) == 36);
   static_assert(offsetof(AcquireIntent, valid) == 44);
   static_assert(offsetof(Continuation, state) == 16);
-  static_assert(offsetof(RuntimeView, intentPool) == 56);
-  static_assert(offsetof(RuntimeView, readyContinuations) == 64);
+  static_assert(offsetof(RuntimeView, dependencies) == 56);
+  static_assert(offsetof(RuntimeView, intentPool) == 64);
+  static_assert(offsetof(RuntimeView, readyContinuations) == 72);
   static_assert(sizeof(nta_nvme_info) == 104);
   static_assert(sizeof(nta_nvme_import) == 48);
   static_assert(sizeof(nta_nvme_register_host) == 32);
   static_assert(sizeof(nta_nvme_dma_pages) == 2064);
 
-  if (Version != 7 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
+  if (Version != 8 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }
