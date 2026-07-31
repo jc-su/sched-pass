@@ -6,6 +6,12 @@ This document defines the problem, claims, system boundary, execution model, and
 implementation gates for the clean `nonresident-acquisition` branch. Decisions
 in this document take precedence over the previous prototype's design notes.
 
+Implementation status (2026-07-31): M0-M3 have a working vertical slice tested
+on an NVIDIA RTX PRO 6000 Blackwell Server Edition. The current external source
+is mapped CPU DRAM, consumed directly or copied into HBM by finite GPU progress
+CTAs. NVMe, RDMA, TMA specialization, and serving-framework integration are not
+implemented and have no placeholder backends.
+
 ## 1. Working thesis
 
 Long-context serving places request-owned KV data across GPU memory, CPU memory,
@@ -133,6 +139,10 @@ The system therefore needs a continuation that survives the issuing CTA.
 **External object**
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
+
+ABI v1 registers each staged directory entry as one acquisition tile. Direct
+sources may serve subranges, but a staged miss transfers the complete entry;
+this makes duplicate suppression exact without a range-readiness bitmap.
 
 **Acquisition site**
 : A compiler-recognized point where logical GPU work requires an external object
@@ -409,8 +419,15 @@ backend-specific.
 
 No persistent service is permitted.
 
-At compiler-selected entry or exit points, one warp may acquire a short-lived
-progress lease. The winner performs bounded work:
+The current implementation captures discover, progress, and resume as three
+finite CUDA graph nodes. Each progress CTA owns at most one published intent
+and exits after copying one finite object tile. Kernel completion supplies the
+publication and visibility boundary, so no CTA polls for external completion
+and the CPU does not issue per-object copies.
+
+A future transport integration may instead let one warp at a
+compiler-selected entry or exit point acquire a short-lived progress lease.
+The winner would perform bounded work:
 
 ```text
 drain at most B_rdma completions
@@ -435,7 +452,10 @@ conditions.
 
 ## 10. Request-aware admission
 
-The first scheduler is deliberately simple and bounded:
+This is a post-M3 design requirement. The current host-memory implementation
+uses duplicate suppression and a fixed-capacity FIFO intent ring; it does not
+claim priority scheduling. The first request-aware scheduler will be simple and
+bounded:
 
 - fixed priority or slack buckets rather than a device heap;
 - per-request and per-tenant byte credits;
@@ -678,6 +698,10 @@ Stop or reframe the project if any of the following holds:
 
 Gate: the pass recognizes only explicit fixtures and declines unknown forms.
 
+Status: complete. The pass binds live per-CTA request SSA values, proves the
+canonical null/defer/return region, emits direct and slow paths, and leaves
+rejected sites untouched with a diagnostic.
+
 ### M1: deterministic mock backend
 
 - Device object directory.
@@ -686,6 +710,10 @@ Gate: the pass recognizes only explicit fixtures and declines unknown forms.
 - Deterministic completion injection.
 
 Gate: exhaustive generation, cancellation, duplicate, and queue-full tests.
+
+Status: the state machine runs against real CUDA allocations rather than a
+disconnected mock. Generation, cancellation, and duplicate transfer behavior
+are tested; exhaustive queue-wrap testing remains open.
 
 ### M2: finite progress protocol
 
@@ -696,6 +724,10 @@ Gate: exhaustive generation, cancellation, duplicate, and queue-full tests.
 
 Gate: no deadlock at ring wraparound or full queue; bounded instruction count.
 
+Status: complete for a single acquisition epoch. Misses publish to a fixed
+ring, object CAS suppresses duplicates, and a finite progress grid precedes a
+finite resume grid. No kernel polls or persists.
+
 ### M3: CPU DRAM
 
 - Mapped-host direct path.
@@ -703,6 +735,11 @@ Gate: no deadlock at ring wraparound or full queue; bounded instruction count.
 - Path selection and visibility tests.
 
 Gate: HBM fast path remains statistically indistinguishable from stock.
+
+Status: functionally complete. Mapped direct and GPU-staged paths are
+numerically tested. The compiler-generated HBM path has no queue or atomic
+instruction; a production-kernel zero-overhead comparison remains evaluation
+work rather than an implementation claim.
 
 ### M4: NVMe
 
@@ -749,7 +786,7 @@ logic.
 
 ## 21. Target repository layout
 
-Implementation should grow into this structure:
+The implemented tree is:
 
 ```text
 CMakeLists.txt
@@ -757,6 +794,8 @@ docs/
     ARCHITECTURE.md
 include/nta/
     AcquireIR.h
+    DeviceAPI.cuh
+    HostRuntime.h
     RuntimeABI.h
     Passes.h
 lib/
@@ -765,21 +804,13 @@ lib/
     ContinuationLowering.cpp
     Plugin.cpp
 runtime/
-    device/
-    host/
-backends/
-    mock/
-    host/
-    nvme/
-    rdma/
+    device/Acquire.cuh
+    host/Runtime.cpp
 tests/
-    ir/
-    runtime/
-    hardware/
+    ir/{batched,reject-*}.ll
+    runtime/{AbiTest,RuntimeTest}.cpp
 benchmarks/
-    kv/
-    moe/
-    ann/
+    kv/{KvAcquire,KvAcquireKernel,KvTypes}
 ```
 
 No legacy scheduler, CLC, grouped-LPT, cache-hint, or timing implementation is
