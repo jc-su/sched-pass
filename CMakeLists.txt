@@ -165,13 +165,16 @@ if(NTA_ENABLE_CUDA)
   endif()
 
   add_library(nta-runtime-host STATIC
+    runtime/host/DeviceWorkPlan.cpp
     runtime/host/NvmeRuntime.cpp
     runtime/host/Runtime.cpp
   )
   target_include_directories(nta-runtime-host PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  target_link_libraries(nta-runtime-host PUBLIC CUDA::cuda_driver CUDA::cudart)
+  target_link_libraries(
+    nta-runtime-host PUBLIC nta-work-plan CUDA::cuda_driver CUDA::cudart
+  )
   if(NTA_WARNINGS_AS_ERRORS)
     target_compile_options(
       nta-runtime-host PRIVATE -Wall -Wextra -Wpedantic -Werror
@@ -332,6 +335,24 @@ if(NTA_ENABLE_CUDA)
     )
   endif()
 
+  add_executable(nta-moe-bench benchmarks/moe/MoeExperts.cpp)
+  add_dependencies(nta-moe-bench nta-kv-kernel)
+  target_include_directories(nta-moe-bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_compile_definitions(
+    nta-moe-bench PRIVATE NTA_KV_CUBIN_PATH="${NTA_KV_CUBIN}"
+  )
+  target_link_libraries(
+    nta-moe-bench PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+  )
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-moe-bench PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+
   add_executable(nta-nvme-bench benchmarks/nvme/NvmeRead.cpp)
   add_dependencies(nta-nvme-bench nta-kv-kernel)
   target_include_directories(nta-nvme-bench PRIVATE
@@ -410,6 +431,47 @@ if(NTA_ENABLE_CUDA)
       --dependencies=3
   )
   set_tests_properties(nta-kv-dependency-set-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-kv-object-version-fault-gpu
+    COMMAND
+      $<TARGET_FILE:nta-kv-bench>
+      --mode=host-staged
+      --requests=24
+      --tile-bytes=4096
+      --iterations=2
+      --coalesce=2
+      --dependencies=3
+      --object-stale-stride=5
+  )
+  set_tests_properties(nta-kv-object-version-fault-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-kv-pending-index-scale-gpu
+    COMMAND
+      $<TARGET_FILE:nta-kv-bench>
+      --mode=resident
+      --requests=4096
+      --tile-bytes=1024
+      --iterations=2
+      --coalesce=64
+      --dependencies=4
+  )
+  set_tests_properties(
+    nta-kv-pending-index-scale-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "pending=0 verification_failures=0"
+  )
+  add_test(
+    NAME nta-moe-mixed-tier-gpu
+    COMMAND
+      $<TARGET_FILE:nta-moe-bench>
+      --mode=mixed
+      --tokens=24
+      --experts=9
+      --top-k=2
+      --hidden=64
+      --iterations=2
+  )
+  set_tests_properties(nta-moe-mixed-tier-gpu PROPERTIES TIMEOUT 60)
   add_test(
     NAME nta-kv-direct-baseline-gpu
     COMMAND

@@ -8,17 +8,10 @@ inline constexpr std::uint32_t AttentionHeadDimension = 128;
 inline constexpr std::uint32_t AttentionPageTokens = 16;
 
 struct alignas(16) AttentionTileTask {
-  std::uint64_t directBase;
-  std::uint64_t directTensorMap;
-  std::uint64_t objectId;
-  std::uint32_t requestSlot;
-  std::uint32_t generation;
   std::uint32_t objectSlot;
-  std::uint32_t objectVersion;
-  std::uint32_t bytes;
-  std::uint32_t continuation;
   std::uint32_t requestIndex;
   std::uint32_t tokenCount;
+  std::uint32_t reserved;
 };
 
 struct alignas(16) AttentionRequest {
@@ -37,7 +30,7 @@ struct alignas(16) AttentionTilePartial {
   float output[AttentionHeadDimension];
 };
 
-static_assert(sizeof(AttentionTileTask) == 64);
+static_assert(sizeof(AttentionTileTask) == 16);
 static_assert(sizeof(AttentionRequest) == 16);
 static_assert(sizeof(AttentionTilePartial) == 528);
 

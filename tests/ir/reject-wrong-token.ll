@@ -2,7 +2,7 @@ declare void @__nta_bind_request(i32, i32)
 declare ptr @__nta_acquire_marker(ptr, ptr, i32, i64, i32, i64, i32, i32)
 declare void @__nta_defer_marker(ptr, i32)
 
-define void @wrong_token(ptr %runtime, i32 %request.slot, i32 %generation,
+define ptx_kernel void @wrong_token(ptr %runtime, i32 %request.slot, i32 %generation,
                          i32 %continuation) {
 entry:
   call void @__nta_bind_request(i32 %request.slot, i32 %generation)

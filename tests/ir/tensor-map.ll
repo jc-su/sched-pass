@@ -3,7 +3,7 @@ declare ptr @__nta_acquire_tensor_map_marker(ptr, ptr, i32, i64, i32, i64,
                                              i32, i32)
 declare void @__nta_defer_marker(ptr, i32)
 
-define void @tensor_map_tile(ptr %runtime, ptr %direct.map,
+define ptx_kernel void @tensor_map_tile(ptr %runtime, ptr %direct.map,
                              i32 %request.slot, i32 %generation,
                              i32 %object.slot, i64 %object.id,
                              i32 %object.version, i32 %bytes,

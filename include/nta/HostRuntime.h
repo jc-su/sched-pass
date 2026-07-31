@@ -9,6 +9,8 @@
 
 namespace nta {
 
+class DeviceWorkPlan;
+struct WorkPlan;
 class NvmeBuffer;
 class NvmeTransport;
 
@@ -87,6 +89,8 @@ public:
   readContinuationDependency(std::uint32_t continuation,
                              std::uint32_t relativeDependency) const;
   [[nodiscard]] abi::IntentPool readIntentPool() const;
+  [[nodiscard]] std::uint32_t readPendingCount() const;
+  [[nodiscard]] DeviceWorkPlan uploadWorkPlan(const WorkPlan &plan) const;
 
 private:
   struct Impl;

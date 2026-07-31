@@ -1,4 +1,6 @@
+#include "nta/DeviceWorkPlan.h"
 #include "nta/HostRuntime.h"
+#include "nta/WorkPlan.h"
 
 #include <cuda_runtime_api.h>
 
@@ -69,8 +71,16 @@ int main() {
             "object and replica capacities were transposed");
     require(hostView.maxDependenciesPerContinuation == 8 &&
                 hostView.dependencyCapacity == 32 &&
-                hostView.dependencies != nullptr,
+                hostView.dependencies != nullptr &&
+                hostView.pendingContinuations != nullptr &&
+                hostView.pendingCount != nullptr,
             "continuation dependency storage was not installed");
+    std::uint32_t pendingCount = 1;
+    require(cudaMemcpy(&pendingCount, hostView.pendingCount,
+                       sizeof(pendingCount), cudaMemcpyDeviceToHost) ==
+                    cudaSuccess &&
+                pendingCount == 0,
+            "pending continuation index was not initialized");
     const std::uint64_t syntheticOutstanding = 4096;
     require(cudaMemcpy(&hostView.requests[0].outstandingBytes,
                        &syntheticOutstanding, sizeof(syntheticOutstanding),
@@ -142,6 +152,90 @@ int main() {
     require(stagedEntry.state ==
                 static_cast<std::uint32_t>(nta::abi::ObjectState::New),
             "staged object must begin nonresident");
+
+    nta::WorkPlanBuilder planBuilder(2);
+    const std::uint32_t planRequest = planBuilder.addRequest({0, 7});
+    const std::array<nta::abi::AcquireRequirement, 2> planDependencies{{
+        nta::makeRequirement({reinterpret_cast<std::uint64_t>(
+                                  hbm.directDeviceBase),
+                              0, 2001, 0, 1,
+                              static_cast<std::uint32_t>(contents.size())}),
+        nta::makeRequirement({0, 0, 2003, 2, 3,
+                              static_cast<std::uint32_t>(contents.size())}),
+    }};
+    (void)planBuilder.addWork(planRequest, 42, planDependencies);
+    const nta::WorkPlan hostPlan = planBuilder.finish();
+    nta::DeviceWorkPlan devicePlan = runtime.uploadWorkPlan(hostPlan);
+    nta::abi::WorkItem uploadedWork{};
+    nta::abi::AcquireRequirement uploadedDependency{};
+    require(devicePlan.workItemCount() == 1 &&
+                devicePlan.dependencyCount() == 2 &&
+                cudaMemcpy(&uploadedWork, devicePlan.workItems(),
+                           sizeof(uploadedWork), cudaMemcpyDeviceToHost) ==
+                    cudaSuccess &&
+                cudaMemcpy(&uploadedDependency,
+                           devicePlan.dependencies() + 1,
+                           sizeof(uploadedDependency),
+                           cudaMemcpyDeviceToHost) == cudaSuccess &&
+                uploadedWork.logicalWork == 42 &&
+                uploadedWork.directDependencyCount == 1 &&
+                uploadedDependency.objectId == 2003,
+            "canonical device work-plan upload failed");
+    require(devicePlan.workItemCapacity() == 1 &&
+                devicePlan.dependencyCapacity() == 2,
+            "device work-plan capacities were not retained");
+
+    nta::DeviceWorkPlan reusablePlan(2, 4);
+    cudaStream_t uploadStream = nullptr;
+    cudaStream_t consumerStream = nullptr;
+    require(cudaStreamCreateWithFlags(&uploadStream, cudaStreamNonBlocking) ==
+                cudaSuccess,
+            "reusable plan stream creation failed");
+    require(cudaStreamCreateWithFlags(&consumerStream, cudaStreamNonBlocking) ==
+                cudaSuccess,
+            "reusable plan consumer stream creation failed");
+    const nta::abi::WorkItem *const reusableWorkAddress =
+        reusablePlan.workItems();
+    const nta::abi::AcquireRequirement *const reusableDependencyAddress =
+        reusablePlan.dependencies();
+    reusablePlan.uploadAsync(hostPlan, uploadStream);
+    reusablePlan.waitOn(consumerStream);
+    nta::abi::WorkItem asynchronouslyUploaded{};
+    require(cudaMemcpyAsync(&asynchronouslyUploaded, reusablePlan.workItems(),
+                            sizeof(asynchronouslyUploaded),
+                            cudaMemcpyDeviceToHost, consumerStream) ==
+                    cudaSuccess &&
+                cudaStreamSynchronize(consumerStream) == cudaSuccess &&
+                asynchronouslyUploaded.logicalWork == 42,
+            "cross-stream work-plan publication failed");
+    nta::WorkPlan updatedPlan = hostPlan;
+    updatedPlan.workItems[0].logicalWork = 77;
+    reusablePlan.uploadAsync(updatedPlan, uploadStream);
+    reusablePlan.waitOn(consumerStream);
+    require(cudaMemcpyAsync(&asynchronouslyUploaded, reusablePlan.workItems(),
+                            sizeof(asynchronouslyUploaded),
+                            cudaMemcpyDeviceToHost, consumerStream) ==
+                    cudaSuccess &&
+                cudaStreamSynchronize(consumerStream) == cudaSuccess &&
+                asynchronouslyUploaded.logicalWork == 77 &&
+                reusablePlan.workItems() == reusableWorkAddress &&
+                reusablePlan.dependencies() == reusableDependencyAddress,
+            "reusable work-plan allocation changed across updates");
+    require(cudaStreamDestroy(consumerStream) == cudaSuccess,
+            "reusable plan consumer stream destruction failed");
+    require(cudaStreamDestroy(uploadStream) == cudaSuccess,
+            "reusable plan stream destruction failed");
+
+    nta::WorkPlan invalidRuntimePlan = hostPlan;
+    invalidRuntimePlan.workItems[0].requestSlot = 3;
+    bool invalidRuntimeBindingRejected = false;
+    try {
+      (void)runtime.uploadWorkPlan(invalidRuntimePlan);
+    } catch (const std::invalid_argument &) {
+      invalidRuntimeBindingRejected = true;
+    }
+    require(invalidRuntimeBindingRejected,
+            "runtime must reject an uninstalled request binding");
     const auto *const replicaMap = reinterpret_cast<const void *>(0x1000ULL);
     const auto *const stagingMap = reinterpret_cast<const void *>(0x2000ULL);
     runtime.bindTensorMaps(2, 0, replicaMap, stagingMap);

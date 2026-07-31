@@ -1,5 +1,7 @@
+#include "nta/DeviceWorkPlan.h"
 #include "nta/HostRuntime.h"
 #include "nta/NvmeRuntime.h"
+#include "nta/WorkPlan.h"
 
 #include <cuda_runtime_api.h>
 
@@ -115,6 +117,9 @@ struct HostRuntime::Impl {
           deviceAllocate<std::uint32_t>(config.continuationCapacity);
       readyCount = deviceAllocate<std::uint32_t>(1);
       readyHead = deviceAllocate<std::uint32_t>(1);
+      pendingContinuations =
+          deviceAllocate<std::uint32_t>(config.continuationCapacity);
+      pendingCount = deviceAllocate<std::uint32_t>(1);
 
       const auto backend = [](abi::SourceKind kind, bool active,
                               std::uint64_t state, std::uint64_t latencyNs,
@@ -183,6 +188,8 @@ struct HostRuntime::Impl {
           readyContinuations,
           readyCount,
           readyHead,
+          pendingContinuations,
+          pendingCount,
           config.requestCapacity,
           config.requestCapacity,
           config.objectCapacity,
@@ -240,6 +247,14 @@ struct HostRuntime::Impl {
     if (readyHead != nullptr) {
       (void)cudaFree(readyHead);
       readyHead = nullptr;
+    }
+    if (pendingCount != nullptr) {
+      (void)cudaFree(pendingCount);
+      pendingCount = nullptr;
+    }
+    if (pendingContinuations != nullptr) {
+      (void)cudaFree(pendingContinuations);
+      pendingContinuations = nullptr;
     }
     if (readyCount != nullptr) {
       (void)cudaFree(readyCount);
@@ -310,6 +325,8 @@ struct HostRuntime::Impl {
   std::uint32_t *readyContinuations = nullptr;
   std::uint32_t *readyCount = nullptr;
   std::uint32_t *readyHead = nullptr;
+  std::uint32_t *pendingContinuations = nullptr;
+  std::uint32_t *pendingCount = nullptr;
   abi::RuntimeView *view = nullptr;
   std::vector<abi::RequestContext> requestsHost;
   std::vector<abi::TenantContext> tenantsHost;
@@ -661,6 +678,34 @@ abi::ContinuationDependency HostRuntime::readContinuationDependency(
 
 abi::IntentPool HostRuntime::readIntentPool() const {
   return downloadOne(impl_->intentPool, 0);
+}
+
+std::uint32_t HostRuntime::readPendingCount() const {
+  return downloadOne(impl_->pendingCount, 0);
+}
+
+DeviceWorkPlan HostRuntime::uploadWorkPlan(const WorkPlan &plan) const {
+  if (plan.workItems.size() > impl_->config.continuationCapacity) {
+    throw std::invalid_argument(
+        "work plan exceeds the runtime continuation capacity");
+  }
+  for (const abi::WorkItem &work : plan.workItems) {
+    if (work.requestSlot >= impl_->config.requestCapacity ||
+        !impl_->requestInstalled[work.requestSlot] ||
+        work.dependencyCount >
+            impl_->config.maxDependenciesPerContinuation) {
+      throw std::invalid_argument(
+          "work plan does not fit the runtime request/dependency contract");
+    }
+  }
+  for (const abi::AcquireRequirement &requirement : plan.dependencies) {
+    if (requirement.directBase == 0 &&
+        requirement.objectSlot >= impl_->config.objectCapacity) {
+      throw std::invalid_argument(
+          "work plan references an external object outside the runtime");
+    }
+  }
+  return DeviceWorkPlan(plan);
 }
 
 } // namespace nta

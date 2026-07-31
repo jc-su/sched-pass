@@ -15,13 +15,17 @@ has real TMA descriptor selection and hardware TMA after direct or externally
 staged acquisition; automatic production-IR recognition remains open. A KIOXIA
 CD8P NVMe controller has DMAed directly into CUDA HBM registered through
 DMA-BUF and into registered mapped DRAM. RDMA is not implemented because this
-host has no RNIC, and there is no placeholder backend.
+host has no RNIC, and there is no placeholder backend. M8 now has a real routed
+MoE matrix workload on the common mechanism; production MoE baselines remain
+open.
 
-ABI v8 adds an engine-neutral work plan and fixed-capacity dependency segments.
-One finite CTA continuation can acquire several mixed-tier objects and is
-published only after every object identity, version, and ready state validates.
-This path is exercised by a non-attention kernel; FlashInfer is an optional
-metadata adapter rather than the core execution model.
+ABI v9 defines one engine-neutral device work item, fixed-capacity dependency
+segments, and a pending-only readiness index. One finite CTA continuation can
+acquire several mixed-tier objects and is published only after every object
+identity, version, and ready state validates. Reusable device plans support
+pinned, asynchronous updates. Generic compute, paged attention, TMA attention,
+and MoE consume this same ABI; FlashInfer is an optional metadata adapter rather
+than the core execution model.
 
 ## 1. Working thesis
 
@@ -151,7 +155,7 @@ The system therefore needs a continuation that survives the issuing CTA.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v8 registers each staged directory entry as one acquisition tile. Direct
+ABI v9 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
 this makes duplicate suppression exact without a range-readiness bitmap.
 
@@ -325,7 +329,7 @@ validate completion
     -> validate request generation and object version
     -> publish destination visibility
     -> recycle transport and staging credits
-    -> scan the continuation's bounded dependency segment
+    -> consult pending continuations and scan each bounded dependency segment
     -> enqueue the continuation only when every dependency is ready
 ```
 
@@ -402,8 +406,12 @@ Required legality conditions are:
 
 The current pass proves domination, marker ABI, a bounded acyclic pending edge,
 exactly one matching defer, return from the finite kernel, and no value/state
-use on that edge. CTA-uniform marker placement is currently a frontend contract;
-full NVVM uniformity analysis remains an open production gate.
+use on that edge. It also performs target-aware CTA-uniformity validation:
+markers must be inlined into a GPU kernel entry; kernel arguments, block
+identity, and block/grid dimensions are collective; and thread/lane/warp
+identity, atomics, volatile loads, local allocation, and unknown calls taint
+control or operands as non-collective. Automatic discovery of unmarked
+production address cones remains an open production gate.
 
 ### 7.5 Phase E: lowering
 
@@ -841,10 +849,13 @@ real FlashInfer decode wrapper is a differential correctness gate. NTA deferral
 is not yet inside FlashInfer's optimized CTA, nor is it wired into SGLang/vLLM
 request lifecycle and KV management; therefore there is no TTFT/TPOT/SLO claim.
 
-The ABI-v8 dependency-set workload separately acquires up to 32 mixed-tier
-objects per CTA, supports cancellation/stale generations and duplicate
-coalescing, and resumes only after the complete set is ready. This demonstrates
-kernel-neutral mechanics, not a production serving result.
+The ABI-v9 dependency-set workload separately acquires up to 32 mixed-tier
+objects per CTA, supports cancellation, stale generations, stale object
+versions, and duplicate coalescing, and resumes only after the complete set is
+ready. Global-load and TMA attention now consume the same common work and
+dependency records rather than duplicating acquisition metadata in a private
+task. This demonstrates kernel-neutral mechanics, not a production serving
+result.
 
 ### M6: TMA specialization
 
@@ -878,9 +889,11 @@ Gate: real network hardware, not loopback or emulation, for performance claims.
 Gate: reuse the same compiler/runtime contracts without kernel-name-specific
 logic.
 
-Status: the common `WorkPlan`, compiler lowering, runtime dependency table, and
-multi-object compute fixture meet the mechanism part of this gate without
-attention-specific code. Real MoE and ANNS application baselines remain open.
+Status: mechanism gate complete for MoE. The routed top-k workload acquires
+multiple versioned expert matrices through the common plan, performs matrix-
+vector products, mixes expert outputs, and checks every result against a CPU
+reference across mixed tiers. Production MoE model baselines and ANNS remain
+open.
 
 ## 21. Target repository layout
 
@@ -894,6 +907,7 @@ docs/
 include/nta/
     AcquireIR.h
     DeviceAPI.cuh
+    DeviceWorkPlan.h
     FlashInferAdapter.h
     HostRuntime.h
     RuntimeABI.h
@@ -906,7 +920,7 @@ lib/
     Plugin.cpp
 runtime/
     device/Acquire.cuh
-    host/{FlashInferAdapter,Runtime,WorkPlan}.cpp
+    host/{DeviceWorkPlan,FlashInferAdapter,Runtime,WorkPlan}.cpp
 tests/
     ir/{batched,dependency-set,reject-*}.ll
     flashinfer/differential_decode.py
@@ -914,6 +928,7 @@ tests/
 benchmarks/
     kv/{KvAcquire,KvAcquireKernel,KvTypes}
     attention/{PagedAttention,PagedAttentionKernel,PagedAttentionTypes}
+    moe/MoeExperts.cpp
     nvme/NvmeRead.cpp
 ```
 

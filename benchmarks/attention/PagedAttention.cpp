@@ -1,4 +1,5 @@
 #include "benchmarks/attention/PagedAttentionTypes.h"
+#include "nta/DeviceWorkPlan.h"
 #include "nta/FlashInferAdapter.h"
 #include "nta/HostRuntime.h"
 
@@ -127,16 +128,23 @@ public:
 
   void tile(CUstream stream, CUfunction function,
             nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
-            std::uint32_t taskCount, const __half *queries,
+            const nta::DeviceWorkPlan &plan, const __half *queries,
             AttentionTilePartial *partials) const {
     CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
     CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
+    CUdeviceptr workAddress =
+        reinterpret_cast<CUdeviceptr>(plan.workItems());
+    CUdeviceptr dependencyAddress =
+        reinterpret_cast<CUdeviceptr>(plan.dependencies());
     CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(queries);
     CUdeviceptr partialAddress = reinterpret_cast<CUdeviceptr>(partials);
+    std::uint32_t taskCount = plan.workItemCount();
     void *arguments[] = {
         &runtimeAddress,
         &taskAddress,
+        &workAddress,
         &taskCount,
+        &dependencyAddress,
         &queryAddress,
         &partialAddress,
     };
@@ -145,29 +153,30 @@ public:
   }
 
   void discover(CUstream stream, nta::abi::RuntimeView *runtime,
-                const AttentionTileTask *tasks, std::uint32_t taskCount,
-                const __half *queries, AttentionTilePartial *partials) const {
-    tile(stream, tile_, runtime, tasks, taskCount, queries, partials);
+                const AttentionTileTask *tasks,
+                const nta::DeviceWorkPlan &plan, const __half *queries,
+                AttentionTilePartial *partials) const {
+    tile(stream, tile_, runtime, tasks, plan, queries, partials);
   }
 
   void discoverTma(CUstream stream, nta::abi::RuntimeView *runtime,
-                   const AttentionTileTask *tasks, std::uint32_t taskCount,
-                   const __half *queries,
+                   const AttentionTileTask *tasks,
+                   const nta::DeviceWorkPlan &plan, const __half *queries,
                    AttentionTilePartial *partials) const {
-    tile(stream, tmaTile_, runtime, tasks, taskCount, queries, partials);
+    tile(stream, tmaTile_, runtime, tasks, plan, queries, partials);
   }
 
   void ready(CUstream stream, nta::abi::RuntimeView *runtime,
-             const AttentionTileTask *tasks, std::uint32_t taskCount,
+             const AttentionTileTask *tasks, const nta::DeviceWorkPlan &plan,
              const __half *queries, AttentionTilePartial *partials) const {
-    tile(stream, ready_, runtime, tasks, taskCount, queries, partials);
+    tile(stream, ready_, runtime, tasks, plan, queries, partials);
   }
 
   void readyTma(CUstream stream, nta::abi::RuntimeView *runtime,
-                const AttentionTileTask *tasks, std::uint32_t taskCount,
-                const __half *queries,
+                const AttentionTileTask *tasks,
+                const nta::DeviceWorkPlan &plan, const __half *queries,
                 AttentionTilePartial *partials) const {
-    tile(stream, tmaReady_, runtime, tasks, taskCount, queries, partials);
+    tile(stream, tmaReady_, runtime, tasks, plan, queries, partials);
   }
 
   void progress(CUstream stream, nta::abi::RuntimeView *runtime,
@@ -180,8 +189,8 @@ public:
   void publish(CUstream stream, nta::abi::RuntimeView *runtime,
                std::uint32_t continuationCount) const {
     const std::uint32_t threads = 256;
-    const std::uint32_t blocks =
-        (continuationCount + threads - 1U) / threads;
+    const std::uint32_t blocks = std::min(
+        32U, (continuationCount + threads - 1U) / threads);
     CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
     void *arguments[] = {&runtimeAddress, &continuationCount};
     launch(publish_, blocks, threads, stream, arguments, "publish ready");
@@ -598,19 +607,25 @@ int main(int argc, char **argv) {
     tasks.reserve(flashInferPlan.chunks.size());
     for (const nta::flashinfer::DecodeChunk &chunk : flashInferPlan.chunks) {
       tasks.push_back({
-          chunk.page.directBase,
-          chunk.page.directTensorMap,
-          chunk.page.objectId,
-          chunk.requestSlot,
-          chunk.generation,
-          chunk.page.objectSlot,
-          chunk.page.objectVersion,
-          chunk.page.bytes,
-          chunk.continuation,
+          chunk.physicalPage,
           chunk.requestIndex,
           chunk.tokenCount,
+          0,
       });
     }
+    if (flashInferPlan.work.workItems.size() != tasks.size()) {
+      throw std::logic_error(
+          "attention requires one common work item per physical-page tile");
+    }
+    for (const nta::abi::WorkItem &workItem :
+         flashInferPlan.work.workItems) {
+      if (workItem.dependencyCount != 1U) {
+        throw std::logic_error(
+            "attention requires exactly one dependency per physical-page tile");
+      }
+    }
+    nta::DeviceWorkPlan devicePlan =
+        runtime.uploadWorkPlan(flashInferPlan.work);
     const std::vector<float> expected =
         referenceAttention(requests, tasks, queries, pages);
 
@@ -655,10 +670,10 @@ int main(int argc, char **argv) {
               "clear attention output");
     if (options.copyMode == CopyMode::Tma) {
       kernels.discoverTma(driverStream, runtime.deviceView(), deviceTasks.get(),
-                          taskCount, deviceQueries.get(), devicePartials.get());
+                          devicePlan, deviceQueries.get(), devicePartials.get());
     } else {
       kernels.discover(driverStream, runtime.deviceView(), deviceTasks.get(),
-                       taskCount, deviceQueries.get(), devicePartials.get());
+                       devicePlan, deviceQueries.get(), devicePartials.get());
     }
     if (options.mode == Mode::HostStaged || options.mode == Mode::Mixed) {
       for (std::uint32_t pass = 0; pass < options.progressPasses; ++pass) {
@@ -666,11 +681,11 @@ int main(int argc, char **argv) {
         kernels.publish(driverStream, runtime.deviceView(), taskCount);
         if (options.copyMode == CopyMode::Tma) {
           kernels.readyTma(driverStream, runtime.deviceView(), deviceTasks.get(),
-                           taskCount, deviceQueries.get(),
+                           devicePlan, deviceQueries.get(),
                            devicePartials.get());
         } else {
           kernels.ready(driverStream, runtime.deviceView(), deviceTasks.get(),
-                        taskCount, deviceQueries.get(), devicePartials.get());
+                        devicePlan, deviceQueries.get(), devicePartials.get());
         }
       }
     }

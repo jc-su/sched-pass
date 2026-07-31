@@ -59,10 +59,12 @@ popReadyContinuation(nta::abi::RuntimeView *runtime) {
 __device__ __forceinline__ void
 computeAttentionTile(nta::abi::RuntimeView *runtime,
                      const AttentionTileTask &task,
-                     std::uint32_t taskIndex, const __half *page,
+                     std::uint32_t taskIndex,
+                     std::uint32_t continuationIndex,
+                     const __half *page,
                      const __half *queries, AttentionTilePartial *partials) {
   nta::abi::Continuation &continuation =
-      runtime->continuations[task.continuation];
+      runtime->continuations[continuationIndex];
   const __half *keys = page;
   const __half *values =
       page + AttentionPageTokens * AttentionHeadDimension;
@@ -114,33 +116,56 @@ computeAttentionTile(nta::abi::RuntimeView *runtime,
 
 __device__ __forceinline__ void
 runAttentionTile(nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
+                 const nta::abi::WorkItem *workItems,
+                 const nta::abi::AcquireRequirement *requirements,
                  std::uint32_t taskIndex, const __half *queries,
                  AttentionTilePartial *partials) {
   const AttentionTileTask task = tasks[taskIndex];
-  __nta_bind_request(task.requestSlot, task.generation);
-  void *address = __nta_acquire_marker(
-      runtime, reinterpret_cast<const void *>(task.directBase), task.objectSlot,
-      task.objectId, task.objectVersion, 0, task.bytes, task.continuation);
-  if (address == nullptr) {
-    __nta_defer_marker(runtime, task.continuation);
+  const nta::abi::WorkItem work = workItems[taskIndex];
+  const nta::abi::AcquireRequirement *dependencies =
+      requirements + work.dependencyBegin;
+  __nta_bind_request(work.requestSlot, work.generation);
+  const bool ready = __nta_acquire_set_marker(
+      runtime, dependencies, work.dependencyCount, work.directDependencyCount,
+      work.continuation);
+  if (!ready) {
+    __nta_defer_marker(runtime, work.continuation);
     return;
   }
-  computeAttentionTile(runtime, task, taskIndex,
-                       static_cast<const __half *>(address), queries, partials);
+  const auto *page = static_cast<const __half *>(
+      nta_requirement_address(runtime, dependencies));
+  if (page == nullptr) {
+    nta::device::failContinuation(runtime, work.continuation,
+                                  nta::abi::ContinuationState::Failed);
+    return;
+  }
+  computeAttentionTile(runtime, task, taskIndex, work.continuation, page,
+                       queries, partials);
 }
 
 __device__ __forceinline__ void runAttentionTileTma(
     nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
+    const nta::abi::WorkItem *workItems,
+    const nta::abi::AcquireRequirement *requirements,
     std::uint32_t taskIndex, const __half *queries,
     AttentionTilePartial *partials) {
   const AttentionTileTask task = tasks[taskIndex];
-  __nta_bind_request(task.requestSlot, task.generation);
-  void *descriptor = __nta_acquire_tensor_map_marker(
-      runtime, reinterpret_cast<const void *>(task.directTensorMap),
-      task.objectSlot, task.objectId, task.objectVersion, 0, task.bytes,
-      task.continuation);
+  const nta::abi::WorkItem work = workItems[taskIndex];
+  const nta::abi::AcquireRequirement *dependencies =
+      requirements + work.dependencyBegin;
+  __nta_bind_request(work.requestSlot, work.generation);
+  const bool ready = __nta_acquire_set_marker(
+      runtime, dependencies, work.dependencyCount, work.directDependencyCount,
+      work.continuation);
+  if (!ready) {
+    __nta_defer_marker(runtime, work.continuation);
+    return;
+  }
+  const void *descriptor =
+      nta_requirement_tensor_map(runtime, dependencies);
   if (descriptor == nullptr) {
-    __nta_defer_marker(runtime, task.continuation);
+    nta::device::failContinuation(runtime, work.continuation,
+                                  nta::abi::ContinuationState::Failed);
     return;
   }
 
@@ -165,25 +190,29 @@ __device__ __forceinline__ void runAttentionTileTma(
     token = barrier.arrive();
   }
   barrier.wait(static_cast<decltype(token) &&>(token));
-  computeAttentionTile(runtime, task, taskIndex, page, queries, partials);
+  computeAttentionTile(runtime, task, taskIndex, work.continuation, page,
+                       queries, partials);
 }
 
 } // namespace
 
 extern "C" __global__ void nta_attention_tile_kernel(
     nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
-    std::uint32_t taskCount, const __half *queries,
+    const nta::abi::WorkItem *workItems, std::uint32_t taskCount,
+    const nta::abi::AcquireRequirement *requirements, const __half *queries,
     AttentionTilePartial *partials) {
   const std::uint32_t taskIndex = blockIdx.x;
   if (blockDim.x != AttentionHeadDimension || taskIndex >= taskCount) {
     return;
   }
-  runAttentionTile(runtime, tasks, taskIndex, queries, partials);
+  runAttentionTile(runtime, tasks, workItems, requirements, taskIndex, queries,
+                   partials);
 }
 
 extern "C" __global__ void nta_attention_ready_kernel(
     nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
-    std::uint32_t taskCount, const __half *queries,
+    const nta::abi::WorkItem *workItems, std::uint32_t taskCount,
+    const nta::abi::AcquireRequirement *requirements, const __half *queries,
     AttentionTilePartial *partials) {
   if (blockDim.x != AttentionHeadDimension) {
     return;
@@ -195,24 +224,28 @@ extern "C" __global__ void nta_attention_ready_kernel(
   const std::uint32_t taskIndex =
       runtime->continuations[continuation].logicalTile;
   if (taskIndex < taskCount) {
-    runAttentionTile(runtime, tasks, taskIndex, queries, partials);
+    runAttentionTile(runtime, tasks, workItems, requirements, taskIndex,
+                     queries, partials);
   }
 }
 
 extern "C" __global__ void nta_attention_tma_tile_kernel(
     nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
-    std::uint32_t taskCount, const __half *queries,
+    const nta::abi::WorkItem *workItems, std::uint32_t taskCount,
+    const nta::abi::AcquireRequirement *requirements, const __half *queries,
     AttentionTilePartial *partials) {
   const std::uint32_t taskIndex = blockIdx.x;
   if (blockDim.x != AttentionHeadDimension || taskIndex >= taskCount) {
     return;
   }
-  runAttentionTileTma(runtime, tasks, taskIndex, queries, partials);
+  runAttentionTileTma(runtime, tasks, workItems, requirements, taskIndex,
+                      queries, partials);
 }
 
 extern "C" __global__ void nta_attention_tma_ready_kernel(
     nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
-    std::uint32_t taskCount, const __half *queries,
+    const nta::abi::WorkItem *workItems, std::uint32_t taskCount,
+    const nta::abi::AcquireRequirement *requirements, const __half *queries,
     AttentionTilePartial *partials) {
   if (blockDim.x != AttentionHeadDimension) {
     return;
@@ -224,7 +257,8 @@ extern "C" __global__ void nta_attention_tma_ready_kernel(
   const std::uint32_t taskIndex =
       runtime->continuations[continuation].logicalTile;
   if (taskIndex < taskCount) {
-    runAttentionTileTma(runtime, tasks, taskIndex, queries, partials);
+    runAttentionTileTma(runtime, tasks, workItems, requirements, taskIndex,
+                        queries, partials);
   }
 }
 

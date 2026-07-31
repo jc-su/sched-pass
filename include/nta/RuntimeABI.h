@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 8;
+inline constexpr std::uint32_t Version = 9;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 5;
 
@@ -159,6 +159,20 @@ struct alignas(16) ContinuationDependency {
 };
 static_assert(sizeof(ContinuationDependency) == 16);
 
+// Canonical per-CTA work descriptor shared by every frontend and device
+// kernel. Dependency records live in one batch-level contiguous array.
+struct alignas(32) WorkItem {
+  std::uint32_t requestIndex;
+  std::uint32_t requestSlot;
+  std::uint32_t generation;
+  std::uint32_t logicalWork;
+  std::uint32_t dependencyBegin;
+  std::uint32_t dependencyCount;
+  std::uint32_t directDependencyCount;
+  std::uint32_t continuation;
+};
+static_assert(sizeof(WorkItem) == 32);
+
 struct alignas(32) Continuation {
   std::uint64_t requestId;
   std::uint32_t requestSlot;
@@ -234,6 +248,8 @@ struct alignas(64) RuntimeView {
   std::uint32_t *readyContinuations;
   std::uint32_t *readyCount;
   std::uint32_t *readyHead;
+  std::uint32_t *pendingContinuations;
+  std::uint32_t *pendingCount;
   std::uint32_t requestCapacity;
   std::uint32_t tenantCapacity;
   std::uint32_t objectCapacity;
@@ -257,11 +273,13 @@ static_assert(std::is_standard_layout_v<IntentSlot>);
 static_assert(std::is_standard_layout_v<IntentPool>);
 static_assert(std::is_standard_layout_v<AcquireRequirement>);
 static_assert(std::is_standard_layout_v<ContinuationDependency>);
+static_assert(std::is_standard_layout_v<WorkItem>);
 static_assert(std::is_standard_layout_v<Continuation>);
 static_assert(std::is_standard_layout_v<NvmeQueueView>);
 static_assert(std::is_standard_layout_v<RuntimeView>);
 static_assert(std::is_trivially_copyable_v<AcquireRequirement>);
 static_assert(std::is_trivially_copyable_v<ContinuationDependency>);
+static_assert(std::is_trivially_copyable_v<WorkItem>);
 static_assert(std::is_trivially_copyable_v<RuntimeView>);
 
 } // namespace nta::abi

@@ -2,9 +2,9 @@
 
 Date: 2026-07-31
 
-This file records reproducible mechanism evidence. It is not an end-to-end
-serving result and does not establish production readiness or an OSDI-level
-claim. Open gates are listed explicitly at the end.
+This record supports a locally validated mechanism prototype. It does not
+establish production readiness, an end-to-end serving result, or an OSDI-level
+evaluation. The missing evidence is listed explicitly below.
 
 ## Environment
 
@@ -23,44 +23,67 @@ layout is incompatible with the current Clang CUDA wrapper.
 
 ## Reproduction
 
-Run the complete local mechanism suite:
-
 ```bash
 NTA_SANITIZE=1 ./scripts/validate-local.sh
+./scripts/measure-direct-overhead.sh
 ```
 
-This builds the pass and runtime, runs CTest, evaluates all direct/staged and
-global-load/TMA attention combinations, emits the PTXAS resource report, and
-runs memcheck, racecheck, and synccheck. Generated evidence is written under
-`results/`, which is excluded from source control.
+The first command builds the pass/runtime, runs CTest, evaluates global-load
+and TMA attention across placements, runs the MoE workload, emits PTXAS reports,
+and executes memcheck, racecheck, and synccheck. The second runs alternating
+process-level baseline/mechanism trials and computes Student-t intervals.
+Generated evidence is under `results/` and is excluded from source control.
 
-## Compiler And Runtime Correctness
+## Correctness Gates
 
-`ctest --test-dir build --output-on-failure` passes eleven tests:
+`ctest --test-dir build --output-on-failure` passes 14 tests:
 
-1. FlashInfer CSR-to-common-work-plan validation, including grouped pages and
-   malformed metadata;
-2. engine-neutral work-plan construction and bounded dependency validation;
-3. byte-address, tensor-map, and dependency-set LLVM lowering plus rejected
-   unsafe IR;
-4. host/device ABI v8 layout;
-5. runtime allocation, corrected object/replica capacities, dependency storage,
-   replicated-object publication, tensor-map binding, and cancellation state;
-6. mixed HBM/mapped/staged single-object acquisition with duplicate coalescing,
-   stale generations, cancellation, and repeated intent-slot reuse;
-7. a three-object-per-CTA mixed-tier dependency-set workload;
-8. the matching direct-address baseline kernel;
-9. staged split-K paged attention with one-page request credit;
-10. the same staged attention path using hardware TMA; and
-11. a differential GPU run against FlashInfer 0.6.12.
+1. FlashInfer CSR-to-common-plan validation, including grouped pages and bad
+   metadata;
+2. engine-neutral plan construction and bounded dependency validation;
+3. LLVM byte-address, tensor-map, and dependency-set lowering, including
+   rejection of live-state, token, missing-binding, non-inlined-helper,
+   lane-divergent control, and lane-divergent operand cases;
+4. host/device ABI v9 layout;
+5. runtime allocation, object/replica capacities, cancellation, reusable
+   pinned/async device-plan upload, and runtime binding validation;
+6. mixed-tier acquisition with duplicate coalescing, stale generations,
+   cancellation, and repeated intent-slot reuse;
+7. a three-object-per-CTA mixed-tier dependency set;
+8. stale object-version failure without output publication;
+9. a 4,096-CTA all-direct scale case with `pending=0`;
+10. routed top-2 MoE expert matrices across mixed tiers;
+11. the matching direct-address numerical baseline;
+12. staged split-K paged attention through the common work plan;
+13. the same common-plan attention path using hardware TMA; and
+14. differential output validation against FlashInfer 0.6.12.
 
-The lowered modules contain no bind/acquire/defer marker calls. Tensor-map sites
-carry `!nta.acquire` metadata identifying ABI v8 and either the `tensor-map` or
-`dependency-set` flavor.
-The direct branch does not enter the intent pool. NVMe progress uses one warp,
-bounds submission and completion work, and has no CTA barrier.
+The pass now proves a canonical finite defer edge and CTA collectivity. Markers
+must be inlined into a GPU kernel entry, where the CTA analysis treats kernel
+arguments, `blockIdx`, and block/grid dimensions as CTA-uniform. It rejects
+non-inlined helpers and control or marker operands derived from `threadIdx`,
+lane/warp identity, atomics, volatile loads, local allocation, or unknown
+calls. Lowered modules contain no bind/acquire/defer markers and carry ABI-v9
+`!nta.acquire` metadata.
 
-The mixed TMA attention run reports:
+Attention global-load and TMA kernels, the generic dependency-set kernel, and
+the MoE kernel all consume the same `abi::WorkItem` and
+`abi::AcquireRequirement` arrays. `DeviceWorkPlan` supports fixed-capacity
+reuse, pinned staging, stream-ordered asynchronous updates, and explicit
+cross-stream waits. Attention-only side metadata contains token-count and
+request-index fields, not a duplicate acquisition binding.
+
+Readiness publication scans the bounded pending index rather than the entire
+continuation directory. The 4,096-CTA resident test confirms that an all-direct
+epoch creates no pending entries. Publication uses at most 32 finite CTAs, no
+CTA barrier, and a grid-stride loop over actual pending entries.
+
+A separate CUDA-disabled build against the supported LLVM 22 installation
+passes all four applicable adapter, plan, IR, and ABI tests.
+
+## Sanitizers And Resources
+
+The latest mixed-tier TMA attention, dependency-set, and MoE runs report:
 
 ```text
 memcheck:  ERROR SUMMARY: 0 errors
@@ -68,140 +91,119 @@ racecheck: 0 hazards displayed (0 errors, 0 warnings)
 synccheck: ERROR SUMMARY: 0 errors
 ```
 
-The ABI-v8 mixed-tier dependency-set workload also reports zero memcheck errors,
-zero racecheck hazards, and zero synccheck errors. Its acquisition path adds no
-CTA barrier; the one barrier reported for the fixture kernel belongs to its
-numerical reduction. PTXAS reports 62/64 registers, no spills, and 128/132 bytes
-of shared memory for initial/ready kernels; the direct baseline uses 32 registers
-and 128 bytes.
+PTXAS reports no spills. Current key resources are:
 
-One local 96-CTA, four-dependency, 64-KiB-per-object run produced:
-
-| Placement | Graph ms | Logical GiB/s | Verification failures |
+| Kernel | Registers | Shared bytes | Barriers |
 | --- | ---: | ---: | ---: |
-| HBM | 0.061 | 382.43 | 0 |
-| mapped CPU DRAM | 1.110 | 21.11 | 0 |
-| mixed tiers | 0.422 | 55.60 | 0 |
+| dependency initial / ready | 62 / 62 | 128 / 132 | 1 / 1 |
+| direct numerical baseline | 32 | 128 | 1 |
+| MoE initial / ready | 64 / 62 | 0 / 4 | 1 / 1 |
+| attention global initial / ready | 62 / 62 | 576 / 580 | 1 / 1 |
+| attention TMA initial / ready | 62 / 62 | 8,840 / 8,840 | 1 / 1 |
+| pending readiness publication | 24 | 0 | 0 |
+| host staging progress | 26 | 24 | 1 |
+| NVMe progress | 50 | 0 | 0 |
 
-These are mechanism samples, not controlled confidence intervals. A separate
-mixed cancellation/stale-generation run completed with 12 cancelled or stale
-work items and zero verification failures.
+The barriers in dependency, MoE, and attention kernels belong to numerical
+cooperation. Acquisition returns before those barriers are reached. The TMA
+barrier is initialized only after the common dependency set is ready and a
+valid direct or staged tensor-map descriptor resolves.
 
-For a direct-path comparison, ten alternating process-level trials ran 200
-captured-graph iterations each. Both variants used the same graph topology and
-four-object numerical work; the baseline bypassed only request/acquisition
-logic:
+## Direct-Path Cost
+
+Ten alternating process-level trials ran 200 captured-graph iterations each.
+Both variants used the same graph topology and four-object numerical work; the
+baseline bypassed request/acquisition logic only.
 
 | Variant | Mean logical GiB/s | 95% t interval |
 | --- | ---: | ---: |
-| direct-address baseline | 397.27 | +/- 0.28 |
-| ABI-v8 dependency set | 383.82 | +/- 0.28 |
+| direct-address baseline | 394.46 | +/- 0.07 |
+| ABI-v9 dependency set | 381.30 | +/- 0.04 |
 
-The paired throughput reduction was 3.39% +/- 0.08 percentage points. This is a
-measured, nonzero mechanism cost, so the production direct-path gate remains
-open. GPU clocks were not fixed, and this microbenchmark is not a serving
-kernel or end-to-end SLO result.
+The paired throughput reduction is **3.33% +/- 0.02 percentage points**. This
+is a real, nonzero mechanism cost. GPU clocks were not fixed, this is a
+microbenchmark rather than an untouched production kernel, and the interval
+does not include machine-to-machine variation.
 
 ## Paged Attention
 
-The workload uses FP16 query/K/V data, head dimension 128, 16-token KV pages,
-one CTA per request-owned page, FP32 partial softmax state, and a deterministic
-split-K reduction. Requests have heterogeneous page counts and final-page token
-counts. A CPU reference checks every output element.
+The workload uses FP16 Q/K/V, head dimension 128, 16-token pages, one CTA per
+request-owned page, FP32 partial softmax state, and deterministic split-K
+reduction. It forms the common plan from FlashInfer's public `kv_indptr`,
+`kv_indices`, and `last_page_len`, then uses the same dependency records for
+global loads or TMA.
 
-The workload is formed from FlashInfer's public `kv_indptr`, `kv_indices`, and
-`last_page_len` representation. Its page CTAs produce normalized `V` plus base-2
-`LSE`, and the reduction compiles FlashInfer's `state_t` from the installed
-headers. The differential gate uses 7 heterogeneous requests, 23 physical pages,
-reversed physical-page indices, and host-staged NTA acquisition. Against a real
-`BatchDecodeWithPagedKVCacheWrapper`, it reports:
+The differential gate covers 7 heterogeneous requests, 23 physical pages,
+non-identity page indices, and staged acquisition:
 
 ```text
 flashinfer_version=0.6.12 requests=7 physical_pages=23
 max_abs_error=2.71425e-05 mean_abs_error=3.2057e-06 matched=1
 ```
 
-This validates layout and numerical-state compatibility, not execution of NTA
-deferral inside FlashInfer's optimized attention CTA.
+This validates layout and numerical-state compatibility. It does not execute
+NTA deferral inside FlashInfer's optimized CTA.
 
-For 32 requests, 299 pages, and 50 graph iterations, one local run produced:
+One latest-code 8-request, 60-page, five-iteration mechanism sample was:
 
 | Source | Consumer | Graph ms | Logical GiB/s | Max abs error |
 | --- | --- | ---: | ---: | ---: |
-| HBM | global loads | 0.022 | 105.31 | 2.61e-8 |
-| HBM | TMA | 0.019 | 123.23 | 2.61e-8 |
-| mapped CPU DRAM | global loads | 0.067 | 34.25 | 2.61e-8 |
-| mapped CPU DRAM | TMA | 0.083 | 27.45 | 2.61e-8 |
-| staged CPU DRAM | global loads | 0.326 | 7.00 | 2.61e-8 |
-| staged CPU DRAM | TMA | 0.318 | 7.18 | 2.61e-8 |
-| mixed | global loads | 0.152 | 14.99 | 2.61e-8 |
-| mixed | TMA | 0.208 | 10.97 | 2.61e-8 |
+| HBM | global loads | 0.024 | 19.30 | 2.42e-8 |
+| HBM | TMA | 0.021 | 22.03 | 2.42e-8 |
+| mapped CPU DRAM | global loads | 0.043 | 10.62 | 2.42e-8 |
+| mapped CPU DRAM | TMA | 0.036 | 12.84 | 2.42e-8 |
+| staged CPU DRAM | global loads | 0.105 | 4.36 | 2.42e-8 |
+| staged CPU DRAM | TMA | 0.109 | 4.22 | 2.42e-8 |
+| mixed | global loads | 0.085 | 5.39 | 2.42e-8 |
+| mixed | TMA | 0.074 | 6.21 | 2.42e-8 |
 
-These are single-run mechanism numbers, not confidence intervals. `logical
-GiB/s` counts full KV pages consumed by tile CTAs and is not raw PCIe or DRAM
-bandwidth. TMA is beneficial for the resident case in this run and is not
-universally beneficial, especially for mapped host memory. Publication results
-must use isolated sequential trials, confidence intervals, and controlled GPU
-clocks.
+These are smoke-test mechanism numbers, not controlled performance results.
 
-PTXAS reports no spills:
+## MoE Generality
 
-| Kernel | Registers | Shared bytes | Barriers |
-| --- | ---: | ---: | ---: |
-| global attention tile | 50 | 576 | 1 |
-| global ready tile | 52 | 580 | 1 |
-| TMA attention tile | 60 | 8,840 | 1 |
-| TMA ready tile | 60 | 8,840 | 1 |
-| host staging progress | 26 | 24 | 1 |
-| NVMe progress | 50 | 0 | 0 |
-
-The one barrier in the global attention kernel belongs to its reduction. The
-TMA barrier is initialized only after acquisition returns a valid descriptor.
+The MoE gate routes each token to two expert matrices, acquires both through
+the common plan, performs real matrix-vector products, mixes routed outputs,
+and checks every element against a CPU reference. A 64-token, 16-expert,
+hidden-size-128 mixed-tier run completed at 0.189 ms per graph, 41.23 logical
+GiB/s, with five staged expert transfers and zero numerical failures. This
+closes the synthetic-only generality gap, but it is not a production MoE model
+or serving baseline.
 
 ## GPU-Initiated NVMe
 
-The tested controller is a KIOXIA CD8P E3.S PCIe 5.0 x4 device. The bootstrap
-driver creates one depth-64 I/O SQ/CQ, maps queue and doorbell memory, and
-registers either mapped CPU DRAM or CUDA HBM exported through DMA-BUF. One
-finite CUDA graph performs discovery, bounded GPU SQE/PRP construction, GPU
-doorbells, bounded GPU CQ handling, ready publication, and checksum work. The
-CPU does not submit or complete commands on the loaded path.
+Earlier hardware validation used a dedicated KIOXIA CD8P controller, one
+depth-64 SQ/CQ, GPU-built READ SQEs/PRPs, GPU MMIO doorbells, bounded GPU CQ
+handling, and either mapped DRAM or DMA-BUF HBM destinations. Sixteen
+independent 64-KiB reads completed with matching checksums:
 
-Earlier hardware validation used 16 independent 64 KiB reads, 10 measured
-graph launches, and 128 finite progress/resume pairs. All 176 expected commands
-completed and every checksum matched the block-device reference:
-
-| Destination | Graph ms | Logical MiB/s | Failed CQEs | Verification failures |
+| Destination | Graph ms | Logical MiB/s | Failed CQEs | Failures |
 | --- | ---: | ---: | ---: | ---: |
 | mapped CPU DRAM | 0.743 | 1,345.90 | 0 | 0 |
 | DMA-BUF HBM | 0.679 | 1,473.54 | 0 | 0 |
 
-The controller is currently owned by the host's `vmem_sw` consumer and has been
-restored to its original driver. The safety helper refuses to rebind it while
-that consumer is active, so ABI v8 and the latest dependency-set changes have not
-been revalidated on NVMe hardware. This is a required regression gate.
+That run predates ABI v9. The controller is currently owned by the host's
+`vmem_sw` consumer, and the safety helper correctly refuses to rebind it.
+Latest-code NVMe evidence therefore remains open.
 
-## Production Gates
+## Open Production And Paper Gates
 
-The following are not validated:
-
-- NTA deferral inside FlashInfer's optimized prefill/decode CTAs;
-- SGLang and vLLM request lifecycle, KV-manager, and attention-backend
-  integration;
-- TTFT, TPOT, p50/p99 latency, SLO attainment, and serving goodput;
-- statistical direct-path overhead against an untouched production kernel;
-- automatic compiler recognition of production load/cp.async/TMA address
-  cones instead of explicit frontend markers;
-- host-staging global priority order, NVMe weighted-fairness hardware
-  validation, and starvation aging;
+- NTA deferral inside optimized production prefill and decode CTAs;
+- vLLM and SGLang lifecycle, KV-manager, cancellation, and CUDA-graph adapters;
+- TTFT, TPOT, p50/p99, SLO attainment, serving goodput, CPU use, and SM tax;
+- direct-path comparison against untouched production kernels with controlled
+  clocks and multiple machines;
+- automatic recognition of production load/`cp.async`/TMA address cones rather
+  than explicit frontend markers;
+- host-staging global priority order, NVMe weighted-fairness hardware results,
+  and starvation aging;
 - GPU-initiated RDMA submission/completion on a real RNIC;
-- latest-ABI NVMe regression, timeout/reset recovery, multiple queues, and
+- ABI-v9 NVMe regression, timeout/reset recovery, multiple queues, and
   multi-tenant security isolation;
-- MoE or ANNS generality workloads; and
-- literature-complete novelty or a paper-quality baseline/ablation matrix.
+- production MoE and optional ANNS baselines; and
+- literature-complete novelty analysis plus a paper-quality baseline and
+  ablation matrix.
 
 The installed vLLM 0.13.0 wheel requires PyTorch 2.9.0, while this environment
-has PyTorch 2.11.0+cu130. Its CUDA extension fails to load with an unresolved
-`c10_cuda_check_implementation` symbol. A matched container or rebuilt vLLM is
-required before serving experiments. This machine also has no Mellanox/RDMA
-device, so an RDMA implementation cannot be honestly validated here.
+has PyTorch 2.11.0+cu130; its CUDA extension fails to load with an unresolved
+symbol. A matched container or rebuild is required. This machine has no
+Mellanox/RDMA device. Those are external testbed blockers, not completed gates.

@@ -23,8 +23,9 @@ workloads:
 
 - per-CTA request/generation binding in batched kernels;
 - compiler proof of a canonical finite-kernel deferral boundary;
-- an engine-neutral `WorkPlan` model and ABI-v8 bounded dependency sets, so one
+- an engine-neutral `WorkPlan` model and ABI-v9 bounded dependency sets, so one
   continuation can wait for several pages, experts, or object shards;
+- one reusable device-plan allocation with pinned, asynchronous batch updates;
 - direct HBM and mapped-CPU-DRAM paths with no queue or atomic operation;
 - staged CPU-DRAM acquisition issued and completed by finite GPU CTAs;
 - direct NVMe reads into either DMA-BUF-registered HBM or registered mapped
@@ -35,7 +36,10 @@ workloads:
   admission;
 - a backend-neutral directory with bounded per-object physical replicas;
 - a numerically checked split-K paged-attention workload with heterogeneous
-  request lengths;
+  request lengths that consumes the common work/dependency ABI for both global
+  loads and TMA;
+- a numerically checked top-k MoE workload using the same plan, compiler pass,
+  tier directory, progress path, and ready scheduling;
 - an optional adapter from FlashInfer's public paged-KV CSR tables into the
   common work model, FlashInfer-native `(V, LSE)` cascade state, and a
   differential GPU correctness gate against FlashInfer 0.6.12;
@@ -52,8 +56,10 @@ FlashInfer compatibility layer does not yet place deferral inside
 FlashInfer's optimized FMHA CTA, and no vLLM/SGLang request-lifecycle adapter is
 present. The compiler currently consumes explicit acquisition markers; automatic
 recognition of arbitrary production load/cp.async/TMA address cones is an open
-gate. There is no placeholder RDMA backend. NVMe is implemented against an isolated
-KIOXIA CD8P controller and tested with read-only commands. The previous
+gate. The pass does prove CTA-uniform control and operands for explicit sites;
+lane-divergent collective calls are rejected. There is no placeholder RDMA
+backend. NVMe is implemented against an isolated KIOXIA CD8P controller and
+tested with read-only commands. The previous
 scheduling prototype remains on `main` at commit `4789f16`.
 
 ## Build and test
@@ -63,6 +69,7 @@ matched distribution LLVM/Clang 22 and CUDA 12.9:
 
 ```bash
 cmake -S . -B build -GNinja \
+  -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
   -DNTA_CLANG_CUDA=/usr/bin/clang++-22 \
   -DCUDAToolkit_ROOT=/usr/local/cuda-12.9 \
@@ -92,6 +99,14 @@ Use `--baseline=1` with a direct placement to run the identical multi-object
 numerical kernel without request/acquisition logic for resident-path overhead
 measurement.
 
+Run the engine-neutral MoE generality workload:
+
+```bash
+./build/nta-moe-bench \
+  --mode=mixed --tokens=64 --experts=16 --top-k=2 --hidden=128 \
+  --iterations=50
+```
+
 Run the split-K attention workload using hardware TMA after external staging:
 
 ```bash
@@ -108,6 +123,8 @@ Run the split-K attention workload using hardware TMA after external staging:
 `scripts/validate-local.sh` reproduces the build, tests, global-load/TMA
 placement matrix, and PTX resource report. Set `NTA_SANITIZE=1` to include
 memcheck, racecheck, and synccheck.
+`scripts/measure-direct-overhead.sh` runs alternating process-level trials and
+reports paired 95% t intervals.
 
 When `flashinfer-python` is installed, CMake locates its headers and builds the
 attention reduction with `flashinfer::state_t`; CTest also enables

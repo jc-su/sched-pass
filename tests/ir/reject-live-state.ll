@@ -3,7 +3,7 @@ declare ptr @__nta_acquire_marker(ptr, ptr, i32, i64, i32, i64, i32, i32)
 declare void @__nta_defer_marker(ptr, i32)
 declare void @side_effect()
 
-define void @unsafe_pending_edge(ptr %runtime, i32 %slot, i32 %generation) {
+define ptx_kernel void @unsafe_pending_edge(ptr %runtime, i32 %slot, i32 %generation) {
 entry:
   call void @__nta_bind_request(i32 %slot, i32 %generation)
   %address = call ptr @__nta_acquire_marker(

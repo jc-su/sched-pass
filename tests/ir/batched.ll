@@ -2,7 +2,7 @@ declare void @__nta_bind_request(i32, i32)
 declare ptr @__nta_acquire_marker(ptr, ptr, i32, i64, i32, i64, i32, i32)
 declare void @__nta_defer_marker(ptr, i32)
 
-define void @batched_tile(ptr %runtime, ptr %direct, ptr %output,
+define ptx_kernel void @batched_tile(ptr %runtime, ptr %direct, ptr %output,
                           i32 %request.slot, i32 %generation,
                           i32 %object.slot, i64 %object.id,
                           i32 %object.version, i64 %offset,

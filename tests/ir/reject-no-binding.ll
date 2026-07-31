@@ -1,7 +1,7 @@
 declare ptr @__nta_acquire_marker(ptr, ptr, i32, i64, i32, i64, i32, i32)
 declare void @__nta_defer_marker(ptr, i32)
 
-define void @missing_request_binding(ptr %runtime, ptr %output) {
+define ptx_kernel void @missing_request_binding(ptr %runtime, ptr %output) {
 entry:
   %address = call ptr @__nta_acquire_marker(
       ptr %runtime, ptr null, i32 0, i64 42, i32 1, i64 0, i32 4, i32 0)

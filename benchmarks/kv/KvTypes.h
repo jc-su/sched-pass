@@ -19,16 +19,4 @@ struct alignas(64) TileTask {
 };
 static_assert(sizeof(TileTask) == 64);
 
-struct alignas(32) WorkTask {
-  std::uint32_t requestSlot;
-  std::uint32_t generation;
-  std::uint32_t dependencyBegin;
-  std::uint32_t dependencyCount;
-  std::uint32_t directDependencyCount;
-  std::uint32_t continuation;
-  std::uint32_t logicalTile;
-  std::uint32_t reserved;
-};
-static_assert(sizeof(WorkTask) == 32);
-
 } // namespace nta::benchmark

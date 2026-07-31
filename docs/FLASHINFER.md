@@ -71,13 +71,19 @@ CTA has accumulated softmax state or entered a barrier protocol. Polling inside
 the attention CTA is also excluded: storage and network latency can outlive a
 finite CTA by orders of magnitude.
 
-A FlashInfer chunk may span several pages. The implemented ABI-v8 adapter can
+A FlashInfer chunk may span several pages. The implemented ABI-v9 adapter can
 group a configured number of pages into one continuation with a bounded
 dependency segment. Runtime publication scans the complete segment and validates
 object identity, version, and readiness before enqueueing that continuation.
 For already resident pages, the set hook bypasses the intent queue and the
 original pointer and data-movement path remain unchanged. The optimized
 FlashInfer CTA has not yet been modified to consume that work item.
+
+The mechanism attention fixture now uploads the adapter's common work plan and
+uses those exact `WorkItem` and `AcquireRequirement` records in both its global-
+load and TMA CTAs. Its private task record carries only attention math metadata.
+This removes a prior integration-only duplicate binding, but it still does not
+place the hook inside FlashInfer's optimized CTA.
 
 This hook should be a small upstreamable template extension, such as an optional
 `begin_kv_chunk(...)` policy on the attention variant. NTA's variant emits the

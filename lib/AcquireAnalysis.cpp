@@ -3,9 +3,11 @@
 #include "nta/AcquireIR.h"
 
 #include "llvm/IR/CFG.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/ADT/DenseMap.h"
 
 #include <optional>
 #include <string>
@@ -103,6 +105,157 @@ CallInst *nearestDominatingBinding(CallInst &site,
 bool isNull(Value *value) {
   auto *constant = dyn_cast<Constant>(value);
   return constant != nullptr && constant->isNullValue();
+}
+
+// NTA markers are CTA collectives. LLVM's generic GPU uniformity analysis is
+// intentionally thread-level and classifies blockIdx as divergent, so use the
+// narrower contract needed here: kernel arguments and block/grid dimensions
+// are CTA-uniform; thread, lane, and warp identities are not.
+class CtaUniformity {
+public:
+  bool isUniform(Value *value) {
+    if (isa<Constant>(value) || isa<Argument>(value) || isa<GlobalValue>(value)) {
+      return true;
+    }
+    auto *instruction = dyn_cast<Instruction>(value);
+    if (instruction == nullptr) {
+      return false;
+    }
+    const auto found = states_.find(instruction);
+    if (found != states_.end()) {
+      // A recursive SSA edge is provisionally uniform. Any divergent seed in
+      // the cycle still propagates when the outer query completes.
+      return found->second != Divergent;
+    }
+    states_[instruction] = Visiting;
+    const bool uniform = classify(*instruction);
+    states_[instruction] = uniform ? Uniform : Divergent;
+    return uniform;
+  }
+
+private:
+  enum State : unsigned { Visiting, Uniform, Divergent };
+
+  bool uniformOperands(Instruction &instruction) {
+    for (Use &operand : instruction.operands()) {
+      if (!isUniform(operand.get())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool classifyCall(CallBase &call) {
+    Function *callee = call.getCalledFunction();
+    if (callee == nullptr) {
+      return false;
+    }
+    const StringRef name = callee->getName();
+    if (name.starts_with("llvm.nvvm.read.ptx.sreg.ctaid.") ||
+        name.starts_with("llvm.nvvm.read.ptx.sreg.ntid.") ||
+        name.starts_with("llvm.nvvm.read.ptx.sreg.nctaid.") ||
+        name == "llvm.nvvm.read.ptx.sreg.warpsize") {
+      return true;
+    }
+    if (name.starts_with("llvm.nvvm.") ||
+        name.starts_with("llvm.amdgcn.workitem.") ||
+        name.starts_with("llvm.amdgcn.mbcnt.")) {
+      return false;
+    }
+    if (callee->isIntrinsic()) {
+      return uniformOperands(call);
+    }
+    if (name == ir::AcquireMarker || name == ir::AcquireTensorMapMarker ||
+        name == ir::AcquireSetMarker) {
+      return uniformOperands(call);
+    }
+    return false;
+  }
+
+  bool classify(Instruction &instruction) {
+    if (isa<AllocaInst>(instruction) || isa<AtomicRMWInst>(instruction) ||
+        isa<AtomicCmpXchgInst>(instruction)) {
+      return false;
+    }
+    if (auto *load = dyn_cast<LoadInst>(&instruction)) {
+      return !load->isVolatile() && !load->isAtomic() &&
+             isUniform(load->getPointerOperand());
+    }
+    if (auto *phi = dyn_cast<PHINode>(&instruction)) {
+      if (!uniformOperands(*phi)) {
+        return false;
+      }
+      Value *first = phi->getIncomingValue(0);
+      for (unsigned index = 1; index < phi->getNumIncomingValues(); ++index) {
+        if (phi->getIncomingValue(index) != first) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (auto *call = dyn_cast<CallBase>(&instruction)) {
+      return classifyCall(*call);
+    }
+    return uniformOperands(instruction);
+  }
+
+  DenseMap<Instruction *, State> states_;
+};
+
+std::optional<std::string>
+validateCtaCollective(CallInst &marker, CallInst &binding,
+                      DominatorTree &dominatorTree) {
+  const CallingConv::ID callingConvention =
+      marker.getFunction()->getCallingConv();
+  if (callingConvention != CallingConv::PTX_Kernel &&
+      callingConvention != CallingConv::AMDGPU_KERNEL &&
+      callingConvention != CallingConv::SPIR_KERNEL) {
+    return "acquisition markers must be inlined into a GPU kernel entry";
+  }
+  CtaUniformity uniformity;
+  for (Use &argument : marker.args()) {
+    if (!uniformity.isUniform(argument.get())) {
+      return "acquisition marker has a non-CTA-uniform operand";
+    }
+  }
+  for (Use &argument : binding.args()) {
+    if (!uniformity.isUniform(argument.get())) {
+      return "request binding has a non-CTA-uniform operand";
+    }
+  }
+
+  BasicBlock *markerBlock = marker.getParent();
+  DomTreeNode *node = dominatorTree.getNode(markerBlock);
+  for (node = node == nullptr ? nullptr : node->getIDom(); node != nullptr;
+       node = node->getIDom()) {
+    BasicBlock *controlBlock = node->getBlock();
+    Instruction *terminator = controlBlock->getTerminator();
+    Value *condition = nullptr;
+    if (auto *branch = dyn_cast<BranchInst>(terminator);
+        branch != nullptr && branch->isConditional()) {
+      condition = branch->getCondition();
+    } else if (auto *select = dyn_cast<SwitchInst>(terminator)) {
+      condition = select->getCondition();
+    }
+    unsigned reachableSuccessors = 0;
+    for (unsigned successor = 0; successor < terminator->getNumSuccessors();
+         ++successor) {
+      reachableSuccessors +=
+          isPotentiallyReachable(terminator->getSuccessor(successor),
+                                 markerBlock, nullptr, &dominatorTree)
+              ? 1U
+              : 0U;
+    }
+    const bool controlsMarker = reachableSuccessors != 0 &&
+                                reachableSuccessors !=
+                                    terminator->getNumSuccessors();
+    if (controlsMarker && condition != nullptr &&
+        !uniformity.isUniform(condition)) {
+      return "acquisition marker is control-dependent on a non-CTA-uniform "
+             "branch";
+    }
+  }
+  return std::nullopt;
 }
 
 struct AcquisitionBranch {
@@ -290,6 +443,11 @@ FunctionPlan analyzeAcquisitions(Function &function) {
     if (binding == nullptr) {
       plan.rejected.push_back(
           {marker, "no valid request binding dominates acquisition"});
+      continue;
+    }
+    if (std::optional<std::string> error =
+            validateCtaCollective(*marker, *binding, dominatorTree)) {
+      plan.rejected.push_back({marker, std::move(*error)});
       continue;
     }
     if (std::optional<std::string> error =

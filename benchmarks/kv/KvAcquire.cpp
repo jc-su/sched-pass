@@ -1,5 +1,7 @@
 #include "benchmarks/kv/KvTypes.h"
+#include "nta/DeviceWorkPlan.h"
 #include "nta/HostRuntime.h"
+#include "nta/WorkPlan.h"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -39,6 +41,7 @@ struct Options {
   std::uint32_t iterations = 20;
   std::uint32_t cancelStride = 0;
   std::uint32_t staleStride = 0;
+  std::uint32_t objectStaleStride = 0;
   std::uint32_t coalesce = 1;
   std::uint32_t dependencies = 1;
   bool baseline = false;
@@ -167,8 +170,8 @@ public:
   void launchPublish(CUstream stream, nta::abi::RuntimeView *runtime,
                      std::uint32_t continuationCount) const {
     const std::uint32_t threads = 256;
-    const std::uint32_t blocks =
-        (continuationCount + threads - 1U) / threads;
+    const std::uint32_t blocks = std::min(
+        32U, (continuationCount + threads - 1U) / threads);
     CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
     void *arguments[] = {&runtimeAddress, &continuationCount};
     checkDriver(cuLaunchKernel(publish_, blocks, 1, 1, threads, 1, 1, 0,
@@ -193,7 +196,7 @@ public:
   }
 
   void launchDependencyCompute(CUstream stream, nta::abi::RuntimeView *runtime,
-                               const nta::benchmark::WorkTask *tasks,
+                               const nta::abi::WorkItem *tasks,
                                std::uint32_t taskCount,
                                const nta::abi::AcquireRequirement *requirements,
                                const float *query, float *output,
@@ -213,7 +216,7 @@ public:
   }
 
   void launchDependencyReady(CUstream stream, nta::abi::RuntimeView *runtime,
-                             const nta::benchmark::WorkTask *tasks,
+                             const nta::abi::WorkItem *tasks,
                              std::uint32_t taskCount,
                              const nta::abi::AcquireRequirement *requirements,
                              const float *query, float *output) const {
@@ -231,7 +234,7 @@ public:
   }
 
   void launchDependencyBaseline(
-      CUstream stream, const nta::benchmark::WorkTask *tasks,
+      CUstream stream, const nta::abi::WorkItem *tasks,
       std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
       const float *query, float *output) const {
     CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
@@ -321,6 +324,9 @@ Options parseOptions(int argc, char **argv) {
       options.cancelStride = value == "0" ? 0 : parsePositive(value, name);
     } else if (name == "--stale-stride") {
       options.staleStride = value == "0" ? 0 : parsePositive(value, name);
+    } else if (name == "--object-stale-stride") {
+      options.objectStaleStride =
+          value == "0" ? 0 : parsePositive(value, name);
     } else if (name == "--coalesce") {
       options.coalesce = parsePositive(value, name);
     } else if (name == "--dependencies") {
@@ -343,9 +349,14 @@ Options parseOptions(int argc, char **argv) {
   }
   if (options.baseline &&
       (options.mode == Mode::HostStaged || options.mode == Mode::Mixed ||
-       options.cancelStride != 0 || options.staleStride != 0)) {
+       options.cancelStride != 0 || options.staleStride != 0 ||
+       options.objectStaleStride != 0)) {
     throw std::invalid_argument(
         "--baseline requires a direct placement and live request bindings");
+  }
+  if (options.objectStaleStride != 0 && options.mode != Mode::HostStaged) {
+    throw std::invalid_argument(
+        "--object-stale-stride requires --mode=host-staged");
   }
   return options;
 }
@@ -405,14 +416,15 @@ int main(int argc, char **argv) {
     nta::HostRuntime runtime({options.requests, objectCount, objectCount,
                               options.requests, 1, options.dependencies});
     std::vector<nta::benchmark::TileTask> tasks(options.requests);
-    std::vector<nta::benchmark::WorkTask> workTasks(options.requests);
     std::vector<nta::abi::AcquireRequirement> requirements(
         static_cast<std::size_t>(options.requests) * options.dependencies);
+    nta::WorkPlanBuilder planBuilder(options.dependencies);
     std::vector<std::vector<float>> objectData(objectCount);
     std::vector<nta::ObjectHandle> objects(objectCount);
     std::vector<float> expected(options.requests, 0.0F);
     std::vector<bool> cancelled(options.requests, false);
     std::vector<bool> stale(options.requests, false);
+    std::vector<bool> objectStale(options.requests, false);
 
     for (std::uint32_t object = 0; object < objectCount; ++object) {
       objectData[object].resize(elements);
@@ -442,13 +454,12 @@ int main(int argc, char **argv) {
 
       const std::uint32_t objectBegin =
           (task / options.coalesce) * options.dependencies;
+      objectStale[task] = options.objectStaleStride != 0 &&
+                          task % options.objectStaleStride == 0;
       double reference = 0.0;
-      std::uint32_t directDependencyCount = 0;
       for (std::uint32_t dependency = 0; dependency < options.dependencies;
            ++dependency) {
         const std::uint32_t object = objectBegin + dependency;
-        directDependencyCount +=
-            objects[object].directDeviceBase != nullptr ? 1U : 0U;
         for (std::uint32_t element = 0; element < elements; ++element) {
           const float value = objectData[object][element];
           reference += static_cast<double>(value) * query[element] *
@@ -461,7 +472,7 @@ int main(int argc, char **argv) {
             200000U + object,
             0,
             object,
-            1,
+            objectStale[task] && dependency == 0 ? 2U : 1U,
             options.tileBytes,
             0,
         };
@@ -482,36 +493,25 @@ int main(int argc, char **argv) {
           0,
           0,
       };
-      workTasks[task] = {
-          task,
-          taskGeneration,
-          task * options.dependencies,
-          options.dependencies,
-          directDependencyCount,
-          task,
-          task,
-          0,
-      };
+      const std::uint32_t request =
+          planBuilder.addRequest({task, taskGeneration});
+      const std::span<const nta::abi::AcquireRequirement> taskRequirements(
+          requirements.data() +
+              static_cast<std::size_t>(task) * options.dependencies,
+          options.dependencies);
+      (void)planBuilder.addWork(request, task, taskRequirements);
     }
 
+    nta::WorkPlan workPlan = planBuilder.finish();
+    nta::DeviceWorkPlan deviceWorkPlan = runtime.uploadWorkPlan(workPlan);
+
     DeviceBuffer<nta::benchmark::TileTask> deviceTasks(tasks.size());
-    DeviceBuffer<nta::benchmark::WorkTask> deviceWorkTasks(workTasks.size());
-    DeviceBuffer<nta::abi::AcquireRequirement> deviceRequirements(
-        requirements.size());
     DeviceBuffer<float> deviceQuery(query.size());
     DeviceBuffer<float> deviceOutput(options.requests);
     checkCuda(cudaMemcpy(deviceTasks.get(), tasks.data(),
                          sizeof(tasks.front()) * tasks.size(),
                          cudaMemcpyHostToDevice),
               "upload tasks");
-    checkCuda(cudaMemcpy(deviceWorkTasks.get(), workTasks.data(),
-                         sizeof(workTasks.front()) * workTasks.size(),
-                         cudaMemcpyHostToDevice),
-              "upload work tasks");
-    checkCuda(cudaMemcpy(deviceRequirements.get(), requirements.data(),
-                         sizeof(requirements.front()) * requirements.size(),
-                         cudaMemcpyHostToDevice),
-              "upload acquisition requirements");
     checkCuda(cudaMemcpy(deviceQuery.get(), query.data(),
                          sizeof(float) * query.size(), cudaMemcpyHostToDevice),
               "upload query");
@@ -537,29 +537,31 @@ int main(int argc, char **argv) {
               "cudaMemsetAsync output");
     if (options.baseline) {
       kernels.launchDependencyBaseline(
-          driverStream, deviceWorkTasks.get(), options.requests,
-          deviceRequirements.get(), deviceQuery.get(), deviceOutput.get());
-    } else if (options.dependencies == 1) {
+          driverStream, deviceWorkPlan.workItems(), options.requests,
+          deviceWorkPlan.dependencies(), deviceQuery.get(), deviceOutput.get());
+    } else if (options.dependencies == 1 &&
+               options.objectStaleStride == 0) {
       kernels.launchCompute(driverStream, runtime.deviceView(),
                             deviceTasks.get(), options.requests,
                             deviceQuery.get(), deviceOutput.get(), 0);
     } else {
       kernels.launchDependencyCompute(driverStream, runtime.deviceView(),
-                                      deviceWorkTasks.get(), options.requests,
-                                      deviceRequirements.get(),
+                                      deviceWorkPlan.workItems(),
+                                      options.requests,
+                                      deviceWorkPlan.dependencies(),
                                       deviceQuery.get(), deviceOutput.get(), 0);
     }
     kernels.launchProgress(driverStream, runtime.deviceView(), objectCount);
     kernels.launchPublish(driverStream, runtime.deviceView(), options.requests);
-    if (options.dependencies == 1) {
+    if (options.dependencies == 1 && options.objectStaleStride == 0) {
       kernels.launchReady(driverStream, runtime.deviceView(), deviceTasks.get(),
                           options.requests, deviceQuery.get(),
                           deviceOutput.get());
     } else {
       kernels.launchDependencyReady(driverStream, runtime.deviceView(),
-                                    deviceWorkTasks.get(), options.requests,
-                                    deviceRequirements.get(), deviceQuery.get(),
-                                    deviceOutput.get());
+                                    deviceWorkPlan.workItems(), options.requests,
+                                    deviceWorkPlan.dependencies(),
+                                    deviceQuery.get(), deviceOutput.get());
     }
     checkCuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
     checkCuda(cudaGraphInstantiate(&graphExec, graph, 0),
@@ -604,6 +606,12 @@ int main(int argc, char **argv) {
             output[task] != 0.0F) {
           ++failures;
         }
+      } else if (objectStale[task]) {
+        if (continuation.state != static_cast<std::uint32_t>(
+                                      nta::abi::ContinuationState::Failed) ||
+            output[task] != 0.0F) {
+          ++failures;
+        }
       } else {
         const float tolerance =
             std::max(0.02F, std::abs(expected[task]) * 2.0e-5F);
@@ -638,6 +646,9 @@ int main(int argc, char **argv) {
               << " staged_issues=" << stagedIssues << " cancelled="
               << std::count(cancelled.begin(), cancelled.end(), true)
               << " stale=" << std::count(stale.begin(), stale.end(), true)
+              << " object_stale="
+              << std::count(objectStale.begin(), objectStale.end(), true)
+              << " pending=" << runtime.readPendingCount()
               << " verification_failures=" << failures << '\n';
 
     (void)cudaEventDestroy(end);

@@ -240,8 +240,8 @@ public:
   void publish(CUstream stream, nta::abi::RuntimeView *runtime,
                std::uint32_t continuationCount) const {
     const std::uint32_t threads = 256;
-    const std::uint32_t blocks =
-        (continuationCount + threads - 1U) / threads;
+    const std::uint32_t blocks = std::min(
+        32U, (continuationCount + threads - 1U) / threads);
     CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
     void *arguments[] = {&runtimeAddress, &continuationCount};
     checkDriver(cuLaunchKernel(publish_, blocks, 1, 1, threads, 1, 1, 0,

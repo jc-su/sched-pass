@@ -26,16 +26,7 @@ struct ObjectBinding {
   std::uint32_t bytes;
 };
 
-struct WorkItem {
-  std::uint32_t requestIndex;
-  std::uint32_t requestSlot;
-  std::uint32_t generation;
-  std::uint32_t logicalWork;
-  std::uint32_t dependencyBegin;
-  std::uint32_t dependencyCount;
-  std::uint32_t directDependencyCount;
-  std::uint32_t continuation;
-};
+using WorkItem = abi::WorkItem;
 
 struct RequestWorkRange {
   std::uint32_t workBegin;

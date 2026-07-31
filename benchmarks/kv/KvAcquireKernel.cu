@@ -146,10 +146,10 @@ runNvmeHash(nta::abi::RuntimeView *runtime,
 
 __device__ __forceinline__ void
 runDependencyTile(nta::abi::RuntimeView *runtime,
-                  const nta::benchmark::WorkTask *tasks,
+                  const nta::abi::WorkItem *tasks,
                   const nta::abi::AcquireRequirement *requirements,
                   std::uint32_t taskIndex, const float *query, float *output) {
-  const nta::benchmark::WorkTask task = tasks[taskIndex];
+  const nta::abi::WorkItem task = tasks[taskIndex];
   nta::abi::Continuation &continuation =
       runtime->continuations[task.continuation];
   const nta::abi::AcquireRequirement *dependencies =
@@ -204,11 +204,11 @@ runDependencyTile(nta::abi::RuntimeView *runtime,
 }
 
 __device__ __forceinline__ void
-runDependencyBaseline(const nta::benchmark::WorkTask *tasks,
+runDependencyBaseline(const nta::abi::WorkItem *tasks,
                       const nta::abi::AcquireRequirement *requirements,
                       std::uint32_t taskIndex, const float *query,
                       float *output) {
-  const nta::benchmark::WorkTask task = tasks[taskIndex];
+  const nta::abi::WorkItem task = tasks[taskIndex];
   const nta::abi::AcquireRequirement *dependencies =
       requirements + task.dependencyBegin;
 
@@ -240,6 +240,53 @@ runDependencyBaseline(const nta::benchmark::WorkTask *tasks,
     if (lane == 0) {
       output[taskIndex] = total;
     }
+  }
+}
+
+__device__ __forceinline__ void
+runMoeTile(nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
+           const nta::abi::AcquireRequirement *requirements,
+           std::uint32_t taskIndex, const float *input, float *output,
+           std::uint32_t hiddenSize) {
+  const nta::abi::WorkItem task = tasks[taskIndex];
+  const nta::abi::AcquireRequirement *experts =
+      requirements + task.dependencyBegin;
+
+  __nta_bind_request(task.requestSlot, task.generation);
+  const bool ready = __nta_acquire_set_marker(
+      runtime, experts, task.dependencyCount, task.directDependencyCount,
+      task.continuation);
+  if (!ready) {
+    __nta_defer_marker(runtime, task.continuation);
+    return;
+  }
+
+  float mixed = 0.0F;
+  const float *token = input + task.logicalWork * hiddenSize;
+  for (std::uint32_t dependency = 0; dependency < task.dependencyCount;
+       ++dependency) {
+    const auto *weights = static_cast<const float *>(
+        nta_requirement_address(runtime, experts + dependency));
+    if (weights == nullptr) {
+      nta::device::failContinuation(runtime, task.continuation,
+                                    nta::abi::ContinuationState::Failed);
+      return;
+    }
+    const float gate = 1.0F / static_cast<float>(dependency + 1U);
+    float expertOutput = 0.0F;
+    const float *row = weights + threadIdx.x * hiddenSize;
+    for (std::uint32_t inputIndex = 0; inputIndex < hiddenSize; ++inputIndex) {
+      expertOutput = fmaf(row[inputIndex], token[inputIndex], expertOutput);
+    }
+    mixed = fmaf(gate, expertOutput, mixed);
+  }
+  output[task.logicalWork * hiddenSize + threadIdx.x] = mixed;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    atomicExch(
+        &runtime->continuations[task.continuation].state,
+        static_cast<std::uint32_t>(nta::abi::ContinuationState::Done));
   }
 }
 
@@ -297,7 +344,7 @@ extern "C" __global__ void nta_nvme_ready_hash_kernel(
 }
 
 extern "C" __global__ void nta_dependency_tile_kernel(
-    nta::abi::RuntimeView *runtime, const nta::benchmark::WorkTask *tasks,
+    nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
     std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
     const float *query, float *output, std::uint32_t phase) {
   const std::uint32_t taskIndex = blockIdx.x;
@@ -308,7 +355,7 @@ extern "C" __global__ void nta_dependency_tile_kernel(
 }
 
 extern "C" __global__ void nta_dependency_ready_kernel(
-    nta::abi::RuntimeView *runtime, const nta::benchmark::WorkTask *tasks,
+    nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
     std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
     const float *query, float *output) {
   const std::uint32_t continuation = popReadyContinuation(runtime);
@@ -323,12 +370,42 @@ extern "C" __global__ void nta_dependency_ready_kernel(
 }
 
 extern "C" __global__ void
-nta_dependency_baseline_kernel(const nta::benchmark::WorkTask *tasks,
+nta_dependency_baseline_kernel(const nta::abi::WorkItem *tasks,
                                std::uint32_t taskCount,
                                const nta::abi::AcquireRequirement *requirements,
                                const float *query, float *output) {
   const std::uint32_t taskIndex = blockIdx.x;
   if (taskIndex < taskCount) {
     runDependencyBaseline(tasks, requirements, taskIndex, query, output);
+  }
+}
+
+extern "C" __global__ void nta_moe_tile_kernel(
+    nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
+    std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
+    const float *input, float *output, std::uint32_t hiddenSize) {
+  const std::uint32_t taskIndex = blockIdx.x;
+  if (taskIndex >= taskCount || hiddenSize == 0 || blockDim.x != hiddenSize) {
+    return;
+  }
+  runMoeTile(runtime, tasks, requirements, taskIndex, input, output, hiddenSize);
+}
+
+extern "C" __global__ void nta_moe_ready_kernel(
+    nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
+    std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
+    const float *input, float *output, std::uint32_t hiddenSize) {
+  if (hiddenSize == 0 || blockDim.x != hiddenSize) {
+    return;
+  }
+  const std::uint32_t continuation = popReadyContinuation(runtime);
+  if (continuation >= runtime->continuationCapacity) {
+    return;
+  }
+  const std::uint32_t taskIndex =
+      runtime->continuations[continuation].logicalTile;
+  if (taskIndex < taskCount) {
+    runMoeTile(runtime, tasks, requirements, taskIndex, input, output,
+               hiddenSize);
   }
 }
