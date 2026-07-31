@@ -8,7 +8,9 @@ in this document take precedence over the previous prototype's design notes.
 
 Implementation status (2026-07-31): M0-M4 have a working vertical slice tested
 on an NVIDIA RTX PRO 6000 Blackwell Server Edition. M5 has a numerically checked
-split-K paged-attention mechanism workload, not a serving-framework result. M6
+split-K paged-attention mechanism workload plus a public-CSR/attention-state
+compatibility layer differentially checked against FlashInfer 0.6.12, not a
+serving-framework result. M6
 has real TMA descriptor selection and hardware TMA after direct or externally
 staged acquisition; automatic production-IR recognition remains open. A KIOXIA
 CD8P NVMe controller has DMAed directly into CUDA HBM registered through
@@ -797,8 +799,12 @@ Gate: improvement over CPU/runtime prefetch using the same data path.
 Status: mechanism workload complete, serving gate open. The branch runs a real
 FP16, head-dimension-128, page-size-16 split-K attention kernel with
 heterogeneous pages per request, stable partial softmax reduction, ready-only
-continuations, and a CPU numerical reference. It is not wired into vLLM's KV
-manager or model runner, and therefore has no TTFT/TPOT/SLO claim.
+continuations, and a CPU numerical reference. Work formation consumes
+FlashInfer's public paged-KV CSR representation, reduction uses FlashInfer's
+base-2 `(V, LSE)` state implementation when its headers are available, and a
+real FlashInfer decode wrapper is a differential correctness gate. NTA deferral
+is not yet inside FlashInfer's optimized CTA, nor is it wired into SGLang/vLLM
+request lifecycle and KV management; therefore there is no TTFT/TPOT/SLO claim.
 
 ### M6: TMA specialization
 
@@ -840,9 +846,11 @@ The implemented tree is:
 CMakeLists.txt
 docs/
     ARCHITECTURE.md
+    FLASHINFER.md
 include/nta/
     AcquireIR.h
     DeviceAPI.cuh
+    FlashInferAdapter.h
     HostRuntime.h
     RuntimeABI.h
     Passes.h
@@ -853,10 +861,12 @@ lib/
     Plugin.cpp
 runtime/
     device/Acquire.cuh
+    host/FlashInferAdapter.cpp
     host/Runtime.cpp
 tests/
     ir/{batched,reject-*}.ll
-    runtime/{AbiTest,RuntimeTest}.cpp
+    flashinfer/differential_decode.py
+    runtime/{AbiTest,FlashInferAdapterTest,RuntimeTest}.cpp
 benchmarks/
     kv/{KvAcquire,KvAcquireKernel,KvTypes}
     attention/{PagedAttention,PagedAttentionKernel,PagedAttentionTypes}

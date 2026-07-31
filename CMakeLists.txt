@@ -7,6 +7,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(NTA_ENABLE_CUDA "Build the real GPU host-memory acquisition workload" ON)
 option(NTA_WARNINGS_AS_ERRORS "Treat project warnings as errors" ON)
+option(NTA_ENABLE_FLASHINFER_VALIDATION
+       "Use FlashInfer headers and enable differential validation when available"
+       ON)
+set(NTA_FLASHINFER_INCLUDE_DIR "" CACHE PATH
+    "Path containing flashinfer/page.cuh and flashinfer/attention/state.cuh")
 
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Building NTA against LLVM ${LLVM_PACKAGE_VERSION} in ${LLVM_DIR}")
@@ -48,6 +53,31 @@ endif()
 
 enable_testing()
 
+add_library(nta-flashinfer-adapter STATIC
+  runtime/host/FlashInferAdapter.cpp
+)
+target_include_directories(nta-flashinfer-adapter PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+if(NTA_WARNINGS_AS_ERRORS)
+  target_compile_options(
+    nta-flashinfer-adapter PRIVATE -Wall -Wextra -Wpedantic -Werror
+  )
+endif()
+
+add_executable(
+  nta-flashinfer-adapter-test tests/runtime/FlashInferAdapterTest.cpp
+)
+target_link_libraries(
+  nta-flashinfer-adapter-test PRIVATE nta-flashinfer-adapter
+)
+if(NTA_WARNINGS_AS_ERRORS)
+  target_compile_options(
+    nta-flashinfer-adapter-test PRIVATE -Wall -Wextra -Wpedantic -Werror
+  )
+endif()
+add_test(NAME nta-flashinfer-adapter COMMAND nta-flashinfer-adapter-test)
+
 add_test(
   NAME nta-ir
   COMMAND
@@ -66,6 +96,30 @@ add_test(NAME nta-abi COMMAND nta-abi-test)
 
 if(NTA_ENABLE_CUDA)
   find_package(CUDAToolkit 12.8 REQUIRED)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(NTA_ENABLE_FLASHINFER_VALIDATION AND
+     NOT NTA_FLASHINFER_INCLUDE_DIR AND Python3_Interpreter_FOUND)
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" -c
+        "import importlib.util,pathlib; s=importlib.util.find_spec('flashinfer'); print(pathlib.Path(s.origin).parent/'data'/'include' if s else '')"
+      OUTPUT_VARIABLE NTA_FLASHINFER_INCLUDE_DIR
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+  endif()
+  set(NTA_FLASHINFER_DEVICE_FLAGS)
+  if(NTA_ENABLE_FLASHINFER_VALIDATION AND
+     EXISTS "${NTA_FLASHINFER_INCLUDE_DIR}/flashinfer/attention/state.cuh")
+    set(NTA_HAVE_FLASHINFER TRUE)
+    list(APPEND NTA_FLASHINFER_DEVICE_FLAGS
+      -I${NTA_FLASHINFER_INCLUDE_DIR}
+      -DNTA_USE_FLASHINFER_STATE=1
+    )
+    message(STATUS
+      "FlashInfer device-state integration: ${NTA_FLASHINFER_INCLUDE_DIR}")
+  elseif(NTA_ENABLE_FLASHINFER_VALIDATION)
+    message(WARNING
+      "FlashInfer headers were not found; building the compatible fallback state")
+  endif()
   if(NOT NTA_CLANG_CUDA)
     if(EXISTS "${LLVM_TOOLS_BINARY_DIR}/clang++")
       set(
@@ -199,6 +253,7 @@ if(NTA_ENABLE_CUDA)
       -Wno-unknown-cuda-version
       -I${CMAKE_CURRENT_SOURCE_DIR}/include
       -I${CMAKE_CURRENT_SOURCE_DIR}
+      ${NTA_FLASHINFER_DEVICE_FLAGS}
       -emit-llvm
       -c
       ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/attention/PagedAttentionKernel.cu
@@ -286,7 +341,8 @@ if(NTA_ENABLE_CUDA)
     PRIVATE NTA_ATTENTION_CUBIN_PATH="${NTA_ATTENTION_CUBIN}"
   )
   target_link_libraries(
-    nta-paged-attention PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+    nta-paged-attention PRIVATE nta-runtime-host nta-flashinfer-adapter
+                                CUDA::cuda_driver CUDA::cudart
   )
   if(NTA_WARNINGS_AS_ERRORS)
     target_compile_options(
@@ -345,6 +401,20 @@ if(NTA_ENABLE_CUDA)
       --request-credit-pages=1
   )
   set_tests_properties(nta-paged-attention-tma-gpu PROPERTIES TIMEOUT 60)
+  if(NTA_HAVE_FLASHINFER AND Python3_Interpreter_FOUND)
+    add_test(
+      NAME nta-flashinfer-differential-gpu
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/flashinfer/differential_decode.py"
+              $<TARGET_FILE:nta-paged-attention>
+    )
+    set_tests_properties(
+      nta-flashinfer-differential-gpu PROPERTIES
+      TIMEOUT 180
+      ENVIRONMENT
+        "FLASHINFER_NVCC=${CMAKE_CURRENT_SOURCE_DIR}/tools/flashinfer/nvcc_compat.py;NTA_REAL_NVCC=${CUDAToolkit_NVCC_EXECUTABLE}"
+    )
+  endif()
 endif()
 
 add_custom_target(

@@ -13,6 +13,8 @@ The exact tested environment and current measurements are in
 [docs/VALIDATION.md](docs/VALIDATION.md).
 The current closest-work and novelty boundary is in
 [docs/RELATED_WORK.md](docs/RELATED_WORK.md).
+The implemented FlashInfer boundary and remaining serving integration are in
+[docs/FLASHINFER.md](docs/FLASHINFER.md).
 
 ## Implemented vertical slice
 
@@ -32,13 +34,18 @@ workloads:
 - a backend-neutral directory with bounded per-object physical replicas;
 - a numerically checked split-K paged-attention workload with heterogeneous
   request lengths;
+- a validated adapter from FlashInfer's public paged-KV CSR tables to NTA page
+  continuations, FlashInfer-native `(V, LSE)` cascade state, and a differential
+  GPU correctness gate against FlashInfer 0.6.12;
 - real TMA consumption from direct sources or from HBM after external staging,
   with compiler-proven deferral before barrier creation;
 - one captured CUDA graph containing discover, bounded progress, and resume
   kernels; and
 - an inspectable NVVM IR -> pass -> PTX -> cubin build pipeline.
 
-The compiler currently consumes explicit acquisition markers; automatic
+The FlashInfer compatibility layer does not yet place deferral inside
+FlashInfer's optimized FMHA CTA, and no vLLM/SGLang request-lifecycle adapter is
+present. The compiler currently consumes explicit acquisition markers; automatic
 recognition of arbitrary production load/cp.async/TMA address cones is an open
 gate. There is no placeholder RDMA backend. NVMe is implemented against an isolated
 KIOXIA CD8P controller and tested with read-only commands. The previous
@@ -92,6 +99,11 @@ Run the split-K attention workload using hardware TMA after external staging:
 `scripts/validate-local.sh` reproduces the build, tests, global-load/TMA
 placement matrix, and PTX resource report. Set `NTA_SANITIZE=1` to include
 memcheck, racecheck, and synccheck.
+
+When `flashinfer-python` is installed, CMake locates its headers and builds the
+attention reduction with `flashinfer::state_t`; CTest also enables
+`nta-flashinfer-differential-gpu`. Override header discovery with
+`-DNTA_FLASHINFER_INCLUDE_DIR=/path/to/include`.
 
 ## GPU-initiated NVMe
 

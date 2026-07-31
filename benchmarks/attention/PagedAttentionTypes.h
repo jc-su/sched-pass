@@ -29,11 +29,12 @@ struct alignas(16) AttentionRequest {
 };
 
 struct alignas(16) AttentionTilePartial {
-  float maxLogit;
-  float sumExp;
+  // FlashInfer cascade state: normalized attention output plus base-2 LSE.
+  float lse;
+  float reserved0;
   std::uint32_t valid;
-  std::uint32_t reserved;
-  float numerator[AttentionHeadDimension];
+  std::uint32_t reserved1;
+  float output[AttentionHeadDimension];
 };
 
 static_assert(sizeof(AttentionTileTask) == 64);

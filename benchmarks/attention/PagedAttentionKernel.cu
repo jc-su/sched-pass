@@ -6,6 +6,10 @@
 #include <cuda_runtime.h>
 #include <cuda/barrier>
 
+#if defined(NTA_USE_FLASHINFER_STATE)
+#include <flashinfer/attention/state.cuh>
+#endif
+
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
@@ -98,10 +102,9 @@ computeAttentionTile(nta::abi::RuntimeView *runtime,
                  __half2float(values[token * AttentionHeadDimension +
                                      threadIdx.x]);
   }
-  partial.numerator[threadIdx.x] = numerator;
+  partial.output[threadIdx.x] = numerator / denominator;
   if (threadIdx.x == 0) {
-    partial.maxLogit = tileMaximum;
-    partial.sumExp = denominator;
+    partial.lse = (tileMaximum + logf(denominator)) * 1.4426950408889634F;
     __threadfence();
     partial.valid = 1;
     atomicExch(&continuation.state,
@@ -247,20 +250,32 @@ extern "C" __global__ void nta_attention_reduce_kernel(
       ready = false;
       break;
     }
-    maximum = fmaxf(maximum, partial.maxLogit);
+    maximum = fmaxf(maximum, partial.lse);
   }
   if (!ready) {
     return;
   }
 
+#if defined(NTA_USE_FLASHINFER_STATE)
+  flashinfer::state_t<1> state;
+  for (std::uint32_t tile = 0; tile < request.tileCount; ++tile) {
+    const AttentionTilePartial &partial = partials[request.tileBegin + tile];
+    flashinfer::vec_t<float, 1> value;
+    value[0] = partial.output[threadIdx.x];
+    state.merge(value, partial.lse, 1.0F);
+  }
+  state.normalize();
+  output[requestIndex * AttentionHeadDimension + threadIdx.x] = state.o[0];
+#else
   float denominator = 0.0F;
   float numerator = 0.0F;
   for (std::uint32_t tile = 0; tile < request.tileCount; ++tile) {
     const AttentionTilePartial &partial = partials[request.tileBegin + tile];
-    const float scale = expf(partial.maxLogit - maximum);
-    denominator += scale * partial.sumExp;
-    numerator += scale * partial.numerator[threadIdx.x];
+    const float scale = exp2f(partial.lse - maximum);
+    denominator += scale;
+    numerator += scale * partial.output[threadIdx.x];
   }
   output[requestIndex * AttentionHeadDimension + threadIdx.x] =
       numerator / denominator;
+#endif
 }

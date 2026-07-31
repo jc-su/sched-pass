@@ -8,6 +8,19 @@ evaluation distinguish it from the systems below.
 
 ## Closest Systems
 
+### FlashInfer
+
+[FlashInfer](https://arxiv.org/abs/2501.01005) already provides optimized paged
+prefill/decode, load-balanced KV chunk scheduling, split-K state, and cascade
+merge. NTA cannot claim novelty from paged-KV layout, CTA chunking, or associative
+`(V, LSE)` reduction. The implementation deliberately adopts those public data
+and numerical-state contracts.
+
+The candidate distinction is compiler-checked deferral of a FlashInfer chunk
+whose backing pages require command-based acquisition, followed by selective
+finite-kernel continuation. That distinction remains unproven until the hook is
+inside the optimized FlashInfer CTA and evaluated through a real serving engine.
+
 ### Syncopate (OSDI 2026)
 
 [Syncopate](https://www.usenix.org/conference/osdi26/presentation/qiang) is the

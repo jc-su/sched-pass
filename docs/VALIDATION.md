@@ -15,6 +15,8 @@ claim. Open gates are listed explicitly at the end.
 - Device toolkit: CUDA 12.9.86
 - Target: `sm_120`
 - Compute Sanitizer: 2025.3.1
+- FlashInfer: 0.6.12
+- PyTorch: 2.11.0+cu130
 
 CUDA 13 is installed but is not used for device compilation because its header
 layout is incompatible with the current Clang CUDA wrapper.
@@ -34,16 +36,18 @@ runs memcheck, racecheck, and synccheck. Generated evidence is written under
 
 ## Compiler And Runtime Correctness
 
-`ctest --test-dir build --output-on-failure` passes six tests:
+`ctest --test-dir build --output-on-failure` passes eight tests:
 
-1. byte-address and tensor-map LLVM lowering plus rejected unsafe IR;
-2. host/device ABI v7 layout;
-3. runtime allocation, replicated-object publication, tensor-map binding, and
+1. FlashInfer CSR-to-NTA adapter validation, including malformed metadata;
+2. byte-address and tensor-map LLVM lowering plus rejected unsafe IR;
+3. host/device ABI v7 layout;
+4. runtime allocation, replicated-object publication, tensor-map binding, and
    cancellation state;
-4. mixed HBM/mapped/staged KV acquisition with duplicate coalescing, stale
+5. mixed HBM/mapped/staged KV acquisition with duplicate coalescing, stale
    generations, cancellation, and repeated intent-slot reuse;
-5. staged split-K paged attention with one-page request credit; and
-6. the same staged attention path using hardware TMA.
+6. staged split-K paged attention with one-page request credit;
+7. the same staged attention path using hardware TMA; and
+8. a differential GPU run against FlashInfer 0.6.12.
 
 The lowered modules contain no bind/acquire/defer marker calls. Tensor-map sites
 carry `!nta.acquire` metadata identifying ABI v7 and the `tensor-map` flavor.
@@ -64,6 +68,21 @@ The workload uses FP16 query/K/V data, head dimension 128, 16-token KV pages,
 one CTA per request-owned page, FP32 partial softmax state, and a deterministic
 split-K reduction. Requests have heterogeneous page counts and final-page token
 counts. A CPU reference checks every output element.
+
+The workload is formed from FlashInfer's public `kv_indptr`, `kv_indices`, and
+`last_page_len` representation. Its page CTAs produce normalized `V` plus base-2
+`LSE`, and the reduction compiles FlashInfer's `state_t` from the installed
+headers. The differential gate uses 7 heterogeneous requests, 23 physical pages,
+reversed physical-page indices, and host-staged NTA acquisition. Against a real
+`BatchDecodeWithPagedKVCacheWrapper`, it reports:
+
+```text
+flashinfer_version=0.6.12 requests=7 physical_pages=23
+max_abs_error=2.71425e-05 mean_abs_error=3.2057e-06 matched=1
+```
+
+This validates layout and numerical-state compatibility, not execution of NTA
+deferral inside FlashInfer's optimized attention CTA.
 
 For 32 requests, 299 pages, and 50 graph iterations, one local run produced:
 
@@ -90,11 +109,11 @@ PTXAS reports no spills:
 | Kernel | Registers | Shared bytes | Barriers |
 | --- | ---: | ---: | ---: |
 | global attention tile | 50 | 576 | 1 |
-| global ready tile | 50 | 580 | 1 |
-| TMA attention tile | 58 | 8,840 | 1 |
+| global ready tile | 52 | 580 | 1 |
+| TMA attention tile | 60 | 8,840 | 1 |
 | TMA ready tile | 60 | 8,840 | 1 |
 | host staging progress | 26 | 24 | 1 |
-| NVMe progress | 40 | 0 | 0 |
+| NVMe progress | 50 | 0 | 0 |
 
 The one barrier in the global attention kernel belongs to its reduction. The
 TMA barrier is initialized only after acquisition returns a valid descriptor.
@@ -126,7 +145,9 @@ been revalidated on NVMe hardware. This is a required regression gate.
 
 The following are not validated:
 
-- vLLM model-runner, KV-manager, and attention-backend integration;
+- NTA deferral inside FlashInfer's optimized prefill/decode CTAs;
+- SGLang and vLLM request lifecycle, KV-manager, and attention-backend
+  integration;
 - TTFT, TPOT, p50/p99 latency, SLO attainment, and serving goodput;
 - statistical direct-path overhead against an untouched production kernel;
 - automatic compiler recognition of production load/cp.async/TMA address

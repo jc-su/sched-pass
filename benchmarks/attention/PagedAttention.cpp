@@ -1,4 +1,5 @@
 #include "benchmarks/attention/PagedAttentionTypes.h"
+#include "nta/FlashInferAdapter.h"
 #include "nta/HostRuntime.h"
 
 #include <cuda.h>
@@ -10,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -45,6 +47,7 @@ struct Options {
   std::uint32_t progressPasses = 1;
   std::uint32_t requestCreditPages = 0;
   CopyMode copyMode = CopyMode::Global;
+  std::string dumpOutput;
 };
 
 void checkCuda(cudaError_t result, const char *operation) {
@@ -279,6 +282,11 @@ Options parseOptions(int argc, char **argv) {
       } else {
         throw std::invalid_argument("unknown copy mode");
       }
+    } else if (name == "--dump-output") {
+      if (value.empty()) {
+        throw std::invalid_argument("--dump-output requires a path");
+      }
+      options.dumpOutput = value;
     } else {
       throw std::invalid_argument("unknown option " + std::string(name));
     }
@@ -362,7 +370,8 @@ std::vector<float> referenceAttention(
     for (std::uint32_t tile = 0; tile < request.tileCount; ++tile) {
       const std::uint32_t taskIndex = request.tileBegin + tile;
       const AttentionTileTask task = tasks[taskIndex];
-      const __half *keys = pages.data() + taskIndex * valuesPerPage;
+      const __half *keys =
+          pages.data() + static_cast<std::size_t>(task.objectSlot) * valuesPerPage;
       for (std::uint32_t token = 0; token < task.tokenCount; ++token) {
         float dot = 0.0F;
         for (std::uint32_t dimension = 0;
@@ -372,7 +381,7 @@ std::vector<float> referenceAttention(
                  __half2float(keys[token * AttentionHeadDimension + dimension]);
         }
         logits.push_back(dot * 0.08838834764831845F);
-        tokenTasks.push_back(taskIndex);
+        tokenTasks.push_back(task.objectSlot);
         tokenOffsets.push_back(token);
       }
     }
@@ -400,6 +409,60 @@ std::vector<float> referenceAttention(
   return output;
 }
 
+struct FixtureHeader {
+  std::uint32_t magic;
+  std::uint32_t version;
+  std::uint32_t requestCount;
+  std::uint32_t physicalPageCount;
+  std::uint32_t headDimension;
+  std::uint32_t pageTokens;
+  std::uint32_t referencedPageCount;
+  std::uint32_t reserved;
+};
+static_assert(sizeof(FixtureHeader) == 32);
+
+template <typename T>
+void writeArray(std::ofstream &output, std::span<const T> values) {
+  output.write(reinterpret_cast<const char *>(values.data()),
+               static_cast<std::streamsize>(values.size_bytes()));
+  if (!output) {
+    throw std::runtime_error("failed to write FlashInfer fixture");
+  }
+}
+
+void writeFixture(const std::string &path,
+                  std::span<const std::int32_t> kvIndptr,
+                  std::span<const std::int32_t> kvIndices,
+                  std::span<const std::int32_t> lastPageLen,
+                  std::span<const __half> queries,
+                  std::span<const __half> pages,
+                  std::span<const float> outputValues) {
+  static_assert(sizeof(__half) == sizeof(std::uint16_t));
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    throw std::runtime_error("cannot open FlashInfer fixture output");
+  }
+  const FixtureHeader header{
+      0x4e544146U,
+      1,
+      static_cast<std::uint32_t>(lastPageLen.size()),
+      static_cast<std::uint32_t>(
+          pages.size() /
+          (2ULL * AttentionPageTokens * AttentionHeadDimension)),
+      AttentionHeadDimension,
+      AttentionPageTokens,
+      static_cast<std::uint32_t>(kvIndices.size()),
+      0,
+  };
+  writeArray(output, std::span<const FixtureHeader>(&header, 1));
+  writeArray(output, kvIndptr);
+  writeArray(output, kvIndices);
+  writeArray(output, lastPageLen);
+  writeArray(output, queries);
+  writeArray(output, pages);
+  writeArray(output, outputValues);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -408,13 +471,22 @@ int main(int argc, char **argv) {
     checkDriver(cuInit(0), "cuInit");
     checkCuda(cudaSetDevice(0), "cudaSetDevice");
 
-    std::vector<AttentionRequest> requests(options.requests);
+    std::vector<std::int32_t> kvIndptr(options.requests + 1U, 0);
+    std::vector<std::int32_t> lastPageLen(options.requests, 0);
     std::uint32_t taskCount = 0;
     for (std::uint32_t request = 0; request < options.requests; ++request) {
-      const std::uint32_t pages =
+      const std::uint32_t requestPages =
           options.minPages + request % (options.maxPages - options.minPages + 1U);
-      requests[request] = {taskCount, pages, request, request + 1U};
-      taskCount += pages;
+      taskCount += requestPages;
+      kvIndptr[request + 1U] = static_cast<std::int32_t>(taskCount);
+      lastPageLen[request] =
+          static_cast<std::int32_t>(1U + (request * 7U) % AttentionPageTokens);
+    }
+    std::vector<std::int32_t> kvIndices(taskCount);
+    for (std::uint32_t logicalPage = 0; logicalPage < taskCount;
+         ++logicalPage) {
+      kvIndices[logicalPage] =
+          static_cast<std::int32_t>(taskCount - logicalPage - 1U);
     }
 
     const std::size_t valuesPerPage =
@@ -445,7 +517,7 @@ int main(int argc, char **argv) {
                          requestCredit);
     }
 
-    std::vector<AttentionTileTask> tasks(taskCount);
+    std::vector<nta::flashinfer::PageBinding> pageBindings(taskCount);
     std::unique_ptr<DeviceBuffer<CUtensorMap>> deviceTensorMaps;
     std::vector<CUtensorMap> tensorMaps;
     if (options.copyMode == CopyMode::Tma) {
@@ -453,59 +525,91 @@ int main(int argc, char **argv) {
           std::make_unique<DeviceBuffer<CUtensorMap>>(2ULL * taskCount);
       tensorMaps.resize(2ULL * taskCount);
     }
-    std::uint32_t taskIndex = 0;
-    for (std::uint32_t request = 0; request < options.requests; ++request) {
-      for (std::uint32_t tile = 0; tile < requests[request].tileCount;
-           ++tile, ++taskIndex) {
-        const std::uint32_t tokenCount =
-            tile + 1U == requests[request].tileCount
-                ? 1U + (request * 7U) % AttentionPageTokens
-                : AttentionPageTokens;
+    for (std::uint32_t physicalPage = 0; physicalPage < taskCount;
+         ++physicalPage) {
         const auto *page = reinterpret_cast<const std::byte *>(
-            pages.data() + static_cast<std::size_t>(taskIndex) * valuesPerPage);
-        const std::uint64_t objectId = 0x4b56504700000000ULL + taskIndex;
-        const nta::Placement placement = placementFor(options.mode, taskIndex);
+            pages.data() + static_cast<std::size_t>(physicalPage) * valuesPerPage);
+        const std::uint64_t objectId =
+            0x4b56504700000000ULL + physicalPage;
+        const nta::Placement placement =
+            placementFor(options.mode, physicalPage);
         const nta::ObjectHandle object = runtime.installObject(
-            taskIndex, objectId, 1, std::span<const std::byte>(page, pageBytes),
+            physicalPage, objectId, 1,
+            std::span<const std::byte>(page, pageBytes),
             placement);
         std::uint64_t directTensorMap = 0;
         if (options.copyMode == CopyMode::Tma) {
-          const nta::abi::ObjectEntry objectEntry = runtime.readObject(taskIndex);
-          const nta::abi::ReplicaEntry replica = runtime.readReplica(taskIndex);
-          tensorMaps[2ULL * taskIndex] = encodePageTensorMap(
+          const nta::abi::ObjectEntry objectEntry =
+              runtime.readObject(physicalPage);
+          const nta::abi::ReplicaEntry replica =
+              runtime.readReplica(physicalPage);
+          tensorMaps[2ULL * physicalPage] = encodePageTensorMap(
               reinterpret_cast<void *>(replica.sourceAddress));
-          const void *replicaMap = deviceTensorMaps->get() + 2ULL * taskIndex;
+          const void *replicaMap =
+              deviceTensorMaps->get() + 2ULL * physicalPage;
           const void *stagingMap = nullptr;
           if (placement == nta::Placement::HostStaged) {
-            tensorMaps[2ULL * taskIndex + 1ULL] = encodePageTensorMap(
+            tensorMaps[2ULL * physicalPage + 1ULL] = encodePageTensorMap(
                 reinterpret_cast<void *>(objectEntry.stagingAddress));
             stagingMap =
-                deviceTensorMaps->get() + 2ULL * taskIndex + 1ULL;
+                deviceTensorMaps->get() + 2ULL * physicalPage + 1ULL;
           } else {
             directTensorMap = reinterpret_cast<std::uint64_t>(replicaMap);
           }
-          runtime.bindTensorMaps(taskIndex, 0, replicaMap, stagingMap);
+          runtime.bindTensorMaps(physicalPage, 0, replicaMap, stagingMap);
         }
-        tasks[taskIndex] = {
+        pageBindings[physicalPage] = {
             reinterpret_cast<std::uint64_t>(object.directDeviceBase),
             directTensorMap,
             objectId,
-            request,
-            request + 1U,
-            taskIndex,
+            physicalPage,
             1,
             static_cast<std::uint32_t>(pageBytes),
-            taskIndex,
-            request,
-            tokenCount,
         };
-      }
     }
     if (deviceTensorMaps != nullptr) {
       checkCuda(cudaMemcpy(deviceTensorMaps->get(), tensorMaps.data(),
                            tensorMaps.size() * sizeof(tensorMaps.front()),
                            cudaMemcpyHostToDevice),
                 "upload attention tensor maps");
+    }
+    std::vector<nta::flashinfer::RequestBinding> requestBindings;
+    requestBindings.reserve(options.requests);
+    for (std::uint32_t request = 0; request < options.requests; ++request) {
+      requestBindings.push_back({request, request + 1U});
+    }
+    const nta::flashinfer::DecodePlan flashInferPlan =
+        nta::flashinfer::planDecode({
+            AttentionPageTokens,
+            kvIndptr,
+            kvIndices,
+            lastPageLen,
+            requestBindings,
+            pageBindings,
+        });
+    std::vector<AttentionRequest> requests;
+    requests.reserve(flashInferPlan.requests.size());
+    for (const nta::flashinfer::RequestChunks &request :
+         flashInferPlan.requests) {
+      requests.push_back({request.chunkBegin, request.chunkCount,
+                          request.requestSlot, request.generation});
+    }
+    std::vector<AttentionTileTask> tasks;
+    tasks.reserve(flashInferPlan.chunks.size());
+    for (const nta::flashinfer::DecodeChunk &chunk : flashInferPlan.chunks) {
+      tasks.push_back({
+          chunk.page.directBase,
+          chunk.page.directTensorMap,
+          chunk.page.objectId,
+          chunk.requestSlot,
+          chunk.generation,
+          chunk.page.objectSlot,
+          chunk.page.objectVersion,
+          chunk.page.bytes,
+          chunk.continuation,
+          chunk.requestIndex,
+          chunk.tokenCount,
+      });
     }
     const std::vector<float> expected =
         referenceAttention(requests, tasks, queries, pages);
@@ -596,6 +700,10 @@ int main(int argc, char **argv) {
                          actual.size() * sizeof(actual.front()),
                          cudaMemcpyDeviceToHost),
               "download attention output");
+    if (!options.dumpOutput.empty()) {
+      writeFixture(options.dumpOutput, kvIndptr, kvIndices, lastPageLen, queries,
+                   pages, actual);
+    }
 
     std::uint32_t outputFailures = 0;
     std::uint32_t continuationFailures = 0;
