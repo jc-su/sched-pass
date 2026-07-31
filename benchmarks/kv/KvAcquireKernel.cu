@@ -1,5 +1,5 @@
 #include "benchmarks/kv/KvTypes.h"
-#include "nta/DeviceAPI.cuh"
+#include "nta/KernelPolicy.cuh"
 #include "runtime/device/Acquire.cuh"
 
 #include <cuda_runtime.h>
@@ -47,22 +47,25 @@ popReadyContinuation(nta::abi::RuntimeView *runtime) {
   return selected;
 }
 
-__device__ __forceinline__ void
-runKvTile(nta::abi::RuntimeView *runtime,
-          const nta::benchmark::TileTask *tasks, std::uint32_t taskIndex,
-          const float *query, float *output) {
+__device__ __forceinline__ void runKvTile(nta::abi::RuntimeView *runtime,
+                                          const nta::benchmark::TileTask *tasks,
+                                          std::uint32_t taskIndex,
+                                          const float *query, float *output) {
 
   const nta::benchmark::TileTask task = tasks[taskIndex];
   nta::abi::Continuation &continuation =
       runtime->continuations[task.continuation];
 
-  __nta_bind_request(task.requestSlot, task.generation);
-  void *address = __nta_acquire_marker(
-      runtime, reinterpret_cast<const void *>(task.directBase), task.objectSlot,
-      task.objectId, task.objectVersion, task.offset, task.bytes,
-      task.continuation);
+  const nta::kernel::BoundRequest request{task.requestSlot, task.generation,
+                                          task.continuation};
+  const nta::abi::AcquireRequirement requirement{
+      task.directBase, 0,
+      task.objectId,   task.offset,
+      task.objectSlot, task.objectVersion,
+      task.bytes,      0};
+  void *address = nta::kernel::acquireAddress(runtime, request, requirement);
   if (address == nullptr) {
-    __nta_defer_marker(runtime, task.continuation);
+    nta::kernel::defer(runtime, request);
     return;
   }
 
@@ -104,12 +107,19 @@ runNvmeHash(nta::abi::RuntimeView *runtime,
   nta::abi::Continuation &continuation =
       runtime->continuations[task.continuation];
 
-  __nta_bind_request(task.requestSlot, task.generation);
-  void *address = __nta_acquire_marker(
-      runtime, nullptr, task.objectSlot, task.objectId, task.objectVersion,
-      task.offset, task.bytes, task.continuation);
+  const nta::kernel::BoundRequest request{task.requestSlot, task.generation,
+                                          task.continuation};
+  const nta::abi::AcquireRequirement requirement{0,
+                                                 0,
+                                                 task.objectId,
+                                                 task.offset,
+                                                 task.objectSlot,
+                                                 task.objectVersion,
+                                                 task.bytes,
+                                                 0};
+  void *address = nta::kernel::acquireAddress(runtime, request, requirement);
   if (address == nullptr) {
-    __nta_defer_marker(runtime, task.continuation);
+    nta::kernel::defer(runtime, request);
     return;
   }
 
@@ -149,32 +159,30 @@ runDependencyTile(nta::abi::RuntimeView *runtime,
                   const nta::abi::WorkItem *tasks,
                   const nta::abi::AcquireRequirement *requirements,
                   std::uint32_t taskIndex, const float *query, float *output) {
-  const nta::abi::WorkItem task = tasks[taskIndex];
+  nta::kernel::WorkContext work{};
+  const bool ready =
+      nta::kernel::acquireWork(runtime, tasks, requirements, taskIndex, work);
+  const nta::abi::WorkItem task = work.item;
   nta::abi::Continuation &continuation =
       runtime->continuations[task.continuation];
-  const nta::abi::AcquireRequirement *dependencies =
-      requirements + task.dependencyBegin;
-
-  __nta_bind_request(task.requestSlot, task.generation);
-  const bool ready = __nta_acquire_set_marker(
-      runtime, dependencies, task.dependencyCount, task.directDependencyCount,
-      task.continuation);
   if (!ready) {
-    __nta_defer_marker(runtime, task.continuation);
+    nta::kernel::defer(runtime, work);
     return;
   }
 
   float partial = 0.0F;
   for (std::uint32_t dependency = 0; dependency < task.dependencyCount;
        ++dependency) {
+    const nta::abi::AcquireRequirement *requirement =
+        work.requirement(dependency);
     const auto *values = static_cast<const float *>(
-        nta_requirement_address(runtime, dependencies + dependency));
-    if (values == nullptr) {
+        nta::kernel::address(runtime, work, dependency));
+    if (requirement == nullptr || values == nullptr) {
       nta::device::failContinuation(runtime, task.continuation,
                                     nta::abi::ContinuationState::Failed);
       return;
     }
-    const std::uint32_t count = dependencies[dependency].bytes / sizeof(float);
+    const std::uint32_t count = requirement->bytes / sizeof(float);
     const float weight = static_cast<float>(dependency + 1U);
     for (std::uint32_t element = threadIdx.x; element < count;
          element += blockDim.x) {
@@ -248,16 +256,12 @@ runMoeTile(nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
            const nta::abi::AcquireRequirement *requirements,
            std::uint32_t taskIndex, const float *input, float *output,
            std::uint32_t hiddenSize) {
-  const nta::abi::WorkItem task = tasks[taskIndex];
-  const nta::abi::AcquireRequirement *experts =
-      requirements + task.dependencyBegin;
-
-  __nta_bind_request(task.requestSlot, task.generation);
-  const bool ready = __nta_acquire_set_marker(
-      runtime, experts, task.dependencyCount, task.directDependencyCount,
-      task.continuation);
+  nta::kernel::WorkContext work{};
+  const bool ready =
+      nta::kernel::acquireWork(runtime, tasks, requirements, taskIndex, work);
+  const nta::abi::WorkItem task = work.item;
   if (!ready) {
-    __nta_defer_marker(runtime, task.continuation);
+    nta::kernel::defer(runtime, work);
     return;
   }
 
@@ -266,7 +270,7 @@ runMoeTile(nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
   for (std::uint32_t dependency = 0; dependency < task.dependencyCount;
        ++dependency) {
     const auto *weights = static_cast<const float *>(
-        nta_requirement_address(runtime, experts + dependency));
+        nta::kernel::address(runtime, work, dependency));
     if (weights == nullptr) {
       nta::device::failContinuation(runtime, task.continuation,
                                     nta::abi::ContinuationState::Failed);
@@ -284,9 +288,8 @@ runMoeTile(nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence();
-    atomicExch(
-        &runtime->continuations[task.continuation].state,
-        static_cast<std::uint32_t>(nta::abi::ContinuationState::Done));
+    atomicExch(&runtime->continuations[task.continuation].state,
+               static_cast<std::uint32_t>(nta::abi::ContinuationState::Done));
   }
 }
 
@@ -304,10 +307,9 @@ nta_kv_tile_kernel(nta::abi::RuntimeView *runtime,
   runKvTile(runtime, tasks, taskIndex, query, output);
 }
 
-extern "C" __global__ void
-nta_kv_ready_kernel(nta::abi::RuntimeView *runtime,
-                    const nta::benchmark::TileTask *tasks,
-                    std::uint32_t taskCount, const float *query, float *output) {
+extern "C" __global__ void nta_kv_ready_kernel(
+    nta::abi::RuntimeView *runtime, const nta::benchmark::TileTask *tasks,
+    std::uint32_t taskCount, const float *query, float *output) {
   const std::uint32_t continuation = popReadyContinuation(runtime);
   if (continuation >= runtime->continuationCapacity) {
     return;
@@ -329,9 +331,10 @@ extern "C" __global__ void nta_nvme_hash_kernel(
   runNvmeHash(runtime, tasks, taskIndex, output);
 }
 
-extern "C" __global__ void nta_nvme_ready_hash_kernel(
-    nta::abi::RuntimeView *runtime, const nta::benchmark::TileTask *tasks,
-    std::uint32_t taskCount, std::uint64_t *output) {
+extern "C" __global__ void
+nta_nvme_ready_hash_kernel(nta::abi::RuntimeView *runtime,
+                           const nta::benchmark::TileTask *tasks,
+                           std::uint32_t taskCount, std::uint64_t *output) {
   const std::uint32_t continuation = popReadyContinuation(runtime);
   if (continuation >= runtime->continuationCapacity) {
     return;
@@ -388,7 +391,8 @@ extern "C" __global__ void nta_moe_tile_kernel(
   if (taskIndex >= taskCount || hiddenSize == 0 || blockDim.x != hiddenSize) {
     return;
   }
-  runMoeTile(runtime, tasks, requirements, taskIndex, input, output, hiddenSize);
+  runMoeTile(runtime, tasks, requirements, taskIndex, input, output,
+             hiddenSize);
 }
 
 extern "C" __global__ void nta_moe_ready_kernel(

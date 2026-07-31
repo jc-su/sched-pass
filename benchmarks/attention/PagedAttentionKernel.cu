@@ -1,10 +1,10 @@
 #include "benchmarks/attention/PagedAttentionTypes.h"
-#include "nta/DeviceAPI.cuh"
+#include "nta/KernelPolicy.cuh"
 #include "runtime/device/Acquire.cuh"
 
+#include <cuda/barrier>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cuda/barrier>
 
 #if defined(NTA_USE_FLASHINFER_STATE)
 #include <flashinfer/attention/state.cuh>
@@ -58,26 +58,22 @@ popReadyContinuation(nta::abi::RuntimeView *runtime) {
 
 __device__ __forceinline__ void
 computeAttentionTile(nta::abi::RuntimeView *runtime,
-                     const AttentionTileTask &task,
-                     std::uint32_t taskIndex,
-                     std::uint32_t continuationIndex,
-                     const __half *page,
+                     const AttentionTileTask &task, std::uint32_t taskIndex,
+                     std::uint32_t continuationIndex, const __half *page,
                      const __half *queries, AttentionTilePartial *partials) {
   nta::abi::Continuation &continuation =
       runtime->continuations[continuationIndex];
   const __half *keys = page;
-  const __half *values =
-      page + AttentionPageTokens * AttentionHeadDimension;
-  const __half *query =
-      queries + task.requestIndex * AttentionHeadDimension;
+  const __half *values = page + AttentionPageTokens * AttentionHeadDimension;
+  const __half *query = queries + task.requestIndex * AttentionHeadDimension;
   AttentionTilePartial &partial = partials[taskIndex];
 
   __shared__ float reduction[AttentionHeadDimension];
   __shared__ float logits[AttentionPageTokens];
   for (std::uint32_t token = 0; token < task.tokenCount; ++token) {
-    const float product = __half2float(query[threadIdx.x]) *
-                          __half2float(keys[token * AttentionHeadDimension +
-                                            threadIdx.x]);
+    const float product =
+        __half2float(query[threadIdx.x]) *
+        __half2float(keys[token * AttentionHeadDimension + threadIdx.x]);
     const float dot = blockSum128(product, reduction);
     if (threadIdx.x == 0) {
       logits[token] = dot * 0.08838834764831845F;
@@ -100,9 +96,9 @@ computeAttentionTile(nta::abi::RuntimeView *runtime,
   for (std::uint32_t token = 0; token < task.tokenCount; ++token) {
     const float weight = expf(logits[token] - tileMaximum);
     denominator += weight;
-    numerator += weight *
-                 __half2float(values[token * AttentionHeadDimension +
-                                     threadIdx.x]);
+    numerator +=
+        weight *
+        __half2float(values[token * AttentionHeadDimension + threadIdx.x]);
   }
   partial.output[threadIdx.x] = numerator / denominator;
   if (threadIdx.x == 0) {
@@ -121,50 +117,40 @@ runAttentionTile(nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
                  std::uint32_t taskIndex, const __half *queries,
                  AttentionTilePartial *partials) {
   const AttentionTileTask task = tasks[taskIndex];
-  const nta::abi::WorkItem work = workItems[taskIndex];
-  const nta::abi::AcquireRequirement *dependencies =
-      requirements + work.dependencyBegin;
-  __nta_bind_request(work.requestSlot, work.generation);
-  const bool ready = __nta_acquire_set_marker(
-      runtime, dependencies, work.dependencyCount, work.directDependencyCount,
-      work.continuation);
+  nta::kernel::WorkContext work{};
+  const bool ready = nta::kernel::acquireWork(runtime, workItems, requirements,
+                                              taskIndex, work);
   if (!ready) {
-    __nta_defer_marker(runtime, work.continuation);
+    nta::kernel::defer(runtime, work);
     return;
   }
-  const auto *page = static_cast<const __half *>(
-      nta_requirement_address(runtime, dependencies));
+  const auto *page =
+      static_cast<const __half *>(nta::kernel::address(runtime, work, 0));
   if (page == nullptr) {
-    nta::device::failContinuation(runtime, work.continuation,
+    nta::device::failContinuation(runtime, work.item.continuation,
                                   nta::abi::ContinuationState::Failed);
     return;
   }
-  computeAttentionTile(runtime, task, taskIndex, work.continuation, page,
+  computeAttentionTile(runtime, task, taskIndex, work.item.continuation, page,
                        queries, partials);
 }
 
 __device__ __forceinline__ void runAttentionTileTma(
     nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
     const nta::abi::WorkItem *workItems,
-    const nta::abi::AcquireRequirement *requirements,
-    std::uint32_t taskIndex, const __half *queries,
-    AttentionTilePartial *partials) {
+    const nta::abi::AcquireRequirement *requirements, std::uint32_t taskIndex,
+    const __half *queries, AttentionTilePartial *partials) {
   const AttentionTileTask task = tasks[taskIndex];
-  const nta::abi::WorkItem work = workItems[taskIndex];
-  const nta::abi::AcquireRequirement *dependencies =
-      requirements + work.dependencyBegin;
-  __nta_bind_request(work.requestSlot, work.generation);
-  const bool ready = __nta_acquire_set_marker(
-      runtime, dependencies, work.dependencyCount, work.directDependencyCount,
-      work.continuation);
+  nta::kernel::WorkContext work{};
+  const bool ready = nta::kernel::acquireWork(runtime, workItems, requirements,
+                                              taskIndex, work);
   if (!ready) {
-    __nta_defer_marker(runtime, work.continuation);
+    nta::kernel::defer(runtime, work);
     return;
   }
-  const void *descriptor =
-      nta_requirement_tensor_map(runtime, dependencies);
+  const void *descriptor = nta::kernel::tensorMap(runtime, work, 0);
   if (descriptor == nullptr) {
-    nta::device::failContinuation(runtime, work.continuation,
+    nta::device::failContinuation(runtime, work.item.continuation,
                                   nta::abi::ContinuationState::Failed);
     return;
   }
@@ -190,7 +176,7 @@ __device__ __forceinline__ void runAttentionTileTma(
     token = barrier.arrive();
   }
   barrier.wait(static_cast<decltype(token) &&>(token));
-  computeAttentionTile(runtime, task, taskIndex, work.continuation, page,
+  computeAttentionTile(runtime, task, taskIndex, work.item.continuation, page,
                        queries, partials);
 }
 

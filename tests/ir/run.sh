@@ -40,6 +40,21 @@ if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
   exit 1
 fi
 
+# `clang -fpass-plugin` uses the optimizer extension point rather than an
+# explicit `-passes=nta-acquire` pipeline. Exercise that JIT entry path too.
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes='default<O3>' \
+  -S "${source_dir}/dependency-set.ll" \
+  -o "${output_dir}/dependency-set.jit-lowered.ll"
+rg -q 'call i1 @nta_acquire_set_slow' \
+  "${output_dir}/dependency-set.jit-lowered.ll"
+if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
+  "${output_dir}/dependency-set.jit-lowered.ll"; then
+  echo "JIT optimizer pipeline still contains an NTA marker" >&2
+  exit 1
+fi
+
 "${opt}" \
   -load-pass-plugin="${plugin}" \
   -passes=nta-acquire \

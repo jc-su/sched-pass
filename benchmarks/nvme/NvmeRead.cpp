@@ -1,4 +1,5 @@
 #include "benchmarks/kv/KvTypes.h"
+#include "nta/FinitePhase.h"
 #include "nta/HostRuntime.h"
 #include "nta/NvmeRuntime.h"
 
@@ -182,31 +183,16 @@ public:
   KernelModule() {
     checkDriver(cuModuleLoad(&module_, NTA_KV_CUBIN_PATH),
                 "cuModuleLoad instrumented cubin");
-    checkDriver(cuModuleGetFunction(&reset_, module_, "nta_reset_epoch"),
-                "cuModuleGetFunction nta_reset_epoch");
     checkDriver(cuModuleGetFunction(&hash_, module_, "nta_nvme_hash_kernel"),
                 "cuModuleGetFunction nta_nvme_hash_kernel");
-    checkDriver(cuModuleGetFunction(&ready_, module_,
-                                    "nta_nvme_ready_hash_kernel"),
-                "cuModuleGetFunction nta_nvme_ready_hash_kernel");
-    checkDriver(cuModuleGetFunction(&publish_, module_, "nta_publish_ready"),
-                "cuModuleGetFunction nta_publish_ready");
-    checkDriver(cuModuleGetFunction(&progress_, module_, "nta_progress_nvme"),
-                "cuModuleGetFunction nta_progress_nvme");
+    checkDriver(
+        cuModuleGetFunction(&ready_, module_, "nta_nvme_ready_hash_kernel"),
+        "cuModuleGetFunction nta_nvme_ready_hash_kernel");
   }
   ~KernelModule() {
     if (module_ != nullptr) {
       (void)cuModuleUnload(module_);
     }
-  }
-
-  void reset(CUstream stream, nta::abi::RuntimeView *runtime,
-             std::uint32_t count) const {
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress, &count, &count};
-    checkDriver(cuLaunchKernel(reset_, 1, 1, 1, 256, 1, 1, 0, stream, arguments,
-                               nullptr),
-                "cuLaunchKernel reset");
   }
 
   void hash(CUstream stream, nta::abi::RuntimeView *runtime,
@@ -221,32 +207,6 @@ public:
     checkDriver(cuLaunchKernel(hash_, count, 1, 1, 256, 1, 1, 0, stream,
                                arguments, nullptr),
                 "cuLaunchKernel NVMe hash");
-  }
-
-  void progress(CUstream stream, nta::abi::RuntimeView *runtime) const {
-    std::uint32_t issueBudget = 32;
-    std::uint32_t completionBudget = 32;
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {
-        &runtimeAddress,
-        &issueBudget,
-        &completionBudget,
-    };
-    checkDriver(cuLaunchKernel(progress_, 1, 1, 1, 32, 1, 1, 0, stream,
-                               arguments, nullptr),
-                "cuLaunchKernel NVMe progress");
-  }
-
-  void publish(CUstream stream, nta::abi::RuntimeView *runtime,
-               std::uint32_t continuationCount) const {
-    const std::uint32_t threads = 256;
-    const std::uint32_t blocks = std::min(
-        32U, (continuationCount + threads - 1U) / threads);
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress, &continuationCount};
-    checkDriver(cuLaunchKernel(publish_, blocks, 1, 1, threads, 1, 1, 0,
-                               stream, arguments, nullptr),
-                "cuLaunchKernel publish NVMe ready");
   }
 
   void ready(CUstream stream, nta::abi::RuntimeView *runtime,
@@ -266,13 +226,12 @@ public:
                 "cuLaunchKernel NVMe ready hash");
   }
 
+  [[nodiscard]] CUmodule module() const noexcept { return module_; }
+
 private:
   CUmodule module_ = nullptr;
-  CUfunction reset_ = nullptr;
   CUfunction hash_ = nullptr;
   CUfunction ready_ = nullptr;
-  CUfunction publish_ = nullptr;
-  CUfunction progress_ = nullptr;
 };
 
 } // namespace
@@ -340,6 +299,7 @@ int main(int argc, char **argv) {
               "upload NVMe task");
 
     KernelModule kernels;
+    nta::FinitePhaseProgram phases(kernels.module());
     cudaStream_t stream = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graphExec = nullptr;
@@ -353,18 +313,21 @@ int main(int argc, char **argv) {
 
     checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
               "cudaStreamBeginCapture");
-    kernels.reset(driverStream, runtime.deviceView(), options.requests);
-    checkCuda(cudaMemsetAsync(output.get(), 0,
-                              sizeof(std::uint64_t) * options.requests, stream),
-              "cudaMemsetAsync output");
-    kernels.hash(driverStream, runtime.deviceView(), tasks.get(),
-                 options.requests, output.get(), 0);
-    for (std::uint32_t pass = 0; pass < options.progressPasses; ++pass) {
-      kernels.progress(driverStream, runtime.deviceView());
-      kernels.publish(driverStream, runtime.deviceView(), options.requests);
-      kernels.ready(driverStream, runtime.deviceView(), tasks.get(),
-                    options.requests, output.get());
-    }
+    phases.enqueueNvme(
+        driverStream, runtime.deviceView(),
+        {options.requests, options.requests, options.progressPasses, 32, 32},
+        [&] {
+          checkCuda(cudaMemsetAsync(output.get(), 0,
+                                    sizeof(std::uint64_t) * options.requests,
+                                    stream),
+                    "cudaMemsetAsync output");
+          kernels.hash(driverStream, runtime.deviceView(), tasks.get(),
+                       options.requests, output.get(), 0);
+        },
+        [&] {
+          kernels.ready(driverStream, runtime.deviceView(), tasks.get(),
+                        options.requests, output.get());
+        });
     checkCuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
     checkCuda(cudaGraphInstantiate(&graphExec, graph, 0),
               "cudaGraphInstantiate");

@@ -17,6 +17,11 @@ PassPluginLibraryInfo pluginInfo() {
       "NtaPass",
       LLVM_VERSION_STRING,
       [](PassBuilder &passBuilder) {
+        passBuilder.registerOptimizerLastEPCallback(
+            [](ModulePassManager &manager, OptimizationLevel,
+               ThinOrFullLTOPhase) {
+              manager.addPass(nta::AcquireLoweringPass());
+            });
         passBuilder.registerPipelineParsingCallback(
             [](StringRef name, ModulePassManager &manager,
                ArrayRef<PassBuilder::PipelineElement>) {

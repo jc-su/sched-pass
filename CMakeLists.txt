@@ -166,6 +166,7 @@ if(NTA_ENABLE_CUDA)
 
   add_library(nta-runtime-host STATIC
     runtime/host/DeviceWorkPlan.cpp
+    runtime/host/FinitePhase.cpp
     runtime/host/NvmeRuntime.cpp
     runtime/host/Runtime.cpp
   )
@@ -244,12 +245,42 @@ if(NTA_ENABLE_CUDA)
       benchmarks/kv/KvAcquireKernel.cu
       benchmarks/kv/KvTypes.h
       include/nta/DeviceAPI.cuh
+      include/nta/KernelPolicy.cuh
       include/nta/RuntimeABI.h
       runtime/device/Acquire.cuh
     VERBATIM
     COMMAND_EXPAND_LISTS
   )
   add_custom_target(nta-kv-kernel ALL DEPENDS "${NTA_KV_CUBIN}")
+
+  add_test(
+    NAME nta-clang-jit
+    COMMAND
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/jit/run.sh
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/nvcc_clang.py
+      $<TARGET_FILE:NtaPass>
+      ${NTA_CLANG_CUDA}
+      ${NTA_CUDA_ROOT}
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${NTA_CUDA_ARCH}
+      ${LLVM_TOOLS_BINARY_DIR}/llvm-dis
+      ${CMAKE_CURRENT_BINARY_DIR}/jit-test
+  )
+  if(NTA_HAVE_FLASHINFER AND Python3_Interpreter_FOUND)
+    add_test(
+      NAME nta-flashinfer-jit-compile
+      COMMAND
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
+        --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+        --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
+        --clang ${NTA_CLANG_CUDA}
+        --cuda-path ${NTA_CUDA_ROOT}
+        --
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/flashinfer/jit_compile.py
+    )
+    set_tests_properties(nta-flashinfer-jit-compile PROPERTIES TIMEOUT 300)
+  endif()
 
   set(NTA_ATTENTION_RAW_BC
       "${CMAKE_CURRENT_BINARY_DIR}/kernel/PagedAttention.raw.bc")
@@ -308,6 +339,7 @@ if(NTA_ENABLE_CUDA)
       benchmarks/attention/PagedAttentionKernel.cu
       benchmarks/attention/PagedAttentionTypes.h
       include/nta/DeviceAPI.cuh
+      include/nta/KernelPolicy.cuh
       include/nta/RuntimeABI.h
       runtime/device/Acquire.cuh
     VERBATIM

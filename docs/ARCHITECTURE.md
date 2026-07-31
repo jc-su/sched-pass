@@ -413,6 +413,13 @@ identity, atomics, volatile loads, local allocation, and unknown calls taint
 control or operands as non-collective. Automatic discovery of unmarked
 production address cones remains an open production gate.
 
+For JIT-generated source, the pass also registers at Clang's optimizer-last
+extension point. An nvcc-compatible shim translates the generator command,
+loads the pass, and isolates artifacts in a cache fingerprinted by ABI and
+compiler integration content. This removes a custom offline compilation step;
+it does not manufacture missing request/object semantics or a safe deferral
+point in an arbitrary kernel.
+
 ### 7.5 Phase E: lowering
 
 Lower explicit frontend markers to a small internal acquisition IR using
@@ -444,6 +451,11 @@ The host runtime may:
 - publish request contexts.
 
 This work is initialization, not per-I/O execution.
+
+Production engines may non-owningly register existing HBM, mapped-host, and
+staging allocations. They retain allocation and graph ownership. A reusable
+finite-phase launcher enqueues reset, bounded backend progress, readiness
+publication, and ready work into the engine's stream or existing graph capture.
 
 ### 8.2 Device directory
 

@@ -34,6 +34,7 @@ bool lowerDeferrals(Module &module, const FunctionPlan &plan) {
         ir::Defer, FunctionType::get(
                        voidType, {runtime->getType(), i32, i32, i32}, false));
     IRBuilder<> builder(marker);
+    builder.SetCurrentDebugLocation(marker->getDebugLoc());
     CallInst *lowered = builder.CreateCall(
         defer, {runtime, requestSlot, generation, continuation});
     Metadata *fields[] = {

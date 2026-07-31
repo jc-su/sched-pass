@@ -15,6 +15,8 @@ The current closest-work and novelty boundary is in
 [docs/RELATED_WORK.md](docs/RELATED_WORK.md).
 The implemented FlashInfer boundary and remaining serving integration are in
 [docs/FLASHINFER.md](docs/FLASHINFER.md).
+The compact host/kernel API, JIT path, and exact transparency contract are in
+[docs/INTEGRATION.md](docs/INTEGRATION.md).
 
 ## Implemented vertical slice
 
@@ -26,6 +28,10 @@ workloads:
 - an engine-neutral `WorkPlan` model and ABI-v9 bounded dependency sets, so one
   continuation can wait for several pages, experts, or object shards;
 - one reusable device-plan allocation with pinned, asynchronous batch updates;
+- non-owning registration of existing engine HBM and device-visible host
+  allocations;
+- public finite-kernel host and device policies, replacing benchmark-specific
+  phase launch and marker plumbing;
 - direct HBM and mapped-CPU-DRAM paths with no queue or atomic operation;
 - staged CPU-DRAM acquisition issued and completed by finite GPU CTAs;
 - direct NVMe reads into either DMA-BUF-registered HBM or registered mapped
@@ -46,20 +52,22 @@ workloads:
 - real TMA consumption from direct sources or from HBM after external staging,
   with compiler-proven deferral before barrier creation;
 - one captured CUDA graph containing discover, bounded progress, and resume
-  kernels; and
-- an inspectable NVVM IR -> pass -> PTX -> cubin build pipeline.
+  kernels;
+- an inspectable NVVM IR -> pass -> PTX -> cubin build pipeline;
+- automatic optimizer-last lowering in Clang JIT builds, with an nvcc-compatible
+  compiler shim and an ABI-fingerprinted FlashInfer cache.
 
 The core ABI and compiler pass do not depend on FlashInfer, vLLM, SGLang, or a
 kernel name. A supported kernel must still expose a reconstructible pre-state
 work boundary; arbitrary instruction-level suspension is not implemented. The
-FlashInfer compatibility layer does not yet place deferral inside
-FlashInfer's optimized FMHA CTA, and no vLLM/SGLang request-lifecycle adapter is
-present. The compiler currently consumes explicit acquisition markers; automatic
-recognition of arbitrary production load/cp.async/TMA address cones is an open
-gate. The pass does prove CTA-uniform control and operands for explicit sites;
-lane-divergent collective calls are rejected. There is no placeholder RDMA
-backend. NVMe is implemented against an isolated KIOXIA CD8P controller and
-tested with read-only commands. The previous
+FlashInfer compatibility layer and JIT transport do not yet place deferral
+inside FlashInfer's optimized FMHA CTA, and no vLLM/SGLang request-lifecycle
+adapter is present. The compiler currently consumes explicit acquisition
+markers; automatic recognition of arbitrary production load/cp.async/TMA
+address cones is an open gate. The pass does prove CTA-uniform control and
+operands for explicit sites; lane-divergent collective calls are rejected.
+There is no placeholder RDMA backend. NVMe is implemented against an isolated
+KIOXIA CD8P controller and tested with read-only commands. The previous
 scheduling prototype remains on `main` at commit `4789f16`.
 
 ## Build and test
@@ -78,6 +86,19 @@ cmake -S . -B build -GNinja \
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+Compile a source-generated CUDA kernel through Clang and the NTA pass without a
+separate `opt` step:
+
+```bash
+tools/jit/activate.py --build-dir build -- \
+  python3 your_flashinfer_or_kernel_generator.py
+```
+
+This makes the compiler delivery transparent, not the kernel semantics. The
+kernel source must expose one CTA-uniform, pre-state acquisition hook; arbitrary
+precompiled cubins cannot be transformed safely. See
+[docs/INTEGRATION.md](docs/INTEGRATION.md).
 
 Run the real mixed-placement workload:
 
@@ -127,8 +148,9 @@ memcheck, racecheck, and synccheck.
 reports paired 95% t intervals.
 
 When `flashinfer-python` is installed, CMake locates its headers and builds the
-attention reduction with `flashinfer::state_t`; CTest also enables
-`nta-flashinfer-differential-gpu`. Override header discovery with
+attention reduction with `flashinfer::state_t`; CTest also enables the real
+multi-source JIT compile and `nta-flashinfer-differential-gpu` gates. Override
+header discovery with
 `-DNTA_FLASHINFER_INCLUDE_DIR=/path/to/include`.
 
 ## GPU-initiated NVMe

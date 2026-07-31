@@ -34,6 +34,17 @@ struct HostReplicaSpec {
   Placement placement;
 };
 
+// Non-owning registration for allocations managed by an inference engine or
+// another memory runtime. Every source address must already be device-visible;
+// HostRuntime never frees registered source or staging allocations.
+struct RegisteredReplicaSpec {
+  const void *sourceDeviceAddress;
+  Placement placement;
+  const void *tensorMap = nullptr;
+  std::uint64_t estimatedLatencyNs = 0;
+  std::uint64_t estimatedBandwidthBytesPerSecond = 0;
+};
+
 struct ObjectHandle {
   std::uint32_t slot;
   void *directDeviceBase;
@@ -63,16 +74,20 @@ public:
                              std::uint32_t version,
                              std::span<const std::byte> contents,
                              Placement placement);
-  ObjectHandle installReplicatedObject(
-      std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
-      std::span<const HostReplicaSpec> replicas);
+  ObjectHandle
+  installReplicatedObject(std::uint32_t slot, std::uint64_t objectId,
+                          std::uint32_t version,
+                          std::span<const HostReplicaSpec> replicas);
+  ObjectHandle registerObject(std::uint32_t slot, std::uint64_t objectId,
+                              std::uint32_t version, std::size_t bytes,
+                              void *stagingDeviceAddress,
+                              std::span<const RegisteredReplicaSpec> replicas);
   ObjectHandle installNvmeObject(std::uint32_t slot, std::uint64_t objectId,
                                  std::uint32_t version,
                                  std::uint64_t sourceByteOffset,
                                  std::size_t bytes,
                                  std::unique_ptr<NvmeBuffer> destination);
-  void bindTensorMaps(std::uint32_t objectSlot,
-                      std::uint32_t relativeReplica,
+  void bindTensorMaps(std::uint32_t objectSlot, std::uint32_t relativeReplica,
                       const void *replicaTensorMap,
                       const void *stagingTensorMap = nullptr);
 

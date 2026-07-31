@@ -36,7 +36,7 @@ Generated evidence is under `results/` and is excluded from source control.
 
 ## Correctness Gates
 
-`ctest --test-dir build --output-on-failure` passes 14 tests:
+`ctest --test-dir build --output-on-failure` passes 16 tests:
 
 1. FlashInfer CSR-to-common-plan validation, including grouped pages and bad
    metadata;
@@ -45,18 +45,23 @@ Generated evidence is under `results/` and is excluded from source control.
    rejection of live-state, token, missing-binding, non-inlined-helper,
    lane-divergent control, and lane-divergent operand cases;
 4. host/device ABI v9 layout;
-5. runtime allocation, object/replica capacities, cancellation, reusable
-   pinned/async device-plan upload, and runtime binding validation;
-6. mixed-tier acquisition with duplicate coalescing, stale generations,
+5. Clang nvcc-shim compilation of a foreign source kernel, including automatic
+   optimizer-last lowering, marker removal, metadata, and fast-math forwarding;
+6. compilation and linking of FlashInfer's real three-source custom batch-decode
+   extension through the same JIT activator and isolated cache;
+7. runtime allocation, object/replica capacities, cancellation, non-owning
+   engine allocation registration, reusable pinned/async device-plan upload,
+   and runtime binding validation;
+8. mixed-tier acquisition with duplicate coalescing, stale generations,
    cancellation, and repeated intent-slot reuse;
-7. a three-object-per-CTA mixed-tier dependency set;
-8. stale object-version failure without output publication;
-9. a 4,096-CTA all-direct scale case with `pending=0`;
-10. routed top-2 MoE expert matrices across mixed tiers;
-11. the matching direct-address numerical baseline;
-12. staged split-K paged attention through the common work plan;
-13. the same common-plan attention path using hardware TMA; and
-14. differential output validation against FlashInfer 0.6.12.
+9. a three-object-per-CTA mixed-tier dependency set;
+10. stale object-version failure without output publication;
+11. a 4,096-CTA all-direct scale case with `pending=0`;
+12. routed top-2 MoE expert matrices across mixed tiers;
+13. the matching direct-address numerical baseline;
+14. staged split-K paged attention through the common work plan;
+15. the same common-plan attention path using hardware TMA; and
+16. differential output validation against FlashInfer 0.6.12.
 
 The pass now proves a canonical finite defer edge and CTA collectivity. Markers
 must be inlined into a GPU kernel entry, where the CTA analysis treats kernel
@@ -81,6 +86,11 @@ CTA barrier, and a grid-stride loop over actual pending entries.
 A separate CUDA-disabled build against the supported LLVM 22 installation
 passes all four applicable adapter, plan, IR, and ABI tests.
 
+The JIT activator additionally compiled and linked FlashInfer 0.6.12's real
+three-source custom batch-decode extension in an isolated NTA cache. This is a
+compiler-delivery smoke test. The custom variant did not contain an acquisition
+site, so optimized FlashInfer continuation remains an open gate.
+
 ## Sanitizers And Resources
 
 The latest mixed-tier TMA attention, dependency-set, and MoE runs report:
@@ -95,11 +105,11 @@ PTXAS reports no spills. Current key resources are:
 
 | Kernel | Registers | Shared bytes | Barriers |
 | --- | ---: | ---: | ---: |
-| dependency initial / ready | 62 / 62 | 128 / 132 | 1 / 1 |
+| dependency initial / ready | 60 / 60 | 128 / 132 | 1 / 1 |
 | direct numerical baseline | 32 | 128 | 1 |
 | MoE initial / ready | 64 / 62 | 0 / 4 | 1 / 1 |
 | attention global initial / ready | 62 / 62 | 576 / 580 | 1 / 1 |
-| attention TMA initial / ready | 62 / 62 | 8,840 / 8,840 | 1 / 1 |
+| attention TMA initial / ready | 62 / 64 | 8,840 / 8,840 | 1 / 1 |
 | pending readiness publication | 24 | 0 | 0 |
 | host staging progress | 26 | 24 | 1 |
 | NVMe progress | 50 | 0 | 0 |
@@ -117,10 +127,10 @@ baseline bypassed request/acquisition logic only.
 
 | Variant | Mean logical GiB/s | 95% t interval |
 | --- | ---: | ---: |
-| direct-address baseline | 394.46 | +/- 0.07 |
-| ABI-v9 dependency set | 381.30 | +/- 0.04 |
+| direct-address baseline | 394.51 | +/- 0.05 |
+| ABI-v9 dependency set | 381.29 | +/- 0.04 |
 
-The paired throughput reduction is **3.33% +/- 0.02 percentage points**. This
+The paired throughput reduction is **3.35% +/- 0.02 percentage points**. This
 is a real, nonzero mechanism cost. GPU clocks were not fixed, this is a
 microbenchmark rather than an untouched production kernel, and the interval
 does not include machine-to-machine variation.
@@ -148,14 +158,14 @@ One latest-code 8-request, 60-page, five-iteration mechanism sample was:
 
 | Source | Consumer | Graph ms | Logical GiB/s | Max abs error |
 | --- | --- | ---: | ---: | ---: |
-| HBM | global loads | 0.024 | 19.30 | 2.42e-8 |
-| HBM | TMA | 0.021 | 22.03 | 2.42e-8 |
-| mapped CPU DRAM | global loads | 0.043 | 10.62 | 2.42e-8 |
-| mapped CPU DRAM | TMA | 0.036 | 12.84 | 2.42e-8 |
-| staged CPU DRAM | global loads | 0.105 | 4.36 | 2.42e-8 |
-| staged CPU DRAM | TMA | 0.109 | 4.22 | 2.42e-8 |
-| mixed | global loads | 0.085 | 5.39 | 2.42e-8 |
-| mixed | TMA | 0.074 | 6.21 | 2.42e-8 |
+| HBM | global loads | 0.023 | 19.66 | 2.42e-8 |
+| HBM | TMA | 0.021 | 21.62 | 2.42e-8 |
+| mapped CPU DRAM | global loads | 0.045 | 10.21 | 2.42e-8 |
+| mapped CPU DRAM | TMA | 0.035 | 12.93 | 2.42e-8 |
+| staged CPU DRAM | global loads | 0.108 | 4.24 | 2.42e-8 |
+| staged CPU DRAM | TMA | 0.111 | 4.13 | 2.42e-8 |
+| mixed | global loads | 0.084 | 5.42 | 2.42e-8 |
+| mixed | TMA | 0.074 | 6.19 | 2.42e-8 |
 
 These are smoke-test mechanism numbers, not controlled performance results.
 
@@ -164,7 +174,7 @@ These are smoke-test mechanism numbers, not controlled performance results.
 The MoE gate routes each token to two expert matrices, acquires both through
 the common plan, performs real matrix-vector products, mixes routed outputs,
 and checks every element against a CPU reference. A 64-token, 16-expert,
-hidden-size-128 mixed-tier run completed at 0.189 ms per graph, 41.23 logical
+hidden-size-128 mixed-tier run completed at 0.205 ms per graph, 38.20 logical
 GiB/s, with five staged expert transfers and zero numerical failures. This
 closes the synthetic-only generality gap, but it is not a production MoE model
 or serving baseline.

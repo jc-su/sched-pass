@@ -1,4 +1,5 @@
 #include "nta/DeviceWorkPlan.h"
+#include "nta/FinitePhase.h"
 #include "nta/HostRuntime.h"
 #include "nta/WorkPlan.h"
 
@@ -156,9 +157,9 @@ Options parseOptions(int argc, char **argv) {
 template <typename T> class DeviceBuffer {
 public:
   explicit DeviceBuffer(std::size_t count) {
-    checkCuda(cudaMalloc(reinterpret_cast<void **>(&pointer_),
-                         count * sizeof(T)),
-              "cudaMalloc MoE buffer");
+    checkCuda(
+        cudaMalloc(reinterpret_cast<void **>(&pointer_), count * sizeof(T)),
+        "cudaMalloc MoE buffer");
   }
   ~DeviceBuffer() {
     if (pointer_ != nullptr) {
@@ -178,9 +179,6 @@ public:
   KernelModule() {
     checkDriver(cuModuleLoad(&module_, NTA_KV_CUBIN_PATH),
                 "cuModuleLoad MoE cubin");
-    load(reset_, "nta_reset_epoch");
-    load(progress_, "nta_progress_host_staging");
-    load(publish_, "nta_publish_ready");
     load(tile_, "nta_moe_tile_kernel");
     load(ready_, "nta_moe_ready_kernel");
   }
@@ -192,57 +190,26 @@ public:
   KernelModule(const KernelModule &) = delete;
   KernelModule &operator=(const KernelModule &) = delete;
 
-  void reset(CUstream stream, nta::abi::RuntimeView *runtime,
-             std::uint32_t objectCount,
-             std::uint32_t continuationCount) const {
-    const std::uint32_t threads = 256;
-    const std::uint32_t blocks =
-        (std::max(objectCount, continuationCount) + threads - 1U) / threads;
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress, &objectCount, &continuationCount};
-    launch(reset_, blocks, threads, stream, arguments, "reset MoE epoch");
-  }
-
-  void progress(CUstream stream, nta::abi::RuntimeView *runtime,
-                std::uint32_t objectCount) const {
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress};
-    launch(progress_, objectCount, 256, stream, arguments,
-           "progress MoE acquisition");
-  }
-
-  void publish(CUstream stream, nta::abi::RuntimeView *runtime,
-               std::uint32_t continuationCount) const {
-    constexpr std::uint32_t Threads = 256;
-    const std::uint32_t blocks = std::min(
-        32U, (continuationCount + Threads - 1U) / Threads);
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress, &continuationCount};
-    launch(publish_, blocks, Threads, stream, arguments,
-           "publish MoE readiness");
-  }
-
   void compute(CUfunction kernel, CUstream stream,
-               nta::abi::RuntimeView *runtime,
-               const nta::DeviceWorkPlan &plan, const float *input,
-               float *output, std::uint32_t hidden) const {
+               nta::abi::RuntimeView *runtime, const nta::DeviceWorkPlan &plan,
+               const float *input, float *output, std::uint32_t hidden) const {
     CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    CUdeviceptr workAddress =
-        reinterpret_cast<CUdeviceptr>(plan.workItems());
+    CUdeviceptr workAddress = reinterpret_cast<CUdeviceptr>(plan.workItems());
     CUdeviceptr dependencyAddress =
         reinterpret_cast<CUdeviceptr>(plan.dependencies());
     CUdeviceptr inputAddress = reinterpret_cast<CUdeviceptr>(input);
     CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
     std::uint32_t workCount = plan.workItemCount();
-    void *arguments[] = {&runtimeAddress, &workAddress, &workCount,
-                         &dependencyAddress, &inputAddress, &outputAddress,
-                         &hidden};
+    void *arguments[] = {
+        &runtimeAddress, &workAddress,   &workCount, &dependencyAddress,
+        &inputAddress,   &outputAddress, &hidden};
     launch(kernel, workCount, hidden, stream, arguments,
            kernel == tile_ ? "initial MoE compute" : "resumed MoE compute");
   }
 
   [[nodiscard]] CUfunction tile() const noexcept { return tile_; }
   [[nodiscard]] CUfunction ready() const noexcept { return ready_; }
+  [[nodiscard]] CUmodule module() const noexcept { return module_; }
 
 private:
   void load(CUfunction &function, const char *name) {
@@ -252,21 +219,17 @@ private:
   static void launch(CUfunction function, std::uint32_t blocks,
                      std::uint32_t threads, CUstream stream, void **arguments,
                      const char *operation) {
-    checkDriver(cuLaunchKernel(function, blocks, 1, 1, threads, 1, 1, 0,
-                               stream, arguments, nullptr),
+    checkDriver(cuLaunchKernel(function, blocks, 1, 1, threads, 1, 1, 0, stream,
+                               arguments, nullptr),
                 operation);
   }
 
   CUmodule module_ = nullptr;
-  CUfunction reset_ = nullptr;
-  CUfunction progress_ = nullptr;
-  CUfunction publish_ = nullptr;
   CUfunction tile_ = nullptr;
   CUfunction ready_ = nullptr;
 };
 
-std::vector<std::uint32_t> route(std::uint32_t token,
-                                 std::uint32_t expertCount,
+std::vector<std::uint32_t> route(std::uint32_t token, std::uint32_t expertCount,
                                  std::uint32_t topK) {
   std::vector<std::uint32_t> selected;
   selected.reserve(topK);
@@ -306,8 +269,7 @@ int main(int argc, char **argv) {
       weights[expert].resize(matrixElements);
       for (std::size_t element = 0; element < matrixElements; ++element) {
         weights[expert][element] =
-            static_cast<float>((expert * 17U + element * 3U) % 101U) /
-                127.0F -
+            static_cast<float>((expert * 17U + element * 3U) % 101U) / 127.0F -
             0.35F;
       }
       objects[expert] = runtime.installObject(
@@ -320,8 +282,7 @@ int main(int argc, char **argv) {
                              options.hidden);
     std::vector<float> expected(input.size(), 0.0F);
     for (std::size_t element = 0; element < input.size(); ++element) {
-      input[element] =
-          0.2F + static_cast<float>((element * 11U) % 67U) / 89.0F;
+      input[element] = 0.2F + static_cast<float>((element * 11U) % 67U) / 89.0F;
     }
 
     nta::WorkPlanBuilder builder(options.topK);
@@ -336,7 +297,13 @@ int main(int argc, char **argv) {
       for (std::uint32_t expert : selected) {
         dependencies.push_back({
             reinterpret_cast<std::uint64_t>(objects[expert].directDeviceBase),
-            0, 700000U + expert, 0, expert, 1, matrixBytes, 0,
+            0,
+            700000U + expert,
+            0,
+            expert,
+            1,
+            matrixBytes,
+            0,
         });
       }
       const std::uint32_t request = builder.addRequest({token, generation});
@@ -352,9 +319,9 @@ int main(int argc, char **argv) {
           float expertOutput = 0.0F;
           for (std::uint32_t inputIndex = 0; inputIndex < options.hidden;
                ++inputIndex) {
-            expertOutput = std::fma(
-                row[inputIndex], input[token * options.hidden + inputIndex],
-                expertOutput);
+            expertOutput = std::fma(row[inputIndex],
+                                    input[token * options.hidden + inputIndex],
+                                    expertOutput);
           }
           mixed = std::fma(1.0F / static_cast<float>(dependency + 1U),
                            expertOutput, mixed);
@@ -372,6 +339,7 @@ int main(int argc, char **argv) {
               "upload MoE input");
 
     KernelModule kernels;
+    nta::FinitePhaseProgram phases(kernels.module());
     cudaStream_t stream = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graphExec = nullptr;
@@ -385,19 +353,22 @@ int main(int argc, char **argv) {
 
     checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
               "begin MoE graph capture");
-    kernels.reset(driverStream, runtime.deviceView(), options.experts,
-                  options.tokens);
-    checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
-                              input.size() * sizeof(float), stream),
-              "clear MoE output");
-    kernels.compute(kernels.tile(), driverStream, runtime.deviceView(),
-                    devicePlan, deviceInput.get(), deviceOutput.get(),
-                    options.hidden);
-    kernels.progress(driverStream, runtime.deviceView(), options.experts);
-    kernels.publish(driverStream, runtime.deviceView(), options.tokens);
-    kernels.compute(kernels.ready(), driverStream, runtime.deviceView(),
-                    devicePlan, deviceInput.get(), deviceOutput.get(),
-                    options.hidden);
+    phases.enqueueHost(
+        driverStream, runtime.deviceView(),
+        {options.experts, options.tokens, options.experts, 1},
+        [&] {
+          checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
+                                    input.size() * sizeof(float), stream),
+                    "clear MoE output");
+          kernels.compute(kernels.tile(), driverStream, runtime.deviceView(),
+                          devicePlan, deviceInput.get(), deviceOutput.get(),
+                          options.hidden);
+        },
+        [&] {
+          kernels.compute(kernels.ready(), driverStream, runtime.deviceView(),
+                          devicePlan, deviceInput.get(), deviceOutput.get(),
+                          options.hidden);
+        });
     checkCuda(cudaStreamEndCapture(stream, &graph), "end MoE graph capture");
     checkCuda(cudaGraphInstantiate(&graphExec, graph, 0),
               "instantiate MoE graph");
@@ -415,8 +386,7 @@ int main(int argc, char **argv) {
     checkCuda(cudaEventSynchronize(end), "synchronize MoE end");
 
     float elapsed = 0.0F;
-    checkCuda(cudaEventElapsedTime(&elapsed, begin, end),
-              "measure MoE graph");
+    checkCuda(cudaEventElapsedTime(&elapsed, begin, end), "measure MoE graph");
     std::vector<float> output(input.size());
     checkCuda(cudaMemcpy(output.data(), deviceOutput.get(),
                          output.size() * sizeof(float), cudaMemcpyDeviceToHost),
@@ -446,9 +416,9 @@ int main(int argc, char **argv) {
     }
 
     const double graphMilliseconds = elapsed / options.iterations;
-    const double logicalGiB =
-        static_cast<double>(options.tokens) * options.topK * matrixBytes /
-        (1024.0 * 1024.0 * 1024.0);
+    const double logicalGiB = static_cast<double>(options.tokens) *
+                              options.topK * matrixBytes /
+                              (1024.0 * 1024.0 * 1024.0);
     std::cout << "workload=moe mode=" << modeName(options.mode)
               << " tokens=" << options.tokens << " experts=" << options.experts
               << " top_k=" << options.topK << " hidden=" << options.hidden

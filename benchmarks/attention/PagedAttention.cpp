@@ -1,5 +1,6 @@
 #include "benchmarks/attention/PagedAttentionTypes.h"
 #include "nta/DeviceWorkPlan.h"
+#include "nta/FinitePhase.h"
 #include "nta/FlashInferAdapter.h"
 #include "nta/HostRuntime.h"
 
@@ -75,8 +76,9 @@ void checkDriver(CUresult result, const char *operation) {
 template <typename T> class DeviceBuffer {
 public:
   explicit DeviceBuffer(std::size_t count) {
-    checkCuda(cudaMalloc(reinterpret_cast<void **>(&pointer_), count * sizeof(T)),
-              "cudaMalloc DeviceBuffer");
+    checkCuda(
+        cudaMalloc(reinterpret_cast<void **>(&pointer_), count * sizeof(T)),
+        "cudaMalloc DeviceBuffer");
   }
   ~DeviceBuffer() {
     if (pointer_ != nullptr) {
@@ -96,9 +98,6 @@ public:
   KernelModule() {
     checkDriver(cuModuleLoad(&module_, NTA_ATTENTION_CUBIN_PATH),
                 "cuModuleLoad attention cubin");
-    load(reset_, "nta_reset_epoch");
-    load(progress_, "nta_progress_host_staging");
-    load(publish_, "nta_publish_ready");
     load(tile_, "nta_attention_tile_kernel");
     load(ready_, "nta_attention_ready_kernel");
     load(tmaTile_, "nta_attention_tma_tile_kernel");
@@ -111,51 +110,29 @@ public:
     }
   }
 
-  void reset(CUstream stream, nta::abi::RuntimeView *runtime,
-             std::uint32_t objectCount,
-             std::uint32_t continuationCount) const {
-    const std::uint32_t threads = 256;
-    const std::uint32_t blocks =
-        (std::max(objectCount, continuationCount) + threads - 1U) / threads;
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {
-        &runtimeAddress,
-        &objectCount,
-        &continuationCount,
-    };
-    launch(reset_, blocks, threads, stream, arguments, "reset");
-  }
-
   void tile(CUstream stream, CUfunction function,
             nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
             const nta::DeviceWorkPlan &plan, const __half *queries,
             AttentionTilePartial *partials) const {
     CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
     CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
-    CUdeviceptr workAddress =
-        reinterpret_cast<CUdeviceptr>(plan.workItems());
+    CUdeviceptr workAddress = reinterpret_cast<CUdeviceptr>(plan.workItems());
     CUdeviceptr dependencyAddress =
         reinterpret_cast<CUdeviceptr>(plan.dependencies());
     CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(queries);
     CUdeviceptr partialAddress = reinterpret_cast<CUdeviceptr>(partials);
     std::uint32_t taskCount = plan.workItemCount();
     void *arguments[] = {
-        &runtimeAddress,
-        &taskAddress,
-        &workAddress,
-        &taskCount,
-        &dependencyAddress,
-        &queryAddress,
-        &partialAddress,
+        &runtimeAddress,    &taskAddress,  &workAddress,    &taskCount,
+        &dependencyAddress, &queryAddress, &partialAddress,
     };
     launch(function, taskCount, AttentionHeadDimension, stream, arguments,
            "attention tile");
   }
 
   void discover(CUstream stream, nta::abi::RuntimeView *runtime,
-                const AttentionTileTask *tasks,
-                const nta::DeviceWorkPlan &plan, const __half *queries,
-                AttentionTilePartial *partials) const {
+                const AttentionTileTask *tasks, const nta::DeviceWorkPlan &plan,
+                const __half *queries, AttentionTilePartial *partials) const {
     tile(stream, tile_, runtime, tasks, plan, queries, partials);
   }
 
@@ -173,27 +150,9 @@ public:
   }
 
   void readyTma(CUstream stream, nta::abi::RuntimeView *runtime,
-                const AttentionTileTask *tasks,
-                const nta::DeviceWorkPlan &plan, const __half *queries,
-                AttentionTilePartial *partials) const {
+                const AttentionTileTask *tasks, const nta::DeviceWorkPlan &plan,
+                const __half *queries, AttentionTilePartial *partials) const {
     tile(stream, tmaReady_, runtime, tasks, plan, queries, partials);
-  }
-
-  void progress(CUstream stream, nta::abi::RuntimeView *runtime,
-                std::uint32_t capacity) const {
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress};
-    launch(progress_, capacity, 256, stream, arguments, "host progress");
-  }
-
-  void publish(CUstream stream, nta::abi::RuntimeView *runtime,
-               std::uint32_t continuationCount) const {
-    const std::uint32_t threads = 256;
-    const std::uint32_t blocks = std::min(
-        32U, (continuationCount + threads - 1U) / threads);
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress, &continuationCount};
-    launch(publish_, blocks, threads, stream, arguments, "publish ready");
   }
 
   void reduce(CUstream stream, nta::abi::RuntimeView *runtime,
@@ -204,15 +163,14 @@ public:
     CUdeviceptr partialAddress = reinterpret_cast<CUdeviceptr>(partials);
     CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
     void *arguments[] = {
-        &runtimeAddress,
-        &requestAddress,
-        &requestCount,
-        &partialAddress,
-        &outputAddress,
+        &runtimeAddress, &requestAddress, &requestCount,
+        &partialAddress, &outputAddress,
     };
     launch(reduce_, requestCount, AttentionHeadDimension, stream, arguments,
            "attention reduce");
   }
+
+  [[nodiscard]] CUmodule module() const noexcept { return module_; }
 
 private:
   void load(CUfunction &function, const char *name) {
@@ -228,9 +186,6 @@ private:
   }
 
   CUmodule module_ = nullptr;
-  CUfunction reset_ = nullptr;
-  CUfunction progress_ = nullptr;
-  CUfunction publish_ = nullptr;
   CUfunction tile_ = nullptr;
   CUfunction ready_ = nullptr;
   CUfunction tmaTile_ = nullptr;
@@ -346,27 +301,28 @@ const char *copyModeName(CopyMode mode) {
 
 CUtensorMap encodePageTensorMap(void *address) {
   CUtensorMap tensorMap{};
-  constexpr cuuint64_t globalDimensions[2] = {
-      AttentionHeadDimension, 2U * AttentionPageTokens};
-  constexpr cuuint64_t globalStrides[1] = {
-      AttentionHeadDimension * sizeof(__half)};
-  constexpr cuuint32_t boxDimensions[2] = {
-      AttentionHeadDimension, 2U * AttentionPageTokens};
+  constexpr cuuint64_t globalDimensions[2] = {AttentionHeadDimension,
+                                              2U * AttentionPageTokens};
+  constexpr cuuint64_t globalStrides[1] = {AttentionHeadDimension *
+                                           sizeof(__half)};
+  constexpr cuuint32_t boxDimensions[2] = {AttentionHeadDimension,
+                                           2U * AttentionPageTokens};
   constexpr cuuint32_t elementStrides[2] = {1, 1};
-  checkDriver(
-      cuTensorMapEncodeTiled(
-          &tensorMap, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 2, address,
-          globalDimensions, globalStrides, boxDimensions, elementStrides,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-          CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
-      "cuTensorMapEncodeTiled attention page");
+  checkDriver(cuTensorMapEncodeTiled(
+                  &tensorMap, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 2, address,
+                  globalDimensions, globalStrides, boxDimensions,
+                  elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                  CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                  CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+              "cuTensorMapEncodeTiled attention page");
   return tensorMap;
 }
 
-std::vector<float> referenceAttention(
-    const std::vector<AttentionRequest> &requests,
-    const std::vector<AttentionTileTask> &tasks,
-    const std::vector<__half> &queries, const std::vector<__half> &pages) {
+std::vector<float>
+referenceAttention(const std::vector<AttentionRequest> &requests,
+                   const std::vector<AttentionTileTask> &tasks,
+                   const std::vector<__half> &queries,
+                   const std::vector<__half> &pages) {
   const std::size_t valuesPerPage =
       2ULL * AttentionPageTokens * AttentionHeadDimension;
   std::vector<float> output(requests.size() * AttentionHeadDimension);
@@ -380,14 +336,16 @@ std::vector<float> referenceAttention(
       const std::uint32_t taskIndex = request.tileBegin + tile;
       const AttentionTileTask task = tasks[taskIndex];
       const __half *keys =
-          pages.data() + static_cast<std::size_t>(task.objectSlot) * valuesPerPage;
+          pages.data() +
+          static_cast<std::size_t>(task.objectSlot) * valuesPerPage;
       for (std::uint32_t token = 0; token < task.tokenCount; ++token) {
         float dot = 0.0F;
-        for (std::uint32_t dimension = 0;
-             dimension < AttentionHeadDimension; ++dimension) {
-          dot += __half2float(
-                     queries[requestIndex * AttentionHeadDimension + dimension]) *
-                 __half2float(keys[token * AttentionHeadDimension + dimension]);
+        for (std::uint32_t dimension = 0; dimension < AttentionHeadDimension;
+             ++dimension) {
+          dot +=
+              __half2float(
+                  queries[requestIndex * AttentionHeadDimension + dimension]) *
+              __half2float(keys[token * AttentionHeadDimension + dimension]);
         }
         logits.push_back(dot * 0.08838834764831845F);
         tokenTasks.push_back(task.objectSlot);
@@ -403,9 +361,9 @@ std::vector<float> referenceAttention(
          ++dimension) {
       float numerator = 0.0F;
       for (std::size_t token = 0; token < logits.size(); ++token) {
-        const __half *values =
-            pages.data() + tokenTasks[token] * valuesPerPage +
-            AttentionPageTokens * AttentionHeadDimension;
+        const __half *values = pages.data() +
+                               tokenTasks[token] * valuesPerPage +
+                               AttentionPageTokens * AttentionHeadDimension;
         numerator +=
             std::exp(logits[token] - maximum) *
             __half2float(values[tokenOffsets[token] * AttentionHeadDimension +
@@ -456,8 +414,7 @@ void writeFixture(const std::string &path,
       1,
       static_cast<std::uint32_t>(lastPageLen.size()),
       static_cast<std::uint32_t>(
-          pages.size() /
-          (2ULL * AttentionPageTokens * AttentionHeadDimension)),
+          pages.size() / (2ULL * AttentionPageTokens * AttentionHeadDimension)),
       AttentionHeadDimension,
       AttentionPageTokens,
       static_cast<std::uint32_t>(kvIndices.size()),
@@ -485,7 +442,8 @@ int main(int argc, char **argv) {
     std::uint32_t taskCount = 0;
     for (std::uint32_t request = 0; request < options.requests; ++request) {
       const std::uint32_t requestPages =
-          options.minPages + request % (options.maxPages - options.minPages + 1U);
+          options.minPages +
+          request % (options.maxPages - options.minPages + 1U);
       taskCount += requestPages;
       kvIndptr[request + 1U] = static_cast<std::int32_t>(taskCount);
       lastPageLen[request] =
@@ -521,9 +479,8 @@ int main(int argc, char **argv) {
               ? UINT64_MAX
               : static_cast<std::uint64_t>(options.requestCreditPages) *
                     pageBytes;
-      runtime.setRequest(request, 0x4154544e00000000ULL + request,
-                         request + 1U, request % 4U, request % 8U, 0,
-                         requestCredit);
+      runtime.setRequest(request, 0x4154544e00000000ULL + request, request + 1U,
+                         request % 4U, request % 8U, 0, requestCredit);
     }
 
     std::vector<nta::flashinfer::PageBinding> pageBindings(taskCount);
@@ -536,45 +493,41 @@ int main(int argc, char **argv) {
     }
     for (std::uint32_t physicalPage = 0; physicalPage < taskCount;
          ++physicalPage) {
-        const auto *page = reinterpret_cast<const std::byte *>(
-            pages.data() + static_cast<std::size_t>(physicalPage) * valuesPerPage);
-        const std::uint64_t objectId =
-            0x4b56504700000000ULL + physicalPage;
-        const nta::Placement placement =
-            placementFor(options.mode, physicalPage);
-        const nta::ObjectHandle object = runtime.installObject(
-            physicalPage, objectId, 1,
-            std::span<const std::byte>(page, pageBytes),
-            placement);
-        std::uint64_t directTensorMap = 0;
-        if (options.copyMode == CopyMode::Tma) {
-          const nta::abi::ObjectEntry objectEntry =
-              runtime.readObject(physicalPage);
-          const nta::abi::ReplicaEntry replica =
-              runtime.readReplica(physicalPage);
-          tensorMaps[2ULL * physicalPage] = encodePageTensorMap(
-              reinterpret_cast<void *>(replica.sourceAddress));
-          const void *replicaMap =
-              deviceTensorMaps->get() + 2ULL * physicalPage;
-          const void *stagingMap = nullptr;
-          if (placement == nta::Placement::HostStaged) {
-            tensorMaps[2ULL * physicalPage + 1ULL] = encodePageTensorMap(
-                reinterpret_cast<void *>(objectEntry.stagingAddress));
-            stagingMap =
-                deviceTensorMaps->get() + 2ULL * physicalPage + 1ULL;
-          } else {
-            directTensorMap = reinterpret_cast<std::uint64_t>(replicaMap);
-          }
-          runtime.bindTensorMaps(physicalPage, 0, replicaMap, stagingMap);
+      const auto *page = reinterpret_cast<const std::byte *>(
+          pages.data() +
+          static_cast<std::size_t>(physicalPage) * valuesPerPage);
+      const std::uint64_t objectId = 0x4b56504700000000ULL + physicalPage;
+      const nta::Placement placement = placementFor(options.mode, physicalPage);
+      const nta::ObjectHandle object = runtime.installObject(
+          physicalPage, objectId, 1,
+          std::span<const std::byte>(page, pageBytes), placement);
+      std::uint64_t directTensorMap = 0;
+      if (options.copyMode == CopyMode::Tma) {
+        const nta::abi::ObjectEntry objectEntry =
+            runtime.readObject(physicalPage);
+        const nta::abi::ReplicaEntry replica =
+            runtime.readReplica(physicalPage);
+        tensorMaps[2ULL * physicalPage] = encodePageTensorMap(
+            reinterpret_cast<void *>(replica.sourceAddress));
+        const void *replicaMap = deviceTensorMaps->get() + 2ULL * physicalPage;
+        const void *stagingMap = nullptr;
+        if (placement == nta::Placement::HostStaged) {
+          tensorMaps[2ULL * physicalPage + 1ULL] = encodePageTensorMap(
+              reinterpret_cast<void *>(objectEntry.stagingAddress));
+          stagingMap = deviceTensorMaps->get() + 2ULL * physicalPage + 1ULL;
+        } else {
+          directTensorMap = reinterpret_cast<std::uint64_t>(replicaMap);
         }
-        pageBindings[physicalPage] = {
-            reinterpret_cast<std::uint64_t>(object.directDeviceBase),
-            directTensorMap,
-            objectId,
-            physicalPage,
-            1,
-            static_cast<std::uint32_t>(pageBytes),
-        };
+        runtime.bindTensorMaps(physicalPage, 0, replicaMap, stagingMap);
+      }
+      pageBindings[physicalPage] = {
+          reinterpret_cast<std::uint64_t>(object.directDeviceBase),
+          directTensorMap,
+          objectId,
+          physicalPage,
+          1,
+          static_cast<std::uint32_t>(pageBytes),
+      };
     }
     if (deviceTensorMaps != nullptr) {
       checkCuda(cudaMemcpy(deviceTensorMaps->get(), tensorMaps.data(),
@@ -617,8 +570,7 @@ int main(int argc, char **argv) {
       throw std::logic_error(
           "attention requires one common work item per physical-page tile");
     }
-    for (const nta::abi::WorkItem &workItem :
-         flashInferPlan.work.workItems) {
+    for (const nta::abi::WorkItem &workItem : flashInferPlan.work.workItems) {
       if (workItem.dependencyCount != 1U) {
         throw std::logic_error(
             "attention requires exactly one dependency per physical-page tile");
@@ -648,6 +600,7 @@ int main(int argc, char **argv) {
               "upload attention queries");
 
     KernelModule kernels;
+    nta::FinitePhaseProgram phases(kernels.module());
     cudaStream_t stream = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graphExec = nullptr;
@@ -661,34 +614,42 @@ int main(int argc, char **argv) {
 
     checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
               "cudaStreamBeginCapture");
-    kernels.reset(driverStream, runtime.deviceView(), taskCount, taskCount);
-    checkCuda(cudaMemsetAsync(devicePartials.get(), 0,
-                              tasks.size() * sizeof(AttentionTilePartial), stream),
-              "clear attention partials");
-    checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
-                              expected.size() * sizeof(float), stream),
-              "clear attention output");
-    if (options.copyMode == CopyMode::Tma) {
-      kernels.discoverTma(driverStream, runtime.deviceView(), deviceTasks.get(),
-                          devicePlan, deviceQueries.get(), devicePartials.get());
-    } else {
-      kernels.discover(driverStream, runtime.deviceView(), deviceTasks.get(),
-                       devicePlan, deviceQueries.get(), devicePartials.get());
-    }
-    if (options.mode == Mode::HostStaged || options.mode == Mode::Mixed) {
-      for (std::uint32_t pass = 0; pass < options.progressPasses; ++pass) {
-        kernels.progress(driverStream, runtime.deviceView(), taskCount);
-        kernels.publish(driverStream, runtime.deviceView(), taskCount);
-        if (options.copyMode == CopyMode::Tma) {
-          kernels.readyTma(driverStream, runtime.deviceView(), deviceTasks.get(),
-                           devicePlan, deviceQueries.get(),
-                           devicePartials.get());
-        } else {
-          kernels.ready(driverStream, runtime.deviceView(), deviceTasks.get(),
-                        devicePlan, deviceQueries.get(), devicePartials.get());
-        }
-      }
-    }
+    const std::uint32_t progressPasses =
+        options.mode == Mode::HostStaged || options.mode == Mode::Mixed
+            ? options.progressPasses
+            : 0;
+    phases.enqueueHost(
+        driverStream, runtime.deviceView(),
+        {taskCount, taskCount, taskCount, progressPasses},
+        [&] {
+          checkCuda(cudaMemsetAsync(devicePartials.get(), 0,
+                                    tasks.size() * sizeof(AttentionTilePartial),
+                                    stream),
+                    "clear attention partials");
+          checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
+                                    expected.size() * sizeof(float), stream),
+                    "clear attention output");
+          if (options.copyMode == CopyMode::Tma) {
+            kernels.discoverTma(driverStream, runtime.deviceView(),
+                                deviceTasks.get(), devicePlan,
+                                deviceQueries.get(), devicePartials.get());
+          } else {
+            kernels.discover(driverStream, runtime.deviceView(),
+                             deviceTasks.get(), devicePlan, deviceQueries.get(),
+                             devicePartials.get());
+          }
+        },
+        [&] {
+          if (options.copyMode == CopyMode::Tma) {
+            kernels.readyTma(driverStream, runtime.deviceView(),
+                             deviceTasks.get(), devicePlan, deviceQueries.get(),
+                             devicePartials.get());
+          } else {
+            kernels.ready(driverStream, runtime.deviceView(), deviceTasks.get(),
+                          devicePlan, deviceQueries.get(),
+                          devicePartials.get());
+          }
+        });
     kernels.reduce(driverStream, runtime.deviceView(), deviceRequests.get(),
                    options.requests, devicePartials.get(), deviceOutput.get());
     checkCuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
@@ -702,7 +663,8 @@ int main(int argc, char **argv) {
     checkCuda(cudaEventRecord(begin, stream), "cudaEventRecord begin");
     for (std::uint32_t iteration = 0; iteration < options.iterations;
          ++iteration) {
-      checkCuda(cudaGraphLaunch(graphExec, stream), "attention measured launch");
+      checkCuda(cudaGraphLaunch(graphExec, stream),
+                "attention measured launch");
     }
     checkCuda(cudaEventRecord(end, stream), "cudaEventRecord end");
     checkCuda(cudaEventSynchronize(end), "cudaEventSynchronize end");
@@ -716,8 +678,8 @@ int main(int argc, char **argv) {
                          cudaMemcpyDeviceToHost),
               "download attention output");
     if (!options.dumpOutput.empty()) {
-      writeFixture(options.dumpOutput, kvIndptr, kvIndices, lastPageLen, queries,
-                   pages, actual);
+      writeFixture(options.dumpOutput, kvIndptr, kvIndices, lastPageLen,
+                   queries, pages, actual);
     }
 
     std::uint32_t outputFailures = 0;
@@ -750,8 +712,9 @@ int main(int argc, char **argv) {
           static_cast<std::uint32_t>(nta::abi::ObjectState::Ready)) {
         ++objectFailures;
         if (objectFailures <= 4) {
-          std::cerr << "unready_task=" << task << " object_state="
-                    << object.state << " issue_count=" << object.issueCount
+          std::cerr << "unready_task=" << task
+                    << " object_state=" << object.state
+                    << " issue_count=" << object.issueCount
                     << " continuation_state="
                     << runtime.readContinuation(task).state << '\n';
         }
@@ -766,8 +729,8 @@ int main(int argc, char **argv) {
     if (intentPool.active != 0 || intentPool.overflow != 0) {
       ++objectFailures;
     }
-    const std::uint32_t failures =
-        outputFailures + continuationFailures + partialFailures + objectFailures;
+    const std::uint32_t failures = outputFailures + continuationFailures +
+                                   partialFailures + objectFailures;
 
     const double milliseconds = elapsedMilliseconds / options.iterations;
     const double logicalGib =

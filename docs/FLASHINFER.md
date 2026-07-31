@@ -1,7 +1,7 @@
 # FlashInfer Integration
 
-Status: data/state integration implemented; optimized-kernel continuation hook
-and serving-engine adapters remain open.
+Status: data/state and Clang JIT delivery implemented; optimized-kernel
+continuation hook and serving-engine adapters remain open.
 
 ## Why FlashInfer
 
@@ -85,11 +85,20 @@ load and TMA CTAs. Its private task record carries only attention math metadata.
 This removes a prior integration-only duplicate binding, but it still does not
 place the hook inside FlashInfer's optimized CTA.
 
-This hook should be a small upstreamable template extension, such as an optional
-`begin_kv_chunk(...)` policy on the attention variant. NTA's variant emits the
-request binding and acquisition markers; the LLVM pass proves the pre-state
-deferral boundary and lowers them. A source rewrite of every vector load or a
-long-lived FlashInfer fork is not the target design.
+The JIT activator has also compiled and linked a real FlashInfer 0.6.12 custom
+batch-decode module through Clang 22 with the NTA pass loaded. Its cache is
+fingerprinted by NTA ABI, pass, shim, and device integration content. This
+validates compiler transport and FlashInfer's multi-source extension build;
+that smoke module had no acquisition hook and is not evidence that optimized
+FlashInfer deferral is complete.
+
+FlashInfer 0.6.12's custom `AttentionVariant` interface can transform scores,
+masks, statistics, and outputs, but it cannot reject the whole CTA. The hook
+therefore needs a small upstreamable template extension, such as an optional
+`begin_kv_chunk(...)` policy after block validity and request/chunk discovery.
+NTA's policy emits the request binding and acquisition markers; the LLVM pass
+proves the pre-state deferral boundary and lowers them. A source rewrite of
+every vector load or a long-lived FlashInfer fork is not the target design.
 
 ## Serving Adapters
 

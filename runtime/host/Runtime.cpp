@@ -67,6 +67,7 @@ struct HostRuntime::Impl {
       : config(runtimeConfig), requestsHost(config.requestCapacity),
         tenantsHost(config.requestCapacity),
         requestInstalled(config.requestCapacity, false),
+        objectInstalled(config.objectCapacity, false),
         objects(config.objectCapacity), nvme(std::move(nvmeTransport)) {
     if (config.requestCapacity == 0 || config.objectCapacity == 0 ||
         config.intentCapacity == 0 || config.continuationCapacity == 0 ||
@@ -147,8 +148,7 @@ struct HostRuntime::Impl {
                       ? 0
                       : reinterpret_cast<std::uint64_t>(nvme->deviceQueue()),
                   80'000, 7'000'000'000ULL),
-          backend(abi::SourceKind::Rdma, false, 0, 5'000,
-                  25'000'000'000ULL),
+          backend(abi::SourceKind::Rdma, false, 0, 5'000, 25'000'000'000ULL),
       };
       checkCuda(cudaMemcpy(backendEntries, hostBackends.data(),
                            sizeof(hostBackends), cudaMemcpyHostToDevice),
@@ -164,15 +164,16 @@ struct HostRuntime::Impl {
       for (std::uint32_t slot = 0; slot < config.intentCapacity; ++slot) {
         hostIntentSlots[slot].sequence = slot;
       }
-      checkCuda(cudaMemcpy(intents, hostIntentSlots.data(),
-                           hostIntentSlots.size() * sizeof(hostIntentSlots.front()),
-                           cudaMemcpyHostToDevice),
-                "initialize intent ring slots");
+      checkCuda(
+          cudaMemcpy(intents, hostIntentSlots.data(),
+                     hostIntentSlots.size() * sizeof(hostIntentSlots.front()),
+                     cudaMemcpyHostToDevice),
+          "initialize intent ring slots");
       const abi::IntentPool hostIntentPool{
           0, 0, config.intentCapacity, 0, 0, 0, {0, 0, 0, 0},
       };
-      checkCuda(cudaMemcpy(intentPool, &hostIntentPool,
-                           sizeof(hostIntentPool), cudaMemcpyHostToDevice),
+      checkCuda(cudaMemcpy(intentPool, &hostIntentPool, sizeof(hostIntentPool),
+                           cudaMemcpyHostToDevice),
                 "initialize intent pool");
 
       abi::RuntimeView hostView{
@@ -331,6 +332,7 @@ struct HostRuntime::Impl {
   std::vector<abi::RequestContext> requestsHost;
   std::vector<abi::TenantContext> tenantsHost;
   std::vector<bool> requestInstalled;
+  std::vector<bool> objectInstalled;
   std::vector<std::optional<OwnedObject>> objects;
   std::shared_ptr<NvmeTransport> nvme;
 };
@@ -358,13 +360,19 @@ void HostRuntime::setRequest(std::uint32_t slot, std::uint64_t requestId,
   if (impl_->requestInstalled[slot]) {
     const abi::RequestContext current = downloadOne(impl_->requests, slot);
     if (current.outstandingBytes != 0) {
-      throw std::logic_error(
-          "request slot cannot be reused while acquisition bytes are outstanding");
+      throw std::logic_error("request slot cannot be reused while acquisition "
+                             "bytes are outstanding");
     }
   }
   abi::RequestContext request{
-      requestId, deadlineClock, maxOutstandingBytes, 0,
-      generation, tenantId, priority, 0,
+      requestId,
+      deadlineClock,
+      maxOutstandingBytes,
+      0,
+      generation,
+      tenantId,
+      priority,
+      0,
   };
   impl_->requestsHost[slot] = request;
   impl_->requestInstalled[slot] = true;
@@ -456,9 +464,9 @@ ObjectHandle HostRuntime::installReplicatedObject(
                              cudaMemcpyHostToDevice),
                   "upload HBM object replica");
       } else {
-        checkCuda(cudaHostAlloc(&owned.hostAllocation, bytes,
-                                cudaHostAllocMapped),
-                  "cudaHostAlloc mapped object replica");
+        checkCuda(
+            cudaHostAlloc(&owned.hostAllocation, bytes, cudaHostAllocMapped),
+            "cudaHostAlloc mapped object replica");
         std::memcpy(owned.hostAllocation, spec.contents.data(), bytes);
         checkCuda(cudaHostGetDevicePointer(&owned.sourceDevice,
                                            owned.hostAllocation, 0),
@@ -468,9 +476,10 @@ ObjectHandle HostRuntime::installReplicatedObject(
       const bool direct = spec.placement != Placement::HostStaged;
       hasTransport |= !direct;
       const abi::SourceKind sourceKind =
-          spec.placement == Placement::Hbm          ? abi::SourceKind::Hbm
-          : spec.placement == Placement::HostMapped ? abi::SourceKind::HostMapped
-                                                    : abi::SourceKind::HostStaged;
+          spec.placement == Placement::Hbm ? abi::SourceKind::Hbm
+          : spec.placement == Placement::HostMapped
+              ? abi::SourceKind::HostMapped
+              : abi::SourceKind::HostStaged;
       replicaEntries.push_back({
           reinterpret_cast<std::uint64_t>(owned.sourceDevice),
           0,
@@ -530,11 +539,110 @@ ObjectHandle HostRuntime::installReplicatedObject(
       impl_->releaseObject(*impl_->objects[slot]);
     }
     impl_->objects[slot] = std::move(allocation);
+    impl_->objectInstalled[slot] = true;
     return {slot, directAddress};
   } catch (...) {
     impl_->releaseObject(allocation);
     throw;
   }
+}
+
+ObjectHandle
+HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
+                            std::uint32_t version, std::size_t bytes,
+                            void *stagingDeviceAddress,
+                            std::span<const RegisteredReplicaSpec> replicas) {
+  impl_->checkObjectSlot(slot);
+  if (bytes == 0 || bytes > std::numeric_limits<std::uint32_t>::max() ||
+      replicas.empty() ||
+      replicas.size() > impl_->config.maxReplicasPerObject) {
+    throw std::invalid_argument(
+        "registered object size and replicas must fit the runtime ABI");
+  }
+
+  std::vector<abi::ReplicaEntry> entries;
+  entries.reserve(replicas.size());
+  void *directAddress = nullptr;
+  std::uint64_t directCost = UINT64_MAX;
+  bool hasTransport = false;
+  for (const RegisteredReplicaSpec &replica : replicas) {
+    if (replica.sourceDeviceAddress == nullptr) {
+      throw std::invalid_argument(
+          "registered replica needs a device-visible source address");
+    }
+    const bool direct = replica.placement != Placement::HostStaged;
+    hasTransport |= !direct;
+    const abi::SourceKind sourceKind =
+        replica.placement == Placement::Hbm ? abi::SourceKind::Hbm
+        : replica.placement == Placement::HostMapped
+            ? abi::SourceKind::HostMapped
+            : abi::SourceKind::HostStaged;
+    const std::uint64_t defaultLatency =
+        sourceKind == abi::SourceKind::Hbm          ? 0
+        : sourceKind == abi::SourceKind::HostMapped ? 300
+                                                    : 2'000;
+    const std::uint64_t defaultBandwidth =
+        sourceKind == abi::SourceKind::Hbm          ? 1'000'000'000'000ULL
+        : sourceKind == abi::SourceKind::HostMapped ? 50'000'000'000ULL
+                                                    : 30'000'000'000ULL;
+    const std::uint64_t latency = replica.estimatedLatencyNs == 0
+                                      ? defaultLatency
+                                      : replica.estimatedLatencyNs;
+    const std::uint64_t bandwidth =
+        replica.estimatedBandwidthBytesPerSecond == 0
+            ? defaultBandwidth
+            : replica.estimatedBandwidthBytesPerSecond;
+    entries.push_back({
+        reinterpret_cast<std::uint64_t>(replica.sourceDeviceAddress),
+        0,
+        latency,
+        bandwidth,
+        static_cast<std::uint32_t>(sourceKind),
+        0,
+        static_cast<std::uint32_t>(sourceKind),
+        direct ? abi::ReplicaDirect : abi::ReplicaTransport,
+        reinterpret_cast<std::uint64_t>(replica.tensorMap),
+        0,
+    });
+    const std::uint64_t cost = latency + static_cast<std::uint64_t>(bytes) *
+                                             1'000'000'000ULL / bandwidth;
+    if (direct && cost < directCost) {
+      directAddress = const_cast<void *>(replica.sourceDeviceAddress);
+      directCost = cost;
+    }
+  }
+  if (hasTransport && stagingDeviceAddress == nullptr) {
+    throw std::invalid_argument(
+        "registered staged replicas need an HBM staging address");
+  }
+
+  const std::uint32_t replicaStart = slot * impl_->config.maxReplicasPerObject;
+  const abi::ObjectEntry entry{
+      objectId,
+      reinterpret_cast<std::uint64_t>(stagingDeviceAddress),
+      static_cast<std::uint64_t>(bytes),
+      0,
+      version,
+      static_cast<std::uint32_t>(directAddress == nullptr
+                                     ? abi::ObjectState::New
+                                     : abi::ObjectState::Ready),
+      replicaStart,
+      static_cast<std::uint32_t>(entries.size()),
+      abi::InvalidIndex,
+      0,
+      0,
+  };
+  checkCuda(cudaMemcpy(impl_->replicaEntries + replicaStart, entries.data(),
+                       entries.size() * sizeof(entries.front()),
+                       cudaMemcpyHostToDevice),
+            "upload registered object replicas");
+  uploadOne(impl_->objectEntries, slot, entry);
+  if (impl_->objects[slot].has_value()) {
+    impl_->releaseObject(*impl_->objects[slot]);
+    impl_->objects[slot].reset();
+  }
+  impl_->objectInstalled[slot] = true;
+  return {slot, directAddress};
 }
 
 ObjectHandle HostRuntime::installNvmeObject(
@@ -555,8 +663,8 @@ ObjectHandle HostRuntime::installNvmeObject(
     throw std::invalid_argument("NVMe object range is invalid or unaligned");
   }
 
-  Impl::OwnedObject allocation{destination->deviceAddress(),
-                               std::move(destination), {}};
+  Impl::OwnedObject allocation{
+      destination->deviceAddress(), std::move(destination), {}};
   const abi::ReplicaEntry replica{
       sourceByteOffset,
       allocation.nvmeBuffer->dmaPageListAddress(),
@@ -569,8 +677,7 @@ ObjectHandle HostRuntime::installNvmeObject(
       0,
       0,
   };
-  const std::uint32_t replicaStart =
-      slot * impl_->config.maxReplicasPerObject;
+  const std::uint32_t replicaStart = slot * impl_->config.maxReplicasPerObject;
   abi::ObjectEntry entry{
       objectId,
       reinterpret_cast<std::uint64_t>(allocation.stagingDevice),
@@ -590,6 +697,7 @@ ObjectHandle HostRuntime::installNvmeObject(
     impl_->releaseObject(*impl_->objects[slot]);
   }
   impl_->objects[slot] = std::move(allocation);
+  impl_->objectInstalled[slot] = true;
   return {slot, nullptr};
 }
 
@@ -598,8 +706,9 @@ void HostRuntime::bindTensorMaps(std::uint32_t objectSlot,
                                  const void *replicaTensorMap,
                                  const void *stagingTensorMap) {
   impl_->checkObjectSlot(objectSlot);
-  if (!impl_->objects[objectSlot].has_value()) {
-    throw std::invalid_argument("cannot bind tensor maps before object install");
+  if (!impl_->objectInstalled[objectSlot]) {
+    throw std::invalid_argument(
+        "cannot bind tensor maps before object install");
   }
 
   abi::ObjectEntry object = downloadOne(impl_->objectEntries, objectSlot);
@@ -608,10 +717,9 @@ void HostRuntime::bindTensorMaps(std::uint32_t objectSlot,
       relativeReplica >= impl_->replicaCapacity - object.replicaStart) {
     throw std::out_of_range("relative replica exceeds object replica range");
   }
-  abi::ReplicaEntry replica = downloadOne(
-      impl_->replicaEntries, object.replicaStart + relativeReplica);
-  replica.tensorMapAddress =
-      reinterpret_cast<std::uint64_t>(replicaTensorMap);
+  abi::ReplicaEntry replica =
+      downloadOne(impl_->replicaEntries, object.replicaStart + relativeReplica);
+  replica.tensorMapAddress = reinterpret_cast<std::uint64_t>(replicaTensorMap);
   object.stagingTensorMapAddress =
       reinterpret_cast<std::uint64_t>(stagingTensorMap);
   uploadOne(impl_->replicaEntries, object.replicaStart + relativeReplica,
@@ -644,8 +752,9 @@ abi::ObjectEntry HostRuntime::readObject(std::uint32_t slot) const {
   return downloadOne(impl_->objectEntries, slot);
 }
 
-abi::ReplicaEntry HostRuntime::readReplica(
-    std::uint32_t objectSlot, std::uint32_t relativeReplica) const {
+abi::ReplicaEntry
+HostRuntime::readReplica(std::uint32_t objectSlot,
+                         std::uint32_t relativeReplica) const {
   impl_->checkObjectSlot(objectSlot);
   const abi::ObjectEntry object = readObject(objectSlot);
   if (relativeReplica >= object.replicaCount ||
@@ -692,17 +801,17 @@ DeviceWorkPlan HostRuntime::uploadWorkPlan(const WorkPlan &plan) const {
   for (const abi::WorkItem &work : plan.workItems) {
     if (work.requestSlot >= impl_->config.requestCapacity ||
         !impl_->requestInstalled[work.requestSlot] ||
-        work.dependencyCount >
-            impl_->config.maxDependenciesPerContinuation) {
+        work.dependencyCount > impl_->config.maxDependenciesPerContinuation) {
       throw std::invalid_argument(
           "work plan does not fit the runtime request/dependency contract");
     }
   }
   for (const abi::AcquireRequirement &requirement : plan.dependencies) {
     if (requirement.directBase == 0 &&
-        requirement.objectSlot >= impl_->config.objectCapacity) {
+        (requirement.objectSlot >= impl_->config.objectCapacity ||
+         !impl_->objectInstalled[requirement.objectSlot])) {
       throw std::invalid_argument(
-          "work plan references an external object outside the runtime");
+          "work plan references an unregistered external object");
     }
   }
   return DeviceWorkPlan(plan);

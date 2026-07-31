@@ -45,7 +45,7 @@ int main() {
     require(dependencyCapacityRejected,
             "dependency capacity must be finite and non-zero");
 
-    nta::HostRuntime runtime({4, 3, 3, 4, 2});
+    nta::HostRuntime runtime({4, 4, 4, 4, 2});
     bool uninitializedCancelRejected = false;
     try {
       runtime.cancelRequest(3, 0);
@@ -67,7 +67,7 @@ int main() {
     require(cudaMemcpy(&hostView, runtime.deviceView(), sizeof(hostView),
                        cudaMemcpyDeviceToHost) == cudaSuccess,
             "runtime view download failed");
-    require(hostView.objectCapacity == 3 && hostView.replicaCapacity == 6,
+    require(hostView.objectCapacity == 4 && hostView.replicaCapacity == 8,
             "object and replica capacities were transposed");
     require(hostView.maxDependenciesPerContinuation == 8 &&
                 hostView.dependencyCapacity == 32 &&
@@ -77,8 +77,8 @@ int main() {
             "continuation dependency storage was not installed");
     std::uint32_t pendingCount = 1;
     require(cudaMemcpy(&pendingCount, hostView.pendingCount,
-                       sizeof(pendingCount), cudaMemcpyDeviceToHost) ==
-                    cudaSuccess &&
+                       sizeof(pendingCount),
+                       cudaMemcpyDeviceToHost) == cudaSuccess &&
                 pendingCount == 0,
             "pending continuation index was not initialized");
     const std::uint64_t syntheticOutstanding = 4096;
@@ -99,8 +99,8 @@ int main() {
             "request slot reuse must wait for outstanding acquisition bytes");
     const std::uint64_t zeroOutstanding = 0;
     require(cudaMemcpy(&hostView.requests[0].outstandingBytes, &zeroOutstanding,
-                       sizeof(zeroOutstanding), cudaMemcpyHostToDevice) ==
-                cudaSuccess,
+                       sizeof(zeroOutstanding),
+                       cudaMemcpyHostToDevice) == cudaSuccess,
             "request counter reset failed");
 
     require(cudaMemcpy(&hostView.tenants[2].outstandingBytes,
@@ -111,8 +111,8 @@ int main() {
     require(runtime.readTenant(2).outstandingBytes == syntheticOutstanding,
             "tenant policy update reset a live credit counter");
     require(cudaMemcpy(&hostView.tenants[2].outstandingBytes, &zeroOutstanding,
-                       sizeof(zeroOutstanding), cudaMemcpyHostToDevice) ==
-                cudaSuccess,
+                       sizeof(zeroOutstanding),
+                       cudaMemcpyHostToDevice) == cudaSuccess,
             "tenant counter reset failed");
 
     std::array<std::byte, 4096> contents{};
@@ -124,8 +124,8 @@ int main() {
         {contents, nta::Placement::HostMapped},
         {contents, nta::Placement::Hbm},
     }};
-    const nta::ObjectHandle hbm = runtime.installReplicatedObject(
-        0, 2001, 1, replicaSpecs);
+    const nta::ObjectHandle hbm =
+        runtime.installReplicatedObject(0, 2001, 1, replicaSpecs);
     const nta::ObjectHandle mapped =
         runtime.installObject(1, 2002, 2, contents, nta::Placement::HostMapped);
     const nta::ObjectHandle staged =
@@ -135,8 +135,7 @@ int main() {
             "HBM object must expose a direct pointer");
     require(runtime.readObject(0).replicaCount == 2 &&
                 runtime.readReplica(0, 1).sourceKind ==
-                    static_cast<std::uint32_t>(
-                        nta::abi::SourceKind::Hbm) &&
+                    static_cast<std::uint32_t>(nta::abi::SourceKind::Hbm) &&
                 reinterpret_cast<std::uint64_t>(hbm.directDeviceBase) ==
                     runtime.readReplica(0, 1).sourceAddress,
             "replicated object directory was not installed");
@@ -153,15 +152,44 @@ int main() {
                 static_cast<std::uint32_t>(nta::abi::ObjectState::New),
             "staged object must begin nonresident");
 
+    void *borrowedDevice = nullptr;
+    require(cudaMalloc(&borrowedDevice, contents.size()) == cudaSuccess,
+            "borrowed HBM allocation failed");
+    require(cudaMemcpy(borrowedDevice, contents.data(), contents.size(),
+                       cudaMemcpyHostToDevice) == cudaSuccess,
+            "borrowed HBM upload failed");
+    const nta::RegisteredReplicaSpec invalidStagedReplica{
+        borrowedDevice, nta::Placement::HostStaged};
+    bool missingStagingRejected = false;
+    try {
+      runtime.registerObject(3, 2004, 4, contents.size(), nullptr,
+                             std::span<const nta::RegisteredReplicaSpec>(
+                                 &invalidStagedReplica, 1));
+    } catch (const std::invalid_argument &) {
+      missingStagingRejected = true;
+    }
+    require(missingStagingRejected,
+            "non-owning staged registration accepted no HBM destination");
+    const nta::RegisteredReplicaSpec borrowedReplica{borrowedDevice,
+                                                     nta::Placement::Hbm};
+    const nta::ObjectHandle borrowed = runtime.registerObject(
+        3, 2004, 4, contents.size(), nullptr,
+        std::span<const nta::RegisteredReplicaSpec>(&borrowedReplica, 1));
+    require(borrowed.directDeviceBase == borrowedDevice &&
+                runtime.readObject(3).state ==
+                    static_cast<std::uint32_t>(nta::abi::ObjectState::Ready),
+            "non-owning HBM registration failed");
+    require(cudaFree(borrowedDevice) == cudaSuccess,
+            "runtime incorrectly took ownership of registered HBM");
+
     nta::WorkPlanBuilder planBuilder(2);
     const std::uint32_t planRequest = planBuilder.addRequest({0, 7});
     const std::array<nta::abi::AcquireRequirement, 2> planDependencies{{
-        nta::makeRequirement({reinterpret_cast<std::uint64_t>(
-                                  hbm.directDeviceBase),
-                              0, 2001, 0, 1,
-                              static_cast<std::uint32_t>(contents.size())}),
-        nta::makeRequirement({0, 0, 2003, 2, 3,
-                              static_cast<std::uint32_t>(contents.size())}),
+        nta::makeRequirement(
+            {reinterpret_cast<std::uint64_t>(hbm.directDeviceBase), 0, 2001, 0,
+             1, static_cast<std::uint32_t>(contents.size())}),
+        nta::makeRequirement(
+            {0, 0, 2003, 2, 3, static_cast<std::uint32_t>(contents.size())}),
     }};
     (void)planBuilder.addWork(planRequest, 42, planDependencies);
     const nta::WorkPlan hostPlan = planBuilder.finish();
@@ -171,10 +199,9 @@ int main() {
     require(devicePlan.workItemCount() == 1 &&
                 devicePlan.dependencyCount() == 2 &&
                 cudaMemcpy(&uploadedWork, devicePlan.workItems(),
-                           sizeof(uploadedWork), cudaMemcpyDeviceToHost) ==
-                    cudaSuccess &&
-                cudaMemcpy(&uploadedDependency,
-                           devicePlan.dependencies() + 1,
+                           sizeof(uploadedWork),
+                           cudaMemcpyDeviceToHost) == cudaSuccess &&
+                cudaMemcpy(&uploadedDependency, devicePlan.dependencies() + 1,
                            sizeof(uploadedDependency),
                            cudaMemcpyDeviceToHost) == cudaSuccess &&
                 uploadedWork.logicalWork == 42 &&
@@ -203,8 +230,8 @@ int main() {
     nta::abi::WorkItem asynchronouslyUploaded{};
     require(cudaMemcpyAsync(&asynchronouslyUploaded, reusablePlan.workItems(),
                             sizeof(asynchronouslyUploaded),
-                            cudaMemcpyDeviceToHost, consumerStream) ==
-                    cudaSuccess &&
+                            cudaMemcpyDeviceToHost,
+                            consumerStream) == cudaSuccess &&
                 cudaStreamSynchronize(consumerStream) == cudaSuccess &&
                 asynchronouslyUploaded.logicalWork == 42,
             "cross-stream work-plan publication failed");
@@ -214,8 +241,8 @@ int main() {
     reusablePlan.waitOn(consumerStream);
     require(cudaMemcpyAsync(&asynchronouslyUploaded, reusablePlan.workItems(),
                             sizeof(asynchronouslyUploaded),
-                            cudaMemcpyDeviceToHost, consumerStream) ==
-                    cudaSuccess &&
+                            cudaMemcpyDeviceToHost,
+                            consumerStream) == cudaSuccess &&
                 cudaStreamSynchronize(consumerStream) == cudaSuccess &&
                 asynchronouslyUploaded.logicalWork == 77 &&
                 reusablePlan.workItems() == reusableWorkAddress &&

@@ -70,11 +70,10 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
       FunctionType::get(i1, {runtime->getType(), i32, i32}, false));
   FunctionCallee acquireSet = module.getOrInsertFunction(
       ir::AcquireSetSlow,
-      FunctionType::get(
-          i1,
-          {runtime->getType(), i32, i32, requirements->getType(), i32, i32,
-           i32},
-          false));
+      FunctionType::get(i1,
+                        {runtime->getType(), i32, i32, requirements->getType(),
+                         i32, i32, i32},
+                        false));
 
   BasicBlock *entry = marker->getParent();
   Instruction *afterMarker = marker->getNextNode();
@@ -85,21 +84,23 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
                                              function, continuationBlock);
 
   IRBuilder<> entryBuilder(entry);
+  entryBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   CallInst *live = entryBuilder.CreateCall(
       requestLive, {runtime, requestSlot, generation}, "nta.request.live");
   entryBuilder.CreateCondBr(live, slowBlock, continuationBlock);
 
   IRBuilder<> slowBuilder(slowBlock);
-  CallInst *ready =
-      slowBuilder.CreateCall(acquireSet,
-                             {runtime, requestSlot, generation, requirements,
-                              requirementCount, directRequirementCount,
-                              continuation},
-                             "nta.dependencies.ready");
+  slowBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
+  CallInst *ready = slowBuilder.CreateCall(
+      acquireSet,
+      {runtime, requestSlot, generation, requirements, requirementCount,
+       directRequirementCount, continuation},
+      "nta.dependencies.ready");
   ready->setMetadata(ir::AcquisitionMetadata, dependencySetMetadata(context));
   slowBuilder.CreateBr(continuationBlock);
 
   IRBuilder<> continuationBuilder(&continuationBlock->front());
+  continuationBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   PHINode *result = continuationBuilder.CreatePHI(i1, 2, "nta.ready");
   result->addIncoming(ConstantInt::getFalse(context), entry);
   result->addIncoming(ready, slowBlock);
@@ -130,11 +131,11 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
   Value *offset = marker->getArgOperand(ir::Offset);
   Value *bytes = marker->getArgOperand(ir::Bytes);
   Value *continuation = marker->getArgOperand(ir::Continuation);
-  const auto *markerFunction = dyn_cast<Function>(
-      marker->getCalledOperand()->stripPointerCasts());
-  const bool tensorMap = markerFunction != nullptr &&
-                         markerFunction->getName() ==
-                             ir::AcquireTensorMapMarker;
+  const auto *markerFunction =
+      dyn_cast<Function>(marker->getCalledOperand()->stripPointerCasts());
+  const bool tensorMap =
+      markerFunction != nullptr &&
+      markerFunction->getName() == ir::AcquireTensorMapMarker;
 
   Type *pointerType = marker->getType();
   Type *i1 = Type::getInt1Ty(context);
@@ -165,23 +166,27 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
                                              function, continuationBlock);
 
   IRBuilder<> entryBuilder(entry);
+  entryBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   CallInst *live = entryBuilder.CreateCall(
       requestLive, {runtime, requestSlot, generation}, "nta.request.live");
   entryBuilder.CreateCondBr(live, resolveBlock, continuationBlock);
 
   IRBuilder<> resolveBuilder(resolveBlock);
+  resolveBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   Value *hasDirect = resolveBuilder.CreateIsNotNull(directBase, "nta.direct");
   resolveBuilder.CreateCondBr(hasDirect, directBlock, slowBlock);
 
   IRBuilder<> directBuilder(directBlock);
+  directBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   Value *directAddress = directBase;
   if (!tensorMap) {
-    directAddress = directBuilder.CreateInBoundsGEP(
-        i8, directBase, offset, "nta.direct.address");
+    directAddress = directBuilder.CreateInBoundsGEP(i8, directBase, offset,
+                                                    "nta.direct.address");
   }
   directBuilder.CreateBr(continuationBlock);
 
   IRBuilder<> slowBuilder(slowBlock);
+  slowBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   CallInst *slow = slowBuilder.CreateCall(acquireSlow,
                                           {runtime, requestSlot, generation,
                                            objectSlot, objectId, objectVersion,
@@ -192,6 +197,7 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
   slowBuilder.CreateBr(continuationBlock);
 
   IRBuilder<> continuationBuilder(&continuationBlock->front());
+  continuationBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   PHINode *result =
       continuationBuilder.CreatePHI(pointerType, 3, "nta.address");
   result->addIncoming(ConstantPointerNull::get(cast<PointerType>(pointerType)),

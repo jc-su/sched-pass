@@ -1,5 +1,6 @@
 #include "benchmarks/kv/KvTypes.h"
 #include "nta/DeviceWorkPlan.h"
+#include "nta/FinitePhase.h"
 #include "nta/HostRuntime.h"
 #include "nta/WorkPlan.h"
 
@@ -94,8 +95,6 @@ public:
   KernelModule() {
     checkDriver(cuModuleLoad(&module_, NTA_KV_CUBIN_PATH),
                 "cuModuleLoad instrumented cubin");
-    checkDriver(cuModuleGetFunction(&reset_, module_, "nta_reset_epoch"),
-                "cuModuleGetFunction nta_reset_epoch");
     checkDriver(cuModuleGetFunction(&compute_, module_, "nta_kv_tile_kernel"),
                 "cuModuleGetFunction nta_kv_tile_kernel");
     checkDriver(cuModuleGetFunction(&ready_, module_, "nta_kv_ready_kernel"),
@@ -109,11 +108,6 @@ public:
     checkDriver(cuModuleGetFunction(&dependencyBaseline_, module_,
                                     "nta_dependency_baseline_kernel"),
                 "cuModuleGetFunction nta_dependency_baseline_kernel");
-    checkDriver(cuModuleGetFunction(&publish_, module_, "nta_publish_ready"),
-                "cuModuleGetFunction nta_publish_ready");
-    checkDriver(
-        cuModuleGetFunction(&progress_, module_, "nta_progress_host_staging"),
-        "cuModuleGetFunction nta_progress_host_staging");
   }
 
   ~KernelModule() {
@@ -123,23 +117,6 @@ public:
   }
   KernelModule(const KernelModule &) = delete;
   KernelModule &operator=(const KernelModule &) = delete;
-
-  void launchReset(CUstream stream, nta::abi::RuntimeView *runtime,
-                   std::uint32_t objectCount,
-                   std::uint32_t continuationCount) const {
-    const std::uint32_t threads = 256;
-    const std::uint32_t blocks =
-        (std::max(objectCount, continuationCount) + threads - 1) / threads;
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {
-        &runtimeAddress,
-        &objectCount,
-        &continuationCount,
-    };
-    checkDriver(cuLaunchKernel(reset_, blocks, 1, 1, threads, 1, 1, 0, stream,
-                               arguments, nullptr),
-                "cuLaunchKernel reset");
-  }
 
   void launchCompute(CUstream stream, nta::abi::RuntimeView *runtime,
                      const nta::benchmark::TileTask *tasks,
@@ -158,27 +135,6 @@ public:
                 "cuLaunchKernel compute");
   }
 
-  void launchProgress(CUstream stream, nta::abi::RuntimeView *runtime,
-                      std::uint32_t capacity) const {
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress};
-    checkDriver(cuLaunchKernel(progress_, capacity, 1, 1, 256, 1, 1, 0, stream,
-                               arguments, nullptr),
-                "cuLaunchKernel progress");
-  }
-
-  void launchPublish(CUstream stream, nta::abi::RuntimeView *runtime,
-                     std::uint32_t continuationCount) const {
-    const std::uint32_t threads = 256;
-    const std::uint32_t blocks = std::min(
-        32U, (continuationCount + threads - 1U) / threads);
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    void *arguments[] = {&runtimeAddress, &continuationCount};
-    checkDriver(cuLaunchKernel(publish_, blocks, 1, 1, threads, 1, 1, 0,
-                               stream, arguments, nullptr),
-                "cuLaunchKernel publish ready");
-  }
-
   void launchReady(CUstream stream, nta::abi::RuntimeView *runtime,
                    const nta::benchmark::TileTask *tasks,
                    std::uint32_t taskCount, const float *query,
@@ -188,7 +144,8 @@ public:
     CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(query);
     CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
     void *arguments[] = {
-        &runtimeAddress, &taskAddress, &taskCount, &queryAddress, &outputAddress,
+        &runtimeAddress, &taskAddress,   &taskCount,
+        &queryAddress,   &outputAddress,
     };
     checkDriver(cuLaunchKernel(ready_, taskCount, 1, 1, 256, 1, 1, 0, stream,
                                arguments, nullptr),
@@ -233,10 +190,11 @@ public:
                 "cuLaunchKernel dependency ready");
   }
 
-  void launchDependencyBaseline(
-      CUstream stream, const nta::abi::WorkItem *tasks,
-      std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
-      const float *query, float *output) const {
+  void
+  launchDependencyBaseline(CUstream stream, const nta::abi::WorkItem *tasks,
+                           std::uint32_t taskCount,
+                           const nta::abi::AcquireRequirement *requirements,
+                           const float *query, float *output) const {
     CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
     CUdeviceptr requirementAddress =
         reinterpret_cast<CUdeviceptr>(requirements);
@@ -249,16 +207,15 @@ public:
                 "cuLaunchKernel dependency baseline");
   }
 
+  [[nodiscard]] CUmodule module() const noexcept { return module_; }
+
 private:
   CUmodule module_ = nullptr;
-  CUfunction reset_ = nullptr;
   CUfunction compute_ = nullptr;
   CUfunction ready_ = nullptr;
   CUfunction dependencyCompute_ = nullptr;
   CUfunction dependencyReady_ = nullptr;
   CUfunction dependencyBaseline_ = nullptr;
-  CUfunction publish_ = nullptr;
-  CUfunction progress_ = nullptr;
 };
 
 std::uint32_t parsePositive(std::string_view text, std::string_view option) {
@@ -325,8 +282,7 @@ Options parseOptions(int argc, char **argv) {
     } else if (name == "--stale-stride") {
       options.staleStride = value == "0" ? 0 : parsePositive(value, name);
     } else if (name == "--object-stale-stride") {
-      options.objectStaleStride =
-          value == "0" ? 0 : parsePositive(value, name);
+      options.objectStaleStride = value == "0" ? 0 : parsePositive(value, name);
     } else if (name == "--coalesce") {
       options.coalesce = parsePositive(value, name);
     } else if (name == "--dependencies") {
@@ -517,6 +473,7 @@ int main(int argc, char **argv) {
               "upload query");
 
     KernelModule kernels;
+    nta::FinitePhaseProgram phases(kernels.module());
     cudaStream_t stream = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graphExec = nullptr;
@@ -530,39 +487,42 @@ int main(int argc, char **argv) {
 
     checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
               "cudaStreamBeginCapture");
-    kernels.launchReset(driverStream, runtime.deviceView(), objectCount,
-                        options.requests);
-    checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
-                              sizeof(float) * options.requests, stream),
-              "cudaMemsetAsync output");
-    if (options.baseline) {
-      kernels.launchDependencyBaseline(
-          driverStream, deviceWorkPlan.workItems(), options.requests,
-          deviceWorkPlan.dependencies(), deviceQuery.get(), deviceOutput.get());
-    } else if (options.dependencies == 1 &&
-               options.objectStaleStride == 0) {
-      kernels.launchCompute(driverStream, runtime.deviceView(),
-                            deviceTasks.get(), options.requests,
-                            deviceQuery.get(), deviceOutput.get(), 0);
-    } else {
-      kernels.launchDependencyCompute(driverStream, runtime.deviceView(),
-                                      deviceWorkPlan.workItems(),
-                                      options.requests,
-                                      deviceWorkPlan.dependencies(),
-                                      deviceQuery.get(), deviceOutput.get(), 0);
-    }
-    kernels.launchProgress(driverStream, runtime.deviceView(), objectCount);
-    kernels.launchPublish(driverStream, runtime.deviceView(), options.requests);
-    if (options.dependencies == 1 && options.objectStaleStride == 0) {
-      kernels.launchReady(driverStream, runtime.deviceView(), deviceTasks.get(),
-                          options.requests, deviceQuery.get(),
-                          deviceOutput.get());
-    } else {
-      kernels.launchDependencyReady(driverStream, runtime.deviceView(),
-                                    deviceWorkPlan.workItems(), options.requests,
-                                    deviceWorkPlan.dependencies(),
-                                    deviceQuery.get(), deviceOutput.get());
-    }
+    phases.enqueueHost(
+        driverStream, runtime.deviceView(),
+        {objectCount, options.requests, objectCount, 1},
+        [&] {
+          checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
+                                    sizeof(float) * options.requests, stream),
+                    "cudaMemsetAsync output");
+          if (options.baseline) {
+            kernels.launchDependencyBaseline(
+                driverStream, deviceWorkPlan.workItems(), options.requests,
+                deviceWorkPlan.dependencies(), deviceQuery.get(),
+                deviceOutput.get());
+          } else if (options.dependencies == 1 &&
+                     options.objectStaleStride == 0) {
+            kernels.launchCompute(driverStream, runtime.deviceView(),
+                                  deviceTasks.get(), options.requests,
+                                  deviceQuery.get(), deviceOutput.get(), 0);
+          } else {
+            kernels.launchDependencyCompute(
+                driverStream, runtime.deviceView(), deviceWorkPlan.workItems(),
+                options.requests, deviceWorkPlan.dependencies(),
+                deviceQuery.get(), deviceOutput.get(), 0);
+          }
+        },
+        [&] {
+          if (options.dependencies == 1 && options.objectStaleStride == 0) {
+            kernels.launchReady(driverStream, runtime.deviceView(),
+                                deviceTasks.get(), options.requests,
+                                deviceQuery.get(), deviceOutput.get());
+          } else {
+            kernels.launchDependencyReady(
+                driverStream, runtime.deviceView(), deviceWorkPlan.workItems(),
+                options.requests, deviceWorkPlan.dependencies(),
+                deviceQuery.get(), deviceOutput.get());
+          }
+        });
     checkCuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
     checkCuda(cudaGraphInstantiate(&graphExec, graph, 0),
               "cudaGraphInstantiate");
