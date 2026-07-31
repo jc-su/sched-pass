@@ -3,6 +3,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -47,23 +48,35 @@ template <typename T> T downloadOne(const T *source, std::uint32_t slot) {
 } // namespace
 
 struct HostRuntime::Impl {
-  struct OwnedObject {
+  struct OwnedReplica {
     Placement placement;
     void *hostAllocation;
     void *sourceDevice;
+  };
+
+  struct OwnedObject {
     void *stagingDevice;
     std::unique_ptr<NvmeBuffer> nvmeBuffer;
+    std::vector<OwnedReplica> replicas;
   };
 
   explicit Impl(RuntimeConfig runtimeConfig,
                 std::shared_ptr<NvmeTransport> nvmeTransport = nullptr)
       : config(runtimeConfig), requestsHost(config.requestCapacity),
+        tenantsHost(config.requestCapacity),
         requestInstalled(config.requestCapacity, false),
         objects(config.objectCapacity), nvme(std::move(nvmeTransport)) {
     if (config.requestCapacity == 0 || config.objectCapacity == 0 ||
-        config.intentCapacity == 0 || config.continuationCapacity == 0) {
-      throw std::invalid_argument("all NTA runtime capacities must be nonzero");
+        config.intentCapacity == 0 || config.continuationCapacity == 0 ||
+        config.intentCapacity < config.objectCapacity ||
+        config.maxReplicasPerObject == 0 ||
+        config.objectCapacity >
+            std::numeric_limits<std::uint32_t>::max() /
+                config.maxReplicasPerObject) {
+      throw std::invalid_argument(
+          "runtime capacities are invalid or intent capacity is below object capacity");
     }
+    replicaCapacity = config.objectCapacity * config.maxReplicasPerObject;
 
     cudaError_t flagsResult = cudaSetDeviceFlags(cudaDeviceMapHost);
     if (flagsResult != cudaSuccess &&
@@ -83,21 +96,90 @@ struct HostRuntime::Impl {
 
     try {
       requests = deviceAllocate<abi::RequestContext>(config.requestCapacity);
+      tenants = deviceAllocate<abi::TenantContext>(config.requestCapacity);
       objectEntries = deviceAllocate<abi::ObjectEntry>(config.objectCapacity);
-      intents = deviceAllocate<abi::AcquireIntent>(config.intentCapacity);
+      replicaEntries = deviceAllocate<abi::ReplicaEntry>(replicaCapacity);
+      backendEntries = deviceAllocate<abi::BackendView>(abi::BackendCount);
+      intents = deviceAllocate<abi::IntentSlot>(config.intentCapacity);
       continuations =
           deviceAllocate<abi::Continuation>(config.continuationCapacity);
-      intentCount = deviceAllocate<std::uint32_t>(1);
+      intentPool = deviceAllocate<abi::IntentPool>(1);
+      readyContinuations =
+          deviceAllocate<std::uint32_t>(config.continuationCapacity);
+      readyCount = deviceAllocate<std::uint32_t>(1);
+      readyHead = deviceAllocate<std::uint32_t>(1);
+
+      const auto backend = [](abi::SourceKind kind, bool active,
+                              std::uint64_t state, std::uint64_t latencyNs,
+                              std::uint64_t bandwidth) {
+        return abi::BackendView{
+            state,
+            latencyNs,
+            bandwidth,
+            0,
+            UINT64_MAX,
+            static_cast<std::uint32_t>(kind),
+            active ? 1U : 0U,
+            static_cast<std::uint32_t>(kind),
+            0,
+            0,
+        };
+      };
+      const std::array<abi::BackendView, abi::BackendCount> hostBackends{
+          backend(abi::SourceKind::Hbm, true, 0, 0, 1'000'000'000'000ULL),
+          backend(abi::SourceKind::HostMapped, true, 0, 300, 50'000'000'000ULL),
+          backend(abi::SourceKind::HostStaged, true, 0, 2'000,
+                  30'000'000'000ULL),
+          backend(abi::SourceKind::Nvme, nvme != nullptr,
+                  nvme == nullptr
+                      ? 0
+                      : reinterpret_cast<std::uint64_t>(nvme->deviceQueue()),
+                  80'000, 7'000'000'000ULL),
+          backend(abi::SourceKind::Rdma, false, 0, 5'000,
+                  25'000'000'000ULL),
+      };
+      checkCuda(cudaMemcpy(backendEntries, hostBackends.data(),
+                           sizeof(hostBackends), cudaMemcpyHostToDevice),
+                "upload backend directory");
+      for (abi::TenantContext &tenant : tenantsHost) {
+        tenant = {UINT64_MAX, 0, 1, 1, 0};
+      }
+      checkCuda(cudaMemcpy(tenants, tenantsHost.data(),
+                           tenantsHost.size() * sizeof(tenantsHost.front()),
+                           cudaMemcpyHostToDevice),
+                "upload tenant directory");
+      std::vector<abi::IntentSlot> hostIntentSlots(config.intentCapacity);
+      for (std::uint32_t slot = 0; slot < config.intentCapacity; ++slot) {
+        hostIntentSlots[slot].sequence = slot;
+      }
+      checkCuda(cudaMemcpy(intents, hostIntentSlots.data(),
+                           hostIntentSlots.size() * sizeof(hostIntentSlots.front()),
+                           cudaMemcpyHostToDevice),
+                "initialize intent ring slots");
+      const abi::IntentPool hostIntentPool{
+          0, 0, config.intentCapacity, 0, 0, 0, {0, 0, 0, 0},
+      };
+      checkCuda(cudaMemcpy(intentPool, &hostIntentPool,
+                           sizeof(hostIntentPool), cudaMemcpyHostToDevice),
+                "initialize intent pool");
 
       abi::RuntimeView hostView{
           requests,
+          tenants,
           objectEntries,
+          replicaEntries,
+          backendEntries,
           intents,
           continuations,
-          intentCount,
-          nvme == nullptr ? nullptr : nvme->deviceQueue(),
+          intentPool,
+          readyContinuations,
+          readyCount,
+          readyHead,
           config.requestCapacity,
+          config.requestCapacity,
+          replicaCapacity,
           config.objectCapacity,
+          abi::BackendCount,
           config.intentCapacity,
           config.continuationCapacity,
           abi::Version,
@@ -119,13 +201,16 @@ struct HostRuntime::Impl {
     if (object.nvmeBuffer == nullptr && object.stagingDevice != nullptr) {
       (void)cudaFree(object.stagingDevice);
     }
-    if (object.placement == Placement::Hbm && object.sourceDevice != nullptr) {
-      (void)cudaFree(object.sourceDevice);
+    for (OwnedReplica &replica : object.replicas) {
+      if (replica.placement == Placement::Hbm &&
+          replica.sourceDevice != nullptr) {
+        (void)cudaFree(replica.sourceDevice);
+      }
+      if (replica.hostAllocation != nullptr) {
+        (void)cudaFreeHost(replica.hostAllocation);
+      }
     }
-    if (object.hostAllocation != nullptr) {
-      (void)cudaFreeHost(object.hostAllocation);
-    }
-    object = {object.placement, nullptr, nullptr, nullptr, nullptr};
+    object = {nullptr, nullptr, {}};
   }
 
   void release() noexcept {
@@ -139,9 +224,21 @@ struct HostRuntime::Impl {
       (void)cudaFree(view);
       view = nullptr;
     }
-    if (intentCount != nullptr) {
-      (void)cudaFree(intentCount);
-      intentCount = nullptr;
+    if (intentPool != nullptr) {
+      (void)cudaFree(intentPool);
+      intentPool = nullptr;
+    }
+    if (readyHead != nullptr) {
+      (void)cudaFree(readyHead);
+      readyHead = nullptr;
+    }
+    if (readyCount != nullptr) {
+      (void)cudaFree(readyCount);
+      readyCount = nullptr;
+    }
+    if (readyContinuations != nullptr) {
+      (void)cudaFree(readyContinuations);
+      readyContinuations = nullptr;
     }
     if (continuations != nullptr) {
       (void)cudaFree(continuations);
@@ -155,9 +252,21 @@ struct HostRuntime::Impl {
       (void)cudaFree(objectEntries);
       objectEntries = nullptr;
     }
+    if (backendEntries != nullptr) {
+      (void)cudaFree(backendEntries);
+      backendEntries = nullptr;
+    }
+    if (replicaEntries != nullptr) {
+      (void)cudaFree(replicaEntries);
+      replicaEntries = nullptr;
+    }
     if (requests != nullptr) {
       (void)cudaFree(requests);
       requests = nullptr;
+    }
+    if (tenants != nullptr) {
+      (void)cudaFree(tenants);
+      tenants = nullptr;
     }
   }
 
@@ -174,13 +283,21 @@ struct HostRuntime::Impl {
   }
 
   RuntimeConfig config;
+  std::uint32_t replicaCapacity = 0;
   abi::RequestContext *requests = nullptr;
+  abi::TenantContext *tenants = nullptr;
   abi::ObjectEntry *objectEntries = nullptr;
-  abi::AcquireIntent *intents = nullptr;
+  abi::ReplicaEntry *replicaEntries = nullptr;
+  abi::BackendView *backendEntries = nullptr;
+  abi::IntentSlot *intents = nullptr;
   abi::Continuation *continuations = nullptr;
-  std::uint32_t *intentCount = nullptr;
+  abi::IntentPool *intentPool = nullptr;
+  std::uint32_t *readyContinuations = nullptr;
+  std::uint32_t *readyCount = nullptr;
+  std::uint32_t *readyHead = nullptr;
   abi::RuntimeView *view = nullptr;
   std::vector<abi::RequestContext> requestsHost;
+  std::vector<abi::TenantContext> tenantsHost;
   std::vector<bool> requestInstalled;
   std::vector<std::optional<OwnedObject>> objects;
   std::shared_ptr<NvmeTransport> nvme;
@@ -200,14 +317,44 @@ HostRuntime &HostRuntime::operator=(HostRuntime &&) noexcept = default;
 void HostRuntime::setRequest(std::uint32_t slot, std::uint64_t requestId,
                              std::uint32_t generation, std::uint32_t tenantId,
                              std::uint32_t priority,
-                             std::uint64_t deadlineClock) {
+                             std::uint64_t deadlineClock,
+                             std::uint64_t maxOutstandingBytes) {
   impl_->checkRequestSlot(slot);
+  if (tenantId >= impl_->config.requestCapacity) {
+    throw std::out_of_range("tenant id exceeds runtime capacity");
+  }
+  if (impl_->requestInstalled[slot]) {
+    const abi::RequestContext current = downloadOne(impl_->requests, slot);
+    if (current.outstandingBytes != 0) {
+      throw std::logic_error(
+          "request slot cannot be reused while acquisition bytes are outstanding");
+    }
+  }
   abi::RequestContext request{
-      requestId, deadlineClock, generation, tenantId, priority, 0,
+      requestId, deadlineClock, maxOutstandingBytes, 0,
+      generation, tenantId, priority, 0,
   };
   impl_->requestsHost[slot] = request;
   impl_->requestInstalled[slot] = true;
   uploadOne(impl_->requests, slot, request);
+}
+
+void HostRuntime::setTenantBudget(std::uint32_t tenantId,
+                                  std::uint64_t maxOutstandingBytes,
+                                  std::uint32_t weight) {
+  if (tenantId >= impl_->config.requestCapacity || weight == 0) {
+    throw std::invalid_argument("tenant budget id and weight must be valid");
+  }
+  abi::TenantContext tenant = downloadOne(impl_->tenants, tenantId);
+  if (tenant.outstandingBytes > maxOutstandingBytes) {
+    throw std::invalid_argument(
+        "tenant budget cannot drop below currently outstanding bytes");
+  }
+  tenant.maxOutstandingBytes = maxOutstandingBytes;
+  tenant.weight = weight;
+  tenant.active = 1;
+  impl_->tenantsHost[tenantId] = tenant;
+  uploadOne(impl_->tenants, tenantId, tenant);
 }
 
 void HostRuntime::cancelRequest(std::uint32_t slot, std::uint32_t generation) {
@@ -215,12 +362,13 @@ void HostRuntime::cancelRequest(std::uint32_t slot, std::uint32_t generation) {
   if (!impl_->requestInstalled[slot]) {
     throw std::invalid_argument("cannot cancel an uninitialized request slot");
   }
-  abi::RequestContext &request = impl_->requestsHost[slot];
+  abi::RequestContext request = downloadOne(impl_->requests, slot);
   if (request.generation != generation) {
     throw std::invalid_argument(
         "cannot cancel a reused request slot with a stale generation");
   }
   request.cancelled = 1;
+  impl_->requestsHost[slot] = request;
   uploadOne(impl_->requests, slot, request);
 }
 
@@ -229,65 +377,128 @@ ObjectHandle HostRuntime::installObject(std::uint32_t slot,
                                         std::uint32_t version,
                                         std::span<const std::byte> contents,
                                         Placement placement) {
+  const HostReplicaSpec replica{contents, placement};
+  return installReplicatedObject(slot, objectId, version,
+                                 std::span<const HostReplicaSpec>(&replica, 1));
+}
+
+ObjectHandle HostRuntime::installReplicatedObject(
+    std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
+    std::span<const HostReplicaSpec> replicas) {
   impl_->checkObjectSlot(slot);
-  if (contents.empty()) {
+  if (replicas.empty() ||
+      replicas.size() > impl_->config.maxReplicasPerObject) {
+    throw std::invalid_argument(
+        "replica count must fit the configured per-object capacity");
+  }
+  const std::size_t bytes = replicas.front().contents.size();
+  if (bytes == 0) {
     throw std::invalid_argument(
         "external objects must contain at least one byte");
   }
-  if (contents.size() > std::numeric_limits<std::uint32_t>::max()) {
+  if (bytes > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("objects are limited to 4 GiB");
   }
+  for (const HostReplicaSpec &replica : replicas) {
+    if (replica.contents.size() != bytes) {
+      throw std::invalid_argument(
+          "all physical replicas must have the same object size");
+    }
+  }
 
-  Impl::OwnedObject allocation{placement, nullptr, nullptr, nullptr, nullptr};
+  Impl::OwnedObject allocation{nullptr, nullptr, {}};
+  allocation.replicas.reserve(replicas.size());
+  std::vector<abi::ReplicaEntry> replicaEntries;
+  replicaEntries.reserve(replicas.size());
+  void *directAddress = nullptr;
+  std::uint64_t directCost = UINT64_MAX;
+  bool hasTransport = false;
   try {
-    if (placement == Placement::Hbm) {
-      checkCuda(cudaMalloc(&allocation.sourceDevice, contents.size()),
-                "cudaMalloc HBM object");
-      checkCuda(cudaMemcpy(allocation.sourceDevice, contents.data(),
-                           contents.size(), cudaMemcpyHostToDevice),
-                "upload HBM object");
-    } else {
-      checkCuda(cudaHostAlloc(&allocation.hostAllocation, contents.size(),
-                              cudaHostAllocMapped),
-                "cudaHostAlloc mapped object");
-      std::memcpy(allocation.hostAllocation, contents.data(), contents.size());
-      checkCuda(cudaHostGetDevicePointer(&allocation.sourceDevice,
-                                         allocation.hostAllocation, 0),
-                "cudaHostGetDevicePointer");
-      if (placement == Placement::HostStaged) {
-        checkCuda(cudaMalloc(&allocation.stagingDevice, contents.size()),
-                  "cudaMalloc staging object");
+    for (const HostReplicaSpec &spec : replicas) {
+      allocation.replicas.push_back({spec.placement, nullptr, nullptr});
+      Impl::OwnedReplica &owned = allocation.replicas.back();
+      if (spec.placement == Placement::Hbm) {
+        checkCuda(cudaMalloc(&owned.sourceDevice, bytes),
+                  "cudaMalloc HBM object replica");
+        checkCuda(cudaMemcpy(owned.sourceDevice, spec.contents.data(), bytes,
+                             cudaMemcpyHostToDevice),
+                  "upload HBM object replica");
+      } else {
+        checkCuda(cudaHostAlloc(&owned.hostAllocation, bytes,
+                                cudaHostAllocMapped),
+                  "cudaHostAlloc mapped object replica");
+        std::memcpy(owned.hostAllocation, spec.contents.data(), bytes);
+        checkCuda(cudaHostGetDevicePointer(&owned.sourceDevice,
+                                           owned.hostAllocation, 0),
+                  "cudaHostGetDevicePointer object replica");
+      }
+
+      const bool direct = spec.placement != Placement::HostStaged;
+      hasTransport |= !direct;
+      const abi::SourceKind sourceKind =
+          spec.placement == Placement::Hbm          ? abi::SourceKind::Hbm
+          : spec.placement == Placement::HostMapped ? abi::SourceKind::HostMapped
+                                                    : abi::SourceKind::HostStaged;
+      replicaEntries.push_back({
+          reinterpret_cast<std::uint64_t>(owned.sourceDevice),
+          0,
+          sourceKind == abi::SourceKind::Hbm          ? 0ULL
+          : sourceKind == abi::SourceKind::HostMapped ? 300ULL
+                                                      : 2'000ULL,
+          sourceKind == abi::SourceKind::Hbm          ? 1'000'000'000'000ULL
+          : sourceKind == abi::SourceKind::HostMapped ? 50'000'000'000ULL
+                                                      : 30'000'000'000ULL,
+          static_cast<std::uint32_t>(sourceKind),
+          0,
+          static_cast<std::uint32_t>(sourceKind),
+          static_cast<std::uint32_t>(direct ? abi::ReplicaDirect
+                                            : abi::ReplicaTransport),
+          0,
+          0,
+      });
+      const std::uint64_t candidateCost =
+          replicaEntries.back().estimatedLatencyNs +
+          bytes * 1'000'000'000ULL /
+              replicaEntries.back().estimatedBandwidthBytesPerSecond;
+      if (direct && candidateCost < directCost) {
+        directAddress = owned.sourceDevice;
+        directCost = candidateCost;
       }
     }
+    if (hasTransport) {
+      checkCuda(cudaMalloc(&allocation.stagingDevice, bytes),
+                "cudaMalloc object staging destination");
+    }
 
-    const bool direct = placement != Placement::HostStaged;
+    const std::uint32_t replicaStart =
+        slot * impl_->config.maxReplicasPerObject;
     abi::ObjectEntry entry{
         objectId,
-        reinterpret_cast<std::uint64_t>(allocation.sourceDevice),
         reinterpret_cast<std::uint64_t>(allocation.stagingDevice),
-        contents.size(),
-        0,
+        bytes,
         0,
         version,
-        static_cast<std::uint32_t>(
-            placement == Placement::Hbm          ? abi::SourceKind::Hbm
-            : placement == Placement::HostMapped ? abi::SourceKind::HostMapped
-                                                 : abi::SourceKind::HostStaged),
-        static_cast<std::uint32_t>(direct ? abi::ObjectState::Ready
-                                          : abi::ObjectState::New),
+        static_cast<std::uint32_t>(directAddress != nullptr
+                                       ? abi::ObjectState::Ready
+                                       : abi::ObjectState::New),
+        replicaStart,
+        static_cast<std::uint32_t>(replicaEntries.size()),
+        abi::InvalidIndex,
+        0,
         0,
     };
 
+    checkCuda(cudaMemcpy(impl_->replicaEntries + replicaStart,
+                         replicaEntries.data(),
+                         replicaEntries.size() * sizeof(replicaEntries.front()),
+                         cudaMemcpyHostToDevice),
+              "upload object replica directory");
     uploadOne(impl_->objectEntries, slot, entry);
     if (impl_->objects[slot].has_value()) {
       impl_->releaseObject(*impl_->objects[slot]);
     }
-    void *const directAddress = direct ? allocation.sourceDevice : nullptr;
     impl_->objects[slot] = std::move(allocation);
-    return {
-        slot,
-        directAddress,
-    };
+    return {slot, directAddress};
   } catch (...) {
     impl_->releaseObject(allocation);
     throw;
@@ -312,28 +523,68 @@ ObjectHandle HostRuntime::installNvmeObject(
     throw std::invalid_argument("NVMe object range is invalid or unaligned");
   }
 
-  Impl::OwnedObject allocation{
-      Placement::HostStaged,  nullptr, nullptr, destination->deviceAddress(),
-      std::move(destination),
+  Impl::OwnedObject allocation{destination->deviceAddress(),
+                               std::move(destination), {}};
+  const abi::ReplicaEntry replica{
+      sourceByteOffset,
+      allocation.nvmeBuffer->dmaPageListAddress(),
+      80'000,
+      7'000'000'000ULL,
+      static_cast<std::uint32_t>(abi::SourceKind::Nvme),
+      allocation.nvmeBuffer->dmaPageCount(),
+      static_cast<std::uint32_t>(abi::SourceKind::Nvme),
+      abi::ReplicaTransport,
+      0,
+      0,
   };
+  const std::uint32_t replicaStart =
+      slot * impl_->config.maxReplicasPerObject;
   abi::ObjectEntry entry{
       objectId,
-      sourceByteOffset,
       reinterpret_cast<std::uint64_t>(allocation.stagingDevice),
       bytes,
-      allocation.nvmeBuffer->dmaPageListAddress(),
       0,
       version,
-      static_cast<std::uint32_t>(abi::SourceKind::Nvme),
       static_cast<std::uint32_t>(abi::ObjectState::New),
-      allocation.nvmeBuffer->dmaPageCount(),
+      replicaStart,
+      1,
+      abi::InvalidIndex,
+      0,
+      0,
   };
+  uploadOne(impl_->replicaEntries, replicaStart, replica);
   uploadOne(impl_->objectEntries, slot, entry);
   if (impl_->objects[slot].has_value()) {
     impl_->releaseObject(*impl_->objects[slot]);
   }
   impl_->objects[slot] = std::move(allocation);
   return {slot, nullptr};
+}
+
+void HostRuntime::bindTensorMaps(std::uint32_t objectSlot,
+                                 std::uint32_t relativeReplica,
+                                 const void *replicaTensorMap,
+                                 const void *stagingTensorMap) {
+  impl_->checkObjectSlot(objectSlot);
+  if (!impl_->objects[objectSlot].has_value()) {
+    throw std::invalid_argument("cannot bind tensor maps before object install");
+  }
+
+  abi::ObjectEntry object = downloadOne(impl_->objectEntries, objectSlot);
+  if (relativeReplica >= object.replicaCount ||
+      object.replicaStart > impl_->replicaCapacity ||
+      relativeReplica >= impl_->replicaCapacity - object.replicaStart) {
+    throw std::out_of_range("relative replica exceeds object replica range");
+  }
+  abi::ReplicaEntry replica = downloadOne(
+      impl_->replicaEntries, object.replicaStart + relativeReplica);
+  replica.tensorMapAddress =
+      reinterpret_cast<std::uint64_t>(replicaTensorMap);
+  object.stagingTensorMapAddress =
+      reinterpret_cast<std::uint64_t>(stagingTensorMap);
+  uploadOne(impl_->replicaEntries, object.replicaStart + relativeReplica,
+            replica);
+  uploadOne(impl_->objectEntries, objectSlot, object);
 }
 
 abi::RuntimeView *HostRuntime::deviceView() const noexcept {
@@ -349,9 +600,29 @@ abi::RequestContext HostRuntime::readRequest(std::uint32_t slot) const {
   return downloadOne(impl_->requests, slot);
 }
 
+abi::TenantContext HostRuntime::readTenant(std::uint32_t tenantId) const {
+  if (tenantId >= impl_->config.requestCapacity) {
+    throw std::out_of_range("tenant id exceeds runtime capacity");
+  }
+  return downloadOne(impl_->tenants, tenantId);
+}
+
 abi::ObjectEntry HostRuntime::readObject(std::uint32_t slot) const {
   impl_->checkObjectSlot(slot);
   return downloadOne(impl_->objectEntries, slot);
+}
+
+abi::ReplicaEntry HostRuntime::readReplica(
+    std::uint32_t objectSlot, std::uint32_t relativeReplica) const {
+  impl_->checkObjectSlot(objectSlot);
+  const abi::ObjectEntry object = readObject(objectSlot);
+  if (relativeReplica >= object.replicaCount ||
+      object.replicaStart > impl_->replicaCapacity ||
+      relativeReplica >= impl_->replicaCapacity - object.replicaStart) {
+    throw std::out_of_range("relative replica exceeds object replica range");
+  }
+  return downloadOne(impl_->replicaEntries,
+                     object.replicaStart + relativeReplica);
 }
 
 abi::Continuation HostRuntime::readContinuation(std::uint32_t slot) const {
@@ -359,6 +630,10 @@ abi::Continuation HostRuntime::readContinuation(std::uint32_t slot) const {
     throw std::out_of_range("continuation slot exceeds runtime capacity");
   }
   return downloadOne(impl_->continuations, slot);
+}
+
+abi::IntentPool HostRuntime::readIntentPool() const {
+  return downloadOne(impl_->intentPool, 0);
 }
 
 } // namespace nta

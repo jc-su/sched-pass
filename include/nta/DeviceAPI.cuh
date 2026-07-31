@@ -15,5 +15,11 @@ __nta_acquire_marker(nta::abi::RuntimeView *runtime, const void *directBase,
                      std::uint32_t objectVersion, std::uint64_t offset,
                      std::uint32_t bytes, std::uint32_t continuation);
 
+extern "C" __device__ void *__nta_acquire_tensor_map_marker(
+    nta::abi::RuntimeView *runtime, const void *directTensorMap,
+    std::uint32_t objectSlot, std::uint64_t objectId,
+    std::uint32_t objectVersion, std::uint64_t offset, std::uint32_t bytes,
+    std::uint32_t continuation);
+
 extern "C" __device__ void __nta_defer_marker(nta::abi::RuntimeView *runtime,
                                               std::uint32_t continuation);

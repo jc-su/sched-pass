@@ -7,11 +7,13 @@ implementation gates for the clean `nonresident-acquisition` branch. Decisions
 in this document take precedence over the previous prototype's design notes.
 
 Implementation status (2026-07-31): M0-M4 have a working vertical slice tested
-on an NVIDIA RTX PRO 6000 Blackwell Server Edition. CPU DRAM can be consumed
-directly or copied into HBM by finite GPU progress CTAs. A KIOXIA CD8P NVMe
-controller can DMA directly into CUDA HBM registered through DMA-BUF or into
-registered mapped DRAM. RDMA, TMA specialization, and serving-framework
-integration are not implemented and have no placeholder backends.
+on an NVIDIA RTX PRO 6000 Blackwell Server Edition. M5 has a numerically checked
+split-K paged-attention mechanism workload, not a serving-framework result. M6
+has real TMA descriptor selection and hardware TMA after direct or externally
+staged acquisition; automatic production-IR recognition remains open. A KIOXIA
+CD8P NVMe controller has DMAed directly into CUDA HBM registered through
+DMA-BUF and into registered mapped DRAM. RDMA is not implemented because this
+host has no RNIC, and there is no placeholder backend.
 
 ## 1. Working thesis
 
@@ -141,7 +143,7 @@ The system therefore needs a continuation that survives the issuing CTA.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v2 registers each staged directory entry as one acquisition tile. Direct
+ABI v7 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
 this makes duplicate suppression exact without a range-readiness bitmap.
 
@@ -176,7 +178,7 @@ RequestContext {
     deadline
     cancelled
     outstanding_bytes
-    per_backend_credits
+    max_outstanding_bytes
 }
 ```
 
@@ -229,7 +231,8 @@ Continuation {
 }
 ```
 
-The initial implementation uses fixed-size, preallocated tables and rings. It
+The implementation uses fixed-size, preallocated tables and an object-keyed
+reusable intent pool. It
 must not allocate memory on the device hot path.
 
 ## 6. Execution model
@@ -247,10 +250,9 @@ FAILED(error)
 The state machine is:
 
 ```text
-NEW -> ADMITTED -> ISSUED -> READY -> CONSUMED
-          |           |
-          |           +-> FAILED
-          +-> DEFERRED
+NEW -> QUEUED -> ISSUED -> READY
+  |        |        |
+  +--------+--------+-> FAILED
 
 Any nonterminal state -> CANCELLED on generation mismatch or cancellation.
 ```
@@ -339,9 +341,11 @@ Recognize:
 - inline PTX `cp.async` global-to-shared operations; and
 - TMA operations or descriptors when visible through IR or frontend metadata.
 
-The previous prototype proved `cp.async` recognition but did not implement TMA
-descriptor handling. The clean implementation starts with plain loads and
-`cp.async`; TMA is admitted after a dedicated IR census and test fixture.
+The clean implementation currently consumes explicit byte-address or tensor-map
+markers and rejects sites without a dominating request binding or canonical
+null/defer/return edge. It does not yet infer arbitrary production load,
+`cp.async`, or TMA address cones. The previous branch's recognition experiment
+is not evidence for this branch.
 
 ### 7.3 Phase C: object-key derivation
 
@@ -367,14 +371,14 @@ Prove:
 
 ### 7.5 Phase E: lowering
 
-Emit a small internal acquisition IR using ordinary function calls so this
-project does not require an LLVM fork:
+Lower explicit frontend markers to a small internal acquisition IR using
+ordinary function calls so this project does not require an LLVM fork:
 
 ```llvm
-declare i64 @nta.acquire(...)
-declare i1  @nta.test.once(i64)
-declare void @nta.defer(...)
-declare void @nta.progress(i32 backend_mask, i32 budget)
+declare ptr @nta_acquire_slow(...)
+declare ptr @nta_acquire_tensor_map_slow(...)
+declare i1  @nta_request_live(...)
+declare void @nta_defer(...)
 ```
 
 A backend-lowering pass or linked device bitcode specializes these operations.
@@ -458,15 +462,17 @@ conditions.
 
 ## 10. Request-aware admission
 
-This is a post-M3 design requirement. The current host-memory implementation
-uses duplicate suppression and a fixed-capacity FIFO intent ring; it does not
-claim priority scheduling. The first request-aware scheduler will be simple and
-bounded:
+The current implementation carries request generation, tenant, priority, and
+deadline into every intent. Request, tenant, and backend byte credits are
+reserved without waiting and rolled back on admission failure. NVMe scans the
+bounded pool and chooses by priority/deadline urgency, then weighted tenant
+service, before submission. Host
+staging launches independent finite copy CTAs and enforces byte isolation, but
+does not yet impose global priority order because those copies can run
+concurrently. Remaining policy work is:
 
 - fixed priority or slack buckets rather than a device heap;
-- per-request and per-tenant byte credits;
-- per-backend credits;
-- aging to prevent starvation;
+- long-horizon aging across urgency classes;
 - duplicate-object coalescing; and
 - generation-safe cancellation.
 
@@ -590,7 +596,9 @@ path. Registration is performed ahead of time.
 3. Submission publication follows backend-required release ordering before a
    doorbell write.
 4. Completion consumption establishes visibility before READY publication.
-5. Queue exhaustion causes deferral, never spinning while holding resources.
+5. Transport queue exhaustion causes deferral, never spinning while holding
+   resources; bootstrap requires one intent slot per independently queued
+   object so the intent pool itself cannot exhaust under valid publication.
 6. Duplicate intents share a transfer only when object version and byte range
    match.
 7. Cancellation cannot make a stale continuation runnable.
@@ -633,16 +641,20 @@ The candidate contribution is the combination:
 
 Required comparison points include:
 
-- BaM: GPU-initiated NVMe;
-- AGILE: asynchronous GPU storage with a background GPU service;
-- DAK: direct host-memory TMA in custom offload kernels;
-- NVSHMEM: GPU-initiated remote communication and peer TMA;
-- Tutti and Strata: tiered KV serving;
-- CoPilotIO: GPU submission with CPU completion; and
+- Syncopate: compiler-generated chunk-level compute/communication overlap;
+- Strata: production hierarchical KV, GPU-assisted I/O, and cache-aware
+  scheduling;
+- DirectKV: zero-copy CPU-resident KV with fused warp-level pipelines;
+- CoPilotIO: GPU storage submission with CPU completion;
+- BaM and AGILE: GPU-initiated storage and background GPU progress;
+- GORIO and GNStor: GPU-owned remote I/O and NVMe-over-RDMA;
+- GIN, GICC, and NVSHMEM: GPU-initiated remote communication;
+- DAK: direct host-memory TMA in custom offload kernels; and
 - VTC: compiler-managed virtual tensors for movement elimination.
 
-The implementation must not claim "first" until the literature audit is updated
-at submission time.
+Detailed boundaries are maintained in `docs/RELATED_WORK.md`. The
+implementation must not claim "first" until that audit is updated at submission
+time.
 
 ## 18. Evaluation
 
@@ -735,9 +747,10 @@ are tested; exhaustive queue-wrap testing remains open.
 
 Gate: no deadlock at ring wraparound or full queue; bounded instruction count.
 
-Status: complete for a single acquisition epoch. Misses publish to a fixed
-ring, object CAS suppresses duplicates, and a finite progress grid precedes a
-finite resume grid. No kernel polls or persists.
+Status: complete across repeated epochs. Misses publish to a reusable
+object-keyed pool, object CAS suppresses duplicates, and a finite progress grid
+precedes ready publication and a finite ready-only resume grid. No kernel polls
+or persists.
 
 ### M3: CPU DRAM
 
@@ -781,6 +794,12 @@ trusted privileged process and is not a hardware-enforced read-only interface.
 
 Gate: improvement over CPU/runtime prefetch using the same data path.
 
+Status: mechanism workload complete, serving gate open. The branch runs a real
+FP16, head-dimension-128, page-size-16 split-K attention kernel with
+heterogeneous pages per request, stable partial softmax reduction, ready-only
+continuations, and a CPU numerical reference. It is not wired into vLLM's KV
+manager or model runner, and therefore has no TTFT/TPOT/SLO claim.
+
 ### M6: TMA specialization
 
 - Census actual production IR/PTX forms.
@@ -789,6 +808,13 @@ Gate: improvement over CPU/runtime prefetch using the same data path.
 - Resume from HBM staging using the original TMA path.
 
 Gate: no claim based solely on a synthetic TMA kernel.
+
+Status: mechanism complete, production census gate open. A distinct compiler
+marker preserves direct tensor-map descriptors or selects an HBM staging
+descriptor after readiness. The attention CTA initializes its barrier only
+after acquisition succeeds, executes `cp.async.bulk.tensor`, and is covered by
+memcheck/racecheck/synccheck. Production attention IR recognition and an
+untouched-kernel comparison remain required.
 
 ### M7: RDMA
 
@@ -833,6 +859,8 @@ tests/
     runtime/{AbiTest,RuntimeTest}.cpp
 benchmarks/
     kv/{KvAcquire,KvAcquireKernel,KvTypes}
+    attention/{PagedAttention,PagedAttentionKernel,PagedAttentionTypes}
+    nvme/NvmeRead.cpp
 ```
 
 No legacy scheduler, CLC, grouped-LPT, cache-hint, or timing implementation is

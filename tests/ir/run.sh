@@ -25,7 +25,25 @@ if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
   exit 1
 fi
 
-for fixture in reject-no-binding reject-live-state; do
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
+  -S "${source_dir}/tensor-map.ll" \
+  -o "${output_dir}/tensor-map.lowered.ll"
+rg -q 'call ptr @nta_acquire_tensor_map_slow' \
+  "${output_dir}/tensor-map.lowered.ll"
+rg -Fq '!{!"request-bound", i32 7, !"tensor-map"}' \
+  "${output_dir}/tensor-map.lowered.ll"
+rg -q 'phi ptr \[ null, %entry \], \[ %direct.map, %nta.acquire.direct \]' \
+  "${output_dir}/tensor-map.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_tensor_map_marker|defer_marker)' \
+  "${output_dir}/tensor-map.lowered.ll"; then
+  echo "lowered tensor-map module still contains an NTA marker" >&2
+  exit 1
+fi
+
+for fixture in reject-no-binding reject-live-state reject-wrong-token \
+               reject-pending-use; do
   "${opt}" \
     -load-pass-plugin="${plugin}" \
     -passes=nta-acquire \

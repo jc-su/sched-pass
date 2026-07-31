@@ -172,6 +172,71 @@ if(NTA_ENABLE_CUDA)
   )
   add_custom_target(nta-kv-kernel ALL DEPENDS "${NTA_KV_CUBIN}")
 
+  set(NTA_ATTENTION_RAW_BC
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel/PagedAttention.raw.bc")
+  set(NTA_ATTENTION_LOWERED_IR
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel/PagedAttention.lowered.ll")
+  set(NTA_ATTENTION_PTX
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel/PagedAttention.ptx")
+  set(NTA_ATTENTION_CUBIN
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel/PagedAttention.cubin")
+  add_custom_command(
+    OUTPUT "${NTA_ATTENTION_CUBIN}"
+    BYPRODUCTS
+      "${NTA_ATTENTION_RAW_BC}"
+      "${NTA_ATTENTION_LOWERED_IR}"
+      "${NTA_ATTENTION_PTX}"
+    COMMAND
+      ${CMAKE_COMMAND} -E make_directory
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel"
+    COMMAND
+      "${NTA_CLANG_CUDA}"
+      -O3
+      -std=c++20
+      --cuda-device-only
+      --cuda-path=${NTA_CUDA_ROOT}
+      --cuda-gpu-arch=${NTA_CUDA_ARCH}
+      -Wno-unknown-cuda-version
+      -I${CMAKE_CURRENT_SOURCE_DIR}/include
+      -I${CMAKE_CURRENT_SOURCE_DIR}
+      -emit-llvm
+      -c
+      ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/attention/PagedAttentionKernel.cu
+      -o "${NTA_ATTENTION_RAW_BC}"
+    COMMAND
+      ${LLVM_TOOLS_BINARY_DIR}/opt
+      -load-pass-plugin=$<TARGET_FILE:NtaPass>
+      -passes=nta-acquire,always-inline
+      -S
+      "${NTA_ATTENTION_RAW_BC}"
+      -o "${NTA_ATTENTION_LOWERED_IR}"
+    COMMAND
+      ${LLVM_TOOLS_BINARY_DIR}/llc
+      -march=nvptx64
+      -mcpu=${NTA_CUDA_ARCH}
+      -O3
+      "${NTA_ATTENTION_LOWERED_IR}"
+      -o "${NTA_ATTENTION_PTX}"
+    COMMAND
+      "${NTA_PTXAS}"
+      -arch=${NTA_CUDA_ARCH}
+      -O3
+      "${NTA_ATTENTION_PTX}"
+      -o "${NTA_ATTENTION_CUBIN}"
+    DEPENDS
+      NtaPass
+      benchmarks/attention/PagedAttentionKernel.cu
+      benchmarks/attention/PagedAttentionTypes.h
+      include/nta/DeviceAPI.cuh
+      include/nta/RuntimeABI.h
+      runtime/device/Acquire.cuh
+    VERBATIM
+    COMMAND_EXPAND_LISTS
+  )
+  add_custom_target(
+    nta-attention-kernel ALL DEPENDS "${NTA_ATTENTION_CUBIN}"
+  )
+
   add_executable(nta-kv-bench benchmarks/kv/KvAcquire.cpp)
   add_dependencies(nta-kv-bench nta-kv-kernel)
   target_include_directories(nta-kv-bench PRIVATE
@@ -208,6 +273,27 @@ if(NTA_ENABLE_CUDA)
     )
   endif()
 
+  add_executable(
+    nta-paged-attention benchmarks/attention/PagedAttention.cpp
+  )
+  add_dependencies(nta-paged-attention nta-attention-kernel)
+  target_include_directories(nta-paged-attention PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_compile_definitions(
+    nta-paged-attention
+    PRIVATE NTA_ATTENTION_CUBIN_PATH="${NTA_ATTENTION_CUBIN}"
+  )
+  target_link_libraries(
+    nta-paged-attention PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+  )
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-paged-attention PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+
   add_executable(nta-runtime-test tests/runtime/RuntimeTest.cpp)
   target_include_directories(nta-runtime-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -232,6 +318,33 @@ if(NTA_ENABLE_CUDA)
       --coalesce=3
   )
   set_tests_properties(nta-kv-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-paged-attention-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=host-staged
+      --requests=4
+      --min-pages=2
+      --max-pages=4
+      --iterations=2
+      --progress-passes=4
+      --request-credit-pages=1
+  )
+  set_tests_properties(nta-paged-attention-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-paged-attention-tma-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=host-staged
+      --copy=tma
+      --requests=4
+      --min-pages=2
+      --max-pages=4
+      --iterations=2
+      --progress-passes=4
+      --request-credit-pages=1
+  )
+  set_tests_properties(nta-paged-attention-tma-gpu PROPERTIES TIMEOUT 60)
 endif()
 
 add_custom_target(

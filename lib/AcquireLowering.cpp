@@ -28,11 +28,12 @@ STATISTIC(SitesRejected, "Number of unsafe NTA sites rejected");
 namespace nta {
 namespace {
 
-MDNode *acquisitionMetadata(LLVMContext &context) {
+MDNode *acquisitionMetadata(LLVMContext &context, bool tensorMap) {
   Metadata *fields[] = {
       MDString::get(context, "request-bound"),
       ConstantAsMetadata::get(
           ConstantInt::get(Type::getInt32Ty(context), abi::Version)),
+      MDString::get(context, tensorMap ? "tensor-map" : "byte-address"),
   };
   return MDNode::get(context, fields);
 }
@@ -53,6 +54,11 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
   Value *offset = marker->getArgOperand(ir::Offset);
   Value *bytes = marker->getArgOperand(ir::Bytes);
   Value *continuation = marker->getArgOperand(ir::Continuation);
+  const auto *markerFunction = dyn_cast<Function>(
+      marker->getCalledOperand()->stripPointerCasts());
+  const bool tensorMap = markerFunction != nullptr &&
+                         markerFunction->getName() ==
+                             ir::AcquireTensorMapMarker;
 
   Type *pointerType = marker->getType();
   Type *i1 = Type::getInt1Ty(context);
@@ -64,7 +70,7 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
       ir::RequestLive,
       FunctionType::get(i1, {runtime->getType(), i32, i32}, false));
   FunctionCallee acquireSlow = module.getOrInsertFunction(
-      ir::AcquireSlow,
+      tensorMap ? ir::AcquireTensorMapSlow : ir::AcquireSlow,
       FunctionType::get(
           pointerType,
           {runtime->getType(), i32, i32, i32, i64, i32, i64, i32, i32}, false));
@@ -92,8 +98,11 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
   resolveBuilder.CreateCondBr(hasDirect, directBlock, slowBlock);
 
   IRBuilder<> directBuilder(directBlock);
-  Value *directAddress = directBuilder.CreateInBoundsGEP(i8, directBase, offset,
-                                                         "nta.direct.address");
+  Value *directAddress = directBase;
+  if (!tensorMap) {
+    directAddress = directBuilder.CreateInBoundsGEP(
+        i8, directBase, offset, "nta.direct.address");
+  }
   directBuilder.CreateBr(continuationBlock);
 
   IRBuilder<> slowBuilder(slowBlock);
@@ -102,7 +111,8 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
                                            objectSlot, objectId, objectVersion,
                                            offset, bytes, continuation},
                                           "nta.pending.address");
-  slow->setMetadata(ir::AcquisitionMetadata, acquisitionMetadata(context));
+  slow->setMetadata(ir::AcquisitionMetadata,
+                    acquisitionMetadata(context, tensorMap));
   slowBuilder.CreateBr(continuationBlock);
 
   IRBuilder<> continuationBuilder(&continuationBlock->front());
@@ -171,6 +181,7 @@ AcquireLoweringPass::run(Module &module,
                          ir::LoweredModuleFlag, abi::Version);
     removeUnusedMarker(module, ir::BindMarker);
     removeUnusedMarker(module, ir::AcquireMarker);
+    removeUnusedMarker(module, ir::AcquireTensorMapMarker);
     removeUnusedMarker(module, ir::DeferMarker);
   }
 

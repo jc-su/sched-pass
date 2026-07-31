@@ -24,22 +24,35 @@ __device__ __forceinline__ std::uint64_t warpSum64(std::uint64_t value) {
 
 } // namespace
 
-extern "C" __global__ void
-nta_kv_tile_kernel(nta::abi::RuntimeView *runtime,
-                   const nta::benchmark::TileTask *tasks,
-                   std::uint32_t taskCount, const float *query, float *output,
-                   std::uint32_t phase) {
-  const std::uint32_t taskIndex = blockIdx.x;
-  if (taskIndex >= taskCount) {
-    return;
+namespace {
+
+__device__ __forceinline__ std::uint32_t
+popReadyContinuation(nta::abi::RuntimeView *runtime) {
+  __shared__ std::uint32_t selected;
+  if (threadIdx.x == 0) {
+    selected = nta::abi::InvalidIndex;
+    for (;;) {
+      const std::uint32_t head = atomicAdd(runtime->readyHead, 0U);
+      const std::uint32_t count = atomicAdd(runtime->readyCount, 0U);
+      if (head >= count) {
+        break;
+      }
+      if (atomicCAS(runtime->readyHead, head, head + 1U) == head) {
+        selected = runtime->readyContinuations[head];
+        break;
+      }
+    }
   }
+  __syncthreads();
+  return selected;
+}
+
+__device__ __forceinline__ void
+runKvTile(nta::abi::RuntimeView *runtime,
+          const nta::benchmark::TileTask *tasks, std::uint32_t taskIndex,
+          const float *query, float *output) {
 
   const nta::benchmark::TileTask task = tasks[taskIndex];
-  const bool direct = task.directBase != 0;
-  if (phase != 0 && direct) {
-    return;
-  }
-
   nta::abi::Continuation &continuation =
       runtime->continuations[task.continuation];
 
@@ -83,22 +96,13 @@ nta_kv_tile_kernel(nta::abi::RuntimeView *runtime,
   }
 }
 
-extern "C" __global__ void nta_nvme_hash_kernel(
-    nta::abi::RuntimeView *runtime, const nta::benchmark::TileTask *tasks,
-    std::uint32_t taskCount, std::uint64_t *output, std::uint32_t phase) {
-  const std::uint32_t taskIndex = blockIdx.x;
-  if (taskIndex >= taskCount) {
-    return;
-  }
-
+__device__ __forceinline__ void
+runNvmeHash(nta::abi::RuntimeView *runtime,
+            const nta::benchmark::TileTask *tasks, std::uint32_t taskIndex,
+            std::uint64_t *output) {
   const nta::benchmark::TileTask task = tasks[taskIndex];
   nta::abi::Continuation &continuation =
       runtime->continuations[task.continuation];
-  if (phase != 0 &&
-      atomicAdd(&continuation.state, 0U) ==
-          static_cast<std::uint32_t>(nta::abi::ContinuationState::Done)) {
-    return;
-  }
 
   __nta_bind_request(task.requestSlot, task.generation);
   void *address = __nta_acquire_marker(
@@ -137,5 +141,58 @@ extern "C" __global__ void nta_nvme_hash_kernel(
       atomicExch(&continuation.state,
                  static_cast<std::uint32_t>(nta::abi::ContinuationState::Done));
     }
+  }
+}
+
+} // namespace
+
+extern "C" __global__ void
+nta_kv_tile_kernel(nta::abi::RuntimeView *runtime,
+                   const nta::benchmark::TileTask *tasks,
+                   std::uint32_t taskCount, const float *query, float *output,
+                   std::uint32_t phase) {
+  const std::uint32_t taskIndex = blockIdx.x;
+  if (phase != 0 || taskIndex >= taskCount) {
+    return;
+  }
+  runKvTile(runtime, tasks, taskIndex, query, output);
+}
+
+extern "C" __global__ void
+nta_kv_ready_kernel(nta::abi::RuntimeView *runtime,
+                    const nta::benchmark::TileTask *tasks,
+                    std::uint32_t taskCount, const float *query, float *output) {
+  const std::uint32_t continuation = popReadyContinuation(runtime);
+  if (continuation >= runtime->continuationCapacity) {
+    return;
+  }
+  const std::uint32_t taskIndex =
+      runtime->continuations[continuation].logicalTile;
+  if (taskIndex < taskCount) {
+    runKvTile(runtime, tasks, taskIndex, query, output);
+  }
+}
+
+extern "C" __global__ void nta_nvme_hash_kernel(
+    nta::abi::RuntimeView *runtime, const nta::benchmark::TileTask *tasks,
+    std::uint32_t taskCount, std::uint64_t *output, std::uint32_t phase) {
+  const std::uint32_t taskIndex = blockIdx.x;
+  if (phase != 0 || taskIndex >= taskCount) {
+    return;
+  }
+  runNvmeHash(runtime, tasks, taskIndex, output);
+}
+
+extern "C" __global__ void nta_nvme_ready_hash_kernel(
+    nta::abi::RuntimeView *runtime, const nta::benchmark::TileTask *tasks,
+    std::uint32_t taskCount, std::uint64_t *output) {
+  const std::uint32_t continuation = popReadyContinuation(runtime);
+  if (continuation >= runtime->continuationCapacity) {
+    return;
+  }
+  const std::uint32_t taskIndex =
+      runtime->continuations[continuation].logicalTile;
+  if (taskIndex < taskCount) {
+    runNvmeHash(runtime, tasks, taskIndex, output);
   }
 }

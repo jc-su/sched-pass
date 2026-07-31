@@ -6,10 +6,14 @@ namespace nta::ir {
 
 inline constexpr llvm::StringLiteral BindMarker = "__nta_bind_request";
 inline constexpr llvm::StringLiteral AcquireMarker = "__nta_acquire_marker";
+inline constexpr llvm::StringLiteral AcquireTensorMapMarker =
+    "__nta_acquire_tensor_map_marker";
 inline constexpr llvm::StringLiteral DeferMarker = "__nta_defer_marker";
 
 inline constexpr llvm::StringLiteral RequestLive = "nta_request_live";
 inline constexpr llvm::StringLiteral AcquireSlow = "nta_acquire_slow";
+inline constexpr llvm::StringLiteral AcquireTensorMapSlow =
+    "nta_acquire_tensor_map_slow";
 inline constexpr llvm::StringLiteral Defer = "nta_defer";
 
 inline constexpr llvm::StringLiteral AcquisitionMetadata = "nta.acquire";

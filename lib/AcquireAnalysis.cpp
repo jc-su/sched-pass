@@ -90,7 +90,13 @@ bool isNull(Value *value) {
   return constant != nullptr && constant->isNullValue();
 }
 
-std::optional<BasicBlock *> pendingSuccessor(CallInst &marker) {
+struct AcquisitionBranch {
+  ICmpInst *comparison;
+  BasicBlock *pending;
+  BasicBlock *ready;
+};
+
+std::optional<AcquisitionBranch> acquisitionBranch(CallInst &marker) {
   ICmpInst *nullComparison = nullptr;
   for (User *user : marker.users()) {
     auto *comparison = dyn_cast<ICmpInst>(user);
@@ -117,7 +123,11 @@ std::optional<BasicBlock *> pendingSuccessor(CallInst &marker) {
 
   const bool trueMeansPending =
       nullComparison->getPredicate() == ICmpInst::ICMP_EQ;
-  return branch->getSuccessor(trueMeansPending ? 0 : 1);
+  return AcquisitionBranch{
+      nullComparison,
+      branch->getSuccessor(trueMeansPending ? 0 : 1),
+      branch->getSuccessor(trueMeansPending ? 1 : 0),
+  };
 }
 
 bool isHarmlessPendingInstruction(Instruction &instruction) {
@@ -133,15 +143,27 @@ bool isHarmlessPendingInstruction(Instruction &instruction) {
   return isa<PHINode>(instruction);
 }
 
-std::optional<std::string> validateDeferralBoundary(CallInst &marker) {
-  std::optional<BasicBlock *> pending = pendingSuccessor(marker);
-  if (!pending.has_value()) {
+std::optional<std::string>
+validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
+  std::optional<AcquisitionBranch> branch = acquisitionBranch(marker);
+  if (!branch.has_value()) {
     return "acquired pointer must have one canonical null branch";
   }
 
-  bool foundDefer = false;
+  for (User *user : marker.users()) {
+    if (user == branch->comparison) {
+      continue;
+    }
+    auto *instruction = dyn_cast<Instruction>(user);
+    if (instruction == nullptr ||
+        !dominatorTree.dominates(branch->ready, instruction->getParent())) {
+      return "acquired value is used outside the ready edge";
+    }
+  }
+
+  unsigned deferCount = 0;
   bool foundReturn = false;
-  SmallVector<BasicBlock *, 4> worklist{*pending};
+  SmallVector<BasicBlock *, 4> worklist{branch->pending};
   std::unordered_set<BasicBlock *> visited;
   while (!worklist.empty()) {
     BasicBlock *block = worklist.pop_back_val();
@@ -155,7 +177,13 @@ std::optional<std::string> validateDeferralBoundary(CallInst &marker) {
     for (Instruction &instruction : *block) {
       if (auto *call = dyn_cast<CallInst>(&instruction);
           call != nullptr && hasName(*call, ir::DeferMarker)) {
-        foundDefer = true;
+        if (call->getArgOperand(ir::DeferRuntime) !=
+                marker.getArgOperand(ir::Runtime) ||
+            call->getArgOperand(ir::DeferContinuation) !=
+                marker.getArgOperand(ir::Continuation)) {
+          return "pending edge defers a different acquisition token";
+        }
+        ++deferCount;
       } else if (!isHarmlessPendingInstruction(instruction)) {
         return "pending edge contains state that cannot cross CTA deferral";
       }
@@ -173,8 +201,8 @@ std::optional<std::string> validateDeferralBoundary(CallInst &marker) {
     worklist.push_back(branch->getSuccessor(0));
   }
 
-  if (!foundDefer || !foundReturn) {
-    return "pending edge must defer and return from the finite kernel";
+  if (deferCount != 1 || !foundReturn) {
+    return "pending edge must defer exactly once and return from the finite kernel";
   }
   return std::nullopt;
 }
@@ -198,7 +226,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
         } else {
           plan.bindings.push_back(call);
         }
-      } else if (hasName(*call, ir::AcquireMarker)) {
+      } else if (hasName(*call, ir::AcquireMarker) ||
+                 hasName(*call, ir::AcquireTensorMapMarker)) {
         acquireMarkers.push_back(call);
       } else if (hasName(*call, ir::DeferMarker)) {
         deferMarkers.push_back(call);
@@ -223,7 +252,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           {marker, "no valid request binding dominates acquisition"});
       continue;
     }
-    if (std::optional<std::string> error = validateDeferralBoundary(*marker)) {
+    if (std::optional<std::string> error =
+            validateDeferralBoundary(*marker, dominatorTree)) {
       plan.rejected.push_back({marker, std::move(*error)});
       continue;
     }

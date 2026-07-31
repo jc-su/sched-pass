@@ -93,6 +93,10 @@ public:
                 "cuModuleGetFunction nta_reset_epoch");
     checkDriver(cuModuleGetFunction(&compute_, module_, "nta_kv_tile_kernel"),
                 "cuModuleGetFunction nta_kv_tile_kernel");
+    checkDriver(cuModuleGetFunction(&ready_, module_, "nta_kv_ready_kernel"),
+                "cuModuleGetFunction nta_kv_ready_kernel");
+    checkDriver(cuModuleGetFunction(&publish_, module_, "nta_publish_ready"),
+                "cuModuleGetFunction nta_publish_ready");
     checkDriver(
         cuModuleGetFunction(&progress_, module_, "nta_progress_host_staging"),
         "cuModuleGetFunction nta_progress_host_staging");
@@ -149,10 +153,40 @@ public:
                 "cuLaunchKernel progress");
   }
 
+  void launchPublish(CUstream stream, nta::abi::RuntimeView *runtime,
+                     std::uint32_t continuationCount) const {
+    const std::uint32_t threads = 256;
+    const std::uint32_t blocks =
+        (continuationCount + threads - 1U) / threads;
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    void *arguments[] = {&runtimeAddress, &continuationCount};
+    checkDriver(cuLaunchKernel(publish_, blocks, 1, 1, threads, 1, 1, 0,
+                               stream, arguments, nullptr),
+                "cuLaunchKernel publish ready");
+  }
+
+  void launchReady(CUstream stream, nta::abi::RuntimeView *runtime,
+                   const nta::benchmark::TileTask *tasks,
+                   std::uint32_t taskCount, const float *query,
+                   float *output) const {
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
+    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(query);
+    CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
+    void *arguments[] = {
+        &runtimeAddress, &taskAddress, &taskCount, &queryAddress, &outputAddress,
+    };
+    checkDriver(cuLaunchKernel(ready_, taskCount, 1, 1, 256, 1, 1, 0, stream,
+                               arguments, nullptr),
+                "cuLaunchKernel ready compute");
+  }
+
 private:
   CUmodule module_ = nullptr;
   CUfunction reset_ = nullptr;
   CUfunction compute_ = nullptr;
+  CUfunction ready_ = nullptr;
+  CUfunction publish_ = nullptr;
   CUfunction progress_ = nullptr;
 };
 
@@ -371,9 +405,9 @@ int main(int argc, char **argv) {
                           options.requests, deviceQuery.get(),
                           deviceOutput.get(), 0);
     kernels.launchProgress(driverStream, runtime.deviceView(), objectCount);
-    kernels.launchCompute(driverStream, runtime.deviceView(), deviceTasks.get(),
-                          options.requests, deviceQuery.get(),
-                          deviceOutput.get(), 1);
+    kernels.launchPublish(driverStream, runtime.deviceView(), options.requests);
+    kernels.launchReady(driverStream, runtime.deviceView(), deviceTasks.get(),
+                        options.requests, deviceQuery.get(), deviceOutput.get());
     checkCuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
     checkCuda(cudaGraphInstantiate(&graphExec, graph, 0),
               "cudaGraphInstantiate");

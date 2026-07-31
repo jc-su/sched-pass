@@ -11,11 +11,13 @@ The architecture contract and implementation sequence are defined in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 The exact tested environment and current measurements are in
 [docs/VALIDATION.md](docs/VALIDATION.md).
+The current closest-work and novelty boundary is in
+[docs/RELATED_WORK.md](docs/RELATED_WORK.md).
 
 ## Implemented vertical slice
 
-The branch contains a working LLVM 22 new-PM pass and a real Blackwell CUDA
-workload:
+The branch contains a working LLVM 22 new-PM pass and real Blackwell CUDA
+workloads:
 
 - per-CTA request/generation binding in batched kernels;
 - compiler proof of a canonical finite-kernel deferral boundary;
@@ -23,13 +25,22 @@ workload:
 - staged CPU-DRAM acquisition issued and completed by finite GPU CTAs;
 - direct NVMe reads into either DMA-BUF-registered HBM or registered mapped
   DRAM, with GPU-built SQEs/PRPs, GPU MMIO doorbells, and GPU CQ handling;
-- a fixed-capacity intent ring, duplicate-object coalescing, cancellation, and
-  generation-safe continuations;
+- a reusable, object-keyed intent pool, duplicate-object coalescing,
+  cancellation, and generation-safe ready-only continuations;
+- fixed request, tenant, and backend byte credits plus priority/deadline NVMe
+  admission;
+- a backend-neutral directory with bounded per-object physical replicas;
+- a numerically checked split-K paged-attention workload with heterogeneous
+  request lengths;
+- real TMA consumption from direct sources or from HBM after external staging,
+  with compiler-proven deferral before barrier creation;
 - one captured CUDA graph containing discover, bounded progress, and resume
   kernels; and
 - an inspectable NVVM IR -> pass -> PTX -> cubin build pipeline.
 
-There is no placeholder RDMA backend. NVMe is implemented against an isolated
+The compiler currently consumes explicit acquisition markers; automatic
+recognition of arbitrary production load/cp.async/TMA address cones is an open
+gate. There is no placeholder RDMA backend. NVMe is implemented against an isolated
 KIOXIA CD8P controller and tested with read-only commands. The previous
 scheduling prototype remains on `main` at commit `4789f16`.
 
@@ -64,6 +75,23 @@ Run the real mixed-placement workload:
 
 Supported modes are `resident`, `host-direct`, `host-staged`, and `mixed`.
 Generated compiler artifacts are under `build/kernel/`.
+
+Run the split-K attention workload using hardware TMA after external staging:
+
+```bash
+./build/nta-paged-attention \
+  --mode=mixed \
+  --copy=tma \
+  --requests=32 \
+  --min-pages=4 \
+  --max-pages=16 \
+  --iterations=50 \
+  --progress-passes=1
+```
+
+`scripts/validate-local.sh` reproduces the build, tests, global-load/TMA
+placement matrix, and PTX resource report. Set `NTA_SANITIZE=1` to include
+memcheck, racecheck, and synccheck.
 
 ## GPU-initiated NVMe
 

@@ -1,9 +1,10 @@
-# Validation
+# Validation Record
 
 Date: 2026-07-31
 
-This file records reproducible implementation evidence. It is not an
-end-to-end serving or SLO result.
+This file records reproducible mechanism evidence. It is not an end-to-end
+serving result and does not establish production readiness or an OSDI-level
+claim. Open gates are listed explicitly at the end.
 
 ## Environment
 
@@ -11,124 +12,135 @@ end-to-end serving or SLO result.
 - Driver: 595.84
 - Device memory: 97,887 MiB
 - Compiler: Ubuntu LLVM/Clang 22.1.8
-- CUDA device toolkit: 12.9.86
+- Device toolkit: CUDA 12.9.86
 - Target: `sm_120`
+- Compute Sanitizer: 2025.3.1
 
-CUDA 13 is installed but is not used for device compilation because its
-reorganized headers are incompatible with the current Clang CUDA wrapper.
+CUDA 13 is installed but is not used for device compilation because its header
+layout is incompatible with the current Clang CUDA wrapper.
 
-NVMe M4 hardware:
+## Reproduction
 
-- controller: KIOXIA CD8P E3.S, PCIe 5.0 x4, 1.92 TB;
-- queue: one depth-64 I/O SQ/CQ, 4 KiB controller pages, 512-byte LBAs;
-- command: NVM READ only in the benchmark;
-- destination: CUDA HBM through DMA-BUF or pinned mapped CPU DRAM; and
-- launch: one finite CUDA graph, with no persistent kernel and no CPU command
-  or completion path.
+Run the complete local mechanism suite:
 
-## Compiler evidence
-
-The build emits:
-
-```text
-build/kernel/KvAcquire.raw.bc
-build/kernel/KvAcquire.lowered.ll
-build/kernel/KvAcquire.ptx
-build/kernel/KvAcquire.cubin
+```bash
+NTA_SANITIZE=1 ./scripts/validate-local.sh
 ```
 
-The lowered module contains zero bind/acquire/defer marker symbols and two
-compiler-generated `nta_acquire_slow` sites: KV dot product and NVMe checksum.
-The PTX direct KV compute entry has no atomic instruction. Its only calls are on
-the null/slow and defer edges. NVMe progress uses `ld.global.cv`, `membar.sys`,
-and no CTA barrier.
+This builds the pass and runtime, runs CTest, evaluates all direct/staged and
+global-load/TMA attention combinations, emits the PTXAS resource report, and
+runs memcheck, racecheck, and synccheck. Generated evidence is written under
+`results/`, which is excluded from source control.
 
-`ptxas` resource usage:
+## Compiler And Runtime Correctness
 
-| Kernel | Registers | Shared bytes | Local bytes |
+`ctest --test-dir build --output-on-failure` passes six tests:
+
+1. byte-address and tensor-map LLVM lowering plus rejected unsafe IR;
+2. host/device ABI v7 layout;
+3. runtime allocation, replicated-object publication, tensor-map binding, and
+   cancellation state;
+4. mixed HBM/mapped/staged KV acquisition with duplicate coalescing, stale
+   generations, cancellation, and repeated intent-slot reuse;
+5. staged split-K paged attention with one-page request credit; and
+6. the same staged attention path using hardware TMA.
+
+The lowered modules contain no bind/acquire/defer marker calls. Tensor-map sites
+carry `!nta.acquire` metadata identifying ABI v7 and the `tensor-map` flavor.
+The direct branch does not enter the intent pool. NVMe progress uses one warp,
+bounds submission and completion work, and has no CTA barrier.
+
+The mixed TMA attention run reports:
+
+```text
+memcheck:  ERROR SUMMARY: 0 errors
+racecheck: 0 hazards displayed (0 errors, 0 warnings)
+synccheck: ERROR SUMMARY: 0 errors
+```
+
+## Paged Attention
+
+The workload uses FP16 query/K/V data, head dimension 128, 16-token KV pages,
+one CTA per request-owned page, FP32 partial softmax state, and a deterministic
+split-K reduction. Requests have heterogeneous page counts and final-page token
+counts. A CPU reference checks every output element.
+
+For 32 requests, 299 pages, and 50 graph iterations, one local run produced:
+
+| Source | Consumer | Graph ms | Logical GiB/s | Max abs error |
+| --- | --- | ---: | ---: | ---: |
+| HBM | global loads | 0.022 | 105.31 | 2.61e-8 |
+| HBM | TMA | 0.019 | 123.23 | 2.61e-8 |
+| mapped CPU DRAM | global loads | 0.067 | 34.25 | 2.61e-8 |
+| mapped CPU DRAM | TMA | 0.083 | 27.45 | 2.61e-8 |
+| staged CPU DRAM | global loads | 0.326 | 7.00 | 2.61e-8 |
+| staged CPU DRAM | TMA | 0.318 | 7.18 | 2.61e-8 |
+| mixed | global loads | 0.152 | 14.99 | 2.61e-8 |
+| mixed | TMA | 0.208 | 10.97 | 2.61e-8 |
+
+These are single-run mechanism numbers, not confidence intervals. `logical
+GiB/s` counts full KV pages consumed by tile CTAs and is not raw PCIe or DRAM
+bandwidth. TMA is beneficial for the resident case in this run and is not
+universally beneficial, especially for mapped host memory. Publication results
+must use isolated sequential trials, confidence intervals, and controlled GPU
+clocks.
+
+PTXAS reports no spills:
+
+| Kernel | Registers | Shared bytes | Barriers |
 | --- | ---: | ---: | ---: |
-| `nta_kv_tile_kernel` | 32 | 128 | 0 |
-| `nta_progress_host_staging` | 26 | 0 | 0 |
-| `nta_reset_epoch` | 10 | 0 | 0 |
-| `nta_progress_nvme` | 40 | 0 | 0 |
-| `nta_nvme_hash_kernel` | 32 | 256 | 0 |
+| global attention tile | 50 | 576 | 1 |
+| global ready tile | 50 | 580 | 1 |
+| TMA attention tile | 58 | 8,840 | 1 |
+| TMA ready tile | 60 | 8,840 | 1 |
+| host staging progress | 26 | 24 | 1 |
+| NVMe progress | 40 | 0 | 0 |
 
-## Correctness
+The one barrier in the global attention kernel belongs to its reduction. The
+TMA barrier is initialized only after acquisition returns a valid descriptor.
 
-`ctest --test-dir build --output-on-failure` passes:
+## GPU-Initiated NVMe
 
-1. valid and rejected LLVM IR transformations;
-2. host/device ABI layout;
-3. CUDA allocation, publication, and cancellation state; and
-4. mixed HBM, mapped-host, and staged-host KV tiles.
+The tested controller is a KIOXIA CD8P E3.S PCIe 5.0 x4 device. The bootstrap
+driver creates one depth-64 I/O SQ/CQ, maps queue and doorbell memory, and
+registers either mapped CPU DRAM or CUDA HBM exported through DMA-BUF. One
+finite CUDA graph performs discovery, bounded GPU SQE/PRP construction, GPU
+doorbells, bounded GPU CQ handling, ready publication, and checksum work. The
+CPU does not submit or complete commands on the loaded path.
 
-The GPU test includes duplicate-object coalescing, cancellation, and stale
-request generations. Compute Sanitizer reports:
+Earlier hardware validation used 16 independent 64 KiB reads, 10 measured
+graph launches, and 128 finite progress/resume pairs. All 176 expected commands
+completed and every checksum matched the block-device reference:
 
-```text
-memcheck:  0 errors
-racecheck: 0 hazards, 0 errors, 0 warnings
-synccheck: 0 errors
-```
-
-## Mechanism throughput
-
-Each row uses 256 requests, one 256 KiB tile per request, 50 captured-graph
-iterations, and no cancellation. `logical_GiB/s` counts bytes consumed by KV
-dot-product CTAs, so it is not a raw PCIe bandwidth measurement.
-
-| Placement | Graph time (ms) | Logical GiB/s | Verification failures |
-| --- | ---: | ---: | ---: |
-| HBM resident | 0.094 | 662.20 | 0 |
-| CPU DRAM direct | 1.350 | 46.28 | 0 |
-| CPU DRAM staged by GPU | 1.426 | 43.82 | 0 |
-
-A coalescing run with 96 requests sharing 24 staged 64 KiB objects produced
-exactly 24 GPU transfer issues, despite six cancelled and six stale request
-bindings:
-
-```text
-graph_ms=0.072 logical_GiB/s=81.65 staged_issues=24
-verification_failures=0
-```
-
-## GPU-initiated NVMe
-
-Before controller rebinding, the validation helper saved a 2 MiB reference from
-namespace offset zero. Each run used 16 independent 64 KiB ranges, one warmup,
-10 measured graph launches, and 128 bounded progress/resume pairs per graph.
-All 176 expected commands completed and every GPU checksum matched the block
-device reference.
-
-| Destination | Graph time (ms) | Logical MiB/s | Failed CQEs | Verification failures |
+| Destination | Graph ms | Logical MiB/s | Failed CQEs | Verification failures |
 | --- | ---: | ---: | ---: | ---: |
 | mapped CPU DRAM | 0.743 | 1,345.90 | 0 | 0 |
 | DMA-BUF HBM | 0.679 | 1,473.54 | 0 | 0 |
 
-These are finite-graph mechanism measurements, not raw SSD bandwidth. The graph
-also runs checksum CTAs and many completion checks after the transfer is ready.
-One 2 MiB mapped-DRAM read also completed correctly at 2.488 ms per graph over
-three measured iterations.
+The controller is currently owned by the host's `vmem_sw` consumer and has been
+restored to its original driver. The safety helper refuses to rebind it while
+that consumer is active, so ABI v7 and the latest scheduler changes have not
+been revalidated on NVMe hardware. This is a required regression gate.
 
-CUDA reported DMA-BUF support and exported 2 MiB HBM allocations. The NVMe
-importer observed one contiguous 2 MiB DMA segment. Explicitly requesting
-CUDA's `DMA_BUF_MAPPING_TYPE_PCIE` export flag returned
-`CUDA_ERROR_NOT_SUPPORTED` on this driver/platform, while the default DMA-BUF
-export was successfully attached and verified by actual NVMe reads into HBM.
+## Production Gates
 
-The test process required root because unprivileged CUDA I/O-memory registration
-of the NVMe doorbell failed with `CUDA_ERROR_NOT_PERMITTED`. After validation,
-a background `vmem_sw` consumer was detected on the target controller. The
-controller was restored to its original driver, and the setup helper now refuses
-to bind while that module is loaded. The project issued no NVMe writes.
+The following are not validated:
 
-## Claims not yet validated
+- vLLM model-runner, KV-manager, and attention-backend integration;
+- TTFT, TPOT, p50/p99 latency, SLO attainment, and serving goodput;
+- statistical direct-path overhead against an untouched production kernel;
+- automatic compiler recognition of production load/cp.async/TMA address
+  cones instead of explicit frontend markers;
+- host-staging global priority order, NVMe weighted-fairness hardware
+  validation, and starvation aging;
+- GPU-initiated RDMA submission/completion on a real RNIC;
+- latest-ABI NVMe regression, timeout/reset recovery, multiple queues, and
+  multi-tenant security isolation;
+- MoE or ANNS generality workloads; and
+- literature-complete novelty or a paper-quality baseline/ablation matrix.
 
-- production paged-attention integration and SLO impact;
-- direct-path overhead against an untouched production kernel;
-- GPU submission and completion over RDMA;
-- TMA descriptor rebinding; and
-- priority/deadline-aware admission.
-
-These remain gated milestones. No source directory contains a placeholder
-backend for them.
+The installed vLLM 0.13.0 wheel requires PyTorch 2.9.0, while this environment
+has PyTorch 2.11.0+cu130. Its CUDA extension fails to load with an unresolved
+`c10_cuda_check_implementation` symbol. A matched container or rebuilt vLLM is
+required before serving experiments. This machine also has no Mellanox/RDMA
+device, so an RDMA implementation cannot be honestly validated here.
