@@ -14,9 +14,9 @@ namespace nta {
 // explicit lifetime for the complete batch description.
 class DeviceWorkPlan {
 public:
-  explicit DeviceWorkPlan(const WorkPlan &plan);
+  explicit DeviceWorkPlan(const WorkPlan &plan, int deviceOrdinal = -1);
   DeviceWorkPlan(std::uint32_t workItemCapacity,
-                 std::uint32_t dependencyCapacity);
+                 std::uint32_t dependencyCapacity, int deviceOrdinal = -1);
   ~DeviceWorkPlan();
 
   DeviceWorkPlan(const DeviceWorkPlan &) = delete;
@@ -37,6 +37,7 @@ public:
   [[nodiscard]] std::uint32_t dependencyCount() const noexcept;
   [[nodiscard]] std::uint32_t workItemCapacity() const noexcept;
   [[nodiscard]] std::uint32_t dependencyCapacity() const noexcept;
+  [[nodiscard]] int deviceOrdinal() const noexcept;
 
 private:
   struct Impl;

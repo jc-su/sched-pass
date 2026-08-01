@@ -32,7 +32,7 @@ fi
   -o "${output_dir}/dependency-set.lowered.ll"
 rg -q 'call i1 @nta_acquire_set_slow' \
   "${output_dir}/dependency-set.lowered.ll"
-rg -Fq '!{!"request-bound", i32 9, !"dependency-set"}' \
+rg -Fq '!{!"request-bound", i32 10, !"dependency-set"}' \
   "${output_dir}/dependency-set.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
   "${output_dir}/dependency-set.lowered.ll"; then
@@ -62,7 +62,7 @@ fi
   -o "${output_dir}/tensor-map.lowered.ll"
 rg -q 'call ptr @nta_acquire_tensor_map_slow' \
   "${output_dir}/tensor-map.lowered.ll"
-rg -Fq '!{!"request-bound", i32 9, !"tensor-map"}' \
+rg -Fq '!{!"request-bound", i32 10, !"tensor-map"}' \
   "${output_dir}/tensor-map.lowered.ll"
 rg -q 'phi ptr \[ null, %entry \], \[ %direct.map, %nta.acquire.direct \]' \
   "${output_dir}/tensor-map.lowered.ll"

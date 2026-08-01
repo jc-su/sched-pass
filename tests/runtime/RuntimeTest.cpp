@@ -27,6 +27,18 @@ int main() {
       std::cout << "SKIP: no CUDA device\n";
       return 0;
     }
+    int originalDevice = 0;
+    require(cudaGetDevice(&originalDevice) == cudaSuccess,
+            "current CUDA device query failed");
+    bool invalidDeviceRejected = false;
+    try {
+      nta::RuntimeConfig invalidDevice{1, 1, 1, 1};
+      invalidDevice.deviceOrdinal = deviceCount;
+      nta::HostRuntime invalid(invalidDevice);
+    } catch (const std::out_of_range &) {
+      invalidDeviceRejected = true;
+    }
+    require(invalidDeviceRejected, "invalid CUDA device ordinal was accepted");
 
     bool undersizedIntentPoolRejected = false;
     try {
@@ -46,6 +58,8 @@ int main() {
             "dependency capacity must be finite and non-zero");
 
     nta::HostRuntime runtime({4, 4, 4, 4, 2});
+    require(runtime.deviceOrdinal() == originalDevice,
+            "runtime did not retain its CUDA device owner");
     bool uninitializedCancelRejected = false;
     try {
       runtime.cancelRequest(3, 0);
@@ -209,7 +223,8 @@ int main() {
                 uploadedDependency.objectId == 2003,
             "canonical device work-plan upload failed");
     require(devicePlan.workItemCapacity() == 1 &&
-                devicePlan.dependencyCapacity() == 2,
+                devicePlan.dependencyCapacity() == 2 &&
+                devicePlan.deviceOrdinal() == originalDevice,
             "device work-plan capacities were not retained");
 
     nta::DeviceWorkPlan reusablePlan(2, 4);
@@ -275,6 +290,28 @@ int main() {
 
     require(runtime.readRequest(0).cancelled == 1,
             "request cancellation was not published");
+
+    if (deviceCount > 1) {
+      const int secondDevice = originalDevice == 0 ? 1 : 0;
+      nta::RuntimeConfig secondConfig{1, 1, 1, 1};
+      secondConfig.deviceOrdinal = secondDevice;
+      nta::HostRuntime secondRuntime(secondConfig);
+      secondRuntime.setRequest(0, 9001, 1);
+      require(secondRuntime.deviceOrdinal() == secondDevice &&
+                  secondRuntime.readRequest(0).requestId == 9001,
+              "second GPU runtime did not retain independent state");
+
+      require(cudaSetDevice(secondDevice) == cudaSuccess,
+              "cross-device guard test could not switch devices");
+      require(runtime.readRequest(0).requestId == 1001,
+              "runtime operation used the caller's current CUDA device");
+      int restoredDevice = -1;
+      require(cudaGetDevice(&restoredDevice) == cudaSuccess &&
+                  restoredDevice == secondDevice,
+              "runtime device guard did not restore caller state");
+      require(cudaSetDevice(originalDevice) == cudaSuccess,
+              "cross-device guard test could not restore its device");
+    }
 
     bool staleCancelRejected = false;
     try {

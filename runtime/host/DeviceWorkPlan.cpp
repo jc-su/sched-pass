@@ -1,4 +1,5 @@
 #include "nta/DeviceWorkPlan.h"
+#include "CudaDeviceGuard.h"
 
 #include <cuda_runtime_api.h>
 
@@ -39,7 +40,8 @@ void validate(const WorkPlan &plan) {
     const RequestWorkRange &request = plan.requests[requestIndex];
     if (request.workBegin != workCursor || request.workCount == 0 ||
         request.workCount > workCount - workCursor) {
-      throw std::invalid_argument("work plan request ranges are not contiguous");
+      throw std::invalid_argument(
+          "work plan request ranges are not contiguous");
     }
     for (std::uint32_t relative = 0; relative < request.workCount; ++relative) {
       const abi::WorkItem &work = plan.workItems[workCursor + relative];
@@ -85,9 +87,11 @@ void validate(const WorkPlan &plan) {
 
 struct DeviceWorkPlan::Impl {
   Impl(std::uint32_t requestedWorkCapacity,
-       std::uint32_t requestedDependencyCapacity)
+       std::uint32_t requestedDependencyCapacity, int requestedDevice)
       : workCapacity(requestedWorkCapacity),
-        dependencyCapacity(requestedDependencyCapacity) {
+        dependencyCapacity(requestedDependencyCapacity),
+        deviceOrdinal(detail::resolveCudaDevice(requestedDevice)) {
+    detail::CudaDeviceGuard deviceGuard(deviceOrdinal);
     if (workCapacity == 0 || dependencyCapacity == 0) {
       throw std::invalid_argument(
           "device work-plan capacities must be non-zero");
@@ -97,8 +101,7 @@ struct DeviceWorkPlan::Impl {
     const std::size_t dependencyBytes =
         static_cast<std::size_t>(dependencyCapacity) *
         sizeof(abi::AcquireRequirement);
-    if (workBytes >
-        std::numeric_limits<std::size_t>::max() - dependencyBytes) {
+    if (workBytes > std::numeric_limits<std::size_t>::max() - dependencyBytes) {
       throw std::overflow_error("device work-plan allocation overflows");
     }
     allocationBytes = workBytes + dependencyBytes;
@@ -109,12 +112,12 @@ struct DeviceWorkPlan::Impl {
       workItems = static_cast<abi::WorkItem *>(allocation);
       dependencies = reinterpret_cast<abi::AcquireRequirement *>(
           static_cast<std::byte *>(allocation) + dependencyOffset);
-      checkCuda(cudaHostAlloc(&hostStaging, allocationBytes,
-                              cudaHostAllocPortable),
-                "cudaHostAlloc device work-plan staging");
-      checkCuda(cudaEventCreateWithFlags(&uploadComplete,
-                                         cudaEventDisableTiming),
-                "cudaEventCreate device work-plan upload");
+      checkCuda(
+          cudaHostAlloc(&hostStaging, allocationBytes, cudaHostAllocPortable),
+          "cudaHostAlloc device work-plan staging");
+      checkCuda(
+          cudaEventCreateWithFlags(&uploadComplete, cudaEventDisableTiming),
+          "cudaEventCreate device work-plan upload");
     } catch (...) {
       if (uploadComplete != nullptr) {
         (void)cudaEventDestroy(uploadComplete);
@@ -130,6 +133,7 @@ struct DeviceWorkPlan::Impl {
   }
 
   ~Impl() {
+    detail::NoexceptCudaDeviceGuard deviceGuard(deviceOrdinal);
     if (uploadPending) {
       (void)cudaEventSynchronize(uploadComplete);
     }
@@ -145,6 +149,7 @@ struct DeviceWorkPlan::Impl {
   }
 
   void uploadAsync(const WorkPlan &plan, cudaStream_t stream) {
+    detail::CudaDeviceGuard deviceGuard(deviceOrdinal);
     validate(plan);
     if (plan.workItems.size() > workCapacity ||
         plan.dependencies.size() > dependencyCapacity) {
@@ -176,6 +181,7 @@ struct DeviceWorkPlan::Impl {
   }
 
   void synchronizeUpload() const {
+    detail::CudaDeviceGuard deviceGuard(deviceOrdinal);
     if (uploadPending) {
       checkCuda(cudaEventSynchronize(uploadComplete),
                 "synchronize device work-plan upload");
@@ -194,19 +200,22 @@ struct DeviceWorkPlan::Impl {
   std::uint32_t dependencyCapacity = 0;
   std::uint32_t workCount = 0;
   std::uint32_t dependencyCount = 0;
+  int deviceOrdinal = 0;
   mutable bool uploadPending = false;
 };
 
-DeviceWorkPlan::DeviceWorkPlan(const WorkPlan &plan)
+DeviceWorkPlan::DeviceWorkPlan(const WorkPlan &plan, int deviceOrdinal)
     : impl_(std::make_unique<Impl>(
           checkedCount(plan.workItems.size(), "work item count"),
-          checkedCount(plan.dependencies.size(), "dependency count"))) {
+          checkedCount(plan.dependencies.size(), "dependency count"),
+          deviceOrdinal)) {
   upload(plan);
 }
 DeviceWorkPlan::DeviceWorkPlan(std::uint32_t workItemCapacity,
-                               std::uint32_t dependencyCapacity)
-    : impl_(
-          std::make_unique<Impl>(workItemCapacity, dependencyCapacity)) {}
+                               std::uint32_t dependencyCapacity,
+                               int deviceOrdinal)
+    : impl_(std::make_unique<Impl>(workItemCapacity, dependencyCapacity,
+                                   deviceOrdinal)) {}
 DeviceWorkPlan::~DeviceWorkPlan() = default;
 DeviceWorkPlan::DeviceWorkPlan(DeviceWorkPlan &&) noexcept = default;
 DeviceWorkPlan &DeviceWorkPlan::operator=(DeviceWorkPlan &&) noexcept = default;
@@ -227,6 +236,7 @@ void DeviceWorkPlan::waitOn(cudaStream_t stream) const {
   if (impl_ == nullptr) {
     throw std::logic_error("cannot wait on a moved device work plan");
   }
+  detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
   checkCuda(cudaStreamWaitEvent(stream, impl_->uploadComplete, 0),
             "cudaStreamWaitEvent device work plan");
 }
@@ -259,6 +269,10 @@ std::uint32_t DeviceWorkPlan::workItemCapacity() const noexcept {
 
 std::uint32_t DeviceWorkPlan::dependencyCapacity() const noexcept {
   return impl_ == nullptr ? 0 : impl_->dependencyCapacity;
+}
+
+int DeviceWorkPlan::deviceOrdinal() const noexcept {
+  return impl_ == nullptr ? -1 : impl_->deviceOrdinal;
 }
 
 } // namespace nta

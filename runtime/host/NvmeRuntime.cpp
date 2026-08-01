@@ -1,5 +1,6 @@
 #include "nta/NvmeRuntime.h"
 
+#include "CudaDeviceGuard.h"
 #include "nta/NvmeUapi.h"
 
 #include <cuda.h>
@@ -60,7 +61,9 @@ std::size_t roundUp(std::size_t value, std::size_t alignment) {
 } // namespace
 
 struct NvmeTransport::Impl {
-  explicit Impl(const std::string &path) {
+  Impl(const std::string &path, int requestedDevice)
+      : deviceOrdinal(detail::resolveCudaDevice(requestedDevice)) {
+    detail::CudaDeviceGuard deviceGuard(deviceOrdinal);
     fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
       throwSystem("open NVMe GPU queue device");
@@ -69,10 +72,16 @@ struct NvmeTransport::Impl {
       if (::ioctl(fd, NTA_NVME_IOCTL_GET_INFO, &info) != 0) {
         throwSystem("NTA_NVME_IOCTL_GET_INFO");
       }
+      constexpr std::uint32_t requiredCapabilities =
+          NTA_NVME_CAP_IOMMU_TRANSLATED | NTA_NVME_CAP_NAMESPACE_READ_ONLY |
+          NTA_NVME_CAP_STATIC_DMA_BUF | NTA_NVME_CAP_MULTI_QUEUE |
+          NTA_NVME_CAP_TRUSTED_RAW_QUEUE;
       if (info.abi_version != NTA_NVME_ABI_VERSION || info.queue_depth < 2 ||
           info.controller_page_size == 0 ||
           (info.controller_page_size & (info.controller_page_size - 1U)) != 0 ||
-          info.queue_bytes == 0 || info.doorbell_mmap_bytes == 0) {
+          info.queue_bytes == 0 || info.doorbell_mmap_bytes == 0 ||
+          info.queue_id == 0 || info.queue_id > info.queue_count ||
+          (info.capabilities & requiredCapabilities) != requiredCapabilities) {
         throw std::runtime_error("NVMe driver returned an incompatible ABI");
       }
       capabilities = {
@@ -81,6 +90,12 @@ struct NvmeTransport::Impl {
           1U << info.lba_shift,
           info.max_transfer_bytes,
           info.namespace_blocks << info.lba_shift,
+          info.queue_id,
+          info.queue_count,
+          deviceOrdinal,
+          false,
+          true,
+          true,
       };
 
       const long systemPage = ::sysconf(_SC_PAGESIZE);
@@ -111,6 +126,15 @@ struct NvmeTransport::Impl {
       queueRegistered = true;
       checkDriver(cuMemHostGetDevicePointer(&queueDevice, queueHost, 0),
                   "cuMemHostGetDevicePointer NVMe queue memory");
+      auto *controlHost = reinterpret_cast<nta_nvme_queue_control *>(
+          static_cast<std::byte *>(queueHost) + info.control_offset);
+      if (controlHost->magic != NTA_NVME_QUEUE_CONTROL_MAGIC ||
+          controlHost->abi_version != NTA_NVME_ABI_VERSION ||
+          controlHost->state != NTA_NVME_QUEUE_ONLINE ||
+          controlHost->generation != info.generation ||
+          controlHost->queue_id != info.queue_id) {
+        throw std::runtime_error("NVMe queue control page is inconsistent");
+      }
       checkDriver(cuMemHostRegister(doorbellHost, info.doorbell_mmap_bytes,
                                     CU_MEMHOSTREGISTER_DEVICEMAP |
                                         CU_MEMHOSTREGISTER_IOMEMORY),
@@ -130,12 +154,14 @@ struct NvmeTransport::Impl {
           reinterpret_cast<abi::NvmeSubmission *>(queueDevice + info.sq_offset),
           reinterpret_cast<abi::NvmeCompletion *>(queueDevice + info.cq_offset),
           reinterpret_cast<std::uint64_t *>(queueDevice + info.prp_offset),
-          info.queue_dma_address + info.prp_offset,
+          info.prp_dma_address,
           reinterpret_cast<volatile std::uint32_t *>(doorbellDevice +
                                                      info.sq_doorbell_offset),
           reinterpret_cast<volatile std::uint32_t *>(doorbellDevice +
                                                      info.cq_doorbell_offset),
           contexts,
+          reinterpret_cast<abi::NvmeQueueControl *>(queueDevice +
+                                                    info.control_offset),
           info.queue_depth,
           info.controller_page_size,
           info.lba_shift,
@@ -148,6 +174,8 @@ struct NvmeTransport::Impl {
           1,
           0,
           0,
+          info.generation,
+          info.queue_id,
           0,
           0,
           0,
@@ -168,6 +196,7 @@ struct NvmeTransport::Impl {
   ~Impl() { release(); }
 
   void release() noexcept {
+    detail::NoexceptCudaDeviceGuard deviceGuard(deviceOrdinal);
     (void)cudaDeviceSynchronize();
     if (deviceQueue != nullptr) {
       (void)cudaFree(deviceQueue);
@@ -209,21 +238,11 @@ struct NvmeTransport::Impl {
   }
 
   void prepareMappingRelease() noexcept {
+    detail::NoexceptCudaDeviceGuard deviceGuard(deviceOrdinal);
     if (fd < 0 || deviceQueue == nullptr || quiesced) {
       return;
     }
-    bool mustQuiesce = cudaDeviceSynchronize() != cudaSuccess;
-    abi::NvmeQueueView queue{};
-    if (!mustQuiesce && cudaMemcpy(&queue, deviceQueue, sizeof(queue),
-                                   cudaMemcpyDeviceToHost) == cudaSuccess) {
-      mustQuiesce = queue.outstanding != 0;
-    } else {
-      mustQuiesce = true;
-    }
-    if (!mustQuiesce) {
-      return;
-    }
-
+    (void)cudaDeviceSynchronize();
     std::scoped_lock lock(ioctlMutex);
     (void)::ioctl(fd, NTA_NVME_IOCTL_QUIESCE);
     quiesced = true;
@@ -259,6 +278,7 @@ struct NvmeTransport::Impl {
   }
 
   int fd = -1;
+  int deviceOrdinal = 0;
   nta_nvme_info info{};
   NvmeCapabilities capabilities{};
   void *queueHost = nullptr;
@@ -275,6 +295,8 @@ struct NvmeTransport::Impl {
 
 struct NvmeBuffer::Impl {
   ~Impl() {
+    detail::NoexceptCudaDeviceGuard deviceGuard(
+        owner == nullptr ? 0 : owner->deviceOrdinal);
     if (owner) {
       owner->prepareMappingRelease();
       owner->releaseMapping(mappingHandle);
@@ -325,8 +347,8 @@ NvmeDestination NvmeBuffer::destination() const noexcept {
   return impl_->destination;
 }
 
-NvmeTransport::NvmeTransport(std::string devicePath)
-    : impl_(std::make_shared<Impl>(devicePath)) {}
+NvmeTransport::NvmeTransport(std::string devicePath, int deviceOrdinal)
+    : impl_(std::make_shared<Impl>(devicePath, deviceOrdinal)) {}
 
 NvmeTransport::~NvmeTransport() = default;
 NvmeTransport::NvmeTransport(NvmeTransport &&) noexcept = default;
@@ -336,11 +358,16 @@ const NvmeCapabilities &NvmeTransport::capabilities() const noexcept {
   return impl_->capabilities;
 }
 
+int NvmeTransport::deviceOrdinal() const noexcept {
+  return impl_->deviceOrdinal;
+}
+
 abi::NvmeQueueView *NvmeTransport::deviceQueue() const noexcept {
   return impl_->deviceQueue;
 }
 
 NvmeQueueStats NvmeTransport::readStats() const {
+  detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
   abi::NvmeQueueView queue{};
   checkCuda(cudaMemcpy(&queue, impl_->deviceQueue, sizeof(queue),
                        cudaMemcpyDeviceToHost),
@@ -353,6 +380,7 @@ NvmeQueueStats NvmeTransport::readStats() const {
 
 std::unique_ptr<NvmeBuffer>
 NvmeTransport::allocate(std::size_t bytes, NvmeDestination destination) {
+  detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
   if (impl_->quiesced) {
     throw std::runtime_error("NVMe transport has been quiesced");
   }
@@ -363,44 +391,18 @@ NvmeTransport::allocate(std::size_t bytes, NvmeDestination destination) {
   }
   const std::size_t allocationBytes =
       roundUp(bytes, impl_->capabilities.controllerPageSize);
+  if (destination == NvmeDestination::Hbm) {
+    throw std::invalid_argument(
+        "direct HBM NVMe DMA is disabled: the contained driver does not "
+        "advertise a validated PCIe P2P route");
+  }
   auto buffer = std::make_unique<NvmeBuffer::Impl>();
   buffer->owner = impl_;
   buffer->destination = destination;
   buffer->allocationBytes = allocationBytes;
 
   try {
-    if (destination == NvmeDestination::Hbm) {
-      // The NVIDIA exporter on this platform uses a 2 MiB allocation
-      // granule even when the NVMe transfer itself is smaller.
-      const std::size_t exportBytes =
-          std::max<std::size_t>(allocationBytes, 2U * 1024U * 1024U);
-      checkCuda(cudaMalloc(&buffer->deviceAddress, exportBytes),
-                "cudaMalloc NVMe HBM destination");
-      const CUdeviceptr pointer =
-          reinterpret_cast<CUdeviceptr>(buffer->deviceAddress);
-      int dmaBufFd = -1;
-      checkDriver(
-          cuMemGetHandleForAddressRange(&dmaBufFd, pointer, exportBytes,
-                                        CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0),
-          "cuMemGetHandleForAddressRange DMA-BUF");
-      nta_nvme_import request{
-          dmaBufFd, 0, exportBytes, 0, 0, 0, 0, 0,
-      };
-      int result;
-      {
-        std::scoped_lock lock(impl_->ioctlMutex);
-        result = ::ioctl(impl_->fd, NTA_NVME_IOCTL_IMPORT_DMA_BUF, &request);
-      }
-      const int savedErrno = errno;
-      (void)::close(dmaBufFd);
-      if (result != 0) {
-        errno = savedErrno;
-        throwSystem("NTA_NVME_IOCTL_IMPORT_DMA_BUF");
-      }
-      buffer->mappingHandle = request.handle;
-      buffer->pageCount = static_cast<std::uint32_t>(
-          allocationBytes / impl_->capabilities.controllerPageSize);
-    } else {
+    {
       checkCuda(cudaHostAlloc(&buffer->hostAddress, allocationBytes,
                               cudaHostAllocMapped),
                 "cudaHostAlloc NVMe mapped destination");

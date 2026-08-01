@@ -20,6 +20,12 @@ struct NvmeCapabilities {
   std::uint32_t lbaSize;
   std::uint32_t maxTransferBytes;
   std::uint64_t namespaceBytes;
+  std::uint32_t queueId;
+  std::uint32_t queueCount;
+  int deviceOrdinal;
+  bool supportsHbmPeer;
+  bool translatedIommu;
+  bool namespaceReadOnly;
 };
 
 struct NvmeQueueStats {
@@ -55,7 +61,8 @@ private:
 
 class NvmeTransport {
 public:
-  explicit NvmeTransport(std::string devicePath = "/dev/nta_nvme");
+  explicit NvmeTransport(std::string devicePath = "/dev/nta_nvme",
+                         int deviceOrdinal = -1);
   ~NvmeTransport();
 
   NvmeTransport(const NvmeTransport &) = delete;
@@ -64,6 +71,7 @@ public:
   NvmeTransport &operator=(NvmeTransport &&) noexcept;
 
   [[nodiscard]] const NvmeCapabilities &capabilities() const noexcept;
+  [[nodiscard]] int deviceOrdinal() const noexcept;
   [[nodiscard]] abi::NvmeQueueView *deviceQueue() const noexcept;
   [[nodiscard]] NvmeQueueStats readStats() const;
   [[nodiscard]] std::unique_ptr<NvmeBuffer>

@@ -6,20 +6,21 @@ This document defines the problem, claims, system boundary, execution model, and
 implementation gates for the clean `nonresident-acquisition` branch. Decisions
 in this document take precedence over the previous prototype's design notes.
 
-Implementation status (2026-07-31): M0-M4 have a working vertical slice tested
+Implementation status (2026-08-01): M0-M3 have a working vertical slice tested
 on an NVIDIA RTX PRO 6000 Blackwell Server Edition. M5 has a numerically checked
 split-K paged-attention mechanism workload and version-checked JIT hooks
 executed in FlashInfer 0.6.12 decode and FA2 paged-prefill kernels. This is not
 yet a serving-framework result. M6
 has real TMA descriptor selection and hardware TMA after direct or externally
-staged acquisition; automatic production-IR recognition remains open. A KIOXIA
-CD8P NVMe controller has DMAed directly into CUDA HBM registered through
-DMA-BUF and into registered mapped DRAM. RDMA is not implemented because this
+staged acquisition; automatic production-IR recognition remains open. An
+earlier NVMe ABI DMAed into CUDA HBM and mapped DRAM, but it lacked the current
+containment contract. M4 now refuses this host's identity IOMMU domain, so a
+current-ABI hardware rerun requires a translated testbed. RDMA is not implemented because this
 host has no RNIC, and there is no placeholder backend. M8 now has a real routed
 MoE matrix workload on the common mechanism; production MoE baselines remain
 open.
 
-ABI v9 defines one engine-neutral device work item, fixed-capacity dependency
+ABI v10 defines one engine-neutral device work item, fixed-capacity dependency
 segments, and a pending-only readiness index. One finite CTA continuation can
 acquire several mixed-tier objects and is published only after every object
 identity, version, and ready state validates. Reusable device plans support
@@ -155,7 +156,7 @@ The system therefore needs a continuation that survives the issuing CTA.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v9 registers each staged directory entry as one acquisition tile. Direct
+ABI v10 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
 this makes duplicate suppression exact without a range-readiness bitmap.
 
@@ -627,10 +628,11 @@ acquisition, not extension of TMA hardware.
 DMA-BUF is kernel plumbing for sharing an allocated buffer among device drivers.
 It may register the HBM staging pool with NIC or NVMe drivers.
 
-M4 uses exactly this boundary: CUDA exports an HBM allocation, the bootstrap
-driver attaches and maps it in the NVMe device DMA domain, and the runtime
-publishes the resulting per-page DMA addresses. Queue setup and mapping occur
-once. No DMA-BUF operation occurs in a GPU kernel or per transfer.
+M4 retains a static DMA-BUF importer for pre-registered buffers, but does not
+enable peer resources. The current runtime uses pinned mapped DRAM because this
+host has no validated GPU/NVMe P2P route. Static attachment pins storage, waits
+reservation fences, and holds a write fence until the queue is quiesced. No
+DMA-BUF operation occurs in a GPU kernel or per transfer.
 
 DMA-BUF does not provide:
 
@@ -831,16 +833,19 @@ work rather than an implementation claim.
 Gate: finite producer/consumer kernels sustain queue progress without a
 persistent poller.
 
-Status: complete for a dedicated read-only experiment. The bootstrap driver
-resets and identifies the controller, owns one depth-64 queue pair, imports HBM
-DMA-BUFs or pins mapped host destinations, and maps coherent queue memory plus
-the MMIO doorbell page into CUDA. A bounded device function constructs NVMe
+Status: software mechanism complete; current-ABI hardware rerun blocked by the
+test host's identity IOMMU domain. The bootstrap driver resets and identifies
+the controller, negotiates one depth-64 queue per open GPU, pins mapped host
+destinations, verifies namespace write protection, and maps coherent queue
+memory plus exactly one MMIO doorbell page into CUDA. A bounded device function constructs NVMe
 READ SQEs and PRP lists, batches the SQ doorbell, consumes phase-tagged CQEs,
 validates object/request generations, and publishes ready continuations. The
 benchmark performs no CPU command submission or completion polling.
 
-The tested program emits only READ commands, but the raw queue is exposed to a
-trusted privileged process and is not a hardware-enforced read-only interface.
+The device program emits only READ commands. Hardware namespace write
+protection prevents media modification, but the raw queue is still exposed to
+a trusted `CAP_SYS_RAWIO` process and is not a per-command or multi-tenant
+security boundary. See `NVME_SECURITY.md`.
 
 ### M5: KV integration
 
@@ -862,7 +867,7 @@ also executes in version-checked FlashInfer 0.6.12 decode and FA2 paged-prefill
 JIT kernels. It is not wired into SGLang/vLLM request lifecycle and KV
 management; therefore there is no TTFT/TPOT/SLO claim.
 
-The ABI-v9 dependency-set workload separately acquires up to 32 mixed-tier
+The ABI-v10 dependency-set workload separately acquires up to 32 mixed-tier
 objects per CTA, supports cancellation, stale generations, stale object
 versions, and duplicate coalescing, and resumes only after the complete set is
 ready. Global-load and TMA attention now consume the same common work and

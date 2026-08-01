@@ -27,6 +27,7 @@ struct RuntimeConfig {
   std::uint32_t continuationCapacity;
   std::uint32_t maxReplicasPerObject = 1;
   std::uint32_t maxDependenciesPerContinuation = 8;
+  int deviceOrdinal = -1;
 };
 
 struct HostReplicaSpec {
@@ -92,6 +93,7 @@ public:
                       const void *stagingTensorMap = nullptr);
 
   [[nodiscard]] abi::RuntimeView *deviceView() const noexcept;
+  [[nodiscard]] int deviceOrdinal() const noexcept;
   [[nodiscard]] const RuntimeConfig &config() const noexcept;
   [[nodiscard]] abi::RequestContext readRequest(std::uint32_t slot) const;
   [[nodiscard]] abi::TenantContext readTenant(std::uint32_t tenantId) const;

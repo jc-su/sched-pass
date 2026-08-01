@@ -1,6 +1,6 @@
 # Validation Record
 
-Date: 2026-07-31
+Date: 2026-08-01
 
 This record supports a locally validated mechanism prototype. It does not
 establish production readiness, an end-to-end serving result, or an OSDI-level
@@ -44,7 +44,7 @@ Generated evidence is under `results/` and is excluded from source control.
 3. LLVM byte-address, tensor-map, and dependency-set lowering, including
    rejection of live-state, token, missing-binding, non-inlined-helper,
    lane-divergent control, and lane-divergent operand cases;
-4. host/device ABI v9 layout;
+4. host/device ABI v10 layout, including the NVMe control-page mirror;
 5. Clang nvcc-shim compilation of a foreign source kernel, including automatic
    optimizer-last lowering, marker removal, metadata, and fast-math forwarding;
 6. compilation and linking of FlashInfer's real multi-source custom decode and
@@ -70,7 +70,7 @@ must be inlined into a GPU kernel entry, where the CTA analysis treats kernel
 arguments, `blockIdx`, and block/grid dimensions as CTA-uniform. It rejects
 non-inlined helpers and control or marker operands derived from `threadIdx`,
 lane/warp identity, atomics, volatile loads, local allocation, or unknown
-calls. Lowered modules contain no bind/acquire/defer markers and carry ABI-v9
+calls. Lowered modules contain no bind/acquire/defer markers and carry ABI-v10
 `!nta.acquire` metadata.
 
 Attention global-load and TMA kernels, the generic dependency-set kernel, and
@@ -131,7 +131,7 @@ baseline bypassed request/acquisition logic only.
 | Variant | Mean logical GiB/s | 95% t interval |
 | --- | ---: | ---: |
 | direct-address baseline | 394.51 | +/- 0.05 |
-| ABI-v9 dependency set | 381.29 | +/- 0.04 |
+| ABI-v10 dependency set | 381.29 | +/- 0.04 |
 
 The paired throughput reduction is **3.35% +/- 0.02 percentage points**. This
 is a real, nonzero mechanism cost. GPU clocks were not fixed, this is a
@@ -210,9 +210,11 @@ independent 64-KiB reads completed with matching checksums:
 | mapped CPU DRAM | 0.743 | 1,345.90 | 0 | 0 |
 | DMA-BUF HBM | 0.679 | 1,473.54 | 0 | 0 |
 
-That run predates ABI v9. The controller is currently owned by the host's
-`vmem_sw` consumer, and the safety helper correctly refuses to rebind it.
-Latest-code NVMe evidence therefore remains open.
+That run predates ABI v10 and the hardened driver. The target controller's
+IOMMU group currently has type `identity`; preflight now refuses to unbind or
+attach the raw-queue driver. Latest-code NVMe evidence therefore remains open.
+The old results demonstrate mechanism feasibility, not current security,
+correctness, or performance.
 
 ## Open Production And Paper Gates
 
@@ -225,8 +227,8 @@ Latest-code NVMe evidence therefore remains open.
 - host-staging global priority order, NVMe weighted-fairness hardware results,
   and starvation aging;
 - GPU-initiated RDMA submission/completion on a real RNIC;
-- ABI-v9 NVMe regression, timeout/reset recovery, multiple queues, and
-  multi-tenant security isolation;
+- ABI-v10 NVMe hardware regression, injected timeout/reset/AER/hot-unplug
+  recovery, translated-IOMMU fault tests, and multiple physical GPUs;
 - production MoE and optional ANNS baselines; and
 - literature-complete novelty analysis plus a paper-quality baseline and
   ablation matrix.

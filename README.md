@@ -17,6 +17,8 @@ The implemented FlashInfer boundary and remaining serving integration are in
 [docs/FLASHINFER.md](docs/FLASHINFER.md).
 The compact host/kernel API, JIT path, and exact transparency contract are in
 [docs/INTEGRATION.md](docs/INTEGRATION.md).
+The NVMe threat model, containment requirements, and residual trust boundary
+are in [docs/NVME_SECURITY.md](docs/NVME_SECURITY.md).
 
 ## Implemented vertical slice
 
@@ -25,7 +27,7 @@ workloads:
 
 - per-CTA request/generation binding in batched kernels;
 - compiler proof of a canonical finite-kernel deferral boundary;
-- an engine-neutral `WorkPlan` model and ABI-v9 bounded dependency sets, so one
+- an engine-neutral `WorkPlan` model and ABI-v10 bounded dependency sets, so one
   continuation can wait for several pages, experts, or object shards;
 - one reusable device-plan allocation with pinned, asynchronous batch updates;
 - non-owning registration of existing engine HBM and device-visible host
@@ -34,8 +36,8 @@ workloads:
   phase launch and marker plumbing;
 - direct HBM and mapped-CPU-DRAM paths with no queue or atomic operation;
 - staged CPU-DRAM acquisition issued and completed by finite GPU CTAs;
-- direct NVMe reads into either DMA-BUF-registered HBM or registered mapped
-  DRAM, with GPU-built SQEs/PRPs, GPU MMIO doorbells, and GPU CQ handling;
+- GPU-initiated NVMe reads into registered mapped DRAM, with per-open queues,
+  GPU-built SQEs/PRPs, GPU MMIO doorbells, and GPU CQ handling;
 - a reusable, object-keyed intent pool, duplicate-object coalescing,
   cancellation, and generation-safe ready-only continuations;
 - fixed request, tenant, and backend byte credits plus priority/deadline NVMe
@@ -67,8 +69,10 @@ compiler currently consumes explicit acquisition
 markers; automatic recognition of arbitrary production load/cp.async/TMA
 address cones is an open gate. The pass does prove CTA-uniform control and
 operands for explicit sites; lane-divergent collective calls are rejected.
-There is no placeholder RDMA backend. NVMe is implemented against an isolated
-KIOXIA CD8P controller and tested with read-only commands. The previous
+There is no placeholder RDMA backend. The NVMe driver now requires a translated,
+single-device IOMMU group and hardware namespace write protection. The current
+host exposes the target KIOXIA controller through an identity domain, so current
+hardware validation is blocked rather than run without containment. The previous
 scheduling prototype remains on `main` at commit `4789f16`.
 
 ## Build and test
@@ -159,7 +163,10 @@ with `-DNTA_FLASHINFER_INCLUDE_DIR=/path/to/include`.
 
 The NVMe path has a small, trusted bootstrap driver under
 `driver/nta_nvme/`. It exclusively owns one explicitly selected controller,
-creates one queue pair, imports CUDA DMA-BUFs, and maps queue/doorbell pages.
+creates one queue per open GPU runtime, pins mapped host destinations, and maps
+queue/doorbell pages. Probe requires a translated isolated IOMMU group and
+verified hardware namespace write protection. Direct HBM import is disabled
+until the platform supplies a validated P2P route.
 After initialization, the CPU does not construct commands, ring doorbells, or
 consume completions.
 
@@ -167,10 +174,12 @@ Build and bind only an unmounted, otherwise unused test controller:
 
 ```bash
 cmake --build build --target nta-nvme-driver
+./scripts/nta-nvme-device.sh preflight
 ./scripts/nta-nvme-device.sh bind
 sudo env LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64 \
   ./build/nta-nvme-bench \
-  --destination=hbm \
+  --destination=host-mapped \
+  --gpu=0 \
   --reference=/tmp/nta-nvme-reference.bin \
   --requests=16 \
   --bytes=65536 \
@@ -179,8 +188,9 @@ sudo env LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64 \
 ./scripts/nta-nvme-device.sh restore
 ```
 
-The bind helper refuses mounted/open devices, block holders, and this host's
-`vmem_sw` backing-store module. NVIDIA also requires privilege for mapping a
-third-party PCIe doorbell with `CU_MEMHOSTREGISTER_IOMEMORY`, so the hardware
-benchmark runs as root. The driver exposes a raw queue to that trusted process;
-it is not a multi-tenant security boundary.
+The bind helper refuses mounted/open devices, block holders, identity IOMMU
+domains, shared IOMMU groups, non-4-KiB pages, and this host's `vmem_sw`
+backing-store module. It leaves `/dev/nta_nvme` root-owned; both `CAP_SYS_RAWIO`
+and NVIDIA privilege for `CU_MEMHOSTREGISTER_IOMEMORY` are required. The raw
+queue remains a mutually trusted, privileged interface, not a multi-tenant
+security boundary.

@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 9;
+inline constexpr std::uint32_t Version = 10;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 5;
 
@@ -208,6 +208,28 @@ struct alignas(32) NvmeCommandContext {
 };
 static_assert(sizeof(NvmeCommandContext) == 64);
 
+inline constexpr std::uint32_t NvmeQueueControlMagic = 0x4e544151U;
+inline constexpr std::uint32_t NvmeDriverAbiVersion = 2U;
+
+enum class NvmeQueueState : std::uint32_t {
+  Offline = 0,
+  Online = 1,
+  Quiesced = 2,
+  Fatal = 3,
+  Removed = 4,
+};
+
+struct alignas(64) NvmeQueueControl {
+  std::uint32_t magic;
+  std::uint32_t abiVersion;
+  std::uint32_t state;
+  std::uint32_t generation;
+  std::uint32_t queueId;
+  std::uint32_t reserved0;
+  std::uint64_t reserved1[5];
+};
+static_assert(sizeof(NvmeQueueControl) == 64);
+
 struct alignas(64) NvmeQueueView {
   NvmeSubmission *submissions;
   NvmeCompletion *completions;
@@ -216,6 +238,7 @@ struct alignas(64) NvmeQueueView {
   volatile std::uint32_t *sqDoorbell;
   volatile std::uint32_t *cqDoorbell;
   NvmeCommandContext *contexts;
+  NvmeQueueControl *control;
   std::uint32_t depth;
   std::uint32_t controllerPageSize;
   std::uint32_t lbaShift;
@@ -228,6 +251,8 @@ struct alignas(64) NvmeQueueView {
   std::uint32_t active;
   std::uint32_t error;
   std::uint32_t cidCursor;
+  std::uint32_t queueGeneration;
+  std::uint32_t queueId;
   std::uint64_t submitted;
   std::uint64_t completed;
   std::uint64_t failed;
@@ -275,6 +300,7 @@ static_assert(std::is_standard_layout_v<AcquireRequirement>);
 static_assert(std::is_standard_layout_v<ContinuationDependency>);
 static_assert(std::is_standard_layout_v<WorkItem>);
 static_assert(std::is_standard_layout_v<Continuation>);
+static_assert(std::is_standard_layout_v<NvmeQueueControl>);
 static_assert(std::is_standard_layout_v<NvmeQueueView>);
 static_assert(std::is_standard_layout_v<RuntimeView>);
 static_assert(std::is_trivially_copyable_v<AcquireRequirement>);

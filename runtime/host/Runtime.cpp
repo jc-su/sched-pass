@@ -1,3 +1,4 @@
+#include "CudaDeviceGuard.h"
 #include "nta/DeviceWorkPlan.h"
 #include "nta/HostRuntime.h"
 #include "nta/NvmeRuntime.h"
@@ -69,6 +70,12 @@ struct HostRuntime::Impl {
         requestInstalled(config.requestCapacity, false),
         objectInstalled(config.objectCapacity, false),
         objects(config.objectCapacity), nvme(std::move(nvmeTransport)) {
+    config.deviceOrdinal = detail::resolveCudaDevice(config.deviceOrdinal);
+    detail::CudaDeviceGuard deviceGuard(config.deviceOrdinal);
+    if (nvme != nullptr && nvme->deviceOrdinal() != config.deviceOrdinal) {
+      throw std::invalid_argument(
+          "HostRuntime and NvmeTransport must own the same CUDA device");
+    }
     if (config.requestCapacity == 0 || config.objectCapacity == 0 ||
         config.intentCapacity == 0 || config.continuationCapacity == 0 ||
         config.intentCapacity < config.objectCapacity ||
@@ -92,10 +99,8 @@ struct HostRuntime::Impl {
       checkCuda(flagsResult, "cudaSetDeviceFlags(cudaDeviceMapHost)");
     }
 
-    int device = 0;
-    checkCuda(cudaGetDevice(&device), "cudaGetDevice");
     cudaDeviceProp properties{};
-    checkCuda(cudaGetDeviceProperties(&properties, device),
+    checkCuda(cudaGetDeviceProperties(&properties, config.deviceOrdinal),
               "cudaGetDeviceProperties");
     if (properties.canMapHostMemory == 0) {
       throw std::runtime_error(
@@ -231,6 +236,7 @@ struct HostRuntime::Impl {
   }
 
   void release() noexcept {
+    detail::NoexceptCudaDeviceGuard deviceGuard(config.deviceOrdinal);
     for (std::optional<OwnedObject> &object : objects) {
       if (object.has_value()) {
         releaseObject(*object);
@@ -353,6 +359,7 @@ void HostRuntime::setRequest(std::uint32_t slot, std::uint64_t requestId,
                              std::uint32_t priority,
                              std::uint64_t deadlineClock,
                              std::uint64_t maxOutstandingBytes) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkRequestSlot(slot);
   if (tenantId >= impl_->config.requestCapacity) {
     throw std::out_of_range("tenant id exceeds runtime capacity");
@@ -382,6 +389,7 @@ void HostRuntime::setRequest(std::uint32_t slot, std::uint64_t requestId,
 void HostRuntime::setTenantBudget(std::uint32_t tenantId,
                                   std::uint64_t maxOutstandingBytes,
                                   std::uint32_t weight) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (tenantId >= impl_->config.requestCapacity || weight == 0) {
     throw std::invalid_argument("tenant budget id and weight must be valid");
   }
@@ -398,6 +406,7 @@ void HostRuntime::setTenantBudget(std::uint32_t tenantId,
 }
 
 void HostRuntime::cancelRequest(std::uint32_t slot, std::uint32_t generation) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkRequestSlot(slot);
   if (!impl_->requestInstalled[slot]) {
     throw std::invalid_argument("cannot cancel an uninitialized request slot");
@@ -417,6 +426,7 @@ ObjectHandle HostRuntime::installObject(std::uint32_t slot,
                                         std::uint32_t version,
                                         std::span<const std::byte> contents,
                                         Placement placement) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   const HostReplicaSpec replica{contents, placement};
   return installReplicatedObject(slot, objectId, version,
                                  std::span<const HostReplicaSpec>(&replica, 1));
@@ -425,6 +435,7 @@ ObjectHandle HostRuntime::installObject(std::uint32_t slot,
 ObjectHandle HostRuntime::installReplicatedObject(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::span<const HostReplicaSpec> replicas) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
   if (replicas.empty() ||
       replicas.size() > impl_->config.maxReplicasPerObject) {
@@ -552,6 +563,7 @@ HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
                             std::uint32_t version, std::size_t bytes,
                             void *stagingDeviceAddress,
                             std::span<const RegisteredReplicaSpec> replicas) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
   if (bytes == 0 || bytes > std::numeric_limits<std::uint32_t>::max() ||
       replicas.empty() ||
@@ -649,6 +661,7 @@ ObjectHandle HostRuntime::installNvmeObject(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::uint64_t sourceByteOffset, std::size_t bytes,
     std::unique_ptr<NvmeBuffer> destination) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
   if (impl_->nvme == nullptr || destination == nullptr) {
     throw std::invalid_argument(
@@ -705,6 +718,7 @@ void HostRuntime::bindTensorMaps(std::uint32_t objectSlot,
                                  std::uint32_t relativeReplica,
                                  const void *replicaTensorMap,
                                  const void *stagingTensorMap) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(objectSlot);
   if (!impl_->objectInstalled[objectSlot]) {
     throw std::invalid_argument(
@@ -731,16 +745,22 @@ abi::RuntimeView *HostRuntime::deviceView() const noexcept {
   return impl_->view;
 }
 
+int HostRuntime::deviceOrdinal() const noexcept {
+  return impl_->config.deviceOrdinal;
+}
+
 const RuntimeConfig &HostRuntime::config() const noexcept {
   return impl_->config;
 }
 
 abi::RequestContext HostRuntime::readRequest(std::uint32_t slot) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkRequestSlot(slot);
   return downloadOne(impl_->requests, slot);
 }
 
 abi::TenantContext HostRuntime::readTenant(std::uint32_t tenantId) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (tenantId >= impl_->config.requestCapacity) {
     throw std::out_of_range("tenant id exceeds runtime capacity");
   }
@@ -748,6 +768,7 @@ abi::TenantContext HostRuntime::readTenant(std::uint32_t tenantId) const {
 }
 
 abi::ObjectEntry HostRuntime::readObject(std::uint32_t slot) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
   return downloadOne(impl_->objectEntries, slot);
 }
@@ -755,6 +776,7 @@ abi::ObjectEntry HostRuntime::readObject(std::uint32_t slot) const {
 abi::ReplicaEntry
 HostRuntime::readReplica(std::uint32_t objectSlot,
                          std::uint32_t relativeReplica) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(objectSlot);
   const abi::ObjectEntry object = readObject(objectSlot);
   if (relativeReplica >= object.replicaCount ||
@@ -767,6 +789,7 @@ HostRuntime::readReplica(std::uint32_t objectSlot,
 }
 
 abi::Continuation HostRuntime::readContinuation(std::uint32_t slot) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (slot >= impl_->config.continuationCapacity) {
     throw std::out_of_range("continuation slot exceeds runtime capacity");
   }
@@ -775,6 +798,7 @@ abi::Continuation HostRuntime::readContinuation(std::uint32_t slot) const {
 
 abi::ContinuationDependency HostRuntime::readContinuationDependency(
     std::uint32_t continuation, std::uint32_t relativeDependency) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (continuation >= impl_->config.continuationCapacity ||
       relativeDependency >= impl_->config.maxDependenciesPerContinuation) {
     throw std::out_of_range("continuation dependency exceeds runtime capacity");
@@ -786,14 +810,17 @@ abi::ContinuationDependency HostRuntime::readContinuationDependency(
 }
 
 abi::IntentPool HostRuntime::readIntentPool() const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   return downloadOne(impl_->intentPool, 0);
 }
 
 std::uint32_t HostRuntime::readPendingCount() const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   return downloadOne(impl_->pendingCount, 0);
 }
 
 DeviceWorkPlan HostRuntime::uploadWorkPlan(const WorkPlan &plan) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (plan.workItems.size() > impl_->config.continuationCapacity) {
     throw std::invalid_argument(
         "work plan exceeds the runtime continuation capacity");
@@ -814,7 +841,7 @@ DeviceWorkPlan HostRuntime::uploadWorkPlan(const WorkPlan &plan) const {
           "work plan references an unregistered external object");
     }
   }
-  return DeviceWorkPlan(plan);
+  return DeviceWorkPlan(plan, impl_->config.deviceOrdinal);
 }
 
 } // namespace nta

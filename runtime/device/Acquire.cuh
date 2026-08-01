@@ -121,9 +121,9 @@ __device__ __forceinline__ std::uint64_t globalTimerNs() {
   return value;
 }
 
-__device__ __forceinline__ bool
-tryReserveCounter(std::uint64_t *counter, std::uint64_t maximum,
-                  std::uint64_t bytes) {
+__device__ __forceinline__ bool tryReserveCounter(std::uint64_t *counter,
+                                                  std::uint64_t maximum,
+                                                  std::uint64_t bytes) {
   if (bytes > maximum) {
     return false;
   }
@@ -136,8 +136,8 @@ tryReserveCounter(std::uint64_t *counter, std::uint64_t maximum,
   return false;
 }
 
-__device__ __forceinline__ void
-releaseCounter(std::uint64_t *counter, std::uint64_t bytes) {
+__device__ __forceinline__ void releaseCounter(std::uint64_t *counter,
+                                               std::uint64_t bytes) {
   if (bytes != 0) {
     atomicAdd(reinterpret_cast<unsigned long long *>(counter),
               0ULL - static_cast<unsigned long long>(bytes));
@@ -156,9 +156,10 @@ tryReserveRequestBytes(abi::RuntimeView *runtime, std::uint32_t requestSlot,
                            request.maxOutstandingBytes, bytes);
 }
 
-__device__ __forceinline__ void
-releaseRequestBytes(abi::RuntimeView *runtime, std::uint32_t requestSlot,
-                    std::uint32_t generation, std::uint64_t bytes) {
+__device__ __forceinline__ void releaseRequestBytes(abi::RuntimeView *runtime,
+                                                    std::uint32_t requestSlot,
+                                                    std::uint32_t generation,
+                                                    std::uint64_t bytes) {
   if (bytes == 0 || requestSlot >= runtime->requestCapacity) {
     return;
   }
@@ -168,9 +169,9 @@ releaseRequestBytes(abi::RuntimeView *runtime, std::uint32_t requestSlot,
   }
 }
 
-__device__ __forceinline__ bool
-tryReserveTenantBytes(abi::RuntimeView *runtime, std::uint32_t tenantId,
-                      std::uint64_t bytes) {
+__device__ __forceinline__ bool tryReserveTenantBytes(abi::RuntimeView *runtime,
+                                                      std::uint32_t tenantId,
+                                                      std::uint64_t bytes) {
   if (tenantId >= runtime->tenantCapacity) {
     return false;
   }
@@ -180,33 +181,32 @@ tryReserveTenantBytes(abi::RuntimeView *runtime, std::uint32_t tenantId,
                            bytes);
 }
 
-__device__ __forceinline__ void
-releaseTenantBytes(abi::RuntimeView *runtime, std::uint32_t tenantId,
-                   std::uint64_t bytes) {
+__device__ __forceinline__ void releaseTenantBytes(abi::RuntimeView *runtime,
+                                                   std::uint32_t tenantId,
+                                                   std::uint64_t bytes) {
   if (bytes != 0 && tenantId < runtime->tenantCapacity) {
     releaseCounter(&runtime->tenants[tenantId].outstandingBytes, bytes);
   }
 }
 
-__device__ __forceinline__ std::uint32_t
-urgencyBucket(std::uint32_t priority, std::uint64_t deadline,
-              std::uint64_t now) {
+__device__ __forceinline__ std::uint32_t urgencyBucket(std::uint32_t priority,
+                                                       std::uint64_t deadline,
+                                                       std::uint64_t now) {
   std::uint32_t urgency = priority > 7U ? 7U : priority;
   if (deadline == 0) {
     return urgency;
   }
   const std::uint64_t slack = deadline > now ? deadline - now : 0;
-  const std::uint32_t deadlineUrgency =
-      slack <= 50'000ULL    ? 7U
-      : slack <= 200'000ULL ? 6U
-      : slack <= 1'000'000ULL ? 5U
-      : slack <= 5'000'000ULL ? 4U
-                              : 0U;
+  const std::uint32_t deadlineUrgency = slack <= 50'000ULL      ? 7U
+                                        : slack <= 200'000ULL   ? 6U
+                                        : slack <= 1'000'000ULL ? 5U
+                                        : slack <= 5'000'000ULL ? 4U
+                                                                : 0U;
   return urgency > deadlineUrgency ? urgency : deadlineUrgency;
 }
 
-__device__ __forceinline__ abi::BackendView *
-backend(abi::RuntimeView *runtime, abi::SourceKind kind) {
+__device__ __forceinline__ abi::BackendView *backend(abi::RuntimeView *runtime,
+                                                     abi::SourceKind kind) {
   const std::uint32_t index = static_cast<std::uint32_t>(kind);
   if (runtime == nullptr || runtime->backends == nullptr ||
       index >= runtime->backendCapacity) {
@@ -221,13 +221,13 @@ tryReserveBackendBytes(abi::RuntimeView *runtime, abi::SourceKind kind,
                        std::uint64_t bytes) {
   abi::BackendView *entry = backend(runtime, kind);
   return entry != nullptr && entry->active != 0 &&
-         tryReserveCounter(&entry->outstandingBytes,
-                           entry->maxOutstandingBytes, bytes);
+         tryReserveCounter(&entry->outstandingBytes, entry->maxOutstandingBytes,
+                           bytes);
 }
 
-__device__ __forceinline__ void
-releaseBackendBytes(abi::RuntimeView *runtime, abi::SourceKind kind,
-                    std::uint64_t bytes) {
+__device__ __forceinline__ void releaseBackendBytes(abi::RuntimeView *runtime,
+                                                    abi::SourceKind kind,
+                                                    std::uint64_t bytes) {
   abi::BackendView *entry = backend(runtime, kind);
   if (entry != nullptr) {
     releaseCounter(&entry->outstandingBytes, bytes);
@@ -240,6 +240,51 @@ nvmeQueue(abi::RuntimeView *runtime) {
   return entry == nullptr || entry->active == 0 || entry->deviceState == 0
              ? nullptr
              : reinterpret_cast<abi::NvmeQueueView *>(entry->deviceState);
+}
+
+__device__ __forceinline__ bool
+nvmeQueueOnline(const abi::NvmeQueueView &queue) {
+  if (queue.control == nullptr)
+    return false;
+  const abi::NvmeQueueControl &control = *queue.control;
+  return loadIoCoherent(&control.magic) == abi::NvmeQueueControlMagic &&
+         loadIoCoherent(&control.abiVersion) == abi::NvmeDriverAbiVersion &&
+         loadIoCoherent(&control.queueId) == queue.queueId &&
+         loadIoCoherent(&control.generation) == queue.queueGeneration &&
+         loadIoCoherent(&control.state) ==
+             static_cast<std::uint32_t>(abi::NvmeQueueState::Online);
+}
+
+__device__ __forceinline__ void failNvmeQueue(abi::RuntimeView *runtime,
+                                              abi::NvmeQueueView &queue,
+                                              std::uint32_t lane,
+                                              std::uint32_t error) {
+  for (std::uint32_t commandId = lane; commandId < queue.depth;
+       commandId += warpSize) {
+    abi::NvmeCommandContext &stored = queue.contexts[commandId];
+    if (atomicExch(&stored.active, 0U) == 0U)
+      continue;
+    const abi::NvmeCommandContext context = stored;
+    if (context.objectSlot < runtime->objectCapacity) {
+      atomicExch(&runtime->objects[context.objectSlot].state,
+                 static_cast<std::uint32_t>(abi::ObjectState::Failed));
+    }
+    if (context.continuation < runtime->continuationCapacity) {
+      atomicExch(&runtime->continuations[context.continuation].state,
+                 static_cast<std::uint32_t>(abi::ContinuationState::Failed));
+    }
+    atomicAdd(reinterpret_cast<unsigned long long *>(&queue.failed), 1ULL);
+    releaseRequestBytes(runtime, context.requestSlot, context.generation,
+                        context.bytes);
+    releaseTenantBytes(runtime, context.tenantId, context.bytes);
+    releaseBackendBytes(runtime, abi::SourceKind::Nvme, context.backendBytes);
+  }
+  __syncwarp();
+  if (lane == 0) {
+    queue.outstanding = 0;
+    queue.active = 0;
+    queue.error = error;
+  }
 }
 
 __device__ __forceinline__ const abi::ReplicaEntry *
@@ -261,8 +306,7 @@ replicaReadyCost(const abi::ReplicaEntry &replica, std::uint64_t bytes) {
   const std::uint64_t transfer =
       bytes > UINT64_MAX / 1'000'000'000ULL
           ? UINT64_MAX
-          : bytes * 1'000'000'000ULL /
-                replica.estimatedBandwidthBytesPerSecond;
+          : bytes * 1'000'000'000ULL / replica.estimatedBandwidthBytesPerSecond;
   return replica.estimatedLatencyNs > UINT64_MAX - transfer
              ? UINT64_MAX
              : replica.estimatedLatencyNs + transfer;
@@ -270,15 +314,15 @@ replicaReadyCost(const abi::ReplicaEntry &replica, std::uint64_t bytes) {
 
 __device__ __forceinline__ std::uint64_t
 loadCounter(const std::uint64_t *counter) {
-  return atomicAdd(
-      reinterpret_cast<unsigned long long *>(const_cast<std::uint64_t *>(counter)),
-      0ULL);
+  return atomicAdd(reinterpret_cast<unsigned long long *>(
+                       const_cast<std::uint64_t *>(counter)),
+                   0ULL);
 }
 
-__device__ __forceinline__ bool
-reserveIntent(abi::RuntimeView *runtime, std::uint32_t key,
-              std::uint32_t &slotIndex,
-              abi::IntentSlot *&slot) {
+__device__ __forceinline__ bool reserveIntent(abi::RuntimeView *runtime,
+                                              std::uint32_t key,
+                                              std::uint32_t &slotIndex,
+                                              abi::IntentSlot *&slot) {
   if (runtime->intentPool == nullptr || runtime->intents == nullptr ||
       runtime->intentPool->capacity == 0 ||
       runtime->intentPool->capacity > runtime->intentCapacity) {
@@ -298,12 +342,12 @@ reserveIntent(abi::RuntimeView *runtime, std::uint32_t key,
   return false;
 }
 
-__device__ __forceinline__ void
-publishIntent(abi::RuntimeView *runtime, abi::IntentSlot &slot) {
+__device__ __forceinline__ void publishIntent(abi::RuntimeView *runtime,
+                                              abi::IntentSlot &slot) {
   __threadfence();
-  atomicAdd(reinterpret_cast<unsigned long long *>(
-                &runtime->intentPool->enqueued),
-            1ULL);
+  atomicAdd(
+      reinterpret_cast<unsigned long long *>(&runtime->intentPool->enqueued),
+      1ULL);
   atomicAdd(&runtime->intentPool->active, 1U);
   __threadfence();
   atomicExch(&slot.intent.valid, 1U);
@@ -313,14 +357,14 @@ __device__ __forceinline__ bool claimIntent(abi::IntentSlot &slot) {
   return atomicCAS(&slot.intent.valid, 1U, 2U) == 1U;
 }
 
-__device__ __forceinline__ void
-consumeIntent(abi::RuntimeView *runtime, abi::IntentSlot &slot) {
+__device__ __forceinline__ void consumeIntent(abi::RuntimeView *runtime,
+                                              abi::IntentSlot &slot) {
   atomicAdd(reinterpret_cast<unsigned long long *>(&slot.sequence), 1ULL);
   __threadfence();
   atomicExch(&slot.intent.valid, 0U);
-  atomicAdd(reinterpret_cast<unsigned long long *>(
-                &runtime->intentPool->consumed),
-            1ULL);
+  atomicAdd(
+      reinterpret_cast<unsigned long long *>(&runtime->intentPool->consumed),
+      1ULL);
   atomicSub(&runtime->intentPool->active, 1U);
 }
 
@@ -477,14 +521,14 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
 }
 
 extern "C" __device__ __attribute__((used, noinline)) void *
-nta_acquire_tensor_map_slow(
-    nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
-    std::uint32_t generation, std::uint32_t objectSlot,
-    std::uint64_t objectId, std::uint32_t objectVersion, std::uint64_t offset,
-    std::uint32_t bytes, std::uint32_t continuation) {
-  void *address = nta_acquire_slow(runtime, requestSlot, generation, objectSlot,
-                                   objectId, objectVersion, offset, bytes,
-                                   continuation);
+nta_acquire_tensor_map_slow(nta::abi::RuntimeView *runtime,
+                            std::uint32_t requestSlot, std::uint32_t generation,
+                            std::uint32_t objectSlot, std::uint64_t objectId,
+                            std::uint32_t objectVersion, std::uint64_t offset,
+                            std::uint32_t bytes, std::uint32_t continuation) {
+  void *address =
+      nta_acquire_slow(runtime, requestSlot, generation, objectSlot, objectId,
+                       objectVersion, offset, bytes, continuation);
   if (address == nullptr || runtime == nullptr ||
       objectSlot >= runtime->objectCapacity) {
     return nullptr;
@@ -492,8 +536,8 @@ nta_acquire_tensor_map_slow(
 
   nta::abi::ObjectEntry &object = runtime->objects[objectSlot];
   const auto *byteAddress = static_cast<const std::byte *>(address);
-  const auto *stagingAddress = reinterpret_cast<const std::byte *>(
-      object.stagingAddress + offset);
+  const auto *stagingAddress =
+      reinterpret_cast<const std::byte *>(object.stagingAddress + offset);
   if (byteAddress == stagingAddress) {
     if (object.stagingTensorMapAddress != 0) {
       return reinterpret_cast<void *>(object.stagingTensorMapAddress);
@@ -660,6 +704,12 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
   if (queue.active == 0 || queue.depth < 2 || queue.controllerPageSize == 0) {
     return;
   }
+  bool queueOnline = lane == 0 && device::nvmeQueueOnline(queue);
+  queueOnline = __shfl_sync(0xffffffffU, queueOnline, 0);
+  if (!queueOnline) {
+    device::failNvmeQueue(runtime, queue, lane, 0xfffffffcU);
+    return;
+  }
 
   if (lane == 0) {
     std::uint32_t drained = 0;
@@ -763,15 +813,14 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
             runtime, candidateObject, candidateObject.selectedReplica);
         if (candidateReplica != nullptr &&
             candidateReplica->sourceKind ==
-            static_cast<std::uint32_t>(abi::SourceKind::Nvme)) {
+                static_cast<std::uint32_t>(abi::SourceKind::Nvme)) {
           const std::uint32_t urgency = device::urgencyBucket(
               candidate.priority, candidate.deadlineClock, now);
-          const std::uint64_t slack =
-              candidate.deadlineClock == 0
-                  ? UINT64_MAX
-                  : (candidate.deadlineClock > now
-                         ? candidate.deadlineClock - now
-                         : 0);
+          const std::uint64_t slack = candidate.deadlineClock == 0
+                                          ? UINT64_MAX
+                                          : (candidate.deadlineClock > now
+                                                 ? candidate.deadlineClock - now
+                                                 : 0);
           const abi::TenantContext *tenant =
               candidate.tenantId < runtime->tenantCapacity
                   ? &runtime->tenants[candidate.tenantId]
@@ -779,17 +828,14 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
           const std::uint64_t weightedService =
               tenant == nullptr || tenant->weight == 0
                   ? UINT64_MAX
-                  : device::loadCounter(&tenant->serviceBytes) /
-                        tenant->weight;
+                  : device::loadCounter(&tenant->serviceBytes) / tenant->weight;
           if (selected == nullptr || urgency > bestUrgency ||
               (urgency == bestUrgency &&
                weightedService < bestWeightedService) ||
               (urgency == bestUrgency &&
-               weightedService == bestWeightedService &&
-               slack < bestSlack) ||
+               weightedService == bestWeightedService && slack < bestSlack) ||
               (urgency == bestUrgency &&
-               weightedService == bestWeightedService &&
-               slack == bestSlack &&
+               weightedService == bestWeightedService && slack == bestSlack &&
                candidateTicket < ticket)) {
             selected = &candidate;
             selectedSlot = &candidateSlot;
@@ -828,8 +874,8 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
           queue.error = 0xfffffffeU;
           action = 1;
         } else {
-          const bool live = device::requestLive(
-              runtime, selected->requestSlot, selected->generation);
+          const bool live = device::requestLive(runtime, selected->requestSlot,
+                                                selected->generation);
           bool admitted = true;
           if (live) {
             admitted = device::tryReserveRequestBytes(
@@ -837,18 +883,16 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
                 object->bytes);
             if (admitted && !device::tryReserveTenantBytes(
                                 runtime, selected->tenantId, object->bytes)) {
-              device::releaseRequestBytes(
-                  runtime, selected->requestSlot, selected->generation,
-                  object->bytes);
+              device::releaseRequestBytes(runtime, selected->requestSlot,
+                                          selected->generation, object->bytes);
               admitted = false;
             }
           }
           if (admitted && !device::tryReserveBackendBytes(
                               runtime, abi::SourceKind::Nvme, object->bytes)) {
             if (live) {
-              device::releaseRequestBytes(
-                  runtime, selected->requestSlot, selected->generation,
-                  object->bytes);
+              device::releaseRequestBytes(runtime, selected->requestSlot,
+                                          selected->generation, object->bytes);
               device::releaseTenantBytes(runtime, selected->tenantId,
                                          object->bytes);
             }
@@ -876,15 +920,14 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
                 submissionSlot = queue.sqTail;
                 action = 2;
                 if (selected->tenantId < runtime->tenantCapacity) {
-                  atomicAdd(reinterpret_cast<unsigned long long *>(
-                                &runtime->tenants[selected->tenantId]
-                                     .serviceBytes),
-                            static_cast<unsigned long long>(object->bytes));
+                  atomicAdd(
+                      reinterpret_cast<unsigned long long *>(
+                          &runtime->tenants[selected->tenantId].serviceBytes),
+                      static_cast<unsigned long long>(object->bytes));
                 }
               } else {
-                device::releaseRequestBytes(
-                    runtime, selected->requestSlot, selected->generation,
-                    chargedBytes);
+                device::releaseRequestBytes(runtime, selected->requestSlot,
+                                            selected->generation, chargedBytes);
                 device::releaseTenantBytes(runtime, selected->tenantId,
                                            chargedBytes);
                 device::releaseBackendBytes(runtime, abi::SourceKind::Nvme,
@@ -894,9 +937,8 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
                 action = 1;
               }
             } else {
-              device::releaseRequestBytes(
-                  runtime, selected->requestSlot, selected->generation,
-                  chargedBytes);
+              device::releaseRequestBytes(runtime, selected->requestSlot,
+                                          selected->generation, chargedBytes);
               device::releaseTenantBytes(runtime, selected->tenantId,
                                          chargedBytes);
               device::releaseBackendBytes(runtime, abi::SourceKind::Nvme,
@@ -924,8 +966,8 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
     abi::IntentSlot &selectedSlot = runtime->intents[intentSlotIndex];
     abi::AcquireIntent &selected = selectedSlot.intent;
     abi::ObjectEntry &object = runtime->objects[objectSlot];
-    const abi::ReplicaEntry &replica = *device::replica(
-        runtime, object, object.selectedReplica);
+    const abi::ReplicaEntry &replica =
+        *device::replica(runtime, object, object.selectedReplica);
     abi::NvmeSubmission &submission = queue.submissions[submissionSlot];
     if (lane < 16) {
       submission.dword[lane] = 0;
@@ -990,7 +1032,12 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
     }
     __syncwarp();
   }
-  if (lane == 0 && issued != 0) {
+  issued = __shfl_sync(0xffffffffU, issued, 0);
+  queueOnline = lane == 0 && device::nvmeQueueOnline(queue);
+  queueOnline = __shfl_sync(0xffffffffU, queueOnline, 0);
+  if (issued != 0 && !queueOnline) {
+    device::failNvmeQueue(runtime, queue, lane, 0xfffffffcU);
+  } else if (lane == 0 && issued != 0) {
     device::systemIoFence();
     *queue.sqDoorbell = queue.sqTail;
   }
@@ -1060,8 +1107,9 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   abi::ObjectEntry &object = runtime->objects[intent.objectSlot];
   const abi::ReplicaEntry *replica =
       device::replica(runtime, object, object.selectedReplica);
-  if (replica == nullptr || replica->sourceKind !=
-      static_cast<std::uint32_t>(abi::SourceKind::HostStaged)) {
+  if (replica == nullptr ||
+      replica->sourceKind !=
+          static_cast<std::uint32_t>(abi::SourceKind::HostStaged)) {
     return;
   }
   if (object.objectId != intent.objectId ||
@@ -1090,8 +1138,8 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
     if (live) {
       accepted = device::tryReserveRequestBytes(
           runtime, intent.requestSlot, intent.generation, intent.bytes);
-      if (accepted && !device::tryReserveTenantBytes(
-                          runtime, intent.tenantId, intent.bytes)) {
+      if (accepted && !device::tryReserveTenantBytes(runtime, intent.tenantId,
+                                                     intent.bytes)) {
         device::releaseRequestBytes(runtime, intent.requestSlot,
                                     intent.generation, intent.bytes);
         accepted = false;
@@ -1126,8 +1174,8 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
     return;
   }
 
-  auto *source =
-      reinterpret_cast<const std::byte *>(replica->sourceAddress) + intent.offset;
+  auto *source = reinterpret_cast<const std::byte *>(replica->sourceAddress) +
+                 intent.offset;
   auto *destination =
       reinterpret_cast<std::byte *>(object.stagingAddress) + intent.offset;
 
@@ -1158,9 +1206,8 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
 #endif
 
 #if NTA_DEVICE_PHASE_KERNELS
-extern "C" __global__ void
-nta_publish_ready(nta::abi::RuntimeView *runtime,
-                  std::uint32_t pendingBudget) {
+extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
+                                             std::uint32_t pendingBudget) {
   using namespace nta;
   if (runtime == nullptr || runtime->pendingCount == nullptr ||
       runtime->pendingContinuations == nullptr) {
@@ -1178,8 +1225,7 @@ nta_publish_ready(nta::abi::RuntimeView *runtime,
     if (continuationIndex >= runtime->continuationCapacity) {
       continue;
     }
-    abi::Continuation &continuation =
-        runtime->continuations[continuationIndex];
+    abi::Continuation &continuation = runtime->continuations[continuationIndex];
     if (atomicAdd(&continuation.state, 0U) !=
         static_cast<std::uint32_t>(abi::ContinuationState::Pending)) {
       continue;
@@ -1302,16 +1348,15 @@ nta_complete_launched(nta::abi::RuntimeView *runtime,
     return;
   }
   const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= continuationCount ||
-      index >= runtime->continuationCapacity) {
+  if (index >= continuationCount || index >= runtime->continuationCapacity) {
     return;
   }
   nta::abi::Continuation &continuation = runtime->continuations[index];
   const std::uint32_t done =
       static_cast<std::uint32_t>(nta::abi::ContinuationState::Done);
-  (void)atomicCAS(
-      &continuation.state,
-      static_cast<std::uint32_t>(nta::abi::ContinuationState::New), done);
+  (void)atomicCAS(&continuation.state,
+                  static_cast<std::uint32_t>(nta::abi::ContinuationState::New),
+                  done);
   (void)atomicCAS(
       &continuation.state,
       static_cast<std::uint32_t>(nta::abi::ContinuationState::Ready), done);

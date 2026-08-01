@@ -31,7 +31,8 @@ namespace {
 struct Options {
   std::string device = "/dev/nta_nvme";
   std::string reference = "/tmp/nta-nvme-reference.bin";
-  nta::NvmeDestination destination = nta::NvmeDestination::Hbm;
+  nta::NvmeDestination destination = nta::NvmeDestination::HostMapped;
+  int gpu = 0;
   std::uint64_t sourceOffset = 0;
   std::uint32_t bytes = 64U * 1024U;
   std::uint32_t requests = 16;
@@ -83,6 +84,13 @@ Options parseOptions(int argc, char **argv) {
     const std::string_view value = argument.substr(equals + 1);
     if (name == "--device") {
       options.device = value;
+    } else if (name == "--gpu") {
+      const std::uint64_t parsed = parseInteger(value, name, true);
+      if (parsed >
+          static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("--gpu exceeds int");
+      }
+      options.gpu = static_cast<int>(parsed);
     } else if (name == "--reference") {
       options.reference = value;
     } else if (name == "--destination") {
@@ -248,8 +256,9 @@ int main(int argc, char **argv) {
     }
 
     checkDriver(cuInit(0), "cuInit");
-    checkCuda(cudaSetDevice(0), "cudaSetDevice");
-    auto transport = std::make_shared<nta::NvmeTransport>(options.device);
+    checkCuda(cudaSetDevice(options.gpu), "cudaSetDevice");
+    auto transport =
+        std::make_shared<nta::NvmeTransport>(options.device, options.gpu);
     const nta::NvmeCapabilities capabilities = transport->capabilities();
     if (options.bytes % capabilities.lbaSize != 0 ||
         options.sourceOffset % capabilities.lbaSize != 0) {
@@ -262,9 +271,10 @@ int main(int argc, char **argv) {
         totalSourceBytes > capabilities.namespaceBytes - options.sourceOffset) {
       throw std::invalid_argument("requested NVMe range exceeds namespace");
     }
-    nta::HostRuntime runtime({options.requests, options.requests,
-                              options.requests, options.requests},
-                             transport);
+    nta::RuntimeConfig runtimeConfig{options.requests, options.requests,
+                                     options.requests, options.requests};
+    runtimeConfig.deviceOrdinal = options.gpu;
+    nta::HostRuntime runtime(runtimeConfig, transport);
     std::vector<nta::benchmark::TileTask> hostTasks(options.requests);
     for (std::uint32_t request = 0; request < options.requests; ++request) {
       std::unique_ptr<nta::NvmeBuffer> destination =

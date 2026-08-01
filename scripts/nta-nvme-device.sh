@@ -6,6 +6,8 @@ bdf=${NTA_NVME_BDF:-0000:d8:00.0}
 device=/sys/bus/pci/devices/$bdf
 module=$root_dir/driver/nta_nvme/nta_nvme.ko
 reference=${NTA_NVME_REFERENCE:-/tmp/nta-nvme-reference.bin}
+nsid=${NTA_NVME_NSID:-1}
+queues=${NTA_NVME_QUEUES:-8}
 
 die() {
   printf 'nta-nvme-device: %s\n' "$*" >&2
@@ -38,10 +40,37 @@ require_safe_device() {
   done
 }
 
+require_containment() {
+  [[ $(getconf PAGESIZE) == 4096 ]] ||
+    die "4 KiB host pages are required to map only the NVMe doorbell page"
+  [[ -L $device/iommu_group ]] || die "$bdf has no IOMMU group"
+  local group
+  group=$(readlink -f "$device/iommu_group")
+  local type
+  type=$(<"$group/type")
+  case $type in
+  DMA | DMA-FQ) ;;
+  *) die "IOMMU group $(basename "$group") is '$type', not translated DMA" ;;
+  esac
+  local members=("$group"/devices/*)
+  [[ ${#members[@]} == 1 && $(basename "${members[0]}") == "$bdf" ]] ||
+    die "$bdf is not alone in IOMMU group $(basename "$group")"
+  [[ $nsid =~ ^[1-9][0-9]*$ ]] || die "NTA_NVME_NSID must be positive"
+  [[ $queues =~ ^[1-9][0-9]*$ && $queues -le 32 ]] ||
+    die "NTA_NVME_QUEUES must be between 1 and 32"
+}
+
 case ${1:-status} in
 status)
-  printf 'bdf=%s driver=%s node=%s\n' "$bdf" "$(current_driver)" \
-    "$([[ -e /dev/nta_nvme ]] && printf present || printf absent)"
+  printf 'bdf=%s driver=%s node=%s iommu=%s\n' "$bdf" "$(current_driver)" \
+    "$([[ -e /dev/nta_nvme ]] && printf present || printf absent)" \
+    "$([[ -L $device/iommu_group ]] && cat "$(readlink -f "$device/iommu_group")/type" || printf absent)"
+  ;;
+preflight)
+  require_safe_device
+  require_containment
+  printf 'containment preflight passed: bdf=%s nsid=%s queues=%s\n' \
+    "$bdf" "$nsid" "$queues"
   ;;
 build)
   make -C "$root_dir/driver/nta_nvme"
@@ -51,6 +80,7 @@ bind)
     die "vmem_sw is loaded and may own this SSD; unload/disable it before binding"
   fi
   require_safe_device
+  require_containment
   make -C "$root_dir/driver/nta_nvme"
   for block in "$device"/nvme/nvme*/nvme*n*; do
     [[ -e $block ]] || continue
@@ -64,11 +94,11 @@ bind)
   if lsmod | awk '{print $1}' | grep -qx nta_nvme; then
     sudo rmmod nta_nvme
   fi
-  sudo insmod "$module" target_bdf="$bdf"
+  sudo insmod "$module" target_bdf="$bdf" target_nsid="$nsid" \
+    max_io_queues="$queues"
   printf '%s' nta_nvme | sudo tee "$device/driver_override" >/dev/null
   printf '%s' "$bdf" | sudo tee /sys/bus/pci/drivers_probe >/dev/null
   [[ -e /dev/nta_nvme ]] || die "driver probe failed; inspect dmesg"
-  sudo chown "$(id -u):$(id -g)" /dev/nta_nvme
   "$0" status
   ;;
 restore)
@@ -87,6 +117,6 @@ restore)
   "$0" status
   ;;
 *)
-  die "usage: $0 {status|build|bind|restore}"
+  die "usage: $0 {status|preflight|build|bind|restore}"
   ;;
 esac
