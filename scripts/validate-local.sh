@@ -55,6 +55,11 @@ ptxas=${NTA_PTXAS:-/usr/local/cuda-12.9/bin/ptxas}
 
 if [[ ${NTA_SANITIZE:-0} == 1 ]]; then
   sanitizer=${NTA_COMPUTE_SANITIZER:-/usr/local/cuda-13.0/bin/compute-sanitizer}
+  python=${NTA_PYTHON:-python3}
+  have_flashinfer=0
+  if "${python}" -c 'import flashinfer' >/dev/null 2>&1; then
+    have_flashinfer=1
+  fi
   for tool in memcheck racecheck synccheck; do
     "${sanitizer}" --tool "${tool}" --error-exitcode 99 \
       "${build}/nta-paged-attention" \
@@ -71,5 +76,16 @@ if [[ ${NTA_SANITIZE:-0} == 1 ]]; then
       --mode=mixed --tokens=6 --experts=6 --top-k=2 --hidden=64 \
       --iterations=1 \
       2>&1 | tee "${results}/moe-${tool}.log"
+    if [[ ${have_flashinfer} == 1 ]]; then
+      "${root}/tools/jit/activate.py" \
+        --build-dir "${build}" \
+        --cache-root "${build}/flashinfer-jit-cache" \
+        --clang "${NTA_CLANG_CUDA:-/usr/bin/clang++-22}" \
+        --cuda-path "${NTA_CUDA_ROOT:-/usr/local/cuda-12.9}" \
+        --flashinfer-hook -- \
+        "${sanitizer}" --tool "${tool}" --error-exitcode 99 \
+        "${python}" "${root}/tests/flashinfer/hooked_decode.py" --sanitizer \
+        2>&1 | tee "${results}/flashinfer-${tool}.log"
+    fi
   done
 fi

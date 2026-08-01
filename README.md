@@ -60,9 +60,10 @@ workloads:
 The core ABI and compiler pass do not depend on FlashInfer, vLLM, SGLang, or a
 kernel name. A supported kernel must still expose a reconstructible pre-state
 work boundary; arbitrary instruction-level suspension is not implemented. The
-FlashInfer compatibility layer and JIT transport do not yet place deferral
-inside FlashInfer's optimized FMHA CTA, and no vLLM/SGLang request-lifecycle
-adapter is present. The compiler currently consumes explicit acquisition
+version-checked FlashInfer 0.6.12 JIT overlay places deferral before state
+initialization in optimized decode and FA2 paged-prefill CTAs without modifying
+the installed package. No vLLM/SGLang request-lifecycle adapter is present. The
+compiler currently consumes explicit acquisition
 markers; automatic recognition of arbitrary production load/cp.async/TMA
 address cones is an open gate. The pass does prove CTA-uniform control and
 operands for explicit sites; lane-divergent collective calls are rejected.
@@ -91,7 +92,7 @@ Compile a source-generated CUDA kernel through Clang and the NTA pass without a
 separate `opt` step:
 
 ```bash
-tools/jit/activate.py --build-dir build -- \
+tools/jit/activate.py --build-dir build --flashinfer-hook -- \
   python3 your_flashinfer_or_kernel_generator.py
 ```
 
@@ -147,11 +148,12 @@ memcheck, racecheck, and synccheck.
 `scripts/measure-direct-overhead.sh` runs alternating process-level trials and
 reports paired 95% t intervals.
 
-When `flashinfer-python` is installed, CMake locates its headers and builds the
-attention reduction with `flashinfer::state_t`; CTest also enables the real
-multi-source JIT compile and `nta-flashinfer-differential-gpu` gates. Override
-header discovery with
-`-DNTA_FLASHINFER_INCLUDE_DIR=/path/to/include`.
+When FlashInfer 0.6.12 is installed, CTest compiles NTA-parameterized decode and
+paged-prefill modules, loads the exported phase ABI, and executes resident,
+pinned-host, shared-head, split-K decode, and multi-tile prefill gates. The
+overlay rejects source hashes or anchors that differ from the validated wheel.
+CTest also enables `nta-flashinfer-differential-gpu`. Override header discovery
+with `-DNTA_FLASHINFER_INCLUDE_DIR=/path/to/include`.
 
 ## GPU-initiated NVMe
 

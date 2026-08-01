@@ -47,7 +47,8 @@ FinitePhaseProgram::FinitePhaseProgram(CUmodule module)
     : reset_(load(module, "nta_reset_epoch")),
       progressHost_(load(module, "nta_progress_host_staging")),
       progressNvme_(load(module, "nta_progress_nvme")),
-      publish_(load(module, "nta_publish_ready")) {}
+      publish_(load(module, "nta_publish_ready")),
+      complete_(load(module, "nta_complete_launched")) {}
 
 void FinitePhaseProgram::reset(CUstream stream, abi::RuntimeView *runtime,
                                std::uint32_t objectCount,
@@ -101,6 +102,20 @@ void FinitePhaseProgram::publish(CUstream stream, abi::RuntimeView *runtime,
   CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
   void *arguments[] = {&runtimeAddress, &pendingBudget};
   launch(publish_, blocks, Threads, stream, arguments, "nta_publish_ready");
+}
+
+void FinitePhaseProgram::complete(CUstream stream, abi::RuntimeView *runtime,
+                                  std::uint32_t continuationCount) const {
+  if (runtime == nullptr || continuationCount == 0) {
+    throw std::invalid_argument(
+        "completion needs a runtime and continuation count");
+  }
+  constexpr std::uint32_t Threads = 256;
+  const std::uint32_t blocks = (continuationCount + Threads - 1U) / Threads;
+  CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+  void *arguments[] = {&runtimeAddress, &continuationCount};
+  launch(complete_, blocks, Threads, stream, arguments,
+         "nta_complete_launched");
 }
 
 } // namespace nta

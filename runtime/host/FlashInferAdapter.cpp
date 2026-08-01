@@ -125,4 +125,38 @@ DecodePlan planDecode(const DecodeBatchView &batch) {
   return plan;
 }
 
+DecodePlan planScheduledDecode(const DecodeBatchView &batch,
+                               const DecodeScheduleView &schedule) {
+  if (batch.pageSize == 0 || schedule.kvChunkTokens == 0 ||
+      schedule.kvChunkTokens % batch.pageSize != 0) {
+    throw std::invalid_argument(
+        "FlashInfer decode chunk size must contain complete KV pages");
+  }
+  if (schedule.requestIndices.size() != schedule.kvTileIndices.size()) {
+    throw std::invalid_argument(
+        "FlashInfer decode schedule arrays must have equal length");
+  }
+  DecodeBatchView scheduledBatch = batch;
+  scheduledBatch.maxPagesPerWorkItem = schedule.kvChunkTokens / batch.pageSize;
+  DecodePlan plan = planDecode(scheduledBatch);
+  if (plan.work.workItems.size() != schedule.requestIndices.size()) {
+    throw std::invalid_argument(
+        "FlashInfer decode scheduler work count does not match the NTA plan");
+  }
+  for (std::size_t index = 0; index < plan.work.workItems.size(); ++index) {
+    const std::uint32_t request = checkedIndex(
+        schedule.requestIndices[index], "FlashInfer scheduled request index");
+    const std::uint32_t kvTile = checkedIndex(
+        schedule.kvTileIndices[index], "FlashInfer scheduled KV tile index");
+    const abi::WorkItem &item = plan.work.workItems[index];
+    if (item.requestIndex != request ||
+        item.logicalWork / scheduledBatch.maxPagesPerWorkItem != kvTile ||
+        item.logicalWork % scheduledBatch.maxPagesPerWorkItem != 0) {
+      throw std::invalid_argument(
+          "FlashInfer decode scheduler identity does not match the NTA plan");
+    }
+  }
+  return plan;
+}
+
 } // namespace nta::flashinfer

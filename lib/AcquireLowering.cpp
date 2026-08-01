@@ -80,6 +80,8 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
   BasicBlock *continuationBlock =
       entry->splitBasicBlock(afterMarker, "nta.acquire-set.cont");
   entry->getTerminator()->eraseFromParent();
+  BasicBlock *classifyBlock = BasicBlock::Create(
+      context, "nta.acquire-set.classify", function, continuationBlock);
   BasicBlock *slowBlock = BasicBlock::Create(context, "nta.acquire-set.slow",
                                              function, continuationBlock);
 
@@ -87,7 +89,13 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
   entryBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   CallInst *live = entryBuilder.CreateCall(
       requestLive, {runtime, requestSlot, generation}, "nta.request.live");
-  entryBuilder.CreateCondBr(live, slowBlock, continuationBlock);
+  entryBuilder.CreateCondBr(live, classifyBlock, continuationBlock);
+
+  IRBuilder<> classifyBuilder(classifyBlock);
+  classifyBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
+  Value *allDirect = classifyBuilder.CreateICmpEQ(
+      directRequirementCount, requirementCount, "nta.dependencies.direct");
+  classifyBuilder.CreateCondBr(allDirect, continuationBlock, slowBlock);
 
   IRBuilder<> slowBuilder(slowBlock);
   slowBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
@@ -101,8 +109,9 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
 
   IRBuilder<> continuationBuilder(&continuationBlock->front());
   continuationBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
-  PHINode *result = continuationBuilder.CreatePHI(i1, 2, "nta.ready");
+  PHINode *result = continuationBuilder.CreatePHI(i1, 3, "nta.ready");
   result->addIncoming(ConstantInt::getFalse(context), entry);
+  result->addIncoming(ConstantInt::getTrue(context), classifyBlock);
   result->addIncoming(ready, slowBlock);
   marker->replaceAllUsesWith(result);
   marker->eraseFromParent();

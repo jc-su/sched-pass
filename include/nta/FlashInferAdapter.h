@@ -45,10 +45,21 @@ struct DecodePlan {
   std::vector<RequestChunks> requests;
 };
 
+struct DecodeScheduleView {
+  std::span<const std::int32_t> requestIndices;
+  std::span<const std::int32_t> kvTileIndices;
+  std::uint32_t kvChunkTokens;
+};
+
 // Converts FlashInfer's public paged-KV CSR representation into one finite NTA
-// continuation per logical KV page. Physical page reuse and arbitrary
-// page-table order are preserved; no FlashInfer private PlanInfo layout is
-// inspected.
+// continuation per logical KV chunk. Physical page reuse and arbitrary
+// page-table order are preserved.
 DecodePlan planDecode(const DecodeBatchView &batch);
+
+// Uses schedule identity extracted by a version-specific frontend and rejects
+// any mismatch with the engine-neutral plan. Active scheduler entries must be
+// supplied without CUDA-graph padding.
+DecodePlan planScheduledDecode(const DecodeBatchView &batch,
+                               const DecodeScheduleView &schedule);
 
 } // namespace nta::flashinfer

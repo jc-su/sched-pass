@@ -167,6 +167,7 @@ if(NTA_ENABLE_CUDA)
   add_library(nta-runtime-host STATIC
     runtime/host/DeviceWorkPlan.cpp
     runtime/host/FinitePhase.cpp
+    runtime/host/JitPhase.cpp
     runtime/host/NvmeRuntime.cpp
     runtime/host/Runtime.cpp
   )
@@ -175,10 +176,19 @@ if(NTA_ENABLE_CUDA)
   )
   target_link_libraries(
     nta-runtime-host PUBLIC nta-work-plan CUDA::cuda_driver CUDA::cudart
+                             ${CMAKE_DL_LIBS}
   )
   if(NTA_WARNINGS_AS_ERRORS)
     target_compile_options(
       nta-runtime-host PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+
+  add_executable(nta-jit-phase-load tests/runtime/JitPhaseLoad.cpp)
+  target_link_libraries(nta-jit-phase-load PRIVATE nta-runtime-host)
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-jit-phase-load PRIVATE -Wall -Wextra -Wpedantic -Werror
     )
   endif()
 
@@ -275,11 +285,29 @@ if(NTA_ENABLE_CUDA)
         --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
         --clang ${NTA_CLANG_CUDA}
         --cuda-path ${NTA_CUDA_ROOT}
+        --flashinfer-hook
         --
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/flashinfer/jit_compile.py
     )
     set_tests_properties(nta-flashinfer-jit-compile PROPERTIES TIMEOUT 300)
+    add_test(
+      NAME nta-flashinfer-hooked-decode
+      COMMAND
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
+        --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+        --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
+        --clang ${NTA_CLANG_CUDA}
+        --cuda-path ${NTA_CUDA_ROOT}
+        --flashinfer-hook
+        --
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/flashinfer/hooked_decode.py
+    )
+    set_tests_properties(
+      nta-flashinfer-jit-compile nta-flashinfer-hooked-decode
+      PROPERTIES RUN_SERIAL TRUE TIMEOUT 300
+    )
   endif()
 
   set(NTA_ATTENTION_RAW_BC

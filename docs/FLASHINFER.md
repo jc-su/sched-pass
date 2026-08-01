@@ -1,140 +1,139 @@
 # FlashInfer Integration
 
-Status: data/state and Clang JIT delivery implemented; optimized-kernel
-continuation hook and serving-engine adapters remain open.
+Status: optimized decode and FA2 paged-prefill continuation hooks are
+implemented and executed for FlashInfer 0.6.12; serving-engine adapters remain
+open.
 
-## Why FlashInfer
+## Boundary
 
-FlashInfer is a useful kernel boundary because vLLM and SGLang can both select
-its paged prefill/decode implementations. Integrating once at that boundary can
-reuse optimized attention and cascade reduction across two serving engines.
-It does not replace engine integration: request identity, generation,
-cancellation, KV ownership, CUDA-graph lifetime, and SLO policy still belong to
-vLLM or SGLang.
+FlashInfer is a useful kernel boundary because serving engines can select its
+paged prefill/decode kernels. Integration there reuses optimized attention, but
+does not replace engine ownership of request identity, cancellation, KV
+allocation, CUDA graphs, or output lifetime.
 
-The implementation was checked against FlashInfer 0.6.12 and audited against
-upstream `main` commit `668a1ba1ca86432c79f6adad37ecfce8d06ec083`.
-
-## Implemented Boundary
-
-`nta::flashinfer::planDecode` consumes FlashInfer's public paged-KV inputs:
+`nta::flashinfer::planDecode` translates public paged-KV inputs into the common
+work model:
 
 ```text
 kv_indptr, kv_indices, last_page_len
     + request slot/generation bindings
     + physical page/object bindings
-    -> engine-neutral NTA work items and bounded dependency segments
+    -> NTA WorkItem and AcquireRequirement arrays
 ```
 
-The adapter validates CSR dimensions, monotonic offsets, final-page lengths,
-physical-page bounds, and complete object bindings. It preserves repeated
-physical pages and arbitrary page-table order. It does not inspect private
-`PlanInfo` offsets or assume one CTA per request.
+It validates CSR dimensions, monotonic offsets, final-page lengths, physical
+page bounds, and complete object bindings. Repeated physical pages and arbitrary
+page-table order are preserved. `planScheduledDecode` additionally checks NTA
+work against the active request/KV-tile order and chunk size produced by
+FlashInfer's scheduler.
 
-Attention page CTAs emit the same state consumed by FlashInfer cascade:
+The implementation is checked against the FlashInfer 0.6.12 wheel headers. The
+overlay requires an exact hash of the complete 205-file include tree, exact
+decode/prefill hashes, and exact insertion anchors; an unknown revision fails
+closed. Overlay creation is process-locked, atomically published, immutable,
+and hash-verified on reuse.
+
+## Kernel Hook
+
+Decode and paged prefill know request and KV-tile identity before shared memory,
+barriers, TMA/cp.async state, or live softmax values. The overlay adds this
+canonical global-kernel entry sequence:
 
 ```text
-V   = normalized partial attention output
-LSE = base-2 logsumexp
+validate active scheduler work
+bind request and dependency set
+acquire
+  ready -> enter unchanged FlashInfer device mainloop
+  miss  -> publish finite continuation and return the whole CTA
 ```
 
-When FlashInfer headers are available, the NTA reduction instantiates
-`flashinfer::state_t` directly. CTest also runs the externally acquired NTA
-fixture through a real `BatchDecodeWithPagedKVCacheWrapper`; the current local
-gate covers heterogeneous request lengths and non-identity physical page
-indices.
+The LLVM pass proves CTA-uniform operands and control, requires the direct
+`acquire -> pending branch -> defer -> return` shape, and rejects a hook in a
+non-inlined device helper. Direct dependencies take a compiler-generated fast
+edge that avoids the noinline acquisition helper while retaining request
+liveness and continuation-state checks.
 
-This is a real compatibility and differential-correctness layer. It is not yet
-the final high-performance kernel integration: the current acquisition workload
-uses NTA's mechanism attention CTA, while FlashInfer runs as the independent
-differential implementation.
+FlashInfer's `AttentionVariant` starts too late and cannot return the whole CTA.
+That limitation prevents a variant-only implementation, not this architecture.
+The checked source overlay inserts the hook in the global wrappers. A small
+upstream `begin_work(...)` template hook is the preferred long-term replacement
+for the overlay.
 
-## Correct Kernel Hook
+## JIT Delivery
 
-FlashInfer prefill and decode already schedule a CTA with a request index and a
-KV chunk index. The acquisition hook belongs after those indices and chunk
-bounds are known, but before query/KV movement, shared-memory barriers, or live
-softmax state are initialized:
+Run a custom FlashInfer generator under:
+
+```bash
+tools/jit/activate.py --build-dir build --flashinfer-hook -- \
+  python3 generator.py
+```
+
+The activator:
+
+- creates an ABI/pass/source-fingerprinted cache;
+- verifies and prepares a private 0.6.12 include overlay;
+- instruments decode and paged-prefill kernel sources through Clang 22;
+- compiles device acquisition code into every hooked kernel source;
+- emits reset, host/NVMe progress, publish, completion, and ABI wrappers from
+  exactly one source per shared object; and
+- leaves FlashInfer planning and TVM-FFI binding sources unchanged.
+
+`JitPhaseProgram` loads those wrappers from the generated shared object and
+checks ABI compatibility. `tools/flashinfer/schedule.py` isolates the private
+0.6.12 `PlanInfo` layout and extracts active request/KV-tile identity, including
+CUDA-graph padding masks. A supported upstream schedule API should replace that
+version adapter.
+
+## Finite Execution
+
+One stream-ordered acquisition cycle is:
 
 ```text
-FlashInfer plan
-  -> CTA request/chunk binding
-  -> acquire all physical pages required by this chunk
-       ready: continue into the unchanged FlashInfer mainloop
-       miss:  record the reconstructible chunk and return the CTA
-  -> write (V, LSE) partial
-  -> FlashInfer cascade merge after every required chunk is complete
+reset -> FlashInfer initial run -> complete launched work
+      -> bounded transport progress -> publish ready
+      -> FlashInfer full-grid ready run -> complete launched work
 ```
 
-Hooking individual `K/V` loads is incorrect because a miss can occur after the
-CTA has accumulated softmax state or entered a barrier protocol. Polling inside
-the attention CTA is also excluded: storage and network latency can outlive a
-finite CTA by orders of magnitude.
+`Done` and still-`Pending` CTAs return at the pre-state hook. `Ready` CTAs enter
+the unmodified mainloop. Multiple KV-head CTAs may share one x-coordinate work
+item; continuation initialization uses a single CAS owner. No CTA polls for
+external completion and no persistent kernel is used.
 
-A FlashInfer chunk may span several pages. The implemented ABI-v9 adapter can
-group a configured number of pages into one continuation with a bounded
-dependency segment. Runtime publication scans the complete segment and validates
-object identity, version, and readiness before enqueueing that continuation.
-For already resident pages, the set hook bypasses the intent queue and the
-original pointer and data-movement path remain unchanged. The optimized
-FlashInfer CTA has not yet been modified to consume that work item.
+Split-K decode is supported. FlashInfer's stock cascade merge can execute after
+the initial miss launch and transiently write incomplete output. The integration
+contract forbids output consumption until the ready relaunch and final merge
+finish. Suppressing the first merge is a remaining performance optimization.
+Ragged prefill is intentionally not hooked because it does not consume external
+paged KV through this boundary.
 
-The mechanism attention fixture now uploads the adapter's common work plan and
-uses those exact `WorkItem` and `AcquireRequirement` records in both its global-
-load and TMA CTAs. Its private task record carries only attention math metadata.
-This removes a prior integration-only duplicate binding, but it still does not
-place the hook inside FlashInfer's optimized CTA.
+## Validation
 
-The JIT activator has also compiled and linked a real FlashInfer 0.6.12 custom
-batch-decode module through Clang 22 with the NTA pass loaded. Its cache is
-fingerprinted by NTA ABI, pass, shim, and device integration content. This
-validates compiler transport and FlashInfer's multi-source extension build;
-that smoke module had no acquisition hook and is not evidence that optimized
-FlashInfer deferral is complete.
+The local CTest gate covers:
 
-FlashInfer 0.6.12's custom `AttentionVariant` interface can transform scores,
-masks, statistics, and outputs, but it cannot reject the whole CTA. The hook
-therefore needs a small upstreamable template extension, such as an optional
-`begin_kv_chunk(...)` policy after block validity and request/chunk discovery.
-NTA's policy emits the request binding and acquisition markers; the LLVM pass
-proves the pre-state deferral boundary and lowers them. A source rewrite of
-every vector load or a long-lived FlashInfer fork is not the target design.
+- real multi-source decode and paged-prefill JIT compilation with NTA Params;
+- C and C++ loading of the exported ABI-9 phase functions;
+- resident and pinned-host deferred decode;
+- two KV-head CTAs sharing one continuation;
+- 32-way split-K decode and stock cascade reduction;
+- four-work-item FA2 paged prefill; and
+- exact output comparison with stock FlashInfer.
 
-## Serving Adapters
+Memcheck, racecheck, and synccheck are clean on the shared-continuation deferred
+path. A matched 64-request custom-variant microbenchmark has an 8% CTest
+regression limit; the latest local median measured 6.33% resident overhead.
+This is a local regression gate, not controlled multi-machine performance
+evidence.
 
-The engine adapters should be thin and separate from the kernel integration.
+## Open Gates
 
-For both vLLM and SGLang they must:
+- vLLM and SGLang request/KV/cancellation/CUDA-graph lifecycle adapters;
+- long-running graph replay, cancellation, generation reuse, and multi-GPU
+  stress;
+- avoiding unnecessary split-K reduction on miss launches;
+- TTFT, TPOT, p50/p99, SLO goodput, CPU use, and SM-tax comparisons;
+- current-ABI NVMe error/reset/backpressure reruns and real RNIC RDMA; and
+- upstream FlashInfer hook and scheduler-metadata APIs.
 
-1. Publish request slot, generation, tenant, priority, deadline, and
-   cancellation before graph replay.
-2. Translate the engine's KV block ownership into physical page/object
-   bindings while preserving FlashInfer's `kv_indices` values.
-3. Reserve stable HBM slots for command-addressed pages so FlashInfer's native
-   page pointers are valid after acquisition completes.
-4. Supply the FlashInfer CTA-to-request/chunk mapping through a supported API,
-   not version-pinned reads of private workspace offsets.
-5. Delay final output consumption until all exact dense-attention chunks have
-   produced valid `(V, LSE)` states.
-6. Retire generations only after in-flight acquisition and graph work can no
-   longer publish stale readiness.
-
-SGLang and vLLM remain separate adapters because they differ in batch formation,
-KV allocation, cancellation, and graph orchestration even when both select the
-same FlashInfer kernel.
-
-## Production Gates
-
-The FlashInfer path is not production-ready until all of these pass:
-
-- the optional chunk hook is implemented in decode and paged prefill without a
-  persistent kernel or CTA-wide completion polling;
-- multi-page dependency continuations remain safe under production CUDA-graph
-  reuse and engine cancellation races;
-- direct-resident overhead is statistically indistinguishable from untouched
-  FlashInfer or is small enough to justify with end-to-end benefit;
-- real SGLang and vLLM batches pass output, reuse, cancellation, CUDA-graph, and
-  long-context tests;
-- TTFT, TPOT, p50/p99, SLO goodput, CPU usage, and SM tax are compared with
-  userspace prefetch and native tiering baselines; and
-- NVMe and RDMA error, timeout, reset, and backpressure behavior is validated.
+Therefore this is a functioning optimized-kernel integration for one validated
+FlashInfer revision. It is not yet a production serving integration or an
+OSDI-level evaluation.

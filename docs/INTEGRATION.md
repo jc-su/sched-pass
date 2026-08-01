@@ -41,6 +41,17 @@ phases.enqueueHost(stream, runtime.deviceView(), config,
   [&] { launch_ready_kernel(device_plan.view()); });
 ```
 
+`enqueueHost` and `enqueueNvme` retire completed initial/ready launches in
+stream order. For a shared-object JIT, `JitPhaseProgram` loads equivalent
+exported launchers and verifies `nta::abi::Version` before use:
+
+```cpp
+nta::JitPhaseProgram phases(flashinfer_module_path);
+phases.enqueueHost(stream, runtime.deviceView(), config,
+  [&] { flashinfer_initial_run(); },
+  [&] { flashinfer_ready_run(); });
+```
+
 The engine still owns graph lifetime, batch formation, output synchronization,
 request cancellation, and generation retirement. NTA does not insert a CPU
 submission or completion loop.
@@ -75,7 +86,7 @@ continuation state. The kernel never waits for I/O.
 For source-generated CUDA, run the generator under the activation tool:
 
 ```bash
-tools/jit/activate.py --build-dir build -- \
+tools/jit/activate.py --build-dir build --flashinfer-hook -- \
   python3 your_flashinfer_or_kernel_generator.py
 ```
 
@@ -92,12 +103,19 @@ target architecture, optimization level, fast-math choice, line tables,
 dependency output, and host compiler options used by the generator.
 
 The instrumented kernel translation unit must also compile
-`runtime/device/Acquire.cuh`, which supplies the lowered slow path and finite
-phase kernels. In a multi-source JIT it must be included in exactly that device
-kernel source, not every host-binding source. The foreign-kernel test exercises
-this complete single-translation-unit path. A future FlashInfer begin-chunk
-integration must add the policy and device runtime to its kernel-instantiation
-source while leaving planning and TVM-FFI binding sources unchanged.
+`runtime/device/Acquire.cuh`. FlashInfer activation force-includes the runtime
+only in paged-attention kernel instantiations and emits phase wrappers from
+exactly one source per shared object. Planning and TVM-FFI binding sources stay
+stock. `tools/flashinfer/prepare_overlay.py` copies the installed include tree
+into the fingerprinted cache, checks the complete 0.6.12 tree plus patched-file
+hashes and insertion anchors, then adds the pre-state wrappers. Creation is
+process-locked and atomically published; reuse verifies the immutable overlay.
+The installed package is never edited.
+
+`tools/flashinfer/schedule.py` is the only code that reads 0.6.12 `PlanInfo`
+offsets. It extracts active request/KV-tile order and chunk size.
+`planScheduledDecode` checks that schedule against the engine-neutral
+CSR/object plan before upload.
 
 ## Transparency Contract
 
@@ -111,12 +129,12 @@ return without abandoning barrier or numerical state. Precompiled cubins are
 therefore unsupported. Source-available kernels need the small pre-state policy
 call above, either directly or through an upstream template hook.
 
-FlashInfer 0.6.12 exposes request and KV-tile indices at the needed point, but
-its current custom attention-variant interface has no begin-chunk callback that
-can reject the whole CTA. JIT compilation is implemented and verified; placing
-NTA deferral inside the optimized decode and paged-prefill CTAs still requires
-an upstreamable begin-chunk hook. Claiming zero-source-change optimized
-FlashInfer integration before that hook exists would be incorrect.
+FlashInfer 0.6.12's attention-variant interface has no callback that can reject
+a whole CTA. This does not block NTA: the checked JIT overlay adds the hook to
+the global decode and FA2 paged-prefill wrappers before shared memory or
+numerical state. An upstream optional begin-work hook would remove the overlay
+and private schedule adapter. This is source-JIT integration, not
+zero-source-change binary instrumentation.
 
 ## Why Benchmarks Contain C++
 

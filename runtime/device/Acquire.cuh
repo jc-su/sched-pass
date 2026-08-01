@@ -7,6 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifndef NTA_DEVICE_PHASE_KERNELS
+#define NTA_DEVICE_PHASE_KERNELS 1
+#endif
+
 namespace nta::device {
 
 __device__ __forceinline__ bool requestLive(abi::RuntimeView *runtime,
@@ -62,8 +66,9 @@ initializeContinuation(abi::RuntimeView *runtime, std::uint32_t requestSlot,
   }
 
   abi::Continuation &record = runtime->continuations[continuation];
-  const auto state =
-      static_cast<abi::ContinuationState>(atomicAdd(&record.state, 0U));
+  const auto state = static_cast<abi::ContinuationState>(atomicCAS(
+      &record.state, static_cast<std::uint32_t>(abi::ContinuationState::New),
+      static_cast<std::uint32_t>(abi::ContinuationState::Pending)));
   if (state == abi::ContinuationState::Cancelled ||
       state == abi::ContinuationState::Failed) {
     return false;
@@ -87,19 +92,14 @@ initializeContinuation(abi::RuntimeView *runtime, std::uint32_t requestSlot,
   record.logicalTile = continuation;
   record.dependencyStart = dependencyStart;
   __threadfence();
-  if (atomicCAS(&record.state,
-                static_cast<std::uint32_t>(abi::ContinuationState::New),
-                static_cast<std::uint32_t>(abi::ContinuationState::Pending)) ==
-      static_cast<std::uint32_t>(abi::ContinuationState::New)) {
-    const std::uint32_t ticket = atomicAdd(runtime->pendingCount, 1U);
-    if (ticket < runtime->continuationCapacity) {
-      runtime->pendingContinuations[ticket] = continuation;
-      __threadfence();
-    } else {
-      atomicExch(&record.state,
-                 static_cast<std::uint32_t>(abi::ContinuationState::Failed));
-      return false;
-    }
+  const std::uint32_t ticket = atomicAdd(runtime->pendingCount, 1U);
+  if (ticket < runtime->continuationCapacity) {
+    runtime->pendingContinuations[ticket] = continuation;
+    __threadfence();
+  } else {
+    atomicExch(&record.state,
+               static_cast<std::uint32_t>(abi::ContinuationState::Failed));
+    return false;
   }
   return true;
 }
@@ -643,6 +643,7 @@ nta_requirement_tensor_map(nta::abi::RuntimeView *runtime,
   return reinterpret_cast<const void *>(object.stagingTensorMapAddress);
 }
 
+#if NTA_DEVICE_PHASE_KERNELS
 extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
                                              std::uint32_t issueBudget,
                                              std::uint32_t completionBudget) {
@@ -994,6 +995,7 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
     *queue.sqDoorbell = queue.sqTail;
   }
 }
+#endif
 
 extern "C" __device__ __attribute__((used, noinline)) void
 nta_defer(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
@@ -1035,6 +1037,7 @@ nta_defer(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
   }
 }
 
+#if NTA_DEVICE_PHASE_KERNELS
 extern "C" __global__ void
 nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   using namespace nta;
@@ -1152,7 +1155,9 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
                                 backendBytes);
   }
 }
+#endif
 
+#if NTA_DEVICE_PHASE_KERNELS
 extern "C" __global__ void
 nta_publish_ready(nta::abi::RuntimeView *runtime,
                   std::uint32_t pendingBudget) {
@@ -1246,7 +1251,9 @@ nta_publish_ready(nta::abi::RuntimeView *runtime,
     }
   }
 }
+#endif
 
+#if NTA_DEVICE_PHASE_KERNELS
 extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
                                            std::uint32_t objectCount,
                                            std::uint32_t continuationCount) {
@@ -1285,3 +1292,28 @@ extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
     device::nvmeQueue(runtime)->intentCursor = 0;
   }
 }
+
+// Retire only work that executed in the preceding stream-ordered kernel.
+// Pending work remains eligible for readiness publication and a later launch.
+extern "C" __global__ void
+nta_complete_launched(nta::abi::RuntimeView *runtime,
+                      std::uint32_t continuationCount) {
+  if (runtime == nullptr) {
+    return;
+  }
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= continuationCount ||
+      index >= runtime->continuationCapacity) {
+    return;
+  }
+  nta::abi::Continuation &continuation = runtime->continuations[index];
+  const std::uint32_t done =
+      static_cast<std::uint32_t>(nta::abi::ContinuationState::Done);
+  (void)atomicCAS(
+      &continuation.state,
+      static_cast<std::uint32_t>(nta::abi::ContinuationState::New), done);
+  (void)atomicCAS(
+      &continuation.state,
+      static_cast<std::uint32_t>(nta::abi::ContinuationState::Ready), done);
+}
+#endif

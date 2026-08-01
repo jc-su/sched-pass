@@ -37,6 +37,13 @@ def should_instrument(arguments: list[str]) -> bool:
                if token.strip())
 
 
+def matches_filter(arguments: list[str], variable: str) -> bool:
+    filters = os.environ.get(variable, "")
+    command = " ".join(arguments)
+    return any(token.strip() in command for token in filters.split(",")
+               if token.strip())
+
+
 def translate(arguments: list[str], instrument: bool) -> list[str]:
     command = [
         CLANG,
@@ -50,9 +57,11 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
         str(ROOT / "include"),
         "-I",
         str(ROOT),
-        "-include",
-        str(PRELUDE),
     ]
+    overlay = os.environ.get("NTA_FLASHINFER_OVERLAY", "")
+    if overlay:
+        command[1:1] = ["-I", overlay]
+    command.extend(["-include", str(PRELUDE)])
     toolkit = re.search(r"cuda-(\d+)\.(\d+)", CUDA_PATH)
     major, minor = toolkit.groups() if toolkit else ("12", "0")
     command.extend([
@@ -65,6 +74,18 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
             raise RuntimeError(
                 "NTA_PLUGIN must identify the built libNtaPass.so")
         command.append(f"-fpass-plugin={PLUGIN}")
+        if os.environ.get("NTA_FLASHINFER_HOOK"):
+            phase_source = matches_filter(arguments, "NTA_JIT_PHASE_SOURCE")
+            command.extend([
+                f"-DNTA_DEVICE_PHASE_KERNELS={1 if phase_source else 0}",
+                "-include",
+                str(
+                    ROOT / (
+                        "runtime/device/JitRuntime.cuh"
+                        if phase_source else "runtime/device/Acquire.cuh"
+                    )
+                ),
+            ])
 
     have_standard = False
     index = 0

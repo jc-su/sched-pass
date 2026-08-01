@@ -36,7 +36,7 @@ Generated evidence is under `results/` and is excluded from source control.
 
 ## Correctness Gates
 
-`ctest --test-dir build --output-on-failure` passes 16 tests:
+`ctest --test-dir build --output-on-failure` passes 17 tests:
 
 1. FlashInfer CSR-to-common-plan validation, including grouped pages and bad
    metadata;
@@ -47,21 +47,23 @@ Generated evidence is under `results/` and is excluded from source control.
 4. host/device ABI v9 layout;
 5. Clang nvcc-shim compilation of a foreign source kernel, including automatic
    optimizer-last lowering, marker removal, metadata, and fast-math forwarding;
-6. compilation and linking of FlashInfer's real three-source custom batch-decode
-   extension through the same JIT activator and isolated cache;
-7. runtime allocation, object/replica capacities, cancellation, non-owning
+6. compilation and linking of FlashInfer's real multi-source custom decode and
+   paged-prefill extensions through the same JIT activator and isolated cache;
+7. resident, pinned-host deferred, shared-head, split-K decode, and multi-tile
+   paged-prefill execution inside those optimized FlashInfer kernels;
+8. runtime allocation, object/replica capacities, cancellation, non-owning
    engine allocation registration, reusable pinned/async device-plan upload,
    and runtime binding validation;
-8. mixed-tier acquisition with duplicate coalescing, stale generations,
+9. mixed-tier acquisition with duplicate coalescing, stale generations,
    cancellation, and repeated intent-slot reuse;
-9. a three-object-per-CTA mixed-tier dependency set;
-10. stale object-version failure without output publication;
-11. a 4,096-CTA all-direct scale case with `pending=0`;
-12. routed top-2 MoE expert matrices across mixed tiers;
-13. the matching direct-address numerical baseline;
-14. staged split-K paged attention through the common work plan;
-15. the same common-plan attention path using hardware TMA; and
-16. differential output validation against FlashInfer 0.6.12.
+10. a three-object-per-CTA mixed-tier dependency set;
+11. stale object-version failure without output publication;
+12. a 4,096-CTA all-direct scale case with `pending=0`;
+13. routed top-2 MoE expert matrices across mixed tiers;
+14. the matching direct-address numerical baseline;
+15. staged split-K paged attention through the common work plan;
+16. the same common-plan attention path using hardware TMA; and
+17. differential output validation against FlashInfer 0.6.12.
 
 The pass now proves a canonical finite defer edge and CTA collectivity. Markers
 must be inlined into a GPU kernel entry, where the CTA analysis treats kernel
@@ -86,10 +88,11 @@ CTA barrier, and a grid-stride loop over actual pending entries.
 A separate CUDA-disabled build against the supported LLVM 22 installation
 passes all four applicable adapter, plan, IR, and ABI tests.
 
-The JIT activator additionally compiled and linked FlashInfer 0.6.12's real
-three-source custom batch-decode extension in an isolated NTA cache. This is a
-compiler-delivery smoke test. The custom variant did not contain an acquisition
-site, so optimized FlashInfer continuation remains an open gate.
+The JIT activator compiles and links FlashInfer 0.6.12's real multi-source
+custom decode and paged-prefill extensions in an isolated NTA cache. The
+version-checked overlay places acquisition sites at their global kernel entry
+wrappers, and the execution gate exercises resident and deferred continuation
+through those optimized kernels.
 
 ## Sanitizers And Resources
 
@@ -151,8 +154,24 @@ flashinfer_version=0.6.12 requests=7 physical_pages=23
 max_abs_error=2.71425e-05 mean_abs_error=3.2057e-06 matched=1
 ```
 
-This validates layout and numerical-state compatibility. It does not execute
-NTA deferral inside FlashInfer's optimized CTA.
+The optimized-kernel gate additionally executes NTA in FlashInfer 0.6.12:
+
+```text
+resident decode: pass
+pinned-host deferred decode: Pending -> Ready -> Done, max error 0
+shared KV-head CTAs: 2
+split-K decode work items: 32, max error 0
+FA2 paged-prefill work items: 4, max error 0
+```
+
+The matched custom-variant microbenchmark uses 64 requests and 2000 iterations
+per alternating sample. The latest local median measured 11.980 us without NTA
+fields and 12.739 us with the resident hook, a 6.33% cost. CTest fails above 8%.
+Clocks are not fixed, so this is a local regression gate rather than a
+paper-quality result.
+
+Compute Sanitizer on the two-head deferred path reports memcheck 0 errors,
+racecheck 0 hazards, and synccheck 0 errors.
 
 One latest-code 8-request, 60-page, five-iteration mechanism sample was:
 
@@ -197,7 +216,6 @@ Latest-code NVMe evidence therefore remains open.
 
 ## Open Production And Paper Gates
 
-- NTA deferral inside optimized production prefill and decode CTAs;
 - vLLM and SGLang lifecycle, KV-manager, cancellation, and CUDA-graph adapters;
 - TTFT, TPOT, p50/p99, SLO attainment, serving goodput, CPU use, and SM tax;
 - direct-path comparison against untouched production kernels with controlled

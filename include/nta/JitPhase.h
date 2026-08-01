@@ -1,49 +1,42 @@
 #pragma once
 
-#include "nta/RuntimeABI.h"
+#include "nta/FinitePhase.h"
 
-#include <cuda.h>
+#include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <memory>
+#include <string_view>
 
 namespace nta {
 
-struct HostPhaseConfig {
-  std::uint32_t objectCount;
-  std::uint32_t continuationCount;
-  std::uint32_t progressBlocks;
-  std::uint32_t progressPasses = 1;
-};
-
-struct NvmePhaseConfig {
-  std::uint32_t objectCount;
-  std::uint32_t continuationCount;
-  std::uint32_t progressPasses;
-  std::uint32_t issueBudget = 32;
-  std::uint32_t completionBudget = 32;
-};
-
-// Non-owning launcher for the finite acquisition phases linked into an
-// instrumented cubin. It can enqueue into an ordinary stream or an existing
-// CUDA graph capture; the caller retains ownership of the module and stream.
-class FinitePhaseProgram {
+// Owning host adapter for phase launchers exported by an instrumented JIT
+// shared object. Loading the same object as the kernel framework is safe:
+// dlopen retains the existing mapping and this class holds one reference.
+class JitPhaseProgram {
 public:
-  explicit FinitePhaseProgram(CUmodule module);
+  explicit JitPhaseProgram(std::string_view sharedObject);
+  ~JitPhaseProgram();
 
-  void reset(CUstream stream, abi::RuntimeView *runtime,
+  JitPhaseProgram(const JitPhaseProgram &) = delete;
+  JitPhaseProgram &operator=(const JitPhaseProgram &) = delete;
+  JitPhaseProgram(JitPhaseProgram &&) noexcept;
+  JitPhaseProgram &operator=(JitPhaseProgram &&) noexcept;
+
+  void reset(cudaStream_t stream, abi::RuntimeView *runtime,
              std::uint32_t objectCount, std::uint32_t continuationCount) const;
-  void progressHost(CUstream stream, abi::RuntimeView *runtime,
+  void progressHost(cudaStream_t stream, abi::RuntimeView *runtime,
                     std::uint32_t blocks) const;
-  void progressNvme(CUstream stream, abi::RuntimeView *runtime,
+  void progressNvme(cudaStream_t stream, abi::RuntimeView *runtime,
                     std::uint32_t issueBudget,
                     std::uint32_t completionBudget) const;
-  void publish(CUstream stream, abi::RuntimeView *runtime,
+  void publish(cudaStream_t stream, abi::RuntimeView *runtime,
                std::uint32_t pendingBudget) const;
-  void complete(CUstream stream, abi::RuntimeView *runtime,
+  void complete(cudaStream_t stream, abi::RuntimeView *runtime,
                 std::uint32_t continuationCount) const;
 
   template <typename Initial, typename Ready>
-  void enqueueHost(CUstream stream, abi::RuntimeView *runtime,
+  void enqueueHost(cudaStream_t stream, abi::RuntimeView *runtime,
                    const HostPhaseConfig &config, Initial &&initial,
                    Ready &&ready) const {
     reset(stream, runtime, config.objectCount, config.continuationCount);
@@ -58,7 +51,7 @@ public:
   }
 
   template <typename Initial, typename Ready>
-  void enqueueNvme(CUstream stream, abi::RuntimeView *runtime,
+  void enqueueNvme(cudaStream_t stream, abi::RuntimeView *runtime,
                    const NvmePhaseConfig &config, Initial &&initial,
                    Ready &&ready) const {
     reset(stream, runtime, config.objectCount, config.continuationCount);
@@ -74,11 +67,8 @@ public:
   }
 
 private:
-  CUfunction reset_ = nullptr;
-  CUfunction progressHost_ = nullptr;
-  CUfunction progressNvme_ = nullptr;
-  CUfunction publish_ = nullptr;
-  CUfunction complete_ = nullptr;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 } // namespace nta

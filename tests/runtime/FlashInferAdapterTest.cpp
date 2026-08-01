@@ -9,6 +9,7 @@
 namespace {
 
 using nta::flashinfer::DecodeBatchView;
+using nta::flashinfer::DecodeScheduleView;
 using nta::flashinfer::PageBinding;
 using nta::flashinfer::RequestBinding;
 
@@ -62,6 +63,22 @@ int main() {
   ok &= grouped.chunks[0].continuation == 0 &&
         grouped.chunks[1].continuation == 0 &&
         grouped.chunks[2].continuation == 1;
+
+  const std::vector<std::int32_t> scheduledRequests{0, 1};
+  const std::vector<std::int32_t> scheduledTiles{0, 0};
+  const auto scheduled = nta::flashinfer::planScheduledDecode(
+      view, DecodeScheduleView{scheduledRequests, scheduledTiles, 32});
+  ok &= scheduled.work.workItems.size() == 2 &&
+        scheduled.work.workItems[0].dependencyCount == 2;
+  const std::vector<std::int32_t> wrongScheduledRequests{1, 0};
+  ok &= rejects([&] {
+    (void)nta::flashinfer::planScheduledDecode(
+        view, DecodeScheduleView{wrongScheduledRequests, scheduledTiles, 32});
+  });
+  ok &= rejects([&] {
+    (void)nta::flashinfer::planScheduledDecode(
+        view, DecodeScheduleView{scheduledRequests, scheduledTiles, 17});
+  });
 
   std::vector<std::int32_t> badIndptr = indptr;
   badIndptr[1] = 4;

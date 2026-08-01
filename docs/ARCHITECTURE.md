@@ -8,9 +8,9 @@ in this document take precedence over the previous prototype's design notes.
 
 Implementation status (2026-07-31): M0-M4 have a working vertical slice tested
 on an NVIDIA RTX PRO 6000 Blackwell Server Edition. M5 has a numerically checked
-split-K paged-attention mechanism workload plus a public-CSR/attention-state
-compatibility layer differentially checked against FlashInfer 0.6.12, not a
-serving-framework result. M6
+split-K paged-attention mechanism workload and version-checked JIT hooks
+executed in FlashInfer 0.6.12 decode and FA2 paged-prefill kernels. This is not
+yet a serving-framework result. M6
 has real TMA descriptor selection and hardware TMA after direct or externally
 staged acquisition; automatic production-IR recognition remains open. A KIOXIA
 CD8P NVMe controller has DMAed directly into CUDA HBM registered through
@@ -858,8 +858,9 @@ continuations, and a CPU numerical reference. Work formation consumes
 FlashInfer's public paged-KV CSR representation, reduction uses FlashInfer's
 base-2 `(V, LSE)` state implementation when its headers are available, and a
 real FlashInfer decode wrapper is a differential correctness gate. NTA deferral
-is not yet inside FlashInfer's optimized CTA, nor is it wired into SGLang/vLLM
-request lifecycle and KV management; therefore there is no TTFT/TPOT/SLO claim.
+also executes in version-checked FlashInfer 0.6.12 decode and FA2 paged-prefill
+JIT kernels. It is not wired into SGLang/vLLM request lifecycle and KV
+management; therefore there is no TTFT/TPOT/SLO claim.
 
 The ABI-v9 dependency-set workload separately acquires up to 32 mixed-tier
 objects per CTA, supports cancellation, stale generations, stale object
