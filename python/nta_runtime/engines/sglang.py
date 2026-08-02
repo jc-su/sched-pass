@@ -462,21 +462,18 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._active_batch = None
             return
 
-        bindings = self._bind_forward_requests(
-            forward_batch, allow_capture_ids=in_capture
-        )
         counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
         if pending is None:
-            self._active_batch = _ActiveBatch(bindings, {}, None, {}, {}, {}, ())
+            self._active_batch = None
         else:
             if not self._pipeline_host or not pending.prefetched_layers:
                 raise RuntimeError(
                     "CUDA graph replay requires the stream-ordered HiCache pipeline"
                 )
             self._active_batch = _ActiveBatch(
-                bindings,
+                (),
                 {},
                 pending,
                 {},
@@ -585,21 +582,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._active_opportunity_batch = self._opportunity_batch
             self._opportunity_batch += 1
         metadata_started = time.perf_counter_ns() if self._profile_cpu else 0
-        request_ids = forward_batch.rids
-        if request_ids is None:
-            raise RuntimeError("SGLang did not publish request IDs to NTA")
-        # NTA owns compact batch-local request slots. Engine allocator slots
-        # are intentionally volatile and would force identical CTA plans to
-        # be rebuilt whenever SGLang recycles its request pool.
-        bind_started = time.perf_counter_ns() if self._profile_cpu else 0
-        if bindings is None:
-            bindings = self._bind_forward_requests(
-                forward_batch, allow_capture_ids=False
-            )
-        if self._profile_cpu and count_batch:
-            self._stats["request_bind_cpu_ns"] = self._stats.get(
-                "request_bind_cpu_ns", 0
-            ) + (time.perf_counter_ns() - bind_started)
         if forward_batch.forward_mode.is_decode_or_idle():
             wrappers = self.forward_metadata.decode_wrappers
             extractor = decode_schedule
@@ -612,7 +594,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             if not pending.prefetched_layers:
                 raise RuntimeError("HiCache producer did not publish prefetched layers")
             self._active_batch = _ActiveBatch(
-                bindings,
+                (),
                 {},
                 pending,
                 {},
@@ -628,6 +610,22 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._stats["batches"] += 1
                 self._stats["hicache_claimed_batches"] += 1
             return None
+
+        request_ids = forward_batch.rids
+        if request_ids is None:
+            raise RuntimeError("SGLang did not publish request IDs to NTA")
+        # NTA owns compact batch-local request slots. Engine allocator slots
+        # are intentionally volatile and would force identical CTA plans to
+        # be rebuilt whenever SGLang recycles its request pool.
+        bind_started = time.perf_counter_ns() if self._profile_cpu else 0
+        if bindings is None:
+            bindings = self._bind_forward_requests(
+                forward_batch, allow_capture_ids=False
+            )
+        if self._profile_cpu and count_batch:
+            self._stats["request_bind_cpu_ns"] = self._stats.get(
+                "request_bind_cpu_ns", 0
+            ) + (time.perf_counter_ns() - bind_started)
 
         schedules: dict[int, Schedule] = {}
         for wrapper in wrappers:

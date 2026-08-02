@@ -122,10 +122,11 @@ workloads:
   back to the original FlashInfer request/tile schedule while the launch is
   stream-ordered;
 - an installed SGLang 0.5.14 plugin backend that binds real request IDs,
-  generations, and priorities, overlaps HiCache's tuned layer copies with model
-  execution, retains stock FlashInfer after acquisition, routes only unresolved
-  multi-round work through request-guarded instrumented FlashInfer, mirrors
-  request aborts, keys plan reuse by exact host/device page pairs, and fails
+  generations, and priorities for unresolved demand, overlaps HiCache's tuned
+  layer copies with model execution, retains stock FlashInfer after acquisition,
+  routes only unresolved multi-round work through guarded instrumented
+  FlashInfer, mirrors request aborts, keys plan reuse by exact host/device page
+  pairs, and fails
   closed on claimed-batch planning errors unless availability-only fallback is
   explicitly enabled.
 - a hard capacity and high-water telemetry for HBM staging allocations owned by

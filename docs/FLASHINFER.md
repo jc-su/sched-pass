@@ -246,10 +246,10 @@ evidence.
 
 The matched SGLang 0.5.14 environment completes both a stock smoke workload
 and an NTA HiCache workload through the installed `sglang.srt.plugins` entry
-point. The plugin registers `nta_flashinfer`, binds request slot generations,
-intercepts HiCache loads, and routes external paged-KV batches through the
-stock wrappers after acquisition. Only unresolved incremental batches use the
-instrumented wrappers.
+point. The plugin registers `nta_flashinfer`, intercepts HiCache loads, and
+routes external paged-KV batches through the stock
+wrappers after acquisition. Only unresolved incremental batches use the
+instrumented wrappers and publish request slot generations to NTA.
 
 ```bash
 ./benchmarks/serving/SglangSmoke.py \

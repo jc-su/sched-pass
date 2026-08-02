@@ -30,22 +30,25 @@ constructs its padded decode-graph replay view. The patch is version-pinned and
 fails closed if upstream metadata no longer matches the validated structure;
 synthetic padding slots receive distinct non-user request IDs.
 
-The adapter binds `ForwardBatch.rids` to compact engine-neutral request slots
-with monotonically changing generations. At SGLang's HiCache producer point,
-the default path enqueues each layer's existing tuned indexed-copy kernel on a
-dedicated finite CUDA stream and records a preallocated data-available event. The
-consumer stream waits only for the layer it is about to use. The
-unchanged stock FlashInfer kernel then consumes that layer. Request binding is
-retained for lifecycle accounting and for incremental batches, where the
-compiler-instrumented CTA checks the bound generation before attention.
+Before unresolved demand planning, the adapter binds `ForwardBatch.rids` to
+compact engine-neutral request slots with monotonically changing generations.
+The preacquired stock path has no NTA work ticket or CTA hook and therefore does
+not publish unused bindings. At SGLang's HiCache producer point, that path
+enqueues each layer's existing tuned indexed-copy kernel on a dedicated finite
+CUDA stream and records a preallocated data-available event. The consumer stream
+waits only for the layer it is about to use, then unchanged stock FlashInfer
+consumes that layer.
 
 ```text
 SGLang request and HiCache page map
   -> early layer-wise indexed copy on a finite CUDA stream
   -> preallocated per-layer data-available event
-  -> compact request slot/generation binding
-  -> stock FlashInfer after acquisition, or ABI-20 guarded incremental CTAs
+  -> stock FlashInfer after acquisition
   -> SGLang-owned output tensor and HiCache completion
+
+Unresolved demand
+  -> compact request slot/generation binding
+  -> ABI-20 guarded incremental CTAs
 ```
 
 This preacquired path allocates no per-batch `WorkItem` array, publishes no
@@ -140,12 +143,11 @@ engine = sglang.Engine(
 ```
 
 Structural graph planning delegates to SGLang and FlashInfer before capture.
-Replay binds the current padded request IDs/generations and invokes the real
-stock FA2 wrapper. A pending HiCache transfer is ordered before graph replay;
-CUDA stream-capture isolation forbids capturing a wait on uncaptured
-producer-stream work. Eager prefill retains per-layer copy/compute overlap. The
-demand-mode reset/progress/runnable loop is not yet embedded in SGLang's replay
-graph.
+Replay invokes the real stock FA2 wrapper without publishing unused NTA request
+bindings. A pending HiCache transfer is ordered before graph replay; CUDA
+stream-capture isolation forbids capturing a wait on uncaptured producer-stream
+work. Eager prefill retains per-layer copy/compute overlap. The demand-mode
+reset/progress/runnable loop is not yet embedded in SGLang's replay graph.
 
 `NTA_ENGINE_STATS_FILE=/path/report.json` enables per-process statistics. Demand
 mode already synchronizes once per layer to enforce its terminal epoch result.
