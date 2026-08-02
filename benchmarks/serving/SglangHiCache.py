@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Measure repeated CPU-DRAM KV promotion through SGLang HiCache."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import os
+import pathlib
+import shutil
+import statistics
+import subprocess
+import time
+from typing import Any
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def git_value(*arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--attention-backend",
+        choices=("flashinfer", "nta_flashinfer"),
+        required=True,
+    )
+    parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        help="fail unless this many attempts yield the requested promotions",
+    )
+    parser.add_argument("--hot-tokens", type=int, default=160)
+    parser.add_argument("--churn-tokens", type=int, default=240)
+    parser.add_argument("--resident-tokens", type=int, default=0)
+    parser.add_argument("--max-total-tokens", type=int, default=320)
+    parser.add_argument("--context-length", type=int, default=512)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.35)
+    parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--cuda-graph-decode",
+        choices=("disabled", "full"),
+        default="disabled",
+    )
+    args = parser.parse_args()
+    if not args.model.is_dir():
+        parser.error(f"model directory does not exist: {args.model}")
+    if (
+        min(
+            args.iterations,
+            args.hot_tokens,
+            args.churn_tokens,
+            args.max_total_tokens,
+            args.context_length,
+        )
+        <= 0
+    ):
+        parser.error("token counts and iterations must be positive")
+    if args.resident_tokens < 0:
+        parser.error("resident token count cannot be negative")
+    if args.max_attempts is None:
+        args.max_attempts = 4 * args.iterations
+    if args.max_attempts < args.iterations:
+        parser.error("max attempts must be at least the requested iterations")
+    if args.hot_tokens + args.churn_tokens <= args.max_total_tokens:
+        parser.error("hot and churn prompts must exceed the device token pool together")
+    return args
+
+
+def configure_environment(args: argparse.Namespace) -> pathlib.Path:
+    host_cxx = next(
+        (shutil.which(name) for name in ("g++-14", "g++-13", "g++-12")), None
+    )
+    if host_cxx is None:
+        raise RuntimeError("CUDA-compatible host compiler not found")
+    launcher = pathlib.Path(
+        os.environ.get(
+            "FLASHINFER_NVCC", ROOT / "tools" / "flashinfer" / "nvcc_compat.py"
+        )
+    ).resolve()
+    workspace = pathlib.Path(
+        os.environ.get("FLASHINFER_WORKSPACE_BASE", args.flashinfer_workspace_base)
+    ).resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+    for stale in workspace.glob("nta-engine.*.json"):
+        stale.unlink()
+    os.environ.update(
+        {
+            "CC": host_cxx,
+            "CXX": host_cxx,
+            "CUDAHOSTCXX": host_cxx,
+            "NTA_NVCC_HOST_COMPILER": host_cxx,
+            "FLASHINFER_NVCC": str(launcher),
+            "FLASHINFER_WORKSPACE_BASE": str(workspace),
+            "NTA_ENGINE_STATS_FILE": str(workspace / "nta-engine.json"),
+            "NTA_REVISION": os.environ.get(
+                "NTA_REVISION", git_value("rev-parse", "HEAD")
+            ),
+        }
+    )
+    return workspace
+
+
+def make_prompt(tokenizer: Any, label: str, token_count: int) -> str:
+    seed = f"{label}: finite GPU kernels acquire cache pages by request identity. "
+    text = seed
+    while len(tokenizer.encode(text, add_special_tokens=False)) < token_count:
+        text += seed
+    ids = tokenizer.encode(text, add_special_tokens=False)[:token_count]
+    return tokenizer.decode(ids, skip_special_tokens=True)
+
+
+def generated_text(result: Any) -> str:
+    if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+        raise RuntimeError("SGLang returned an invalid generation result")
+    return result["text"]
+
+
+def generation_results(result: Any) -> list[dict[str, Any]]:
+    values = result if isinstance(result, list) else [result]
+    for value in values:
+        generated_text(value)
+    return values
+
+
+def host_cached_tokens(result: dict[str, Any]) -> int:
+    details = result.get("meta_info", {}).get("cached_tokens_details", {})
+    return int(details.get("host", 0))
+
+
+def main() -> int:
+    args = parse_args()
+    workspace = configure_environment(args)
+    import sglang as sgl
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()))
+    hot = make_prompt(tokenizer, "hot-prefix", args.hot_tokens)
+    churn = [
+        make_prompt(tokenizer, f"eviction-{attempt}", args.churn_tokens)
+        for attempt in range(args.max_attempts + 1)
+    ]
+    resident = (
+        [
+            make_prompt(tokenizer, f"resident-{attempt}", args.resident_tokens)
+            for attempt in range(args.max_attempts)
+        ]
+        if args.resident_tokens
+        else []
+    )
+    sampling = {"temperature": 0, "max_new_tokens": 1}
+    load_started = time.perf_counter()
+    with sgl.Engine(
+        model_path=str(args.model.resolve()),
+        attention_backend=args.attention_backend,
+        dtype="float16",
+        mem_fraction_static=args.mem_fraction_static,
+        context_length=args.context_length,
+        max_total_tokens=args.max_total_tokens,
+        max_running_requests=8,
+        cuda_graph_backend_decode=args.cuda_graph_decode,
+        cuda_graph_backend_prefill="disabled",
+        chunked_prefill_size=args.context_length,
+        enable_hierarchical_cache=True,
+        hicache_ratio=2.0,
+        hicache_write_policy="write_through",
+        hicache_io_backend="kernel",
+        hicache_mem_layout="page_first",
+    ) as engine:
+        load_seconds = time.perf_counter() - load_started
+        generated_text(engine.generate(hot, sampling))
+        generated_text(engine.generate(churn[0], sampling))
+        samples: list[float] = []
+        metadata: list[Any] = []
+        attempt_seconds: list[float] = []
+        attempt_metadata: list[Any] = []
+        external_attempt_indices: list[int] = []
+        generated_samples: list[list[str]] = []
+        digest = hashlib.sha256()
+        for attempt in range(args.max_attempts):
+            started = time.perf_counter()
+            prompts = [hot, resident[attempt]] if resident else hot
+            result = engine.generate(prompts, sampling)
+            elapsed = time.perf_counter() - started
+            values = generation_results(result)
+            texts = [generated_text(value) for value in values]
+            result_metadata = [value.get("meta_info", {}) for value in values]
+            attempt_seconds.append(elapsed)
+            attempt_metadata.append(result_metadata)
+            if host_cached_tokens(values[0]) > 0:
+                samples.append(elapsed)
+                metadata.append(result_metadata)
+                external_attempt_indices.append(attempt)
+                generated_samples.append(texts)
+                for text in texts:
+                    digest.update(text.encode("utf-8"))
+                    digest.update(b"\0")
+            generated_text(engine.generate(churn[attempt + 1], sampling))
+            if len(samples) == args.iterations:
+                break
+        if len(samples) != args.iterations:
+            raise RuntimeError(
+                f"only {len(samples)} of {args.max_attempts} attempts loaded the "
+                f"hot prefix from host memory; requested {args.iterations}"
+            )
+
+    stats = []
+    for path in sorted(workspace.glob("nta-engine.*.json")):
+        stats.append(json.loads(path.read_text(encoding="utf-8")))
+    median = statistics.median(samples)
+    hot_request_seconds = [
+        float(values[0]["e2e_latency"])
+        for values in metadata
+        if values and isinstance(values[0].get("e2e_latency"), (int, float))
+    ]
+    peer_request_seconds = [
+        float(values[1]["e2e_latency"])
+        for values in metadata
+        if len(values) > 1
+        and isinstance(values[1].get("e2e_latency"), (int, float))
+    ]
+    peer_delay_seconds = [
+        max(0.0, peer - hot)
+        for hot, peer in zip(hot_request_seconds, peer_request_seconds)
+    ]
+    report = {
+        "schema": 1,
+        "classification": "sglang-hicache-promotion",
+        "revision": os.environ["NTA_REVISION"],
+        "dirty": bool(git_value("status", "--porcelain")),
+        "engine": "sglang",
+        "engine_version": importlib.metadata.version("sglang"),
+        "flashinfer_version": importlib.metadata.version("flashinfer-python"),
+        "attention_backend": args.attention_backend,
+        "cuda_graph_decode": args.cuda_graph_decode,
+        "model": str(args.model.resolve()),
+        "hot_tokens": args.hot_tokens,
+        "churn_tokens": args.churn_tokens,
+        "resident_tokens": args.resident_tokens,
+        "batch_width": 2 if resident else 1,
+        "max_total_tokens": args.max_total_tokens,
+        "iterations": args.iterations,
+        "attempts": len(attempt_seconds),
+        "max_attempts": args.max_attempts,
+        "external_attempt_indices": external_attempt_indices,
+        "load_seconds": load_seconds,
+        "promotion_seconds_samples": samples,
+        "attempt_seconds_samples": attempt_seconds,
+        "median_promotion_seconds": median,
+        "promotions_per_second": 1.0 / median,
+        "completed_requests_per_second": (2 if resident else 1) / median,
+        "generated_text_sha256": digest.hexdigest(),
+        "generated_text_samples": generated_samples,
+        "result_metadata": metadata,
+        "attempt_metadata": attempt_metadata,
+        "engine_stats": stats,
+    }
+    if len(hot_request_seconds) == len(samples):
+        report["hot_request_seconds_samples"] = hot_request_seconds
+        report["median_hot_request_seconds"] = statistics.median(
+            hot_request_seconds
+        )
+    if len(peer_request_seconds) == len(samples):
+        report["peer_request_seconds_samples"] = peer_request_seconds
+        report["peer_delay_seconds_samples"] = peer_delay_seconds
+        report["median_peer_request_seconds"] = statistics.median(
+            peer_request_seconds
+        )
+        report["median_peer_delay_seconds"] = statistics.median(
+            peer_delay_seconds
+        )
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

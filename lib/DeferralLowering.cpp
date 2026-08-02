@@ -1,4 +1,4 @@
-#include "ContinuationLoweringInternal.h"
+#include "DeferralLoweringInternal.h"
 
 #include "nta/AcquireIR.h"
 #include "nta/RuntimeABI.h"
@@ -26,7 +26,7 @@ bool lowerDeferrals(Module &module, const FunctionPlan &plan) {
     CallInst *marker = site.marker;
     CallInst *binding = site.binding;
     Value *runtime = marker->getArgOperand(ir::DeferRuntime);
-    Value *continuation = marker->getArgOperand(ir::DeferContinuation);
+    Value *workTicket = marker->getArgOperand(ir::DeferWorkTicket);
     Value *requestSlot = binding->getArgOperand(ir::RequestSlot);
     Value *generation = binding->getArgOperand(ir::RequestGeneration);
 
@@ -36,7 +36,7 @@ bool lowerDeferrals(Module &module, const FunctionPlan &plan) {
     IRBuilder<> builder(marker);
     builder.SetCurrentDebugLocation(marker->getDebugLoc());
     CallInst *lowered = builder.CreateCall(
-        defer, {runtime, requestSlot, generation, continuation});
+        defer, {runtime, requestSlot, generation, workTicket});
     Metadata *fields[] = {
         MDString::get(context, "request-bound"),
         ConstantAsMetadata::get(ConstantInt::get(i32, abi::Version)),

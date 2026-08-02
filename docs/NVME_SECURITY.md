@@ -1,117 +1,123 @@
 # NVMe Security And Lifecycle Contract
 
-Status: trusted single-host mechanism, not a multi-tenant device API
+Status: dedicated-controller, trusted-process mechanism; not a multi-tenant API
 
-The GPU submits NVMe commands and rings an MMIO doorbell without a CPU proxy.
-That removes the point at which a kernel driver could validate each command.
-The interface is consequently restricted to `CAP_SYS_RAWIO` callers and is not
-a security boundary between mutually untrusted processes, containers, tenants,
-or GPUs.
+The only backend is VFIO PCI cdev ownership attached to a private IOMMUFD
+IO address space. The GPU writes NVMe SQ entries and doorbells without a CPU
+proxy, so no software component can validate a command after publication. The
+design always requires DMA containment and makes media containment a deployment
+policy. `RequireHardwareWriteProtection` is the default and fails closed when
+NVMe feature `0x84` is absent. `TrustReadOnlyDeviceCode` explicitly accepts that
+the compiler-generated device path is the media-safety boundary. It does not add
+a CPU broker or per-command proxy.
 
-## Enforced Probe Preconditions
+## Enforced VFIO Preconditions
 
-The driver refuses to bind unless all of these conditions hold:
+`vfio:DDDD:BB:SS.F` construction requires all of the following:
 
-- host and controller pages are 4 KiB, so the mapping beginning at BAR offset
-  `0x1000` cannot include controller registers before or after the doorbell
-  page;
-- the controller is in a translated DMA or DMA-FQ IOMMU domain;
-- the controller is the only device in its IOMMU group;
-- the configured namespace exists, uses no metadata or protection information,
-  and supports the PRP transfer contract; and
-- the controller supports basic namespace write protection, and a read-back of
-  feature `0x84` confirms that every active namespace entered that state.
+- the PCI function is bound to `vfio-pci` and exposes a VFIO cdev;
+- `/dev/iommu` accepts a new IOAS and the device attaches to it;
+- the function is alone in its IOMMU group and unsafe no-IOMMU mode is off;
+- function reset and readable, writable, mmap-capable BAR0/config regions work;
+- host and controller pages are 4 KiB;
+- controller registers and the doorbell page are separate one-page VMAs;
+- CAP advertises the NVM command set and the requested queue depth;
+- the namespace has no metadata or protection information and fits the PRP
+  contract; and
+- either feature `0x84` read-back confirms basic write protection for every
+  active namespace, or the caller explicitly selects trusted READ-only device
+  code before an I/O SQ is exposed.
 
-The IOMMU prevents arbitrary physical-memory DMA. Protecting every active
-namespace prevents an I/O submission queue command from selecting another NSID
-and modifying media. Neither property
-turns a raw queue into an untrusted API: a malicious privileged caller can still
-target an IOVA currently mapped in this device's domain, corrupt its own queue,
-or ring another queue's doorbell in the same 4 KiB page.
+IOMMUFD maps admin queues, I/O queues, PRP arenas, and destination buffers with
+read and write permissions because a raw SQ does not reveal DMA direction to
+the host runtime. IOVAs exist only in the transport's private IOAS. This blocks
+DMA into unrelated host physical memory; it does not make arbitrary commands
+inside that IOAS safe.
 
-Use VFIO/IOMMUFD plus a dedicated IOMMU address space when untrusted userspace
-device ownership is required. Even then, opcode/media safety needs hardware
-write protection or a validating command mediator; IOMMU isolation alone does
-not validate NVMe commands.
+Hardware protection prevents media writes even if a malformed SQE selects a
+different NSID. Under the trusted-code policy, the generated transport hardcodes
+opcode `0x02` and the configured NSID; corruption or arbitrary device code can
+still issue destructive commands. Both policies assume a trusted serving
+process with exclusive controller ownership. Neither protects queue state or
+controller availability from that process.
+
+## NVIDIA BAR Compatibility Gate
+
+A CPU BAR mapping is not evidence that an NVIDIA GPU can use the same VMA. The
+runtime registers exactly the one-page doorbell VMA using
+`CU_MEMHOSTREGISTER_IOMEMORY`, obtains its GPU address, JITs a one-thread probe,
+places a valid READ in the I/O SQ, and requires a GPU MMIO SQ-doorbell store to
+produce a phase-correct, successful NVMe CQE. Transport construction fails on a
+timeout, CID mismatch, or NVMe status error. Kernel completion by itself is not
+accepted as evidence that the PCIe transaction reached the controller.
+
+This gate tests the exact VFIO BAR VMA, CUDA device ordinal, NVIDIA driver, and
+GPU combination used by the workload. It must be rerun for each qualified
+platform and driver release.
+
+The control plane also performs one CPU-issued READ before publishing the queue
+to validate queue creation and IOMMU DMA independently. Both reads are bounded
+bootstrap qualification operations into private scratch pages. They are not
+application I/O and occur before the finite workload data path starts.
 
 ## Queue And Mapping Ownership
 
-Each successful `open()` allocates one SQ/CQ pair, PRP-list arena, command
-context array, mapping table, queue ID, and generation. Up to
-`max_io_queues` mutually trusted GPU runtimes can coexist. Queue and doorbell
-VMAs hold references after file close, so coherent memory and PCI resources are
-not freed while a CUDA or inherited mapping remains live.
+The CPU bootstrap exclusively owns controller reset, admin SQ/CQ operation,
+Identify, optional namespace protection, queue negotiation, queue creation, and
+the two qualification reads above. Once the I/O queue is published, application
+CTAs may submit one bounded READ and finite progress CTAs submit fallback work
+and consume completions. CPU code does not submit application I/O or poll
+application completions.
 
-The first queue page contains state and generation. GPU progress checks it
-before consuming or publishing queue work and immediately fails outstanding
-continuations if the driver reports fatal, removed, or stale state. The page is
-an availability signal, not a security primitive; bus-master disable and IOMMU
-translation provide containment after a fatal event.
+Queue memory is published through the engine-neutral `NvmeQueueView` device
+ABI. The compiler and device transport depend on that bounded queue view, not
+on VFIO administration details.
 
-The runtime records one CUDA device ordinal for every transport, host runtime,
-and reusable work plan. CUDA operations switch to that owner and restore the
-caller's previous device. Separate GPUs obtain separate NVMe queues by opening
-the device independently. This is multi-GPU ownership support, not multi-tenant
-isolation, and real multi-GPU doorbell routing still requires platform
-qualification.
+Releasing any destination first synchronizes the owning CUDA device, marks the
+GPU queue inactive, deletes the I/O SQ/CQ, and only then unmaps its IOVA. If
+queue deletion or an admin command fails, bus mastering is cleared and VFIO
+function reset is used before mappings are released. This whole-queue quiesce
+is intentional: there is no trusted CPU command ledger that can prove a
+mapping is absent from already-published GPU SQ entries.
 
-## DMA-BUF And Host Memory
+## SPDK Boundary
 
-All mappings use `DMA_BIDIRECTIONAL`; the raw queue cannot determine a command's
-direction after the GPU writes it.
+SPDK is a useful correctness and performance baseline for userspace NVMe
+initialization. It is not linked into this backend. SPDK's public NVMe qpair API
+owns queue trackers, submission, completion, and doorbell bookkeeping on the
+CPU; it does not provide a stable transfer of raw SQ/CQ/doorbell ownership to a
+GPU. Integrating below that API would depend on private SPDK internals and leave
+two queue owners.
 
-DMA-BUF import uses a static attachment. Mapping pins the backing storage and
-waits the exporter's reservation fences. The importer adds a write-usage fence
-for the full queue-visible lifetime, deletes the SQ before signaling that
-fence, then unmaps and detaches. There is no dynamic `move_notify` path and no
-stale scatter-gather mapping to rebuild.
-
-`allow_peer2peer` is not enabled. Direct NVMe DMA into CUDA HBM is therefore
-disabled by the runtime until a platform-specific, validated P2P path exists.
-The supported contained destination is long-term pinned, mapped CPU DRAM. This
-avoids treating a successful DMA-BUF export as proof of a safe GPU/NVMe PCIe
-route. See the Linux [DMA-BUF](https://docs.kernel.org/driver-api/dma-buf.html)
-and [P2PDMA](https://docs.kernel.org/driver-api/pci/p2pdma.html) contracts.
-
-Mapping release quiesces the complete queue. This is intentional: without a
-CPU-visible command ledger, the driver cannot prove that one arbitrary mapping
-is absent from already-published SQ entries.
-
-## Failure And Device Lifecycle
-
-An admin timeout or CID mismatch poisons every open queue, advances generation,
-and disables PCI bus mastering. Recovery is attempted only after all queue and
-VMA references close; it performs a PCI function reset, controller
-reinitialization, namespace re-identification, write-protect verification, and
-queue-count negotiation.
-
-PCI AER/reset callbacks poison active queues and recover only with no live
-owners. Suspend is rejected while queues or VMAs exist. Shutdown and removal
-mark queue controls before teardown; removal waits for all mapped references.
-The namespace is re-identified and write protection is revalidated before the
-first queue in each open epoch.
+The implementation instead contains the narrow administration path required
+for exclusive GPU queue ownership: reset/enable, Identify, write protection,
+number-of-queues negotiation, and create/delete SQ/CQ. SPDK should be used as a
+matched CPU baseline and its traces should be compared against this bootstrap.
 
 ## Deliberate Limits
 
-- GPU code emits only READ SQEs, but the kernel cannot enforce that opcode per
-  command without moving submission through a CPU or hardware mediator.
-- Queue depth is 64. The controller negotiates one queue per open, up to 32.
-- Transfers use PRPs. One page of PRP entries per CID and MDTS bound every
-  transfer; NVMe SGLs are not implemented.
-- Metadata and protection information are rejected rather than silently
-  mishandled.
-- One configured namespace is exposed for reads per module instance; it is no
-  longer hardcoded to namespace 1. Every active namespace is write-protected
-  because the raw SQE still carries a caller-controlled NSID.
-- The exact 4 KiB doorbell page necessarily contains all queue doorbells.
-- Asynchronous namespace events are not consumed while queues are live. The
-  driver assumes exclusive ownership of a dedicated controller and validates
-  the namespace at epoch boundaries.
-- The implementation does not inherit the upstream NVMe driver's complete
-  controller quirk, power-management, and hotplug coverage.
+- Device code emits fixed READ SQEs. The default policy also requires namespace
+  hardware write protection; trusted-code mode deliberately relies on the
+  generated device path and is not a media-containment boundary.
+- VFIO currently exposes one depth-configurable I/O queue per transport and one
+  configured namespace for workload reads.
+- Transfers use PRPs, with one PRP-list page per CID; NVMe SGLs are not used.
+- Direct NVMe DMA into HBM remains disabled until GPU/NVMe P2P topology and
+  NVIDIA memory registration are separately validated.
+- The VFIO transport owns the complete PCI function. It does not share a
+  controller with the kernel NVMe driver or another process.
+- One transport is bound to one CUDA device ordinal. Multi-GPU qualification
+  requires a tested GPU/BAR route for every GPU. Scale-out uses one independently
+  owned controller function per GPU; shared-function brokerage is intentionally
+  outside this design. Success on one GPU is not inherited by another.
+- AER, surprise removal, suspend, and power-loss testing remain hardware gates.
+  VFIO reset contains teardown failures, but does not reproduce the upstream
+  NVMe driver's complete quirk and platform lifecycle coverage.
 
-These limits are paper and production gates, not hidden implementation claims.
-On the current host, the target SSD's IOMMU group type is `identity`, so the
-hardened preflight correctly refuses to bind it. Earlier HBM and mapped-DRAM
-measurements predate this contract and are retained only as historical
-mechanism evidence.
+Use `scripts/nta-vfio-device.sh preflight`, then on an otherwise unused test
+controller run `bind-and-probe`. The safe policy remains the default. On the
+KIOXIA CD8P, which reports `NWPC=0`, use
+`NTA_NVME_MEDIA_POLICY=trusted-read-only-code` only when the dedicated-device
+threat model is acceptable. On 2026-08-01 that policy passed CPU queue/DMA
+qualification, GPU SQ-doorbell-CQ qualification, and verified application READ
+workloads; teardown restored `nvmex` after testing.

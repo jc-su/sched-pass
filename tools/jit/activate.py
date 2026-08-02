@@ -15,6 +15,39 @@ import subprocess
 import sys
 
 
+def project_layout(
+    script: pathlib.Path, configured_root: str | None
+) -> tuple[pathlib.Path, pathlib.Path | None]:
+    if configured_root:
+        root = pathlib.Path(configured_root).expanduser().resolve()
+        prefix = (
+            root.parents[1]
+            if root.name == "nta" and root.parent.name == "share"
+            else None
+        )
+        return root, prefix
+    source_root = script.parents[2]
+    if (source_root / "include/nta/RuntimeABI.h").is_file():
+        return source_root, None
+    if script.parent.name == "bin":
+        prefix = script.parent.parent
+        root = prefix / "share" / "nta"
+        if (root / "include/nta/RuntimeABI.h").is_file():
+            return root, prefix
+    raise RuntimeError(
+        "cannot locate NTA headers; use --project-root or install the CMake "
+        "runtime and JIT artifacts together"
+    )
+
+
+def first_file(candidates: list[pathlib.Path], description: str) -> pathlib.Path:
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    rendered = ", ".join(str(candidate) for candidate in candidates)
+    raise RuntimeError(f"{description} not found; checked {rendered}")
+
+
 def fingerprint(paths: list[pathlib.Path]) -> str:
     digest = hashlib.sha256()
     for path in paths:
@@ -36,6 +69,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", default="build")
     parser.add_argument("--cache-root")
+    parser.add_argument("--project-root")
+    parser.add_argument("--plugin")
+    parser.add_argument("--runtime-library")
     parser.add_argument("--clang", default="/usr/bin/clang++-22")
     parser.add_argument("--cuda-path", default="/usr/local/cuda-12.9")
     parser.add_argument("--flashinfer-hook", action="store_true")
@@ -43,12 +79,40 @@ def main() -> int:
     parser.add_argument("command", nargs=argparse.REMAINDER)
     options = parser.parse_args()
 
-    root = pathlib.Path(__file__).resolve().parents[2]
-    build = (root / options.build_dir).resolve()
-    plugin = build / "libNtaPass.so"
+    script = pathlib.Path(__file__).resolve()
+    try:
+        root, prefix = project_layout(
+            script, options.project_root or os.environ.get("NTA_PROJECT_ROOT")
+        )
+    except RuntimeError as error:
+        parser.error(str(error))
+    build_value = pathlib.Path(options.build_dir).expanduser()
+    build = (build_value if build_value.is_absolute() else root / build_value).resolve()
+    plugin_candidates = []
+    configured_plugin = options.plugin or os.environ.get("NTA_PLUGIN")
+    if configured_plugin:
+        plugin_candidates.append(pathlib.Path(configured_plugin).expanduser())
+    plugin_candidates.append(build / "libNtaPass.so")
+    if prefix is not None:
+        plugin_candidates.append(prefix / "lib" / "nta" / "libNtaPass.so")
+    try:
+        plugin = first_file(plugin_candidates, "NTA pass plugin")
+    except RuntimeError as error:
+        parser.error(str(error))
     shim = root / "tools" / "jit" / "nvcc_clang.py"
-    if not plugin.is_file():
-        parser.error(f"pass plugin not found: {plugin}")
+    runtime_candidates = []
+    configured_runtime = options.runtime_library or os.environ.get(
+        "NTA_RUNTIME_LIBRARY"
+    )
+    if configured_runtime:
+        runtime_candidates.append(pathlib.Path(configured_runtime).expanduser())
+    runtime_candidates.append(build / "libnta-runtime.so")
+    if prefix is not None:
+        runtime_candidates.append(prefix / "lib" / "libnta-runtime.so")
+    try:
+        runtime_library = first_file(runtime_candidates, "NTA runtime library")
+    except RuntimeError as error:
+        parser.error(str(error))
     abi_header = root / "include/nta/RuntimeABI.h"
     abi_version = runtime_abi_version(abi_header)
     integration_inputs = [
@@ -75,16 +139,20 @@ def main() -> int:
         flashinfer_include = (
             pathlib.Path(spec.origin).resolve().parent / "data" / "include"
         )
-        integration_inputs.extend([
-            flashinfer_include / "flashinfer/attention/decode.cuh",
-            flashinfer_include / "flashinfer/attention/prefill.cuh",
-            root / "tools/flashinfer/prepare_overlay.py",
-        ])
+        integration_inputs.extend(
+            [
+                flashinfer_include / "flashinfer/attention/decode.cuh",
+                flashinfer_include / "flashinfer/attention/prefill.cuh",
+                root / "tools/flashinfer/prepare_overlay.py",
+            ]
+        )
     version_tag = f"-fi{flashinfer_version}" if flashinfer_version else ""
     tag = f"nta-abi{abi_version}{version_tag}-{fingerprint(integration_inputs)}"
     cache_root = pathlib.Path(
         options.cache_root
-        or os.environ.get("NTA_JIT_CACHE_ROOT", pathlib.Path.home() / ".cache/flashinfer")
+        or os.environ.get(
+            "NTA_JIT_CACHE_ROOT", pathlib.Path.home() / ".cache/flashinfer"
+        )
     ).expanduser()
     workspace = (cache_root / tag).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -98,8 +166,23 @@ def main() -> int:
         "NTA_JIT_CACHE_TAG": tag,
         "NTA_ABI_VERSION": str(abi_version),
         "NTA_BUILD_DIR": str(build),
+        "NTA_RUNTIME_LIBRARY": str(runtime_library),
         "PYTHONPATH": os.pathsep.join(
-            value for value in (str(root), os.environ.get("PYTHONPATH", "")) if value
+            value
+            for value in (
+                str(root / "python"),
+                str(root),
+                os.environ.get("PYTHONPATH", ""),
+            )
+            if value
+        ),
+        "LD_LIBRARY_PATH": os.pathsep.join(
+            value
+            for value in (
+                str(runtime_library.parent),
+                os.environ.get("LD_LIBRARY_PATH", ""),
+            )
+            if value
         ),
     }
     if options.flashinfer_hook:
@@ -114,18 +197,20 @@ def main() -> int:
             check=True,
             stdout=subprocess.DEVNULL,
         )
-        environment.update({
-            "NTA_FLASHINFER_HOOK": "1",
-            "NTA_FLASHINFER_OVERLAY": str(overlay),
-            "NTA_JIT_ONLY": os.environ.get(
-                "NTA_JIT_ONLY",
-                "batch_decode_kernel.cu,batch_prefill_paged_kernel_",
-            ),
-            "NTA_JIT_PHASE_SOURCE": os.environ.get(
-                "NTA_JIT_PHASE_SOURCE",
-                "batch_decode_kernel.cu,batch_prefill_paged_kernel_mask_0.cu",
-            ),
-        })
+        environment.update(
+            {
+                "NTA_FLASHINFER_HOOK": "1",
+                "NTA_FLASHINFER_OVERLAY": str(overlay),
+                "NTA_JIT_ONLY": os.environ.get(
+                    "NTA_JIT_ONLY",
+                    "batch_decode_kernel.cu,batch_prefill_paged_kernel_",
+                ),
+                "NTA_JIT_PHASE_SOURCE": os.environ.get(
+                    "NTA_JIT_PHASE_SOURCE",
+                    "batch_decode_kernel.cu,batch_prefill_paged_kernel_mask_0.cu",
+                ),
+            }
+        )
     if options.print_env:
         for name, value in environment.items():
             print(f"export {name}={shlex.quote(value)}")

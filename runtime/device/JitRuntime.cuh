@@ -24,15 +24,27 @@ nta_jit_abi_version() {
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_reset_epoch(void *runtime, std::uint32_t objectCount,
-                    std::uint32_t continuationCount, cudaStream_t stream) {
+                    std::uint32_t workTicketCount, cudaStream_t stream) {
   constexpr std::uint32_t threads = 256;
-  const std::uint32_t count = std::max(objectCount, continuationCount);
+  const std::uint32_t count = std::max(objectCount, workTicketCount);
   if (runtime == nullptr || count == 0) {
     return cudaErrorInvalidValue;
   }
   nta_reset_epoch<<<(count + threads - 1U) / threads, threads, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime), objectCount,
-      continuationCount);
+      workTicketCount);
+  return nta::jit::launchStatus();
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_preload_host(void *runtime, std::uint32_t firstObject,
+                     std::uint32_t objectCount, cudaStream_t stream) {
+  if (runtime == nullptr || objectCount == 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr std::uint32_t blocksPerObject = 2;
+  nta_preload_indexed_host<<<objectCount * blocksPerObject, 1024, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), firstObject, objectCount);
   return nta::jit::launchStatus();
 }
 
@@ -42,7 +54,7 @@ nta_jit_progress_host(void *runtime, std::uint32_t blocks,
   if (runtime == nullptr || blocks == 0) {
     return cudaErrorInvalidValue;
   }
-  nta_progress_host_staging<<<blocks, 256, 0, stream>>>(
+  nta_progress_host_staging<<<blocks, 1024, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime));
   return nta::jit::launchStatus();
 }
@@ -66,22 +78,20 @@ nta_jit_publish_ready(void *runtime, std::uint32_t pendingBudget,
   if (runtime == nullptr || pendingBudget == 0) {
     return cudaErrorInvalidValue;
   }
-  const std::uint32_t blocks =
-      std::min(32U, (pendingBudget + threads - 1U) / threads);
-  nta_publish_ready<<<blocks, threads, 0, stream>>>(
+  nta_publish_ready<<<1, threads, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime), pendingBudget);
   return nta::jit::launchStatus();
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
-nta_jit_complete_launched(void *runtime, std::uint32_t continuationCount,
+nta_jit_complete_launched(void *runtime, std::uint32_t workTicketCount,
                           cudaStream_t stream) {
   constexpr std::uint32_t threads = 256;
-  if (runtime == nullptr || continuationCount == 0) {
+  if (runtime == nullptr || workTicketCount == 0) {
     return cudaErrorInvalidValue;
   }
-  nta_complete_launched<<<(continuationCount + threads - 1U) / threads, threads,
+  nta_complete_launched<<<(workTicketCount + threads - 1U) / threads, threads,
                           0, stream>>>(
-      static_cast<nta::abi::RuntimeView *>(runtime), continuationCount);
+      static_cast<nta::abi::RuntimeView *>(runtime), workTicketCount);
   return nta::jit::launchStatus();
 }

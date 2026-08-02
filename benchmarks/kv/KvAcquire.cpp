@@ -1,3 +1,4 @@
+#include "benchmarks/CommonCuda.h"
 #include "benchmarks/kv/KvTypes.h"
 #include "nta/DeviceWorkPlan.h"
 #include "nta/FinitePhase.h"
@@ -12,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -20,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #ifndef NTA_KV_CUBIN_PATH
@@ -27,6 +30,10 @@
 #endif
 
 namespace {
+
+using nta::benchmark::checkCuda;
+using nta::benchmark::checkDriver;
+using nta::benchmark::DeviceBuffer;
 
 enum class Mode {
   Resident,
@@ -45,49 +52,99 @@ struct Options {
   std::uint32_t objectStaleStride = 0;
   std::uint32_t coalesce = 1;
   std::uint32_t dependencies = 1;
+  std::uint32_t lifecycleEpochs = 1;
   bool baseline = false;
+  bool externalRegistration = false;
+  std::uint32_t externalOffset = 0;
 };
 
-void checkCuda(cudaError_t result, const char *operation) {
-  if (result != cudaSuccess) {
-    throw std::runtime_error(std::string(operation) + ": " +
-                             cudaGetErrorString(result));
-  }
-}
-
-void checkDriver(CUresult result, const char *operation) {
-  if (result == CUDA_SUCCESS) {
-    return;
-  }
-  const char *name = nullptr;
-  const char *description = nullptr;
-  (void)cuGetErrorName(result, &name);
-  (void)cuGetErrorString(result, &description);
-  throw std::runtime_error(
-      std::string(operation) + ": " +
-      (name == nullptr ? "unknown CUDA driver error" : name) + " (" +
-      (description == nullptr ? "no description" : description) + ")");
-}
-
-template <typename T> class DeviceBuffer {
+class RegisteredObjectBuffer {
 public:
-  explicit DeviceBuffer(std::size_t count) {
-    checkCuda(
-        cudaMalloc(reinterpret_cast<void **>(&pointer_), sizeof(T) * count),
-        "cudaMalloc DeviceBuffer");
+  RegisteredObjectBuffer() = default;
+  ~RegisteredObjectBuffer() { release(); }
+  RegisteredObjectBuffer(const RegisteredObjectBuffer &) = delete;
+  RegisteredObjectBuffer &operator=(const RegisteredObjectBuffer &) = delete;
+  RegisteredObjectBuffer(RegisteredObjectBuffer &&other) noexcept
+      : sourceAllocation_(std::exchange(other.sourceAllocation_, nullptr)),
+        sourceDevice_(std::exchange(other.sourceDevice_, nullptr)),
+        stagingDevice_(std::exchange(other.stagingDevice_, nullptr)),
+        hostSource_(std::exchange(other.hostSource_, false)) {}
+  RegisteredObjectBuffer &operator=(RegisteredObjectBuffer &&other) noexcept {
+    if (this != &other) {
+      release();
+      sourceAllocation_ = std::exchange(other.sourceAllocation_, nullptr);
+      sourceDevice_ = std::exchange(other.sourceDevice_, nullptr);
+      stagingDevice_ = std::exchange(other.stagingDevice_, nullptr);
+      hostSource_ = std::exchange(other.hostSource_, false);
+    }
+    return *this;
   }
-  ~DeviceBuffer() {
-    if (pointer_ != nullptr) {
-      (void)cudaFree(pointer_);
+
+  void initialize(std::span<const std::byte> contents, nta::Placement placement,
+                  std::uint32_t sourceOffset) {
+    if (sourceAllocation_ != nullptr || contents.empty()) {
+      throw std::logic_error(
+          "registered object buffer initialization is invalid");
+    }
+    const std::size_t allocationBytes = contents.size() + sourceOffset;
+    try {
+      if (placement == nta::Placement::Hbm) {
+        checkCuda(cudaMalloc(&sourceAllocation_, allocationBytes),
+                  "cudaMalloc registered HBM source");
+        sourceDevice_ =
+            static_cast<std::byte *>(sourceAllocation_) + sourceOffset;
+        checkCuda(cudaMemcpy(sourceDevice_, contents.data(), contents.size(),
+                             cudaMemcpyHostToDevice),
+                  "upload registered HBM source");
+      } else {
+        hostSource_ = true;
+        checkCuda(cudaHostAlloc(&sourceAllocation_, allocationBytes,
+                                cudaHostAllocMapped),
+                  "cudaHostAlloc registered DRAM source");
+        std::memcpy(static_cast<std::byte *>(sourceAllocation_) + sourceOffset,
+                    contents.data(), contents.size());
+        void *mappedBase = nullptr;
+        checkCuda(cudaHostGetDevicePointer(&mappedBase, sourceAllocation_, 0),
+                  "cudaHostGetDevicePointer registered DRAM source");
+        sourceDevice_ = static_cast<std::byte *>(mappedBase) + sourceOffset;
+      }
+      if (placement == nta::Placement::HostStaged) {
+        checkCuda(cudaMalloc(&stagingDevice_, contents.size()),
+                  "cudaMalloc registered DRAM staging");
+      }
+    } catch (...) {
+      release();
+      throw;
     }
   }
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
 
-  T *get() const noexcept { return pointer_; }
+  [[nodiscard]] const void *sourceDevice() const noexcept {
+    return sourceDevice_;
+  }
+  [[nodiscard]] void *stagingDevice() const noexcept { return stagingDevice_; }
 
 private:
-  T *pointer_ = nullptr;
+  void release() noexcept {
+    if (stagingDevice_ != nullptr) {
+      (void)cudaFree(stagingDevice_);
+      stagingDevice_ = nullptr;
+    }
+    if (sourceAllocation_ != nullptr) {
+      if (hostSource_) {
+        (void)cudaFreeHost(sourceAllocation_);
+      } else {
+        (void)cudaFree(sourceAllocation_);
+      }
+      sourceAllocation_ = nullptr;
+    }
+    sourceDevice_ = nullptr;
+    hostSource_ = false;
+  }
+
+  void *sourceAllocation_ = nullptr;
+  void *sourceDevice_ = nullptr;
+  void *stagingDevice_ = nullptr;
+  bool hostSource_ = false;
 };
 
 class KernelModule {
@@ -287,11 +344,20 @@ Options parseOptions(int argc, char **argv) {
       options.coalesce = parsePositive(value, name);
     } else if (name == "--dependencies") {
       options.dependencies = parsePositive(value, name);
+    } else if (name == "--lifecycle-epochs") {
+      options.lifecycleEpochs = parsePositive(value, name);
     } else if (name == "--baseline") {
       if (value != "0" && value != "1") {
         throw std::invalid_argument("--baseline must be 0 or 1");
       }
       options.baseline = value == "1";
+    } else if (name == "--external-registration") {
+      if (value != "0" && value != "1") {
+        throw std::invalid_argument("--external-registration must be 0 or 1");
+      }
+      options.externalRegistration = value == "1";
+    } else if (name == "--external-offset") {
+      options.externalOffset = value == "0" ? 0 : parsePositive(value, name);
     } else {
       throw std::invalid_argument("unknown option " + std::string(name));
     }
@@ -313,6 +379,25 @@ Options parseOptions(int argc, char **argv) {
   if (options.objectStaleStride != 0 && options.mode != Mode::HostStaged) {
     throw std::invalid_argument(
         "--object-stale-stride requires --mode=host-staged");
+  }
+  if (options.externalOffset >= 16) {
+    throw std::invalid_argument("--external-offset must be below 16 bytes");
+  }
+  if (options.externalOffset != 0 && !options.externalRegistration) {
+    throw std::invalid_argument(
+        "--external-offset requires --external-registration=1");
+  }
+  if (options.externalOffset != 0 && options.mode != Mode::HostStaged) {
+    throw std::invalid_argument(
+        "--external-offset requires --mode=host-staged");
+  }
+  const std::uint64_t largestGeneration =
+      100ULL +
+      static_cast<std::uint64_t>(options.lifecycleEpochs - 1U) *
+          (static_cast<std::uint64_t>(options.requests) + 1ULL) +
+      options.requests;
+  if (largestGeneration > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("lifecycle generations exceed the NTA ABI");
   }
   return options;
 }
@@ -369,6 +454,8 @@ int main(int argc, char **argv) {
       query[i] = 0.25F + static_cast<float>((i * 7U) % 29U) / 31.0F;
     }
 
+    std::vector<RegisteredObjectBuffer> registeredObjects;
+    registeredObjects.reserve(options.externalRegistration ? objectCount : 0);
     nta::HostRuntime runtime({options.requests, objectCount, objectCount,
                               options.requests, 1, options.dependencies});
     std::vector<nta::benchmark::TileTask> tasks(options.requests);
@@ -390,9 +477,22 @@ int main(int argc, char **argv) {
             static_cast<float>((object * 13U + element * 5U) % 97U) / 101.0F;
       }
       const std::span<const float> floats(objectData[object]);
-      objects[object] = runtime.installObject(
-          object, 200000U + object, 1, std::as_bytes(floats),
-          placementFor(options.mode, object));
+      const std::span<const std::byte> contents = std::as_bytes(floats);
+      const nta::Placement placement = placementFor(options.mode, object);
+      if (options.externalRegistration) {
+        RegisteredObjectBuffer allocation;
+        allocation.initialize(contents, placement, options.externalOffset);
+        const nta::RegisteredReplicaSpec replica{allocation.sourceDevice(),
+                                                 placement};
+        objects[object] = runtime.registerObject(
+            object, 200000U + object, 1, contents.size(),
+            allocation.stagingDevice(),
+            std::span<const nta::RegisteredReplicaSpec>(&replica, 1));
+        registeredObjects.push_back(std::move(allocation));
+      } else {
+        objects[object] = runtime.installObject(object, 200000U + object, 1,
+                                                contents, placement);
+      }
     }
 
     for (std::uint32_t task = 0; task < options.requests; ++task) {
@@ -532,62 +632,126 @@ int main(int argc, char **argv) {
     }
     checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize warmup");
 
+    std::vector<float> output(options.requests);
+    std::uint32_t failures = 0;
+    const auto prepareLifecycleEpoch = [&](std::uint32_t epoch) {
+      for (std::uint32_t task = 0; task < options.requests; ++task) {
+        const std::uint32_t generation =
+            100U + epoch * (options.requests + 1U) + task;
+        runtime.setRequest(
+            task,
+            100000ULL + static_cast<std::uint64_t>(epoch) * options.requests +
+                task,
+            generation, task % 4, task % 3);
+        cancelled[task] = options.cancelStride != 0 &&
+                          (task + epoch) % options.cancelStride == 0;
+        if (cancelled[task]) {
+          runtime.cancelRequest(task, generation);
+        }
+        const std::uint32_t taskGeneration =
+            options.staleStride != 0 &&
+                    (task + epoch) % options.staleStride == 0
+                ? generation - 1U
+                : generation;
+        stale[task] = taskGeneration != generation;
+        objectStale[task] = options.objectStaleStride != 0 &&
+                            (task + epoch) % options.objectStaleStride == 0;
+        tasks[task].generation = taskGeneration;
+        tasks[task].objectVersion = objectStale[task] ? 2U : 1U;
+        workPlan.requests[task].generation = taskGeneration;
+        workPlan.workItems[task].generation = taskGeneration;
+        for (std::uint32_t dependency = 0; dependency < options.dependencies;
+             ++dependency) {
+          const std::size_t index =
+              static_cast<std::size_t>(task) * options.dependencies +
+              dependency;
+          requirements[index].objectVersion =
+              objectStale[task] && dependency == 0 ? 2U : 1U;
+          workPlan.dependencies[index].objectVersion =
+              requirements[index].objectVersion;
+        }
+      }
+      checkCuda(cudaMemcpyAsync(deviceTasks.get(), tasks.data(),
+                                sizeof(tasks.front()) * tasks.size(),
+                                cudaMemcpyHostToDevice, stream),
+                "upload lifecycle tasks");
+      deviceWorkPlan.uploadAsync(workPlan, stream);
+    };
+
+    const auto verifyEpoch = [&] {
+      checkCuda(cudaMemcpy(output.data(), deviceOutput.get(),
+                           sizeof(float) * output.size(),
+                           cudaMemcpyDeviceToHost),
+                "download lifecycle output");
+      for (std::uint32_t task = 0; task < options.requests; ++task) {
+        const nta::abi::WorkTicket workTicket =
+            runtime.readWorkTicket(task);
+        if (options.baseline) {
+          const float tolerance =
+              std::max(0.02F, std::abs(expected[task]) * 2.0e-5F);
+          if (std::abs(output[task] - expected[task]) > tolerance) {
+            ++failures;
+          }
+        } else if (cancelled[task] || stale[task]) {
+          if (workTicket.state !=
+                  static_cast<std::uint32_t>(
+                      nta::abi::WorkTicketState::Cancelled) ||
+              output[task] != 0.0F) {
+            ++failures;
+          }
+        } else if (objectStale[task]) {
+          if (workTicket.state != static_cast<std::uint32_t>(
+                                        nta::abi::WorkTicketState::Failed) ||
+              output[task] != 0.0F) {
+            ++failures;
+          }
+        } else {
+          const float tolerance =
+              std::max(0.02F, std::abs(expected[task]) * 2.0e-5F);
+          if (workTicket.state != static_cast<std::uint32_t>(
+                                        nta::abi::WorkTicketState::Done) ||
+              std::abs(output[task] - expected[task]) > tolerance) {
+            ++failures;
+          }
+        }
+      }
+      if (runtime.readPendingCount() != 0) {
+        ++failures;
+      }
+    };
+
     checkCuda(cudaEventRecord(begin, stream), "cudaEventRecord begin");
-    for (std::uint32_t iteration = 0; iteration < options.iterations;
-         ++iteration) {
-      checkCuda(cudaGraphLaunch(graphExec, stream), "cudaGraphLaunch measured");
+    for (std::uint32_t epoch = 0; epoch < options.lifecycleEpochs; ++epoch) {
+      if (epoch != 0) {
+        prepareLifecycleEpoch(epoch);
+      }
+      for (std::uint32_t iteration = 0; iteration < options.iterations;
+           ++iteration) {
+        checkCuda(cudaGraphLaunch(graphExec, stream),
+                  "cudaGraphLaunch measured");
+      }
+      if (epoch + 1U == options.lifecycleEpochs) {
+        checkCuda(cudaEventRecord(end, stream), "cudaEventRecord end");
+      }
+      checkCuda(cudaStreamSynchronize(stream),
+                "cudaStreamSynchronize lifecycle epoch");
+      verifyEpoch();
     }
-    checkCuda(cudaEventRecord(end, stream), "cudaEventRecord end");
-    checkCuda(cudaEventSynchronize(end), "cudaEventSynchronize");
 
     float elapsedMilliseconds = 0.0F;
     checkCuda(cudaEventElapsedTime(&elapsedMilliseconds, begin, end),
               "cudaEventElapsedTime");
 
-    std::vector<float> output(options.requests);
-    checkCuda(cudaMemcpy(output.data(), deviceOutput.get(),
-                         sizeof(float) * output.size(), cudaMemcpyDeviceToHost),
-              "download output");
-
-    std::uint32_t failures = 0;
     std::uint64_t stagedIssues = 0;
-    for (std::uint32_t task = 0; task < options.requests; ++task) {
-      const nta::abi::Continuation continuation =
-          runtime.readContinuation(task);
-      if (options.baseline) {
-        const float tolerance =
-            std::max(0.02F, std::abs(expected[task]) * 2.0e-5F);
-        if (std::abs(output[task] - expected[task]) > tolerance) {
-          ++failures;
-        }
-      } else if (cancelled[task] || stale[task]) {
-        if (continuation.state != static_cast<std::uint32_t>(
-                                      nta::abi::ContinuationState::Cancelled) ||
-            output[task] != 0.0F) {
-          ++failures;
-        }
-      } else if (objectStale[task]) {
-        if (continuation.state != static_cast<std::uint32_t>(
-                                      nta::abi::ContinuationState::Failed) ||
-            output[task] != 0.0F) {
-          ++failures;
-        }
-      } else {
-        const float tolerance =
-            std::max(0.02F, std::abs(expected[task]) * 2.0e-5F);
-        if (continuation.state !=
-                static_cast<std::uint32_t>(nta::abi::ContinuationState::Done) ||
-            std::abs(output[task] - expected[task]) > tolerance) {
-          ++failures;
-        }
-      }
-    }
     for (std::uint32_t object = 0; object < objectCount; ++object) {
       stagedIssues += runtime.readObject(object).issueCount;
     }
 
+    const std::uint64_t graphLaunches =
+        static_cast<std::uint64_t>(options.lifecycleEpochs) *
+        options.iterations;
     const double millisecondsPerBatch =
-        elapsedMilliseconds / options.iterations;
+        elapsedMilliseconds / static_cast<double>(graphLaunches);
     const double gibPerSecond =
         (static_cast<double>(options.requests) * options.tileBytes *
          options.dependencies / (1024.0 * 1024.0 * 1024.0)) /
@@ -598,7 +762,12 @@ int main(int argc, char **argv) {
               << " requests=" << options.requests << " objects=" << objectCount
               << " coalesce=" << options.coalesce
               << " dependencies=" << options.dependencies
+              << " lifecycle_epochs=" << options.lifecycleEpochs
+              << " graph_launches=" << graphLaunches
               << " baseline=" << (options.baseline ? 1 : 0)
+              << " external_registration="
+              << (options.externalRegistration ? 1 : 0)
+              << " external_offset=" << options.externalOffset
               << " tile_bytes=" << options.tileBytes
               << " graph_ms=" << std::fixed << std::setprecision(3)
               << millisecondsPerBatch
@@ -609,6 +778,7 @@ int main(int argc, char **argv) {
               << " object_stale="
               << std::count(objectStale.begin(), objectStale.end(), true)
               << " pending=" << runtime.readPendingCount()
+              << " pending_index=" << runtime.readPendingIndexCount()
               << " verification_failures=" << failures << '\n';
 
     (void)cudaEventDestroy(end);

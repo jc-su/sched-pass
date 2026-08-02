@@ -28,7 +28,7 @@ struct DecodeChunk {
   std::uint32_t pageTableOffset;
   std::uint32_t physicalPage;
   std::uint32_t tokenCount;
-  std::uint32_t continuation;
+  std::uint32_t workTicket;
   PageBinding page;
 };
 
@@ -52,7 +52,7 @@ struct DecodeScheduleView {
 };
 
 // Converts FlashInfer's public paged-KV CSR representation into one finite NTA
-// continuation per logical KV chunk. Physical page reuse and arbitrary
+// work ticket per logical KV chunk. Physical page reuse and arbitrary
 // page-table order are preserved.
 DecodePlan planDecode(const DecodeBatchView &batch);
 

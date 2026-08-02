@@ -30,7 +30,7 @@ enum AcquireArgument : unsigned {
   ObjectVersion = 4,
   Offset = 5,
   Bytes = 6,
-  Continuation = 7,
+  WorkTicket = 7,
   AcquireArgumentCount = 8,
 };
 
@@ -39,7 +39,7 @@ enum AcquireSetArgument : unsigned {
   Requirements = 1,
   RequirementCount = 2,
   DirectRequirementCount = 3,
-  SetContinuation = 4,
+  SetWorkTicket = 4,
   AcquireSetArgumentCount = 5,
 };
 
@@ -51,7 +51,7 @@ enum BindArgument : unsigned {
 
 enum DeferArgument : unsigned {
   DeferRuntime = 0,
-  DeferContinuation = 1,
+  DeferWorkTicket = 1,
   DeferArgumentCount = 2,
 };
 

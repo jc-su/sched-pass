@@ -12,6 +12,8 @@ namespace {
 using AbiVersion = std::uint32_t (*)();
 using Reset = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                               cudaStream_t);
+using PreloadHost = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
+                                    cudaStream_t);
 using ProgressHost = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using ProgressNvme = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                                      cudaStream_t);
@@ -56,6 +58,7 @@ struct JitPhaseProgram::Impl {
             "instrumented JIT module uses an incompatible NTA ABI");
       }
       reset = load<Reset>(library, "nta_jit_reset_epoch");
+      preloadHost = load<PreloadHost>(library, "nta_jit_preload_host");
       progressHost = load<ProgressHost>(library, "nta_jit_progress_host");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
       publish = load<Publish>(library, "nta_jit_publish_ready");
@@ -75,6 +78,7 @@ struct JitPhaseProgram::Impl {
 
   void *library = nullptr;
   Reset reset = nullptr;
+  PreloadHost preloadHost = nullptr;
   ProgressHost progressHost = nullptr;
   ProgressNvme progressNvme = nullptr;
   Publish publish = nullptr;
@@ -91,13 +95,25 @@ JitPhaseProgram::operator=(JitPhaseProgram &&) noexcept = default;
 
 void JitPhaseProgram::reset(cudaStream_t stream, abi::RuntimeView *runtime,
                             std::uint32_t objectCount,
-                            std::uint32_t continuationCount) const {
-  if (runtime == nullptr || objectCount == 0 || continuationCount == 0) {
+                            std::uint32_t workTicketCount) const {
+  if (runtime == nullptr || workTicketCount == 0) {
     throw std::invalid_argument(
-        "JIT phase reset needs runtime objects and continuations");
+        "JIT phase reset needs runtime objects and work tickets");
   }
-  check(impl_->reset(runtime, objectCount, continuationCount, stream),
+  check(impl_->reset(runtime, objectCount, workTicketCount, stream),
         "nta_jit_reset_epoch");
+}
+
+void JitPhaseProgram::preloadHost(cudaStream_t stream,
+                                  abi::RuntimeView *runtime,
+                                  std::uint32_t firstObject,
+                                  std::uint32_t objectCount) const {
+  if (runtime == nullptr || objectCount == 0) {
+    throw std::invalid_argument(
+        "JIT host preload needs a runtime and non-zero object count");
+  }
+  check(impl_->preloadHost(runtime, firstObject, objectCount, stream),
+        "nta_jit_preload_host");
 }
 
 void JitPhaseProgram::progressHost(cudaStream_t stream,
@@ -133,12 +149,12 @@ void JitPhaseProgram::publish(cudaStream_t stream, abi::RuntimeView *runtime,
 }
 
 void JitPhaseProgram::complete(cudaStream_t stream, abi::RuntimeView *runtime,
-                               std::uint32_t continuationCount) const {
-  if (runtime == nullptr || continuationCount == 0) {
+                               std::uint32_t workTicketCount) const {
+  if (runtime == nullptr || workTicketCount == 0) {
     throw std::invalid_argument(
-        "JIT completion needs a runtime and continuation count");
+        "JIT completion needs a runtime and work-ticket count");
   }
-  check(impl_->complete(runtime, continuationCount, stream),
+  check(impl_->complete(runtime, workTicketCount, stream),
         "nta_jit_complete_launched");
 }
 

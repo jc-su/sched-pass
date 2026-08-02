@@ -14,13 +14,12 @@ from flashinfer.jit.attention.modules import (
     gen_customize_batch_decode_module,
     gen_customize_batch_prefill_module,
 )
-from flashinfer.jit.attention.variants import attention_sink_fa2_decl
-
-
-TENSOR_NAMES = ["sink", "nta_runtime", "nta_work_items", "nta_dependencies"]
-TENSOR_DTYPES = ["float", "uint8_t", "uint8_t", "uint8_t"]
-SCALAR_NAMES = ["sm_scale", "nta_work_count"]
-SCALAR_DTYPES = ["double", "int64_t"]
+TENSOR_NAMES = ["nta_runtime", "nta_work_items", "nta_dependencies"]
+TENSOR_DTYPES = ["uint8_t", "uint8_t", "uint8_t"]
+SCALAR_NAMES = ["sm_scale", "nta_work_count", "nta_skip_merge"]
+SCALAR_DTYPES = ["double", "int64_t", "int64_t"]
+VARIANT_NAME = "DefaultAttention<false, false, false, false>"
+VARIANT_DECL = "#include <flashinfer/attention/variants.cuh>"
 ABI_VERSION = int(os.environ["NTA_ABI_VERSION"])
 
 
@@ -65,7 +64,7 @@ def check_module(
 
 
 def main() -> None:
-    baseline_name = "nta_batch_decode_baseline"
+    baseline_name = "nta_batch_decode_default_v2_baseline"
     baseline = gen_customize_batch_decode_module(
         baseline_name,
         torch.float16,
@@ -74,14 +73,14 @@ def main() -> None:
         torch.int32,
         128,
         128,
-        ["sink"],
-        ["float"],
+        [],
+        [],
         ["sm_scale"],
         ["double"],
-        "AttentionSink",
-        attention_sink_fa2_decl,
+        VARIANT_NAME,
+        VARIANT_DECL,
     )
-    decode_name = "nta_batch_decode_hooked"
+    decode_name = "nta_batch_decode_default_v2_hooked"
     decode = gen_customize_batch_decode_module(
         decode_name,
         torch.float16,
@@ -94,10 +93,10 @@ def main() -> None:
         TENSOR_DTYPES,
         SCALAR_NAMES,
         SCALAR_DTYPES,
-        "AttentionSink",
-        attention_sink_fa2_decl,
+        VARIANT_NAME,
+        VARIANT_DECL,
     )
-    prefill_name = "nta_batch_prefill_hooked"
+    prefill_name = "nta_batch_prefill_default_v2_hooked"
     prefill = gen_customize_batch_prefill_module(
         "fa2",
         prefill_name,
@@ -111,8 +110,8 @@ def main() -> None:
         TENSOR_DTYPES,
         SCALAR_NAMES,
         SCALAR_DTYPES,
-        "AttentionSink",
-        attention_sink_fa2_decl,
+        VARIANT_NAME,
+        VARIANT_DECL,
     )
     print(
         "flashinfer_baseline_module="

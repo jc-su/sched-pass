@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nta-runtime"
+version = "0.1.0"
+description = "Python engine bindings for finite-kernel nonresident acquisition"
+requires-python = ">=3.10"
+
+[project.entry-points."sglang.srt.plugins"]
+nta = "nta_runtime.plugins.sglang:register"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]

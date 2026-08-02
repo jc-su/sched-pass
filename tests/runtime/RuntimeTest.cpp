@@ -1,5 +1,6 @@
 #include "nta/DeviceWorkPlan.h"
 #include "nta/HostRuntime.h"
+#include "nta/NvmeRuntime.h"
 #include "nta/WorkPlan.h"
 
 #include <cuda_runtime_api.h>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -40,14 +42,21 @@ int main() {
     }
     require(invalidDeviceRejected, "invalid CUDA device ordinal was accepted");
 
-    bool undersizedIntentPoolRejected = false;
+    bool nonVfioNvmeRejected = false;
     try {
-      nta::HostRuntime invalid({1, 2, 1, 1});
+      nta::NvmeTransportOptions invalidNvme;
+      invalidNvme.endpoint = "/dev/nta_nvme";
+      invalidNvme.deviceOrdinal = originalDevice;
+      nta::NvmeTransport invalid(std::move(invalidNvme));
     } catch (const std::invalid_argument &) {
-      undersizedIntentPoolRejected = true;
+      nonVfioNvmeRejected = true;
     }
-    require(undersizedIntentPoolRejected,
-            "intent pool must cover every independently queued object");
+    require(nonVfioNvmeRejected,
+            "NVMe transport accepted a non-VFIO ownership endpoint");
+
+    nta::HostRuntime boundedIntentPool({1, 2, 1, 1});
+    require(boundedIntentPool.config().intentCapacity == 1,
+            "intent pool must be sized by the active acquisition frontier");
     bool dependencyCapacityRejected = false;
     try {
       nta::HostRuntime invalid({1, 1, 1, 1, 1, 0});
@@ -83,18 +92,38 @@ int main() {
             "runtime view download failed");
     require(hostView.objectCapacity == 4 && hostView.replicaCapacity == 8,
             "object and replica capacities were transposed");
-    require(hostView.maxDependenciesPerContinuation == 8 &&
+    require(hostView.maxDependenciesPerWorkTicket == 8 &&
                 hostView.dependencyCapacity == 32 &&
                 hostView.dependencies != nullptr &&
-                hostView.pendingContinuations != nullptr &&
-                hostView.pendingCount != nullptr,
-            "continuation dependency storage was not installed");
+                hostView.workRunnableNs != nullptr &&
+                hostView.pendingWorkTickets != nullptr &&
+                hostView.pendingCount != nullptr &&
+                hostView.objectDependentHeads != nullptr &&
+                hostView.dependencyNext != nullptr &&
+                hostView.remainingDependencies != nullptr &&
+                hostView.changedWorkTickets != nullptr &&
+                hostView.changedCount != nullptr &&
+                hostView.changedOverflow != nullptr &&
+                hostView.requestProgress != nullptr,
+            "workTicket dependency storage was not installed");
+    const nta::abi::RequestProgress requestProgress =
+        runtime.readRequestProgress(0);
+    require(requestProgress.requestId == 1001 &&
+                requestProgress.generation == 7 &&
+                requestProgress.expectedWork == 0,
+            "request progress was not initialized with request identity");
     std::uint32_t pendingCount = 1;
     require(cudaMemcpy(&pendingCount, hostView.pendingCount,
                        sizeof(pendingCount),
                        cudaMemcpyDeviceToHost) == cudaSuccess &&
-                pendingCount == 0,
-            "pending continuation index was not initialized");
+                pendingCount == 0 && runtime.readPendingCount() == 0 &&
+                runtime.readPendingIndexCount() == 0,
+            "pending workTicket index was not initialized");
+    const nta::EpochStatus initialEpoch = runtime.readEpochStatus(4);
+    require(initialEpoch.total == 4 && initialEpoch.fresh == 4 &&
+                initialEpoch.pending == 0 && !initialEpoch.succeeded() &&
+                !initialEpoch.hasFailure(),
+            "epoch status did not summarize the workTicket prefix");
     const std::uint64_t syntheticOutstanding = 4096;
     require(cudaMemcpy(&hostView.requests[0].outstandingBytes,
                        &syntheticOutstanding, sizeof(syntheticOutstanding),
@@ -166,6 +195,31 @@ int main() {
                 static_cast<std::uint32_t>(nta::abi::ObjectState::New),
             "staged object must begin nonresident");
 
+    nta::RuntimeConfig stagingConfig{1, 2, 1, 1};
+    stagingConfig.stagingByteCapacity = contents.size();
+    nta::HostRuntime boundedStaging(stagingConfig);
+    boundedStaging.installObject(0, 3001, 1, contents,
+                                 nta::Placement::HostStaged);
+    const nta::StagingUsage fullUsage = boundedStaging.stagingUsage();
+    require(fullUsage.bytes == contents.size() &&
+                fullUsage.capacity == contents.size() &&
+                fullUsage.highWaterBytes == contents.size(),
+            "runtime-owned staging usage is incorrect");
+    bool stagingCapacityRejected = false;
+    try {
+      boundedStaging.installObject(1, 3002, 1, contents,
+                                   nta::Placement::HostStaged);
+    } catch (const std::runtime_error &) {
+      stagingCapacityRejected = true;
+    }
+    require(stagingCapacityRejected &&
+                boundedStaging.stagingUsage().bytes == contents.size(),
+            "runtime-owned staging capacity did not fail atomically");
+    boundedStaging.installObject(0, 3001, 2, contents,
+                                 nta::Placement::HostMapped);
+    require(boundedStaging.stagingUsage().bytes == 0,
+            "replaced staging allocation remained charged");
+
     void *borrowedDevice = nullptr;
     require(cudaMalloc(&borrowedDevice, contents.size()) == cudaSuccess,
             "borrowed HBM allocation failed");
@@ -195,6 +249,45 @@ int main() {
             "non-owning HBM registration failed");
     require(cudaFree(borrowedDevice) == cudaSuccess,
             "runtime incorrectly took ownership of registered HBM");
+
+    void *indexedHost = nullptr;
+    void *indexedHostDevice = nullptr;
+    void *indexedStaging = nullptr;
+    std::uint32_t *indexedSource = nullptr;
+    std::uint32_t *indexedDestination = nullptr;
+    require(cudaHostAlloc(&indexedHost, 64, cudaHostAllocMapped) ==
+                    cudaSuccess &&
+                cudaHostGetDevicePointer(&indexedHostDevice, indexedHost, 0) ==
+                    cudaSuccess &&
+                cudaMalloc(&indexedStaging, 64) == cudaSuccess &&
+                cudaMalloc(reinterpret_cast<void **>(&indexedSource),
+                           sizeof(std::uint32_t)) == cudaSuccess &&
+                cudaMalloc(reinterpret_cast<void **>(&indexedDestination),
+                           sizeof(std::uint32_t)) == cudaSuccess,
+            "preacquired indexed allocation failed");
+    const nta::IndexedHostObjectSpec preacquired{2005,
+                                                 5,
+                                                 indexedHostDevice,
+                                                 indexedStaging,
+                                                 indexedSource,
+                                                 indexedDestination,
+                                                 1,
+                                                 64,
+                                                 64,
+                                                 64,
+                                                 true};
+    runtime.registerIndexedHostObjects(
+        3, std::span<const nta::IndexedHostObjectSpec>(&preacquired, 1));
+    const nta::abi::ObjectEntry preacquiredEntry = runtime.readObject(3);
+    require(preacquiredEntry.state ==
+                    static_cast<std::uint32_t>(nta::abi::ObjectState::Ready) &&
+                preacquiredEntry.selectedReplica == 0,
+            "preacquired indexed object was not published ready");
+    require(cudaFree(indexedDestination) == cudaSuccess &&
+                cudaFree(indexedSource) == cudaSuccess &&
+                cudaFree(indexedStaging) == cudaSuccess &&
+                cudaFreeHost(indexedHost) == cudaSuccess,
+            "preacquired indexed allocation release failed");
 
     nta::WorkPlanBuilder planBuilder(2);
     const std::uint32_t planRequest = planBuilder.addRequest({0, 7});
@@ -263,6 +356,19 @@ int main() {
                 reusablePlan.workItems() == reusableWorkAddress &&
                 reusablePlan.dependencies() == reusableDependencyAddress,
             "reusable work-plan allocation changed across updates");
+    nta::WorkPlan queuedPlan = hostPlan;
+    queuedPlan.workItems[0].logicalWork = 88;
+    reusablePlan.uploadAsync(queuedPlan, uploadStream);
+    queuedPlan.workItems[0].logicalWork = 99;
+    reusablePlan.uploadAsync(queuedPlan, uploadStream);
+    reusablePlan.waitOn(consumerStream);
+    require(cudaMemcpyAsync(&asynchronouslyUploaded, reusablePlan.workItems(),
+                            sizeof(asynchronouslyUploaded),
+                            cudaMemcpyDeviceToHost,
+                            consumerStream) == cudaSuccess &&
+                cudaStreamSynchronize(consumerStream) == cudaSuccess &&
+                asynchronouslyUploaded.logicalWork == 99,
+            "double-buffered work-plan uploads were not stream ordered");
     require(cudaStreamDestroy(consumerStream) == cudaSuccess,
             "reusable plan consumer stream destruction failed");
     require(cudaStreamDestroy(uploadStream) == cudaSuccess,

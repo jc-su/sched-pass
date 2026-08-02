@@ -1,3 +1,4 @@
+#include "benchmarks/CommonCuda.h"
 #include "benchmarks/attention/PagedAttentionTypes.h"
 #include "nta/DeviceWorkPlan.h"
 #include "nta/FinitePhase.h"
@@ -32,13 +33,19 @@
 namespace {
 
 using nta::benchmark::AttentionHeadDimension;
+using nta::benchmark::AttentionPageDescriptor;
+using nta::benchmark::AttentionPageNeedsStaging;
 using nta::benchmark::AttentionPageTokens;
 using nta::benchmark::AttentionRequest;
 using nta::benchmark::AttentionTilePartial;
 using nta::benchmark::AttentionTileTask;
+using nta::benchmark::checkCuda;
+using nta::benchmark::checkDriver;
+using nta::benchmark::DeviceBuffer;
 
 enum class Mode { Resident, HostDirect, HostStaged, Mixed };
 enum class CopyMode { Global, Tma };
+enum class SparsePolicy { LateBound, Overfetch };
 
 struct Options {
   Mode mode = Mode::Mixed;
@@ -48,49 +55,11 @@ struct Options {
   std::uint32_t iterations = 20;
   std::uint32_t progressPasses = 1;
   std::uint32_t requestCreditPages = 0;
+  std::uint32_t sparseTopK = 0;
+  SparsePolicy sparsePolicy = SparsePolicy::LateBound;
   CopyMode copyMode = CopyMode::Global;
+  bool json = false;
   std::string dumpOutput;
-};
-
-void checkCuda(cudaError_t result, const char *operation) {
-  if (result != cudaSuccess) {
-    throw std::runtime_error(std::string(operation) + ": " +
-                             cudaGetErrorString(result));
-  }
-}
-
-void checkDriver(CUresult result, const char *operation) {
-  if (result == CUDA_SUCCESS) {
-    return;
-  }
-  const char *name = nullptr;
-  const char *description = nullptr;
-  (void)cuGetErrorName(result, &name);
-  (void)cuGetErrorString(result, &description);
-  throw std::runtime_error(
-      std::string(operation) + ": " +
-      (name == nullptr ? "unknown CUDA driver error" : name) + " (" +
-      (description == nullptr ? "no description" : description) + ")");
-}
-
-template <typename T> class DeviceBuffer {
-public:
-  explicit DeviceBuffer(std::size_t count) {
-    checkCuda(
-        cudaMalloc(reinterpret_cast<void **>(&pointer_), count * sizeof(T)),
-        "cudaMalloc DeviceBuffer");
-  }
-  ~DeviceBuffer() {
-    if (pointer_ != nullptr) {
-      (void)cudaFree(pointer_);
-    }
-  }
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-  [[nodiscard]] T *get() const noexcept { return pointer_; }
-
-private:
-  T *pointer_ = nullptr;
 };
 
 class KernelModule {
@@ -102,6 +71,11 @@ public:
     load(ready_, "nta_attention_ready_kernel");
     load(tmaTile_, "nta_attention_tma_tile_kernel");
     load(tmaReady_, "nta_attention_tma_ready_kernel");
+    load(sparseQuery_, "nta_sparse_query_kernel");
+    load(sparse_, "nta_sparse_attention_kernel");
+    load(sparseReady_, "nta_sparse_attention_ready_kernel");
+    load(sparseCopyAll_, "nta_sparse_copy_all_kernel");
+    load(sparseInvalidate_, "nta_sparse_invalidate_staging_kernel");
     load(reduce_, "nta_attention_reduce_kernel");
   }
   ~KernelModule() {
@@ -170,6 +144,90 @@ public:
            "attention reduce");
   }
 
+  void sparse(CUstream stream, CUfunction function,
+              nta::abi::RuntimeView *runtime,
+              const AttentionPageDescriptor *catalog,
+              const std::uint32_t *candidateOffsets, const __half *summaries,
+              const __half *queries, std::uint32_t requestCount,
+              std::uint32_t topK, const nta::DeviceWorkPlan &plan,
+              std::uint32_t *selectedCatalogIndices, float *output,
+              bool preacquired) const {
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    CUdeviceptr catalogAddress = reinterpret_cast<CUdeviceptr>(catalog);
+    CUdeviceptr offsetAddress = reinterpret_cast<CUdeviceptr>(candidateOffsets);
+    CUdeviceptr summaryAddress = reinterpret_cast<CUdeviceptr>(summaries);
+    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(queries);
+    CUdeviceptr workAddress = reinterpret_cast<CUdeviceptr>(
+        const_cast<nta::abi::WorkItem *>(plan.workItems()));
+    CUdeviceptr dependencyAddress = reinterpret_cast<CUdeviceptr>(
+        const_cast<nta::abi::AcquireRequirement *>(plan.dependencies()));
+    CUdeviceptr selectionAddress =
+        reinterpret_cast<CUdeviceptr>(selectedCatalogIndices);
+    CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
+    std::uint32_t acquired = preacquired ? 1U : 0U;
+    void *arguments[] = {
+        &runtimeAddress,    &catalogAddress,   &offsetAddress, &summaryAddress,
+        &queryAddress,      &requestCount,     &topK,          &workAddress,
+        &dependencyAddress, &selectionAddress, &outputAddress, &acquired,
+    };
+    launch(function, requestCount, AttentionHeadDimension, stream, arguments,
+           "sparse attention");
+  }
+
+  void produceSparseQueries(CUstream stream, const __half *hidden,
+                            __half *queries, std::uint32_t requestCount) const {
+    CUdeviceptr hiddenAddress = reinterpret_cast<CUdeviceptr>(hidden);
+    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(queries);
+    void *arguments[] = {&hiddenAddress, &queryAddress, &requestCount};
+    launch(sparseQuery_, requestCount, AttentionHeadDimension, stream,
+           arguments, "sparse query producer");
+  }
+
+  void discoverSparse(CUstream stream, nta::abi::RuntimeView *runtime,
+                      const AttentionPageDescriptor *catalog,
+                      const std::uint32_t *candidateOffsets,
+                      const __half *summaries, const __half *queries,
+                      std::uint32_t requestCount, std::uint32_t topK,
+                      const nta::DeviceWorkPlan &plan,
+                      std::uint32_t *selectedCatalogIndices, float *output,
+                      bool preacquired = false) const {
+    sparse(stream, sparse_, runtime, catalog, candidateOffsets, summaries,
+           queries, requestCount, topK, plan, selectedCatalogIndices, output,
+           preacquired);
+  }
+
+  void readySparse(CUstream stream, nta::abi::RuntimeView *runtime,
+                   const AttentionPageDescriptor *catalog,
+                   const std::uint32_t *candidateOffsets,
+                   const __half *summaries, const __half *queries,
+                   std::uint32_t requestCount, std::uint32_t topK,
+                   const nta::DeviceWorkPlan &plan,
+                   std::uint32_t *selectedCatalogIndices, float *output,
+                   bool preacquired = false) const {
+    sparse(stream, sparseReady_, runtime, catalog, candidateOffsets, summaries,
+           queries, requestCount, topK, plan, selectedCatalogIndices, output,
+           preacquired);
+  }
+
+  void copySparseCatalog(CUstream stream,
+                         const AttentionPageDescriptor *catalog,
+                         std::uint32_t candidateCount) const {
+    CUdeviceptr catalogAddress = reinterpret_cast<CUdeviceptr>(catalog);
+    void *arguments[] = {&catalogAddress, &candidateCount};
+    launch(sparseCopyAll_, candidateCount, 256, stream, arguments,
+           "sparse overfetch copy");
+  }
+
+  void invalidateSparseStaging(CUstream stream, nta::abi::RuntimeView *runtime,
+                               const AttentionPageDescriptor *catalog,
+                               std::uint32_t candidateCount) const {
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    CUdeviceptr catalogAddress = reinterpret_cast<CUdeviceptr>(catalog);
+    void *arguments[] = {&runtimeAddress, &catalogAddress, &candidateCount};
+    launch(sparseInvalidate_, (candidateCount + 255U) / 256U, 256, stream,
+           arguments, "invalidate sparse staging cache");
+  }
+
   [[nodiscard]] CUmodule module() const noexcept { return module_; }
 
 private:
@@ -190,6 +248,11 @@ private:
   CUfunction ready_ = nullptr;
   CUfunction tmaTile_ = nullptr;
   CUfunction tmaReady_ = nullptr;
+  CUfunction sparseQuery_ = nullptr;
+  CUfunction sparse_ = nullptr;
+  CUfunction sparseReady_ = nullptr;
+  CUfunction sparseCopyAll_ = nullptr;
+  CUfunction sparseInvalidate_ = nullptr;
   CUfunction reduce_ = nullptr;
 };
 
@@ -238,6 +301,16 @@ Options parseOptions(int argc, char **argv) {
       options.progressPasses = parsePositive(value, name);
     } else if (name == "--request-credit-pages") {
       options.requestCreditPages = parsePositive(value, name);
+    } else if (name == "--sparse-top-k") {
+      options.sparseTopK = parsePositive(value, name);
+    } else if (name == "--sparse-policy") {
+      if (value == "late-bound") {
+        options.sparsePolicy = SparsePolicy::LateBound;
+      } else if (value == "overfetch") {
+        options.sparsePolicy = SparsePolicy::Overfetch;
+      } else {
+        throw std::invalid_argument("unknown sparse attention policy");
+      }
     } else if (name == "--copy") {
       if (value == "global") {
         options.copyMode = CopyMode::Global;
@@ -246,6 +319,11 @@ Options parseOptions(int argc, char **argv) {
       } else {
         throw std::invalid_argument("unknown copy mode");
       }
+    } else if (name == "--json") {
+      if (value != "0" && value != "1") {
+        throw std::invalid_argument("--json must be 0 or 1");
+      }
+      options.json = value == "1";
     } else if (name == "--dump-output") {
       if (value.empty()) {
         throw std::invalid_argument("--dump-output requires a path");
@@ -257,6 +335,14 @@ Options parseOptions(int argc, char **argv) {
   }
   if (options.minPages > options.maxPages) {
     throw std::invalid_argument("--min-pages must not exceed --max-pages");
+  }
+  if (options.sparseTopK > 8 || options.sparseTopK > options.minPages) {
+    throw std::invalid_argument(
+        "--sparse-top-k must be at most 8 and no larger than --min-pages");
+  }
+  if (options.sparseTopK != 0 && options.copyMode != CopyMode::Global) {
+    throw std::invalid_argument(
+        "query-dependent sparse attention currently uses global loads");
   }
   return options;
 }
@@ -297,6 +383,10 @@ const char *modeName(Mode mode) {
 
 const char *copyModeName(CopyMode mode) {
   return mode == CopyMode::Tma ? "tma" : "global";
+}
+
+const char *sparsePolicyName(SparsePolicy policy) {
+  return policy == SparsePolicy::Overfetch ? "overfetch" : "late-bound";
 }
 
 CUtensorMap encodePageTensorMap(void *address) {
@@ -429,6 +519,362 @@ void writeFixture(const std::string &path,
   writeArray(output, outputValues);
 }
 
+int runSparseAttention(
+    const Options &options, std::span<const std::int32_t> kvIndptr,
+    std::span<const std::int32_t> kvIndices,
+    std::span<const std::int32_t> lastPageLen, std::span<const __half> queries,
+    std::span<const __half> pages,
+    std::span<const nta::flashinfer::PageBinding> pageBindings,
+    nta::HostRuntime &runtime) {
+  const std::uint32_t requestCount = options.requests;
+  const std::uint32_t topK = options.sparseTopK;
+  const std::uint32_t candidateCount =
+      static_cast<std::uint32_t>(kvIndices.size());
+  const std::size_t valuesPerPage =
+      2ULL * AttentionPageTokens * AttentionHeadDimension;
+  const std::size_t pageBytes = valuesPerPage * sizeof(__half);
+
+  std::vector<std::uint32_t> candidateOffsets(kvIndptr.size());
+  std::transform(
+      kvIndptr.begin(), kvIndptr.end(), candidateOffsets.begin(),
+      [](std::int32_t value) { return static_cast<std::uint32_t>(value); });
+  std::vector<AttentionPageDescriptor> catalog(candidateCount);
+  std::vector<__half> summaries(static_cast<std::size_t>(candidateCount) *
+                                AttentionHeadDimension);
+  for (std::uint32_t request = 0; request < requestCount; ++request) {
+    const std::uint32_t begin = candidateOffsets[request];
+    const std::uint32_t end = candidateOffsets[request + 1U];
+    for (std::uint32_t logical = begin; logical < end; ++logical) {
+      const std::uint32_t physical =
+          static_cast<std::uint32_t>(kvIndices[logical]);
+      const nta::flashinfer::PageBinding &binding = pageBindings[physical];
+      const nta::abi::ObjectEntry object =
+          runtime.readObject(binding.objectSlot);
+      const nta::abi::ReplicaEntry replica =
+          runtime.readReplica(object.replicaStart);
+      const bool needsStaging =
+          binding.directBase == 0 && object.stagingAddress != 0;
+      catalog[logical] = {
+          binding.directBase,
+          replica.sourceAddress,
+          needsStaging ? object.stagingAddress : binding.directBase,
+          binding.objectId,
+          binding.objectSlot,
+          binding.objectVersion,
+          binding.bytes,
+          logical + 1U == end ? static_cast<std::uint32_t>(lastPageLen[request])
+                              : AttentionPageTokens,
+          needsStaging ? AttentionPageNeedsStaging : 0U,
+          0,
+      };
+      const __half *source =
+          pages.data() + static_cast<std::size_t>(physical) * valuesPerPage;
+      std::copy_n(source, AttentionHeadDimension,
+                  summaries.data() + static_cast<std::size_t>(logical) *
+                                         AttentionHeadDimension);
+    }
+  }
+
+  nta::WorkPlanBuilder builder(topK);
+  std::vector<std::uint32_t> requestSlots(requestCount);
+  for (std::uint32_t request = 0; request < requestCount; ++request) {
+    const std::uint32_t requestSlot = requestCount - request - 1U;
+    requestSlots[request] = requestSlot;
+    const std::uint32_t requestIndex =
+        builder.addRequest({requestSlot, requestSlot + 1U});
+    std::vector<nta::abi::AcquireRequirement> requirements;
+    requirements.reserve(topK);
+    for (std::uint32_t rank = 0; rank < topK; ++rank) {
+      const AttentionPageDescriptor &descriptor =
+          catalog[candidateOffsets[request] + rank];
+      requirements.push_back({
+          descriptor.directBase,
+          0,
+          descriptor.objectId,
+          0,
+          descriptor.objectSlot,
+          descriptor.objectVersion,
+          descriptor.bytes,
+          0,
+      });
+    }
+    (void)builder.addWork(requestIndex, request, requirements);
+  }
+  nta::DeviceWorkPlan devicePlan = runtime.uploadWorkPlan(builder.finish());
+
+  DeviceBuffer<AttentionPageDescriptor> deviceCatalog(catalog.size());
+  DeviceBuffer<std::uint32_t> deviceOffsets(candidateOffsets.size());
+  DeviceBuffer<__half> deviceSummaries(summaries.size());
+  DeviceBuffer<__half> deviceHidden(queries.size());
+  DeviceBuffer<__half> deviceQueries(queries.size());
+  DeviceBuffer<std::uint32_t> deviceSelections(
+      static_cast<std::size_t>(requestCount) * topK);
+  DeviceBuffer<float> deviceOutput(static_cast<std::size_t>(requestCount) *
+                                   AttentionHeadDimension);
+  checkCuda(cudaMemcpy(deviceCatalog.get(), catalog.data(),
+                       catalog.size() * sizeof(catalog.front()),
+                       cudaMemcpyHostToDevice),
+            "upload sparse page catalog");
+  checkCuda(
+      cudaMemcpy(deviceOffsets.get(), candidateOffsets.data(),
+                 candidateOffsets.size() * sizeof(candidateOffsets.front()),
+                 cudaMemcpyHostToDevice),
+      "upload sparse candidate offsets");
+  checkCuda(cudaMemcpy(deviceSummaries.get(), summaries.data(),
+                       summaries.size() * sizeof(summaries.front()),
+                       cudaMemcpyHostToDevice),
+            "upload sparse summaries");
+  checkCuda(cudaMemcpy(deviceHidden.get(), queries.data(),
+                       queries.size() * sizeof(queries.front()),
+                       cudaMemcpyHostToDevice),
+            "upload sparse hidden state");
+
+  KernelModule kernels;
+  nta::FinitePhaseProgram phases(kernels.module());
+  cudaStream_t stream = nullptr;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t graphExec = nullptr;
+  cudaEvent_t begin = nullptr;
+  cudaEvent_t end = nullptr;
+  cudaStream_t overfetchStream = nullptr;
+  cudaEvent_t overfetchFork = nullptr;
+  cudaEvent_t overfetchReady = nullptr;
+  checkCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+            "cudaStreamCreateWithFlags sparse attention");
+  checkCuda(cudaEventCreate(&begin), "cudaEventCreate sparse begin");
+  checkCuda(cudaEventCreate(&end), "cudaEventCreate sparse end");
+  if (options.sparsePolicy == SparsePolicy::Overfetch) {
+    checkCuda(
+        cudaStreamCreateWithFlags(&overfetchStream, cudaStreamNonBlocking),
+        "create sparse overfetch stream");
+    checkCuda(cudaEventCreateWithFlags(&overfetchFork, cudaEventDisableTiming),
+              "create sparse overfetch fork event");
+    checkCuda(cudaEventCreateWithFlags(&overfetchReady, cudaEventDisableTiming),
+              "create sparse overfetch ready event");
+  }
+  const CUstream driverStream = reinterpret_cast<CUstream>(stream);
+  const CUstream overfetchDriverStream =
+      reinterpret_cast<CUstream>(overfetchStream);
+  const bool preacquired = options.sparsePolicy == SparsePolicy::Overfetch;
+  const std::uint32_t progressPasses =
+      !preacquired &&
+              (options.mode == Mode::HostStaged || options.mode == Mode::Mixed)
+          ? options.progressPasses
+          : 0;
+
+  checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+            "cudaStreamBeginCapture sparse attention");
+  phases.enqueueHost(
+      driverStream, runtime.deviceView(),
+      {candidateCount, requestCount, candidateCount, progressPasses},
+      [&] {
+        checkCuda(cudaMemsetAsync(deviceSelections.get(), 0xff,
+                                  static_cast<std::size_t>(requestCount) *
+                                      topK * sizeof(std::uint32_t),
+                                  stream),
+                  "clear sparse selections");
+        checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
+                                  static_cast<std::size_t>(requestCount) *
+                                      AttentionHeadDimension * sizeof(float),
+                                  stream),
+                  "clear sparse output");
+        if (!preacquired) {
+          kernels.invalidateSparseStaging(driverStream, runtime.deviceView(),
+                                          deviceCatalog.get(), candidateCount);
+        }
+        if (preacquired) {
+          checkCuda(cudaEventRecord(overfetchFork, stream),
+                    "fork sparse overfetch graph");
+          checkCuda(cudaStreamWaitEvent(overfetchStream, overfetchFork),
+                    "start sparse overfetch copy");
+          kernels.copySparseCatalog(overfetchDriverStream, deviceCatalog.get(),
+                                    candidateCount);
+          checkCuda(cudaEventRecord(overfetchReady, overfetchStream),
+                    "publish sparse overfetch copy");
+        }
+        kernels.produceSparseQueries(driverStream, deviceHidden.get(),
+                                     deviceQueries.get(), requestCount);
+        if (preacquired) {
+          checkCuda(cudaStreamWaitEvent(stream, overfetchReady),
+                    "join sparse overfetch graph");
+        }
+        kernels.discoverSparse(
+            driverStream, runtime.deviceView(), deviceCatalog.get(),
+            deviceOffsets.get(), deviceSummaries.get(), deviceQueries.get(),
+            requestCount, topK, devicePlan, deviceSelections.get(),
+            deviceOutput.get(), preacquired);
+      },
+      [&] {
+        kernels.readySparse(driverStream, runtime.deviceView(),
+                            deviceCatalog.get(), deviceOffsets.get(),
+                            deviceSummaries.get(), deviceQueries.get(),
+                            requestCount, topK, devicePlan,
+                            deviceSelections.get(), deviceOutput.get(), false);
+      });
+  checkCuda(cudaStreamEndCapture(stream, &graph),
+            "cudaStreamEndCapture sparse attention");
+  checkCuda(cudaGraphInstantiate(&graphExec, graph, 0),
+            "cudaGraphInstantiate sparse attention");
+
+  for (int warmup = 0; warmup < 3; ++warmup) {
+    checkCuda(cudaGraphLaunch(graphExec, stream), "sparse attention warmup");
+  }
+  checkCuda(cudaStreamSynchronize(stream),
+            "sparse attention warmup synchronize");
+  checkCuda(cudaEventRecord(begin, stream), "cudaEventRecord sparse begin");
+  for (std::uint32_t iteration = 0; iteration < options.iterations;
+       ++iteration) {
+    checkCuda(cudaGraphLaunch(graphExec, stream),
+              "sparse attention measured launch");
+  }
+  checkCuda(cudaEventRecord(end, stream), "cudaEventRecord sparse end");
+  checkCuda(cudaEventSynchronize(end), "cudaEventSynchronize sparse end");
+
+  float elapsedMilliseconds = 0;
+  checkCuda(cudaEventElapsedTime(&elapsedMilliseconds, begin, end),
+            "cudaEventElapsedTime sparse attention");
+  std::vector<std::uint32_t> selected(static_cast<std::size_t>(requestCount) *
+                                      topK);
+  std::vector<float> actual(static_cast<std::size_t>(requestCount) *
+                            AttentionHeadDimension);
+  std::vector<__half> materializedQueries(queries.size());
+  checkCuda(cudaMemcpy(selected.data(), deviceSelections.get(),
+                       selected.size() * sizeof(selected.front()),
+                       cudaMemcpyDeviceToHost),
+            "download sparse selections");
+  checkCuda(cudaMemcpy(actual.data(), deviceOutput.get(),
+                       actual.size() * sizeof(actual.front()),
+                       cudaMemcpyDeviceToHost),
+            "download sparse output");
+  checkCuda(cudaMemcpy(materializedQueries.data(), deviceQueries.get(),
+                       materializedQueries.size() *
+                           sizeof(materializedQueries.front()),
+                       cudaMemcpyDeviceToHost),
+            "download materialized sparse queries");
+
+  std::vector<AttentionRequest> selectedRequests;
+  std::vector<AttentionTileTask> selectedTasks;
+  selectedRequests.reserve(requestCount);
+  selectedTasks.reserve(static_cast<std::size_t>(requestCount) * topK);
+  for (std::uint32_t request = 0; request < requestCount; ++request) {
+    selectedRequests.push_back({request * topK, topK, request, request + 1U});
+    for (std::uint32_t rank = 0; rank < topK; ++rank) {
+      const std::uint32_t catalogIndex = selected[request * topK + rank];
+      if (catalogIndex >= catalog.size()) {
+        throw std::runtime_error("sparse selector published an invalid page");
+      }
+      const AttentionPageDescriptor &descriptor = catalog[catalogIndex];
+      selectedTasks.push_back(
+          {descriptor.objectSlot, request, descriptor.tokenCount, 0});
+    }
+  }
+  const std::vector<float> expected =
+      referenceAttention(selectedRequests, selectedTasks, materializedQueries,
+                         std::vector<__half>(pages.begin(), pages.end()));
+
+  std::uint32_t failures = 0;
+  float maximumError = 0.0F;
+  for (std::size_t element = 0; element < expected.size(); ++element) {
+    const float error = std::abs(actual[element] - expected[element]);
+    maximumError = std::max(maximumError, error);
+    failures += error > 2.0e-4F ? 1U : 0U;
+  }
+  for (std::uint32_t request = 0; request < requestCount; ++request) {
+    const nta::abi::WorkTicket ticket = runtime.readWorkTicket(request);
+    failures += ticket.state != static_cast<std::uint32_t>(
+                                    nta::abi::WorkTicketState::Done)
+                    ? 1U
+                    : 0U;
+    if (!preacquired) {
+      failures += ticket.requestSlot != requestSlots[request] ||
+                          ticket.generation != requestSlots[request] + 1U ||
+                          ticket.logicalTile != request
+                      ? 1U
+                      : 0U;
+    }
+    failures += runtime.readRequest(requestSlots[request]).outstandingBytes != 0
+                    ? 1U
+                    : 0U;
+  }
+  if (!preacquired) {
+    for (const AttentionTileTask &task : selectedTasks) {
+      failures +=
+          runtime.readObject(task.objectSlot).state !=
+                  static_cast<std::uint32_t>(nta::abi::ObjectState::Ready)
+              ? 1U
+              : 0U;
+    }
+  }
+  const nta::abi::IntentPool pool = runtime.readIntentPool();
+  failures += pool.active != 0 || pool.overflow != 0 ? 1U : 0U;
+
+  const double milliseconds = elapsedMilliseconds / options.iterations;
+  const double usefulGib = static_cast<double>(requestCount) * topK *
+                           pageBytes / (1024.0 * 1024.0 * 1024.0);
+  const std::uint32_t stagedCandidates = static_cast<std::uint32_t>(
+      std::count_if(catalog.begin(), catalog.end(),
+                    [](const AttentionPageDescriptor &page) {
+                      return (page.flags & AttentionPageNeedsStaging) != 0;
+                    }));
+  std::uint32_t selectedStaged = 0;
+  for (std::uint32_t catalogIndex : selected) {
+    selectedStaged +=
+        (catalog[catalogIndex].flags & AttentionPageNeedsStaging) != 0 ? 1U
+                                                                       : 0U;
+  }
+  const std::uint32_t movedPages =
+      preacquired ? stagedCandidates : selectedStaged;
+  const double overfetchRatio =
+      selectedStaged == 0 ? 1.0
+                          : static_cast<double>(movedPages) / selectedStaged;
+  std::cout << "mode=" << modeName(options.mode) << " demand_visibility=gpu-cta"
+            << " policy=" << sparsePolicyName(options.sparsePolicy)
+            << " query_materialization=device-before-selector"
+            << " request_binding=permuted"
+            << " requests=" << requestCount
+            << " candidate_pages=" << candidateCount << " top_k=" << topK
+            << " selected_pages=" << requestCount * topK
+            << " staged_pages_moved=" << movedPages
+            << " overfetch_ratio=" << std::fixed << std::setprecision(2)
+            << overfetchRatio << " graph_ms=" << std::fixed
+            << std::setprecision(3) << milliseconds
+            << " useful_GiB/s=" << std::setprecision(2)
+            << usefulGib / (milliseconds / 1000.0)
+            << " max_abs_error=" << std::scientific << maximumError
+            << " intents_enqueued=" << pool.enqueued
+            << " intents_consumed=" << pool.consumed
+            << " progress_passes=" << options.progressPasses
+            << " verification_failures=" << failures << '\n';
+  if (options.json) {
+    std::cout << "{\"schema\":1,\"policy\":\""
+              << sparsePolicyName(options.sparsePolicy)
+              << "\",\"graph_ms\":" << std::fixed << std::setprecision(6)
+              << milliseconds << ",\"useful_gib_per_second\":"
+              << usefulGib / (milliseconds / 1000.0)
+              << ",\"candidate_pages\":" << candidateCount
+              << ",\"selected_pages\":" << requestCount * topK
+              << ",\"staged_pages_moved\":" << movedPages
+              << ",\"overfetch_ratio\":" << overfetchRatio
+              << ",\"verification_failures\":" << failures << "}\n";
+  }
+
+  (void)cudaEventDestroy(end);
+  (void)cudaEventDestroy(begin);
+  if (overfetchReady != nullptr) {
+    (void)cudaEventDestroy(overfetchReady);
+  }
+  if (overfetchFork != nullptr) {
+    (void)cudaEventDestroy(overfetchFork);
+  }
+  if (overfetchStream != nullptr) {
+    (void)cudaStreamDestroy(overfetchStream);
+  }
+  (void)cudaGraphExecDestroy(graphExec);
+  (void)cudaGraphDestroy(graph);
+  (void)cudaStreamDestroy(stream);
+  return failures == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -534,6 +980,14 @@ int main(int argc, char **argv) {
                            tensorMaps.size() * sizeof(tensorMaps.front()),
                            cudaMemcpyHostToDevice),
                 "upload attention tensor maps");
+    }
+    if (options.sparseTopK != 0) {
+      if (!options.dumpOutput.empty()) {
+        throw std::invalid_argument(
+            "--dump-output is unavailable for sparse selected-page output");
+      }
+      return runSparseAttention(options, kvIndptr, kvIndices, lastPageLen,
+                                queries, pages, pageBindings, runtime);
     }
     std::vector<nta::flashinfer::RequestBinding> requestBindings;
     requestBindings.reserve(options.requests);
@@ -683,7 +1137,7 @@ int main(int argc, char **argv) {
     }
 
     std::uint32_t outputFailures = 0;
-    std::uint32_t continuationFailures = 0;
+    std::uint32_t workTicketFailures = 0;
     std::uint32_t partialFailures = 0;
     std::uint32_t objectFailures = 0;
     float maximumError = 0;
@@ -703,9 +1157,9 @@ int main(int argc, char **argv) {
       if (hostPartials[task].valid == 0) {
         ++partialFailures;
       }
-      if (runtime.readContinuation(task).state !=
-          static_cast<std::uint32_t>(nta::abi::ContinuationState::Done)) {
-        ++continuationFailures;
+      if (runtime.readWorkTicket(task).state !=
+          static_cast<std::uint32_t>(nta::abi::WorkTicketState::Done)) {
+        ++workTicketFailures;
       }
       const nta::abi::ObjectEntry object = runtime.readObject(task);
       if (object.state !=
@@ -715,22 +1169,22 @@ int main(int argc, char **argv) {
           std::cerr << "unready_task=" << task
                     << " object_state=" << object.state
                     << " issue_count=" << object.issueCount
-                    << " continuation_state="
-                    << runtime.readContinuation(task).state << '\n';
+                    << " work_ticket_state="
+                    << runtime.readWorkTicket(task).state << '\n';
         }
       }
     }
     for (std::uint32_t request = 0; request < options.requests; ++request) {
       if (runtime.readRequest(request).outstandingBytes != 0) {
-        ++continuationFailures;
+        ++workTicketFailures;
       }
     }
     const nta::abi::IntentPool intentPool = runtime.readIntentPool();
     if (intentPool.active != 0 || intentPool.overflow != 0) {
       ++objectFailures;
     }
-    const std::uint32_t failures = outputFailures + continuationFailures +
-                                   partialFailures + objectFailures;
+    const std::uint32_t failures =
+        outputFailures + workTicketFailures + partialFailures + objectFailures;
 
     const double milliseconds = elapsedMilliseconds / options.iterations;
     const double logicalGib =
@@ -744,7 +1198,7 @@ int main(int argc, char **argv) {
               << " max_abs_error=" << std::scientific << maximumError
               << " output_failures=" << outputFailures
               << " partial_failures=" << partialFailures
-              << " continuation_failures=" << continuationFailures
+              << " work_ticket_failures=" << workTicketFailures
               << " object_failures=" << objectFailures
               << " intents_enqueued=" << intentPool.enqueued
               << " intents_consumed=" << intentPool.consumed

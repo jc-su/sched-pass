@@ -38,7 +38,8 @@ std::uint32_t WorkPlanBuilder::addRequest(RequestBinding request) {
 
 std::uint32_t WorkPlanBuilder::addWork(
     std::uint32_t requestIndex, std::uint32_t logicalWork,
-    std::span<const abi::AcquireRequirement> requirements) {
+    std::span<const abi::AcquireRequirement> requirements,
+    std::uint32_t estimatedComputeNs) {
   if (finished_) {
     throw std::logic_error("cannot append to a finished work plan");
   }
@@ -63,7 +64,7 @@ std::uint32_t WorkPlanBuilder::addWork(
   if (range.workCount == std::numeric_limits<std::uint32_t>::max()) {
     throw std::overflow_error("request work count exceeds the NTA ABI");
   }
-  const std::uint32_t continuation =
+  const std::uint32_t workTicket =
       checkedSize(plan_.workItems.size(), "work count");
   const std::uint32_t dependencyBegin =
       checkedSize(plan_.dependencies.size(), "dependency count");
@@ -85,10 +86,18 @@ std::uint32_t WorkPlanBuilder::addWork(
       dependencyBegin,
       static_cast<std::uint32_t>(requirements.size()),
       directDependencyCount,
-      continuation,
+      workTicket,
+      requestIndex,
+      range.workCount,
+      0,
+      estimatedComputeNs,
+      0,
+      0,
+      0,
+      0,
   });
   ++range.workCount;
-  return continuation;
+  return workTicket;
 }
 
 WorkPlan WorkPlanBuilder::finish() {
@@ -99,6 +108,10 @@ WorkPlan WorkPlanBuilder::finish() {
   for (const RequestWorkRange &request : plan_.requests) {
     if (request.workCount == 0) {
       throw std::invalid_argument("every request needs at least one work item");
+    }
+    for (std::uint32_t offset = 0; offset < request.workCount; ++offset) {
+      plan_.workItems[request.workBegin + offset].contributorCount =
+          request.workCount;
     }
   }
   return std::move(plan_);

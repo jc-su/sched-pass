@@ -9,9 +9,20 @@
 
 namespace nta {
 
-enum class NvmeDestination {
-  Hbm,
-  HostMapped,
+enum class NvmeMediaPolicy {
+  RequireHardwareWriteProtection,
+  TrustReadOnlyDeviceCode,
+};
+
+struct NvmeTransportOptions {
+  // The transport exclusively owns this PCI function through VFIO/IOMMUFD.
+  // No implicit controller is selected because binding a device is destructive.
+  std::string endpoint;
+  int deviceOrdinal = -1;
+  std::uint32_t namespaceId = 1;
+  std::uint32_t queueDepth = 64;
+  std::uint32_t adminTimeoutMs = 10'000;
+  NvmeMediaPolicy mediaPolicy = NvmeMediaPolicy::RequireHardwareWriteProtection;
 };
 
 struct NvmeCapabilities {
@@ -26,14 +37,21 @@ struct NvmeCapabilities {
   bool supportsHbmPeer;
   bool translatedIommu;
   bool namespaceReadOnly;
+  bool gpuDoorbellMappingValidated;
 };
 
 struct NvmeQueueStats {
   std::uint64_t submitted;
   std::uint64_t completed;
   std::uint64_t failed;
+  std::uint64_t directSubmitted;
+  std::uint64_t directFallbacks;
   std::uint32_t outstanding;
   std::uint32_t error;
+  std::uint32_t sqTail;
+  std::uint32_t cqHead;
+  std::uint32_t cqPhase;
+  std::uint32_t nextCompletionDword3;
 };
 
 class NvmeBuffer {
@@ -49,7 +67,6 @@ public:
   [[nodiscard]] std::uint64_t dmaPageListAddress() const noexcept;
   [[nodiscard]] std::uint32_t dmaPageCount() const noexcept;
   [[nodiscard]] std::size_t bytes() const noexcept;
-  [[nodiscard]] NvmeDestination destination() const noexcept;
 
 private:
   struct Impl;
@@ -61,8 +78,8 @@ private:
 
 class NvmeTransport {
 public:
-  explicit NvmeTransport(std::string devicePath = "/dev/nta_nvme",
-                         int deviceOrdinal = -1);
+  explicit NvmeTransport(std::string vfioEndpoint, int deviceOrdinal = -1);
+  explicit NvmeTransport(NvmeTransportOptions options);
   ~NvmeTransport();
 
   NvmeTransport(const NvmeTransport &) = delete;
@@ -75,7 +92,7 @@ public:
   [[nodiscard]] abi::NvmeQueueView *deviceQueue() const noexcept;
   [[nodiscard]] NvmeQueueStats readStats() const;
   [[nodiscard]] std::unique_ptr<NvmeBuffer>
-  allocate(std::size_t bytes, NvmeDestination destination);
+  allocate(std::size_t bytes);
 
 private:
   struct Impl;

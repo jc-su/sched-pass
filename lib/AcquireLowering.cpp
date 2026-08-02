@@ -1,5 +1,5 @@
 #include "AcquireAnalysisInternal.h"
-#include "ContinuationLoweringInternal.h"
+#include "DeferralLoweringInternal.h"
 
 #include "nta/AcquireIR.h"
 #include "nta/Passes.h"
@@ -13,6 +13,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/WithColor.h"
 
 #include <utility>
@@ -34,6 +35,7 @@ MDNode *acquisitionMetadata(LLVMContext &context, bool tensorMap) {
       ConstantAsMetadata::get(
           ConstantInt::get(Type::getInt32Ty(context), abi::Version)),
       MDString::get(context, tensorMap ? "tensor-map" : "byte-address"),
+      MDString::get(context, "split-phase-cta"),
   };
   return MDNode::get(context, fields);
 }
@@ -44,6 +46,7 @@ MDNode *dependencySetMetadata(LLVMContext &context) {
       ConstantAsMetadata::get(
           ConstantInt::get(Type::getInt32Ty(context), abi::Version)),
       MDString::get(context, "dependency-set"),
+      MDString::get(context, "split-phase-cta"),
   };
   return MDNode::get(context, fields);
 }
@@ -59,7 +62,7 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
   Value *requirementCount = marker->getArgOperand(ir::RequirementCount);
   Value *directRequirementCount =
       marker->getArgOperand(ir::DirectRequirementCount);
-  Value *continuation = marker->getArgOperand(ir::SetContinuation);
+  Value *workTicket = marker->getArgOperand(ir::SetWorkTicket);
   Value *requestSlot = binding->getArgOperand(ir::RequestSlot);
   Value *generation = binding->getArgOperand(ir::RequestGeneration);
   Type *i1 = Type::getInt1Ty(context);
@@ -77,39 +80,39 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
 
   BasicBlock *entry = marker->getParent();
   Instruction *afterMarker = marker->getNextNode();
-  BasicBlock *continuationBlock =
+  BasicBlock *workTicketBlock =
       entry->splitBasicBlock(afterMarker, "nta.acquire-set.cont");
   entry->getTerminator()->eraseFromParent();
   BasicBlock *classifyBlock = BasicBlock::Create(
-      context, "nta.acquire-set.classify", function, continuationBlock);
+      context, "nta.acquire-set.classify", function, workTicketBlock);
   BasicBlock *slowBlock = BasicBlock::Create(context, "nta.acquire-set.slow",
-                                             function, continuationBlock);
+                                             function, workTicketBlock);
 
   IRBuilder<> entryBuilder(entry);
   entryBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   CallInst *live = entryBuilder.CreateCall(
       requestLive, {runtime, requestSlot, generation}, "nta.request.live");
-  entryBuilder.CreateCondBr(live, classifyBlock, continuationBlock);
+  entryBuilder.CreateCondBr(live, classifyBlock, workTicketBlock);
 
   IRBuilder<> classifyBuilder(classifyBlock);
   classifyBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   Value *allDirect = classifyBuilder.CreateICmpEQ(
       directRequirementCount, requirementCount, "nta.dependencies.direct");
-  classifyBuilder.CreateCondBr(allDirect, continuationBlock, slowBlock);
+  classifyBuilder.CreateCondBr(allDirect, workTicketBlock, slowBlock);
 
   IRBuilder<> slowBuilder(slowBlock);
   slowBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   CallInst *ready = slowBuilder.CreateCall(
       acquireSet,
       {runtime, requestSlot, generation, requirements, requirementCount,
-       directRequirementCount, continuation},
+       directRequirementCount, workTicket},
       "nta.dependencies.ready");
   ready->setMetadata(ir::AcquisitionMetadata, dependencySetMetadata(context));
-  slowBuilder.CreateBr(continuationBlock);
+  slowBuilder.CreateBr(workTicketBlock);
 
-  IRBuilder<> continuationBuilder(&continuationBlock->front());
-  continuationBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
-  PHINode *result = continuationBuilder.CreatePHI(i1, 3, "nta.ready");
+  IRBuilder<> workTicketBuilder(&workTicketBlock->front());
+  workTicketBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
+  PHINode *result = workTicketBuilder.CreatePHI(i1, 3, "nta.ready");
   result->addIncoming(ConstantInt::getFalse(context), entry);
   result->addIncoming(ConstantInt::getTrue(context), classifyBlock);
   result->addIncoming(ready, slowBlock);
@@ -139,7 +142,7 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
   Value *objectVersion = marker->getArgOperand(ir::ObjectVersion);
   Value *offset = marker->getArgOperand(ir::Offset);
   Value *bytes = marker->getArgOperand(ir::Bytes);
-  Value *continuation = marker->getArgOperand(ir::Continuation);
+  Value *workTicket = marker->getArgOperand(ir::WorkTicket);
   const auto *markerFunction =
       dyn_cast<Function>(marker->getCalledOperand()->stripPointerCasts());
   const bool tensorMap =
@@ -163,22 +166,22 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
 
   BasicBlock *entry = marker->getParent();
   Instruction *afterMarker = marker->getNextNode();
-  BasicBlock *continuationBlock =
+  BasicBlock *workTicketBlock =
       entry->splitBasicBlock(afterMarker, "nta.acquire.cont");
   entry->getTerminator()->eraseFromParent();
 
   BasicBlock *resolveBlock = BasicBlock::Create(context, "nta.acquire.resolve",
-                                                function, continuationBlock);
+                                                function, workTicketBlock);
   BasicBlock *directBlock = BasicBlock::Create(context, "nta.acquire.direct",
-                                               function, continuationBlock);
+                                               function, workTicketBlock);
   BasicBlock *slowBlock = BasicBlock::Create(context, "nta.acquire.slow",
-                                             function, continuationBlock);
+                                             function, workTicketBlock);
 
   IRBuilder<> entryBuilder(entry);
   entryBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   CallInst *live = entryBuilder.CreateCall(
       requestLive, {runtime, requestSlot, generation}, "nta.request.live");
-  entryBuilder.CreateCondBr(live, resolveBlock, continuationBlock);
+  entryBuilder.CreateCondBr(live, resolveBlock, workTicketBlock);
 
   IRBuilder<> resolveBuilder(resolveBlock);
   resolveBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
@@ -192,23 +195,23 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
     directAddress = directBuilder.CreateInBoundsGEP(i8, directBase, offset,
                                                     "nta.direct.address");
   }
-  directBuilder.CreateBr(continuationBlock);
+  directBuilder.CreateBr(workTicketBlock);
 
   IRBuilder<> slowBuilder(slowBlock);
   slowBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   CallInst *slow = slowBuilder.CreateCall(acquireSlow,
                                           {runtime, requestSlot, generation,
                                            objectSlot, objectId, objectVersion,
-                                           offset, bytes, continuation},
+                                           offset, bytes, workTicket},
                                           "nta.pending.address");
   slow->setMetadata(ir::AcquisitionMetadata,
                     acquisitionMetadata(context, tensorMap));
-  slowBuilder.CreateBr(continuationBlock);
+  slowBuilder.CreateBr(workTicketBlock);
 
-  IRBuilder<> continuationBuilder(&continuationBlock->front());
-  continuationBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
+  IRBuilder<> workTicketBuilder(&workTicketBlock->front());
+  workTicketBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
   PHINode *result =
-      continuationBuilder.CreatePHI(pointerType, 3, "nta.address");
+      workTicketBuilder.CreatePHI(pointerType, 3, "nta.address");
   result->addIncoming(ConstantPointerNull::get(cast<PointerType>(pointerType)),
                       entry);
   result->addIncoming(directAddress, directBlock);
@@ -249,11 +252,20 @@ AcquireLoweringPass::run(Module &module,
     for (const RejectedSite &rejected : plan.rejected) {
       ++SitesRejected;
       rejectedAny = true;
-      WithColor::warning(errs(), "nta")
+      WithColor::error(errs(), "nta")
           << rejected.marker->getFunction()->getName() << ": "
           << rejected.reason << '\n';
     }
+  }
 
+  // Leaving an unsafe marker unresolved turns a verifier failure into a later
+  // linker error and allows JIT callers to miss the actual cause. Reject the
+  // module before applying any partial lowering.
+  if (rejectedAny) {
+    report_fatal_error("NTA acquisition verification failed", false);
+  }
+
+  for (FunctionPlan &plan : plans) {
     for (const BoundSite &site : plan.acquisitions) {
       changed |= lowerAcquisition(module, site);
     }
@@ -277,8 +289,7 @@ AcquireLoweringPass::run(Module &module,
     removeUnusedMarker(module, ir::DeferMarker);
   }
 
-  return changed || rejectedAny ? PreservedAnalyses::none()
-                                : PreservedAnalyses::all();
+  return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
 } // namespace nta

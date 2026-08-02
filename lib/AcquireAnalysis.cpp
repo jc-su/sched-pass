@@ -2,12 +2,13 @@
 
 #include "nta/AcquireIR.h"
 
-#include "llvm/IR/CFG.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/PostDominators.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
-#include "llvm/ADT/DenseMap.h"
 
 #include <optional>
 #include <string>
@@ -56,7 +57,7 @@ std::optional<std::string> validateAcquire(CallInst &call) {
       !isInteger(call.getArgOperand(ir::ObjectVersion), 32) ||
       !isInteger(call.getArgOperand(ir::Offset), 64) ||
       !isInteger(call.getArgOperand(ir::Bytes), 32) ||
-      !isInteger(call.getArgOperand(ir::Continuation), 32)) {
+      !isInteger(call.getArgOperand(ir::WorkTicket), 32)) {
     return "acquisition marker argument types do not match the marker contract";
   }
   return std::nullopt;
@@ -71,7 +72,7 @@ std::optional<std::string> validateAcquireSet(CallInst &call) {
       !call.getArgOperand(ir::Requirements)->getType()->isPointerTy() ||
       !isInteger(call.getArgOperand(ir::RequirementCount), 32) ||
       !isInteger(call.getArgOperand(ir::DirectRequirementCount), 32) ||
-      !isInteger(call.getArgOperand(ir::SetContinuation), 32)) {
+      !isInteger(call.getArgOperand(ir::SetWorkTicket), 32)) {
     return "dependency-set arguments do not match the marker contract";
   }
   return std::nullopt;
@@ -81,7 +82,7 @@ std::optional<std::string> validateDefer(CallInst &call) {
   if (call.arg_size() != ir::DeferArgumentCount ||
       !call.getType()->isVoidTy() ||
       !call.getArgOperand(ir::DeferRuntime)->getType()->isPointerTy() ||
-      !isInteger(call.getArgOperand(ir::DeferContinuation), 32)) {
+      !isInteger(call.getArgOperand(ir::DeferWorkTicket), 32)) {
     return "defer marker has an incompatible ABI";
   }
   return std::nullopt;
@@ -107,14 +108,22 @@ bool isNull(Value *value) {
   return constant != nullptr && constant->isNullValue();
 }
 
-// NTA markers are CTA collectives. LLVM's generic GPU uniformity analysis is
-// intentionally thread-level and classifies blockIdx as divergent, so use the
-// narrower contract needed here: kernel arguments and block/grid dimensions
-// are CTA-uniform; thread, lane, and warp identities are not.
+// NTA markers are CTA collectives. The typed frontend asserts that ordinary
+// plan/catalog loads used by a marker are immutable for the launch; the engine
+// establishes that contract through stream ordering. This verifier rejects
+// visible divergence but cannot prove absence of a concurrent writer from a
+// plain LLVM load. LLVM's generic GPU uniformity analysis is thread-level and
+// classifies blockIdx as divergent, so use the narrower CTA contract here:
+// kernel arguments and block/grid dimensions are CTA-uniform; thread, lane,
+// and warp identities are not.
 class CtaUniformity {
 public:
+  explicit CtaUniformity(PostDominatorTree &postDominatorTree)
+      : postDominatorTree_(postDominatorTree) {}
+
   bool isUniform(Value *value) {
-    if (isa<Constant>(value) || isa<Argument>(value) || isa<GlobalValue>(value)) {
+    if (isa<Constant>(value) || isa<Argument>(value) ||
+        isa<GlobalValue>(value)) {
       return true;
     }
     auto *instruction = dyn_cast<Instruction>(value);
@@ -139,6 +148,35 @@ private:
   bool uniformOperands(Instruction &instruction) {
     for (Use &operand : instruction.operands()) {
       if (!isUniform(operand.get())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool hasUniformControl(BasicBlock *target) {
+    for (BasicBlock &controlBlockValue : *target->getParent()) {
+      BasicBlock *controlBlock = &controlBlockValue;
+      Instruction *terminator = controlBlock->getTerminator();
+      Value *condition = nullptr;
+      if (auto *branch = dyn_cast<BranchInst>(terminator);
+          branch != nullptr && branch->isConditional()) {
+        condition = branch->getCondition();
+      } else if (auto *select = dyn_cast<SwitchInst>(terminator)) {
+        condition = select->getCondition();
+      }
+      if (condition == nullptr) {
+        continue;
+      }
+      bool postDominatesSuccessor = false;
+      for (unsigned successor = 0; successor < terminator->getNumSuccessors();
+           ++successor) {
+        postDominatesSuccessor |= postDominatorTree_.dominates(
+            target, terminator->getSuccessor(successor));
+      }
+      if (postDominatesSuccessor &&
+          !postDominatorTree_.dominates(target, controlBlock) &&
+          !isUniform(condition)) {
         return false;
       }
     }
@@ -186,8 +224,15 @@ private:
         return false;
       }
       Value *first = phi->getIncomingValue(0);
+      bool identical = true;
       for (unsigned index = 1; index < phi->getNumIncomingValues(); ++index) {
-        if (phi->getIncomingValue(index) != first) {
+        identical &= phi->getIncomingValue(index) == first;
+      }
+      if (identical) {
+        return true;
+      }
+      for (unsigned index = 0; index < phi->getNumIncomingValues(); ++index) {
+        if (!hasUniformControl(phi->getIncomingBlock(index))) {
           return false;
         }
       }
@@ -200,11 +245,12 @@ private:
   }
 
   DenseMap<Instruction *, State> states_;
+  PostDominatorTree &postDominatorTree_;
 };
 
 std::optional<std::string>
 validateCtaCollective(CallInst &marker, CallInst &binding,
-                      DominatorTree &dominatorTree) {
+                      PostDominatorTree &postDominatorTree) {
   const CallingConv::ID callingConvention =
       marker.getFunction()->getCallingConv();
   if (callingConvention != CallingConv::PTX_Kernel &&
@@ -212,7 +258,7 @@ validateCtaCollective(CallInst &marker, CallInst &binding,
       callingConvention != CallingConv::SPIR_KERNEL) {
     return "acquisition markers must be inlined into a GPU kernel entry";
   }
-  CtaUniformity uniformity;
+  CtaUniformity uniformity(postDominatorTree);
   for (Use &argument : marker.args()) {
     if (!uniformity.isUniform(argument.get())) {
       return "acquisition marker has a non-CTA-uniform operand";
@@ -225,10 +271,11 @@ validateCtaCollective(CallInst &marker, CallInst &binding,
   }
 
   BasicBlock *markerBlock = marker.getParent();
-  DomTreeNode *node = dominatorTree.getNode(markerBlock);
-  for (node = node == nullptr ? nullptr : node->getIDom(); node != nullptr;
-       node = node->getIDom()) {
-    BasicBlock *controlBlock = node->getBlock();
+  // Y is control-dependent on X when Y post-dominates at least one successor of
+  // X but does not post-dominate X. This catches non-dominating divergent edges
+  // without treating every edge that can reach Y as controlling it.
+  for (BasicBlock &controlBlockValue : *marker.getFunction()) {
+    BasicBlock *controlBlock = &controlBlockValue;
     Instruction *terminator = controlBlock->getTerminator();
     Value *condition = nullptr;
     if (auto *branch = dyn_cast<BranchInst>(terminator);
@@ -237,20 +284,19 @@ validateCtaCollective(CallInst &marker, CallInst &binding,
     } else if (auto *select = dyn_cast<SwitchInst>(terminator)) {
       condition = select->getCondition();
     }
-    unsigned reachableSuccessors = 0;
+    if (condition == nullptr) {
+      continue;
+    }
+    bool postDominatesSuccessor = false;
     for (unsigned successor = 0; successor < terminator->getNumSuccessors();
          ++successor) {
-      reachableSuccessors +=
-          isPotentiallyReachable(terminator->getSuccessor(successor),
-                                 markerBlock, nullptr, &dominatorTree)
-              ? 1U
-              : 0U;
+      postDominatesSuccessor |= postDominatorTree.dominates(
+          markerBlock, terminator->getSuccessor(successor));
     }
-    const bool controlsMarker = reachableSuccessors != 0 &&
-                                reachableSuccessors !=
-                                    terminator->getNumSuccessors();
-    if (controlsMarker && condition != nullptr &&
-        !uniformity.isUniform(condition)) {
+    const bool controlsMarker =
+        postDominatesSuccessor &&
+        !postDominatorTree.dominates(markerBlock, controlBlock);
+    if (controlsMarker && !uniformity.isUniform(condition)) {
       return "acquisition marker is control-dependent on a non-CTA-uniform "
              "branch";
     }
@@ -336,9 +382,9 @@ validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
   const unsigned runtimeArgument = dependencySet
                                        ? static_cast<unsigned>(ir::SetRuntime)
                                        : static_cast<unsigned>(ir::Runtime);
-  const unsigned continuationArgument =
-      dependencySet ? static_cast<unsigned>(ir::SetContinuation)
-                    : static_cast<unsigned>(ir::Continuation);
+  const unsigned workTicketArgument =
+      dependencySet ? static_cast<unsigned>(ir::SetWorkTicket)
+                    : static_cast<unsigned>(ir::WorkTicket);
 
   for (User *user : marker.users()) {
     if (user == branch->condition) {
@@ -369,8 +415,8 @@ validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
           call != nullptr && hasName(*call, ir::DeferMarker)) {
         if (call->getArgOperand(ir::DeferRuntime) !=
                 marker.getArgOperand(runtimeArgument) ||
-            call->getArgOperand(ir::DeferContinuation) !=
-                marker.getArgOperand(continuationArgument)) {
+            call->getArgOperand(ir::DeferWorkTicket) !=
+                marker.getArgOperand(workTicketArgument)) {
           return "pending edge defers a different acquisition token";
         }
         ++deferCount;
@@ -392,7 +438,8 @@ validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
   }
 
   if (deferCount != 1 || !foundReturn) {
-    return "pending edge must defer exactly once and return from the finite kernel";
+    return "pending edge must defer exactly once and return from the finite "
+           "kernel";
   }
   return std::nullopt;
 }
@@ -431,6 +478,7 @@ FunctionPlan analyzeAcquisitions(Function &function) {
   }
 
   DominatorTree dominatorTree(function);
+  PostDominatorTree postDominatorTree(function);
   for (CallInst *marker : acquireMarkers) {
     const bool set = hasName(*marker, ir::AcquireSetMarker);
     if (std::optional<std::string> error =
@@ -446,7 +494,7 @@ FunctionPlan analyzeAcquisitions(Function &function) {
       continue;
     }
     if (std::optional<std::string> error =
-            validateCtaCollective(*marker, *binding, dominatorTree)) {
+            validateCtaCollective(*marker, *binding, postDominatorTree)) {
       plan.rejected.push_back({marker, std::move(*error)});
       continue;
     }

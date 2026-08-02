@@ -5,25 +5,35 @@ Status: implementation contract
 This document defines the problem, claims, system boundary, execution model, and
 implementation gates for the clean `nonresident-acquisition` branch. Decisions
 in this document take precedence over the previous prototype's design notes.
+`SYSTEM_PLAN.md` governs the target system motivation and implementation order;
+this document governs implemented mechanism invariants and status.
 
-Implementation status (2026-08-01): M0-M3 have a working vertical slice tested
+Implementation status (2026-08-02): M0-M3 have a working vertical slice tested
 on an NVIDIA RTX PRO 6000 Blackwell Server Edition. M5 has a numerically checked
 split-K paged-attention mechanism workload and version-checked JIT hooks
 executed in FlashInfer 0.6.12 decode and FA2 paged-prefill kernels. This is not
-yet a serving-framework result. M6
-has real TMA descriptor selection and hardware TMA after direct or externally
-staged acquisition; automatic production-IR recognition remains open. An
-earlier NVMe ABI DMAed into CUDA HBM and mapped DRAM, but it lacked the current
-containment contract. M4 now refuses this host's identity IOMMU domain, so a
-current-ABI hardware rerun requires a translated testbed. RDMA is not implemented because this
-host has no RNIC, and there is no placeholder backend. M8 now has a real routed
-MoE matrix workload on the common mechanism; production MoE baselines remain
-open.
+yet a production serving result; SGLang 0.5.14 HiCache and decode graph replay
+are locally integrated. M6 has real TMA descriptor selection and
+hardware TMA after direct or externally staged acquisition; automatic
+production-IR recognition remains open. M4 has a VFIO PCI cdev/IOMMUFD
+bootstrap behind the same queue ABI, an exact NVIDIA BAR-VMA GPU-write gate,
+and a controller-free tested CTA-side NVMe try-issue path with bounded scheduled
+fallback. ABI-v18 hardware qualification completed 32,000 compulsory-miss,
+checksum-verified reads through an eight-pass graph on one CD8P controller. The
+controller was restored to `nvmex` afterward. RNIC/RDMA is explicitly deferred because this host has no
+RNIC, and no active backend is claimed. M8 has a real routed MoE matrix workload
+on the common mechanism; production MoE baselines remain open. A 10,000-epoch
+runtime/graph lifecycle stress passes; the two-device ownership test is present
+but skips on this one-GPU host.
 
-ABI v10 defines one engine-neutral device work item, fixed-capacity dependency
-segments, and a pending-only readiness index. One finite CTA continuation can
-acquire several mixed-tier objects and is published only after every object
-identity, version, and ready state validates. Reusable device plans support
+ABI v19 defines one engine-neutral device work item, fixed-capacity dependency
+segments, completion-driven reverse dependency edges, and a compact runnable
+work queue. The completion CTA that satisfies the final dependency performs the
+single `Pending -> Ready` transition and appends the ticket; a bounded
+publication kernel remains as a compatibility and diagnostic drain. One finite
+CTA work ticket can acquire several mixed-tier objects and is published only
+after every object identity and version match and every dependency reaches the
+literal `Ready` state. Reusable device plans support
 pinned, asynchronous updates. Generic compute, paged attention, TMA attention,
 and MoE consume this same ABI; FlashInfer is an optional metadata adapter rather
 than the core execution model.
@@ -42,24 +52,26 @@ request semantics
     -> external object range
     -> physical source and transport
     -> completion
-    -> runnable continuation
+    -> runnable work ticket
 ```
 
 We will test the following research hypothesis:
 
-> A compiler can bind external data-acquisition sites in existing finite GPU
-> kernels to live request semantics, preserve native load/cp.async/TMA fast
-> paths for directly addressable data, and convert command-based accesses into
-> suspendable acquisition and ready-continuation execution without persistent
-> GPU workers or loaded-path CPU control.
+> A compiler can turn an all-or-nothing batched GPU kernel into an incrementally
+> executable operator whose runnable request/tile subsets can be co-scheduled
+> with data arrival and later request admission across memory tiers, without
+> persistent GPU workers or loss of the native complete-data path.
 
-The primary workload is external KV for online serving. The mechanism is
-designed for request-conditioned external tensors and object ranges rather than
-for KV alone.
+The primary workload is dense external KV for online serving with heterogeneous
+arrival time. Dense KV tests overlap of useful partial computation with data
+movement. GPU-selected sparse KV additionally tests avoided transfer and is not
+the scope of the system. The mechanism is designed for request-conditioned
+external tensors and object ranges rather than for KV alone. The complete
+co-design and evaluation roadmap is in `SYSTEM_PLAN.md`.
 
 ## 2. Problem
 
-### 2.1 Semantic discontinuity
+### 2.1 Two-sided semantic blind spot
 
 The serving scheduler knows:
 
@@ -85,7 +97,15 @@ The transport knows:
 
 Without an explicit binding, transport work is ordered by low-level arrival
 rather than request criticality, completions do not directly release request
-continuations, and stale work survives cancellation or batch-slot reuse.
+work tickets, and stale work survives cancellation or batch-slot reuse.
+
+Neither side can reconstruct the missing half from pointers or launch order.
+The compiler hook therefore binds userspace lifecycle state to the kernel's
+logical tile at the last reconstructible pre-state boundary. The runtime keeps
+that identity across an asynchronous transport and maps a physical CTA whose
+data became available back to the original logical work. Request policy can
+then govern admission while tile availability governs incremental execution,
+without making either side infer the other's state.
 
 ### 2.2 Addressability discontinuity
 
@@ -117,7 +137,19 @@ operations can outlive a CTA by microseconds. A compute CTA must not:
 - remain resident solely to provide progress; or
 - execute a divergent exit across a required CTA barrier.
 
-The system therefore needs a continuation that survives the issuing CTA.
+The system therefore needs a work ticket that survives the issuing CTA.
+
+### 2.4 Granularity discontinuity
+
+One I/O and one launch per tile exposes partial computation but wastes bandwidth
+for dense, contiguous demand. Waiting for a complete layer preserves transfer
+efficiency but creates an all-or-nothing kernel barrier under arrival skew.
+
+The target system continuously groups unavailable object ranges while the saved
+transfer and command cost exceeds the request delay and useful compute being
+postponed. Direct execution, bulk transfer, fine-grained acquisition, and
+whole-request delay are limiting outcomes of this one incremental scheduler,
+not independent production policies.
 
 ## 3. Scope
 
@@ -156,9 +188,9 @@ The system therefore needs a continuation that survives the issuing CTA.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v10 registers each staged directory entry as one acquisition tile. Direct
+ABI v19 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
-this makes duplicate suppression exact without a range-readiness bitmap.
+this makes duplicate suppression exact without a range-availability bitmap.
 
 **Acquisition site**
 : A compiler-recognized point where logical GPU work requires an external object
@@ -170,9 +202,17 @@ this makes duplicate suppression exact without a range-readiness bitmap.
 **Transport source**
 : A source requiring RDMA, NVMe, or another command protocol.
 
-**Continuation**
+**Work ticket**
 : Reconstructible logical work that becomes runnable after all dependencies are
   ready.
+
+**Runnable tile**
+: One current-generation logical tile whose complete dependency set is
+  available. The ABI represents this condition with work-ticket state `Ready`.
+
+**Incremental operator**
+: A compiled operator that can execute valid runnable-tile subsets over several
+  finite launches and merge only complete partial results.
 
 **Nonresident acquisition**
 : An acquisition whose logical future may outlive the issuing CTA.
@@ -222,7 +262,7 @@ Replica {
 AcquireIntent {
     request_id
     generation
-    continuation_id
+    work ticket_id
     object_id
     object_version
     offset
@@ -234,8 +274,8 @@ AcquireIntent {
 ```
 
 ```text
-Continuation {
-    continuation_id
+Work ticket {
+    work ticket_id
     request_id
     generation
     logical_tile
@@ -252,7 +292,7 @@ WorkItem {
     dependency_begin
     dependency_count
     direct_dependency_count
-    continuation_id
+    work ticket_id
 }
 
 AcquireRequirement {
@@ -310,7 +350,28 @@ Backend-specific lowering:
 
 An HBM hit must not enter a global intent queue or perform a global atomic.
 
-### 6.3 Deferred path
+### 6.3 Incremental execution cycle
+
+The target runtime operates one bounded cycle:
+
+```text
+consume completed transfers
+    -> update dependent object and tile counters
+    -> append newly runnable logical tiles
+    -> group or issue unavailable object ranges by request impact
+    -> launch compact runnable work
+    -> merge requests with every contributor complete
+    -> report partial progress to the engine scheduler
+```
+
+The grouping objective uses contiguous bytes, duplicate fan-in, predicted queue
+and transfer time, request SLO slack, delayed useful compute, and measured
+launch/work-ticket cost. Forced bulk, fine-grained, and whole-request-delay
+controls exist for evaluation only. `SYSTEM_PLAN.md` defines the complete target;
+the current implementation covers the direct and unavailable-data mechanisms,
+not the unified scheduler or engine feedback loop.
+
+### 6.4 Unavailable-data path
 
 For RDMA, NVMe, or another command source:
 
@@ -319,7 +380,7 @@ derive request and object
     -> coalesce duplicate intents
     -> reserve request and backend credit
     -> submit or enqueue transport work
-    -> publish continuation
+    -> publish work ticket
     -> end/defer the logical tile
 ```
 
@@ -330,14 +391,47 @@ validate completion
     -> validate request generation and object version
     -> publish destination visibility
     -> recycle transport and staging credits
-    -> consult pending continuations and scan each bounded dependency segment
-    -> enqueue the continuation only when every dependency is ready
+    -> consult pending work tickets and scan each bounded dependency segment
+    -> enqueue the work ticket only when every dependency is ready
 ```
 
-A later finite kernel invocation receives the ready continuation and executes
-the original native load, `cp.async`, or TMA path from the HBM staging address.
+A later finite kernel invocation receives a work ticket in the literal `Ready`
+state and executes the original native load, `cp.async`, or TMA path from the
+HBM staging address.
 
-### 6.4 No arbitrary live-state capture
+### 6.5 CTA-side try-issue
+
+For an enabled command backend, the application CTA leader may attempt one
+non-spinning submission before publishing an intent:
+
+```text
+external miss
+    -> claim and fully publish a generation-safe work ticket
+    -> count backend demand before attempting transport ownership
+    -> if this is the oldest demand and a queue lease is immediately available:
+         reserve credits, construct command, ring doorbell
+       else:
+         publish request-aware intent
+    -> return the whole CTA
+```
+
+The queue lease protects only command construction and publication. It is
+released before the CTA returns and is never held across device I/O. The CTA
+does not inspect completion state. A separate finite progress invocation drains
+the CQ, releases credits, and publishes data availability. ABI v19 implements this for
+NVMe; RDMA remains inactive until a real backend and RNIC testbed exist.
+
+The fast path is intentionally opportunistic. Backend demand is atomically
+counted before the lease attempt, closing the reservation-to-publication window:
+only the oldest pending acquisition may issue directly. Concurrent demand,
+queue ownership contention, full SQ/CID state, or failed admission all fall
+back immediately. Backend-local counters prevent unrelated host staging work
+from suppressing NVMe submission while preserving the global request-aware
+scheduler for contested NVMe work. Direct construction is capped at 32
+destination PRP pages; larger transfers retain warp-cooperative PRP construction
+and batched doorbells in the scheduled progress kernel.
+
+### 6.6 No arbitrary live-state capture
 
 Version 1 only permits deferral at a compiler-proven safe boundary:
 
@@ -383,6 +477,13 @@ of engine and kernel names. It does not yet infer arbitrary production load,
 `cp.async`, or TMA address cones. The previous branch's recognition experiment
 is not evidence for this branch.
 
+FlashInfer is the first typed frontend: a version- and source-hash-checked C++
+template overlay retains its scheduler request/tile coordinates, inserts the
+work hook before shared/variant state initialization, and threads request-local
+merge groups into cascade reduction. The LLVM pass remains the backend legality
+verifier. A second generated-kernel frontend and generation of distinct direct
+and incremental forms from one typed operator remain open.
+
 ### 7.3 Phase C: object-key derivation
 
 Derive:
@@ -394,7 +495,7 @@ object_id, byte range, logical tile, request, generation
 Object identity must come from an explicit external-object contract or a
 structurally verified address cone. An opaque pointer alone is insufficient.
 
-### 7.4 Phase D: continuation legality
+### 7.4 Phase D: work ticket legality
 
 Required legality conditions are:
 
@@ -413,6 +514,21 @@ identity, and block/grid dimensions are collective; and thread/lane/warp
 identity, atomics, volatile loads, local allocation, and unknown calls taint
 control or operands as non-collective. Automatic discovery of unmarked
 production address cones remains an open production gate.
+
+Ordinary plan and catalog loads used as collective marker operands are uniform
+under the typed frontend contract that those allocations are immutable for the
+finite launch. The engine establishes that property through stream/graph
+ordering. The verifier rejects volatile and atomic loads and visible
+thread-derived operands, but LLVM IR alone cannot prove that an unrelated CTA
+never writes a plain global address; unsupported frontends must not assert this
+contract without equivalent ownership.
+
+The ABI-v19 IR suite includes a positive device-selected-object case whose slot,
+identity, version, range, and direct pointer are loaded from a catalog selected
+by CTA identity. The pass lowers that case and tags it `split-phase-cta` while
+the existing thread/lane-derived fixtures remain rejected. This establishes
+support for explicit GPU-selected object semantics, not automatic discovery of
+an unmarked catalog.
 
 For JIT-generated source, the pass also registers at Clang's optimizer-last
 extension point. An nvcc-compatible shim translates the generator command,
@@ -444,10 +560,10 @@ LLVM optimization may inline the backend fast paths.
 The host runtime may:
 
 - allocate and pin device tables and staging pools;
-- export or import HBM buffers through DMA-BUF;
-- register HBM with NIC and NVMe drivers;
+- register HBM with a future validated NIC or peer-memory provider;
 - create RDMA QPs and exchange remote keys;
-- create NVMe queue pairs and map doorbells;
+- acquire a dedicated NVMe function through VFIO/IOMMUFD, create queue pairs,
+  and map the isolated doorbell page;
 - install external-object replicas; and
 - publish request contexts.
 
@@ -455,13 +571,14 @@ This work is initialization, not per-I/O execution.
 
 Production engines may non-owningly register existing HBM, mapped-host, and
 staging allocations. They retain allocation and graph ownership. A reusable
-finite-phase launcher enqueues reset, bounded backend progress, readiness
-publication, and ready work into the engine's stream or existing graph capture.
+finite-phase launcher enqueues reset, bounded backend progress, and runnable
+work into the engine's stream or existing graph capture. Normal backend
+progress publishes newly runnable tickets directly, without a separate launch.
 
 ### 8.2 Device directory
 
 The device-visible directory contains compact, read-mostly placement entries.
-Frequently changing readiness and credit state is stored separately to avoid
+Frequently changing availability and credit state is stored separately to avoid
 invalidating placement metadata.
 
 ### 8.3 Backend interface
@@ -484,14 +601,28 @@ No persistent service is permitted.
 
 The host-staging implementation captures discover, progress, and resume as
 three finite CUDA graph nodes. Each progress CTA owns at most one published
-intent and exits after copying one finite object tile.
+intent, copies one finite object tile, publishes any newly runnable dependent,
+and exits.
 
 The NVMe implementation uses repeated, statically bounded progress/resume nodes
 inside one finite graph launch. An NVMe progress invocation checks at most a
 completion budget, submits at most an issue budget, batches each doorbell, and
 returns immediately when the next CQ phase is absent. It never waits for a new
-completion. This turns external latency into graph-level continuation rather
+completion. This turns external latency into graph-level work ticket rather
 than CTA residency.
+
+The current graph topology is deliberately fixed and bounded. CUDA conditional
+`IF`/`WHILE` nodes are a possible way to skip empty rounds, but CUDA forbids
+device graph launch from kernels in a conditional-node body. A future adaptive
+graph must choose a compatible control strategy; it cannot combine those two
+features as if they were independently composable. See the
+[CUDA Graphs programming guide](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html).
+
+ABI v19 also allows the missing application CTA to attempt one NVMe submission.
+A backend-local queue lease serializes it with the finite progress kernel. The
+CTA rings at most one doorbell, never waits for the lease or completion, and
+publishes an intent on any recoverable failure. This is a latency path, not a
+replacement for batched request-aware submission.
 
 A future transport integration may instead let one warp at a
 compiler-selected entry or exit point acquire a short-lived progress lease.
@@ -522,17 +653,19 @@ conditions.
 
 The current implementation carries request generation, tenant, priority, and
 deadline into every intent. Request, tenant, and backend byte credits are
-reserved without waiting and rolled back on admission failure. NVMe scans the
-bounded pool and chooses by priority/deadline urgency, then weighted tenant
-service, before submission. Host
+reserved without waiting and rolled back on admission failure. NVMe consumes
+tagged per-backend urgency buckets, skipping stale heads without a normal-path
+capacity scan. Weighted tenant service is accounted but not yet enforced as an
+ordering rule within one bucket. CTA try-issue is permitted only when that
+backend has no older queued intent; otherwise the same scheduler orders it. Host
 staging launches independent finite copy CTAs and enforces byte isolation, but
 does not yet impose global priority order because those copies can run
 concurrently. Remaining policy work is:
 
 - fixed priority or slack buckets rather than a device heap;
 - long-horizon aging across urgency classes;
-- duplicate-object coalescing; and
-- generation-safe cancellation.
+- a measured threshold for enabling opportunistic CTA submission; and
+- cross-device policy for replicated objects.
 
 The scheduler chooses among replicas using a bounded estimate:
 
@@ -577,11 +710,38 @@ all chunks ready -> deterministic final reduction
 Dense attention cannot finish without all required exact KV. The system may make
 partial progress but must not claim otherwise.
 
+Dense serving is the primary applicability case. The incremental scheduler
+should form large groups for homogeneous cold layers, dispatch the direct form
+for resident work, expose partial execution under within-batch arrival skew,
+and naturally delay requests with no useful runnable work. The contribution is
+not discovery of a dense KV list; it is joining request policy, tile
+availability, partial numerical progress, and acquisition cost without forcing
+one granularity on every batch.
+
 ### 11.3 Sparse or conditional attention
 
-When GPU-side indexing selects KV blocks, the exact object set is not known to
-userspace before execution. This is the strongest semantic-gap case within
-attention and should be included if a production kernel is available.
+When GPU-side indexing selects KV blocks, userspace cannot observe the exact
+object set at batch formation without duplicating the selector or synchronizing
+after the query is produced. This is the strongest semantic-gap case within
+attention.
+
+The implemented mechanism fixture materializes the query in an upstream device
+kernel and then performs summary scoring, deterministic top-k page selection,
+canonical dependency publication, acquisition, and attention in the same
+finite attention CTA. On a miss, the CTA publishes a ticket and exits. The
+ready CTA obtains the logical request from that ticket, recomputes the selector,
+reloads the selected catalog entries, and consumes the acquired pages. No
+selector local/shared state crosses the exit. The test deliberately permutes
+compact request indices and runtime request slots and checks the preserved
+`(epoch, request slot, generation, logical request, object, version)` identity.
+This establishes mechanism feasibility; integration into a production sparse
+attention kernel and end-to-end SLO evidence remain open.
+
+The controlled fixture includes a cold-cache, overlapped GPU overfetch policy
+that moves every candidate page while running the same device query producer,
+selector, and attention math. It is intentionally retained even where it wins:
+selective acquisition has a fixed ticket/progress cost and is justified only
+after avoided transfer exceeds that cost.
 
 ## 12. Secondary applications
 
@@ -597,11 +757,17 @@ Expert GEMM kernels are naturally tiled and may use TMA on supported
 architectures. The system coalesces expert acquisitions while retaining the
 request dependencies and deadlines of all dependent tokens.
 
+The implemented mechanism workload computes hidden states and top-k routing on
+the GPU. The router writes canonical `WorkItem` and `AcquireRequirement`
+records; userspace publishes the expert catalog but does not know the selected
+IDs before the consumer launch. This is the concrete device-generated-demand
+case. See `docs/DEVICE_ROUTED_MOE.md`.
+
 ### 12.2 Graph and ANNS
 
 ANNS vectors can use tensor-like tiled staging. Graph adjacency pages are more
 likely to use ordinary loads. These applications validate the generic
-object-range and continuation machinery, not the TMA-specific claim.
+object-range and work ticket machinery, not the TMA-specific claim.
 
 ## 13. TMA position
 
@@ -626,13 +792,11 @@ acquisition, not extension of TMA hardware.
 ## 14. DMA-BUF position
 
 DMA-BUF is kernel plumbing for sharing an allocated buffer among device drivers.
-It may register the HBM staging pool with NIC or NVMe drivers.
-
-M4 retains a static DMA-BUF importer for pre-registered buffers, but does not
-enable peer resources. The current runtime uses pinned mapped DRAM because this
-host has no validated GPU/NVMe P2P route. Static attachment pins storage, waits
-reservation fences, and holds a write fence until the queue is quiesced. No
-DMA-BUF operation occurs in a GPU kernel or per transfer.
+It could be part of a future direct-HBM transport, but the current system does
+not contain a DMA-BUF importer. NVMe destinations are mapped pinned DRAM inside
+the private IOMMUFD IOAS because this host has no validated GPU/NVMe P2P route.
+This removes dynamic-import invalidation, reservation-fence, and DMA-direction
+ambiguity from the active implementation.
 
 DMA-BUF does not provide:
 
@@ -640,7 +804,7 @@ DMA-BUF does not provide:
 - source-tier selection;
 - RDMA or NVMe command submission;
 - device-side admission;
-- continuation scheduling; or
+- work ticket scheduling; or
 - compiler transformation.
 
 Per-transfer attach/map operations may sleep and must not occur on the GPU hot
@@ -656,15 +820,22 @@ path. Registration is performed ahead of time.
    doorbell write.
 4. Completion consumption establishes visibility before READY publication.
 5. Transport queue exhaustion causes deferral, never spinning while holding
-   resources; bootstrap requires one intent slot per independently queued
-   object so the intent pool itself cannot exhaust under valid publication.
+   resources. The intent pool is bounded by the maximum active acquisition
+   frontier rather than catalog size; unexpected overflow fails affected work
+   explicitly instead of spinning or overwriting an intent.
 6. Duplicate intents share a transfer only when object version and byte range
    match.
-7. Cancellation cannot make a stale continuation runnable.
+7. Cancellation cannot make a stale work ticket runnable.
 8. The pass declines transformations that cannot preserve barrier convergence.
 9. The HBM/direct path preserves the original kernel's numerical behavior.
 10. Partial attention reduction uses a defined deterministic order when
     bit-exactness is required.
+11. Work ticket ownership publishes `Initializing` before writing fields and
+    transitions to `Pending` only after the dependency and pending-index records
+    are visible; competing CTAs do not wait or issue against partial state.
+12. A completion whose object identity/version or work ticket generation is
+    stale retires credits and transport context without modifying replacement
+    state.
 
 ## 16. Efficiency invariants
 
@@ -693,18 +864,24 @@ The following are not contributions:
 
 The candidate contribution is the combination:
 
-> automatic binding of live request semantics to acquisition sites in existing
-> finite kernels, direct-path preservation for addressable data, and
-> generation-safe suspend/resume of transport-backed logical work across CTA
-> lifetimes with bounded nonresident progress.
+> compiler and serving-runtime co-design that transforms an atomic finite GPU
+> operator into request-scoped incremental execution, then jointly schedules
+> arriving data, useful partial computation, and later request admission while
+> preserving the original complete-data path.
+
+Work tickets across CTA lifetimes implement unavailable-data handling. Elastic
+coalescing preserves dense transfer efficiency. Neither is claimed to be the
+contribution or to dominate independently.
 
 Required comparison points include:
 
 - Syncopate: compiler-generated chunk-level compute/communication overlap;
 - Strata: production hierarchical KV, GPU-assisted I/O, and cache-aware
   scheduling;
+- ECHO: lossless sparse-KV prefetch and fused recall/indexer overlap;
 - DirectKV: zero-copy CPU-resident KV with fused warp-level pipelines;
 - CoPilotIO: GPU storage submission with CPU completion;
+- Tutti: asynchronous GPU-native KV object I/O and slack-aware scheduling;
 - BaM and AGILE: GPU-initiated storage and background GPU progress;
 - GORIO and GNStor: GPU-owned remote I/O and NVMe-over-RDMA;
 - GIN, GICC, and NVSHMEM: GPU-initiated remote communication;
@@ -720,7 +897,13 @@ time.
 ### 18.1 Baselines
 
 - untouched production kernel with HBM-resident data;
+- instrumented direct path with identical resident data;
 - CPU/runtime prefetch into HBM;
+- coalesced bulk acquisition;
+- engine request skip and rebatch;
+- forced fine-grained incremental execution;
+- the unified incremental scheduler, a best-fixed whole-trace reference, and
+  resettable decision-oracle experiments;
 - direct mapped-host access;
 - synchronous GPU-initiated transport;
 - dedicated GPU progress service;
@@ -731,7 +914,7 @@ time.
 
 - TTFT, TPOT, request p50/p99, and SLO attainment;
 - useful serving goodput;
-- I/O completion and ready-continuation latency;
+- I/O completion to runnable-tile publication latency;
 - CPU cores and CPU time;
 - SM occupancy and progress tax;
 - register and shared-memory changes;
@@ -746,7 +929,9 @@ time.
 ### 18.3 Required ablations
 
 - request semantics removed;
-- continuation scheduling removed;
+- work ticket scheduling removed;
+- elastic grouping replaced by each forced endpoint;
+- partial-progress feedback to the userspace batch scheduler removed;
 - direct versus staged host path;
 - bounded helper versus persistent service;
 - backend batching disabled;
@@ -761,15 +946,23 @@ Stop or reframe the project if any of the following holds:
 2. Direct-path overhead is measurable on HBM-resident production kernels.
 3. Safe deferral requires kernel-specific source rewrites rather than a
    repeatable compiler analysis.
-4. Relaunch and continuation overhead exceeds saved waiting time.
+4. Relaunch and work ticket overhead exceeds saved waiting time.
 5. Useful kernel cadence is insufficient and fallback handles most progress.
 6. A dedicated service warp is cheaper than bounded distributed progress.
 7. External KV misses are too rare in the target serving configuration.
 8. The available PCIe topology prevents useful GPU-device peer DMA.
 9. Results come from a new backend rather than the request-semantic compiler
    mechanism.
+10. The incremental scheduler has material regret in identical-snapshot decision
+    replays, loses to the best-fixed policy on real traces, or wins only through
+    unmatched initial cache state, admission, or input request order.
 
 ## 20. Implementation sequence
+
+M0-M8 below record component implementation status. The research priority and
+remaining end-to-end work are governed by P0-P7 in `SYSTEM_PLAN.md`; in
+particular, incremental dense FlashInfer/SGLang execution precedes new transport
+backends.
 
 ### M0: clean compiler skeleton
 
@@ -787,29 +980,31 @@ rejected sites untouched with a diagnostic.
 ### M1: deterministic mock backend
 
 - Device object directory.
-- Fixed intent and continuation pools.
+- Fixed intent and work ticket pools.
 - Direct, pending, failed, and cancelled transitions.
 - Deterministic completion injection.
 
 Gate: exhaustive generation, cancellation, duplicate, and queue-full tests.
 
 Status: the state machine runs against real CUDA allocations rather than a
-disconnected mock. Generation, cancellation, and duplicate transfer behavior
-are tested; exhaustive queue-wrap testing remains open.
+disconnected mock. Generation, cancellation, duplicate transfer, full/fatal
+queue retirement, and stale completion behavior are tested. The current
+depth-64 hardware run crossed more than 25 queue wraps without error;
+exhaustive randomized model checking remains open.
 
 ### M2: finite progress protocol
 
 - Short-lived helper lease.
 - Hard issue and completion budgets.
 - No-wait credit handling.
-- Ready-continuation queue.
+- Runnable-tile queue.
 
 Gate: no deadlock at ring wraparound or full queue; bounded instruction count.
 
 Status: complete across repeated epochs. Misses publish to a reusable
 object-keyed pool, object CAS suppresses duplicates, and a finite progress grid
-precedes ready publication and a finite ready-only resume grid. No kernel polls
-or persists.
+precedes data-availability publication and a finite runnable-work grid. No
+kernel polls or persists.
 
 ### M3: CPU DRAM
 
@@ -820,54 +1015,83 @@ or persists.
 Gate: HBM fast path remains statistically indistinguishable from stock.
 
 Status: functionally complete. Mapped direct and GPU-staged paths are
-numerically tested. The compiler-generated HBM path has no queue or atomic
-instruction; a production-kernel zero-overhead comparison remains evaluation
-work rather than an implementation claim.
+numerically tested through both runtime-owned allocations and non-owning
+registration of engine-managed allocations. Staged acquisition keeps a
+16-byte vector path and safely handles arbitrary external alignment. The
+runtime enforces a hard byte capacity and records high-water use for staging
+allocations it owns; engine-managed staging remains under the engine cache's
+eviction policy. The
+compiler-generated HBM path has no queue or atomic instruction; a
+production-kernel zero-overhead comparison remains evaluation work rather than
+an implementation claim.
 
 ### M4: NVMe
 
-- Minimal queue setup through a dedicated driver/runtime component.
+- Minimal queue setup through a VFIO/IOMMUFD userspace control plane.
 - GPU command construction and batched submission.
-- CQ processing into the common continuation state.
+- CQ processing into the common work ticket state.
 
 Gate: finite producer/consumer kernels sustain queue progress without a
 persistent poller.
 
-Status: software mechanism complete; current-ABI hardware rerun blocked by the
-test host's identity IOMMU domain. The bootstrap driver resets and identifies
-the controller, negotiates one depth-64 queue per open GPU, pins mapped host
-destinations, verifies namespace write protection, and maps coherent queue
-memory plus exactly one MMIO doorbell page into CUDA. A bounded device function constructs NVMe
-READ SQEs and PRP lists, batches the SQ doorbell, consumes phase-tagged CQEs,
-validates object/request generations, and publishes ready continuations. The
-benchmark performs no CPU command submission or completion polling.
+Status: software mechanism complete; historical ABI-v18 VFIO trusted-mode
+hardware qualification passed on the local GPU/CD8P system. A compulsory-miss run issued
+and completed all 32,000 measured 64-KiB reads with zero checksum failure at
+1,624.42 MiB/s physical throughput. This one-controller point is a correctness and
+scaling regression, not production portability or competitive-bandwidth proof.
+The control plane resets and
+identifies the controller, creates a private translated IOAS, negotiates one
+configurable queue, maps host destinations, applies the selected media policy,
+and maps separate control and doorbell pages. Construction first validates queue
+DMA with a CPU bootstrap READ, then requires a GPU SQ-doorbell store to produce
+a successful NVMe completion before publishing the queue. A bounded device function
+constructs NVMe READ SQEs and PRP lists, batches the scheduled SQ doorbell,
+consumes phase-tagged CQEs, validates object/request generations, and publishes
+runnable work tickets. An application CTA can opportunistically construct and
+ring one read under a one-shot queue lease, then exits without polling. A GPU
+queue-model test exercises direct issue, CQ completion, runnable-work execution,
+two-request queue contention, forced-lock fallback, stale completion isolation, NVMe status failure,
+malformed-CID queue quiescence with cooperative context/credit reclamation, and
+fatal queue retirement.
+The benchmark performs no CPU command submission or completion polling.
 
-The device program emits only READ commands. Hardware namespace write
-protection prevents media modification, but the raw queue is still exposed to
-a trusted `CAP_SYS_RAWIO` process and is not a per-command or multi-tenant
-security boundary. See `NVME_SECURITY.md`.
+The device program emits only READ commands. IOMMUFD contains DMA to a private
+IOAS. Hardware write protection remains the safe default; explicit trusted-code
+mode supports controllers without it and is not a media-containment boundary.
+The raw queue is a trusted-process interface rather than a per-command or
+multi-tenant security boundary. See `NVME_SECURITY.md`.
 
 ### M5: KV integration
 
 - Existing paged-attention request/tile binding rebuilt cleanly.
-- Ready-only tile scheduling.
-- Dense split-K or sparse-KV continuation fixture.
+- Runnable-tile scheduling.
+- Dense split-K and query-dependent sparse-KV work ticket fixtures.
 - End-to-end SLO experiment.
 
 Gate: improvement over CPU/runtime prefetch using the same data path.
 
 Status: mechanism workload complete, serving gate open. The branch runs a real
 FP16, head-dimension-128, page-size-16 split-K attention kernel with
-heterogeneous pages per request, stable partial softmax reduction, ready-only
-continuations, and a CPU numerical reference. Work formation consumes
+heterogeneous pages per request, stable partial softmax reduction,
+runnable-work tickets, and a CPU numerical reference. Work formation consumes
 FlashInfer's public paged-KV CSR representation, reduction uses FlashInfer's
 base-2 `(V, LSE)` state implementation when its headers are available, and a
 real FlashInfer decode wrapper is a differential correctness gate. NTA deferral
 also executes in version-checked FlashInfer 0.6.12 decode and FA2 paged-prefill
-JIT kernels. It is not wired into SGLang/vLLM request lifecycle and KV
-management; therefore there is no TTFT/TPOT/SLO claim.
+JIT kernels. SGLang 0.5.14 HiCache is wired through the plugin adapter; vLLM
+request lifecycle and KV ownership remain open. Instrumented FlashInfer decode
+also replays through SGLang's full CUDA-graph mode with live request identity;
+the demand progress loop and paged-prefill graph remain open. There is still no
+TTFT/TPOT/SLO benefit claim.
 
-The ABI-v10 dependency-set workload separately acquires up to 32 mixed-tier
+The separate sparse fixture runs one CTA per request over a resident summary
+catalog. An upstream device kernel materializes the query; the attention CTA
+selects top-k full KV pages, fills the common dependency set, and either
+consumes direct pages or exits for finite staged acquisition. Runnable work is
+mapped back through the ticket rather than assuming request index equals slot.
+This is not yet a FlashInfer or SGLang sparse-attention integration.
+
+The ABI-v19 dependency-set workload separately acquires up to 32 mixed-tier
 objects per CTA, supports cancellation, stale generations, stale object
 versions, and duplicate coalescing, and resumes only after the complete set is
 ready. Global-load and TMA attention now consume the same common work and
@@ -886,7 +1110,7 @@ Gate: no claim based solely on a synthetic TMA kernel.
 
 Status: mechanism complete, production census gate open. A distinct compiler
 marker preserves direct tensor-map descriptors or selects an HBM staging
-descriptor after readiness. The attention CTA initializes its barrier only
+descriptor after data becomes available. The attention CTA initializes its barrier only
 after acquisition succeeds, executes `cp.async.bulk.tensor`, and is covered by
 memcheck/racecheck/synccheck. Production attention IR recognition and an
 untouched-kernel comparison remain required.
@@ -899,6 +1123,10 @@ untouched-kernel comparison remain required.
 
 Gate: real network hardware, not loopback or emulation, for performance claims.
 
+Status: explicitly deferred. `SourceKind::Rdma` remains inactive, so the system
+does not advertise an RNIC data path. This does not block the HBM, CPU-DRAM, or
+NVMe mechanism; it does limit the current claim to local memory and storage.
+
 ### M8: generality
 
 - MoE expert acquisition.
@@ -907,11 +1135,12 @@ Gate: real network hardware, not loopback or emulation, for performance claims.
 Gate: reuse the same compiler/runtime contracts without kernel-name-specific
 logic.
 
-Status: mechanism gate complete for MoE. The routed top-k workload acquires
-multiple versioned expert matrices through the common plan, performs matrix-
-vector products, mixes expert outputs, and checks every result against a CPU
-reference across mixed tiers. Production MoE model baselines and ANNS remain
-open.
+Status: mechanism gate complete for device-routed MoE. A GPU hidden-state
+producer and top-k router build the common plan on device without exposing the
+selected experts to userspace. Compiler-lowered consumers acquire multiple
+versioned matrices, mix expert outputs, and check every result against a CPU
+reference across tiers. Matched CPU-sync and all-expert overfetch policies are
+implemented. Production MoE model baselines and ANNS remain open.
 
 ## 21. Target repository layout
 
@@ -922,6 +1151,7 @@ CMakeLists.txt
 docs/
     ARCHITECTURE.md
     FLASHINFER.md
+    SYSTEM_PLAN.md
 include/nta/
     AcquireIR.h
     DeviceAPI.cuh
@@ -934,7 +1164,7 @@ include/nta/
 lib/
     AcquireAnalysis.cpp
     AcquireLowering.cpp
-    ContinuationLowering.cpp
+    DeferralLowering.cpp
     Plugin.cpp
 runtime/
     device/Acquire.cuh

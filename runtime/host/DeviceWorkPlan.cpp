@@ -3,6 +3,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -47,7 +48,10 @@ void validate(const WorkPlan &plan) {
       const abi::WorkItem &work = plan.workItems[workCursor + relative];
       if (work.requestIndex != requestIndex ||
           work.requestSlot != request.requestSlot ||
-          work.generation != request.generation) {
+          work.generation != request.generation ||
+          work.reductionGroup != requestIndex ||
+          work.contributorIndex != relative ||
+          work.contributorCount != request.workCount) {
         throw std::invalid_argument(
             "work plan request and work-item bindings disagree");
       }
@@ -59,10 +63,12 @@ void validate(const WorkPlan &plan) {
   }
   for (std::uint32_t index = 0; index < workCount; ++index) {
     const abi::WorkItem &work = plan.workItems[index];
-    if (work.continuation != index || work.dependencyCount == 0 ||
+    if (work.workTicket != index || work.dependencyCount == 0 ||
         work.directDependencyCount > work.dependencyCount ||
         work.dependencyBegin > dependencyCount ||
-        work.dependencyCount > dependencyCount - work.dependencyBegin) {
+        work.dependencyCount > dependencyCount - work.dependencyBegin ||
+        work.reserved0 != 0 || work.reserved1 != 0 || work.reserved2 != 0 ||
+        work.reserved3 != 0) {
       throw std::invalid_argument("work plan contains an invalid work item");
     }
     std::uint32_t directCount = 0;
@@ -86,6 +92,14 @@ void validate(const WorkPlan &plan) {
 } // namespace
 
 struct DeviceWorkPlan::Impl {
+  struct UploadSlot {
+    void *host = nullptr;
+    cudaEvent_t complete = nullptr;
+    bool pending = false;
+  };
+
+  static constexpr std::size_t UploadDepth = 2;
+
   Impl(std::uint32_t requestedWorkCapacity,
        std::uint32_t requestedDependencyCapacity, int requestedDevice)
       : workCapacity(requestedWorkCapacity),
@@ -112,18 +126,22 @@ struct DeviceWorkPlan::Impl {
       workItems = static_cast<abi::WorkItem *>(allocation);
       dependencies = reinterpret_cast<abi::AcquireRequirement *>(
           static_cast<std::byte *>(allocation) + dependencyOffset);
-      checkCuda(
-          cudaHostAlloc(&hostStaging, allocationBytes, cudaHostAllocPortable),
-          "cudaHostAlloc device work-plan staging");
-      checkCuda(
-          cudaEventCreateWithFlags(&uploadComplete, cudaEventDisableTiming),
-          "cudaEventCreate device work-plan upload");
-    } catch (...) {
-      if (uploadComplete != nullptr) {
-        (void)cudaEventDestroy(uploadComplete);
+      for (UploadSlot &slot : uploads) {
+        checkCuda(cudaHostAlloc(&slot.host, allocationBytes,
+                                cudaHostAllocPortable),
+                  "cudaHostAlloc device work-plan staging");
+        checkCuda(cudaEventCreateWithFlags(&slot.complete,
+                                           cudaEventDisableTiming),
+                  "cudaEventCreate device work-plan upload");
       }
-      if (hostStaging != nullptr) {
-        (void)cudaFreeHost(hostStaging);
+    } catch (...) {
+      for (UploadSlot &slot : uploads) {
+        if (slot.complete != nullptr) {
+          (void)cudaEventDestroy(slot.complete);
+        }
+        if (slot.host != nullptr) {
+          (void)cudaFreeHost(slot.host);
+        }
       }
       if (allocation != nullptr) {
         (void)cudaFree(allocation);
@@ -134,14 +152,16 @@ struct DeviceWorkPlan::Impl {
 
   ~Impl() {
     detail::NoexceptCudaDeviceGuard deviceGuard(deviceOrdinal);
-    if (uploadPending) {
-      (void)cudaEventSynchronize(uploadComplete);
-    }
-    if (uploadComplete != nullptr) {
-      (void)cudaEventDestroy(uploadComplete);
-    }
-    if (hostStaging != nullptr) {
-      (void)cudaFreeHost(hostStaging);
+    for (UploadSlot &slot : uploads) {
+      if (slot.pending) {
+        (void)cudaEventSynchronize(slot.complete);
+      }
+      if (slot.complete != nullptr) {
+        (void)cudaEventDestroy(slot.complete);
+      }
+      if (slot.host != nullptr) {
+        (void)cudaFreeHost(slot.host);
+      }
     }
     if (allocation != nullptr) {
       (void)cudaFree(allocation);
@@ -156,42 +176,77 @@ struct DeviceWorkPlan::Impl {
       throw std::invalid_argument(
           "work plan exceeds the reusable device allocation");
     }
-    // The staging image cannot be overwritten until its prior H2D transfer
-    // has completed. This wait does not wait for later consumer kernels.
-    synchronizeUpload();
+    cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+    checkCuda(cudaStreamIsCapturing(stream, &captureStatus),
+              "query device work-plan capture state");
+    if (captureStatus != cudaStreamCaptureStatusNone) {
+      throw std::logic_error(
+          "device work plans must be uploaded before CUDA graph capture");
+    }
+    const std::size_t uploadIndex = acquireUploadSlot();
+    UploadSlot &upload = uploads[uploadIndex];
     workCount = static_cast<std::uint32_t>(plan.workItems.size());
     dependencyCount = static_cast<std::uint32_t>(plan.dependencies.size());
     const std::size_t workBytes = plan.workItems.size() * sizeof(abi::WorkItem);
     const std::size_t dependencyBytes =
         plan.dependencies.size() * sizeof(abi::AcquireRequirement);
-    std::memcpy(hostStaging, plan.workItems.data(), workBytes);
-    std::memcpy(static_cast<std::byte *>(hostStaging) + dependencyOffset,
+    std::memcpy(upload.host, plan.workItems.data(), workBytes);
+    std::memcpy(static_cast<std::byte *>(upload.host) + dependencyOffset,
                 plan.dependencies.data(), dependencyBytes);
-    checkCuda(cudaMemcpyAsync(allocation, hostStaging, workBytes,
+    checkCuda(cudaMemcpyAsync(allocation, upload.host, workBytes,
                               cudaMemcpyHostToDevice, stream),
               "upload work items asynchronously");
     checkCuda(cudaMemcpyAsync(
                   static_cast<std::byte *>(allocation) + dependencyOffset,
-                  static_cast<std::byte *>(hostStaging) + dependencyOffset,
+                  static_cast<std::byte *>(upload.host) + dependencyOffset,
                   dependencyBytes, cudaMemcpyHostToDevice, stream),
               "upload work dependencies asynchronously");
-    checkCuda(cudaEventRecord(uploadComplete, stream),
+    checkCuda(cudaEventRecord(upload.complete, stream),
               "record device work-plan upload");
-    uploadPending = true;
+    upload.pending = true;
+    latestUpload = uploadIndex;
+    hasUpload = true;
+  }
+
+  std::size_t acquireUploadSlot() {
+    for (std::size_t offset = 0; offset < uploads.size(); ++offset) {
+      const std::size_t index = (nextUpload + offset) % uploads.size();
+      UploadSlot &slot = uploads[index];
+      if (slot.pending) {
+        const cudaError_t status = cudaEventQuery(slot.complete);
+        if (status == cudaSuccess) {
+          slot.pending = false;
+        } else if (status == cudaErrorNotReady) {
+          continue;
+        } else {
+          checkCuda(status, "query device work-plan upload");
+        }
+      }
+      nextUpload = (index + 1) % uploads.size();
+      return index;
+    }
+
+    const std::size_t index = nextUpload;
+    checkCuda(cudaEventSynchronize(uploads[index].complete),
+              "recycle device work-plan staging");
+    uploads[index].pending = false;
+    nextUpload = (index + 1) % uploads.size();
+    return index;
   }
 
   void synchronizeUpload() const {
     detail::CudaDeviceGuard deviceGuard(deviceOrdinal);
-    if (uploadPending) {
-      checkCuda(cudaEventSynchronize(uploadComplete),
-                "synchronize device work-plan upload");
-      uploadPending = false;
+    for (UploadSlot &slot : uploads) {
+      if (slot.pending) {
+        checkCuda(cudaEventSynchronize(slot.complete),
+                  "synchronize device work-plan upload");
+        slot.pending = false;
+      }
     }
   }
 
   void *allocation = nullptr;
-  void *hostStaging = nullptr;
-  cudaEvent_t uploadComplete = nullptr;
+  mutable std::array<UploadSlot, UploadDepth> uploads{};
   abi::WorkItem *workItems = nullptr;
   abi::AcquireRequirement *dependencies = nullptr;
   std::size_t allocationBytes = 0;
@@ -201,7 +256,9 @@ struct DeviceWorkPlan::Impl {
   std::uint32_t workCount = 0;
   std::uint32_t dependencyCount = 0;
   int deviceOrdinal = 0;
-  mutable bool uploadPending = false;
+  std::size_t nextUpload = 0;
+  std::size_t latestUpload = 0;
+  bool hasUpload = false;
 };
 
 DeviceWorkPlan::DeviceWorkPlan(const WorkPlan &plan, int deviceOrdinal)
@@ -237,8 +294,12 @@ void DeviceWorkPlan::waitOn(cudaStream_t stream) const {
     throw std::logic_error("cannot wait on a moved device work plan");
   }
   detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
-  checkCuda(cudaStreamWaitEvent(stream, impl_->uploadComplete, 0),
-            "cudaStreamWaitEvent device work plan");
+  if (impl_->hasUpload) {
+    checkCuda(cudaStreamWaitEvent(stream,
+                                  impl_->uploads[impl_->latestUpload].complete,
+                                  0),
+              "cudaStreamWaitEvent device work plan");
+  }
 }
 
 void DeviceWorkPlan::synchronizeUpload() const {

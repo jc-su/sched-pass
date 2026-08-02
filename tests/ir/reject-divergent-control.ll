@@ -5,7 +5,7 @@ declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
 
 define ptx_kernel void @divergent_collective(ptr %runtime, ptr %requirements,
                                   i32 %request.slot, i32 %generation,
-                                  i32 %continuation) {
+                                  i32 %workTicket) {
 entry:
   call void @__nta_bind_request(i32 %request.slot, i32 %generation)
   %thread = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
@@ -15,11 +15,11 @@ entry:
 acquire:
   %ready = call i1 @__nta_acquire_set_marker(
       ptr %runtime, ptr %requirements, i32 1, i32 0,
-      i32 %continuation)
+      i32 %workTicket)
   br i1 %ready, label %exit, label %defer
 
 defer:
-  call void @__nta_defer_marker(ptr %runtime, i32 %continuation)
+  call void @__nta_defer_marker(ptr %runtime, i32 %workTicket)
   ret void
 
 exit:

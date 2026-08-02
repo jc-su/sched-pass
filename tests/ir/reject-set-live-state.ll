@@ -5,16 +5,16 @@ declare void @side_effect()
 
 define ptx_kernel void @unsafe_dependency_set(ptr %runtime, ptr %requirements,
                                    i32 %request.slot, i32 %generation,
-                                   i32 %continuation) {
+                                   i32 %workTicket) {
 entry:
   call void @__nta_bind_request(i32 %request.slot, i32 %generation)
   %ready = call i1 @__nta_acquire_set_marker(
-      ptr %runtime, ptr %requirements, i32 2, i32 0, i32 %continuation)
+      ptr %runtime, ptr %requirements, i32 2, i32 0, i32 %workTicket)
   br i1 %ready, label %consume, label %defer
 
 defer:
   call void @side_effect()
-  call void @__nta_defer_marker(ptr %runtime, i32 %continuation)
+  call void @__nta_defer_marker(ptr %runtime, i32 %workTicket)
   ret void
 
 consume:

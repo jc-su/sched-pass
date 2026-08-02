@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 project(nonresident-acquisition LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -14,12 +16,13 @@ set(NTA_FLASHINFER_INCLUDE_DIR "" CACHE PATH
     "Path containing flashinfer/page.cuh and flashinfer/attention/state.cuh")
 
 find_package(LLVM REQUIRED CONFIG)
+find_package(Python3 COMPONENTS Interpreter QUIET)
 message(STATUS "Building NTA against LLVM ${LLVM_PACKAGE_VERSION} in ${LLVM_DIR}")
 
 add_library(NtaPass MODULE
   lib/AcquireAnalysis.cpp
   lib/AcquireLowering.cpp
-  lib/ContinuationLowering.cpp
+  lib/DeferralLowering.cpp
   lib/Plugin.cpp
 )
 target_include_directories(NtaPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
@@ -56,6 +59,7 @@ enable_testing()
 add_library(nta-work-plan STATIC
   runtime/host/WorkPlan.cpp
 )
+set_target_properties(nta-work-plan PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(nta-work-plan PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -100,6 +104,12 @@ if(NTA_WARNINGS_AS_ERRORS)
 endif()
 add_test(NAME nta-work-plan COMMAND nta-work-plan-test)
 
+install(DIRECTORY include/nta DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(
+  TARGETS nta-work-plan nta-flashinfer-adapter
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
 add_test(
   NAME nta-ir
   COMMAND
@@ -116,9 +126,26 @@ if(NTA_WARNINGS_AS_ERRORS)
 endif()
 add_test(NAME nta-abi COMMAND nta-abi-test)
 
+if(Python3_Interpreter_FOUND)
+  add_test(
+    NAME nta-execution-policy
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/execution_policy.py
+  )
+  set_tests_properties(
+    nta-execution-policy PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+endif()
+
+install(
+  TARGETS NtaPass
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/nta
+)
+
 if(NTA_ENABLE_CUDA)
   find_package(CUDAToolkit 12.8 REQUIRED)
-  find_package(Python3 COMPONENTS Interpreter QUIET)
   if(NTA_ENABLE_FLASHINFER_VALIDATION AND
      NOT NTA_FLASHINFER_INCLUDE_DIR AND Python3_Interpreter_FOUND)
     execute_process(
@@ -169,8 +196,10 @@ if(NTA_ENABLE_CUDA)
     runtime/host/FinitePhase.cpp
     runtime/host/JitPhase.cpp
     runtime/host/NvmeRuntime.cpp
+    runtime/host/NvmeVfioControlPlane.cpp
     runtime/host/Runtime.cpp
   )
+  set_target_properties(nta-runtime-host PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(nta-runtime-host PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
@@ -181,6 +210,108 @@ if(NTA_ENABLE_CUDA)
   if(NTA_WARNINGS_AS_ERRORS)
     target_compile_options(
       nta-runtime-host PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+
+  add_library(nta-runtime SHARED runtime/host/RuntimeC.cpp)
+  target_include_directories(nta-runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(nta-runtime PRIVATE nta-runtime-host CUDA::cudart)
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-runtime PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+  install(
+    TARGETS nta-runtime nta-runtime-host
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  )
+  install(
+    DIRECTORY include/nta
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/include
+  )
+  install(
+    FILES runtime/device/Acquire.cuh runtime/device/JitRuntime.cuh
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/runtime/device
+  )
+  install(
+    PROGRAMS tools/jit/nvcc_clang.py
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/tools/jit
+  )
+  install(
+    FILES tools/jit/clang_cuda_prelude.h
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/tools/jit
+  )
+  install(
+    PROGRAMS tools/flashinfer/prepare_overlay.py
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/tools/flashinfer
+  )
+  install(
+    PROGRAMS tools/jit/activate.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    RENAME nta-jit-activate
+  )
+
+  add_executable(nta-runtime-c-api-test tests/runtime/RuntimeCApiTest.cpp)
+  target_include_directories(nta-runtime-c-api-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(nta-runtime-c-api-test PRIVATE nta-runtime CUDA::cudart)
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-runtime-c-api-test PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+  add_test(NAME nta-runtime-c-api COMMAND nta-runtime-c-api-test)
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME nta-request-slots
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/request_slots.py
+    )
+    add_test(
+      NAME nta-sglang-plugin
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_plugin.py
+    )
+    add_test(
+      NAME nta-python-runtime
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/python_runtime.py
+    )
+    add_test(
+      NAME nta-qualification-runner
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/qualification_runner.py
+    )
+    add_test(
+      NAME nta-qualification-evidence
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/qualification_evidence.py
+    )
+    add_test(
+      NAME nta-opportunity-analysis
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity.py
+    )
+    set_tests_properties(
+      nta-request-slots nta-sglang-plugin nta-qualification-runner
+      nta-qualification-evidence
+      nta-opportunity-analysis
+      PROPERTIES TIMEOUT 60
+    )
+    set_tests_properties(nta-python-runtime nta-sglang-plugin PROPERTIES
+      ENVIRONMENT
+        "NTA_RUNTIME_LIBRARY=$<TARGET_FILE:nta-runtime>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+      TIMEOUT 60
+    )
+    set_tests_properties(nta-request-slots PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    )
+    set_tests_properties(nta-opportunity-analysis PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
     )
   endif()
 
@@ -262,6 +393,17 @@ if(NTA_ENABLE_CUDA)
     COMMAND_EXPAND_LISTS
   )
   add_custom_target(nta-kv-kernel ALL DEPENDS "${NTA_KV_CUBIN}")
+
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME nta-moe-lowering
+      COMMAND
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/ir/moe_lowering.py
+        ${NTA_KV_LOWERED_IR}
+    )
+    set_tests_properties(nta-moe-lowering PROPERTIES TIMEOUT 30)
+  endif()
 
   add_test(
     NAME nta-clang-jit
@@ -431,6 +573,19 @@ if(NTA_ENABLE_CUDA)
     )
   endif()
 
+  add_executable(nta-vfio-nvme-probe tools/VfioNvmeProbe.cpp)
+  target_include_directories(nta-vfio-nvme-probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(
+    nta-vfio-nvme-probe PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+  )
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-vfio-nvme-probe PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+
   add_executable(
     nta-paged-attention benchmarks/attention/PagedAttention.cpp
   )
@@ -464,6 +619,110 @@ if(NTA_ENABLE_CUDA)
     )
   endif()
   add_test(NAME nta-runtime COMMAND nta-runtime-test)
+
+  set(NTA_DEPENDENCY_RACE_PTX
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel/DependencyArrivalRace.ptx")
+  set(NTA_DEPENDENCY_RACE_CUBIN
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel/DependencyArrivalRace.cubin")
+  add_custom_command(
+    OUTPUT "${NTA_DEPENDENCY_RACE_CUBIN}"
+    BYPRODUCTS "${NTA_DEPENDENCY_RACE_PTX}"
+    COMMAND
+      "${NTA_CLANG_CUDA}"
+      -O3
+      -std=c++20
+      --cuda-device-only
+      --cuda-path=${NTA_CUDA_ROOT}
+      --cuda-gpu-arch=${NTA_CUDA_ARCH}
+      -Wno-unknown-cuda-version
+      -I${CMAKE_CURRENT_SOURCE_DIR}/include
+      -I${CMAKE_CURRENT_SOURCE_DIR}
+      -S
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/DependencyArrivalRaceKernel.cu
+      -o "${NTA_DEPENDENCY_RACE_PTX}"
+    COMMAND
+      "${NTA_PTXAS}"
+      -arch=${NTA_CUDA_ARCH}
+      -O3
+      "${NTA_DEPENDENCY_RACE_PTX}"
+      -o "${NTA_DEPENDENCY_RACE_CUBIN}"
+    DEPENDS
+      tests/runtime/DependencyArrivalRaceKernel.cu
+      include/nta/RuntimeABI.h
+      include/nta/TicketProtocol.cuh
+      runtime/device/Acquire.cuh
+    VERBATIM
+  )
+  add_custom_target(
+    nta-dependency-arrival-race-kernel
+    DEPENDS "${NTA_DEPENDENCY_RACE_CUBIN}"
+  )
+  add_executable(
+    nta-dependency-arrival-race-test
+    tests/runtime/DependencyArrivalRaceTest.cpp
+  )
+  add_dependencies(
+    nta-dependency-arrival-race-test nta-dependency-arrival-race-kernel
+  )
+  target_include_directories(nta-dependency-arrival-race-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_link_libraries(
+    nta-dependency-arrival-race-test
+    PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+  )
+  target_compile_definitions(
+    nta-dependency-arrival-race-test PRIVATE
+    NTA_DEPENDENCY_RACE_CUBIN_PATH="${NTA_DEPENDENCY_RACE_CUBIN}"
+  )
+  add_test(
+    NAME nta-dependency-arrival-race
+    COMMAND nta-dependency-arrival-race-test
+  )
+  set_tests_properties(nta-dependency-arrival-race PROPERTIES TIMEOUT 60)
+
+  add_executable(nta-multi-gpu-test tests/runtime/MultiGpuTest.cpp)
+  target_include_directories(nta-multi-gpu-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(
+    nta-multi-gpu-test PRIVATE nta-runtime-host CUDA::cudart
+  )
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-multi-gpu-test PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+  add_test(NAME nta-multi-gpu COMMAND nta-multi-gpu-test)
+  set_tests_properties(
+    nta-multi-gpu PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+  )
+
+  add_executable(
+    nta-cta-nvme-try-issue-test tests/runtime/CtaNvmeTryIssueTest.cpp
+  )
+  add_dependencies(nta-cta-nvme-try-issue-test nta-kv-kernel)
+  target_include_directories(nta-cta-nvme-try-issue-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_compile_definitions(
+    nta-cta-nvme-try-issue-test
+    PRIVATE NTA_KV_CUBIN_PATH="${NTA_KV_CUBIN}"
+  )
+  target_link_libraries(
+    nta-cta-nvme-try-issue-test
+    PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+  )
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-cta-nvme-try-issue-test PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+  add_test(NAME nta-cta-nvme-try-issue COMMAND nta-cta-nvme-try-issue-test)
+  set_tests_properties(nta-cta-nvme-try-issue PROPERTIES TIMEOUT 60)
+
   add_test(
     NAME nta-kv-gpu
     COMMAND
@@ -477,6 +736,37 @@ if(NTA_ENABLE_CUDA)
       --coalesce=3
   )
   set_tests_properties(nta-kv-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-kv-registered-host-direct-gpu
+    COMMAND
+      $<TARGET_FILE:nta-kv-bench>
+      --mode=host-direct
+      --requests=18
+      --tile-bytes=8192
+      --iterations=3
+      --coalesce=2
+      --dependencies=3
+      --external-registration=1
+  )
+  set_tests_properties(
+    nta-kv-registered-host-direct-gpu PROPERTIES TIMEOUT 60
+  )
+  add_test(
+    NAME nta-kv-registered-host-staged-gpu
+    COMMAND
+      $<TARGET_FILE:nta-kv-bench>
+      --mode=host-staged
+      --requests=18
+      --tile-bytes=8192
+      --iterations=3
+      --coalesce=2
+      --dependencies=3
+      --external-registration=1
+      --external-offset=1
+  )
+  set_tests_properties(
+    nta-kv-registered-host-staged-gpu PROPERTIES TIMEOUT 60
+  )
   add_test(
     NAME nta-kv-dependency-set-gpu
     COMMAND
@@ -518,20 +808,122 @@ if(NTA_ENABLE_CUDA)
   set_tests_properties(
     nta-kv-pending-index-scale-gpu PROPERTIES
     TIMEOUT 60
-    PASS_REGULAR_EXPRESSION "pending=0 verification_failures=0"
+    PASS_REGULAR_EXPRESSION
+      "pending=0 pending_index=0 verification_failures=0"
+  )
+  add_test(
+    NAME nta-kv-lifecycle-stress-gpu
+    COMMAND
+      $<TARGET_FILE:nta-kv-bench>
+      --mode=mixed
+      --requests=48
+      --tile-bytes=8192
+      --iterations=1
+      --lifecycle-epochs=200
+      --cancel-stride=11
+      --stale-stride=13
+      --coalesce=3
+      --dependencies=4
+  )
+  set_tests_properties(
+    nta-kv-lifecycle-stress-gpu PROPERTIES
+    TIMEOUT 120
+    PASS_REGULAR_EXPRESSION
+      "lifecycle_epochs=200 graph_launches=200.*pending=0.*verification_failures=0"
+  )
+  add_test(
+    NAME nta-kv-lifecycle-object-fault-gpu
+    COMMAND
+      $<TARGET_FILE:nta-kv-bench>
+      --mode=host-staged
+      --requests=24
+      --tile-bytes=4096
+      --iterations=1
+      --lifecycle-epochs=100
+      --object-stale-stride=7
+      --coalesce=2
+      --dependencies=3
+      --external-registration=1
+      --external-offset=1
+  )
+  set_tests_properties(
+    nta-kv-lifecycle-object-fault-gpu PROPERTIES
+    TIMEOUT 120
+    PASS_REGULAR_EXPRESSION
+      "lifecycle_epochs=100 graph_launches=100.*pending=0.*verification_failures=0"
   )
   add_test(
     NAME nta-moe-mixed-tier-gpu
     COMMAND
       $<TARGET_FILE:nta-moe-bench>
       --mode=mixed
+      --policy=late-bound
       --tokens=24
       --experts=9
       --top-k=2
       --hidden=64
       --iterations=2
   )
-  set_tests_properties(nta-moe-mixed-tier-gpu PROPERTIES TIMEOUT 60)
+  set_tests_properties(
+    nta-moe-mixed-tier-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "route_visibility=gpu policy=late-bound.*verification_failures=0"
+  )
+  add_test(
+    NAME nta-moe-cpu-sync-gpu
+    COMMAND
+      $<TARGET_FILE:nta-moe-bench>
+      --mode=host-staged
+      --policy=cpu-sync
+      --tokens=8
+      --experts=16
+      --top-k=2
+      --hidden=64
+      --iterations=2
+  )
+  set_tests_properties(
+    nta-moe-cpu-sync-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "route_visibility=gpu policy=cpu-sync.*verification_failures=0"
+  )
+  add_test(
+    NAME nta-moe-overfetch-gpu
+    COMMAND
+      $<TARGET_FILE:nta-moe-bench>
+      --mode=host-staged
+      --policy=overfetch
+      --tokens=8
+      --experts=16
+      --top-k=2
+      --hidden=64
+      --iterations=2
+  )
+  set_tests_properties(
+    nta-moe-overfetch-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "route_visibility=gpu policy=overfetch.*verification_failures=0"
+  )
+  add_test(
+    NAME nta-moe-direct-gpu
+    COMMAND
+      $<TARGET_FILE:nta-moe-bench>
+      --mode=resident
+      --policy=direct
+      --tokens=8
+      --experts=16
+      --top-k=2
+      --hidden=64
+      --iterations=2
+  )
+  set_tests_properties(
+    nta-moe-direct-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "route_visibility=gpu policy=direct.*verification_failures=0"
+  )
   add_test(
     NAME nta-kv-direct-baseline-gpu
     COMMAND
@@ -558,6 +950,45 @@ if(NTA_ENABLE_CUDA)
       --request-credit-pages=1
   )
   set_tests_properties(nta-paged-attention-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-paged-attention-sparse-late-bound-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=host-staged
+      --requests=4
+      --min-pages=4
+      --max-pages=6
+      --sparse-top-k=2
+      --iterations=2
+      --progress-passes=1
+      --request-credit-pages=2
+  )
+  set_tests_properties(
+    nta-paged-attention-sparse-late-bound-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "demand_visibility=gpu-cta.*verification_failures=0"
+  )
+  add_test(
+    NAME nta-paged-attention-sparse-overfetch-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=host-staged
+      --requests=4
+      --min-pages=4
+      --max-pages=6
+      --sparse-top-k=2
+      --sparse-policy=overfetch
+      --iterations=2
+      --progress-passes=1
+      --request-credit-pages=2
+  )
+  set_tests_properties(
+    nta-paged-attention-sparse-overfetch-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "policy=overfetch.*verification_failures=0"
+  )
   add_test(
     NAME nta-paged-attention-tma-gpu
     COMMAND
@@ -589,7 +1020,7 @@ if(NTA_ENABLE_CUDA)
 endif()
 
 add_custom_target(
-  nta-nvme-driver
-  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/nta-nvme-device.sh build
+  nta-vfio-preflight
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/nta-vfio-device.sh preflight
   USES_TERMINAL
 )

@@ -3,15 +3,15 @@ declare i1 @__nta_acquire_set_marker(ptr, ptr, i32, i32, i32)
 declare void @__nta_defer_marker(ptr, i32)
 
 define void @device_helper(ptr %runtime, ptr %requirements, i32 %request.slot,
-                           i32 %generation, i32 %continuation) {
+                           i32 %generation, i32 %workTicket) {
 entry:
   call void @__nta_bind_request(i32 %request.slot, i32 %generation)
   %ready = call i1 @__nta_acquire_set_marker(
-      ptr %runtime, ptr %requirements, i32 1, i32 0, i32 %continuation)
+      ptr %runtime, ptr %requirements, i32 1, i32 0, i32 %workTicket)
   br i1 %ready, label %consume, label %defer
 
 defer:
-  call void @__nta_defer_marker(ptr %runtime, i32 %continuation)
+  call void @__nta_defer_marker(ptr %runtime, i32 %workTicket)
   ret void
 
 consume:

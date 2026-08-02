@@ -6,9 +6,10 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 10;
+inline constexpr std::uint32_t Version = 19;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 5;
+inline constexpr std::uint32_t UrgencyBucketCount = 8;
 
 enum class SourceKind : std::uint32_t {
   Hbm = 0,
@@ -21,6 +22,16 @@ enum class SourceKind : std::uint32_t {
 enum ReplicaFlags : std::uint32_t {
   ReplicaDirect = 1U << 0,
   ReplicaTransport = 1U << 1,
+  // Host-staged replica whose source and destination are indexed rows. The
+  // two index arrays contain uint32_t entries; transferShape packs the source
+  // and destination row strides in bytes.
+  ReplicaIndexed = 1U << 2,
+};
+
+enum BackendFlags : std::uint32_t {
+  // A finite application CTA may attempt one transport submission before it
+  // publishes an intent. Completion processing always remains out of line.
+  BackendCtaTryIssue = 1U << 0,
 };
 
 enum class ObjectState : std::uint32_t {
@@ -31,13 +42,14 @@ enum class ObjectState : std::uint32_t {
   Failed = 4,
 };
 
-enum class ContinuationState : std::uint32_t {
+enum class WorkTicketState : std::uint32_t {
   New = 0,
   Pending = 1,
   Ready = 2,
   Done = 3,
   Cancelled = 4,
   Failed = 5,
+  Initializing = 6,
 };
 
 struct alignas(32) RequestContext {
@@ -60,6 +72,22 @@ struct alignas(32) TenantContext {
   std::uint64_t serviceBytes;
 };
 static_assert(sizeof(TenantContext) == 32);
+
+struct alignas(32) RequestProgress {
+  std::uint64_t requestId;
+  std::uint32_t generation;
+  std::uint32_t expectedWork;
+  std::uint32_t pendingWork;
+  std::uint32_t runnableWork;
+  std::uint32_t completedWork;
+  std::uint32_t failedWork;
+  std::uint32_t cancelledWork;
+  std::uint32_t epoch;
+  std::uint64_t unavailableBytes;
+  std::uint64_t runnableComputeNs;
+  std::uint64_t completedComputeNs;
+};
+static_assert(sizeof(RequestProgress) == 64);
 
 struct alignas(64) ObjectEntry {
   std::uint64_t objectId;
@@ -86,9 +114,26 @@ struct alignas(64) ReplicaEntry {
   std::uint32_t backendIndex;
   std::uint32_t flags;
   std::uint64_t tensorMapAddress;
-  std::uint64_t reserved1;
+  std::uint64_t transferShape;
 };
 static_assert(sizeof(ReplicaEntry) == 64);
+
+[[nodiscard]] constexpr std::uint64_t
+packTransferStrides(std::uint32_t sourceStride,
+                    std::uint32_t destinationStride) noexcept {
+  return static_cast<std::uint64_t>(sourceStride) |
+         (static_cast<std::uint64_t>(destinationStride) << 32U);
+}
+
+[[nodiscard]] constexpr std::uint32_t
+sourceTransferStride(std::uint64_t shape) noexcept {
+  return static_cast<std::uint32_t>(shape);
+}
+
+[[nodiscard]] constexpr std::uint32_t
+destinationTransferStride(std::uint64_t shape) noexcept {
+  return static_cast<std::uint32_t>(shape >> 32U);
+}
 
 struct alignas(64) BackendView {
   std::uint64_t deviceState;
@@ -99,8 +144,8 @@ struct alignas(64) BackendView {
   std::uint32_t sourceKind;
   std::uint32_t active;
   std::uint32_t backendIndex;
-  std::uint32_t reserved0;
-  std::uint64_t reserved1;
+  std::uint32_t flags;
+  std::uint64_t pendingAcquisitions;
 };
 static_assert(sizeof(BackendView) == 64);
 
@@ -112,7 +157,7 @@ struct alignas(64) AcquireIntent {
   std::uint32_t generation;
   std::uint32_t objectSlot;
   std::uint32_t objectVersion;
-  std::uint32_t continuation;
+  std::uint32_t workTicket;
   std::uint32_t valid;
   std::uint32_t priority;
   std::uint32_t tenantId;
@@ -123,7 +168,9 @@ static_assert(sizeof(AcquireIntent) == 64);
 struct alignas(128) IntentSlot {
   AcquireIntent intent;
   std::uint64_t sequence;
-  std::uint64_t reserved[7];
+  std::uint32_t sourceKind;
+  std::uint32_t epoch;
+  std::uint64_t reserved[6];
 };
 static_assert(sizeof(IntentSlot) == 128);
 
@@ -137,6 +184,20 @@ struct alignas(64) IntentPool {
   std::uint64_t reserved[4];
 };
 static_assert(sizeof(IntentPool) == 64);
+
+// One fixed queue node per intent slot. Queue heads carry a 32-bit mutation
+// tag above the node index, preventing ABA when a credit-limited transfer is
+// popped and requeued without allocating another node.
+struct alignas(32) IntentQueueEntry {
+  std::uint64_t sequence;
+  std::uint32_t next;
+  std::uint32_t state;
+  std::uint32_t epoch;
+  std::uint32_t sourceKind;
+  std::uint32_t urgency;
+  std::uint32_t reserved;
+};
+static_assert(sizeof(IntentQueueEntry) == 32);
 
 // A kernel work item may require several independently resident objects. The
 // compiler treats an array of these records as one finite deferral boundary.
@@ -152,12 +213,12 @@ struct alignas(16) AcquireRequirement {
 };
 static_assert(sizeof(AcquireRequirement) == 48);
 
-struct alignas(16) ContinuationDependency {
+struct alignas(16) WorkDependency {
   std::uint64_t objectId;
   std::uint32_t objectSlot;
   std::uint32_t objectVersion;
 };
-static_assert(sizeof(ContinuationDependency) == 16);
+static_assert(sizeof(WorkDependency) == 16);
 
 // Canonical per-CTA work descriptor shared by every frontend and device
 // kernel. Dependency records live in one batch-level contiguous array.
@@ -169,11 +230,21 @@ struct alignas(32) WorkItem {
   std::uint32_t dependencyBegin;
   std::uint32_t dependencyCount;
   std::uint32_t directDependencyCount;
-  std::uint32_t continuation;
+  std::uint32_t workTicket;
+  std::uint32_t reductionGroup;
+  std::uint32_t contributorIndex;
+  std::uint32_t contributorCount;
+  std::uint32_t estimatedComputeNs;
+  // Explicit tail padding keeps the C, Python, and device-array stride equal.
+  // A non-zero value denotes an ABI extension this runtime cannot interpret.
+  std::uint32_t reserved0;
+  std::uint32_t reserved1;
+  std::uint32_t reserved2;
+  std::uint32_t reserved3;
 };
-static_assert(sizeof(WorkItem) == 32);
+static_assert(sizeof(WorkItem) == 64);
 
-struct alignas(32) Continuation {
+struct alignas(32) WorkTicket {
   std::uint64_t requestId;
   std::uint32_t requestSlot;
   std::uint32_t generation;
@@ -181,8 +252,15 @@ struct alignas(32) Continuation {
   std::uint32_t dependencyCount;
   std::uint32_t logicalTile;
   std::uint32_t dependencyStart;
+  // Operation identity is distinct from request-slot generation. The same
+  // request and ticket index may be reused by consecutive transformer layers.
+  std::uint32_t epoch;
+  std::uint64_t unavailableBytes;
+  std::uint64_t estimatedComputeNs;
+  std::uint32_t reductionGroup;
+  std::uint32_t contributorCount;
 };
-static_assert(sizeof(Continuation) == 32);
+static_assert(sizeof(WorkTicket) == 64);
 
 struct alignas(64) NvmeSubmission {
   std::uint32_t dword[16];
@@ -198,18 +276,20 @@ struct alignas(32) NvmeCommandContext {
   std::uint64_t objectId;
   std::uint64_t bytes;
   std::uint64_t backendBytes;
+  std::uint64_t mappingKey;
   std::uint32_t objectSlot;
   std::uint32_t objectVersion;
   std::uint32_t requestSlot;
   std::uint32_t generation;
-  std::uint32_t continuation;
+  std::uint32_t workTicket;
   std::uint32_t tenantId;
+  std::uint32_t epoch;
   std::uint32_t active;
 };
 static_assert(sizeof(NvmeCommandContext) == 64);
 
 inline constexpr std::uint32_t NvmeQueueControlMagic = 0x4e544151U;
-inline constexpr std::uint32_t NvmeDriverAbiVersion = 2U;
+inline constexpr std::uint32_t NvmeQueueAbiVersion = 2U;
 
 enum class NvmeQueueState : std::uint32_t {
   Offline = 0,
@@ -247,7 +327,7 @@ struct alignas(64) NvmeQueueView {
   std::uint32_t cqHead;
   std::uint32_t cqPhase;
   std::uint32_t outstanding;
-  std::uint32_t intentCursor;
+  std::uint32_t ownerLock;
   std::uint32_t active;
   std::uint32_t error;
   std::uint32_t cidCursor;
@@ -256,7 +336,10 @@ struct alignas(64) NvmeQueueView {
   std::uint64_t submitted;
   std::uint64_t completed;
   std::uint64_t failed;
-  std::uint64_t reserved1;
+  std::uint64_t directSubmitted;
+  std::uint64_t directFallbacks;
+  std::uint32_t directMaxPrpPages;
+  std::uint32_t reserved1;
 };
 static_assert(sizeof(NvmeQueueView) == 192);
 
@@ -267,44 +350,85 @@ struct alignas(64) RuntimeView {
   ReplicaEntry *replicas;
   BackendView *backends;
   IntentSlot *intents;
-  Continuation *continuations;
-  ContinuationDependency *dependencies;
+  WorkTicket *workTickets;
+  // Relative device-global nanoseconds at which each ticket first became
+  // runnable in the current epoch. Zero denotes work available at epoch start.
+  std::uint64_t *workRunnableNs;
+  WorkDependency *dependencies;
   IntentPool *intentPool;
-  std::uint32_t *readyContinuations;
+  IntentQueueEntry *intentQueueEntries;
+  std::uint64_t *intentQueueHeads;
+  std::uint32_t *readyWorkTickets;
   std::uint32_t *readyCount;
   std::uint32_t *readyHead;
-  std::uint32_t *pendingContinuations;
+  std::uint32_t *pendingWorkTickets;
   std::uint32_t *pendingCount;
+  // Number of application CTAs that retired each canonical work ticket in the
+  // current epoch. Framework kernels with a head dimension use this to let the
+  // last sibling CTA publish Done without an extra completion kernel.
+  std::uint32_t *ctaCompletions;
+  // Reverse dependency index for completion-driven runnable-work discovery.
+  // Each object head points into the fixed per-ticket dependency array; the
+  // ticket owning an edge is dependency_index / maxDependenciesPerWorkTicket.
+  std::uint32_t *objectDependentHeads;
+  std::uint32_t *dependencyNext;
+  // Set exactly once when an object transition satisfies this dependency.
+  // This closes the race between reverse-edge installation and completion.
+  std::uint32_t *dependencySatisfied;
+  std::uint32_t *remainingDependencies;
+  // Compatibility queue for integrations that separate dependency completion
+  // from runnable publication. Built-in backends publish directly; the
+  // explicit publish phase consumes this queue or the bounded pending index.
+  std::uint32_t *changedWorkTickets;
+  // Per-ticket compatibility-queue membership bit.
+  std::uint32_t *changedQueued;
+  std::uint32_t *changedCount;
+  std::uint32_t *changedOverflow;
+  RequestProgress *requestProgress;
+  // Per-request reduction state. Work items in one request share a reduction
+  // group, allowing split-work merges to proceed independently across requests.
+  std::uint32_t *reductionExpected;
+  std::uint32_t *reductionCompleted;
+  std::uint32_t *reductionFailed;
   std::uint32_t requestCapacity;
   std::uint32_t tenantCapacity;
   std::uint32_t objectCapacity;
   std::uint32_t replicaCapacity;
   std::uint32_t backendCapacity;
   std::uint32_t intentCapacity;
-  std::uint32_t continuationCapacity;
+  std::uint32_t workTicketCapacity;
   std::uint32_t dependencyCapacity;
-  std::uint32_t maxDependenciesPerContinuation;
+  std::uint32_t maxDependenciesPerWorkTicket;
+  std::uint64_t epochStartClock;
+  // Device-owned epoch and terminal counters. reset_epoch advances epoch after
+  // clearing all ticket records; application and progress kernels reject work
+  // whose ticket/intent/transport context belongs to a different operation.
+  std::uint32_t epoch;
+  std::uint32_t completedCount;
+  std::uint32_t failedCount;
   std::uint32_t abiVersion;
 };
-static_assert(sizeof(RuntimeView) == 192);
+static_assert(sizeof(RuntimeView) == 320);
 
 static_assert(std::is_standard_layout_v<RequestContext>);
 static_assert(std::is_standard_layout_v<TenantContext>);
+static_assert(std::is_standard_layout_v<RequestProgress>);
 static_assert(std::is_standard_layout_v<ObjectEntry>);
 static_assert(std::is_standard_layout_v<ReplicaEntry>);
 static_assert(std::is_standard_layout_v<BackendView>);
 static_assert(std::is_standard_layout_v<AcquireIntent>);
 static_assert(std::is_standard_layout_v<IntentSlot>);
 static_assert(std::is_standard_layout_v<IntentPool>);
+static_assert(std::is_standard_layout_v<IntentQueueEntry>);
 static_assert(std::is_standard_layout_v<AcquireRequirement>);
-static_assert(std::is_standard_layout_v<ContinuationDependency>);
+static_assert(std::is_standard_layout_v<WorkDependency>);
 static_assert(std::is_standard_layout_v<WorkItem>);
-static_assert(std::is_standard_layout_v<Continuation>);
+static_assert(std::is_standard_layout_v<WorkTicket>);
 static_assert(std::is_standard_layout_v<NvmeQueueControl>);
 static_assert(std::is_standard_layout_v<NvmeQueueView>);
 static_assert(std::is_standard_layout_v<RuntimeView>);
 static_assert(std::is_trivially_copyable_v<AcquireRequirement>);
-static_assert(std::is_trivially_copyable_v<ContinuationDependency>);
+static_assert(std::is_trivially_copyable_v<WorkDependency>);
 static_assert(std::is_trivially_copyable_v<WorkItem>);
 static_assert(std::is_trivially_copyable_v<RuntimeView>);
 

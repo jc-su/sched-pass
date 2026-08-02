@@ -24,8 +24,9 @@ public:
   DeviceWorkPlan(DeviceWorkPlan &&) noexcept;
   DeviceWorkPlan &operator=(DeviceWorkPlan &&) noexcept;
 
-  // Reuses the fixed device allocation. Async updates stage through pinned
-  // host memory; consumers on another stream must call waitOn().
+  // Reuses the fixed device allocation. Async updates rotate through two
+  // pinned host images; consumers on another stream must call waitOn(). Plans
+  // are structural graph inputs and must be uploaded before graph capture.
   void upload(const WorkPlan &plan);
   void uploadAsync(const WorkPlan &plan, cudaStream_t stream);
   void waitOn(cudaStream_t stream) const;

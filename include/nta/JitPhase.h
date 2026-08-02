@@ -24,7 +24,10 @@ public:
   JitPhaseProgram &operator=(JitPhaseProgram &&) noexcept;
 
   void reset(cudaStream_t stream, abi::RuntimeView *runtime,
-             std::uint32_t objectCount, std::uint32_t continuationCount) const;
+             std::uint32_t objectCount, std::uint32_t workTicketCount) const;
+  void preloadHost(cudaStream_t stream, abi::RuntimeView *runtime,
+                   std::uint32_t firstObject,
+                   std::uint32_t objectCount) const;
   void progressHost(cudaStream_t stream, abi::RuntimeView *runtime,
                     std::uint32_t blocks) const;
   void progressNvme(cudaStream_t stream, abi::RuntimeView *runtime,
@@ -33,20 +36,19 @@ public:
   void publish(cudaStream_t stream, abi::RuntimeView *runtime,
                std::uint32_t pendingBudget) const;
   void complete(cudaStream_t stream, abi::RuntimeView *runtime,
-                std::uint32_t continuationCount) const;
+                std::uint32_t workTicketCount) const;
 
   template <typename Initial, typename Ready>
   void enqueueHost(cudaStream_t stream, abi::RuntimeView *runtime,
                    const HostPhaseConfig &config, Initial &&initial,
                    Ready &&ready) const {
-    reset(stream, runtime, config.objectCount, config.continuationCount);
+    reset(stream, runtime, config.objectCount, config.workTicketCount);
     initial();
-    complete(stream, runtime, config.continuationCount);
+    complete(stream, runtime, config.workTicketCount);
     for (std::uint32_t pass = 0; pass < config.progressPasses; ++pass) {
       progressHost(stream, runtime, config.progressBlocks);
-      publish(stream, runtime, config.continuationCount);
       ready();
-      complete(stream, runtime, config.continuationCount);
+      complete(stream, runtime, config.workTicketCount);
     }
   }
 
@@ -54,15 +56,14 @@ public:
   void enqueueNvme(cudaStream_t stream, abi::RuntimeView *runtime,
                    const NvmePhaseConfig &config, Initial &&initial,
                    Ready &&ready) const {
-    reset(stream, runtime, config.objectCount, config.continuationCount);
+    reset(stream, runtime, config.objectCount, config.workTicketCount);
     initial();
-    complete(stream, runtime, config.continuationCount);
+    complete(stream, runtime, config.workTicketCount);
     for (std::uint32_t pass = 0; pass < config.progressPasses; ++pass) {
       progressNvme(stream, runtime, config.issueBudget,
                    config.completionBudget);
-      publish(stream, runtime, config.continuationCount);
       ready();
-      complete(stream, runtime, config.continuationCount);
+      complete(stream, runtime, config.workTicketCount);
     }
   }
 

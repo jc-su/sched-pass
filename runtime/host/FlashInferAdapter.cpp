@@ -93,7 +93,7 @@ DecodePlan planDecode(const DecodeBatchView &batch) {
         requirements.push_back(makeRequirement(page));
       }
 
-      const std::uint32_t continuation =
+      const std::uint32_t workTicket =
           workBuilder.addWork(genericRequest, groupBegin - begin, requirements);
       for (std::uint32_t pageOffset = groupBegin; pageOffset < groupEnd;
            ++pageOffset) {
@@ -112,7 +112,7 @@ DecodePlan planDecode(const DecodeBatchView &batch) {
             pageOffset,
             physicalPage,
             pageOffset + 1U == end ? finalPageTokens : batch.pageSize,
-            continuation,
+            workTicket,
             batch.physicalPages[physicalPage],
         });
       }

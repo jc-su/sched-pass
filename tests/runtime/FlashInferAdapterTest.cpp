@@ -46,7 +46,7 @@ int main() {
   ok &= plan.chunks[1].physicalPage == 0 && plan.chunks[1].tokenCount == 5;
   ok &= plan.chunks[2].physicalPage == 2 && plan.chunks[2].tokenCount == 16;
   ok &= plan.chunks[0].requestSlot == 7 && plan.chunks[2].requestSlot == 9;
-  ok &= plan.chunks[0].continuation == 0 && plan.chunks[2].continuation == 2;
+  ok &= plan.chunks[0].workTicket == 0 && plan.chunks[2].workTicket == 2;
   ok &= plan.chunks[0].page.objectSlot == 5 &&
         plan.chunks[2].page.objectSlot == 5;
   ok &= plan.work.dependencies[0].objectSlot == 5 &&
@@ -60,9 +60,9 @@ int main() {
         grouped.work.workItems[0].dependencyCount == 2 &&
         grouped.work.workItems[0].directDependencyCount == 2 &&
         grouped.work.workItems[1].dependencyCount == 1;
-  ok &= grouped.chunks[0].continuation == 0 &&
-        grouped.chunks[1].continuation == 0 &&
-        grouped.chunks[2].continuation == 1;
+  ok &= grouped.chunks[0].workTicket == 0 &&
+        grouped.chunks[1].workTicket == 0 &&
+        grouped.chunks[2].workTicket == 1;
 
   const std::vector<std::int32_t> scheduledRequests{0, 1};
   const std::vector<std::int32_t> scheduledTiles{0, 0};

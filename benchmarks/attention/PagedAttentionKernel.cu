@@ -12,11 +12,14 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace {
 
 using nta::benchmark::AttentionHeadDimension;
+using nta::benchmark::AttentionPageDescriptor;
+using nta::benchmark::AttentionPageNeedsStaging;
 using nta::benchmark::AttentionPageTokens;
 using nta::benchmark::AttentionRequest;
 using nta::benchmark::AttentionTilePartial;
@@ -36,7 +39,7 @@ __device__ __forceinline__ float blockSum128(float value, float *scratch) {
 }
 
 __device__ __forceinline__ std::uint32_t
-popReadyContinuation(nta::abi::RuntimeView *runtime) {
+popReadyWorkTicket(nta::abi::RuntimeView *runtime) {
   __shared__ std::uint32_t selected;
   if (threadIdx.x == 0) {
     selected = nta::abi::InvalidIndex;
@@ -47,7 +50,7 @@ popReadyContinuation(nta::abi::RuntimeView *runtime) {
         break;
       }
       if (atomicCAS(runtime->readyHead, head, head + 1U) == head) {
-        selected = runtime->readyContinuations[head];
+        selected = runtime->readyWorkTickets[head];
         break;
       }
     }
@@ -59,10 +62,8 @@ popReadyContinuation(nta::abi::RuntimeView *runtime) {
 __device__ __forceinline__ void
 computeAttentionTile(nta::abi::RuntimeView *runtime,
                      const AttentionTileTask &task, std::uint32_t taskIndex,
-                     std::uint32_t continuationIndex, const __half *page,
+                     const nta::abi::WorkItem &work, const __half *page,
                      const __half *queries, AttentionTilePartial *partials) {
-  nta::abi::Continuation &continuation =
-      runtime->continuations[continuationIndex];
   const __half *keys = page;
   const __half *values = page + AttentionPageTokens * AttentionHeadDimension;
   const __half *query = queries + task.requestIndex * AttentionHeadDimension;
@@ -105,8 +106,173 @@ computeAttentionTile(nta::abi::RuntimeView *runtime,
     partial.lse = (tileMaximum + logf(denominator)) * 1.4426950408889634F;
     __threadfence();
     partial.valid = 1;
-    atomicExch(&continuation.state,
-               static_cast<std::uint32_t>(nta::abi::ContinuationState::Done));
+    (void)nta::device::completeBoundWorkTicket(
+        runtime, work.requestSlot, work.generation, work.workTicket);
+  }
+}
+
+constexpr std::uint32_t SparseTopKLimit = 8;
+
+__device__ __forceinline__ void selectSparsePages(
+    const AttentionPageDescriptor *catalog,
+    const std::uint32_t *candidateOffsets, const __half *summaries,
+    const __half *queries, std::uint32_t requestIndex, std::uint32_t topK,
+    nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
+    std::uint32_t *selectedObjectSlots, bool preacquired) {
+  __shared__ float reduction[AttentionHeadDimension];
+  __shared__ float topScores[SparseTopKLimit];
+  __shared__ std::uint32_t topSlots[SparseTopKLimit];
+  if (threadIdx.x == 0) {
+    for (std::uint32_t rank = 0; rank < topK; ++rank) {
+      topScores[rank] = -FLT_MAX;
+      topSlots[rank] = nta::abi::InvalidIndex;
+    }
+  }
+  __syncthreads();
+
+  const __half *query = queries + requestIndex * AttentionHeadDimension;
+  const std::uint32_t begin = candidateOffsets[requestIndex];
+  const std::uint32_t end = candidateOffsets[requestIndex + 1U];
+  for (std::uint32_t candidate = begin; candidate < end; ++candidate) {
+    const __half *summary = summaries + candidate * AttentionHeadDimension;
+    const float score = blockSum128(__half2float(query[threadIdx.x]) *
+                                        __half2float(summary[threadIdx.x]),
+                                    reduction);
+    if (threadIdx.x == 0) {
+      for (std::uint32_t rank = 0; rank < topK; ++rank) {
+        if (score > topScores[rank] ||
+            (score == topScores[rank] && candidate < topSlots[rank])) {
+          for (std::uint32_t move = topK - 1U; move > rank; --move) {
+            topScores[move] = topScores[move - 1U];
+            topSlots[move] = topSlots[move - 1U];
+          }
+          topScores[rank] = score;
+          topSlots[rank] = candidate;
+          break;
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    std::uint32_t directCount = 0;
+    const std::uint32_t dependencyBegin = requestIndex * topK;
+    for (std::uint32_t rank = 0; rank < topK; ++rank) {
+      const std::uint32_t candidate = topSlots[rank];
+      const AttentionPageDescriptor descriptor = catalog[candidate];
+      const std::uint64_t directBase =
+          preacquired ? descriptor.consumeBase : descriptor.directBase;
+      selectedObjectSlots[dependencyBegin + rank] = candidate;
+      requirements[dependencyBegin + rank] = {
+          directBase,
+          0,
+          descriptor.objectId,
+          0,
+          descriptor.objectSlot,
+          descriptor.objectVersion,
+          descriptor.bytes,
+          0,
+      };
+      directCount += directBase != 0 ? 1U : 0U;
+    }
+    // Discovery changes the selected dependency set only. Request ownership,
+    // reduction identity, and the host-calibrated cost remain structural plan
+    // metadata and must survive device-side page selection.
+    nta::abi::WorkItem &work = workItems[requestIndex];
+    work.dependencyBegin = dependencyBegin;
+    work.dependencyCount = topK;
+    work.directDependencyCount = directCount;
+    __threadfence();
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void runSparseAttention(
+    nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
+    const std::uint32_t *candidateOffsets, const __half *summaries,
+    const __half *queries, std::uint32_t requestIndex,
+    std::uint32_t requestCount, std::uint32_t topK,
+    nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
+    std::uint32_t *selectedObjectSlots, float *output, bool preacquired) {
+  if (requestIndex >= requestCount || topK == 0 || topK > SparseTopKLimit ||
+      candidateOffsets[requestIndex + 1U] - candidateOffsets[requestIndex] <
+          topK) {
+    return;
+  }
+
+  selectSparsePages(catalog, candidateOffsets, summaries, queries, requestIndex,
+                    topK, workItems, requirements, selectedObjectSlots,
+                    preacquired);
+  nta::kernel::WorkContext work{};
+  const bool ready = nta::kernel::acquireWork(runtime, workItems, requirements,
+                                              requestIndex, work);
+  if (!ready) {
+    nta::kernel::defer(runtime, work);
+    return;
+  }
+
+  __shared__ float reduction[AttentionHeadDimension];
+  __shared__ float runningMaximum;
+  __shared__ float runningDenominator;
+  __shared__ float previousScale;
+  __shared__ float tokenScale;
+  if (threadIdx.x == 0) {
+    runningMaximum = -FLT_MAX;
+    runningDenominator = 0.0F;
+  }
+  __syncthreads();
+
+  const __half *query = queries + requestIndex * AttentionHeadDimension;
+  float numerator = 0.0F;
+  const std::uint32_t selectionBegin = requestIndex * topK;
+  for (std::uint32_t rank = 0; rank < topK; ++rank) {
+    // Reload selection after the deferral boundary. No shared/local selector
+    // state is carried across a CTA exit.
+    const std::uint32_t catalogIndex =
+        selectedObjectSlots[selectionBegin + rank];
+    const AttentionPageDescriptor descriptor = catalog[catalogIndex];
+    const auto *page =
+        static_cast<const __half *>(nta::kernel::address(runtime, work, rank));
+    if (page == nullptr) {
+      nta::device::failWorkTicket(runtime, work.item.workTicket,
+                                  nta::abi::WorkTicketState::Failed);
+      return;
+    }
+    const __half *keys = page;
+    const __half *values = page + AttentionPageTokens * AttentionHeadDimension;
+    for (std::uint32_t token = 0; token < descriptor.tokenCount; ++token) {
+      const float score =
+          blockSum128(
+              __half2float(query[threadIdx.x]) *
+                  __half2float(
+                      keys[token * AttentionHeadDimension + threadIdx.x]),
+              reduction) *
+          0.08838834764831845F;
+      if (threadIdx.x == 0) {
+        const float updatedMaximum = fmaxf(runningMaximum, score);
+        previousScale = runningDenominator == 0.0F
+                            ? 0.0F
+                            : expf(runningMaximum - updatedMaximum);
+        tokenScale = expf(score - updatedMaximum);
+        runningDenominator = runningDenominator * previousScale + tokenScale;
+        runningMaximum = updatedMaximum;
+      }
+      __syncthreads();
+      numerator = numerator * previousScale +
+                  tokenScale *
+                      __half2float(
+                          values[token * AttentionHeadDimension + threadIdx.x]);
+    }
+  }
+  output[requestIndex * AttentionHeadDimension + threadIdx.x] =
+      numerator / runningDenominator;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    (void)nta::device::completeBoundWorkTicket(
+        runtime, work.item.requestSlot, work.item.generation,
+        work.item.workTicket);
   }
 }
 
@@ -127,12 +293,12 @@ runAttentionTile(nta::abi::RuntimeView *runtime, const AttentionTileTask *tasks,
   const auto *page =
       static_cast<const __half *>(nta::kernel::address(runtime, work, 0));
   if (page == nullptr) {
-    nta::device::failContinuation(runtime, work.item.continuation,
-                                  nta::abi::ContinuationState::Failed);
+    nta::device::failWorkTicket(runtime, work.item.workTicket,
+                                nta::abi::WorkTicketState::Failed);
     return;
   }
-  computeAttentionTile(runtime, task, taskIndex, work.item.continuation, page,
-                       queries, partials);
+  computeAttentionTile(runtime, task, taskIndex, work.item, page, queries,
+                       partials);
 }
 
 __device__ __forceinline__ void runAttentionTileTma(
@@ -150,8 +316,8 @@ __device__ __forceinline__ void runAttentionTileTma(
   }
   const void *descriptor = nta::kernel::tensorMap(runtime, work, 0);
   if (descriptor == nullptr) {
-    nta::device::failContinuation(runtime, work.item.continuation,
-                                  nta::abi::ContinuationState::Failed);
+    nta::device::failWorkTicket(runtime, work.item.workTicket,
+                                nta::abi::WorkTicketState::Failed);
     return;
   }
 
@@ -176,8 +342,8 @@ __device__ __forceinline__ void runAttentionTileTma(
     token = barrier.arrive();
   }
   barrier.wait(static_cast<decltype(token) &&>(token));
-  computeAttentionTile(runtime, task, taskIndex, work.item.continuation, page,
-                       queries, partials);
+  computeAttentionTile(runtime, task, taskIndex, work.item, page, queries,
+                       partials);
 }
 
 } // namespace
@@ -203,12 +369,11 @@ extern "C" __global__ void nta_attention_ready_kernel(
   if (blockDim.x != AttentionHeadDimension) {
     return;
   }
-  const std::uint32_t continuation = popReadyContinuation(runtime);
-  if (continuation >= runtime->continuationCapacity) {
+  const std::uint32_t workTicket = popReadyWorkTicket(runtime);
+  if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex =
-      runtime->continuations[continuation].logicalTile;
+  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
   if (taskIndex < taskCount) {
     runAttentionTile(runtime, tasks, workItems, requirements, taskIndex,
                      queries, partials);
@@ -236,15 +401,115 @@ extern "C" __global__ void nta_attention_tma_ready_kernel(
   if (blockDim.x != AttentionHeadDimension) {
     return;
   }
-  const std::uint32_t continuation = popReadyContinuation(runtime);
-  if (continuation >= runtime->continuationCapacity) {
+  const std::uint32_t workTicket = popReadyWorkTicket(runtime);
+  if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex =
-      runtime->continuations[continuation].logicalTile;
+  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
   if (taskIndex < taskCount) {
     runAttentionTileTma(runtime, tasks, workItems, requirements, taskIndex,
                         queries, partials);
+  }
+}
+
+extern "C" __global__ void nta_sparse_query_kernel(const __half *hidden,
+                                                   __half *queries,
+                                                   std::uint32_t requestCount) {
+  const std::uint32_t requestIndex = blockIdx.x;
+  const std::uint32_t dimension = threadIdx.x;
+  if (requestIndex >= requestCount || dimension >= AttentionHeadDimension) {
+    return;
+  }
+  const std::size_t base =
+      static_cast<std::size_t>(requestIndex) * AttentionHeadDimension;
+  const std::uint32_t neighbor = (dimension + 17U) % AttentionHeadDimension;
+  const float projected = 1.375F * __half2float(hidden[base + dimension]) +
+                          0.625F * __half2float(hidden[base + neighbor]) +
+                          0.001F * static_cast<float>(requestIndex + 1U);
+  queries[base + dimension] = __float2half(tanhf(projected));
+}
+
+extern "C" __global__ void nta_sparse_attention_kernel(
+    nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
+    const std::uint32_t *candidateOffsets, const __half *summaries,
+    const __half *queries, std::uint32_t requestCount, std::uint32_t topK,
+    nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
+    std::uint32_t *selectedObjectSlots, float *output,
+    std::uint32_t preacquired) {
+  if (blockDim.x == AttentionHeadDimension) {
+    runSparseAttention(runtime, catalog, candidateOffsets, summaries, queries,
+                       blockIdx.x, requestCount, topK, workItems, requirements,
+                       selectedObjectSlots, output, preacquired != 0);
+  }
+}
+
+extern "C" __global__ void nta_sparse_attention_ready_kernel(
+    nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
+    const std::uint32_t *candidateOffsets, const __half *summaries,
+    const __half *queries, std::uint32_t requestCount, std::uint32_t topK,
+    nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
+    std::uint32_t *selectedObjectSlots, float *output,
+    std::uint32_t preacquired) {
+  if (blockDim.x != AttentionHeadDimension) {
+    return;
+  }
+  const std::uint32_t workTicket = popReadyWorkTicket(runtime);
+  if (workTicket >= runtime->workTicketCapacity) {
+    return;
+  }
+  const std::uint32_t requestIndex =
+      runtime->workTickets[workTicket].logicalTile;
+  if (requestIndex < requestCount) {
+    runSparseAttention(runtime, catalog, candidateOffsets, summaries, queries,
+                       requestIndex, requestCount, topK, workItems,
+                       requirements, selectedObjectSlots, output,
+                       preacquired != 0);
+  }
+}
+
+extern "C" __global__ void
+nta_sparse_copy_all_kernel(const AttentionPageDescriptor *catalog,
+                           std::uint32_t candidateCount) {
+  const std::uint32_t candidate = blockIdx.x;
+  if (candidate >= candidateCount) {
+    return;
+  }
+  const AttentionPageDescriptor descriptor = catalog[candidate];
+  if ((descriptor.flags & AttentionPageNeedsStaging) == 0 ||
+      descriptor.sourceBase == 0 || descriptor.consumeBase == 0) {
+    return;
+  }
+  const auto *source = reinterpret_cast<const uint4 *>(descriptor.sourceBase);
+  auto *destination = reinterpret_cast<uint4 *>(descriptor.consumeBase);
+  const std::uint32_t vectors = descriptor.bytes / sizeof(uint4);
+  for (std::uint32_t vector = threadIdx.x; vector < vectors;
+       vector += blockDim.x) {
+    nta::device::storeNoAllocate(destination + vector,
+                                 nta::device::loadNoAllocate(source + vector));
+  }
+  auto *destinationBytes =
+      reinterpret_cast<std::byte *>(descriptor.consumeBase);
+  const auto *sourceBytes =
+      reinterpret_cast<const std::byte *>(descriptor.sourceBase);
+  for (std::uint32_t byte = vectors * sizeof(uint4) + threadIdx.x;
+       byte < descriptor.bytes; byte += blockDim.x) {
+    destinationBytes[byte] = sourceBytes[byte];
+  }
+}
+
+extern "C" __global__ void
+nta_sparse_invalidate_staging_kernel(nta::abi::RuntimeView *runtime,
+                                     const AttentionPageDescriptor *catalog,
+                                     std::uint32_t candidateCount) {
+  const std::uint32_t candidate = blockIdx.x * blockDim.x + threadIdx.x;
+  if (candidate >= candidateCount) {
+    return;
+  }
+  const AttentionPageDescriptor descriptor = catalog[candidate];
+  if ((descriptor.flags & AttentionPageNeedsStaging) != 0 &&
+      descriptor.objectSlot < runtime->objectCapacity) {
+    atomicExch(&runtime->objects[descriptor.objectSlot].state,
+               static_cast<std::uint32_t>(nta::abi::ObjectState::New));
   }
 }
 

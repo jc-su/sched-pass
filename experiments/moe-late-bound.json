@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "repetitions": 10,
+  "seed": 20260801,
+  "controlled_clocks": false,
+  "experiments": [
+    {
+      "name": "moe-sparse-gpu-route",
+      "variant": "late-bound",
+      "command": [
+        "./build/nta-moe-bench",
+        "--mode=host-staged",
+        "--policy=late-bound",
+        "--tokens=8",
+        "--experts=512",
+        "--top-k=2",
+        "--hidden=256",
+        "--iterations=50",
+        "--json=1"
+      ],
+      "metrics": [
+        "epoch_ms",
+        "wall_ms",
+        "tokens_per_second",
+        "final_epoch_physical_transfer_mib",
+        "transfer_amplification",
+        "verification_failures"
+      ]
+    },
+    {
+      "name": "moe-sparse-gpu-route",
+      "variant": "cpu-sync",
+      "command": [
+        "./build/nta-moe-bench",
+        "--mode=host-staged",
+        "--policy=cpu-sync",
+        "--tokens=8",
+        "--experts=512",
+        "--top-k=2",
+        "--hidden=256",
+        "--iterations=50",
+        "--json=1"
+      ],
+      "metrics": [
+        "epoch_ms",
+        "wall_ms",
+        "tokens_per_second",
+        "final_epoch_physical_transfer_mib",
+        "transfer_amplification",
+        "verification_failures"
+      ]
+    },
+    {
+      "name": "moe-sparse-gpu-route",
+      "variant": "overfetch",
+      "command": [
+        "./build/nta-moe-bench",
+        "--mode=host-staged",
+        "--policy=overfetch",
+        "--tokens=8",
+        "--experts=512",
+        "--top-k=2",
+        "--hidden=256",
+        "--iterations=50",
+        "--json=1"
+      ],
+      "metrics": [
+        "epoch_ms",
+        "wall_ms",
+        "tokens_per_second",
+        "final_epoch_physical_transfer_mib",
+        "transfer_amplification",
+        "verification_failures"
+      ]
+    },
+    {
+      "name": "moe-resident-gpu-route",
+      "variant": "late-bound",
+      "command": [
+        "./build/nta-moe-bench",
+        "--mode=resident",
+        "--policy=late-bound",
+        "--tokens=8",
+        "--experts=512",
+        "--top-k=2",
+        "--hidden=256",
+        "--iterations=100",
+        "--json=1"
+      ],
+      "metrics": [
+        "epoch_ms",
+        "wall_ms",
+        "tokens_per_second",
+        "final_epoch_physical_transfer_mib",
+        "transfer_amplification",
+        "verification_failures"
+      ]
+    },
+    {
+      "name": "moe-resident-gpu-route",
+      "variant": "direct",
+      "command": [
+        "./build/nta-moe-bench",
+        "--mode=resident",
+        "--policy=direct",
+        "--tokens=8",
+        "--experts=512",
+        "--top-k=2",
+        "--hidden=256",
+        "--iterations=100",
+        "--json=1"
+      ],
+      "metrics": [
+        "epoch_ms",
+        "wall_ms",
+        "tokens_per_second",
+        "final_epoch_physical_transfer_mib",
+        "transfer_amplification",
+        "verification_failures"
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "late-bound-over-overfetch-speedup",
+      "experiment": "moe-sparse-gpu-route",
+      "numerator_variant": "overfetch",
+      "denominator_variant": "late-bound",
+      "metric": "epoch_ms"
+    },
+    {
+      "name": "late-bound-over-cpu-sync-speedup",
+      "experiment": "moe-sparse-gpu-route",
+      "numerator_variant": "cpu-sync",
+      "denominator_variant": "late-bound",
+      "metric": "epoch_ms"
+    },
+    {
+      "name": "resident-late-bound-overhead-ratio",
+      "experiment": "moe-resident-gpu-route",
+      "numerator_variant": "late-bound",
+      "denominator_variant": "direct",
+      "metric": "epoch_ms"
+    }
+  ]
+}

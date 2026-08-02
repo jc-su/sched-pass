@@ -18,8 +18,8 @@ extern "C" __global__ void nta_foreign_kernel(
   const auto *input =
       static_cast<const float *>(nta::kernel::address(runtime, work, 0));
   if (input == nullptr) {
-    nta::device::failContinuation(runtime, work.item.continuation,
-                                  nta::abi::ContinuationState::Failed);
+    nta::device::failWorkTicket(runtime, work.item.workTicket,
+                                  nta::abi::WorkTicketState::Failed);
     return;
   }
   if (threadIdx.x == 0) {

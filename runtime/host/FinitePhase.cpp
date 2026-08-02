@@ -52,16 +52,16 @@ FinitePhaseProgram::FinitePhaseProgram(CUmodule module)
 
 void FinitePhaseProgram::reset(CUstream stream, abi::RuntimeView *runtime,
                                std::uint32_t objectCount,
-                               std::uint32_t continuationCount) const {
-  if (runtime == nullptr || objectCount == 0 || continuationCount == 0) {
+                               std::uint32_t workTicketCount) const {
+  if (runtime == nullptr || objectCount == 0 || workTicketCount == 0) {
     throw std::invalid_argument(
-        "finite phase reset needs runtime objects and continuations");
+        "finite phase reset needs runtime objects and work tickets");
   }
   constexpr std::uint32_t Threads = 256;
   const std::uint32_t blocks =
-      (std::max(objectCount, continuationCount) + Threads - 1U) / Threads;
+      (std::max(objectCount, workTicketCount) + Threads - 1U) / Threads;
   CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-  void *arguments[] = {&runtimeAddress, &objectCount, &continuationCount};
+  void *arguments[] = {&runtimeAddress, &objectCount, &workTicketCount};
   launch(reset_, blocks, Threads, stream, arguments, "nta_reset_epoch");
 }
 
@@ -94,26 +94,24 @@ void FinitePhaseProgram::publish(CUstream stream, abi::RuntimeView *runtime,
                                  std::uint32_t pendingBudget) const {
   if (runtime == nullptr || pendingBudget == 0) {
     throw std::invalid_argument(
-        "readiness publication needs a runtime and pending budget");
+        "availability publication needs a runtime and pending budget");
   }
   constexpr std::uint32_t Threads = 256;
-  const std::uint32_t blocks =
-      std::min(32U, (pendingBudget + Threads - 1U) / Threads);
   CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
   void *arguments[] = {&runtimeAddress, &pendingBudget};
-  launch(publish_, blocks, Threads, stream, arguments, "nta_publish_ready");
+  launch(publish_, 1, Threads, stream, arguments, "nta_publish_ready");
 }
 
 void FinitePhaseProgram::complete(CUstream stream, abi::RuntimeView *runtime,
-                                  std::uint32_t continuationCount) const {
-  if (runtime == nullptr || continuationCount == 0) {
+                                  std::uint32_t workTicketCount) const {
+  if (runtime == nullptr || workTicketCount == 0) {
     throw std::invalid_argument(
-        "completion needs a runtime and continuation count");
+        "completion needs a runtime and work-ticket count");
   }
   constexpr std::uint32_t Threads = 256;
-  const std::uint32_t blocks = (continuationCount + Threads - 1U) / Threads;
+  const std::uint32_t blocks = (workTicketCount + Threads - 1U) / Threads;
   CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-  void *arguments[] = {&runtimeAddress, &continuationCount};
+  void *arguments[] = {&runtimeAddress, &workTicketCount};
   launch(complete_, blocks, Threads, stream, arguments,
          "nta_complete_launched");
 }

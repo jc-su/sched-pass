@@ -25,16 +25,20 @@ int main() {
       {0, 0, 1001, 0, 7, 2, 4096, 0},
       {0x10000, 0, 1002, 128, 8, 3, 2048, 0},
   }};
-  const std::uint32_t continuation = builder.addWork(first, 31, graphShards);
+  const std::uint32_t workTicket = builder.addWork(first, 31, graphShards, 2500);
   nta::WorkPlan plan = builder.finish();
 
-  bool ok = continuation == 0 && plan.requests.size() == 1 &&
+  bool ok = workTicket == 0 && plan.requests.size() == 1 &&
         plan.workItems.size() == 1 && plan.dependencies.size() == 2;
   ok &= plan.workItems[0].requestSlot == 4 &&
         plan.workItems[0].generation == 9 &&
         plan.workItems[0].logicalWork == 31 &&
         plan.workItems[0].dependencyCount == 2 &&
-        plan.workItems[0].directDependencyCount == 1;
+        plan.workItems[0].directDependencyCount == 1 &&
+        plan.workItems[0].reductionGroup == first &&
+        plan.workItems[0].contributorIndex == 0 &&
+        plan.workItems[0].contributorCount == 1 &&
+        plan.workItems[0].estimatedComputeNs == 2500;
   ok &= plan.dependencies[1].directBase == 0x10000 &&
         plan.dependencies[1].offset == 128;
 
