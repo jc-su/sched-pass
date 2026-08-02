@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 19;
+inline constexpr std::uint32_t Version = 20;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 5;
 inline constexpr std::uint32_t UrgencyBucketCount = 8;
@@ -133,6 +133,23 @@ sourceTransferStride(std::uint64_t shape) noexcept {
 [[nodiscard]] constexpr std::uint32_t
 destinationTransferStride(std::uint64_t shape) noexcept {
   return static_cast<std::uint32_t>(shape >> 32U);
+}
+
+[[nodiscard]] constexpr std::uint64_t
+packTransferIndexLimits(std::uint32_t sourceLimit,
+                        std::uint32_t destinationLimit) noexcept {
+  return static_cast<std::uint64_t>(sourceLimit) |
+         (static_cast<std::uint64_t>(destinationLimit) << 32U);
+}
+
+[[nodiscard]] constexpr std::uint32_t
+sourceTransferIndexLimit(std::uint64_t limits) noexcept {
+  return static_cast<std::uint32_t>(limits);
+}
+
+[[nodiscard]] constexpr std::uint32_t
+destinationTransferIndexLimit(std::uint64_t limits) noexcept {
+  return static_cast<std::uint32_t>(limits >> 32U);
 }
 
 struct alignas(64) BackendView {

@@ -132,6 +132,8 @@ class RuntimeFixture:
                     element_bytes,
                     host_source.stride(0) * host_source.element_size(),
                     kv.stride(0) * kv.element_size(),
+                    int(host_source.shape[0]),
+                    int(kv.shape[0]),
                 )
                 object_ids[index] = object_id
                 object_slots[index] = index
@@ -149,6 +151,8 @@ class RuntimeFixture:
                 element_bytes,
                 host_source.stride(0) * host_source.element_size(),
                 kv.stride(0) * kv.element_size(),
+                int(host_source.shape[0]),
+                int(kv.shape[0]),
             )
             direct_bases = [0] * work_count
         else:
@@ -611,10 +615,29 @@ def main() -> None:
         indexed_staging[3]
     ).item() != 0:
         raise RuntimeError("indexed host acquisition overwrote an unselected row")
+
+    invalid_staging = torch.zeros_like(reference_kv)
+    invalid_indexed = RuntimeFixture(
+        invalid_staging,
+        host_kv,
+        source_indices=torch.tensor([host_kv.shape[0]], dtype=torch.int32),
+        destination_indices=torch.tensor([0], dtype=torch.int32),
+    )
+    phases.call("nta_jit_reset_epoch", invalid_indexed, 1, 1)
+    invalid_output = torch.full_like(expected, math.nan)
+    run_hooked(hooked, q, invalid_staging, invalid_indexed, invalid_output)
+    phases.call("nta_jit_complete_launched", invalid_indexed, 1)
+    phases.call("nta_jit_progress_host", invalid_indexed, 1)
+    phases.call("nta_jit_publish_ready", invalid_indexed, 1)
+    torch.cuda.synchronize()
+    invalid_indexed.assert_all_states(5)
+    if torch.count_nonzero(invalid_staging).item() != 0:
+        raise RuntimeError("out-of-range indexed acquisition wrote staging memory")
     if options.sanitizer:
         print(
             f"flashinfer_version={flashinfer.__version__} sanitizer_path=pass "
-            f"shared_kv_head_ctas=2 indexed_host=pass ready_wave=pass "
+            f"shared_kv_head_ctas=2 indexed_host=pass indexed_bounds=pass "
+            f"ready_wave=pass "
             f"max_abs_error={maximum:.6g}"
         )
         return
@@ -941,7 +964,8 @@ def main() -> None:
 
     print(
         f"flashinfer_version={flashinfer.__version__} resident=pass "
-        f"host_staged=pass indexed_host=pass shared_kv_head_ctas=2 "
+        f"host_staged=pass indexed_host=pass indexed_bounds=pass "
+        f"shared_kv_head_ctas=2 "
         f"ready_wave=pass "
         f"merge_gate=pass "
         f"request_local_merge=pass "

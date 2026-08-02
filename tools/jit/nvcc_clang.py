@@ -180,6 +180,12 @@ def main() -> int:
     if not instrument:
         real_nvcc = os.environ.get("NTA_REAL_NVCC", "")
         if real_nvcc and pathlib.Path(real_nvcc).is_file():
+            compatibility_launcher = ROOT / "tools" / "flashinfer" / "nvcc_compat.py"
+            if compatibility_launcher.is_file():
+                os.execv(
+                    compatibility_launcher,
+                    [str(compatibility_launcher), *arguments],
+                )
             os.execv(real_nvcc, [real_nvcc, *arguments])
 
     cache_tag = os.environ.get("NTA_JIT_CACHE_TAG", "")

@@ -429,7 +429,8 @@ nta_status nta_runtime_register_indexed_host_object(
     std::uint64_t sourceIndicesDeviceAddress,
     std::uint64_t stagingIndicesDeviceAddress, std::uint32_t indexCount,
     std::uint32_t elementBytes, std::uint32_t sourceStrideBytes,
-    std::uint32_t stagingStrideBytes) {
+    std::uint32_t stagingStrideBytes, std::uint32_t sourceIndexLimit,
+    std::uint32_t stagingIndexLimit) {
   return protect([&] {
     requireHandle(runtime, "runtime");
     runtime->value->registerIndexedHostObject(
@@ -442,7 +443,8 @@ nta_status nta_runtime_register_indexed_host_object(
             static_cast<std::uintptr_t>(sourceIndicesDeviceAddress)),
         reinterpret_cast<const std::uint32_t *>(
             static_cast<std::uintptr_t>(stagingIndicesDeviceAddress)),
-        indexCount, elementBytes, sourceStrideBytes, stagingStrideBytes);
+        indexCount, elementBytes, sourceStrideBytes, stagingStrideBytes,
+        sourceIndexLimit, stagingIndexLimit);
   });
 }
 
@@ -477,6 +479,8 @@ nta_status nta_runtime_register_indexed_host_objects(
           object.element_bytes,
           object.source_stride_bytes,
           object.staging_stride_bytes,
+          object.source_index_limit,
+          object.staging_index_limit,
           (object.flags & NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0,
       });
     }
@@ -516,6 +520,8 @@ nta_status nta_runtime_register_indexed_host_objects_async(
           object.element_bytes,
           object.source_stride_bytes,
           object.staging_stride_bytes,
+          object.source_index_limit,
+          object.staging_index_limit,
           (object.flags & NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0,
       });
     }
@@ -867,6 +873,19 @@ nta_status nta_jit_phase_reset(const nta_jit_phase_program *program,
     requireHandle(runtime, "runtime");
     program->value->reset(stream(cudaStream), runtime->value->deviceView(),
                           objectCount, workTicketCount);
+  });
+}
+
+nta_status nta_jit_phase_invalidate_cached_objects(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->invalidateCachedObjects(
+        stream(cudaStream), runtime->value->deviceView(), firstObject,
+        objectCount);
   });
 }
 

@@ -38,6 +38,18 @@ _EXPORTS = {
     "FlashInferLayerEpoch": ("flashinfer", "FlashInferLayerEpoch"),
     "attention_jit_args": ("flashinfer", "attention_jit_args"),
     "enqueue_resident_attention": ("flashinfer", "enqueue_resident_attention"),
+    "DeviceDemandCostModel": ("execution_policy", "DeviceDemandCostModel"),
+    "DeviceDemandPlan": ("execution_policy", "DeviceDemandPlan"),
+    "plan_device_demand": ("execution_policy", "plan_device_demand"),
+    "SelectedPageAcquisition": ("selected_pages", "SelectedPageAcquisition"),
+    "build_selected_page_work_plan": (
+        "selected_pages",
+        "build_selected_page_work_plan",
+    ),
+    "register_selected_host_pages": (
+        "selected_pages",
+        "register_selected_host_pages",
+    ),
 }
 
 __all__ = sorted(_EXPORTS)

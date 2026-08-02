@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 10U
+#define NTA_RUNTIME_C_API_VERSION 11U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -83,6 +83,8 @@ typedef struct nta_indexed_host_object {
   uint32_t element_bytes;
   uint32_t source_stride_bytes;
   uint32_t staging_stride_bytes;
+  uint32_t source_index_limit;
+  uint32_t staging_index_limit;
   uint32_t flags;
 } nta_indexed_host_object;
 
@@ -216,7 +218,8 @@ nta_status nta_runtime_register_indexed_host_object(
     uint64_t staging_device_address, uint64_t source_indices_device_address,
     uint64_t staging_indices_device_address, uint32_t index_count,
     uint32_t element_bytes, uint32_t source_stride_bytes,
-    uint32_t staging_stride_bytes);
+    uint32_t staging_stride_bytes, uint32_t source_index_limit,
+    uint32_t staging_index_limit);
 nta_status nta_runtime_register_indexed_host_objects(
     nta_runtime *runtime, uint32_t first_slot,
     const nta_indexed_host_object *objects, uint32_t object_count);
@@ -294,6 +297,9 @@ nta_status nta_jit_phase_reset(const nta_jit_phase_program *program,
                                nta_runtime *runtime, uint32_t object_count,
                                uint32_t work_ticket_count,
                                uint64_t cuda_stream);
+nta_status nta_jit_phase_invalidate_cached_objects(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
 nta_status nta_jit_phase_preload_host(const nta_jit_phase_program *program,
                                       nta_runtime *runtime,
                                       uint32_t first_object,

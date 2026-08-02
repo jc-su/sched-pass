@@ -94,14 +94,23 @@ class OpportunitySummary:
     operators: int
     tiles: int
     requests: int
+    parallel_slots: int
+    material_delay_ns: int
     median_arrival_spread_ns: float
     p95_arrival_spread_ns: float
     available_before_atomic_launch: float
+    material_available_before_atomic_launch: float
+    operators_with_material_opportunity: float
+    operators_with_speedup: float
     blocked_compute_ns: int
     blocked_compute_area_ns2: int
     atomic_makespan_ns: int
     incremental_makespan_ns: int
     incremental_speedup: float
+    median_operator_speedup: float
+    p95_operator_speedup: float
+    ideal_incremental_makespan_ns: int
+    ideal_incremental_speedup: float
 
     def as_json(self) -> dict[str, int | float]:
         return dataclasses.asdict(self)
@@ -117,6 +126,7 @@ class TraceProvenance:
     gpu_timestamped_tiles: int
     resident_at_launch_tiles: int
     calibrated_compute_tiles: int
+    measured_compute_tiles: int
 
     def as_json(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -133,8 +143,20 @@ def _percentile(values: list[int], quantile: float) -> float:
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
+def _parallel_makespan(tiles: Iterable[TileArrival], parallel_slots: int) -> int:
+    """Return deterministic list-scheduling time on identical CTA slots."""
+    slot_ends = [0] * parallel_slots
+    for tile in sorted(tiles, key=lambda item: (-item.compute_ns, item.tile_id)):
+        slot = min(range(parallel_slots), key=slot_ends.__getitem__)
+        slot_ends[slot] += tile.compute_ns
+    return max(slot_ends, default=0)
+
+
 def _incremental_makespan(
-    tiles: tuple[TileArrival, ...], launch_overhead_ns: int, grouping_window_ns: int
+    tiles: tuple[TileArrival, ...],
+    launch_overhead_ns: int,
+    grouping_window_ns: int,
+    parallel_slots: int,
 ) -> int:
     remaining = sorted(tiles, key=lambda tile: (tile.available_ns, tile.tile_id))
     cursor = 0
@@ -146,7 +168,11 @@ def _incremental_makespan(
             wave_end += 1
         wave = remaining[:wave_end]
         del remaining[:wave_end]
-        cursor = cutoff + launch_overhead_ns + sum(tile.compute_ns for tile in wave)
+        cursor = (
+            cutoff
+            + launch_overhead_ns
+            + _parallel_makespan(wave, parallel_slots)
+        )
     return cursor
 
 
@@ -155,9 +181,14 @@ def summarize(
     *,
     launch_overhead_ns: int = 0,
     grouping_window_ns: int = 0,
+    parallel_slots: int = 1,
+    material_delay_ns: int = 0,
+    speedup_threshold: float = 1.2,
 ) -> OpportunitySummary:
-    if launch_overhead_ns < 0 or grouping_window_ns < 0:
-        raise ValueError("launch overhead and grouping window cannot be negative")
+    if min(launch_overhead_ns, grouping_window_ns, material_delay_ns) < 0:
+        raise ValueError("opportunity timing parameters cannot be negative")
+    if parallel_slots <= 0 or speedup_threshold < 1.0:
+        raise ValueError("parallel slots and speedup threshold are invalid")
 
     materialized = tuple(records)
     if not materialized:
@@ -167,10 +198,15 @@ def summarize(
     tile_count = 0
     request_count = 0
     available_before = 0
+    material_available_before = 0
+    material_operators = 0
+    speedup_operators = 0
     blocked_compute = 0
     blocked_area = 0
     atomic_total = 0
     incremental_total = 0
+    ideal_incremental_total = 0
+    operator_speedups: list[float] = []
     for record in materialized:
         tile_count += len(record.tiles)
         by_request: dict[str, list[int]] = {}
@@ -181,31 +217,69 @@ def summarize(
             spreads.append(max(arrivals) - int(statistics.median(arrivals)))
 
         atomic_launch = max(tile.available_ns for tile in record.tiles)
-        compute = sum(tile.compute_ns for tile in record.tiles)
-        atomic_total += atomic_launch + launch_overhead_ns + compute
-        incremental_total += _incremental_makespan(
-            record.tiles, launch_overhead_ns, grouping_window_ns
+        compute = _parallel_makespan(record.tiles, parallel_slots)
+        atomic = atomic_launch + launch_overhead_ns + compute
+        incremental = _incremental_makespan(
+            record.tiles,
+            launch_overhead_ns,
+            grouping_window_ns,
+            parallel_slots,
         )
+        ideal_incremental = _incremental_makespan(
+            record.tiles, 0, 0, parallel_slots
+        )
+        atomic_total += atomic
+        incremental_total += incremental
+        ideal_incremental_total += ideal_incremental
+        speedup = atomic / incremental if incremental else 0.0
+        operator_speedups.append(speedup)
+        if speedup >= speedup_threshold:
+            speedup_operators += 1
+        operator_material = False
         for tile in record.tiles:
             delay = atomic_launch - tile.available_ns
             if delay > 0:
                 available_before += 1
                 blocked_compute += tile.compute_ns
                 blocked_area += delay * tile.compute_ns
+            if delay >= material_delay_ns and delay > 0:
+                material_available_before += 1
+                operator_material = True
+        material_operators += operator_material
 
     return OpportunitySummary(
         operators=len(materialized),
         tiles=tile_count,
         requests=request_count,
+        parallel_slots=parallel_slots,
+        material_delay_ns=material_delay_ns,
         median_arrival_spread_ns=float(statistics.median(spreads)),
         p95_arrival_spread_ns=_percentile(spreads, 0.95),
         available_before_atomic_launch=available_before / tile_count,
+        material_available_before_atomic_launch=(
+            material_available_before / tile_count
+        ),
+        operators_with_material_opportunity=(
+            material_operators / len(materialized)
+        ),
+        operators_with_speedup=speedup_operators / len(materialized),
         blocked_compute_ns=blocked_compute,
         blocked_compute_area_ns2=blocked_area,
         atomic_makespan_ns=atomic_total,
         incremental_makespan_ns=incremental_total,
         incremental_speedup=(
             atomic_total / incremental_total if incremental_total != 0 else 0.0
+        ),
+        median_operator_speedup=float(statistics.median(operator_speedups)),
+        p95_operator_speedup=_percentile(
+            [round(value * 1_000_000) for value in operator_speedups], 0.95
+        )
+        / 1_000_000,
+        ideal_incremental_makespan_ns=ideal_incremental_total,
+        ideal_incremental_speedup=(
+            atomic_total / ideal_incremental_total
+            if ideal_incremental_total != 0
+            else 0.0
         ),
     )
 
@@ -232,6 +306,11 @@ def summarize_provenance(records: Iterable[OperatorArrival]) -> TraceProvenance:
         ),
         calibrated_compute_tiles=sum(
             tile.compute_source == "calibrated"
+            for record in materialized
+            for tile in record.tiles
+        ),
+        measured_compute_tiles=sum(
+            tile.compute_source == "measured"
             for record in materialized
             for tile in record.tiles
         ),

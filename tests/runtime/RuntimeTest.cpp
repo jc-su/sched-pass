@@ -275,6 +275,8 @@ int main() {
                                                  64,
                                                  64,
                                                  64,
+                                                 1,
+                                                 1,
                                                  true};
     runtime.registerIndexedHostObjects(
         3, std::span<const nta::IndexedHostObjectSpec>(&preacquired, 1));

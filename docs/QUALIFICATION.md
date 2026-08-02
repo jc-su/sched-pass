@@ -110,8 +110,8 @@ models, and a physical multi-GPU run.
 ## OSDI Evidence
 
 `results/qualification/osdi-evidence.json` also uses schema 2. Its artifact
-manifest must include `opportunity`, `dense_flashinfer`, `baselines`,
-`ablations`, `statistics`, and `reproduction`.
+manifest must include `opportunity`, `dense_flashinfer`, `sparse_flashinfer`,
+`baselines`, `ablations`, `statistics`, and `reproduction`.
 
 The executable gate now matches `SYSTEM_PLAN.md` and requires:
 
@@ -124,7 +124,10 @@ The executable gate now matches `SYSTEM_PLAN.md` and requires:
   CUDA graph;
 - one elastic online policy with engine admission feedback and identical-state
   decision regret no worse than 1.05 median and 1.10 p95;
-- GPU-selected pages consumed by real FlashInfer sparse attention;
+- GPU-selected pages consumed by a real FlashInfer selector and attention
+  kernel with no NTA hot-path host identity round trip, at least five
+  selectivity points, a measured crossover, at least 2x peak speedup over
+  forced overfetch, and at most 2x regret to a precomputed selected-copy oracle;
 - no more than 5% p50 resident overhead, at least 90% of dense bulk throughput,
   and an end-to-end gain over equal-state request skip/rebatch;
 - at least ten controlled independent trials with confidence intervals; and

@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--max-attempts", type=int)
     parser.add_argument("--hot-tokens", type=int, default=160)
+    parser.add_argument("--hot-requests", type=int, default=1)
     parser.add_argument("--churn-tokens", type=int, default=240)
     parser.add_argument("--resident-tokens", type=int, default=0)
     parser.add_argument("--max-total-tokens", type=int, default=320)
@@ -110,6 +111,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         str(args.iterations),
         "--hot-tokens",
         str(args.hot_tokens),
+        "--hot-requests",
+        str(args.hot_requests),
         "--churn-tokens",
         str(args.churn_tokens),
         "--resident-tokens",

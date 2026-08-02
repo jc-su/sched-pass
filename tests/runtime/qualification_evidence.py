@@ -64,6 +64,37 @@ def main() -> None:
         }.issubset(osdi_names)
         assert not any(item["passed"] for item in osdi)
 
+        qualifier.verify_artifacts = lambda *_args: (True, "test artifacts")
+        current["sparse_flashinfer"] = {
+            "gpu_selected_pages": True,
+            "nta_hot_path_host_identity_round_trips": 0,
+            "real_flashinfer_selector": True,
+            "real_flashinfer_attention": True,
+            "stock_output_parity": True,
+            "candidate_sweep_points": 5,
+            "selectivity_crossover_measured": True,
+            "peak_speedup_over_overfetch": 2.0,
+            "maximum_regret_to_offline_oracle": 2.0,
+        }
+        (evidence / "osdi-evidence.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        osdi = qualifier.osdi_checks(evidence, "revision")
+        sparse = next(
+            item for item in osdi if item["name"] == "real GPU-selected sparse stress"
+        )
+        assert sparse["passed"] is True
+
+        current["sparse_flashinfer"]["maximum_regret_to_offline_oracle"] = 2.01
+        (evidence / "osdi-evidence.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        osdi = qualifier.osdi_checks(evidence, "revision")
+        sparse = next(
+            item for item in osdi if item["name"] == "real GPU-selected sparse stress"
+        )
+        assert sparse["passed"] is False
+
     print("qualification_evidence=pass")
 
 

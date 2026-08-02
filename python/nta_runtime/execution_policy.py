@@ -16,12 +16,15 @@ class HostCostModel:
     dependency_width: int = 2
 
     def validate(self) -> None:
-        if min(
-            self.bandwidth_bytes_per_second,
-            self.tile_compute_ns,
-            self.max_rounds,
-            self.dependency_width,
-        ) <= 0:
+        if (
+            min(
+                self.bandwidth_bytes_per_second,
+                self.tile_compute_ns,
+                self.max_rounds,
+                self.dependency_width,
+            )
+            <= 0
+        ):
             raise ValueError("host execution cost parameters must be positive")
         if self.round_overhead_ns < 0 or self.minimum_predicted_gain < 1.0:
             raise ValueError("host execution overhead and gain are invalid")
@@ -44,6 +47,82 @@ class HostExecutionPlan:
         return self.predicted_atomic_ns / self.predicted_incremental_ns
 
 
+@dataclasses.dataclass(frozen=True)
+class DeviceDemandCostModel:
+    """Calibrated costs for bulk candidates versus device-indexed demand."""
+
+    bulk_bandwidth_bytes_per_second: int = 55_000_000_000
+    indexed_bandwidth_bytes_per_second: int = 30_000_000_000
+    bulk_setup_ns: int = 10_000
+    indexed_setup_ns: int = 50_000
+    indexed_page_overhead_ns: int = 100
+    minimum_predicted_gain: float = 1.10
+
+    def validate(self) -> None:
+        if (
+            min(
+                self.bulk_bandwidth_bytes_per_second,
+                self.indexed_bandwidth_bytes_per_second,
+            )
+            <= 0
+        ):
+            raise ValueError("device-demand bandwidths must be positive")
+        if (
+            min(
+                self.bulk_setup_ns,
+                self.indexed_setup_ns,
+                self.indexed_page_overhead_ns,
+            )
+            < 0
+            or self.minimum_predicted_gain < 1.0
+        ):
+            raise ValueError("device-demand overhead and gain are invalid")
+
+
+@dataclasses.dataclass(frozen=True)
+class DeviceDemandPlan:
+    mode: str
+    predicted_bulk_ns: int
+    predicted_indexed_ns: int
+
+    @property
+    def predicted_gain(self) -> float:
+        selected = (
+            self.predicted_indexed_ns
+            if self.mode == "indexed"
+            else self.predicted_bulk_ns
+        )
+        return self.predicted_bulk_ns / selected
+
+
+def plan_device_demand(
+    *,
+    candidate_bytes: int,
+    selected_bytes: int,
+    selected_pages: int,
+    model: DeviceDemandCostModel,
+) -> DeviceDemandPlan:
+    """Choose bulk or indexed transfer without observing selected identities."""
+
+    model.validate()
+    if min(candidate_bytes, selected_bytes, selected_pages) <= 0:
+        raise ValueError("device-demand planning needs non-empty transfer geometry")
+    if selected_bytes > candidate_bytes:
+        raise ValueError("selected bytes cannot exceed candidate bytes")
+    bulk_ns = model.bulk_setup_ns + math.ceil(
+        candidate_bytes * 1_000_000_000 / model.bulk_bandwidth_bytes_per_second
+    )
+    indexed_ns = (
+        model.indexed_setup_ns
+        + selected_pages * model.indexed_page_overhead_ns
+        + math.ceil(
+            selected_bytes * 1_000_000_000 / model.indexed_bandwidth_bytes_per_second
+        )
+    )
+    mode = "indexed" if bulk_ns / indexed_ns >= model.minimum_predicted_gain else "bulk"
+    return DeviceDemandPlan(mode, bulk_ns, indexed_ns)
+
+
 def _round_width(object_count: int, rounds: int, dependency_width: int) -> int:
     width = math.ceil(object_count / rounds)
     return min(
@@ -54,8 +133,7 @@ def _round_width(object_count: int, rounds: int, dependency_width: int) -> int:
 
 def _block_counts(object_count: int, width: int) -> tuple[int, ...]:
     return tuple(
-        min(width, object_count - first)
-        for first in range(0, object_count, width)
+        min(width, object_count - first) for first in range(0, object_count, width)
     )
 
 
@@ -104,9 +182,7 @@ def plan_host_execution(
 
     max_rounds = min(model.max_rounds, math.ceil(object_count / model.dependency_width))
     for requested_rounds in range(2, max_rounds + 1):
-        width = _round_width(
-            object_count, requested_rounds, model.dependency_width
-        )
+        width = _round_width(object_count, requested_rounds, model.dependency_width)
         counts = _block_counts(object_count, width)
         candidate_ns = _pipeline_ns(
             transfer_ns, compute_ns, len(counts), model.round_overhead_ns

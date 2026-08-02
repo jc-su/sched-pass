@@ -83,6 +83,8 @@ struct IndexedHostObjectSpec {
   std::uint32_t elementBytes;
   std::uint32_t sourceStrideBytes;
   std::uint32_t stagingStrideBytes;
+  std::uint32_t sourceIndexLimit;
+  std::uint32_t stagingIndexLimit;
   // The caller has enqueued the transfer on the same stream after directory
   // publication and will gate every consumer with a post-transfer event.
   bool preacquired = false;
@@ -144,7 +146,8 @@ public:
       const std::uint32_t *sourceIndicesDevice,
       const std::uint32_t *stagingIndicesDevice, std::uint32_t indexCount,
       std::uint32_t elementBytes, std::uint32_t sourceStrideBytes,
-      std::uint32_t stagingStrideBytes);
+      std::uint32_t stagingStrideBytes, std::uint32_t sourceIndexLimit,
+      std::uint32_t stagingIndexLimit);
   void registerIndexedHostObjects(
       std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects);
   void registerIndexedHostObjectsAsync(

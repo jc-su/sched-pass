@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
         help="fail unless this many attempts yield the requested promotions",
     )
     parser.add_argument("--hot-tokens", type=int, default=160)
+    parser.add_argument("--hot-requests", type=int, default=1)
     parser.add_argument("--churn-tokens", type=int, default=240)
     parser.add_argument("--resident-tokens", type=int, default=0)
     parser.add_argument("--max-total-tokens", type=int, default=320)
@@ -62,6 +63,7 @@ def parse_args() -> argparse.Namespace:
         min(
             args.iterations,
             args.hot_tokens,
+            args.hot_requests,
             args.churn_tokens,
             args.max_total_tokens,
             args.context_length,
@@ -75,8 +77,10 @@ def parse_args() -> argparse.Namespace:
         args.max_attempts = 4 * args.iterations
     if args.max_attempts < args.iterations:
         parser.error("max attempts must be at least the requested iterations")
-    if args.hot_tokens + args.churn_tokens <= args.max_total_tokens:
-        parser.error("hot and churn prompts must exceed the device token pool together")
+    if args.hot_requests * args.hot_tokens + args.churn_tokens <= args.max_total_tokens:
+        parser.error(
+            "hot request set and churn prompt must exceed the device token pool together"
+        )
     return args
 
 
@@ -148,7 +152,10 @@ def main() -> int:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()))
-    hot = make_prompt(tokenizer, "hot-prefix", args.hot_tokens)
+    hot = [
+        make_prompt(tokenizer, f"hot-prefix-{index}", args.hot_tokens)
+        for index in range(args.hot_requests)
+    ]
     churn = [
         make_prompt(tokenizer, f"eviction-{attempt}", args.churn_tokens)
         for attempt in range(args.max_attempts + 1)
@@ -181,7 +188,7 @@ def main() -> int:
         hicache_mem_layout="page_first",
     ) as engine:
         load_seconds = time.perf_counter() - load_started
-        generated_text(engine.generate(hot, sampling))
+        generation_results(engine.generate(hot, sampling))
         generated_text(engine.generate(churn[0], sampling))
         samples: list[float] = []
         metadata: list[Any] = []
@@ -192,7 +199,7 @@ def main() -> int:
         digest = hashlib.sha256()
         for attempt in range(args.max_attempts):
             started = time.perf_counter()
-            prompts = [hot, resident[attempt]] if resident else hot
+            prompts = hot + ([resident[attempt]] if resident else [])
             result = engine.generate(prompts, sampling)
             elapsed = time.perf_counter() - started
             values = generation_results(result)
@@ -200,7 +207,10 @@ def main() -> int:
             result_metadata = [value.get("meta_info", {}) for value in values]
             attempt_seconds.append(elapsed)
             attempt_metadata.append(result_metadata)
-            if host_cached_tokens(values[0]) > 0:
+            if all(
+                host_cached_tokens(value) > 0
+                for value in values[: args.hot_requests]
+            ):
                 samples.append(elapsed)
                 metadata.append(result_metadata)
                 external_attempt_indices.append(attempt)
@@ -222,15 +232,21 @@ def main() -> int:
         stats.append(json.loads(path.read_text(encoding="utf-8")))
     median = statistics.median(samples)
     hot_request_seconds = [
-        float(values[0]["e2e_latency"])
+        max(float(value["e2e_latency"]) for value in values[: args.hot_requests])
         for values in metadata
-        if values and isinstance(values[0].get("e2e_latency"), (int, float))
+        if len(values) >= args.hot_requests
+        and all(
+            isinstance(value.get("e2e_latency"), (int, float))
+            for value in values[: args.hot_requests]
+        )
     ]
     peer_request_seconds = [
-        float(values[1]["e2e_latency"])
+        float(values[args.hot_requests]["e2e_latency"])
         for values in metadata
-        if len(values) > 1
-        and isinstance(values[1].get("e2e_latency"), (int, float))
+        if len(values) > args.hot_requests
+        and isinstance(
+            values[args.hot_requests].get("e2e_latency"), (int, float)
+        )
     ]
     peer_delay_seconds = [
         max(0.0, peer - hot)
@@ -248,9 +264,10 @@ def main() -> int:
         "cuda_graph_decode": args.cuda_graph_decode,
         "model": str(args.model.resolve()),
         "hot_tokens": args.hot_tokens,
+        "hot_requests": args.hot_requests,
         "churn_tokens": args.churn_tokens,
         "resident_tokens": args.resident_tokens,
-        "batch_width": 2 if resident else 1,
+        "batch_width": args.hot_requests + (1 if resident else 0),
         "max_total_tokens": args.max_total_tokens,
         "iterations": args.iterations,
         "attempts": len(attempt_seconds),
@@ -261,7 +278,10 @@ def main() -> int:
         "attempt_seconds_samples": attempt_seconds,
         "median_promotion_seconds": median,
         "promotions_per_second": 1.0 / median,
-        "completed_requests_per_second": (2 if resident else 1) / median,
+        "completed_requests_per_second": (
+            args.hot_requests + (1 if resident else 0)
+        )
+        / median,
         "generated_text_sha256": digest.hexdigest(),
         "generated_text_samples": generated_samples,
         "result_metadata": metadata,

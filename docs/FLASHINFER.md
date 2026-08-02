@@ -4,8 +4,10 @@ Status: optimized decode and FA2 paged-prefill work ticket hooks, native C and
 Python engine-runtime bindings, and an owning per-layer FlashInfer executor are
 implemented and executed for FlashInfer 0.6.12. The eager SGLang 0.5.14
 HiCache lifecycle and full decode CUDA-graph replay are integrated through its
-plugin system. vLLM, demand-mode graph phases, and paged-prefill graph
-validation remain open.
+plugin system. FlashInfer top-k selection now feeds bounded device-indexed host
+page acquisition and real paged decode without a host identity round trip.
+vLLM, serving use of that path, demand-mode graph phases, and paged-prefill
+graph validation remain open.
 
 ## Boundary
 
@@ -44,10 +46,10 @@ checks CTA collectivity, control dependence, and the finite return boundary.
 
 The installed 0.6.12 package also exposes
 `top_k_page_table_transform`, `BlockSparseAttentionWrapper`, and
-`VariableBlockSparseAttentionWrapper`. These are the required basis for the
-planned GPU-selected sparse stress case. They are not integrated with NTA yet;
-the current query-dependent sparse benchmark is custom CUDA and is not a
-FlashInfer performance result.
+`VariableBlockSparseAttentionWrapper`. The implemented stress path uses the
+real top-k transform, a stable GPU index table registered with NTA, and real
+FlashInfer paged decode over compact selected KV. The custom query-dependent
+sparse benchmark remains only a protocol fixture.
 
 ## Kernel Hook
 
@@ -205,18 +207,20 @@ GPU scores
   -> real FlashInfer sparse attention
 ```
 
-A separate selector kernel or graph node is permitted. A CPU copy or stream
-synchronization between selection and attention is not.
+A separate selector kernel or graph node is permitted. The implemented path is
+stream ordered and updates the exact stable index table consumed by NTA. Its
+offline-oracle arm materializes IDs on the CPU before timing; the NTA hot path
+does not.
 
 ## Validation
 
-Correctness gates below run on ABI v19. The quoted sanitizer and performance
-numbers predate v19 and must be regenerated before use as current evidence.
+Correctness gates below run on ABI v20. Any quoted sanitizer and performance
+numbers that predate v20 must be regenerated before use as current evidence.
 
 The local CTest gate covers:
 
 - real multi-source decode and paged-prefill JIT compilation with NTA Params;
-- C and C++ loading of the exported ABI-19 phase functions;
+- C and C++ loading of the exported ABI-20 phase functions;
 - resident and pinned-host deferred decode;
 - heterogeneous request remapping where only the nonzero scheduler ticket is
   ready and physical CTA zero must execute it;
@@ -227,6 +231,12 @@ The local CTest gate covers:
   and the blocked peer preserves its sentinel output;
 - four-work-item FA2 paged prefill; and
 - exact output comparison with stock FlashInfer.
+
+`FlashInferSelectedPages.py` additionally checks real selector-to-acquisition
+dataflow, bounded GPU-generated source and destination indices, cold and
+retained staging, and output parity with stock FlashInfer over the same selected
+pages. The five-point sweep and current numbers are recorded in
+`VALIDATION.md`.
 
 Memcheck, racecheck, and synccheck are clean on the shared-work ticket deferred
 path. A matched 64-request custom-variant microbenchmark has an 8% CTest
@@ -248,18 +258,19 @@ instrumented wrappers. Resident batches retain the stock wrappers.
 The runner selects a CUDA-compatible host compiler before importing SGLang,
 uses an isolated FlashInfer JIT cache, and emits machine-readable JSON. It is a
 stock serving baseline and deliberately records `nta_integrated=false`.
-`CompareSglangHiCache.py` is the integrated matched gate. The latest local
-15-promotion Llama-160M measurements have exact output parity, zero fallback,
-and medians 2.58% below stock for one promoted request and 4.62% below stock
-when paired with a fresh request. See `SGLANG.md` for the supported profile and
-the limits of this uncontrolled single-machine result.
+`CompareSglangHiCache.py` is the integrated matched gate. Historical local
+Llama-160M runs had exact output parity and zero fallback, but the current
+schedule-aware five-promotion result was 2.62% slower than stock. See
+`SGLANG.md` for the supported profile and the limits of this uncontrolled
+single-machine result.
 
 ## Open Gates
 
 - compiler-generated direct and incremental forms of the same real FlashInfer
   dense kernel, followed by unified grouping, engine feedback, best-fixed trace
   comparison, and resettable decision-regret evaluation;
-- a GPU-only FlashInfer top-k page-table to real sparse-attention integration;
+- end-to-end SGLang or vLLM use of the GPU-selected page path, including real
+  model-generated scores rather than controlled random scores;
 - a vLLM request-generation/KV-offload adapter, SGLang demand-mode graph
   phases, and paged-prefill graph validation;
 - 24-hour serving graph replay/cancellation soak and execution on multiple

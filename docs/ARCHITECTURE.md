@@ -26,7 +26,7 @@ on the common mechanism; production MoE baselines remain open. A 10,000-epoch
 runtime/graph lifecycle stress passes; the two-device ownership test is present
 but skips on this one-GPU host.
 
-ABI v19 defines one engine-neutral device work item, fixed-capacity dependency
+ABI v20 defines one engine-neutral device work item, fixed-capacity dependency
 segments, completion-driven reverse dependency edges, and a compact runnable
 work queue. The completion CTA that satisfies the final dependency performs the
 single `Pending -> Ready` transition and appends the ticket; a bounded
@@ -188,7 +188,7 @@ not independent production policies.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v19 registers each staged directory entry as one acquisition tile. Direct
+ABI v20 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
 this makes duplicate suppression exact without a range-availability bitmap.
 
@@ -418,7 +418,7 @@ external miss
 The queue lease protects only command construction and publication. It is
 released before the CTA returns and is never held across device I/O. The CTA
 does not inspect completion state. A separate finite progress invocation drains
-the CQ, releases credits, and publishes data availability. ABI v19 implements this for
+the CQ, releases credits, and publishes data availability. ABI v20 implements this for
 NVMe; RDMA remains inactive until a real backend and RNIC testbed exist.
 
 The fast path is intentionally opportunistic. Backend demand is atomically
@@ -523,7 +523,7 @@ thread-derived operands, but LLVM IR alone cannot prove that an unrelated CTA
 never writes a plain global address; unsupported frontends must not assert this
 contract without equivalent ownership.
 
-The ABI-v19 IR suite includes a positive device-selected-object case whose slot,
+The ABI-v20 IR suite includes a positive device-selected-object case whose slot,
 identity, version, range, and direct pointer are loaded from a catalog selected
 by CTA identity. The pass lowers that case and tags it `split-phase-cta` while
 the existing thread/lane-derived fixtures remain rejected. This establishes
@@ -618,7 +618,7 @@ graph must choose a compatible control strategy; it cannot combine those two
 features as if they were independently composable. See the
 [CUDA Graphs programming guide](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html).
 
-ABI v19 also allows the missing application CTA to attempt one NVMe submission.
+ABI v20 also allows the missing application CTA to attempt one NVMe submission.
 A backend-local queue lease serializes it with the finite progress kernel. The
 CTA rings at most one doorbell, never waits for the lease or completion, and
 publishes an intent on any recoverable failure. This is a latency path, not a
@@ -1091,7 +1091,7 @@ consumes direct pages or exits for finite staged acquisition. Runnable work is
 mapped back through the ticket rather than assuming request index equals slot.
 This is not yet a FlashInfer or SGLang sparse-attention integration.
 
-The ABI-v19 dependency-set workload separately acquires up to 32 mixed-tier
+The ABI-v20 dependency-set workload separately acquires up to 32 mixed-tier
 objects per CTA, supports cancellation, stale generations, stale object
 versions, and duplicate coalescing, and resumes only after the complete set is
 ready. Global-load and TMA attention now consume the same common work and

@@ -11,12 +11,13 @@ Tables and command output retain ABI state `Ready` and legacy CLI policy
 runnable work, and device-generated demand; results are not renamed after
 collection.
 
-The source ABI is v19 and the public C API is v10. The build,
-compiler/runtime correctness matrix, real
-FlashInfer differential path, sanitizer matrix, 10,000-epoch lifecycle stress,
-CPU-only build, static analysis, lint, and package gates have been rerun for
-v19. Decode-graph serving and VFIO NVMe results below predate v19 and are local
-dirty-worktree evidence; clean-revision repeated trials remain open.
+The source ABI is v20 and the public C API is v11. The ABI bump adds explicit
+source and destination bounds for GPU-generated indexed transfers plus finite
+cache invalidation used by cold-cache experiments. Focused compiler, C API,
+Python, and real FlashInfer JIT tests have been rerun for v20. The complete
+local qualifier must be rerun after the implementation is frozen. Decode-graph
+serving and VFIO NVMe results below predate v20 and remain historical local
+evidence; clean-revision repeated trials are open.
 
 ## Environment
 
@@ -46,12 +47,11 @@ executes memcheck, racecheck, and synccheck, runs a CUDA-disabled build, perform
 10,000 lifecycle epochs, and runs static/lint/package checks. The second runs
 alternating process-level baseline/mechanism trials and computes Student-t intervals.
 Generated evidence is under `results/` and is excluded from source control.
-The ABI-v19 local qualification completed all 13 commands successfully and
-reported `READY`. It covered the full functional/sanitizer matrix, CPU-only
-build, 10,000 lifecycle epochs, Clang static analysis, Python and shell checks,
-package construction, and patch hygiene. Its recorded workspace is dirty, so it
-is current local mechanism evidence but cannot satisfy the clean-revision
-production or OSDI gates.
+The ABI-v20 local qualification must complete all commands successfully before
+it may report `READY`. Earlier ABI qualifications covered the full
+functional/sanitizer matrix, CPU-only build, 10,000 lifecycle epochs, Clang
+static analysis, Python and shell checks, package construction, and patch
+hygiene; they do not substitute for the final v20 run.
 
 The schema-2 production and OSDI qualifiers both report `NOT_READY` on this
 workspace. The required external evidence manifests do not exist, and the
@@ -60,8 +60,8 @@ local test failure.
 
 ## Correctness Gates
 
-`ctest --test-dir build --output-on-failure` discovers 38 tests. On this
-single-GPU host, 37 pass and `nta-multi-gpu` reports the configured skip code
+`ctest --test-dir build --output-on-failure` discovers 39 tests. On this
+single-GPU host, 38 pass and `nta-multi-gpu` reports the configured skip code
 77 because a second physical CUDA device is unavailable. The gates cover:
 
 1. FlashInfer CSR-to-common-plan validation, including grouped pages and bad
@@ -71,7 +71,7 @@ single-GPU host, 37 pass and `nta-multi-gpu` reports the configured skip code
    rejection of live-state, token, missing-binding, non-inlined-helper,
    lane-divergent control, non-dominating divergent control, and divergent PHI
    operand cases;
-4. host/device ABI v19 layout, including operation epochs, terminal counters,
+4. host/device ABI v20 layout, including operation epochs, terminal counters,
    multi-CTA completion state, and the NVMe control-page mirror;
 5. Clang nvcc-shim compilation of a foreign source kernel, including automatic
    optimizer-last lowering, marker removal, metadata, and fast-math forwarding;
@@ -136,7 +136,7 @@ calls. Control dependence is computed from the post-dominator tree, including
 branches that do not dominate the marker; uniform PHIs require every incoming
 control dependence to be CTA-uniform. A positive late-bound fixture selects an
 object catalog entry from CTA-uniform GPU state. Lowered modules contain no
-bind/acquire/defer markers and carry ABI-v19 `!nta.acquire` metadata tagged
+bind/acquire/defer markers and carry ABI-v20 `!nta.acquire` metadata tagged
 `split-phase-cta`.
 
 Attention global-load and TMA kernels, the generic dependency-set kernel, and
@@ -217,6 +217,48 @@ valid direct or staged tensor-map descriptor resolves.
 
 Clang static analysis of the host runtime, KV benchmark, and MoE benchmark
 reports no findings.
+
+## Real FlashInfer Device-Selected Pages
+
+ABI v20 adds a real FlashInfer pipeline in which
+`top_k_page_table_transform` updates a stable CUDA index table, NTA validates
+and gathers only those pinned-host KV pages, and a compiler-instrumented
+FlashInfer paged-decode kernel consumes the compact KV. The NTA path performs
+no host identity round trip. A separate offline oracle materializes the fixed
+selected IDs before timing and copies only selected pages; it is a lower bound,
+not an implementable online competitor.
+
+```bash
+tools/jit/activate.py --build-dir build --flashinfer-hook -- \
+  python3 scripts/run-selected-pages-sweep.py \
+  --output results/selected-pages-sweep-v20.json \
+  --require-peak-speedup
+```
+
+The local sweep used 32 requests, 16 selected 16-token pages per request, ten
+alternating in-process trials, and 20 iterations per sample. Selector,
+acquisition, and attention are stream ordered in each timed pipeline. Every
+point passed stock FlashInfer output parity.
+
+| Candidate pages/request | Bytes avoided | Online mode | NTA cold us | Forced overfetch us | Forced-indexed speedup |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| 16 | 0% | bulk | 267.242 | 171.250 | 0.641x |
+| 32 | 50% | bulk | 271.141 | 320.498 | 1.182x |
+| 64 | 75% | indexed | 271.656 | 616.583 | 2.270x |
+| 128 | 87.5% | indexed | 271.666 | 1,208.602 | 4.449x |
+| 256 | 93.75% | indexed | 271.450 | 2,395.940 | 8.826x |
+
+The no-oracle cost model chose bulk at the first two points and indexed
+transfer at the final three, so its minimum measured throughput ratio to forced
+overfetch was 1.0x. Maximum NTA cold-pipeline regret to the precomputed
+selected-copy oracle was 1.673x. Retained-object pipeline medians were 68.6 to
+73.0 us.
+
+This is a dirty-worktree, uncontrolled-clock operator crossover with controlled
+random scores. It establishes a real performance domain and the dense
+counterexample; it does not establish end-to-end SLO gain, model-quality impact,
+NVMe benefit, production readiness, or superiority to Strata, ECHO, Syncopate,
+or Prism.
 
 ## Query-Dependent Sparse Attention
 
@@ -353,7 +395,7 @@ exact design and command are in `docs/DEVICE_ROUTED_MOE.md`.
 
 ## GPU-Initiated NVMe
 
-The ABI-v19 controller-free test runs the same compiler-lowered finite CTA and
+The ABI-v20 controller-free test runs the same compiler-lowered finite CTA and
 device transport code against an NVMe queue/control image in CUDA memory. It
 checks that the CTA leader constructs a READ SQE and command context, rings the
 SQ doorbell, leaves its work ticket `Pending`, and exits with no intent. The
@@ -439,7 +481,7 @@ and request metadata preservation, but does not validate graph-captured demand
 acquisition or incremental co-scheduling. The sample is too small and clocks
 are uncontrolled.
 
-The ABI-v19 schedule-aware path was then measured with early host acquisition
+The ABI-v20 schedule-aware path was then measured with early host acquisition
 disabled. It made its decision from the current FlashInfer schedule and exact
 HiCache page mapping, selected one tuned bulk round, and overlapped subsequent
 layer transfers with attention. Across five qualified promotions, stock

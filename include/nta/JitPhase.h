@@ -25,6 +25,9 @@ public:
 
   void reset(cudaStream_t stream, abi::RuntimeView *runtime,
              std::uint32_t objectCount, std::uint32_t workTicketCount) const;
+  void invalidateCachedObjects(cudaStream_t stream, abi::RuntimeView *runtime,
+                               std::uint32_t firstObject,
+                               std::uint32_t objectCount) const;
   void preloadHost(cudaStream_t stream, abi::RuntimeView *runtime,
                    std::uint32_t firstObject,
                    std::uint32_t objectCount) const;

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 
-from nta_runtime.execution_policy import HostCostModel, plan_host_execution
+from nta_runtime.execution_policy import (
+    DeviceDemandCostModel,
+    HostCostModel,
+    plan_device_demand,
+    plan_host_execution,
+)
 
 
 def main() -> None:
@@ -42,6 +47,34 @@ def main() -> None:
         pass
     else:
         raise AssertionError("empty host work was accepted")
+
+    device_model = DeviceDemandCostModel()
+    bulk = plan_device_demand(
+        candidate_bytes=8 * 1024 * 1024,
+        selected_bytes=8 * 1024 * 1024,
+        selected_pages=512,
+        model=device_model,
+    )
+    assert bulk.mode == "bulk"
+    selective = plan_device_demand(
+        candidate_bytes=128 * 1024 * 1024,
+        selected_bytes=8 * 1024 * 1024,
+        selected_pages=512,
+        model=device_model,
+    )
+    assert selective.mode == "indexed"
+    assert selective.predicted_gain >= device_model.minimum_predicted_gain
+    try:
+        plan_device_demand(
+            candidate_bytes=1024,
+            selected_bytes=2048,
+            selected_pages=1,
+            model=device_model,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("oversized selected demand was accepted")
 
 
 if __name__ == "__main__":

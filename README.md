@@ -52,7 +52,7 @@ workloads:
 
 - per-CTA request/generation binding in batched kernels;
 - compiler proof of a canonical finite-kernel deferral boundary;
-- an engine-neutral `WorkPlan` model and ABI-v19 bounded dependency sets, so one
+- an engine-neutral `WorkPlan` model and ABI-v20 bounded dependency sets, so one
   work ticket can wait for several pages, experts, or object shards;
 - one reusable device-plan allocation with two pinned, asynchronous upload
   slots and no unconditional hot-path event synchronization;
@@ -101,6 +101,13 @@ workloads:
 - an optional adapter from FlashInfer's public paged-KV CSR tables into the
   common work model, FlashInfer-native `(V, LSE)` cascade state, and a
   differential GPU correctness gate against FlashInfer 0.6.12;
+- a real FlashInfer device-demand path whose GPU top-k page-table transform
+  updates a stable device index table, whose bounded indexed acquisition moves
+  only selected pinned-host KV pages, and whose compiler-instrumented paged
+  decode consumes the compact KV without a host identity round trip;
+- one no-oracle cost model that dispatches bulk candidate transfer when
+  selectivity is low and GPU-indexed transfer when avoided bytes amortize its
+  fixed cost;
 - real TMA consumption from direct sources or from HBM after external staging,
   with compiler-proven deferral before barrier creation;
 - one captured CUDA graph containing discover, bounded progress, and resume
@@ -138,13 +145,13 @@ acquisition
 markers; automatic recognition of arbitrary production load/cp.async/TMA
 address cones is an open gate. The pass does prove CTA-uniform control and
 operands for explicit sites; lane-divergent collective calls are rejected.
-The query-dependent sparse workload is an executable mechanism fixture, not a
-claim that the current SGLang path uses sparse attention or that it improves an
-end-to-end serving SLO.
-The primary performance path is real FlashInfer dense decode/paged prefill in
-SGLang. A real FlashInfer GPU-top-k sparse path is an explicit roadmap gate;
-custom CUDA attention and MoE programs remain correctness and crossover
-fixtures rather than production performance evidence.
+The real FlashInfer GPU-selected path is an operator-level result, not a claim
+that the current SGLang path uses sparse attention or improves an end-to-end
+serving SLO. Dense SGLang remains the production integration target. Current
+one-GPU dense CPU-DRAM opportunity traces do not justify forced incremental
+execution, so the online path dispatches the stock bulk form there. Custom CUDA
+attention and MoE programs remain correctness fixtures rather than production
+performance evidence.
 The existing code implements the unavailable-data work-ticket mechanism,
 request-local partial reduction, real FlashInfer hooks, and SGLang decode graph
 replay. It does not yet generate direct and incremental forms from one typed
@@ -271,6 +278,16 @@ memcheck, racecheck, and synccheck.
 `scripts/measure-direct-overhead.sh` runs alternating process-level trials and
 reports paired 95% t intervals.
 
+Run the real FlashInfer GPU-selected page crossover, including forced
+overfetch, a precomputed selected-copy oracle, and the online cost decision:
+
+```bash
+tools/jit/activate.py --build-dir build --flashinfer-hook -- \
+  python3 scripts/run-selected-pages-sweep.py \
+  --output results/selected-pages-sweep-v20.json \
+  --require-peak-speedup
+```
+
 Run the release qualifier before making a release-readiness claim:
 
 ```bash
@@ -376,5 +393,5 @@ completed all 32,000 measured commands with matching data at 1,624.42 MiB/s
 physical throughput and zero failure. The benchmark invalidates its staging entries at
 the start of every measured graph; cache-hit replay is therefore not counted as
 SSD bandwidth. This is a single-machine mechanism result, not production
-serving or paper-level evaluation, and it must be rerun on ABI v19 before use as
+serving or paper-level evaluation, and it must be rerun on ABI v20 before use as
 current evidence.

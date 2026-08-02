@@ -296,10 +296,16 @@ if(NTA_ENABLE_CUDA)
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity.py
     )
+    add_test(
+      NAME nta-opportunity-study
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity_study.py
+    )
     set_tests_properties(
       nta-request-slots nta-sglang-plugin nta-qualification-runner
       nta-qualification-evidence
       nta-opportunity-analysis
+      nta-opportunity-study
       PROPERTIES TIMEOUT 60
     )
     set_tests_properties(nta-python-runtime nta-sglang-plugin PROPERTIES

@@ -42,7 +42,7 @@ SGLang request and HiCache page map
   -> early layer-wise indexed copy on a finite CUDA stream
   -> preallocated per-layer data-available event
   -> compact request slot/generation binding
-  -> ABI-19 request-liveness guard in each FlashInfer CTA
+  -> ABI-20 request-liveness guard in each FlashInfer CTA
   -> SGLang-owned output tensor and HiCache completion
 ```
 
@@ -160,22 +160,37 @@ Demand mode can append GPU-timestamped per-tile availability records:
 ```bash
 NTA_SGLANG_PIPELINE_HOST=0 \
 NTA_SGLANG_FORCE_INCREMENTAL=1 \
+NTA_OPPORTUNITY_MEASURE_COMPUTE=1 \
 NTA_OPPORTUNITY_TRACE_FILE=results/opportunity/sglang-host.jsonl \
 NTA_OPPORTUNITY_TIER=host_staged \
 NTA_OPPORTUNITY_MODEL=/path/to/model \
 NTA_REVISION="$(git rev-parse HEAD)" \
 python your_sglang_workload.py
 
+PARALLEL_SLOTS="$(python3 -c \
+  'import torch; print(torch.cuda.get_device_properties(0).multi_processor_count)')"
 ./scripts/analyze-opportunity.py \
-  results/opportunity/sglang-host.jsonl
+  results/opportunity/sglang-host.jsonl \
+  --output results/opportunity/model-host-analysis.json \
+  --parallel-slots "${PARALLEL_SLOTS}" \
+  --material-delay-ns 50000 \
+  --require-proceed
+
+./scripts/summarize-opportunity-study.py \
+  results/opportunity/model-a-host-analysis.json \
+  results/opportunity/model-b-nvme-analysis.json \
+  --output results/opportunity/study.json \
+  --require-proceed
 ```
 
-ABI v19 stores one relative `%globaltimer` timestamp per bounded work ticket.
+ABI v20 stores one relative `%globaltimer` timestamp per bounded work ticket.
 Zero means the tile was resident or already staged at epoch start; a positive
 value is written exactly once when the ticket enters the runnable tile set.
-`compute_ns` remains an explicitly calibrated cost, while `available_ns` is a
-device observation. The analyzer is an offline evaluation tool, not an oracle
-used by the online scheduler.
+With `NTA_OPPORTUNITY_MEASURE_COMPUTE=1`, `compute_ns` is calibrated by a
+GPU-event-timed all-resident FlashInfer launch; otherwise it is explicitly
+modeled. `available_ns` is a device observation. The analyzer and multi-trace
+study reducer are offline evaluation tools, not oracles used by the online
+scheduler.
 
 ## Cancellation And Stale Work
 
@@ -262,7 +277,7 @@ report therefore also records per-request latency and peer delay; controlled
 arrival traces and repeated confidence intervals are required before
 attributing that scheduler-sensitive 30.92% difference to the mechanism.
 
-An ABI-v19 schedule-aware run disabled early acquisition so the adapter had to
+An ABI-v20 schedule-aware run disabled early acquisition so the adapter had to
 choose after observing the real FlashInfer schedule. For a 96-token host-cached
 request, the online model selected one bulk round, issued all 12 layer
 promotions on the transfer stream, and overlapped later layers with attention.

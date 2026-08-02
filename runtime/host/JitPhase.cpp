@@ -12,6 +12,8 @@ namespace {
 using AbiVersion = std::uint32_t (*)();
 using Reset = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                               cudaStream_t);
+using InvalidateCachedObjects = cudaError_t (*)(void *, std::uint32_t,
+                                                std::uint32_t, cudaStream_t);
 using PreloadHost = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                                     cudaStream_t);
 using ProgressHost = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
@@ -58,6 +60,8 @@ struct JitPhaseProgram::Impl {
             "instrumented JIT module uses an incompatible NTA ABI");
       }
       reset = load<Reset>(library, "nta_jit_reset_epoch");
+      invalidateCachedObjects = load<InvalidateCachedObjects>(
+          library, "nta_jit_invalidate_cached_objects");
       preloadHost = load<PreloadHost>(library, "nta_jit_preload_host");
       progressHost = load<ProgressHost>(library, "nta_jit_progress_host");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
@@ -78,6 +82,7 @@ struct JitPhaseProgram::Impl {
 
   void *library = nullptr;
   Reset reset = nullptr;
+  InvalidateCachedObjects invalidateCachedObjects = nullptr;
   PreloadHost preloadHost = nullptr;
   ProgressHost progressHost = nullptr;
   ProgressNvme progressNvme = nullptr;
@@ -102,6 +107,17 @@ void JitPhaseProgram::reset(cudaStream_t stream, abi::RuntimeView *runtime,
   }
   check(impl_->reset(runtime, objectCount, workTicketCount, stream),
         "nta_jit_reset_epoch");
+}
+
+void JitPhaseProgram::invalidateCachedObjects(
+    cudaStream_t stream, abi::RuntimeView *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount) const {
+  if (runtime == nullptr || objectCount == 0) {
+    throw std::invalid_argument(
+        "JIT cache invalidation needs a runtime and non-zero object count");
+  }
+  check(impl_->invalidateCachedObjects(runtime, firstObject, objectCount, stream),
+        "nta_jit_invalidate_cached_objects");
 }
 
 void JitPhaseProgram::preloadHost(cudaStream_t stream,

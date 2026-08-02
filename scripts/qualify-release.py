@@ -264,6 +264,7 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
         {
             "opportunity",
             "dense_flashinfer",
+            "sparse_flashinfer",
             "baselines",
             "ablations",
             "statistics",
@@ -340,9 +341,18 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
         check(
             "real GPU-selected sparse stress",
             sparse.get("gpu_selected_pages") is True
-            and sparse.get("real_flashinfer_kernel") is True
-            and sparse.get("stock_output_parity") is True,
-            "requires GPU-selected demand through real FlashInfer sparse attention",
+            and sparse.get("nta_hot_path_host_identity_round_trips") == 0
+            and sparse.get("real_flashinfer_selector") is True
+            and sparse.get("real_flashinfer_attention") is True
+            and sparse.get("stock_output_parity") is True
+            and sparse.get("candidate_sweep_points", 0) >= 5
+            and sparse.get("selectivity_crossover_measured") is True
+            and isinstance(sparse.get("peak_speedup_over_overfetch"), (int, float))
+            and sparse["peak_speedup_over_overfetch"] >= 2.0
+            and isinstance(sparse.get("maximum_regret_to_offline_oracle"), (int, float))
+            and sparse["maximum_regret_to_offline_oracle"] <= 2.0,
+            "requires real FlashInfer selection/attention, a five-point crossover, "
+            "a matched overfetch win, and bounded regret to an offline oracle",
         ),
         check(
             "mechanism performance bounds",

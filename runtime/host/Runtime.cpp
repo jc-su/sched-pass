@@ -877,13 +877,16 @@ ObjectHandle HostRuntime::registerIndexedHostObject(
     const std::uint32_t *sourceIndicesDevice,
     const std::uint32_t *stagingIndicesDevice, std::uint32_t indexCount,
     std::uint32_t elementBytes, std::uint32_t sourceStrideBytes,
-    std::uint32_t stagingStrideBytes) {
+    std::uint32_t stagingStrideBytes, std::uint32_t sourceIndexLimit,
+    std::uint32_t stagingIndexLimit) {
   const IndexedHostObjectSpec object{
       objectId,          version,
       sourceDeviceAddress, stagingDeviceAddress,
       sourceIndicesDevice, stagingIndicesDevice,
       indexCount,        elementBytes,
-      sourceStrideBytes, stagingStrideBytes, false,
+      sourceStrideBytes, stagingStrideBytes,
+      sourceIndexLimit,  stagingIndexLimit,
+      false,
   };
   registerIndexedHostObjects(slot, std::span<const IndexedHostObjectSpec>(&object, 1));
   return {slot, nullptr};
@@ -911,6 +914,7 @@ void HostRuntime::registerIndexedHostObjects(
         object.elementBytes == 0 ||
         object.sourceStrideBytes < object.elementBytes ||
         object.stagingStrideBytes < object.elementBytes ||
+        object.sourceIndexLimit == 0 || object.stagingIndexLimit == 0 ||
         object.indexCount > std::numeric_limits<std::uint32_t>::max() /
                                 object.elementBytes) {
       throw std::invalid_argument("invalid indexed host transfer geometry");
@@ -927,7 +931,8 @@ void HostRuntime::registerIndexedHostObjects(
         object.indexCount,
         static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
         abi::ReplicaTransport | abi::ReplicaIndexed,
-        0,
+        abi::packTransferIndexLimits(object.sourceIndexLimit,
+                                     object.stagingIndexLimit),
         abi::packTransferStrides(object.sourceStrideBytes,
                                  object.stagingStrideBytes),
     };
@@ -998,6 +1003,7 @@ void HostRuntime::registerIndexedHostObjectsAsync(
         object.elementBytes == 0 ||
         object.sourceStrideBytes < object.elementBytes ||
         object.stagingStrideBytes < object.elementBytes ||
+        object.sourceIndexLimit == 0 || object.stagingIndexLimit == 0 ||
         object.indexCount > std::numeric_limits<std::uint32_t>::max() /
                                 object.elementBytes) {
       throw std::invalid_argument("invalid indexed host transfer geometry");
@@ -1014,7 +1020,8 @@ void HostRuntime::registerIndexedHostObjectsAsync(
         object.indexCount,
         static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
         abi::ReplicaTransport | abi::ReplicaIndexed,
-        0,
+        abi::packTransferIndexLimits(object.sourceIndexLimit,
+                                     object.stagingIndexLimit),
         abi::packTransferStrides(object.sourceStrideBytes,
                                  object.stagingStrideBytes),
     };

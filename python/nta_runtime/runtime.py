@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 10
+API_VERSION = 11
 
 
 class RuntimeError(Exception):
@@ -88,7 +88,9 @@ class _IndexedHostObject(ctypes.Structure):
         ("element_bytes", ctypes.c_uint32),
         ("source_stride_bytes", ctypes.c_uint32),
         ("staging_stride_bytes", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
+        ("source_index_limit", ctypes.c_uint32),
+        ("staging_index_limit", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
     ]
 
 
@@ -277,6 +279,8 @@ class IndexedHostObject:
     element_bytes: int
     source_stride_bytes: int
     staging_stride_bytes: int
+    source_index_limit: int
+    staging_index_limit: int
     preacquired: bool = False
 
     def native(self) -> _IndexedHostObject:
@@ -291,6 +295,8 @@ class IndexedHostObject:
             self.element_bytes,
             self.source_stride_bytes,
             self.staging_stride_bytes,
+            self.source_index_limit,
+            self.staging_index_limit,
             int(self.preacquired),
         )
 
@@ -500,6 +506,8 @@ _runtime_register_indexed_host_object = _function(
     ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
 )
 _runtime_register_indexed_host_objects = _function(
     "nta_runtime_register_indexed_host_objects",
@@ -644,6 +652,15 @@ _phase_create = _function(
 _phase_destroy = _function("nta_jit_phase_program_destroy", None, _Handle)
 _phase_reset = _function(
     "nta_jit_phase_reset",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_invalidate_cached_objects = _function(
+    "nta_jit_phase_invalidate_cached_objects",
     ctypes.c_int,
     _Handle,
     _Handle,
@@ -925,6 +942,8 @@ class Runtime(_Owner):
         element_bytes: int,
         source_stride_bytes: int,
         staging_stride_bytes: int,
+        source_index_limit: int,
+        staging_index_limit: int,
     ) -> None:
         """Register a non-owning indexed pinned-host to HBM transfer."""
         _check(
@@ -941,6 +960,8 @@ class Runtime(_Owner):
                 element_bytes,
                 source_stride_bytes,
                 staging_stride_bytes,
+                source_index_limit,
+                staging_index_limit,
             )
         )
 
@@ -1236,6 +1257,23 @@ class JitPhaseProgram(_Owner):
                 runtime._handle,
                 object_count,
                 work_ticket_count,
+                _stream_address(stream),
+            )
+        )
+
+    def invalidate_cached_objects(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        stream: Any = None,
+    ) -> None:
+        _check(
+            _phase_invalidate_cached_objects(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
                 _stream_address(stream),
             )
         )

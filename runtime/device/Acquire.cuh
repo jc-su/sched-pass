@@ -1930,6 +1930,27 @@ copyIndexedHostObject(const abi::ObjectEntry &object,
   }
 }
 
+__device__ __forceinline__ void
+validateIndexedTransferIndices(const abi::ObjectEntry &object,
+                               const abi::ReplicaEntry &replica,
+                               std::uint32_t *invalid) {
+  const auto *sourceIndices = reinterpret_cast<const std::uint32_t *>(
+      replica.dmaPageListAddress);
+  const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
+      object.stagingTensorMapAddress);
+  const std::uint32_t sourceLimit =
+      abi::sourceTransferIndexLimit(replica.tensorMapAddress);
+  const std::uint32_t destinationLimit =
+      abi::destinationTransferIndexLimit(replica.tensorMapAddress);
+  for (std::uint32_t element = threadIdx.x; element < replica.dmaPageCount;
+       element += blockDim.x) {
+    if (sourceIndices[element] >= sourceLimit ||
+        destinationIndices[element] >= destinationLimit) {
+      atomicExch(invalid, 1U);
+    }
+  }
+}
+
 } // namespace nta::device
 
 // Scheduler-selected finite prefetch. It moves registered indexed host objects
@@ -1958,6 +1979,14 @@ nta_preload_indexed_host(nta::abi::RuntimeView *runtime,
       replica == nullptr
           ? 0
           : abi::destinationTransferStride(replica->transferShape);
+  const std::uint32_t sourceLimit =
+      replica == nullptr
+          ? 0
+          : abi::sourceTransferIndexLimit(replica->tensorMapAddress);
+  const std::uint32_t destinationLimit =
+      replica == nullptr
+          ? 0
+          : abi::destinationTransferIndexLimit(replica->tensorMapAddress);
   const bool valid =
       replica != nullptr &&
       replica->sourceKind ==
@@ -1966,12 +1995,24 @@ nta_preload_indexed_host(nta::abi::RuntimeView *runtime,
       replica->sourceAddress != 0 && replica->dmaPageListAddress != 0 &&
       replica->dmaPageCount != 0 && object.stagingAddress != 0 &&
       object.stagingTensorMapAddress != 0 && object.bytes != 0 &&
+      sourceLimit != 0 && destinationLimit != 0 &&
       object.bytes % replica->dmaPageCount == 0 &&
       sourceStride >= object.bytes / replica->dmaPageCount &&
       destinationStride >= object.bytes / replica->dmaPageCount;
 
+  __shared__ std::uint32_t invalidIndex;
+  if (threadIdx.x == 0) {
+    invalidIndex = 0;
+  }
+  __syncthreads();
+  if (valid) {
+    device::validateIndexedTransferIndices(object, *replica, &invalidIndex);
+  }
+  __syncthreads();
+  const bool bounded = valid && invalidIndex == 0;
+
   if (threadIdx.x == 0 && objectBlock == 0) {
-    if (!valid) {
+    if (!bounded) {
       atomicExch(&object.state,
                  static_cast<std::uint32_t>(abi::ObjectState::Failed));
     } else {
@@ -1980,7 +2021,7 @@ nta_preload_indexed_host(nta::abi::RuntimeView *runtime,
                  static_cast<std::uint32_t>(abi::ObjectState::Issued));
     }
   }
-  if (!valid) {
+  if (!bounded) {
     return;
   }
   device::copyIndexedHostObject(object, *replica, objectBlock,
@@ -2052,19 +2093,40 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
       replica == nullptr
           ? 0
           : abi::destinationTransferStride(replica->transferShape);
+  const std::uint32_t sourceLimit =
+      replica == nullptr
+          ? 0
+          : abi::sourceTransferIndexLimit(replica->tensorMapAddress);
+  const std::uint32_t destinationLimit =
+      replica == nullptr
+          ? 0
+          : abi::destinationTransferIndexLimit(replica->tensorMapAddress);
   const bool indexedShapeValid =
       !indexed ||
       (replica->dmaPageListAddress != 0 && object.stagingTensorMapAddress != 0 &&
-       replica->dmaPageCount != 0 &&
+       replica->dmaPageCount != 0 && sourceLimit != 0 &&
+       destinationLimit != 0 &&
        intent.bytes % replica->dmaPageCount == 0 &&
        sourceStride >= intent.bytes / replica->dmaPageCount &&
        destinationStride >= intent.bytes / replica->dmaPageCount);
-  if (!objectCurrent || replica == nullptr ||
-      replica->sourceKind !=
-          static_cast<std::uint32_t>(abi::SourceKind::HostStaged) ||
-      intent.offset != 0 || intent.bytes != object.bytes ||
-      intent.offset > object.bytes ||
-      intent.bytes > object.bytes - intent.offset || !indexedShapeValid) {
+  const bool transferValid =
+      objectCurrent && replica != nullptr &&
+      replica->sourceAddress != 0 && object.stagingAddress != 0 &&
+      replica->sourceKind ==
+          static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
+      intent.offset == 0 && intent.bytes == object.bytes &&
+      intent.offset <= object.bytes &&
+      intent.bytes <= object.bytes - intent.offset && indexedShapeValid;
+  __shared__ std::uint32_t invalidIndex;
+  if (threadIdx.x == 0) {
+    invalidIndex = 0;
+  }
+  __syncthreads();
+  if (transferValid && indexed) {
+    device::validateIndexedTransferIndices(object, *replica, &invalidIndex);
+  }
+  __syncthreads();
+  if (!transferValid || invalidIndex != 0) {
     if (threadIdx.x == 0) {
       if (device::claimIntent(intentSlot)) {
         if (objectCurrent) {
@@ -2359,6 +2421,24 @@ extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
 #endif
 
 #if NTA_DEVICE_PHASE_KERNELS
+extern "C" __global__ void
+nta_invalidate_cached_objects(nta::abi::RuntimeView *runtime,
+                              std::uint32_t firstObject,
+                              std::uint32_t objectCount) {
+  using namespace nta;
+  const std::uint32_t relative = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint64_t slot64 =
+      static_cast<std::uint64_t>(firstObject) + relative;
+  if (runtime == nullptr || relative >= objectCount ||
+      slot64 >= runtime->objectCapacity) {
+    return;
+  }
+  abi::ObjectEntry &object = runtime->objects[static_cast<std::uint32_t>(slot64)];
+  (void)atomicCAS(&object.state,
+                  static_cast<std::uint32_t>(abi::ObjectState::Ready),
+                  static_cast<std::uint32_t>(abi::ObjectState::New));
+}
+
 extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
                                            std::uint32_t objectCount,
                                            std::uint32_t workTicketCount) {

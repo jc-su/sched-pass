@@ -62,7 +62,13 @@ int main() {
   static_assert(offsetof(RuntimeView, epoch) == 288);
   static_assert(offsetof(RuntimeView, abiVersion) == 300);
   static_assert(sizeof(RuntimeView) == 320);
-  if (Version != 19 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
+  static_assert(sourceTransferStride(packTransferStrides(17, 31)) == 17);
+  static_assert(destinationTransferStride(packTransferStrides(17, 31)) == 31);
+  static_assert(sourceTransferIndexLimit(packTransferIndexLimits(23, 47)) ==
+                23);
+  static_assert(
+      destinationTransferIndexLimit(packTransferIndexLimits(23, 47)) == 47);
+  if (Version != 20 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

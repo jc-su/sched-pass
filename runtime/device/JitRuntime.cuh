@@ -23,6 +23,20 @@ nta_jit_abi_version() {
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_invalidate_cached_objects(void *runtime, std::uint32_t firstObject,
+                                  std::uint32_t objectCount,
+                                  cudaStream_t stream) {
+  constexpr std::uint32_t threads = 256;
+  if (runtime == nullptr || objectCount == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_invalidate_cached_objects<<<(objectCount + threads - 1U) / threads,
+                                  threads, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), firstObject, objectCount);
+  return nta::jit::launchStatus();
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_reset_epoch(void *runtime, std::uint32_t objectCount,
                     std::uint32_t workTicketCount, cudaStream_t stream) {
   constexpr std::uint32_t threads = 256;

@@ -113,9 +113,17 @@ def main() -> int:
         runtime_library = first_file(runtime_candidates, "NTA runtime library")
     except RuntimeError as error:
         parser.error(str(error))
+    try:
+        real_nvcc = first_file(
+            [pathlib.Path(options.cuda_path) / "bin" / "nvcc"],
+            "CUDA nvcc",
+        )
+    except RuntimeError as error:
+        parser.error(str(error))
     abi_header = root / "include/nta/RuntimeABI.h"
     abi_version = runtime_abi_version(abi_header)
     integration_inputs = [
+        script,
         plugin,
         shim,
         root / "tools/jit/clang_cuda_prelude.h",
@@ -163,6 +171,7 @@ def main() -> int:
         "NTA_PLUGIN": str(plugin),
         "NTA_CLANG": options.clang,
         "NTA_CUDA_PATH": options.cuda_path,
+        "NTA_REAL_NVCC": str(real_nvcc),
         "NTA_JIT_CACHE_TAG": tag,
         "NTA_ABI_VERSION": str(abi_version),
         "NTA_BUILD_DIR": str(build),
@@ -203,7 +212,7 @@ def main() -> int:
                 "NTA_FLASHINFER_OVERLAY": str(overlay),
                 "NTA_JIT_ONLY": os.environ.get(
                     "NTA_JIT_ONLY",
-                    "batch_decode_kernel.cu,batch_prefill_paged_kernel_",
+                    "generated/",
                 ),
                 "NTA_JIT_PHASE_SOURCE": os.environ.get(
                     "NTA_JIT_PHASE_SOURCE",

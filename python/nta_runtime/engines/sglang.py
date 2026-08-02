@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 import json
 import logging
+import math
 import os
 import pathlib
 import time
@@ -78,6 +79,7 @@ class _ActiveBatch:
     index_maps: dict[_PagePair, tuple[torch.Tensor, torch.Tensor]]
     prefetched_layers: dict[int, _PrefetchedLayer]
     prefetch_tensors: tuple[torch.Tensor, ...]
+    host_execution: HostExecutionPlan | None = None
 
 
 @dataclass
@@ -268,6 +270,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "demand_host_layers": 0,
             "incremental_host_layers": 0,
             "bulk_host_batches": 0,
+            "stock_bulk_launches": 0,
             "host_progress_rounds": 0,
             "predicted_atomic_ns": 0,
             "predicted_incremental_ns": 0,
@@ -293,6 +296,16 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         self._opportunity_batch = 0
         self._active_opportunity_batch = -1
+        self._measure_opportunity_compute = (
+            os.environ.get("NTA_OPPORTUNITY_MEASURE_COMPUTE") == "1"
+        )
+        device_properties = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        )
+        self._opportunity_parallel_slots = _positive_environment(
+            "NTA_OPPORTUNITY_PARALLEL_SLOTS",
+            int(device_properties.multi_processor_count),
+        )
         if self._opportunity_trace is not None:
             if not self._opportunity_revision:
                 raise ValueError(
@@ -544,12 +557,43 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._stats["resident_stock_batches"] += 1
             return
 
-        self._select_wrappers(True)
+        # In schedule-aware mode, plan the stock kernel first. Most dense
+        # batches choose one bulk round and should never enter an instrumented
+        # kernel. Incremental batches are replanned below with the typed hook.
+        self._select_wrappers(self._pipeline_host)
         original_use_paged = self.use_paged
         self.use_paged = True
         try:
             super().init_forward_metadata(forward_batch)
-            self._init_external_metadata(forward_batch, pending)
+            if not self._pipeline_host and not self._force_incremental:
+                fast_policy = self._fast_bulk_policy(pending)
+                if fast_policy.rounds == 1:
+                    self._active_batch = _ActiveBatch(
+                        (), {}, pending, {}, {}, {}, (), fast_policy
+                    )
+                    self._stats["batches"] += 1
+                    self._stats["hicache_claimed_batches"] += 1
+                    return
+            policy = self._init_external_metadata(forward_batch, pending)
+            if (
+                not self._pipeline_host
+                and policy is not None
+                and (policy.rounds > 1 or self._force_incremental)
+            ):
+                bindings = self._active_batch.bindings
+                self._select_wrappers(True)
+                super().init_forward_metadata(forward_batch)
+                instrumented_policy = self._init_external_metadata(
+                    forward_batch,
+                    pending,
+                    bindings=bindings,
+                    count_batch=False,
+                )
+                if instrumented_policy != policy:
+                    raise RuntimeError(
+                        "stock and instrumented FlashInfer schedules selected "
+                        "different host execution policies"
+                    )
         except Exception as error:
             self._active_batch = None
             self._stats["hicache_fallback_batches"] += 1
@@ -574,9 +618,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self.use_paged = original_use_paged
 
     def _init_external_metadata(
-        self, forward_batch: Any, pending: PendingHostLoad
-    ) -> None:
-        if self._opportunity_trace is not None:
+        self,
+        forward_batch: Any,
+        pending: PendingHostLoad,
+        *,
+        bindings: tuple[RequestBinding, ...] | None = None,
+        count_batch: bool = True,
+    ) -> HostExecutionPlan | None:
+        if self._opportunity_trace is not None and count_batch:
             self._active_opportunity_batch = self._opportunity_batch
             self._opportunity_batch += 1
         metadata_started = time.perf_counter_ns() if self._profile_cpu else 0
@@ -587,10 +636,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # are intentionally volatile and would force identical CTA plans to
         # be rebuilt whenever SGLang recycles its request pool.
         bind_started = time.perf_counter_ns() if self._profile_cpu else 0
-        bindings = self._bind_forward_requests(
-            forward_batch, allow_capture_ids=False
-        )
-        if self._profile_cpu:
+        if bindings is None:
+            bindings = self._bind_forward_requests(
+                forward_batch, allow_capture_ids=False
+            )
+        if self._profile_cpu and count_batch:
             self._stats["request_bind_cpu_ns"] = self._stats.get(
                 "request_bind_cpu_ns", 0
             ) + (time.perf_counter_ns() - bind_started)
@@ -618,9 +668,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._stats["metadata_cpu_ns"] = self._stats.get(
                     "metadata_cpu_ns", 0
                 ) + (time.perf_counter_ns() - metadata_started)
-            self._stats["batches"] += 1
-            self._stats["hicache_claimed_batches"] += 1
-            return
+            if count_batch:
+                self._stats["batches"] += 1
+                self._stats["hicache_claimed_batches"] += 1
+            return None
 
         schedules: dict[int, Schedule] = {}
         for wrapper in wrappers:
@@ -640,15 +691,63 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError(
                 f"attention metadata omits {len(missing)} promoted HiCache pages"
             )
+        host_execution = self._metadata_execution_policy(
+            schedules, page_pairs, pending
+        )
         self._active_batch = _ActiveBatch(
-            bindings, schedules, pending, page_pairs, {}, {}, ()
+            bindings,
+            schedules,
+            pending,
+            page_pairs,
+            {},
+            {},
+            (),
+            host_execution,
         )
         if self._profile_cpu:
             self._stats["metadata_cpu_ns"] = self._stats.get(
                 "metadata_cpu_ns", 0
             ) + (time.perf_counter_ns() - metadata_started)
-        self._stats["batches"] += 1
-        self._stats["hicache_claimed_batches"] += 1
+        if count_batch:
+            self._stats["batches"] += 1
+            self._stats["hicache_claimed_batches"] += 1
+        return host_execution
+
+    def _fast_bulk_policy(self, pending: PendingHostLoad) -> HostExecutionPlan:
+        """Reject incremental execution without materializing GPU plan arrays.
+
+        Padded work and one object pair per possible work item deliberately
+        overestimate incremental opportunity. A one-round result is therefore
+        safe to send directly to stock FlashInfer; uncertain batches continue
+        through exact request/tile binding.
+        """
+        if self.forward_metadata is None:
+            raise RuntimeError("bulk policy has no FlashInfer metadata")
+        wrappers = (
+            self.forward_metadata.decode_wrappers
+            if hasattr(self.forward_metadata, "decode_wrappers")
+            else self.forward_metadata.prefill_wrappers
+        )
+        padded_work = max(
+            (int(wrapper._plan_info[0]) for wrapper in wrappers), default=0
+        )
+        transfer_count = int(pending.host_indices.numel())
+        if padded_work <= 0 or transfer_count <= 0:
+            raise RuntimeError("bulk policy observed empty FlashInfer or HiCache work")
+        controller = pending.controller
+        key_cache = controller.mem_pool_host.k_data_refs[0]
+        value_cache = controller.mem_pool_host.v_data_refs[0]
+        transfer_bytes = transfer_count * (
+            key_cache[0].numel() * key_cache.element_size()
+            + value_cache[0].numel() * value_cache.element_size()
+        )
+        possible_groups = min(padded_work, transfer_count)
+        return plan_host_execution(
+            object_count=2 * possible_groups,
+            transfer_bytes=transfer_bytes,
+            runnable_tiles=padded_work,
+            model=self._host_cost_model,
+        )
 
     def _prepare_host_pipeline(self, pending: PendingHostLoad) -> None:
         pipeline_started = time.perf_counter_ns() if self._profile_cpu else 0
@@ -811,16 +910,55 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         batch = self._active_batch
         if batch is None or batch.pending_host_load is None:
             raise RuntimeError("host execution policy has no active HiCache load")
+        if batch.host_execution is not None:
+            return batch.host_execution
         schedule = batch.schedules.get(id(wrapper))
         pairs = batch.page_pairs.get(id(wrapper))
         if schedule is None or pairs is None:
             raise RuntimeError("host execution policy has no FlashInfer schedule")
-        unique_pairs = {pair for pair in pairs if pair[0]}
-        if not unique_pairs:
-            raise RuntimeError("claimed HiCache batch has no external CTA dependency")
         key_cache, value_cache = kv_cache
         key_element_bytes = key_cache[0].numel() * key_cache.element_size()
         value_element_bytes = value_cache[0].numel() * value_cache.element_size()
+        return self._execution_policy(
+            schedule, pairs, key_element_bytes, value_element_bytes
+        )
+
+    def _metadata_execution_policy(
+        self,
+        schedules: dict[int, Schedule],
+        page_pairs: dict[int, tuple[_PagePair, ...]],
+        pending: PendingHostLoad,
+    ) -> HostExecutionPlan:
+        controller = pending.controller
+        if not controller.mem_pool_host.k_data_refs:
+            raise RuntimeError("HiCache host pool has no K/V layers")
+        key_cache = controller.mem_pool_host.k_data_refs[0]
+        value_cache = controller.mem_pool_host.v_data_refs[0]
+        key_element_bytes = key_cache[0].numel() * key_cache.element_size()
+        value_element_bytes = value_cache[0].numel() * value_cache.element_size()
+        policies = {
+            self._execution_policy(
+                schedule,
+                page_pairs[wrapper_id],
+                key_element_bytes,
+                value_element_bytes,
+            )
+            for wrapper_id, schedule in schedules.items()
+        }
+        if len(policies) != 1:
+            raise RuntimeError("FlashInfer wrappers selected inconsistent host policies")
+        return policies.pop()
+
+    def _execution_policy(
+        self,
+        schedule: Schedule,
+        pairs: tuple[_PagePair, ...],
+        key_element_bytes: int,
+        value_element_bytes: int,
+    ) -> HostExecutionPlan:
+        unique_pairs = {pair for pair in pairs if pair[0]}
+        if not unique_pairs:
+            raise RuntimeError("claimed HiCache batch has no external CTA dependency")
         transfer_bytes = sum(
             len(pair[0]) * (key_element_bytes + value_element_bytes)
             for pair in unique_pairs
@@ -856,20 +994,43 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if prefetched is None:
             raise RuntimeError(f"bulk host policy omitted layer {layer.layer_id}")
         stream.wait_event(prefetched.ready_event)
-        runtime_tensor = self._runtime.device_view_tensor
-        wrapper.run(
-            q,
-            kv_cache,
-            runtime_tensor,
-            runtime_tensor,
-            runtime_tensor,
-            layer.scaling,
-            len(batch.bindings),
-            14,
-            out=output,
-            **run_options,
+        self._run_preacquired_attention(
+            wrapper, q, kv_cache, output, layer, run_options
         )
         self._bulk_events = (prefetched.ready_event,)
+
+    def _run_preacquired_attention(
+        self,
+        wrapper: Any,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        output: torch.Tensor,
+        layer: Any,
+        run_options: dict[str, Any],
+    ) -> None:
+        batch = self._active_batch
+        if batch is None:
+            raise RuntimeError("preacquired attention has no active batch")
+        if id(wrapper) in self._wrapper_modules:
+            runtime_tensor = self._runtime.device_view_tensor
+            wrapper.run(
+                q,
+                kv_cache,
+                runtime_tensor,
+                runtime_tensor,
+                runtime_tensor,
+                layer.scaling,
+                len(batch.bindings),
+                14,
+                out=output,
+                **run_options,
+            )
+            self._stats["planless_preacquired_launches"] = self._stats.get(
+                "planless_preacquired_launches", 0
+            ) + 1
+        else:
+            wrapper.run(q, kv_cache, out=output, **run_options)
+            self._stats["stock_bulk_launches"] += 1
 
     def _ensure_plan(
         self, wrapper: Any, layer_id: int, schedule: Schedule
@@ -1012,6 +1173,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     key_element_bytes,
                     host_key.stride(0) * host_key.element_size(),
                     key_cache.stride(0) * key_cache.element_size(),
+                    int(host_key.shape[0]),
+                    int(key_cache.shape[0]),
                 )
             )
             value_slot = len(indexed_objects)
@@ -1028,6 +1191,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     value_element_bytes,
                     host_value.stride(0) * host_value.element_size(),
                     value_cache.stride(0) * value_cache.element_size(),
+                    int(host_value.shape[0]),
+                    int(value_cache.shape[0]),
                 )
             )
             result = (key_slot, key_object_id, value_slot, value_object_id)
@@ -1311,22 +1476,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         progress_passes = 0
         if prefetched is not None:
             stream.wait_event(prefetched.ready_event)
-            runtime_tensor = self._runtime.device_view_tensor
-            wrapper.run(
-                q,
-                kv_cache,
-                runtime_tensor,
-                runtime_tensor,
-                runtime_tensor,
-                layer.scaling,
-                len(batch.bindings),
-                14,
-                out=output,
-                **run_options,
+            self._run_preacquired_attention(
+                wrapper, q, kv_cache, output, layer, run_options
             )
-            self._stats["planless_preacquired_launches"] = self._stats.get(
-                "planless_preacquired_launches", 0
-            ) + 1
         else:
             selected_policy = self._layer_execution_policy(wrapper, kv_cache)
             if selected_policy.rounds == 1 and not self._force_incremental:
@@ -1400,6 +1552,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     item.completed_compute_ns for item in progress
                 )
                 if self._opportunity_trace is not None:
+                    tile_compute_ns = self._host_cost_model.tile_compute_ns
+                    compute_source = "calibrated"
+                    if self._measure_opportunity_compute:
+                        tile_compute_ns = self._measure_flashinfer_tile_compute(
+                            wrapper,
+                            q,
+                            kv_cache,
+                            output,
+                            layer,
+                            run_options,
+                            schedule.work_count,
+                        )
+                        compute_source = "measured"
                     runnable_ns = self._runtime.work_runnable_ns(schedule.work_count)
                     tiles = tuple(
                         TileArrival(
@@ -1408,13 +1573,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                             ),
                             tile_id=work_ticket,
                             available_ns=runnable_ns[work_ticket],
-                            compute_ns=self._host_cost_model.tile_compute_ns,
+                            compute_ns=tile_compute_ns,
                             logical_tile=schedule.kv_tile_indices[work_ticket],
                             availability_source=(
                                 "resident_at_launch"
                                 if runnable_ns[work_ticket] == 0
                                 else "gpu_globaltimer"
                             ),
+                            compute_source=compute_source,
                         )
                         for work_ticket, request_index in enumerate(
                             schedule.request_indices
@@ -1463,6 +1629,56 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if local_layer + 1 == int(pending.controller.layer_num):
             self._write_stats()
         return output.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _measure_flashinfer_tile_compute(
+        self,
+        wrapper: Any,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        output: torch.Tensor,
+        layer: Any,
+        run_options: dict[str, Any],
+        work_count: int,
+    ) -> int:
+        """Calibrate canonical tile cost after all data is resident.
+
+        This evaluation-only launch contains no acquisition or progress work.
+        Its kernel makespan is converted to a per-tile service cost for the
+        analyzer's declared number of parallel CTA slots.
+        """
+        if work_count <= 0 or id(wrapper) not in self._wrapper_modules:
+            raise RuntimeError("compute calibration requires instrumented CTA work")
+        batch = self._active_batch
+        if batch is None:
+            raise RuntimeError("compute calibration has no active batch")
+        start = torch.cuda.Event(enable_timing=True)
+        finish = torch.cuda.Event(enable_timing=True)
+        runtime_tensor = self._runtime.device_view_tensor
+        start.record()
+        wrapper.run(
+            q,
+            kv_cache,
+            runtime_tensor,
+            runtime_tensor,
+            runtime_tensor,
+            layer.scaling,
+            len(batch.bindings),
+            14,
+            out=output,
+            **run_options,
+        )
+        finish.record()
+        finish.synchronize()
+        kernel_ns = max(1, math.ceil(start.elapsed_time(finish) * 1_000_000))
+        active_slots = min(work_count, self._opportunity_parallel_slots)
+        tile_ns = max(1, math.ceil(kernel_ns * active_slots / work_count))
+        self._stats["opportunity_calibration_launches"] = self._stats.get(
+            "opportunity_calibration_launches", 0
+        ) + 1
+        self._stats["opportunity_calibration_kernel_ns"] = self._stats.get(
+            "opportunity_calibration_kernel_ns", 0
+        ) + kernel_ns
+        return tile_ns
 
     def _run_graph_attention(
         self,

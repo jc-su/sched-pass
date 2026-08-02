@@ -331,6 +331,9 @@ Runnable now:
 - resident, mapped-DRAM, staged-DRAM, and mixed placement;
 - global-load and TMA consumers;
 - real FlashInfer resident/deferred correctness and resident-hook latency;
+- real FlashInfer GPU top-k page selection feeding a stable device index table,
+  bounded pinned-host gather, compact paged decode, matched candidate
+  overfetch, and a precomputed selected-copy oracle;
 - GPU-initiated VFIO NVMe mechanism and preliminary hardware trials; and
 - GPU-hidden-state top-k MoE routing with device-built dependencies plus
   matched `late-bound` (legacy CLI name), `cpu-sync`, and `overfetch` controls;
@@ -340,6 +343,12 @@ Runnable now:
 These establish mechanism feasibility. The custom sparse-attention and MoE
 programs are not primary performance evidence.
 
+The implemented five-point operator sweep captures the required crossover: a
+forced indexed path loses at zero byte avoidance, while the online cost model
+keeps bulk there and selects indexed transfer at 75% or greater avoidance. The
+current peak is 8.826x over forced candidate overfetch; see `VALIDATION.md` for
+the exact claim boundary.
+
 Still required before E3/E4 are paper evidence:
 
 - demand-mode SGLang execution of the request/tile ticket path under a
@@ -347,8 +356,8 @@ Still required before E3/E4 are paper evidence:
   is preacquired and does not exercise unavailable-data work tickets;
 - compiler-generated direct and incremental FlashInfer forms plus the unified
   grouping scheduler under the same kernel math and cache policy;
-- a GPU-only `top_k_page_table_transform` to real FlashInfer sparse-attention
-  path with no CPU materialization of selected pages;
+- end-to-end serving use of the implemented GPU-selected FlashInfer path with
+  model-generated scores and quality evaluation;
 - trace preprocessing and an arrival-driven serving client with per-request
   TTFT/TPOT JSON output;
 - physical-byte, queue, SM-tax, per-ticket availability, and partial-progress

@@ -2,7 +2,7 @@
 
 Public design documents call work whose inputs are available a runnable tile and
 call its finite execution a runnable-work launch. `Ready` remains only the
-literal ABI-v19 ticket state for a tile whose dependencies are available.
+literal ABI-v20 ticket state for a tile whose dependencies are available.
 
 NTA is integrated at two independent boundaries: an engine publishes request
 and object metadata, and a source-available finite GPU kernel calls one policy

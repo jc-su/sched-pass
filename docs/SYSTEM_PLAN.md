@@ -232,7 +232,7 @@ Implemented today are:
 - direct HBM and mapped-DRAM consumption, staged DRAM, a retained
   `(object_id, version)` HBM staging entry, a hard byte budget for staging
   allocations owned by the runtime, and one-queue VFIO NVMe;
-- ABI-v19 work metadata carrying request reduction groups, contributor counts,
+- ABI-v20 work metadata carrying request reduction groups, contributor counts,
   unavailable bytes, and estimated compute cost;
 - per-request blocked-byte/runnable-compute/completed-compute summaries and
   request-local complete-contributor counters;
@@ -243,7 +243,10 @@ Implemented today are:
   remapping, and request-local split-K merge gates tested with one complete and
   one blocked request in the same real FlashInfer launch;
 - a finite host-DRAM execution model that chooses one bulk round or bounded
-  rounds, with two-stream transfer/compute overlap; and
+  rounds, with two-stream transfer/compute overlap;
+- a real FlashInfer GPU-selected page path with a stable device-only index
+  table, bounded source/destination validation, cold and retained staging, and
+  a no-oracle bulk-versus-indexed cost decision; and
 - an SGLang HiCache adapter that publishes request generations and priorities,
   preserves exact page-map identity, exposes the complete demand path and the
   preacquired fast path, and replays instrumented FlashInfer decode CUDA graphs.
@@ -253,12 +256,13 @@ incremental forms from one typed operator, a second Triton/MLIR or TileLang
 frontend, a measured elastic
 range-coalescing objective, runtime-generic HBM eviction/refcounts, graph replay
 of the demand-mode progress loop, use of partial progress in engine batch
-admission, a real FlashInfer sparse path, multiple NVMe queue pairs, a vLLM
-adapter, or RNIC/RDMA. Current-ABI VFIO NVMe has one single-controller local
+admission, end-to-end serving use of the GPU-selected path, multiple NVMe queue
+pairs, a vLLM adapter, or RNIC/RDMA. Current-ABI VFIO NVMe has one
+single-controller local
 qualification point, not the multi-platform reliability evidence required for
-production. Real dense serving traces have not yet established the P0
-opportunity. The remaining sections are target design and claim gates, not
-claims that these parts already exist.
+production. Local dense CPU-DRAM traces have not established the P0 opportunity;
+NVMe and additional-model traces remain open. The remaining sections are target
+design and claim gates, not claims that these parts already exist.
 
 ## 5. Why The Mechanisms Belong
 
@@ -416,6 +420,12 @@ batch scheduling.
 Gate: reproducible traces from at least two real models and CPU-DRAM plus NVMe
 arrival distributions demonstrate material all-or-nothing barrier cost.
 
+Current result: local Llama-160M and Qwen2.5-3B CPU-DRAM traces did not pass the
+predeclared dense opportunity gate after finite SM parallelism was modeled.
+The project therefore does not force the incremental form for dense host-DRAM
+batches. This narrows the current performance claim to device-generated demand
+and leaves dense NVMe skew as a measured research question.
+
 ### P1: compiler soundness and incremental form
 
 - Replace ad-hoc collective analysis with principled control dependence and
@@ -471,7 +481,7 @@ admission state.
 ### P5: NVMe scale and reliability
 
 - Preserve the historical ABI-v18 single-controller qualification as a
-  regression, rerun it on ABI v19, and repeat it across platforms.
+  regression, rerun it on ABI v20, and repeat it across platforms.
 - Add multiple queue pairs and depth/transfer sizing from Little's law.
 - Separate buffer lifetime from transport lifetime and validate backpressure,
   timeout, reset, cancellation, and stale completion behavior.
@@ -484,11 +494,14 @@ changed cache policy.
 
 ### P6: GPU-selected sparse FlashInfer and generality
 
-- Keep FlashInfer `top_k_page_table_transform` output on device.
-- Feed selected pages into real FlashInfer sparse attention and the same
-  incremental runtime.
+- Keep FlashInfer `top_k_page_table_transform` output on device. Implemented.
+- Feed selected pages through the incremental runtime into real FlashInfer
+  paged decode over compact KV. Implemented at operator level.
+- Select bulk candidate transfer or bounded indexed transfer without reading
+  selected IDs on the CPU. Implemented and crossed over in a five-point sweep.
 - Retain custom CUDA sparse attention and MoE only as protocol/fault fixtures.
-- Add a second generated-kernel frontend and rerun MoE as a secondary result.
+- Add end-to-end serving integration, a second generated-kernel frontend, and
+  rerun MoE as a secondary result.
 
 Gate: real-kernel output parity and a measured crossover where elastic grouping
 uses large transfers for dense demand and avoids overfetch for low-selectivity
@@ -604,11 +617,11 @@ Stop or narrow the project if:
 
 ## 12. Immediate Order
 
-Freeze further mechanism expansion and run P0 on real dense SGLang traces.
-In parallel, extend the first typed FlashInfer frontend to generate distinct
-direct and incremental forms and finish the P2 direct-path comparison. Continue
-P2-P4 on CPU DRAM because that isolates incremental execution from storage
-implementation quality. Scale NVMe only after the dense operator result
-survives its matched bulk and skip/rebatch baselines. Add the real sparse
-FlashInfer stress case and second frontend after that. RDMA remains deferred
-until real hardware and a matched network baseline are available.
+Integrate the implemented GPU-selected FlashInfer path into a real long-context
+serving loop and compare it with overfetch, CPU materialization, ECHO-style
+recall, and skip/rebatch at identical cache state. Preserve stock bulk dispatch
+for the dense CPU-DRAM regime that failed P0. In parallel, finish same-source
+direct/incremental generation, collect dense NVMe opportunity traces, and add a
+second typed frontend. Scale NVMe only after a workload demonstrates exposed
+operator overlap or avoided bytes. RDMA remains deferred until real hardware
+and a matched network baseline are available.
