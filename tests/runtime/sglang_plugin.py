@@ -82,6 +82,7 @@ def main() -> None:
 
     from nta_runtime.engines.sglang import (
         NtaFlashInferAttnBackend,
+        _ActiveBatch,
         _plan_cache_signature,
     )
 
@@ -97,6 +98,34 @@ def main() -> None:
     )
     assert signature != remapped, "plan cache aliased different HiCache page rows"
     assert signature == rebound, "request rebinding invalidated a structural plan"
+
+    class Wrapper:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, *args, **kwargs) -> None:
+            self.calls += 1
+
+    backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
+    backend._active_batch = _ActiveBatch((), {}, None, {}, {}, {}, ())
+    backend._wrapper_modules = {}
+    backend._stats = {"stock_bulk_launches": 0}
+    wrapper = Wrapper()
+    backend._run_preacquired_attention(
+        wrapper, object(), object(), object(), object(), {}
+    )
+    assert wrapper.calls == 1
+    assert backend._stats["stock_bulk_launches"] == 1
+    backend._wrapper_modules[id(wrapper)] = "instrumented"
+    try:
+        backend._run_preacquired_attention(
+            wrapper, object(), object(), object(), object(), {}
+        )
+    except RuntimeError as error:
+        assert "incorrectly planned" in str(error)
+    else:
+        raise AssertionError("preacquired attention accepted an instrumented wrapper")
+    assert wrapper.calls == 1
 
     context = mp.get_context("spawn")
     result = context.Queue()

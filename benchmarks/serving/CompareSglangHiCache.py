@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import random
 import subprocess
@@ -37,6 +38,14 @@ def parse_args() -> argparse.Namespace:
         "--max-latency-regression-percent",
         type=float,
         help="fail when the NTA median exceeds stock by more than this percent",
+    )
+    parser.add_argument(
+        "--verify-transfer",
+        action="store_true",
+        help=(
+            "run a separate performance-excluded NTA arm that compares every "
+            "promoted KV layer with its pinned-host source"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -82,6 +91,27 @@ def require_clean_mechanism(
         raise RuntimeError(f"NTA HiCache trial used {fallbacks} fallback batches")
     if claimed == 0:
         raise RuntimeError("NTA HiCache trial did not claim an external batch")
+    planless = sum(
+        int(entry.get("planless_preacquired_launches", 0)) for entry in stats
+    )
+    if planless != 0:
+        raise RuntimeError(
+            f"NTA timed {planless} instrumented launches after acquisition"
+        )
+    stock_launches = sum(
+        int(entry.get("stock_bulk_launches", 0)) for entry in stats
+    )
+    if stock_launches == 0:
+        raise RuntimeError("NTA preacquired path did not execute stock FlashInfer")
+    external_launches = sum(
+        int(entry.get("external_launches", 0)) for entry in stats
+    )
+    prefetched_layers = sum(int(entry.get("prefetched_layers", 0)) for entry in stats)
+    if external_launches == 0 or external_launches != prefetched_layers:
+        raise RuntimeError(
+            "NTA did not execute exactly one external attention layer for every "
+            f"prefetched layer ({external_launches} != {prefetched_layers})"
+        )
     if require_graph_replay:
         replays = sum(int(entry.get("graph_replays", 0)) for entry in stats)
         captures = sum(int(entry.get("graph_captures", 0)) for entry in stats)
@@ -91,7 +121,9 @@ def require_clean_mechanism(
             )
 
 
-def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
+def run(
+    args: argparse.Namespace, backend: str, *, verify_transfer: bool = False
+) -> dict[str, Any]:
     workspace = ROOT / "results" / "serving" / "sglang-hicache-cache" / backend
     command = [
         str(ROOT / "tools" / "jit" / "activate.py"),
@@ -128,9 +160,16 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     ]
     if args.max_attempts is not None:
         command.extend(("--max-attempts", str(args.max_attempts)))
+    environment = os.environ.copy()
+    environment.pop("NTA_SGLANG_VERIFY_TRANSFER", None)
+    if verify_transfer:
+        if backend != "nta_flashinfer":
+            raise ValueError("transfer verification is defined only for NTA")
+        environment["NTA_SGLANG_VERIFY_TRANSFER"] = "1"
     completed = subprocess.run(
         command,
         cwd=ROOT,
+        env=environment,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -169,6 +208,25 @@ def main() -> int:
             f"stock={baseline['external_attempt_indices']} "
             f"NTA={mechanism['external_attempt_indices']}"
         )
+    transfer_verification = None
+    if args.verify_transfer:
+        transfer_verification = run(args, "nta_flashinfer", verify_transfer=True)
+        require_clean_mechanism(
+            transfer_verification,
+            require_graph_replay=args.cuda_graph_decode == "full",
+        )
+        if (
+            transfer_verification["generated_text_sha256"]
+            != baseline["generated_text_sha256"]
+        ):
+            raise RuntimeError("transfer-verification generation differs from stock")
+        if (
+            transfer_verification["external_attempt_indices"]
+            != baseline["external_attempt_indices"]
+        ):
+            raise RuntimeError(
+                "transfer-verification host-residency sequence differs from stock"
+            )
     baseline_time = float(baseline["median_promotion_seconds"])
     mechanism_time = float(mechanism["median_promotion_seconds"])
     latency_change = mechanism_time / baseline_time - 1.0
@@ -193,6 +251,7 @@ def main() -> int:
         "promotion_throughput_ratio": baseline_time / mechanism_time,
         "promotion_latency_change_fraction": latency_change,
         "max_latency_regression_percent": args.max_latency_regression_percent,
+        "transfer_verification": transfer_verification,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

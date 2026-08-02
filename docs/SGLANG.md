@@ -2,9 +2,10 @@
 
 Status: SGLang 0.5.14 and FlashInfer 0.6.12 are integrated through SGLang's
 installed plugin mechanism. The adapter handles eager CPU-DRAM HiCache
-promotion and full decode CUDA-graph replay through instrumented FlashInfer
-wrappers. Resident eager batches use stock FlashInfer. This is a locally
-validated integration, not a production-readiness claim.
+promotion and full decode CUDA-graph replay. Preacquired and resident work uses
+stock FlashInfer; only unresolved multi-round demand work uses instrumented
+wrappers. This is a locally validated integration, not a production-readiness
+claim.
 
 ## Plugin Boundary
 
@@ -34,15 +35,16 @@ with monotonically changing generations. At SGLang's HiCache producer point,
 the default path enqueues each layer's existing tuned indexed-copy kernel on a
 dedicated finite CUDA stream and records a preallocated data-available event. The
 consumer stream waits only for the layer it is about to use. The
-compiler-instrumented FlashInfer CTA then checks the bound request generation
-before entering the unchanged attention mainloop.
+unchanged stock FlashInfer kernel then consumes that layer. Request binding is
+retained for lifecycle accounting and for incremental batches, where the
+compiler-instrumented CTA checks the bound generation before attention.
 
 ```text
 SGLang request and HiCache page map
   -> early layer-wise indexed copy on a finite CUDA stream
   -> preallocated per-layer data-available event
   -> compact request slot/generation binding
-  -> ABI-20 request-liveness guard in each FlashInfer CTA
+  -> stock FlashInfer after acquisition, or ABI-20 guarded incremental CTAs
   -> SGLang-owned output tensor and HiCache completion
 ```
 
@@ -52,13 +54,14 @@ no model-thread page-map download. `NTA_SGLANG_PIPELINE_HOST=0` selects the
 schedule-aware policy path: it extracts FlashInfer's request/KV-tile schedule
 and evaluates the calibrated bulk-versus-incremental cost model before building
 a device plan. A one-round decision uses SGLang's tuned layer transfer and the
-compiler request guard without allocating or uploading CTA plan state. A
+stock FlashInfer wrapper without allocating or uploading CTA plan state. A
 multi-round decision registers exact indexed K/V objects and runs bounded CTA
 acquisition epochs. `NTA_SGLANG_FORCE_INCREMENTAL=1` is an evaluation ablation
 that overrides the cost gate. Every incremental epoch is checked before its
 output is returned; transport failure, cancellation, or an exhausted finite
 bound therefore fails closed rather than exposing an incomplete merge. All
-paths preserve the same request-generation checks and finite-kernel contract.
+instrumented paths preserve request-generation checks and the finite-kernel
+contract.
 
 No CPU thread copies KV or polls a device queue. CPU userspace still performs
 normal batch planning and launches finite CUDA kernels. This distinction is
@@ -138,17 +141,20 @@ engine = sglang.Engine(
 
 Structural graph planning delegates to SGLang and FlashInfer before capture.
 Replay binds the current padded request IDs/generations and invokes the real
-instrumented FA2 wrapper with graph-stable runtime tensors. A pending HiCache
-transfer is ordered before graph replay; CUDA stream-capture isolation forbids
-capturing a wait on uncaptured producer-stream work. Eager prefill retains
-per-layer copy/compute overlap. The demand-mode reset/progress/runnable loop is
-not yet embedded in SGLang's replay graph.
+stock FA2 wrapper. A pending HiCache transfer is ordered before graph replay;
+CUDA stream-capture isolation forbids capturing a wait on uncaptured
+producer-stream work. Eager prefill retains per-layer copy/compute overlap. The
+demand-mode reset/progress/runnable loop is not yet embedded in SGLang's replay
+graph.
 
 `NTA_ENGINE_STATS_FILE=/path/report.json` enables per-process statistics. Demand
 mode already synchronizes once per layer to enforce its terminal epoch result.
 The following additional checks are available only for qualification:
 
-- `NTA_SGLANG_VERIFY_TRANSFER=1`: compare every promoted K/V row with host.
+- `NTA_SGLANG_VERIFY_TRANSFER=1`: compare every promoted K/V row with host. This
+  synchronizes and copies data, so it must run in a separate correctness arm and
+  never in a timed performance arm. `CompareSglangHiCache.py --verify-transfer`
+  enforces that separation.
 - `NTA_SGLANG_VERIFY_ATTENTION=1`: compare every layer with stock FlashInfer.
 - `NTA_SGLANG_VERIFY_EXECUTION=1`: fill and scan output for unwritten or
   non-finite values.

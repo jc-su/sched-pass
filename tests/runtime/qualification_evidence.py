@@ -43,11 +43,45 @@ def main() -> None:
         production = qualifier.production_checks(evidence, "revision")
         production_names = {item["name"] for item in production}
         assert {
+            "serving integration",
             "serving graph path",
             "serving performance bounds",
             "serving tier coverage",
         }.issubset(production_names)
         assert not any(item["passed"] for item in production)
+
+        original_verify_artifacts = qualifier.verify_artifacts
+        qualifier.verify_artifacts = lambda *_args: (True, "test artifacts")
+        current["serving"] = {
+            "engine": "sglang",
+            "mechanism_integrated": True,
+            "mechanism_mode": "incremental_demand",
+            "correctness": True,
+            "transfer_verification": True,
+            "all_attention_layers_executed": True,
+            "baseline_and_mechanism": True,
+            "zero_fallback": True,
+            "post_acquisition_instrumented_launches": 0,
+            "matched_cache_and_admission": True,
+        }
+        (evidence / "production-evidence.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        production = qualifier.production_checks(evidence, "revision")
+        integration = next(
+            item for item in production if item["name"] == "serving integration"
+        )
+        assert integration["passed"] is True
+        current["serving"]["post_acquisition_instrumented_launches"] = 1
+        (evidence / "production-evidence.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        production = qualifier.production_checks(evidence, "revision")
+        integration = next(
+            item for item in production if item["name"] == "serving integration"
+        )
+        assert integration["passed"] is False
+        qualifier.verify_artifacts = original_verify_artifacts
 
         (evidence / "osdi-evidence.json").write_text(
             json.dumps(current), encoding="utf-8"

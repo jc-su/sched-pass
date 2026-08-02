@@ -112,10 +112,11 @@ force a device synchronization or repack KV rows on the CPU.
 The installed `sglang.srt.plugins` entry point registers `nta_flashinfer` for
 SGLang 0.5.14. It translates SGLang request slots, HiCache page maps, and
 FlashInfer schedule coordinates into this host boundary. Resident batches
-retain stock FlashInfer; supported host-backed batches use the instrumented
-wrappers; planning failures restore SGLang's original transfer path before
-attention starts. Scheduler aborts are mirrored into the current request
-generation. See `SGLANG.md` for the exact support matrix and command line.
+and preacquired host-backed batches retain stock FlashInfer; unresolved
+multi-round batches use instrumented wrappers. Planning failures restore
+SGLang's original transfer path before attention starts. Scheduler aborts are
+mirrored into the current request generation. See `SGLANG.md` for the exact
+support matrix and command line.
 
 vLLM has no registered adapter. vLLM 0.13's experimental KVConnector carries
 request IDs and block-transfer metadata, but the stock offloading connector

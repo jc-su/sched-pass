@@ -249,7 +249,8 @@ Implemented today are:
   a no-oracle bulk-versus-indexed cost decision; and
 - an SGLang HiCache adapter that publishes request generations and priorities,
   preserves exact page-map identity, exposes the complete demand path and the
-  preacquired fast path, and replays instrumented FlashInfer decode CUDA graphs.
+  preacquired fast path, and replays stock FlashInfer decode CUDA graphs after
+  stream-ordered acquisition.
 
 Not implemented today are compiler generation of separate complete-data and
 incremental forms from one typed operator, a second Triton/MLIR or TileLang

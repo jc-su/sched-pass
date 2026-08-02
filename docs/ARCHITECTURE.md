@@ -1079,9 +1079,9 @@ base-2 `(V, LSE)` state implementation when its headers are available, and a
 real FlashInfer decode wrapper is a differential correctness gate. NTA deferral
 also executes in version-checked FlashInfer 0.6.12 decode and FA2 paged-prefill
 JIT kernels. SGLang 0.5.14 HiCache is wired through the plugin adapter; vLLM
-request lifecycle and KV ownership remain open. Instrumented FlashInfer decode
-also replays through SGLang's full CUDA-graph mode with live request identity;
-the demand progress loop and paged-prefill graph remain open. There is still no
+request lifecycle and KV ownership remain open. Stock FlashInfer decode replays
+through SGLang's full CUDA-graph mode after stream-ordered acquisition; the
+demand progress loop and paged-prefill graph remain open. There is still no
 TTFT/TPOT/SLO benefit claim.
 
 The separate sparse fixture runs one CTA per request over a resident summary

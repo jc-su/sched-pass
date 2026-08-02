@@ -447,12 +447,12 @@ designed.
 
 SGLang 0.5.14 discovers NTA through its public `sglang.srt.plugins` entry-point
 group. The real model run binds engine request IDs and pool slots, registers
-the exact HiCache host/device page rows, executes the instrumented FA2 paged
-prefill CTAs, and returns SGLang-owned output tensors. Debug qualification found
-exact host-to-HBM K/V equality on all 12 layers and exact attention output
-against a separately planned stock FlashInfer wrapper.
+the exact HiCache host/device page rows, overlaps layer acquisition, executes
+stock FA2 paged prefill after each layer is available, and returns SGLang-owned
+output tensors. Separate correctness qualification compares every promoted K/V
+row with pinned-host data; timed trials exclude that synchronous verification.
 
-The latest residency-qualified mixed run used Llama-160M, one 96-token
+An historical residency-qualified mixed run used Llama-160M, one 96-token
 host-cached request, one 64-token fresh request, 15 measured promotions, and
 one generated token per request. Stock and NTA observed identical external
 attempt indices and generated identical text. NTA reported 15 claimed batches,
@@ -469,19 +469,26 @@ peer delay separately and supports an explicit median-regression limit; the
 30.92% aggregate difference is scheduler-sensitive and is not used as a paper
 claim.
 
+Those planless-instrumented measurements do not describe the current fast path.
+The adapter now rejects instrumented attention after acquisition and the matched
+harness requires a positive stock-FlashInfer launch count. Clean-revision
+performance reports must use this implementation and the separate transfer
+verification arm.
+
 An ABI-v18 decode-graph comparison collected three qualified promotions in
 five attempts with the same 96-token hot request and a 64-token peer. Stock
 measured 18.614 ms median promotion latency and `nta_flashinfer` measured
 11.469 ms, giving a 1.623x promotion-throughput ratio. Generated output and
 external-attempt indices matched; NTA reported four captures, ten graph
 replays, three claimed HiCache batches, and zero fallback. Host promotion ran
-through eager prefill and the subsequent decode ran through the instrumented
-resident graph (`graph_external_batches=0`). This validates graph integration
-and request metadata preservation, but does not validate graph-captured demand
-acquisition or incremental co-scheduling. The sample is too small and clocks
-are uncontrolled.
+through eager prefill and the subsequent decode ran through the then-current
+instrumented resident graph (`graph_external_batches=0`). This historical result
+validated graph integration and request metadata preservation, but not
+graph-captured demand acquisition or incremental co-scheduling. The current
+preacquired graph uses stock FlashInfer. The sample is too small and clocks are
+uncontrolled.
 
-The ABI-v20 schedule-aware path was then measured with early host acquisition
+An earlier ABI-v20 schedule-aware path was measured with early host acquisition
 disabled. It made its decision from the current FlashInfer schedule and exact
 HiCache page mapping, selected one tuned bulk round, and overlapped subsequent
 layer transfers with attention. Across five qualified promotions, stock
@@ -489,8 +496,10 @@ measured 12.993 ms and NTA measured 13.333 ms median promotion latency, a 2.62%
 cost and 0.974x throughput ratio. Generated output and residency sequences
 matched. NTA recorded five bulk batches, 60 layer prefetches, no CTA plan
 uploads, no incremental work, and zero fallback. This is a current-ABI local
-regression result for the policy's no-opportunity branch, not an incremental
-speedup or an OSDI result.
+regression result for the old policy's no-opportunity branch, not an incremental
+speedup or an OSDI result. It is retained as negative evidence and is superseded
+as the dense production path by stock attention after stream-ordered
+acquisition.
 
 ## Open Production And Paper Gates
 

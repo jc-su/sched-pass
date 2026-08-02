@@ -61,9 +61,9 @@ workloads:
 - zero-copy DLPack views of the native runtime and plan plus a bounded
   FlashInfer layer executor whose fixed enqueue path can be captured after its
   structural plan is uploaded;
-- full SGLang decode CUDA-graph replay through graph-capable instrumented
-  FlashInfer wrappers, with exact live request metadata preserved across the
-  engine's padded replay view;
+- full SGLang decode CUDA-graph replay through stock FlashInfer wrappers after
+  stream-ordered acquisition, with exact live request metadata preserved across
+  the engine's padded replay view;
 - non-owning registration of existing engine HBM and device-visible host
   allocations;
 - public finite-kernel host and device policies, replacing benchmark-specific
@@ -121,13 +121,13 @@ workloads:
 - request-bound runnable-work launches that map a compact physical CTA prefix
   back to the original FlashInfer request/tile schedule while the launch is
   stream-ordered;
-- an installed SGLang 0.5.14 plugin backend that binds real request IDs and
-  generations and priorities, overlaps HiCache's tuned layer copies with model execution,
-  routes only external batches through planless request-guarded FlashInfer,
-  retains a full indexed-object CTA-demand mode with a finite cost-selected
-  two-stream acquisition/compute pipeline, mirrors request aborts, keys
-  plan reuse by exact host/device page pairs, and fails closed on claimed-batch
-  planning errors unless availability-only fallback is explicitly enabled.
+- an installed SGLang 0.5.14 plugin backend that binds real request IDs,
+  generations, and priorities, overlaps HiCache's tuned layer copies with model
+  execution, retains stock FlashInfer after acquisition, routes only unresolved
+  multi-round work through request-guarded instrumented FlashInfer, mirrors
+  request aborts, keys plan reuse by exact host/device page pairs, and fails
+  closed on claimed-batch planning errors unless availability-only fallback is
+  explicitly enabled.
 - a hard capacity and high-water telemetry for HBM staging allocations owned by
   the runtime; engine-owned KV staging remains governed by the engine cache.
 

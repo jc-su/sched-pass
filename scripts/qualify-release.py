@@ -177,10 +177,14 @@ def production_checks(
             and serving.get("mechanism_integrated") is True
             and serving.get("mechanism_mode") == "incremental_demand"
             and serving.get("correctness") is True
+            and serving.get("transfer_verification") is True
+            and serving.get("all_attention_layers_executed") is True
             and serving.get("baseline_and_mechanism") is True
             and serving.get("zero_fallback") is True
+            and serving.get("post_acquisition_instrumented_launches") == 0
             and serving.get("matched_cache_and_admission") is True,
-            "requires a real demand-mode integration with matched state and zero fallback",
+            "requires a real demand-mode integration with complete execution, "
+            "verified transfers, matched state, and zero fallback",
         ),
         check(
             "serving graph path",

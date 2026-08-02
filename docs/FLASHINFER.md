@@ -156,10 +156,10 @@ integration contract.
 
 When the engine already enqueued acquisition at its producer boundary, a
 post-transfer event orders the consumer stream and the kernel uses the
-planless-preacquired mode. Each CTA still validates the current request
-generation before touching output, but no work ticket is allocated. This is
-the serving fast path; the full cycle above remains available when tile demand
-is discovered only at kernel execution.
+stock FlashInfer wrapper without a work ticket or NTA hook. Request generation
+remains bound for engine lifecycle accounting. The full instrumented cycle
+above, including CTA-side generation validation, remains available when tile
+demand is unresolved at kernel execution.
 
 Split-K decode and paged prefill are phase aware. The custom ABI carries
 `nta_skip_merge`; initial and intermediate runnable-work launches write only
@@ -248,7 +248,8 @@ The matched SGLang 0.5.14 environment completes both a stock smoke workload
 and an NTA HiCache workload through the installed `sglang.srt.plugins` entry
 point. The plugin registers `nta_flashinfer`, binds request slot generations,
 intercepts HiCache loads, and routes external paged-KV batches through the
-instrumented wrappers. Resident batches retain the stock wrappers.
+stock wrappers after acquisition. Only unresolved incremental batches use the
+instrumented wrappers.
 
 ```bash
 ./benchmarks/serving/SglangSmoke.py \
@@ -258,11 +259,12 @@ instrumented wrappers. Resident batches retain the stock wrappers.
 The runner selects a CUDA-compatible host compiler before importing SGLang,
 uses an isolated FlashInfer JIT cache, and emits machine-readable JSON. It is a
 stock serving baseline and deliberately records `nta_integrated=false`.
-`CompareSglangHiCache.py` is the integrated matched gate. Historical local
-Llama-160M runs had exact output parity and zero fallback, but the current
-schedule-aware five-promotion result was 2.62% slower than stock. See
-`SGLANG.md` for the supported profile and the limits of this uncontrolled
-single-machine result.
+`CompareSglangHiCache.py` is the integrated matched gate. It rejects fallback,
+post-acquisition instrumented launches, mismatched output, and mismatched
+residency sequences. `--verify-transfer` executes synchronous row-by-row KV
+verification in a separate arm so it cannot inflate only NTA's timed result.
+See `SGLANG.md` for the supported profile and the limits of local
+single-machine measurements.
 
 ## Open Gates
 

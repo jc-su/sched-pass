@@ -410,60 +410,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list[Any]:
-        if not self._hicache_enabled:
-            return super()._create_decode_wrappers(bs, num_tokens)
-        if self._decode_jit_args is None:
-            raise RuntimeError("NTA decode JIT arguments are not initialized")
-        wrappers = [
-            BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                backend="fa2",
-                use_cuda_graph=True,
-                use_tensor_cores=self.decode_use_tensor_cores,
-                paged_kv_indptr_buffer=self.kv_indptr[index][: num_tokens + 1],
-                paged_kv_indices_buffer=self.cuda_graph_kv_indices[index],
-                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
-                jit_args=self._decode_jit_args,
-            )
-            for index in range(self.num_wrappers)
-        ]
-        for wrapper in wrappers:
-            self._wrapper_modules[id(wrapper)] = self._decode_jit_args[0]
-        return wrappers
+        # External graph batches are accepted only after all layers have been
+        # acquired by the stream-ordered pipeline. Keep the captured attention
+        # kernels byte-for-byte identical to SGLang's stock graph path.
+        return super()._create_decode_wrappers(bs, num_tokens)
 
     def _create_prefill_wrappers(
         self, bs: int, use_custom_mask: bool = False
     ) -> list[Any]:
-        if not self._hicache_enabled:
-            return super()._create_prefill_wrappers(bs, use_custom_mask)
-        if self._prefill_jit_args is None:
-            raise RuntimeError("NTA prefill JIT arguments are not initialized")
-        wrappers = []
-        for index in range(self.num_wrappers):
-            extra = (
-                {
-                    "custom_mask_buf": self.cuda_graph_custom_mask,
-                    "mask_indptr_buf": self.cuda_graph_qk_indptr[index][: bs + 1],
-                }
-                if use_custom_mask
-                else {}
-            )
-            wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                use_cuda_graph=True,
-                backend="fa2",
-                qo_indptr_buf=self.cuda_graph_qo_indptr[index][: bs + 1],
-                paged_kv_indptr_buf=self.kv_indptr[index][: bs + 1],
-                paged_kv_indices_buf=self.cuda_graph_kv_indices[index],
-                paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                jit_args=self._prefill_jit_args,
-                **extra,
-            )
-            self._wrapper_modules[id(wrapper)] = self._prefill_jit_args[0]
-            wrappers.append(wrapper)
-        return wrappers
+        return super()._create_prefill_wrappers(bs, use_custom_mask)
 
     def init_cuda_graph_state(self, *args: Any, **kwargs: Any) -> None:
         super().init_cuda_graph_state(*args, **kwargs)
@@ -557,10 +512,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._stats["resident_stock_batches"] += 1
             return
 
-        # In schedule-aware mode, plan the stock kernel first. Most dense
-        # batches choose one bulk round and should never enter an instrumented
-        # kernel. Incremental batches are replanned below with the typed hook.
-        self._select_wrappers(self._pipeline_host)
+        # Transfer scheduling and attention execution are independent. The
+        # stream-ordered pipeline has acquired every layer before its attention
+        # launch, so it must retain stock FlashInfer. Only an unresolved
+        # incremental batch is replanned below with the typed acquisition hook.
+        self._select_wrappers(False)
         original_use_paged = self.use_paged
         self.use_paged = True
         try:
@@ -1012,25 +968,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if batch is None:
             raise RuntimeError("preacquired attention has no active batch")
         if id(wrapper) in self._wrapper_modules:
-            runtime_tensor = self._runtime.device_view_tensor
-            wrapper.run(
-                q,
-                kv_cache,
-                runtime_tensor,
-                runtime_tensor,
-                runtime_tensor,
-                layer.scaling,
-                len(batch.bindings),
-                14,
-                out=output,
-                **run_options,
+            raise RuntimeError(
+                "preacquired attention was incorrectly planned with an "
+                "instrumented FlashInfer wrapper"
             )
-            self._stats["planless_preacquired_launches"] = self._stats.get(
-                "planless_preacquired_launches", 0
-            ) + 1
-        else:
-            wrapper.run(q, kv_cache, out=output, **run_options)
-            self._stats["stock_bulk_launches"] += 1
+        wrapper.run(q, kv_cache, out=output, **run_options)
+        self._stats["stock_bulk_launches"] += 1
 
     def _ensure_plan(
         self, wrapper: Any, layer_id: int, schedule: Schedule
@@ -1706,20 +1649,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         wrapper._window_left = window_left
         wrapper._logits_soft_cap = 0.0
         wrapper._sm_scale = layer.scaling
-        runtime_tensor = self._runtime.device_view_tensor
+        if id(wrapper) in self._wrapper_modules:
+            raise RuntimeError(
+                "preacquired CUDA graph was incorrectly captured with an "
+                "instrumented FlashInfer wrapper"
+            )
         wrapper.run(
             q,
             kv_cache,
-            runtime_tensor,
-            runtime_tensor,
-            runtime_tensor,
-            layer.scaling,
-            len(batch.bindings),
-            14,
             out=output,
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
+        self._stats["stock_bulk_launches"] += 1
         return output.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _verify_attention_output(

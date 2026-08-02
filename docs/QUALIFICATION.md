@@ -49,7 +49,7 @@ python benchmarks/serving/CompareSglangHiCache.py \
   --model /path/to/local/model --iterations 10 \
   --hot-tokens 160 --resident-tokens 96 --churn-tokens 320 \
   --max-total-tokens 384 --context-length 512 \
-  --cuda-graph-decode full
+  --cuda-graph-decode full --verify-transfer
 ```
 
 That comparison is a local integration gate. Production qualification still
@@ -93,8 +93,9 @@ its `sha256`. Every JSON or JSONL record must carry the exact qualified
 The `serving` object must establish all of the following:
 
 - a real SGLang or vLLM integration with `mechanism_mode` equal to
-  `incremental_demand`, zero fallback, matched cache/admission state, and stock
-  output correctness;
+  `incremental_demand`, zero fallback, matched cache/admission state, stock
+  output correctness, separately verified transfers, complete attention-layer
+  execution, and zero post-acquisition instrumented launches;
 - demand-mode decode CUDA graph replay and paged-prefill integration;
 - no more than 5% p50 resident overhead and at least 90% of matched dense bulk
   throughput;
