@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
     )
+    parser.add_argument(
+        "--skip-load-warmup",
+        action="store_true",
+        help="skip the performance-excluded mixed-arrival graph warmup",
+    )
     args = parser.parse_args()
     if not args.model.is_dir():
         parser.error(f"model directory does not exist: {args.model}")
@@ -284,7 +289,7 @@ def main() -> int:
     eviction_rounds = args.max_total_tokens // args.churn_tokens + 1
     churn_prompts = [
         make_prompt(tokenizer, f"load-churn-{index}", args.churn_tokens)
-        for index in range(2 * eviction_rounds)
+        for index in range(3 * eviction_rounds)
     ]
     setup_sampling = {"temperature": 0, "max_new_tokens": 1}
 
@@ -324,6 +329,22 @@ def main() -> int:
             resident_probe = engine.generate(prompt, setup_sampling)
             if device_cached_tokens(resident_probe) <= 0:
                 raise RuntimeError("resident warmup did not remain in device cache")
+
+        if not args.skip_load_warmup:
+            # Exercise this mixed-arrival shape once outside measurement so a
+            # repeated finite operator can capture/replay without timed setup.
+            engine.loop.run_until_complete(
+                _run_load(engine, resident_prompts, external_prompts, args)
+            )
+            for prompt in churn_prompts[2 * eviction_rounds :]:
+                generated_text(engine.generate(prompt, setup_sampling))
+            for prompt in resident_prompts:
+                generated_text(engine.generate(prompt, setup_sampling))
+                resident_probe = engine.generate(prompt, setup_sampling)
+                if device_cached_tokens(resident_probe) <= 0:
+                    raise RuntimeError(
+                        "resident request was not restored after load warmup"
+                    )
 
         records, elapsed = engine.loop.run_until_complete(
             _run_load(engine, resident_prompts, external_prompts, args)
@@ -380,6 +401,7 @@ def main() -> int:
         "mixed_chunk_enabled": args.batch_mode == "coalesced",
         "hicache_ratio": args.hicache_ratio,
         "cuda_graph_decode": args.cuda_graph_decode,
+        "load_warmup_excluded": not args.skip_load_warmup,
         "load_seconds": load_seconds,
         "elapsed_seconds": elapsed,
         "request_throughput": len(records) / elapsed,

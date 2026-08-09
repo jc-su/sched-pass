@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
     )
     parser.add_argument(
+        "--require-demand-graph",
+        action="store_true",
+        help="require finite NTA demand-operator graph capture and replay",
+    )
+    parser.add_argument(
         "--output",
         type=pathlib.Path,
         default=ROOT / "results" / "serving" / "sglang-hicache-load.json",
@@ -240,8 +245,16 @@ def main() -> int:
     activation = require_clean_mechanism(
         nta,
         require_graph_replay=args.cuda_graph_decode == "full",
+        require_demand_graph=args.require_demand_graph,
         require_physical_compaction=args.batch_mode == "coalesced",
     )
+    if not stock.get("load_warmup_excluded") or not nta.get(
+        "load_warmup_excluded"
+    ):
+        _write_failed_comparison(
+            args.output, reports, order, "mixed-arrival warmup was not excluded"
+        )
+        raise RuntimeError("load trial did not exclude mixed-arrival graph warmup")
     if not stock["placement_proven"] or not nta["placement_proven"]:
         _write_failed_comparison(
             args.output, reports, order, "cache placement was not proven"

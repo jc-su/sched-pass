@@ -335,12 +335,16 @@ python benchmarks/serving/CompareSglangHiCacheLoadTrials.py \
   --external-requests 1 --external-tokens 2048 \
   --resident-requests 1 --resident-tokens 2048 \
   --resident-output-tokens 32 --external-output-tokens 1 \
-  --batch-mode coalesced --cuda-graph-decode full
+  --batch-mode coalesced --cuda-graph-decode disabled \
+  --require-demand-graph
 ```
 
 The reducer alternates the first arm and reports geometric means with bootstrap
 95% intervals. Exact generated output, all transformed attention, and zero
-fallback are mandatory. Resident P99 inter-token latency is the causal
+fallback are mandatory. Each arm runs one performance-excluded mixed-arrival
+warmup so the timed NTA occurrence can capture or replay its finite operator
+graph; `--require-demand-graph` rejects an eager-only report. Resident P99
+inter-token latency is the causal
 interference metric; resident TTFT occurs before the external arrival in this
 fixture and is reported only as a general latency diagnostic.
 
