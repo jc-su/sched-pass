@@ -270,20 +270,20 @@ def main() -> None:
         else:
             raise AssertionError("pipeline object allocator accepted overlap")
     signature = _plan_cache_signature(
-        (0, 0), (3, 4), (((10,), (20,)),), ((7, 3),), 4096, 4096, None
+        (0, 0), (3, 4), (((10,), (20,)),), (7,), 4096, 4096, None
     )
     remapped = _plan_cache_signature(
-        (0, 0), (3, 4), (((11,), (21,)),), ((7, 3),), 4096, 4096, None
+        (0, 0), (3, 4), (((11,), (21,)),), (7,), 4096, 4096, None
     )
     rebound = _plan_cache_signature(
-        (0, 0), (3, 4), (((10,), (20,)),), ((7, 3),), 4096, 4096, None
+        (0, 0), (3, 4), (((10,), (20,)),), (7,), 4096, 4096, None
     )
-    regenerated = _plan_cache_signature(
-        (0, 0), (3, 4), (((10,), (20,)),), ((7, 4),), 4096, 4096, None
+    reslotted = _plan_cache_signature(
+        (0, 0), (3, 4), (((10,), (20,)),), (8,), 4096, 4096, None
     )
     assert signature != remapped, "plan cache aliased different HiCache page rows"
-    assert signature == rebound, "request rebinding invalidated a structural plan"
-    assert signature != regenerated, "plan cache aliased a reused request generation"
+    assert signature == rebound, "request generation invalidated a structural plan"
+    assert signature != reslotted, "plan cache aliased a different request slot"
 
     import torch
 

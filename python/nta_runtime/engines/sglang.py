@@ -390,17 +390,22 @@ def _plan_cache_signature(
     request_indices: tuple[int, ...],
     kv_tile_indices: tuple[int, ...],
     page_pairs: tuple[_PagePair, ...],
-    request_bindings: tuple[tuple[int, int], ...],
+    request_slots: tuple[int, ...],
     key_bytes: int,
     value_bytes: int,
     prefetched_bytes: tuple[int, int] | None,
 ) -> tuple[Any, ...]:
-    """Return an exact identity for every device-side plan input."""
+    """Return the immutable identity of a reusable device-side plan.
+
+    Request generations are dynamic directory state. Demand launches bind the
+    current generation on device, so generation reuse must not rebuild the
+    structural work and dependency arrays.
+    """
     return (
         request_indices,
         kv_tile_indices,
         page_pairs,
-        request_bindings,
+        request_slots,
         key_bytes,
         value_bytes,
         prefetched_bytes,
@@ -1739,9 +1744,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             schedule.request_indices,
             schedule.kv_tile_indices,
             page_pairs,
-            tuple(
-                (binding.request_slot, binding.generation) for binding in batch.bindings
-            ),
+            tuple(binding.request_slot for binding in batch.bindings),
             key_bytes,
             value_bytes,
             None
