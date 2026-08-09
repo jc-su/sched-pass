@@ -10,6 +10,54 @@ The repository has three evidence levels. They are deliberately separate:
   trials, a device-generated-demand workload, and clean-host artifact
   reproduction.
 
+Current verdict: the local mechanism suite passes on the one-GPU host, while
+`production` and `osdi` remain `NOT_READY`. The fixed-arrival-order canonical
+FlashInfer bounded-HBM gate passes with a stable 1.1714x speedup and 4x staging
+reduction. The corrected paired GPU-selected FlashInfer policy chooses the
+transformed bulk arm at zero byte avoidance, where forced indexed acquisition
+would deliver only `0.6431x` throughput. It reaches `8.1731x` over forced
+candidate overfetch at 93.75% avoided bytes, with a peak 95% interval of
+`[8.1639x, 8.1762x]` and same-trial maximum decision regret of `1.0000x`.
+The all-candidate-resident control is 9.15x or more faster than cold indexed
+acquisition, exposing the remaining acquisition cost. A warm-cache resident SGLang graph smoke is within the
+direct-path bound, while the latest ticketed external SGLang measurements
+remain regressions. The positive operator results are compiler-transformed
+with validated typed plans, but they do not establish an end-to-end serving
+gain. Completing manifests alone cannot change the release verdict.
+
+In the latest three arm-balanced Qwen2.5-3B graph trials, the fully transformed
+mixed host/resident path achieved `0.9447x` output-throughput geometric mean
+with bootstrap interval `[0.9337x, 0.9578x]`. External TTFT was `1.3386x` and
+resident P99 inter-token latency was `1.4991x` stock; SLO goodput was only
+`0.7498x`. Three trials are diagnostic, not paper-level statistical evidence.
+This rejects the dense
+early-known-demand performance hypothesis; it is not folded into the positive
+device-selected acquisition claim.
+
+The latest `local` qualifier returned `READY` after 46 CTests (one multi-GPU
+case skipped on the one-GPU host), CUDA sanitizer coverage, a 10,000-epoch
+lifecycle stress, CPU-only tests, Clang static analysis, Python package checks,
+ShellCheck, and patch hygiene. This is an implementation-quality result, not a
+production or paper-evidence verdict.
+
+Validate the local performance-mechanism artifact independently with:
+
+```bash
+python scripts/validate-tier-streaming-results.py \
+  --headline results/serving/tier-streaming-compiler-headline.json \
+  --heterogeneous results/serving/tier-streaming-compiler-heterogeneous.json \
+  --require-compiler-transform \
+  --output results/serving/tier-streaming-compiler-qualification.json
+```
+
+This checks canonical FlashInfer execution, numerical parity, at least ten
+headline trials, a paired-bootstrap interval above 1.0, at least 1.15x effect
+size, at least 4x staging reduction, per-request completion, heterogeneous
+request shapes, explicit compiler-path classification, dynamic-source graph
+replay, generation reuse, and cancellation isolation. Passing it supports only
+the mechanism phrase defined in
+`TIER_STREAMING.md`; it cannot return `production` or `osdi` `READY`.
+
 Run the complete local gate and write its JSON report:
 
 ```bash
@@ -66,6 +114,10 @@ a schema-1 trial specification with:
 ./scripts/run-qualified-trials.py \
   --spec experiments/moe-late-bound.json \
   --output-dir results/osdi/device-routed-moe
+
+./scripts/run-qualified-trials.py \
+  --spec experiments/tier-streaming-compiler.json \
+  --output-dir results/osdi/tier-streaming-compiler
 ```
 
 These checked-in mechanism specifications do not constitute the full OSDI
@@ -81,9 +133,9 @@ runner development and cannot satisfy the clean-revision release gate.
 
 ## Production Evidence
 
-`results/qualification/production-evidence.json` uses schema 2. Schema 1 is
-rejected because it could qualify the old preacquired path without exercising
-incremental demand execution.
+`results/qualification/production-evidence.json` uses schema 3. Earlier schemas
+are rejected because they could qualify a path that dispatched stock attention
+after transfer instead of exercising the compiler/runtime mechanism.
 
 The `artifacts` manifest must include `serving`, `correctness`, `reliability`,
 and `portability` classes. Each entry contains a repository-relative `path` and
@@ -93,15 +145,20 @@ its `sha256`. Every JSON or JSONL record must carry the exact qualified
 The `serving` object must establish all of the following:
 
 - a real SGLang or vLLM integration with `mechanism_mode` equal to
-  `incremental_demand`, zero fallback, matched cache/admission state, stock
-  output correctness, separately verified transfers, complete attention-layer
-  execution, and zero post-acquisition instrumented launches;
+  `request_aware_dual_form`, zero fallback, matched cache/admission state,
+  stock-output correctness, separately verified transfers, complete
+  attention-layer execution, generation-safe bounded-HBM request completion,
+  warm JIT caches, validated versioned compiler contracts with at least one
+  direct/incremental pair, positive transformed-direct and ticketed launch
+  counts, and zero stock attention launches in the NTA arm;
 - demand-mode decode CUDA graph replay and paged-prefill integration;
 - no more than 5% p50 resident overhead and at least 90% of matched dense bulk
   throughput;
-- real `host_staged` and `nvme` serving paths;
+- simultaneous real `host_staged` and `nvme` serving paths with cancellation
+  and request-slot reuse;
 - at least two models, three traces, and a 24-hour soak; and
-- TTFT, TPOT, SLO attainment, goodput, CPU utilization, and SM utilization.
+- TTFT, TPOT, P99 inter-token latency, SLO attainment, goodput, CPU
+  utilization, and SM utilization.
 
 The `reliability` object still requires NVMe status, malformed-CQE, timeout,
 controller-reset, IOMMU-fault, and process-crash injection with zero leaks and
@@ -110,7 +167,7 @@ models, and a physical multi-GPU run.
 
 ## OSDI Evidence
 
-`results/qualification/osdi-evidence.json` also uses schema 2. Its artifact
+`results/qualification/osdi-evidence.json` also uses schema 3. Its artifact
 manifest must include `opportunity`, `dense_flashinfer`, `sparse_flashinfer`,
 `baselines`, `ablations`, `statistics`, and `reproduction`.
 
@@ -119,16 +176,34 @@ The executable gate now matches `SYSTEM_PLAN.md` and requires:
 - GPU-timestamped dense opportunity traces from at least two models over both
   CPU DRAM and NVMe, with material measured barrier cost;
 - same-source direct and incremental compiler forms for at least two generated
-  kernel families, convergence validation, and differential correctness;
+  kernel families, convergence validation, acquired-edge/request/work-ticket
+  identity proofs, exactly-once publication, versioned operator contracts,
+  runtime-ABI validation, matching source fingerprints, and differential
+  correctness;
 - real FlashInfer decode and paged-prefill execution where useful partials run
   before the last arrival, output matches stock, and demand mode replays in a
-  CUDA graph;
+  CUDA graph, with every NTA attention launch accounted to a transformed form,
+  zero stock launches, generation-safe request completion, at least 4x staging
+  reduction, at least 1.15x speedup over atomic promotion, and a 95% speedup
+  interval whose lower bound exceeds 1.0;
+- one long-context/agent workload that jointly exercises mixed resident and
+  external requests, heterogeneous context/prefix state, fragmented KV,
+  simultaneous CPU DRAM and NVMe, admission churn, cancellation, and slot
+  reuse;
 - one elastic online policy with engine admission feedback and identical-state
   decision regret no worse than 1.05 median and 1.10 p95;
-- GPU-selected pages consumed by a real FlashInfer selector and attention
-  kernel with no NTA hot-path host identity round trip, at least five
-  selectivity points, a measured crossover, at least 2x peak speedup over
-  forced overfetch, and at most 2x regret to a precomputed selected-copy oracle;
+- ABI-v25 request accounting in every mechanism-active run, with pending,
+  executable, completed, and expected compiler-attributed compute conserved;
+  dropped attribution must remain zero, and the device critical-work policy
+  must beat or match CTA-count-only and byte-only ablations without using
+  future arrivals;
+- GPU-selected pages consumed by a real FlashInfer selector and paired
+  compiler-transformed attention forms with no NTA hot-path host identity
+  round trip, at least five selectivity points, a measured crossover, a peak
+  confidence interval above one, at least 2x peak speedup over forced
+  overfetch, an explicit forced-indexed zero-avoidance result, an
+  all-candidate-resident baseline, at most 1.05x same-trial online-policy
+  regret, and at most 2x regret to a precomputed selected-copy oracle;
 - no more than 5% p50 resident overhead, at least 90% of dense bulk throughput,
   and an end-to-end gain over equal-state request skip/rebatch;
 - at least ten controlled independent trials with confidence intervals; and

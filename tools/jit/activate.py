@@ -128,6 +128,7 @@ def main() -> int:
         shim,
         root / "tools/jit/clang_cuda_prelude.h",
         abi_header,
+        root / "include/nta/OperatorContract.h",
         root / "include/nta/DeviceAPI.cuh",
         root / "include/nta/KernelPolicy.cuh",
         root / "include/nta/FlashInferKernelPolicy.cuh",
@@ -217,6 +218,11 @@ def main() -> int:
                 "NTA_JIT_PHASE_SOURCE": os.environ.get(
                     "NTA_JIT_PHASE_SOURCE",
                     "batch_decode_kernel.cu,batch_prefill_paged_kernel_mask_0.cu",
+                ),
+                "NTA_JIT_REQUEST_BOUND_SOURCE": os.environ.get(
+                    "NTA_JIT_REQUEST_BOUND_SOURCE",
+                    "nta_sglang_decode_request_bound,"
+                    "nta_sglang_prefill_request_bound",
                 ),
             }
         )

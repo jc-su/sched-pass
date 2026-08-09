@@ -1,6 +1,6 @@
 # Related-Work And Novelty Audit
 
-Audit date: 2026-07-31
+Audit date: 2026-08-04
 
 This is a live design constraint, not a claim of novelty. The project must not
 claim "first", "production-ready", or "OSDI-level" until the implementation and
@@ -19,9 +19,35 @@ and numerical-state contracts.
 The candidate distinction is compiler-generated incremental execution of
 FlashInfer chunks whose data becomes available at different times, followed by
 a request-bound runnable-work launch that reconstructs the original scheduler
-tile and preserves partial reduction state. The current hook and heterogeneous
-work remapping execute inside optimized FlashInfer CTAs; the complete compiler
-transformation and end-to-end benefit remain unproven.
+tile and preserves partial reduction state. The compiler now verifies the
+acquire-or-exit boundary and a convergent, exactly-once numerical publication
+region with identical request/work-ticket identity. The current hook and
+heterogeneous work remapping execute inside optimized FlashInfer CTAs;
+automatic same-source form generation and end-to-end benefit remain unproven.
+
+FlashInfer is not the only prior partial-state implementation. Production and
+research kernels already partition HBM-resident or non-contiguous KV and merge
+softmax state; [ChunkAttention](https://aclanthology.org/2024.acl-long.623/) and
+[Pensieve](https://arxiv.org/abs/2312.05516) are representative examples. NTA
+therefore spends no novelty claim on `(V, LSE)`, segment attention, or a
+temporary partial buffer. The relevant question is who selects executable
+contributors after asynchronous external arrival, preserves request lifecycle
+through that interval, and feeds exact remaining service into SLO scheduling.
+
+### Lynx
+
+[Lynx](https://arxiv.org/abs/2607.01831) already rejects full-KV-arrival as a
+prerequisite for useful decode in disaggregated serving. It transfers a
+high-priority most-significant-bit stream, decodes speculatively, then uses the
+residual stream to recover high-precision behavior. NTA cannot claim to be the
+first system to begin attention before complete KV transfer.
+
+The candidate distinction is exact contributor execution without draft,
+verification, or rollback; local HBM/DRAM/NVMe hierarchy rather than only a
+network transfer; fixed-capacity staging independent of context length; and
+request-generation-safe scheduling in a heterogeneous continuous batch. These
+clauses require matched evaluation and are not established by the current
+fixed-wave operator result.
 
 ### Syncopate (OSDI 2026)
 
@@ -51,6 +77,11 @@ the real operator and feedback of actual partial progress to the batch scheduler
 improve beyond a Strata-style coalesced transfer and batch plan. NTA must
 preserve bulk behavior for dense demand; the distinction cannot rest on finer
 transfer granularity alone.
+
+Strata is also a methodological baseline: NTA should reuse its real
+long-context datasets, reuse-distance and request-rate sweeps, tier and page-size
+sensitivity, and mechanism ablations. Reusing that evaluation view does not
+make NTA another Strata; claiming the same cache-management contribution would.
 
 ### ECHO (OSDI 2026)
 
@@ -110,6 +141,39 @@ to the GPU. Evaluation should compare controller initialization traces and a
 matched SPDK CPU-polling workload against the narrow VFIO/IOMMUFD bootstrap and
 finite GPU progress path.
 
+### Serving Schedulers And Semantic-Gap Systems
+
+[Sarathi-Serve](https://www.usenix.org/conference/osdi24/presentation/agrawal)
+and [Llumnix](https://www.usenix.org/conference/osdi24/presentation/sun-biao)
+are scheduling and evaluation references. They require NTA to report maximum
+sustainable load under tail-latency SLOs, burstiness and length sensitivity,
+and isolated scheduler overhead rather than one favorable kernel latency.
+Their iteration- and request-level scheduling mechanisms are controls for
+whole-request delay and rebatching, not claims NTA may rename.
+
+[Parrot](https://www.usenix.org/conference/osdi24/presentation/lin-chaofan)
+shows that application semantics hidden behind individual API calls can change
+serving decisions. NTA addresses a different semantic gap: userspace knows
+request lifecycle, tier placement, and SLO state but not the optimized kernel's
+request-to-CTA and reduction structure, while the kernel knows the demanded
+tile and numerical contributor but not lifecycle or transport state. The
+typed frontend and request directory make those facts jointly available at the
+consumption boundary. A descriptor alone does not close this gap; identity must
+survive acquisition, finite exit, relaunch, reduction, and later admission.
+
+[ServerlessLLM](https://www.usenix.org/conference/osdi24/presentation/fu) is a
+methodological reference for separating storage bandwidth, loading pipeline,
+component overhead, and end-to-end impact. NTA must similarly prevent a faster
+transport microbenchmark from being reported as an operator or serving win.
+
+### Selective KV Systems
+
+[InfiniGen](https://www.usenix.org/conference/osdi24/presentation/lee) requires
+selective-KV comparisons to include accuracy or perplexity, sequence/batch
+sensitivity, and equal-quality baselines. Sparse attention remains a stress
+case for device-discovered demand, not the only workload or a substitute for
+the dense fragmented-arrival result.
+
 ### GPU-Owned Remote I/O And Communication
 
 [GORIO](https://arxiv.org/abs/2607.04415) keeps ANNS query evolution, page-miss
@@ -131,10 +195,10 @@ novelty claims.
 The defensible research question is narrower than "unified GPU I/O" and broader
 than GPU-selected sparse demand:
 
-> Can a compiler turn an all-or-nothing batched GPU operator into request-scoped
-> incremental execution, then let the serving runtime jointly schedule arriving
-> data, useful partial computation, and later batch admission without persistent
-> GPU workers?
+> Can a compiler expose request-owned data dependencies, executable
+> contributors, and exact completion conditions from optimized finite GPU
+> operators, enabling an SLO runtime to jointly prioritize external data and
+> GPU computation without persistent GPU workers?
 
 The implementation now establishes feasibility for explicitly marked
 byte-address and TMA sites over HBM, CPU DRAM, and NVMe. It also includes two
@@ -151,10 +215,24 @@ mechanism evidence, not a production sparse-serving result. The project does
 not yet establish automaticity across kernel families, production serving
 benefit, RDMA generality, or an OSDI-level result.
 
-The novelty unit is compiler-generated incremental execution of a real atomic
-operator plus preservation of request/tile identity across engine planning,
-finite-kernel partial work, asynchronous acquisition, completion, numerical
-merge, and subsequent batch feedback. Cancellation-safe work tickets,
+The novelty unit is a compiler/runtime co-designed **request-scoped incremental
+operator**: the typed frontend exposes request, dependency, and associative
+reduction structure; LLVM verifies a zero-live-state acquire-or-exit effect and
+a convergent exactly-once numerical publication effect; the runtime preserves
+that identity across asynchronous acquisition and finite relaunch; and the
+engine admits later work using measured request-local data and compute progress.
+This applies to every transformed operator invocation, including the direct
+form. Only unavailable contributors take the finite split-phase path.
+
+The landscape is usefully divided into four controls: hide an unchanged
+operator barrier with caching/scheduling (Strata), remove movement with coherent
+or near-data hardware (DirectKV and computational storage), shrink or speculate
+on data (ECHO and Lynx), and expose exact external-arrival contributors inside
+the finite operator (the NTA candidate). The last category is defensible only if
+the real completion-driven system wins against the first three where their
+hardware and accuracy assumptions apply.
+
+Cancellation-safe work tickets,
 logical-work remapping, a common source descriptor, TMA after staging,
 GPU-initiated submission, priority scheduling, prefetch distance, CTA
 permutation, locality placement, and cache hints are supporting techniques and
@@ -174,8 +252,9 @@ must not be presented as independent contributions.
    fairness, and failure recovery. Real RNIC experiments are additionally
    required only for an RDMA or network-I/O claim.
 5. Ablations isolating request semantics, incremental execution, compiler
-   transformation, elastic grouping, engine progress feedback, replica choice,
-   admission credits, and bounded progress.
+   transformation, CTA-count versus critical-work scoring, elastic grouping,
+   engine progress feedback, replica choice, admission credits, and bounded
+   progress.
 6. A real FlashInfer/SGLang incremental result on dense mixed-arrival KV, plus a
    real FlashInfer GPU-selected sparse path that keeps selected page IDs on the
    device. The custom fixtures satisfy only mechanism correctness today.

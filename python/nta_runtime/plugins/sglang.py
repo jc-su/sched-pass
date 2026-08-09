@@ -15,6 +15,9 @@ _ABORT_TARGET = "sglang.srt.managers.scheduler.Scheduler.abort_request"
 _FORWARD_BATCH_TARGET = (
     "sglang.srt.model_executor.forward_batch_info.ForwardBatch.init_new"
 )
+_PREFILL_ADMISSION_TARGET = (
+    "sglang.srt.managers.scheduler.Scheduler._get_new_batch_prefill_raw"
+)
 
 
 def _preserve_graph_request_metadata() -> None:
@@ -78,6 +81,9 @@ def _flush_backend_stats(scheduler, *args, **kwargs) -> None:
 
 def _cancel_backend_requests(scheduler, recv_req, *args, **kwargs) -> None:
     del args, kwargs
+    from nta_runtime.engines.sglang_admission import cancel_staged_batch
+
+    cancel_staged_batch(scheduler, recv_req)
     request_id = getattr(recv_req, "rid", "") or ""
     abort_all = bool(getattr(recv_req, "abort_all", False))
     for backend in _walk_attention_backends(scheduler):
@@ -126,6 +132,7 @@ def register() -> None:
     )
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
     from nta_runtime.engines.sglang_hicache import route_start_loading
+    from nta_runtime.engines.sglang_admission import route_prefill_admission
 
     _preserve_graph_request_metadata()
 
@@ -146,6 +153,13 @@ def register() -> None:
     if not any(hook is _attach_request_priorities for _, hook, _ in forward_hooks):
         HookRegistry.register(
             _FORWARD_BATCH_TARGET, _attach_request_priorities, HookType.AFTER
+        )
+    admission_hooks = HookRegistry._hooks[_PREFILL_ADMISSION_TARGET]
+    if not any(hook is route_prefill_admission for _, hook, _ in admission_hooks):
+        HookRegistry.register(
+            _PREFILL_ADMISSION_TARGET,
+            route_prefill_admission,
+            HookType.AROUND,
         )
     if BACKEND_NAME in ATTENTION_BACKENDS:
         return

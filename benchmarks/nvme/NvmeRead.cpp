@@ -38,6 +38,7 @@ struct Options {
   std::string device;
   std::string reference = "/tmp/nta-nvme-reference.bin";
   std::string output;
+  std::string revision;
   int gpu = 0;
   std::uint64_t sourceOffset = 0;
   std::uint32_t bytes = 64U * 1024U;
@@ -65,6 +66,9 @@ std::uint64_t parseInteger(std::string_view text, std::string_view option,
 
 Options parseOptions(int argc, char **argv) {
   Options options;
+  if (const char *revision = std::getenv("NTA_REVISION")) {
+    options.revision = revision;
+  }
   for (int index = 1; index < argc; ++index) {
     const std::string_view argument(argv[index]);
     const std::size_t equals = argument.find('=');
@@ -77,6 +81,8 @@ Options parseOptions(int argc, char **argv) {
       options.device = value;
     } else if (name == "--output") {
       options.output = value;
+    } else if (name == "--revision") {
+      options.revision = value;
     } else if (name == "--gpu") {
       const std::uint64_t parsed = parseInteger(value, name, true);
       if (parsed >
@@ -155,6 +161,10 @@ Options parseOptions(int argc, char **argv) {
   if (!options.device.starts_with("vfio:")) {
     throw std::invalid_argument(
         "--device=vfio:DDDD:BB:SS.F is required for exclusive NVMe ownership");
+  }
+  if (!options.output.empty() && options.revision.empty()) {
+    throw std::invalid_argument(
+        "--revision or NTA_REVISION is required for result provenance");
   }
   return options;
 }
@@ -307,7 +317,6 @@ int main(int argc, char **argv) {
     }
 
     checkDriver(cuInit(0), "cuInit");
-    checkCuda(cudaSetDevice(options.gpu), "cudaSetDevice");
     nta::NvmeTransportOptions transportOptions;
     transportOptions.endpoint = options.device;
     transportOptions.deviceOrdinal = options.gpu;
@@ -317,6 +326,9 @@ int main(int argc, char **argv) {
     transportOptions.mediaPolicy = options.mediaPolicy;
     auto transport =
         std::make_shared<nta::NvmeTransport>(std::move(transportOptions));
+    // Keep BAR qualification and queue setup ahead of benchmark allocations so
+    // a failure cannot leave partially initialized workload state.
+    checkCuda(cudaSetDevice(options.gpu), "cudaSetDevice");
     const nta::NvmeCapabilities capabilities = transport->capabilities();
     if (options.bytes % capabilities.lbaSize != 0 ||
         options.sourceOffset % capabilities.lbaSize != 0) {
@@ -509,6 +521,7 @@ int main(int argc, char **argv) {
       artifact << "{\n"
                << "  \"schema\": 1,\n"
                << "  \"classification\": \"nta-vfio-nvme-read\",\n"
+               << "  \"revision\": " << jsonString(options.revision) << ",\n"
                << "  \"device\": " << jsonString(options.device) << ",\n"
                << "  \"gpu\": " << options.gpu << ",\n"
                << "  \"runtime_abi\": " << nta::abi::Version << ",\n"

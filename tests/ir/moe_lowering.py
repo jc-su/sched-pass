@@ -28,7 +28,8 @@ def main() -> None:
 
     for name in ("nta_moe_tile_kernel", "nta_moe_ready_kernel"):
         consumer = kernel_body(module, name)
-        assert "nta.acquire-set.classify" in consumer
+        assert "@_ZZ20nta_acquire_set_slowE8ctaReady" in consumer
+        assert "llvm.nvvm.barrier.cta.sync" in consumer
         assert "call void @nta_defer" in consumer
         assert "!nta.acquire" in consumer
         assert "__nta_acquire_set_marker" not in consumer

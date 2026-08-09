@@ -94,11 +94,23 @@ def main() -> None:
         assert progress.unavailable_bytes == 0
         assert progress.runnable_compute_ns == 0
         assert progress.completed_compute_ns == 0
+        assert progress.pending_compute_ns == 0
+        assert progress.expected_compute_ns == 0
+        assert progress.remaining_compute_ns == 0
         assert runtime.work_runnable_ns(2) == (0, 0)
         progress_range = runtime.request_progress_range(0, 2)
         assert len(progress_range) == 2
         assert progress_range[0].request_id == 17
         assert progress_range[0].generation == 3
+        snapshot = runtime.request_progress_snapshot()
+        snapshot.capture(0, 2, stream)
+        captured = snapshot.wait()
+        assert not snapshot.pending
+        assert snapshot.query() is None
+        assert tuple((item.request_id, item.generation) for item in captured) == (
+            (17, 3),
+            (0, 0),
+        )
         epoch = runtime.epoch_status(2)
         assert epoch.total == 2
         assert epoch.fresh == 2

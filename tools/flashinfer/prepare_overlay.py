@@ -14,9 +14,7 @@ import shutil
 
 
 SUPPORTED_VERSION = "0.6.12"
-EXPECTED_TREE_HASH = (
-    "71b994241bb85a3e3d5d0e40ac02d3c5652a07bbc4afaa8627adcb1914bb8b1c"
-)
+EXPECTED_TREE_HASH = "71b994241bb85a3e3d5d0e40ac02d3c5652a07bbc4afaa8627adcb1914bb8b1c"
 EXPECTED_HASHES = {
     "attention/decode.cuh": (
         "019d673aa848a938798a2c58b34b9b5813a3f137962cbbd90ef7bd71f636f373"
@@ -39,8 +37,20 @@ DECODE_ANCHOR = """__global__ void BatchDecodeWithPagedKVCacheKernel(const __gri
 """
 DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params) {
   nta::abi::RuntimeView* nta_runtime = nullptr;
+#if !NTA_FLASHINFER_REQUEST_BOUND
   nta::kernel::WorkContext nta_work{};
+#endif
   uint32_t nta_work_index = blockIdx.x;
+#if NTA_FLASHINFER_REQUEST_BOUND
+  if constexpr (nta::flashinfer::HasRequestBindingV<Params>) {
+    nta_runtime = nta::flashinfer::runtime(params);
+    if (!nta::flashinfer::validRequestBoundLaunch(params, nta_runtime)) return;
+    if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
+    const uint32_t nta_request_index = params.request_indices[nta_work_index];
+    if (!nta::flashinfer::bindValidatedRequestOnly(
+            params, nta_runtime, nta_request_index)) return;
+  }
+#else
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
     nta_runtime = nta::flashinfer::runtime(params);
     nta_work_index = nta::flashinfer::launchWorkIndex(
@@ -48,22 +58,30 @@ DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernel(const 
     if (nta_work_index == nta::abi::InvalidIndex) return;
     if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
     const uint32_t nta_request_index = params.request_indices[nta_work_index];
+#if NTA_FLASHINFER_PREACQUIRED_ONLY
+    if (nta::flashinfer::tracksCompletion(params)) return;
+#endif
     if (nta::flashinfer::usesPlanlessPreacquired(params)) {
       if (nta_runtime == nullptr || nta_runtime->abiVersion != nta::abi::Version ||
           nta_request_index >= nta_runtime->requestCapacity) return;
       if (!nta::kernel::acquireCurrentRequest(
               nta_runtime, nta_request_index, nta_work)) {
-        nta::kernel::defer(nta_runtime, nta_work);
         return;
       }
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
+    } else if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::kernel::acquirePreacquiredWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta_work_index, nta_work)) return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
       if (!nta::kernel::acquireCurrentWork(
               nta_runtime, nta::flashinfer::workItems(params),
               nta::flashinfer::dependencies(params), nta_work_index, nta_work)) {
+#if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
         nta::kernel::defer(nta_runtime, nta_work);
+#endif
         return;
       }
     } else if (!nta::kernel::acquireWork(
@@ -74,7 +92,11 @@ DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernel(const 
       return;
     }
     if (!nta::flashinfer::shouldRun(params, nta_runtime, nta_work)) return;
+#if !NTA_FLASHINFER_PREACQUIRED_ONLY
+    nta::kernel::beginPartial(nta_runtime, nta_work);
+#endif
   }
+#endif
   extern __shared__ uint8_t smem[];
 """
 
@@ -84,9 +106,13 @@ DECODE_EXIT_ANCHOR = """  BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, n
 """
 DECODE_EXIT_REPLACEMENT = """  BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
                                     bdx, bdy, bdz, AttentionVariant>(params, smem, nta_work_index);
+#if !NTA_FLASHINFER_REQUEST_BOUND
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
+#if !NTA_FLASHINFER_PREACQUIRED_ONLY
     nta::flashinfer::finish(params, nta_runtime, nta_work);
+#endif
   }
+#endif
 }
 """
 
@@ -95,8 +121,23 @@ MLA_DECODE_ANCHOR = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA(Para
 """
 MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   nta::abi::RuntimeView* nta_runtime = nullptr;
+#if !NTA_FLASHINFER_REQUEST_BOUND
   nta::kernel::WorkContext nta_work{};
+#endif
   uint32_t nta_work_index = blockIdx.x;
+#if NTA_FLASHINFER_REQUEST_BOUND
+  if constexpr (nta::flashinfer::HasRequestBindingV<Params>) {
+    nta_runtime = nta::flashinfer::runtime(params);
+    if (!nta::flashinfer::validRequestBoundLaunch(params, nta_runtime)) return;
+    if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
+    const uint32_t nta_request_index = params.request_indices[nta_work_index];
+#if NTA_FLASHINFER_PREACQUIRED_ONLY
+    if (nta::flashinfer::tracksCompletion(params)) return;
+#endif
+    if (!nta::flashinfer::bindValidatedRequestOnly(
+            params, nta_runtime, nta_request_index)) return;
+  }
+#else
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
     nta_runtime = nta::flashinfer::runtime(params);
     nta_work_index = nta::flashinfer::launchWorkIndex(
@@ -109,17 +150,22 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
           nta_request_index >= nta_runtime->requestCapacity) return;
       if (!nta::kernel::acquireCurrentRequest(
               nta_runtime, nta_request_index, nta_work)) {
-        nta::kernel::defer(nta_runtime, nta_work);
         return;
       }
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
+    } else if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::kernel::acquirePreacquiredWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta_work_index, nta_work)) return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
       if (!nta::kernel::acquireCurrentWork(
               nta_runtime, nta::flashinfer::workItems(params),
               nta::flashinfer::dependencies(params), nta_work_index, nta_work)) {
+#if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
         nta::kernel::defer(nta_runtime, nta_work);
+#endif
         return;
       }
     } else if (!nta::kernel::acquireWork(
@@ -130,7 +176,11 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
       return;
     }
     if (!nta::flashinfer::shouldRun(params, nta_runtime, nta_work)) return;
+#if !NTA_FLASHINFER_PREACQUIRED_ONLY
+    nta::kernel::beginPartial(nta_runtime, nta_work);
+#endif
   }
+#endif
   auto block = cg::this_thread_block();
 """
 
@@ -144,9 +194,13 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA"""
 MLA_DECODE_EXIT_REPLACEMENT = """#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
+#if !NTA_FLASHINFER_REQUEST_BOUND
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
+#if !NTA_FLASHINFER_PREACQUIRED_ONLY
     nta::flashinfer::finish(params, nta_runtime, nta_work);
+#endif
   }
+#endif
 }
 
 template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
@@ -155,6 +209,123 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA"""
 MLA_WORK_INDEX_ANCHOR = "  const uint32_t batch_idx = blockIdx.x;"
 MLA_WORK_INDEX_REPLACEMENT = "  const uint32_t batch_idx = nta_work_index;"
 
+DECODE_GRID_ANCHOR = "      dim3 nblks(padded_batch_size, num_kv_heads);"
+DECODE_GRID_REPLACEMENT = """      dim3 nblks(
+          nta::flashinfer::launchWorkCount(params, padded_batch_size), num_kv_heads);"""
+MLA_GRID_ANCHOR = "    dim3 nblks(padded_batch_size, gdy);"
+MLA_GRID_REPLACEMENT = """    dim3 nblks(
+        nta::flashinfer::launchWorkCount(params, padded_batch_size), gdy);"""
+
+RAGGED_PREFILL_ANCHOR = """template <typename KTraits, typename Params>
+__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKVCacheKernel(
+    const __grid_constant__ Params params) {
+  using DTypeQ = typename Params::DTypeQ;
+"""
+RAGGED_PREFILL_REPLACEMENT = """template <typename KTraits, typename Params>
+__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKVCacheKernel(
+    const __grid_constant__ Params params) {
+  nta::abi::RuntimeView* nta_runtime = nullptr;
+#if !NTA_FLASHINFER_REQUEST_BOUND
+  nta::kernel::WorkContext nta_work{};
+#endif
+  uint32_t nta_work_index = blockIdx.x;
+#if NTA_FLASHINFER_REQUEST_BOUND
+  if constexpr (nta::flashinfer::HasRequestBindingV<Params>) {
+    nta_runtime = nta::flashinfer::runtime(params);
+    if (!nta::flashinfer::validRequestBoundLaunch(params, nta_runtime)) return;
+    if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
+    const uint32_t nta_request_index = params.request_indices[nta_work_index];
+    if (!nta::flashinfer::bindValidatedRequestOnly(
+            params, nta_runtime, nta_request_index)) return;
+  }
+#else
+  if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
+    nta_runtime = nta::flashinfer::runtime(params);
+    nta_work_index = nta::flashinfer::launchWorkIndex(
+        params, nta_runtime, blockIdx.x);
+    if (nta_work_index == nta::abi::InvalidIndex) return;
+    if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
+    const uint32_t nta_request_index = params.request_indices[nta_work_index];
+    if (nta::flashinfer::usesPlanlessPreacquired(params)) {
+      if (nta_runtime == nullptr || nta_runtime->abiVersion != nta::abi::Version ||
+          nta_request_index >= nta_runtime->requestCapacity) return;
+      if (!nta::kernel::acquireCurrentRequest(
+              nta_runtime, nta_request_index, nta_work)) return;
+    } else if (!nta::flashinfer::validWork(
+                   params, nta_work_index, nta_request_index)) {
+      return;
+    } else if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::kernel::acquirePreacquiredWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta_work_index, nta_work)) return;
+    } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
+      if (!nta::kernel::acquireCurrentWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta::flashinfer::dependencies(params), nta_work_index, nta_work)) {
+#if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+        nta::kernel::defer(nta_runtime, nta_work);
+#endif
+        return;
+      }
+    } else if (!nta::kernel::acquireWork(
+                   nta_runtime, nta::flashinfer::workItems(params),
+                   nta::flashinfer::dependencies(params), nta_work_index,
+                   nta_work)) {
+      nta::kernel::defer(nta_runtime, nta_work);
+      return;
+    }
+    if (!nta::flashinfer::shouldRun(params, nta_runtime, nta_work)) return;
+    nta::kernel::beginPartial(nta_runtime, nta_work);
+  }
+#endif
+  using DTypeQ = typename Params::DTypeQ;
+"""
+
+RAGGED_WORK_INDEX_ANCHOR = """    const uint32_t bx = blockIdx.x, lane_idx = tid.x,
+"""
+RAGGED_WORK_INDEX_REPLACEMENT = """    const uint32_t bx = nta_work_index, lane_idx = tid.x,
+"""
+
+RAGGED_VALID_MASK_ANCHOR = """    if (block_valid_mask && !block_valid_mask[bx]) {
+      return;
+    }
+"""
+RAGGED_VALID_MASK_REPLACEMENT = """    if constexpr (!nta::flashinfer::HasWorkPlanV<Params> &&
+                  !nta::flashinfer::HasRequestBindingV<Params>) {
+      if (block_valid_mask && !block_valid_mask[bx]) {
+        return;
+      }
+    }
+"""
+
+RAGGED_PREFILL_EXIT_ANCHOR = """#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+#if (__CUDA_ARCH__ < 800)
+  }
+#endif
+}
+
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+"""
+RAGGED_PREFILL_EXIT_REPLACEMENT = """#if !NTA_FLASHINFER_REQUEST_BOUND
+  if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
+    nta::flashinfer::finish(params, nta_runtime, nta_work);
+  }
+#endif
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+#if (__CUDA_ARCH__ < 800)
+  }
+#endif
+}
+
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+"""
+
 PAGED_PREFILL_ANCHOR = """__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
     const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
@@ -162,8 +333,23 @@ PAGED_PREFILL_ANCHOR = """__global__ __launch_bounds__(KTraits::NUM_THREADS) voi
 PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
     const __grid_constant__ Params params) {
   nta::abi::RuntimeView* nta_runtime = nullptr;
+#if !NTA_FLASHINFER_REQUEST_BOUND
   nta::kernel::WorkContext nta_work{};
+#endif
   uint32_t nta_work_index = blockIdx.x;
+#if NTA_FLASHINFER_REQUEST_BOUND
+  if constexpr (nta::flashinfer::HasRequestBindingV<Params>) {
+    nta_runtime = nta::flashinfer::runtime(params);
+    if (!nta::flashinfer::validRequestBoundLaunch(params, nta_runtime)) return;
+    if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
+    const uint32_t nta_request_index = params.request_indices[nta_work_index];
+#if NTA_FLASHINFER_PREACQUIRED_ONLY
+    if (nta::flashinfer::tracksCompletion(params)) return;
+#endif
+    if (!nta::flashinfer::bindValidatedRequestOnly(
+            params, nta_runtime, nta_request_index)) return;
+  }
+#else
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
     nta_runtime = nta::flashinfer::runtime(params);
     nta_work_index = nta::flashinfer::launchWorkIndex(
@@ -176,17 +362,22 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
           nta_request_index >= nta_runtime->requestCapacity) return;
       if (!nta::kernel::acquireCurrentRequest(
               nta_runtime, nta_request_index, nta_work)) {
-        nta::kernel::defer(nta_runtime, nta_work);
         return;
       }
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
+    } else if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::kernel::acquirePreacquiredWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta_work_index, nta_work)) return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
       if (!nta::kernel::acquireCurrentWork(
               nta_runtime, nta::flashinfer::workItems(params),
               nta::flashinfer::dependencies(params), nta_work_index, nta_work)) {
+#if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
         nta::kernel::defer(nta_runtime, nta_work);
+#endif
         return;
       }
     } else if (!nta::kernel::acquireWork(
@@ -197,7 +388,11 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
       return;
     }
     if (!nta::flashinfer::shouldRun(params, nta_runtime, nta_work)) return;
+#if !NTA_FLASHINFER_PREACQUIRED_ONLY
+    nta::kernel::beginPartial(nta_runtime, nta_work);
+#endif
   }
+#endif
   extern __shared__ uint8_t smem[];
 """
 
@@ -207,11 +402,20 @@ PAGED_PREFILL_EXIT_ANCHOR = """  auto& smem_storage = reinterpret_cast<typename 
 """
 PAGED_PREFILL_EXIT_REPLACEMENT = """  auto& smem_storage = reinterpret_cast<typename KTraits::SharedStorage&>(smem);
   BatchPrefillWithPagedKVCacheDevice<KTraits>(params, smem_storage, threadIdx, nta_work_index);
+#if !NTA_FLASHINFER_REQUEST_BOUND
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
+#if !NTA_FLASHINFER_PREACQUIRED_ONLY
     nta::flashinfer::finish(params, nta_runtime, nta_work);
+#endif
   }
+#endif
 }
 """
+
+PAGED_PREFILL_DISPATCH_ANCHOR = "cudaError_t BatchPrefillWithPagedKVCacheDispatched("
+PREFILL_GRID_ANCHOR = "  dim3 nblks(padded_batch_size, 1, num_kv_heads);"
+PREFILL_GRID_REPLACEMENT = """  dim3 nblks(
+      nta::flashinfer::launchWorkCount(params, padded_batch_size), 1, num_kv_heads);"""
 
 DECODE_MERGE_ANCHOR = """        if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
@@ -229,14 +433,15 @@ DECODE_MERGE_REPLACEMENT = """        if (nta::flashinfer::shouldMerge(params)) 
             FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
                 tmp_v, tmp_s, params.o_indptr, o, lse, params.paged_kv.batch_size, nullptr,
                 num_qo_heads, HEAD_DIM, enable_pdl, stream, nta_merge_gate.runtime,
-                static_cast<decltype(params.request_indices)>(nullptr), 0));
+                static_cast<decltype(params.request_indices)>(nullptr), 0,
+                nta_merge_gate.reductionGroupOffset));
           } else {
             FLASHINFER_CUDA_CALL(
                 VariableLengthAttentionSum(tmp_v, params.o_indptr, o, params.paged_kv.batch_size,
                                            nullptr, num_qo_heads, HEAD_DIM, enable_pdl, stream,
                                            nta_merge_gate.runtime,
                                            static_cast<decltype(params.request_indices)>(nullptr),
-                                           0));
+                                           0, nta_merge_gate.reductionGroupOffset));
           }
         }
 """
@@ -258,12 +463,14 @@ PREFILL_MERGE_REPLACEMENT = """        if (nta::flashinfer::shouldMerge(params))
                 tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
                 params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream,
                 nta_merge_gate.runtime, params.q_indptr,
-                nta::flashinfer::requestGroupCount(params)));
+                nta::flashinfer::requestGroupCount(params),
+                nta_merge_gate.reductionGroupOffset));
           } else {
             FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
                 tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
                 num_qo_heads, HEAD_DIM_VO, enable_pdl, stream, nta_merge_gate.runtime,
-                params.q_indptr, nta::flashinfer::requestGroupCount(params)));
+              params.q_indptr, nta::flashinfer::requestGroupCount(params),
+              nta_merge_gate.reductionGroupOffset));
           }
         }
 """
@@ -276,7 +483,8 @@ MERGE_KERNEL_REPLACEMENT = """__global__ void PersistentVariableLengthMergeState
     DTypeIn* __restrict__ V, float* __restrict__ S, IdType* indptr, DTypeO* __restrict__ v_merged,
     float* __restrict__ s_merged, uint32_t max_seq_len, uint32_t* __restrict__ seq_len_ptr,
     uint32_t num_heads, const nta::abi::RuntimeView* __restrict__ nta_runtime,
-    const IdType* __restrict__ nta_group_indptr, uint32_t nta_group_count) {"""
+    const IdType* __restrict__ nta_group_indptr, uint32_t nta_group_count,
+    uint32_t nta_reduction_group_offset) {"""
 
 SUM_KERNEL_ANCHOR = """__global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__ V, IdType* indptr,
                                                            DTypeO* __restrict__ v_sum,
@@ -290,7 +498,8 @@ SUM_KERNEL_REPLACEMENT = """__global__ void PersistentVariableLengthAttentionSum
                                                            uint32_t num_heads,
                                                            const nta::abi::RuntimeView* __restrict__ nta_runtime,
                                                            const IdType* __restrict__ nta_group_indptr,
-                                                           uint32_t nta_group_count) {"""
+                                                           uint32_t nta_group_count,
+                                                           uint32_t nta_reduction_group_offset) {"""
 
 MERGE_WAIT_ANCHOR = """#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
@@ -315,7 +524,7 @@ MERGE_GROUP_ANCHOR = """    uint32_t pos = i / num_heads;
 MERGE_GROUP_REPLACEMENT = """    uint32_t pos = i / num_heads;
     uint32_t head_idx = i % num_heads;
     if (nta_runtime != nullptr) {
-      uint32_t reduction_group = pos;
+      uint32_t reduction_group = nta_reduction_group_offset + pos;
       if (nta_group_indptr != nullptr) {
         if (nta_group_count == 0 || pos >= uint32_t(nta_group_indptr[nta_group_count])) {
           continue;
@@ -329,7 +538,7 @@ MERGE_GROUP_REPLACEMENT = """    uint32_t pos = i / num_heads;
             upper = middle;
           }
         }
-        reduction_group = lower;
+        reduction_group = nta_reduction_group_offset + lower;
       }
       if (reduction_group >= nta_runtime->workTicketCapacity ||
           nta_runtime->reductionExpected[reduction_group] == 0 ||
@@ -350,7 +559,8 @@ MERGE_FUNCTION_REPLACEMENT = """cudaError_t VariableLengthMergeStates(DTypeIn* v
                                       cudaStream_t stream = nullptr,
                                       const nta::abi::RuntimeView* nta_runtime = nullptr,
                                       const IdType* nta_group_indptr = nullptr,
-                                      uint32_t nta_group_count = 0) {"""
+                                      uint32_t nta_group_count = 0,
+                                      uint32_t nta_reduction_group_offset = 0) {"""
 
 SUM_FUNCTION_ANCHOR = """cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum,
                                        uint32_t max_seq_len, uint32_t* seq_len, uint32_t num_heads,
@@ -362,24 +572,31 @@ SUM_FUNCTION_REPLACEMENT = """cudaError_t VariableLengthAttentionSum(DTypeIn* v,
                                        cudaStream_t stream = nullptr,
                                        const nta::abi::RuntimeView* nta_runtime = nullptr,
                                        const IdType* nta_group_indptr = nullptr,
-                                       uint32_t nta_group_count = 0) {"""
+                                       uint32_t nta_group_count = 0,
+                                       uint32_t nta_reduction_group_offset = 0) {"""
 
 MERGE_ARGS_ANCHOR = """    void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &max_seq_len, &seq_len, &num_heads};"""
 MERGE_ARGS_REPLACEMENT = """    void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &max_seq_len, &seq_len,
-                    &num_heads, &nta_runtime, &nta_group_indptr, &nta_group_count};"""
+                    &num_heads, &nta_runtime, &nta_group_indptr, &nta_group_count,
+                    &nta_reduction_group_offset};"""
 MERGE_EX_ANCHOR = """      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, v, s, indptr, v_merged, s_merged,
                                               max_seq_len, seq_len, num_heads));"""
 MERGE_EX_REPLACEMENT = """      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, v, s, indptr, v_merged, s_merged,
                                               max_seq_len, seq_len, num_heads,
                                               nta_runtime, nta_group_indptr,
-                                              nta_group_count));"""
+                                              nta_group_count,
+                                              nta_reduction_group_offset));"""
 
-SUM_ARGS_ANCHOR = """    void* args[] = {&v, &indptr, &v_sum, &max_seq_len, &seq_len, &num_heads};"""
+SUM_ARGS_ANCHOR = (
+    """    void* args[] = {&v, &indptr, &v_sum, &max_seq_len, &seq_len, &num_heads};"""
+)
 SUM_ARGS_REPLACEMENT = """    void* args[] = {&v, &indptr, &v_sum, &max_seq_len, &seq_len, &num_heads,
-                    &nta_runtime, &nta_group_indptr, &nta_group_count};"""
+                    &nta_runtime, &nta_group_indptr, &nta_group_count,
+                    &nta_reduction_group_offset};"""
 SUM_EX_ANCHOR = """          cudaLaunchKernelEx(&config, kernel, v, indptr, v_sum, max_seq_len, seq_len, num_heads));"""
 SUM_EX_REPLACEMENT = """          cudaLaunchKernelEx(&config, kernel, v, indptr, v_sum, max_seq_len, seq_len, num_heads,
-                             nta_runtime, nta_group_indptr, nta_group_count));"""
+                             nta_runtime, nta_group_indptr, nta_group_count,
+                             nta_reduction_group_offset));"""
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -388,7 +605,9 @@ def sha256(path: pathlib.Path) -> str:
 
 def tree_hash(root: pathlib.Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+    for path in sorted(
+        candidate for candidate in root.rglob("*") if candidate.is_file()
+    ):
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
@@ -402,20 +621,21 @@ def flashinfer_include() -> tuple[str, pathlib.Path]:
     try:
         version = importlib.metadata.version("flashinfer-python")
     except importlib.metadata.PackageNotFoundError as error:
-        raise RuntimeError("flashinfer-python distribution metadata is missing") from error
+        raise RuntimeError(
+            "flashinfer-python distribution metadata is missing"
+        ) from error
     include = pathlib.Path(spec.origin).resolve().parent / "data" / "include"
     if not (include / "flashinfer").is_dir():
         raise RuntimeError(f"FlashInfer include tree is missing: {include}")
     return version, include
 
 
-def checked_replace(source: str, anchor: str, replacement: str,
-                    description: str) -> str:
+def checked_replace(
+    source: str, anchor: str, replacement: str, description: str
+) -> str:
     count = source.count(anchor)
     if count != 1:
-        raise RuntimeError(
-            f"expected exactly one {description} anchor, found {count}"
-        )
+        raise RuntimeError(f"expected exactly one {description} anchor, found {count}")
     return source.replace(anchor, replacement)
 
 
@@ -457,6 +677,31 @@ def patch_prefill_header(path: pathlib.Path) -> None:
     )
     source = checked_replace(
         source,
+        RAGGED_PREFILL_ANCHOR,
+        RAGGED_PREFILL_REPLACEMENT,
+        "ragged prefill",
+    )
+    source = checked_replace(
+        source,
+        RAGGED_WORK_INDEX_ANCHOR,
+        RAGGED_WORK_INDEX_REPLACEMENT,
+        "ragged prefill work-index remap",
+    )
+    source = checked_replace_count(
+        source,
+        RAGGED_VALID_MASK_ANCHOR,
+        RAGGED_VALID_MASK_REPLACEMENT,
+        "prefill valid mask",
+        2,
+    )
+    source = checked_replace(
+        source,
+        RAGGED_PREFILL_EXIT_ANCHOR,
+        RAGGED_PREFILL_EXIT_REPLACEMENT,
+        "ragged prefill completion",
+    )
+    source = checked_replace(
+        source,
         PAGED_PREFILL_ANCHOR,
         PAGED_PREFILL_REPLACEMENT,
         "paged prefill",
@@ -466,6 +711,13 @@ def patch_prefill_header(path: pathlib.Path) -> None:
         PAGED_PREFILL_EXIT_ANCHOR,
         PAGED_PREFILL_EXIT_REPLACEMENT,
         "paged prefill completion",
+    )
+    source = checked_replace_count(
+        source,
+        PREFILL_GRID_ANCHOR,
+        PREFILL_GRID_REPLACEMENT,
+        "prefill compact grid",
+        2,
     )
     source = checked_replace_count(
         source,
@@ -559,7 +811,8 @@ def prepare_locked(output: pathlib.Path) -> dict[str, object]:
     observed_tree_hash = tree_hash(include / "flashinfer")
     if observed != EXPECTED_HASHES or observed_tree_hash != EXPECTED_TREE_HASH:
         mismatches = [
-            relative for relative, expected in EXPECTED_HASHES.items()
+            relative
+            for relative, expected in EXPECTED_HASHES.items()
             if observed[relative] != expected
         ]
         if observed_tree_hash != EXPECTED_TREE_HASH:
@@ -578,9 +831,11 @@ def prepare_locked(output: pathlib.Path) -> dict[str, object]:
             "batch-decode",
             "mla-decode",
             "paged-prefill-fa2",
+            "ragged-prefill-fa2",
             "phase-aware-split-k-merge",
             "multi-cta-in-kernel-completion",
             "request-bound-runnable-work-remap",
+            "bounded-physical-runnable-grid",
         ],
     }
     existing = validate_existing(output, manifest)
@@ -599,6 +854,8 @@ def prepare_locked(output: pathlib.Path) -> dict[str, object]:
             (DECODE_ANCHOR, DECODE_REPLACEMENT, "batch decode"),
             (DECODE_EXIT_ANCHOR, DECODE_EXIT_REPLACEMENT, "batch decode completion"),
             (MLA_DECODE_ANCHOR, MLA_DECODE_REPLACEMENT, "MLA decode"),
+            (DECODE_GRID_ANCHOR, DECODE_GRID_REPLACEMENT, "decode compact grid"),
+            (MLA_GRID_ANCHOR, MLA_GRID_REPLACEMENT, "MLA compact grid"),
             (
                 MLA_WORK_INDEX_ANCHOR,
                 MLA_WORK_INDEX_REPLACEMENT,

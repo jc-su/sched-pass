@@ -23,6 +23,7 @@ add_library(NtaPass MODULE
   lib/AcquireAnalysis.cpp
   lib/AcquireLowering.cpp
   lib/DeferralLowering.cpp
+  lib/PartialLowering.cpp
   lib/Plugin.cpp
 )
 target_include_directories(NtaPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
@@ -136,6 +137,32 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(
     nta-execution-policy PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-critical-work
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/critical_work.py
+  )
+  set_tests_properties(
+    nta-critical-work PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-tier-streaming
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/tier_streaming.py
+  )
+  set_tests_properties(
+    nta-tier-streaming PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-tier-streaming-evidence
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/tier_streaming_evidence.py
   )
 endif()
 
@@ -282,6 +309,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/python_runtime.py
     )
     add_test(
+      NAME nta-jit-operator-family
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/jit_operator_family.py
+    )
+    add_test(
       NAME nta-qualification-runner
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/qualification_runner.py
@@ -303,7 +335,7 @@ if(NTA_ENABLE_CUDA)
     )
     set_tests_properties(
       nta-request-slots nta-sglang-plugin nta-qualification-runner
-      nta-qualification-evidence
+      nta-qualification-evidence nta-jit-operator-family
       nta-opportunity-analysis
       nta-opportunity-study
       PROPERTIES TIMEOUT 60
@@ -1021,6 +1053,91 @@ if(NTA_ENABLE_CUDA)
       TIMEOUT 180
       ENVIRONMENT
         "FLASHINFER_NVCC=${CMAKE_CURRENT_SOURCE_DIR}/tools/flashinfer/nvcc_compat.py;NTA_REAL_NVCC=${CUDAToolkit_NVCC_EXECUTABLE}"
+    )
+    add_test(
+      NAME nta-flashinfer-tier-streaming-gpu
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/serving/FlashInferTierStreaming.py"
+        --batch-size 3
+        --query-tokens 16,24,32
+        --context-tokens 110,90,90
+        --resident-fractions 0.090909,0,0.111111
+        --group-tokens 64
+        --workspace-mib 64
+        --warmup 1
+        --iterations 1
+        --trials 1
+        --verify-graph
+    )
+    set_tests_properties(
+      nta-flashinfer-tier-streaming-gpu PROPERTIES
+      TIMEOUT 180
+      ENVIRONMENT
+        "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python;FLASHINFER_NVCC=${CMAKE_CURRENT_SOURCE_DIR}/tools/flashinfer/nvcc_compat.py;NTA_REAL_NVCC=${CUDAToolkit_NVCC_EXECUTABLE}"
+    )
+    add_test(
+      NAME nta-flashinfer-tier-streaming-compiler-gpu
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py"
+        --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+        --cache-root "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache"
+        --cuda-path "${CUDAToolkit_ROOT}"
+        --flashinfer-hook
+        --
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/serving/FlashInferTierStreaming.py"
+        --batch-size 2
+        --query-tokens 16
+        --context-tokens 128
+        --resident-fractions 0,0.5
+        --group-tokens 64
+        --workspace-mib 64
+        --warmup 1
+        --iterations 1
+        --trials 1
+        --verify-graph
+        --verify-lifecycle
+        --compiler-transform
+    )
+    set_tests_properties(
+      nta-flashinfer-tier-streaming-compiler-gpu PROPERTIES
+      TIMEOUT 360
+      PASS_REGULAR_EXPRESSION
+        "compiler_transformed_attention.*true.*output_parity.*true"
+    )
+    add_test(
+      NAME nta-flashinfer-tier-streaming-gpu-initiated-host-gpu
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py"
+        --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
+        --cache-root "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache"
+        --cuda-path "${CUDAToolkit_ROOT}"
+        --flashinfer-hook
+        --
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/serving/FlashInferTierStreaming.py"
+        --batch-size 2
+        --query-tokens 16
+        --context-tokens 128
+        --resident-fractions 0,0.5
+        --group-tokens 64
+        --workspace-mib 64
+        --warmup 2
+        --iterations 2
+        --trials 1
+        --verify-graph
+        --verify-lifecycle
+        --compiler-transform
+        --gpu-initiated-host
+    )
+    set_tests_properties(
+      nta-flashinfer-tier-streaming-gpu-initiated-host-gpu PROPERTIES
+      TIMEOUT 360
+      PASS_REGULAR_EXPRESSION
+        "host_transfer_initiator.*gpu.*output_parity.*true"
     )
   endif()
 endif()

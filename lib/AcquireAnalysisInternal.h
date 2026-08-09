@@ -24,6 +24,8 @@ struct FunctionPlan {
   std::vector<llvm::CallInst *> bindings;
   std::vector<BoundSite> acquisitions;
   std::vector<BoundSite> deferrals;
+  std::vector<BoundSite> partialBegins;
+  std::vector<BoundSite> partialCommits;
   std::vector<RejectedSite> rejected;
 };
 

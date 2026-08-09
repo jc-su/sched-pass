@@ -43,6 +43,24 @@ static_assert(offsetof(nta_work_item, estimated_compute_ns) ==
               offsetof(nta::abi::WorkItem, estimatedComputeNs));
 static_assert(sizeof(nta_request_progress) ==
               sizeof(nta::abi::RequestProgress));
+static_assert(offsetof(nta_request_progress, dropped_attributions) ==
+              offsetof(nta::abi::RequestProgress, droppedAttributions));
+static_assert(sizeof(nta_operator_contract) ==
+              sizeof(nta::operator_contract::Contract));
+static_assert(offsetof(nta_operator_contract, capabilities) ==
+              offsetof(nta::operator_contract::Contract, capabilities));
+static_assert(sizeof(nta_operator_plan) ==
+              sizeof(nta::operator_contract::Plan));
+static_assert(offsetof(nta_operator_plan, plan_fingerprint_low) ==
+              offsetof(nta::operator_contract::Plan, planFingerprintLow));
+static_assert(sizeof(nta_request_spec) == 40);
+static_assert(offsetof(nta_request_spec, request_id) == 0);
+static_assert(offsetof(nta_request_spec, deadline_clock) == 8);
+static_assert(offsetof(nta_request_spec, max_outstanding_bytes) == 16);
+static_assert(offsetof(nta_request_spec, slot) == 24);
+static_assert(offsetof(nta_request_spec, generation) == 28);
+static_assert(offsetof(nta_request_spec, tenant_id) == 32);
+static_assert(offsetof(nta_request_spec, priority) == 36);
 
 struct DLDevice {
   std::int32_t deviceType;
@@ -163,8 +181,8 @@ nta::WorkPlan makeWorkPlan(const nta_work_item *workItems,
                            std::uint32_t requestCount) {
   if (workItems == nullptr || workItemCount == 0 || dependencies == nullptr ||
       dependencyCount == 0 || requests == nullptr || requestCount == 0) {
-    throw std::invalid_argument(
-        "work-plan upload needs non-empty item, dependency, and request arrays");
+    throw std::invalid_argument("work-plan upload needs non-empty item, "
+                                "dependency, and request arrays");
   }
 
   nta::WorkPlan result;
@@ -177,27 +195,19 @@ nta::WorkPlan makeWorkPlan(const nta_work_item *workItems,
         source.reserved2 != 0 || source.reserved3 != 0) {
       throw std::invalid_argument("work-item reserved fields must be zero");
     }
-    result.workItems.push_back({source.request_index, source.request_slot,
-                                source.generation, source.logical_work,
-                                source.dependency_begin,
-                                source.dependency_count,
-                                source.direct_dependency_count,
-                                source.work_ticket,
-                                source.reduction_group,
-                                source.contributor_index,
-                                source.contributor_count,
-                                source.estimated_compute_ns,
-                                0,
-                                0,
-                                0,
-                                0});
+    result.workItems.push_back(
+        {source.request_index, source.request_slot, source.generation,
+         source.logical_work, source.dependency_begin, source.dependency_count,
+         source.direct_dependency_count, source.work_ticket,
+         source.reduction_group, source.contributor_index,
+         source.contributor_count, source.estimated_compute_ns, 0, 0, 0, 0});
   }
   for (std::uint32_t index = 0; index < dependencyCount; ++index) {
     const nta_acquire_requirement &source = dependencies[index];
-    result.dependencies.push_back(
-        {source.direct_base, source.direct_tensor_map, source.object_id,
-         source.offset, source.object_slot, source.object_version, source.bytes,
-         source.flags});
+    result.dependencies.push_back({source.direct_base, source.direct_tensor_map,
+                                   source.object_id, source.offset,
+                                   source.object_slot, source.object_version,
+                                   source.bytes, source.flags});
   }
   for (std::uint32_t index = 0; index < requestCount; ++index) {
     const nta_request_work_range &source = requests[index];
@@ -215,15 +225,12 @@ std::uint32_t nta_runtime_c_api_version(void) {
   return NTA_RUNTIME_C_API_VERSION;
 }
 
-std::uint32_t nta_runtime_device_abi_version(void) {
-  return nta::abi::Version;
-}
+std::uint32_t nta_runtime_device_abi_version(void) { return nta::abi::Version; }
 
 const char *nta_last_error(void) { return LastError.c_str(); }
 
-nta_status nta_nvme_transport_create(
-    const nta_nvme_transport_options *options,
-    nta_nvme_transport **transportOut) {
+nta_status nta_nvme_transport_create(const nta_nvme_transport_options *options,
+                                     nta_nvme_transport **transportOut) {
   if (transportOut != nullptr) {
     *transportOut = nullptr;
   }
@@ -232,8 +239,8 @@ nta_status nta_nvme_transport_create(
       throw std::invalid_argument(
           "NVMe transport creation needs options and an output handle");
     }
-    requireVersion(options->struct_size, sizeof(*options),
-                   options->api_version, "NVMe transport options");
+    requireVersion(options->struct_size, sizeof(*options), options->api_version,
+                   "NVMe transport options");
     if (options->endpoint == nullptr || options->endpoint[0] == '\0') {
       throw std::invalid_argument("NVMe VFIO endpoint must be explicit");
     }
@@ -263,9 +270,9 @@ void nta_nvme_transport_destroy(nta_nvme_transport *transport) {
   delete transport;
 }
 
-nta_status nta_nvme_transport_get_capabilities(
-    const nta_nvme_transport *transport,
-    nta_nvme_capabilities *capabilities) {
+nta_status
+nta_nvme_transport_get_capabilities(const nta_nvme_transport *transport,
+                                    nta_nvme_capabilities *capabilities) {
   return protect([&] {
     requireHandle(transport, "NVMe transport");
     if (capabilities == nullptr) {
@@ -298,11 +305,16 @@ nta_status nta_nvme_transport_read_stats(const nta_nvme_transport *transport,
     }
     const nta::NvmeQueueStats source = transport->value->readStats();
     *stats = {
-        source.submitted,       source.completed,
-        source.failed,          source.directSubmitted,
-        source.directFallbacks, source.outstanding,
-        source.error,           source.sqTail,
-        source.cqHead,          source.cqPhase,
+        source.submitted,
+        source.completed,
+        source.failed,
+        source.directSubmitted,
+        source.directFallbacks,
+        source.outstanding,
+        source.error,
+        source.sqTail,
+        source.cqHead,
+        source.cqPhase,
         source.nextCompletionDword3,
     };
   });
@@ -337,8 +349,7 @@ nta_status nta_runtime_create(const nta_runtime_config *config,
     if (nvme != nullptr) {
       requireHandle(nvme, "NVMe transport");
       handle->nvme = nvme->value;
-      handle->value =
-          std::make_unique<nta::HostRuntime>(native, handle->nvme);
+      handle->value = std::make_unique<nta::HostRuntime>(native, handle->nvme);
     } else {
       handle->value = std::make_unique<nta::HostRuntime>(native);
     }
@@ -359,8 +370,34 @@ nta_status nta_runtime_set_request(
   });
 }
 
-nta_status nta_runtime_cancel_request(nta_runtime *runtime,
-                                      std::uint32_t slot,
+nta_status nta_runtime_publish_requests_async(nta_runtime *runtime,
+                                              const nta_request_spec *requests,
+                                              std::uint32_t requestCount,
+                                              std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (requests == nullptr || requestCount == 0) {
+      throw std::invalid_argument("request publication batch is empty");
+    }
+    std::vector<nta::RequestSpec> native;
+    native.reserve(requestCount);
+    for (std::uint32_t index = 0; index < requestCount; ++index) {
+      native.push_back({
+          requests[index].slot,
+          requests[index].request_id,
+          requests[index].generation,
+          requests[index].tenant_id,
+          requests[index].priority,
+          requests[index].deadline_clock,
+          requests[index].max_outstanding_bytes,
+      });
+    }
+    runtime->value->publishRequestsAsync(
+        native, reinterpret_cast<cudaStream_t>(cudaStream));
+  });
+}
+
+nta_status nta_runtime_cancel_request(nta_runtime *runtime, std::uint32_t slot,
                                       std::uint32_t generation) {
   return protect([&] {
     requireHandle(runtime, "runtime");
@@ -381,9 +418,8 @@ nta_status nta_runtime_set_tenant_budget(nta_runtime *runtime,
 nta_status nta_runtime_register_object(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
     std::uint32_t version, std::uint64_t bytes,
-    std::uint64_t stagingDeviceAddress,
-    const nta_registered_replica *replicas, std::uint32_t replicaCount,
-    std::uint64_t *directDeviceBaseOut) {
+    std::uint64_t stagingDeviceAddress, const nta_registered_replica *replicas,
+    std::uint32_t replicaCount, std::uint64_t *directDeviceBaseOut) {
   if (directDeviceBaseOut != nullptr) {
     *directDeviceBaseOut = 0;
   }
@@ -416,8 +452,8 @@ nta_status nta_runtime_register_object(
             static_cast<std::uintptr_t>(stagingDeviceAddress)),
         native);
     if (directDeviceBaseOut != nullptr) {
-      *directDeviceBaseOut = reinterpret_cast<std::uintptr_t>(
-          object.directDeviceBase);
+      *directDeviceBaseOut =
+          reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
     }
   });
 }
@@ -526,7 +562,7 @@ nta_status nta_runtime_register_indexed_host_objects_async(
       });
     }
     runtime->value->registerIndexedHostObjectsAsync(firstSlot, native,
-                                                     stream(cudaStream));
+                                                    stream(cudaStream));
   });
 }
 
@@ -551,8 +587,8 @@ nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
 
 nta_status nta_runtime_install_nvme_object(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
-    std::uint32_t version, std::uint64_t sourceByteOffset,
-    std::uint64_t bytes, std::uint64_t *destinationDeviceAddressOut) {
+    std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
+    std::uint64_t *destinationDeviceAddressOut) {
   if (destinationDeviceAddressOut != nullptr) {
     *destinationDeviceAddressOut = 0;
   }
@@ -564,11 +600,10 @@ nta_status nta_runtime_install_nvme_object(
     }
     const std::size_t nativeBytes = checkedSize(bytes, "NVMe object bytes");
     auto destination = runtime->nvme->allocate(nativeBytes);
-    const std::uint64_t address = reinterpret_cast<std::uintptr_t>(
-        destination->deviceAddress());
-    runtime->value->installNvmeObject(slot, objectId, version,
-                                      sourceByteOffset, nativeBytes,
-                                      std::move(destination));
+    const std::uint64_t address =
+        reinterpret_cast<std::uintptr_t>(destination->deviceAddress());
+    runtime->value->installNvmeObject(slot, objectId, version, sourceByteOffset,
+                                      nativeBytes, std::move(destination));
     if (destinationDeviceAddressOut != nullptr) {
       *destinationDeviceAddressOut = address;
     }
@@ -596,15 +631,26 @@ nta_status nta_runtime_read_epoch_status(const nta_runtime *runtime,
     }
     const nta::EpochStatus source =
         runtime->value->readEpochStatus(workTicketCount);
-    *status = {source.total,     source.fresh, source.pending,
-               source.ready,   source.done,  source.cancelled,
-               source.failed,  source.initializing};
+    *status = {source.total,  source.fresh,       source.pending,
+               source.ready,  source.done,        source.cancelled,
+               source.failed, source.initializing};
   });
 }
 
-nta_status nta_runtime_read_request_progress(
-    const nta_runtime *runtime, std::uint32_t requestSlot,
-    nta_request_progress *progress) {
+nta_status nta_runtime_read_sticky_failed_count(const nta_runtime *runtime,
+                                                std::uint32_t *failedCount) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (failedCount == nullptr) {
+      throw std::invalid_argument("sticky failure-count output is null");
+    }
+    *failedCount = runtime->value->readStickyFailedCount();
+  });
+}
+
+nta_status nta_runtime_read_request_progress(const nta_runtime *runtime,
+                                             std::uint32_t requestSlot,
+                                             nta_request_progress *progress) {
   return protect([&] {
     requireHandle(runtime, "runtime");
     if (progress == nullptr) {
@@ -613,13 +659,22 @@ nta_status nta_runtime_read_request_progress(
     const nta::abi::RequestProgress source =
         runtime->value->readRequestProgress(requestSlot);
     *progress = {
-        source.requestId,     source.generation, source.expectedWork,
-        source.pendingWork,  source.runnableWork,
-        source.completedWork, source.failedWork, source.cancelledWork,
+        source.requestId,
+        source.generation,
+        source.expectedWork,
+        source.pendingWork,
+        source.runnableWork,
+        source.completedWork,
+        source.failedWork,
+        source.cancelledWork,
         source.epoch,
         source.unavailableBytes,
         source.runnableComputeNs,
         source.completedComputeNs,
+        source.pendingComputeNs,
+        source.expectedComputeNs,
+        source.droppedAttributions,
+        0,
     };
   });
 }
@@ -636,22 +691,50 @@ nta_status nta_runtime_read_request_progress_range(
         runtime->value->readRequestProgress(firstRequestSlot, requestCount);
     for (std::uint32_t index = 0; index < requestCount; ++index) {
       progress[index] = {
-          source[index].requestId,      source[index].generation,
-          source[index].expectedWork,   source[index].pendingWork,
-          source[index].runnableWork,   source[index].completedWork,
-          source[index].failedWork,     source[index].cancelledWork,
+          source[index].requestId,
+          source[index].generation,
+          source[index].expectedWork,
+          source[index].pendingWork,
+          source[index].runnableWork,
+          source[index].completedWork,
+          source[index].failedWork,
+          source[index].cancelledWork,
           source[index].epoch,
           source[index].unavailableBytes,
           source[index].runnableComputeNs,
           source[index].completedComputeNs,
+          source[index].pendingComputeNs,
+          source[index].expectedComputeNs,
+          source[index].droppedAttributions,
+          0,
       };
     }
   });
 }
 
+nta_status nta_runtime_copy_request_progress_async(
+    const nta_runtime *runtime, std::uint32_t firstRequestSlot,
+    std::uint32_t requestCount, std::uint64_t hostDestination,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (requestCount == 0 || hostDestination == 0 ||
+        hostDestination % alignof(nta::abi::RequestProgress) != 0) {
+      throw std::invalid_argument(
+          "request-progress snapshot destination is empty or misaligned");
+    }
+    auto *destination = reinterpret_cast<nta::abi::RequestProgress *>(
+        static_cast<std::uintptr_t>(hostDestination));
+    runtime->value->copyRequestProgressAsync(
+        firstRequestSlot,
+        std::span<nta::abi::RequestProgress>(destination, requestCount),
+        reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(cudaStream)));
+  });
+}
+
 nta_status nta_runtime_read_work_ticket_state(const nta_runtime *runtime,
-                                               std::uint32_t workTicket,
-                                               std::uint32_t *state) {
+                                              std::uint32_t workTicket,
+                                              std::uint32_t *state) {
   return protect([&] {
     requireHandle(runtime, "runtime");
     if (state == nullptr) {
@@ -688,9 +771,9 @@ std::int32_t nta_runtime_device_ordinal(const nta_runtime *runtime) {
 }
 
 nta_status nta_device_pointer_dlpack(std::uint64_t deviceAddress,
-                                    std::uint64_t bytes,
-                                    std::int32_t deviceOrdinal,
-                                    void **managedTensorOut) {
+                                     std::uint64_t bytes,
+                                     std::int32_t deviceOrdinal,
+                                     void **managedTensorOut) {
   if (managedTensorOut != nullptr) {
     *managedTensorOut = nullptr;
   }
@@ -713,9 +796,8 @@ nta_status nta_device_pointer_dlpack(std::uint64_t deviceAddress,
 
     cudaPointerAttributes attributes{};
     checkCuda(cudaPointerGetAttributes(
-                  &attributes,
-                  reinterpret_cast<const void *>(
-                      static_cast<std::uintptr_t>(deviceAddress))),
+                  &attributes, reinterpret_cast<const void *>(
+                                   static_cast<std::uintptr_t>(deviceAddress))),
               "inspect DLPack CUDA pointer");
     if ((attributes.type != cudaMemoryTypeDevice &&
          attributes.type != cudaMemoryTypeManaged) ||
@@ -726,8 +808,8 @@ nta_status nta_device_pointer_dlpack(std::uint64_t deviceAddress,
 
     auto view = std::make_unique<DeviceByteView>();
     view->shape = static_cast<std::int64_t>(bytes);
-    view->managed.tensor.data = reinterpret_cast<void *>(
-        static_cast<std::uintptr_t>(deviceAddress));
+    view->managed.tensor.data =
+        reinterpret_cast<void *>(static_cast<std::uintptr_t>(deviceAddress));
     view->managed.tensor.device = {2, owner}; // kDLCUDA
     view->managed.tensor.ndim = 1;
     view->managed.tensor.dtype = {1, 8, 1}; // kDLUInt, uint8
@@ -756,6 +838,23 @@ nta_status nta_stream_synchronize(std::uint64_t cudaStream) {
   });
 }
 
+nta_status nta_copy_host_to_device_async(std::uint64_t destination,
+                                         std::uint64_t source,
+                                         std::uint64_t bytes,
+                                         std::uint64_t cudaStream) {
+  return protect([&] {
+    if (destination == 0 || source == 0) {
+      throw std::invalid_argument("host-to-device copy addresses are null");
+    }
+    const std::size_t copyBytes =
+        checkedSize(bytes, "host-to-device copy bytes");
+    checkCuda(cudaMemcpyAsync(reinterpret_cast<void *>(destination),
+                              reinterpret_cast<const void *>(source), copyBytes,
+                              cudaMemcpyHostToDevice, stream(cudaStream)),
+              "enqueue host-to-device copy");
+  });
+}
+
 nta_status nta_device_work_plan_create(std::uint32_t workItemCapacity,
                                        std::uint32_t dependencyCapacity,
                                        std::int32_t deviceOrdinal,
@@ -778,16 +877,15 @@ void nta_device_work_plan_destroy(nta_device_work_plan *plan) { delete plan; }
 
 nta_status nta_device_work_plan_upload(
     nta_device_work_plan *plan, const nta_work_item *workItems,
-    std::uint32_t workItemCount,
-    const nta_acquire_requirement *dependencies,
+    std::uint32_t workItemCount, const nta_acquire_requirement *dependencies,
     std::uint32_t dependencyCount, const nta_request_work_range *requests,
     std::uint32_t requestCount, std::uint64_t cudaStream) {
   return protect([&] {
     requireHandle(plan, "device work plan");
-    plan->value->uploadAsync(
-        makeWorkPlan(workItems, workItemCount, dependencies, dependencyCount,
-                     requests, requestCount),
-        stream(cudaStream));
+    plan->value->uploadAsync(makeWorkPlan(workItems, workItemCount,
+                                          dependencies, dependencyCount,
+                                          requests, requestCount),
+                             stream(cudaStream));
   });
 }
 
@@ -799,37 +897,37 @@ nta_status nta_device_work_plan_wait_on(const nta_device_work_plan *plan,
   });
 }
 
-nta_status nta_device_work_plan_synchronize_upload(
-    const nta_device_work_plan *plan) {
+nta_status
+nta_device_work_plan_synchronize_upload(const nta_device_work_plan *plan) {
   return protect([&] {
     requireHandle(plan, "device work plan");
     plan->value->synchronizeUpload();
   });
 }
 
-std::uint64_t nta_device_work_plan_work_items(
-    const nta_device_work_plan *plan) {
+std::uint64_t
+nta_device_work_plan_work_items(const nta_device_work_plan *plan) {
   return plan == nullptr || plan->value == nullptr
              ? 0
              : reinterpret_cast<std::uintptr_t>(plan->value->workItems());
 }
 
-std::uint64_t nta_device_work_plan_dependencies(
-    const nta_device_work_plan *plan) {
+std::uint64_t
+nta_device_work_plan_dependencies(const nta_device_work_plan *plan) {
   return plan == nullptr || plan->value == nullptr
              ? 0
              : reinterpret_cast<std::uintptr_t>(plan->value->dependencies());
 }
 
-std::uint32_t nta_device_work_plan_work_item_count(
-    const nta_device_work_plan *plan) {
+std::uint32_t
+nta_device_work_plan_work_item_count(const nta_device_work_plan *plan) {
   return plan == nullptr || plan->value == nullptr
              ? 0
              : plan->value->workItemCount();
 }
 
-std::uint32_t nta_device_work_plan_dependency_count(
-    const nta_device_work_plan *plan) {
+std::uint32_t
+nta_device_work_plan_dependency_count(const nta_device_work_plan *plan) {
   return plan == nullptr || plan->value == nullptr
              ? 0
              : plan->value->dependencyCount();
@@ -863,9 +961,60 @@ void nta_jit_phase_program_destroy(nta_jit_phase_program *program) {
   delete program;
 }
 
+nta_status nta_jit_phase_operator_contract(const nta_jit_phase_program *program,
+                                           nta_operator_contract *contractOut) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    if (contractOut == nullptr) {
+      throw std::invalid_argument("JIT operator contract output is null");
+    }
+    const nta::operator_contract::Contract &contract =
+        program->value->operatorContract();
+    *contractOut = {
+        contract.magic,
+        contract.schemaVersion,
+        contract.structBytes,
+        contract.runtimeAbiVersion,
+        contract.family,
+        contract.form,
+        contract.reserved,
+        contract.capabilities,
+        contract.sourceFingerprintLow,
+        contract.sourceFingerprintHigh,
+    };
+  });
+}
+
+nta_status nta_jit_phase_operator_plan(const nta_jit_phase_program *program,
+                                       nta_operator_plan *planOut) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    if (planOut == nullptr) {
+      throw std::invalid_argument("JIT operator plan output is null");
+    }
+    const nta::operator_contract::Plan &plan = program->value->operatorPlan();
+    *planOut = {
+        plan.magic,
+        plan.schemaVersion,
+        plan.structBytes,
+        plan.runtimeAbiVersion,
+        plan.family,
+        plan.supportedForms,
+        plan.coordinateMap,
+        plan.partialState,
+        plan.reduction,
+        plan.flags,
+        plan.reserved,
+        plan.sourceFingerprintLow,
+        plan.sourceFingerprintHigh,
+        plan.planFingerprintLow,
+        plan.planFingerprintHigh,
+    };
+  });
+}
+
 nta_status nta_jit_phase_reset(const nta_jit_phase_program *program,
-                               nta_runtime *runtime,
-                               std::uint32_t objectCount,
+                               nta_runtime *runtime, std::uint32_t objectCount,
                                std::uint32_t workTicketCount,
                                std::uint64_t cudaStream) {
   return protect([&] {
@@ -876,6 +1025,22 @@ nta_status nta_jit_phase_reset(const nta_jit_phase_program *program,
   });
 }
 
+nta_status nta_jit_phase_discover(const nta_jit_phase_program *program,
+                                  nta_runtime *runtime, std::uint64_t workItems,
+                                  std::uint64_t dependencies,
+                                  std::uint32_t workItemCount,
+                                  std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->discover(
+        stream(cudaStream), runtime->value->deviceView(),
+        reinterpret_cast<const nta::abi::WorkItem *>(workItems),
+        reinterpret_cast<const nta::abi::AcquireRequirement *>(dependencies),
+        workItemCount);
+  });
+}
+
 nta_status nta_jit_phase_invalidate_cached_objects(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     std::uint32_t firstObject, std::uint32_t objectCount,
@@ -883,9 +1048,36 @@ nta_status nta_jit_phase_invalidate_cached_objects(
   return protect([&] {
     requireHandle(program, "JIT phase program");
     requireHandle(runtime, "runtime");
-    program->value->invalidateCachedObjects(
+    program->value->invalidateCachedObjects(stream(cudaStream),
+                                            runtime->value->deviceView(),
+                                            firstObject, objectCount);
+  });
+}
+
+nta_status nta_jit_phase_validate_indexed_host_range(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->validateIndexedHostRange(stream(cudaStream),
+                                             runtime->value->deviceView(),
+                                             firstObject, objectCount);
+  });
+}
+
+nta_status nta_jit_phase_rebind_indexed_host_pairs(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t pairCount, std::uint64_t keySource,
+    std::uint64_t keyStaging, std::uint64_t valueSource,
+    std::uint64_t valueStaging, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->rebindIndexedHostPairs(
         stream(cudaStream), runtime->value->deviceView(), firstObject,
-        objectCount);
+        pairCount, keySource, keyStaging, valueSource, valueStaging);
   });
 }
 
@@ -897,8 +1089,36 @@ nta_status nta_jit_phase_preload_host(const nta_jit_phase_program *program,
   return protect([&] {
     requireHandle(program, "JIT phase program");
     requireHandle(runtime, "runtime");
-    program->value->preloadHost(stream(cudaStream), runtime->value->deviceView(),
-                                firstObject, objectCount);
+    program->value->preloadHost(stream(cudaStream),
+                                runtime->value->deviceView(), firstObject,
+                                objectCount);
+  });
+}
+
+nta_status nta_jit_phase_preload_host_pairs(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t pairCount,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->preloadHostPairs(stream(cudaStream),
+                                     runtime->value->deviceView(), firstObject,
+                                     pairCount);
+  });
+}
+
+nta_status nta_jit_phase_alias_preloaded_objects(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t sourceFirst, std::uint32_t destinationFirst,
+    std::uint32_t objectCount, std::uint64_t objectIdBase,
+    std::uint32_t version, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->aliasPreloadedObjects(
+        stream(cudaStream), runtime->value->deviceView(), sourceFirst,
+        destinationFirst, objectCount, objectIdBase, version);
   });
 }
 
@@ -914,10 +1134,50 @@ nta_status nta_jit_phase_progress_host(const nta_jit_phase_program *program,
   });
 }
 
-nta_status nta_jit_phase_progress_nvme(
+nta_status nta_jit_phase_progress_indexed_host_range(
     const nta_jit_phase_program *program, nta_runtime *runtime,
-    std::uint32_t issueBudget, std::uint32_t completionBudget,
+    std::uint32_t firstObject, std::uint32_t objectCount,
     std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->progressIndexedHostRange(stream(cudaStream),
+                                             runtime->value->deviceView(),
+                                             firstObject, objectCount);
+  });
+}
+
+nta_status nta_jit_phase_progress_validated_indexed_host_range(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->progressValidatedIndexedHostRange(
+        stream(cudaStream), runtime->value->deviceView(), firstObject,
+        objectCount);
+  });
+}
+
+nta_status nta_jit_phase_progress_validated_indexed_host_range_parallel(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint32_t copyBlocksPerGroup, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->progressValidatedIndexedHostRangeParallel(
+        stream(cudaStream), runtime->value->deviceView(), firstObject,
+        objectCount, copyBlocksPerGroup);
+  });
+}
+
+nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
+                                       nta_runtime *runtime,
+                                       std::uint32_t issueBudget,
+                                       std::uint32_t completionBudget,
+                                       std::uint64_t cudaStream) {
   return protect([&] {
     requireHandle(program, "JIT phase program");
     requireHandle(runtime, "runtime");
@@ -948,6 +1208,19 @@ nta_status nta_jit_phase_complete(const nta_jit_phase_program *program,
     requireHandle(runtime, "runtime");
     program->value->complete(stream(cudaStream), runtime->value->deviceView(),
                              workTicketCount);
+  });
+}
+
+nta_status nta_jit_phase_complete_stream_ordered(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint64_t workItems, std::uint32_t workItemCount,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->completeStreamOrdered(
+        stream(cudaStream), runtime->value->deviceView(),
+        reinterpret_cast<const nta::abi::WorkItem *>(workItems), workItemCount);
   });
 }
 

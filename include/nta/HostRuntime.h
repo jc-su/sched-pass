@@ -33,7 +33,10 @@ struct RuntimeConfig {
   std::uint32_t maxReplicasPerObject = 1;
   std::uint32_t maxDependenciesPerWorkTicket = 8;
   int deviceOrdinal = -1;
-  bool enableCtaNvmeTryIssue = true;
+  // Direct CTA submission is useful only for a small, isolated miss. Batched
+  // traffic defaults to the request-aware scheduler warp; deployments may
+  // enable the one-shot CTA path after measuring their transfer-size regime.
+  bool enableCtaNvmeTryIssue = false;
   // Zero selects requestCapacity for backward-compatible one-tenant-per-slot
   // deployments; otherwise tenant storage is independently bounded.
   std::uint32_t tenantCapacity = 0;
@@ -52,6 +55,18 @@ struct StagingUsage {
 struct HostReplicaSpec {
   std::span<const std::byte> contents;
   Placement placement;
+};
+
+// One request-directory update. publishRequestsAsync requires unique slots in
+// increasing order and a stream ordered after all work for the old generations.
+struct RequestSpec {
+  std::uint32_t slot;
+  std::uint64_t requestId;
+  std::uint32_t generation;
+  std::uint32_t tenantId = 0;
+  std::uint32_t priority = 0;
+  std::uint64_t deadlineClock = 0;
+  std::uint64_t maxOutstandingBytes = UINT64_MAX;
 };
 
 // Non-owning registration for allocations managed by an inference engine or
@@ -121,6 +136,12 @@ public:
                   std::uint32_t generation, std::uint32_t tenantId = 0,
                   std::uint32_t priority = 0, std::uint64_t deadlineClock = 0,
                   std::uint64_t maxOutstandingBytes = UINT64_MAX);
+  // Publish changed request identities without synchronizing the host. The
+  // supplied stream is the reuse boundary: prior users of every old slot
+  // generation must complete before these copies execute, and all consumers
+  // of the new generations must execute after them on this stream.
+  void publishRequestsAsync(std::span<const RequestSpec> requests,
+                            cudaStream_t stream);
   void cancelRequest(std::uint32_t slot, std::uint32_t generation);
   void setTenantBudget(std::uint32_t tenantId,
                        std::uint64_t maxOutstandingBytes,
@@ -172,6 +193,12 @@ public:
   readRequestProgress(std::uint32_t slot) const;
   [[nodiscard]] std::vector<abi::RequestProgress>
   readRequestProgress(std::uint32_t firstSlot, std::uint32_t count) const;
+  // Enqueue a generation-stamped progress snapshot without synchronizing the
+  // device. The destination must be CUDA page-locked host memory and remain
+  // live until all prior work on stream has completed.
+  void copyRequestProgressAsync(
+      std::uint32_t firstSlot, std::span<abi::RequestProgress> destination,
+      cudaStream_t stream) const;
   [[nodiscard]] abi::ObjectEntry readObject(std::uint32_t slot) const;
   [[nodiscard]] abi::ReplicaEntry
   readReplica(std::uint32_t objectSlot,
@@ -189,6 +216,8 @@ public:
   // completion contract used between finite progress rounds.
   [[nodiscard]] EpochStatus
   readEpochStatus(std::uint32_t workTicketCount) const;
+  // Monotonic across epoch resets; any non-zero value poisons the runtime.
+  [[nodiscard]] std::uint32_t readStickyFailedCount() const;
   // Current work tickets whose state is Pending.
   [[nodiscard]] std::uint32_t readPendingCount() const;
   // Entries appended to the bounded pending index in the current epoch.

@@ -120,4 +120,6 @@ KIOXIA CD8P, which reports `NWPC=0`, use
 `NTA_NVME_MEDIA_POLICY=trusted-read-only-code` only when the dedicated-device
 threat model is acceptable. On 2026-08-01 that policy passed CPU queue/DMA
 qualification, GPU SQ-doorbell-CQ qualification, and verified application READ
-workloads; teardown restored `nvmex` after testing.
+workloads; teardown restored `nvme` after testing. The 2026-08-09 ABI-v25
+qualification also completed all 640 measured 2-MiB reads with exact checksums
+and zero outstanding commands. This remains a one-controller local result.

@@ -1,6 +1,6 @@
 # Validation Record
 
-Date: 2026-08-02
+Date: 2026-08-09
 
 This record supports a locally validated mechanism prototype. It does not
 establish production readiness, an end-to-end serving result, or an OSDI-level
@@ -11,13 +11,20 @@ Tables and command output retain ABI state `Ready` and legacy CLI policy
 runnable work, and device-generated demand; results are not renamed after
 collection.
 
-The source ABI is v20 and the public C API is v11. The ABI bump adds explicit
-source and destination bounds for GPU-generated indexed transfers plus finite
-cache invalidation used by cold-cache experiments. Focused compiler, C API,
-Python, and real FlashInfer JIT tests have been rerun for v20. The complete
-local qualifier must be rerun after the implementation is frozen. Decode-graph
-serving and VFIO NVMe results below predate v20 and remain historical local
-evidence; clean-revision repeated trials are open.
+The source ABI is v25 and the public C API is v22. ABI v25 makes rejected
+same-generation epoch attribution observable, uses checked request-progress
+subtraction, and keeps stale generations isolated from reused slots. ABI v24
+added exact pending and expected compiler-attributed compute to the contract;
+ABI v23 added a monotonic
+runtime-lifetime failure counter and GPU-side indexed-directory rebinding used
+by asynchronous layer execution. C API v22 adds a reusable, stream-ordered
+pinned-host request-progress snapshot; the typed JIT operator-plan
+query; v17 added the operator-contract query and capture-safe host-to-device
+copy entry point. Focused compiler, C API, Python, and real FlashInfer JIT tests
+plus the complete 46-test CTest suite have been rerun for v25. All executable
+tests passed; the physical multi-GPU test was skipped on the one-GPU host.
+Current-ABI VFIO correctness and bandwidth were rerun below; a clean-revision
+repeat and multi-platform reliability campaign remain open.
 
 ## Environment
 
@@ -47,21 +54,62 @@ executes memcheck, racecheck, and synccheck, runs a CUDA-disabled build, perform
 10,000 lifecycle epochs, and runs static/lint/package checks. The second runs
 alternating process-level baseline/mechanism trials and computes Student-t intervals.
 Generated evidence is under `results/` and is excluded from source control.
-The ABI-v20 local qualification must complete all commands successfully before
-it may report `READY`. Earlier ABI qualifications covered the full
-functional/sanitizer matrix, CPU-only build, 10,000 lifecycle epochs, Clang
-static analysis, Python and shell checks, package construction, and patch
-hygiene; they do not substitute for the final v20 run.
+The ABI-v23 local qualification completed successfully on 2026-08-03 and
+reported `READY`. It covered the full functional/sanitizer matrix, CPU-only
+build and tests, 10,000 lifecycle epochs, Clang static analysis, Python and
+shell checks, package construction, and patch hygiene.
 
-The schema-2 production and OSDI qualifiers both report `NOT_READY` on this
-workspace. The required external evidence manifests do not exist, and the
-worktree is not an immutable commit. This is the expected claim boundary, not a
-local test failure.
+The schema-3 production and OSDI qualifiers both report `NOT_READY` on this
+workspace. Production lacks its external evidence manifest and an immutable
+clean revision. OSDI additionally lacks the paper evidence manifest. This is
+the expected claim boundary, not a local test failure.
+
+## Canonical FlashInfer Tier Streaming
+
+On 2026-08-03, the request-aware bounded-HBM benchmark passed its separate
+mechanism gate using FlashInfer 0.6.12 ragged prefill and
+`merge_state_in_place`; it contains no custom attention kernel.
+
+| Workload | Atomic promotion | Bounded stream | Speedup | 95% CI | Staging reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| q=256/request, context=64K/request, resident=0/25/50/100% | 6539.1 us | 5582.2 us | 1.1714x | [1.1660x, 1.1732x] | 4.0x |
+| q=128/256/384/512, context=64K/48K/32K/16K | 5008.2 us | 4512.0 us | 1.1100x | [1.1050x, 1.1109x] | 4.83x |
+
+The headline contains 10 arm-rotated trials and 10,000 deterministic paired
+bootstrap resamples. Both arms match one complete all-HBM FlashInfer output
+within the declared FP16 tolerance. Per-request completion follows data
+availability rather than the slowest batch member. The local validator passes
+all ten canonical-kernel, compiler-plan, graph, confidence, capacity, and
+heterogeneity checks.
+
+These artifacts were collected from a dirty development worktree and therefore
+cannot satisfy release provenance. The runtime operator now owns FlashInfer
+wrapper construction, wave metadata, copies, partials, merge, completion, and
+dynamic-source graph replay. Paired JIT artifacts now validate the typed
+request-coordinate and online-softmax execution plan and execute through the
+LLVM-transformed path. SGLang does not yet consume this operator. The result
+establishes the compiler/runtime operator opportunity and bounded-HBM crossover
+only. Full
+details are in `TIER_STREAMING.md`.
+
+A separate transport ablation runs the same compiler-transformed operator with
+GPU-initiated mapped-host copies. It is numerically exact and passes graph and
+request-lifecycle checks, but measures 13.669 ms versus 6.550 ms atomic
+copy-engine promotion (`0.479x`). This validates the GPU-originated CPU-DRAM
+path but rejects it as the performance policy for known host-resident KV on this
+platform.
+
+The checked-in equal-state runner specification also completed 10 randomized
+process-level blocks against ABI v24 on this workspace. The long-context paired
+ratio has median `1.1672x` (range `[1.1609x, 1.1688x]`), and the heterogeneous
+ratio has median `1.1164x` (range `[1.1153x, 1.1218x]`). The run used
+uncontrolled clocks and `--allow-dirty`; it is a reproducibility check, not
+OSDI qualification evidence.
 
 ## Correctness Gates
 
-`ctest --test-dir build --output-on-failure` discovers 39 tests. On this
-single-GPU host, 38 pass and `nta-multi-gpu` reports the configured skip code
+`ctest --test-dir build --output-on-failure` discovers 46 tests. On this
+single-GPU host, 45 pass and `nta-multi-gpu` reports the configured skip code
 77 because a second physical CUDA device is unavailable. The gates cover:
 
 1. FlashInfer CSR-to-common-plan validation, including grouped pages and bad
@@ -71,7 +119,8 @@ single-GPU host, 38 pass and `nta-multi-gpu` reports the configured skip code
    rejection of live-state, token, missing-binding, non-inlined-helper,
    lane-divergent control, non-dominating divergent control, and divergent PHI
    operand cases;
-4. host/device ABI v20 layout, including operation epochs, terminal counters,
+4. host/device ABI v25 layout, including operation epochs, checked progress
+   conservation, dropped-attribution telemetry, terminal counters,
    multi-CTA completion state, and the NVMe control-page mirror;
 5. Clang nvcc-shim compilation of a foreign source kernel, including automatic
    optimizer-last lowering, marker removal, metadata, and fast-math forwarding;
@@ -136,8 +185,17 @@ calls. Control dependence is computed from the post-dominator tree, including
 branches that do not dominate the marker; uniform PHIs require every incoming
 control dependence to be CTA-uniform. A positive late-bound fixture selects an
 object catalog entry from CTA-uniform GPU state. Lowered modules contain no
-bind/acquire/defer markers and carry ABI-v20 `!nta.acquire` metadata tagged
+bind/acquire/defer markers and carry ABI-v25 `!nta.acquire` metadata tagged
 `split-phase-cta`.
+
+Incremental kernels additionally delimit one numerical region with convergent
+begin and publication markers. The pass rejects a region that does not follow
+the acquired edge with the same request binding and work ticket, a publication
+that can be bypassed, duplicate or missing publication, nonuniform operands,
+and non-convergent endpoints. Valid publication lowers to
+`nta_commit_partial` with `!nta.partial` metadata and a function-level
+`!nta.operator` contract; the runtime then validates request generation,
+contributor identity, and reduction-group completion.
 
 Attention global-load and TMA kernels, the generic dependency-set kernel, and
 the MoE kernel all consume the same `abi::WorkItem` and
@@ -162,6 +220,13 @@ the compact work array, and request 1 executes. Its two-request split-K test
 completes every contributor for request 0 while leaving request 1 blocked. The
 device merge emits request 0's stock-equivalent output and preserves request
 1's sentinel without reading incomplete scratch.
+
+The eager path now also verifies a compact initial wave followed by a compact
+resume at a nonzero runnable-queue offset. Discovery publishes direct and
+preloaded work exactly once without constructing suspended dependency state;
+unavailable work still enters the full object/version and generation-checked
+ticket protocol. The real FlashInfer differential test covers resident plus
+offloaded requests in this form and matches stock output.
 
 A separate CUDA-disabled build against the supported LLVM 22 installation
 passes all five applicable adapter, plan, IR, ABI, and execution-policy tests.
@@ -220,7 +285,7 @@ reports no findings.
 
 ## Real FlashInfer Device-Selected Pages
 
-ABI v20 adds a real FlashInfer pipeline in which
+ABI v25 retains the real FlashInfer pipeline in which
 `top_k_page_table_transform` updates a stable CUDA index table, NTA validates
 and gathers only those pinned-host KV pages, and a compiler-instrumented
 FlashInfer paged-decode kernel consumes the compact KV. The NTA path performs
@@ -231,34 +296,46 @@ not an implementable online competitor.
 ```bash
 tools/jit/activate.py --build-dir build --flashinfer-hook -- \
   python3 scripts/run-selected-pages-sweep.py \
-  --output results/selected-pages-sweep-v20.json \
+  --output results/selected-pages-sweep-v25-corrected.json \
   --require-peak-speedup
 ```
 
 The local sweep used 32 requests, 16 selected 16-token pages per request, ten
 alternating in-process trials, and 20 iterations per sample. Selector,
 acquisition, and attention are stream ordered in each timed pipeline. Every
-point passed stock FlashInfer output parity.
+point passed stock FlashInfer output parity. Both the indexed and all-page
+policy arms use compiler-transformed FlashInfer attention, and their versioned
+direct/incremental operator contract pair is checked before timing.
 
-| Candidate pages/request | Bytes avoided | Online mode | NTA cold us | Forced overfetch us | Forced-indexed speedup |
-| ---: | ---: | --- | ---: | ---: | ---: |
-| 16 | 0% | bulk | 267.242 | 171.250 | 0.641x |
-| 32 | 50% | bulk | 271.141 | 320.498 | 1.182x |
-| 64 | 75% | indexed | 271.656 | 616.583 | 2.270x |
-| 128 | 87.5% | indexed | 271.666 | 1,208.602 | 4.449x |
-| 256 | 93.75% | indexed | 271.450 | 2,395.940 | 8.826x |
+| Candidates/request | Avoided | Mode | Online us | Forced indexed us | Overfetch us | Candidates resident us | Speedup vs overfetch (95% CI) |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | 0% | bulk | 187.988 | 292.308 | 187.988 | 31.765 | 1.0000x [1.0000, 1.0000] |
+| 32 | 50% | indexed | 295.091 | 295.091 | 331.465 | 30.821 | 1.1233x [1.1220, 1.1269] |
+| 64 | 75% | indexed | 295.122 | 295.122 | 627.390 | 32.235 | 2.1259x [2.1241, 2.1296] |
+| 128 | 87.5% | indexed | 295.462 | 295.462 | 1,217.003 | 31.272 | 4.1190x [4.1157, 4.1215] |
+| 256 | 93.75% | indexed | 294.434 | 294.434 | 2,406.441 | 31.254 | 8.1731x [8.1639, 8.1762] |
 
-The no-oracle cost model chose bulk at the first two points and indexed
-transfer at the final three, so its minimum measured throughput ratio to forced
-overfetch was 1.0x. Maximum NTA cold-pipeline regret to the precomputed
-selected-copy oracle was 1.673x. Retained-object pipeline medians were 68.6 to
-73.0 us.
+The no-identity-oracle cost model chose bulk only when all candidate pages were
+needed and selected indexed acquisition at 50% selectivity and above. Policy
+regret is computed from the chosen and best arms in the same rotated trial; it
+was 1.0000x at every measured point. The zero-avoidance online ratio is exactly
+1.0000x because the policy chooses bulk, while forcing indexed acquisition is
+only 0.6431x. Maximum cold-pipeline regret to the precomputed selected-copy
+oracle was 1.721x. The all-candidate-resident arm measured 30.8-32.2 us, making
+cold indexed acquisition 9.15x or more slower; this is an optimization gap, not
+a competing equal-capacity policy. The executable sweep gate requires at least a five-point crossover,
+2x speedup at 75% or greater bytes avoided, at most 1.05x policy regret, at
+most 2x oracle regret, exact output, transformed policy forms, and a peak 95%
+interval above one.
 
 This is a dirty-worktree, uncontrolled-clock operator crossover with controlled
-random scores. It establishes a real performance domain and the dense
-counterexample; it does not establish end-to-end SLO gain, model-quality impact,
-NVMe benefit, production readiness, or superiority to Strata, ECHO, Syncopate,
-or Prism.
+random scores. It supports the scoped claim that compiler/runtime paired
+acquisition forms avoid unnecessary transfer when object identity is produced
+on device and that an online bulk/indexed decision avoids the dense indexed
+penalty. It does not show that the indexed mechanism itself preserves dense
+efficiency, nor does it establish end-to-end
+SLO gain, model-quality impact, NVMe benefit, production readiness, or
+superiority to Strata, ECHO, Syncopate, or Prism.
 
 ## Query-Dependent Sparse Attention
 
@@ -350,8 +427,11 @@ FA2 paged-prefill work items: 4, max error 0
 ```
 
 The matched custom-variant microbenchmark uses 64 requests and 2000 iterations
-per alternating sample. The latest local median measured 12.250 us without NTA
-fields and 12.817 us with the resident hook, a 4.63% cost. CTest fails above 8%.
+per alternating sample. The latest three consecutive cached runs measured
+1.76%-2.59% overhead for the compiler-transformed request-bound direct form;
+CTest fails above 5%. The full incremental work-plan form measured 5.82%-6.41%
+and is reported as a separate diagnostic rather than standing in for resident
+direct execution.
 Clocks are not fixed, so this is a local regression gate rather than a
 paper-quality result.
 
@@ -395,7 +475,7 @@ exact design and command are in `docs/DEVICE_ROUTED_MOE.md`.
 
 ## GPU-Initiated NVMe
 
-The ABI-v20 controller-free test runs the same compiler-lowered finite CTA and
+The ABI-v25 controller-free test runs the same compiler-lowered finite CTA and
 device transport code against an NVMe queue/control image in CUDA memory. It
 checks that the CTA leader constructs a READ SQE and command context, rings the
 SQ doorbell, leaves its work ticket `Pending`, and exits with no intent. The
@@ -443,63 +523,133 @@ superiority, serving-level SLO impact, portability, or production readiness.
 The default hardware-write-protect policy still rejects this controller, as
 designed.
 
+On 2026-08-09, the ABI-v25 one-GPU qualification harness reran a matched
+read-only `fio io_uring` baseline and the GPU-controlled VFIO path with 2-MiB
+requests at queue depth 32. The controller was attached to a private translated
+IOMMUFD IOAS and the BAR-write qualification passed. Across 20 measured GPU
+epochs, all 640 commands completed with exact checksums, zero failures, and
+zero outstanding commands. The CPU baseline measured 11,813.31 MiB/s and the
+GPU-controlled finite scheduler measured 6,879.10 MiB/s, or 58.23% of the
+matched baseline. This exceeds the predeclared 50% local scaling gate, but the
+artifact was collected from a dirty worktree and is therefore diagnostic until
+repeated from the final clean revision. It is not serving-SLO, portability, or
+recovery evidence.
+
 ## SGLang HiCache Integration
 
 SGLang 0.5.14 discovers NTA through its public `sglang.srt.plugins` entry-point
 group. The real model run binds engine request IDs and pool slots, registers
-the exact HiCache host/device page rows, overlaps layer acquisition, executes
-stock FA2 paged prefill after each layer is available, and returns SGLang-owned
-output tensors. Separate correctness qualification compares every promoted K/V
-row with pinned-host data; timed trials exclude that synchronous verification.
+the exact HiCache host/device page rows, overlaps layer acquisition, and returns
+SGLang-owned output tensors. NTA always invokes a compiler-transformed FA2
+wrapper: transformed direct for resident or one-round ordered data, and
+transformed incremental for unavailable request/tile work. The matched harness
+rejects stock NTA launches and fallback. Separate correctness qualification
+compares every promoted K/V row with pinned-host data; timed trials exclude that
+synchronous verification.
 
-An historical residency-qualified mixed run used Llama-160M, one 96-token
-host-cached request, one 64-token fresh request, 15 measured promotions, and
-one generated token per request. Stock and NTA observed identical external
-attempt indices and generated identical text. NTA reported 15 claimed batches,
-180 planless preacquired attention launches, no plan uploads, and zero
-fallback. Median batch latency was 14.762 ms stock and 14.079 ms NTA, a 4.62%
-reduction and 4.85% promotion-throughput increase. A separate 15-promotion
-single-request run measured 13.361 ms stock and 13.016 ms NTA, a 2.58%
-reduction. Clocks were uncontrolled and the model is tiny, so these are local
-regression results rather than serving-level or statistical superiority. A
-subsequent full comparison measured 20.073 ms stock and 13.866 ms NTA, but the
-per-request timestamps show that SGLang's fresh peer is sometimes co-batched
-and sometimes delayed to a later scheduler step. The harness now reports that
-peer delay separately and supports an explicit median-regression limit; the
-30.92% aggregate difference is scheduler-sensitive and is not used as a paper
-claim.
+Current ABI-v23 smoke measurements are summarized below. The tree was dirty,
+clocks were uncontrolled, and the newest fragmented rows have one qualified
+external attempt each. They are integration diagnostics, not qualification
+data:
 
-Those planless-instrumented measurements do not describe the current fast path.
-The adapter now rejects instrumented attention after acquisition and the matched
-harness requires a positive stock-FlashInfer launch count. Clean-revision
-performance reports must use this implementation and the separate transfer
-verification arm.
+| Workload | Stock | NTA | Throughput ratio | Mechanism counters |
+| --- | ---: | ---: | ---: | --- |
+| Qwen2.5-3B resident, full decode graph, warm JIT cache | 56.791 ms | 55.618 ms | 1.021x | 4,068 direct, 36 captures, 32 replays, 2 contracts, 0 stock/fallback |
+| Llama-160M resident | 26.325 ms | 26.392 ms | 0.997x | 228 transformed direct, 0 stock |
+| Llama-160M mixed host/resident | 21.013 ms | 21.057 ms | 0.998x | 288 transformed direct, 36 promoted layers |
+| Qwen2.5-3B mixed host/resident | 67.027 ms | 62.453 ms | 1.073x | 684 transformed direct, 72 promoted layers |
+| Llama-160M forced ticketed | 25.993 ms | 34.584 ms | 0.752x | 12 ticketed layers, 1 structural plan |
+| Qwen2.5-3B 4K mixed load | 386.47 ms | 415.96 ms | 0.929x | 2,052 transformed direct, 108 promoted layers, 0 stock/fallback |
+| Qwen2.5-3B 8K saturated | 1,331.7 ms | 1,473.7 ms | 0.904x | 5,616 transformed direct, 144 promoted layers, 0 stock/fallback |
+| Qwen2.5-3B 8K mixed, two fragment waves | 73.750 ms | 85.473 ms | 0.863x | 2,304 work items, 36 ticketed layers, 35 first-wave lookaheads, 0 stock/fallback |
+| Qwen2.5-3B 16K mixed, two fragment waves | 110.205 ms | 118.824 ms | 0.927x | 4,500 work items, 36 ticketed layers, 35 first-wave lookaheads, 0 stock/fallback |
+| Qwen2.5-3B 16K compact fragments | 113.150 ms | 121.043 ms | 0.935x | 50.01% combined physical CTA bound, lightweight available-work publication, 0 stock/fallback |
+| Qwen2.5-3B 2K coalesced requests | 374.601 ms | 393.013 ms | 0.953x | 36 mixed/ticketed/parallel-progress layers, 50.0% combined CTA bound, 0 stock/fallback |
+| Qwen2.5-3B 4K, four resident peers | 446.294 ms | 484.507 ms | 0.921x | 36 mixed/ticketed layers, 132 direct + 32 external work items, 0 stock/fallback |
+| Qwen2.5-3B 2K acquisition frontier v10 | 204.643 ms | 209.384 ms | 0.977x | 1 mixed ticketed layer, 35 preacquired suffix layers, 0 stock/fallback |
 
-An ABI-v18 decode-graph comparison collected three qualified promotions in
-five attempts with the same 96-token hot request and a 64-token peer. Stock
-measured 18.614 ms median promotion latency and `nta_flashinfer` measured
-11.469 ms, giving a 1.623x promotion-throughput ratio. Generated output and
-external-attempt indices matched; NTA reported four captures, ten graph
-replays, three claimed HiCache batches, and zero fallback. Host promotion ran
-through eager prefill and the subsequent decode ran through the then-current
-instrumented resident graph (`graph_external_batches=0`). This historical result
-validated graph integration and request metadata preservation, but not
-graph-captured demand acquisition or incremental co-scheduling. The current
-preacquired graph uses stock FlashInfer. The sample is too small and clocks are
-uncontrolled.
+Generated output matched in every row and fallback was zero. The isolated
+`1.073x` Qwen result is only a smoke point; it is too small and noisy for a
+performance claim. The forced ticketed and load results are negative evidence:
+one known bulk transfer round followed by transformed layer-complete attention
+does not repay NTA's planning and launch cost. An earlier Qwen ticketed run selected two
+rounds and reached only 0.676x throughput; it exposed a missing host plan-setup
+term in the cost model. The model now conservatively includes that term.
 
-An earlier ABI-v20 schedule-aware path was measured with early host acquisition
-disabled. It made its decision from the current FlashInfer schedule and exact
-HiCache page mapping, selected one tuned bulk round, and overlapped subsequent
-layer transfers with attention. Across five qualified promotions, stock
-measured 12.993 ms and NTA measured 13.333 ms median promotion latency, a 2.62%
-cost and 0.974x throughput ratio. Generated output and residency sequences
-matched. NTA recorded five bulk batches, 60 layer prefetches, no CTA plan
-uploads, no incremental work, and zero fallback. This is a current-ABI local
-regression result for the old policy's no-opportunity branch, not an incremental
-speedup or an OSDI result. It is retained as negative evidence and is superseded
-as the dense production path by stock attention after stream-ordered
-acquisition.
+The resident graph row is a three-sample integration smoke. Every attention
+launch used a contract-validated transformed module, and eager-only reruns show
+the transformed kernel itself is not the source of the earlier overhead. The
+row performs no ticketed external work, so it satisfies neither the incremental
+serving gate nor an end-to-end performance claim. `CompareSglang.py` now primes
+each backend's JIT cache in unmeasured processes and requires graph
+capture/replay counters when full decode graphs are requested.
+
+The older mixed-load rows executed no ticketed partial work: all attention
+launches were transformed direct launches after whole-layer promotion. Those rows
+falsify mover-only and admission-only versions of the design. The ABI-v23 8K
+and 16K rows do execute real FlashInfer split-K contributors in two waves. A
+GPU directory rebind stages the first wave of layer `L+1` during post-attention
+compute; the next initial launch consumes it while one finite progress wave
+acquires the rest. Exact generations match stock and every NTA attention launch
+is transformed. The mechanism is therefore active and correct, but it remains
+15.9% slower at 8K and 7.8% slower at the first 16K point. Physical compaction
+and lightweight publication reduce the newest 16K cost to 7.0%, but do not
+produce a win. The next gate is a repeated measured arrival-skew crossover
+against layer wait and skip/rebatch, not another forced dense point.
+
+The coalesced load fixture now enables SGLang mixed-chunk batching and releases
+the host-hit request into the running resident batch through the acquisition
+admission hook. `NTA_SGLANG_REQUIRE_MIXED_ATTENTION=1` fails closed unless the
+real FlashInfer schedule contains both direct and external request work. The 2K
+run above proved 17 direct and 16 external work items in one schedule; the 4K
+four-resident run proved 132 direct and 32 external work items. Both execute the
+compiler-generated direct and incremental forms, so they are valid
+cross-request mechanism evidence. They are also negative performance evidence:
+the current v10 2K point is 2.26% slower overall, has 1.16% worse resident P99
+inter-token latency, and has 2.08% worse external TTFT. The four-resident 4K
+point is 7.9% slower.
+
+The last ABI-v24 full-graph path batches four proactive layers per GPU mover
+wave and uses the warp-cooperative request guard. Three arm-balanced 4K trials
+reported `0.9447x` output-throughput geometric mean with bootstrap interval
+`[0.9337x, 0.9578x]`, `1.3386x` external TTFT, and `1.4991x` resident P99
+inter-token latency. SLO goodput was `0.7498x`. Outputs were exact, all
+attention was transformed, and fallback was zero. Three repetitions are
+diagnostic negative evidence for dense, early-known host demand, not a
+paper-level confidence claim; they do not invalidate the separately measured
+device-selected crossover.
+
+Resident TTFT is not used as the interference headline: the workload submits
+external requests only after a resident emits its first token, so that TTFT is
+causally prior to external acquisition. The benchmark now reports per-request
+and aggregate P99 inter-token latency and includes it in the SLO-goodput gate.
+This change prevents scheduler startup variance from being mistaken for an
+acquisition benefit.
+
+A stronger acquisition-admission experiment detached the mixed request until
+a complete suffix-layer lead was available and then re-formed the same
+compiler-transformed heterogeneous batch. Five arm-balanced exact trials had
+zero fallback and all attention transformed, but geometric-mean throughput was
+0.972x, resident P99 inter-token latency was 1.048x (95% bootstrap interval
+1.010x-1.091x), and external TTFT was 1.295x. That policy was removed from the
+source because it shifted delay instead of reducing it. The raw rejected-policy
+artifact remains at
+`results/serving/sglang-qwen3b-abi23-admission-frontier-v10-2k-qualification.json`.
+The current immediate-mixed v10 diagnostic is
+`results/serving/sglang-qwen3b-abi23-frontier-v10-immediate-32tok.json`.
+
+Demand host progress no longer copies a megabyte-scale indexed object with one
+CTA. It uses three bounded stream-ordered stages: intent/credit claim and index
+validation, a 16-CTA-per-object row-specialized copy, and post-copy object/ticket
+publication. The real FlashInfer differential covers successful and invalid
+indexed ranges through this path. A diagnostic run measured 8.79 GiB/s across
+the combined bulk-warmup and demand transfers versus 8.27 GiB/s before the
+change; because that old profile did not separate the two transfer classes, the
+number is not a standalone demand-bandwidth claim.
+
+Historical 18.614 ms versus 11.469 ms and 13.333 ms versus 12.993 ms results
+used stock attention for part of the NTA arm. They are rejected as evidence for
+the compiler/runtime contribution and must not be used in a paper claim.
 
 ## Open Production And Paper Gates
 
@@ -507,7 +657,8 @@ acquisition.
   and NVMe, followed by the predeclared kill-criterion analysis;
 - vLLM request/KV-manager integration, SGLang demand-mode graph phases, and
   paged-prefill graph validation;
-- TTFT, TPOT, p50/p99, SLO attainment, serving goodput, CPU use, and SM tax;
+- TTFT, TPOT, P99 inter-token latency, SLO attainment, serving goodput, CPU
+  use, and SM tax;
 - direct-path comparison against untouched production kernels with controlled
   clocks and multiple machines;
 - a second typed generated-kernel frontend and automatic direct/incremental

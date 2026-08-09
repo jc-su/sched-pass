@@ -10,6 +10,10 @@ int main() {
   static_assert(alignof(RequestContext) == 32);
   static_assert(alignof(TenantContext) == 32);
   static_assert(alignof(RequestProgress) == 32);
+  static_assert(sizeof(RequestProgress) == 96);
+  static_assert(offsetof(RequestProgress, pendingComputeNs) == 64);
+  static_assert(offsetof(RequestProgress, expectedComputeNs) == 72);
+  static_assert(offsetof(RequestProgress, droppedAttributions) == 80);
   static_assert(alignof(ObjectEntry) == 64);
   static_assert(alignof(ReplicaEntry) == 64);
   static_assert(alignof(BackendView) == 64);
@@ -61,6 +65,7 @@ int main() {
   static_assert(offsetof(RuntimeView, epochStartClock) == 280);
   static_assert(offsetof(RuntimeView, epoch) == 288);
   static_assert(offsetof(RuntimeView, abiVersion) == 300);
+  static_assert(offsetof(RuntimeView, stickyFailedCount) == 304);
   static_assert(sizeof(RuntimeView) == 320);
   static_assert(sourceTransferStride(packTransferStrides(17, 31)) == 17);
   static_assert(destinationTransferStride(packTransferStrides(17, 31)) == 31);
@@ -68,7 +73,7 @@ int main() {
                 23);
   static_assert(
       destinationTransferIndexLimit(packTransferIndexLimits(23, 47)) == 47);
-  if (Version != 20 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
+  if (Version != 25 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

@@ -12,16 +12,30 @@ from .runtime import DeviceWorkPlan, JitPhaseProgram, Runtime
 TENSOR_NAMES = ["nta_runtime", "nta_work_items", "nta_dependencies"]
 TENSOR_DTYPES = ["uint8_t", "uint8_t", "uint8_t"]
 SCALAR_NAMES = ["sm_scale", "nta_work_count", "nta_skip_merge"]
+RUNNABLE_OFFSET_SHIFT = 32
 SCALAR_DTYPES = ["double", "int64_t", "int64_t"]
+REQUEST_BOUND_TENSOR_NAMES = ["nta_runtime"]
+REQUEST_BOUND_TENSOR_DTYPES = ["uint8_t"]
+REQUEST_BOUND_SCALAR_NAMES = ["sm_scale", "nta_request_slot_offset"]
+REQUEST_BOUND_SCALAR_DTYPES = ["double", "int64_t"]
 
 SKIP_MERGE = 1 << 0
 PREACQUIRED = 1 << 1
 BIND_CURRENT_GENERATION = 1 << 2
 PLANLESS_PREACQUIRED = 1 << 3
 RUNNABLE_WORK = 1 << 4
+WORK_COUNT_MASK = (1 << 32) - 1
 
 _DEFAULT_ATTENTION_VARIANT = "DefaultAttention<false, false, false, false>"
 _DEFAULT_ATTENTION_DECL = "#include <flashinfer/attention/variants.cuh>"
+
+
+def pack_work_metadata(work_count: int, request_count: int) -> int:
+    if not 0 < work_count <= WORK_COUNT_MASK:
+        raise ValueError("FlashInfer work count exceeds packed metadata")
+    if not 0 < request_count <= WORK_COUNT_MASK:
+        raise ValueError("FlashInfer request count exceeds packed metadata")
+    return work_count | (request_count << 32)
 
 
 def attention_jit_args(
@@ -49,6 +63,36 @@ def attention_jit_args(
         TENSOR_DTYPES,
         SCALAR_NAMES,
         SCALAR_DTYPES,
+        _DEFAULT_ATTENTION_VARIANT,
+        _DEFAULT_ATTENTION_DECL,
+    ]
+
+
+def request_bound_attention_jit_args(
+    module_name: str,
+    *,
+    dtype_q: Any,
+    dtype_kv: Any,
+    dtype_o: Any,
+    idtype: Any,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> list[Any]:
+    """Build the minimal typed arguments for a request-bound direct module."""
+    if not module_name or min(head_dim_qk, head_dim_vo) <= 0:
+        raise ValueError("FlashInfer module name and head dimensions are required")
+    return [
+        module_name,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        REQUEST_BOUND_TENSOR_NAMES,
+        REQUEST_BOUND_TENSOR_DTYPES,
+        REQUEST_BOUND_SCALAR_NAMES,
+        REQUEST_BOUND_SCALAR_DTYPES,
         _DEFAULT_ATTENTION_VARIANT,
         _DEFAULT_ATTENTION_DECL,
     ]
@@ -132,8 +176,16 @@ class FlashInferLayerEpoch:
         out: Any,
         sm_scale: float,
         launch_flags: int,
+        launch_work_count: int | None = None,
         run_options: dict[str, Any] | None = None,
     ) -> None:
+        work_count = (
+            self.plan.work_item_count
+            if launch_work_count is None
+            else int(launch_work_count)
+        )
+        if work_count <= 0 or work_count > self.plan.work_item_count:
+            raise ValueError("FlashInfer launch work count is outside the active plan")
         options = {} if run_options is None else run_options
         wrapper.run(
             q,
@@ -142,7 +194,7 @@ class FlashInferLayerEpoch:
             self._work_items_tensor,
             self._dependencies_tensor,
             sm_scale,
-            self.plan.work_item_count,
+            work_count,
             launch_flags,
             out=out,
             **options,
@@ -195,6 +247,7 @@ class FlashInferLayerEpoch:
             out,
             scale,
             False,
+            None,
             run_options,
         )
 
@@ -209,6 +262,14 @@ class FlashInferLayerEpoch:
         sm_scale: float | None = None,
         stream: Any = None,
         progress_stream: Any = None,
+        ready_event: Any = None,
+        ready_work_counts: int | tuple[int, ...] | None = None,
+        initial_ready_work_count: int = 0,
+        indexed_host_first_object: int | None = None,
+        indexed_host_prevalidated: bool = False,
+        indexed_host_copy_blocks_per_group: int = 2,
+        sync_events: tuple[Any, tuple[Any, ...]] | None = None,
+        progress_profile: tuple[Any, Any] | None = None,
         run_options: dict[str, Any] | None = None,
     ) -> int:
         """Enqueue a fixed host epoch; call ``check`` after execution."""
@@ -218,25 +279,95 @@ class FlashInferLayerEpoch:
             block_counts = (progress_blocks,) * self.epoch.max_progress_passes
         else:
             block_counts = tuple(int(count) for count in progress_blocks)
-            if (
-                len(block_counts) != self.epoch.max_progress_passes
-                or any(count <= 0 for count in block_counts)
+            if len(block_counts) != self.epoch.max_progress_passes or any(
+                count <= 0 for count in block_counts
             ):
                 raise ValueError(
                     "host progress rounds must match the finite epoch bound"
                 )
+        if ready_work_counts is None:
+            launch_counts = (self.plan.work_item_count,) * len(block_counts)
+        elif isinstance(ready_work_counts, int):
+            launch_counts = (int(ready_work_counts),) * len(block_counts)
+        else:
+            launch_counts = tuple(int(count) for count in ready_work_counts)
+        if (
+            len(launch_counts) != len(block_counts)
+            or any(
+                count <= 0 or count > self.plan.work_item_count
+                for count in launch_counts
+            )
+            or any(
+                current < previous
+                for previous, current in zip(launch_counts, launch_counts[1:])
+            )
+        ):
+            raise ValueError("runnable launch bounds must be monotonic plan counts")
+        initial_ready_work_count = int(initial_ready_work_count)
+        if not 0 <= initial_ready_work_count <= self.plan.work_item_count:
+            raise ValueError("initial runnable work count is outside the active plan")
+        next_indexed_object = (
+            None
+            if indexed_host_first_object is None
+            else int(indexed_host_first_object)
+        )
+        if next_indexed_object is not None and next_indexed_object < 0:
+            raise ValueError("indexed host object offset must be nonnegative")
+        indexed_host_copy_blocks_per_group = int(
+            indexed_host_copy_blocks_per_group
+        )
+        if not 1 <= indexed_host_copy_blocks_per_group <= 64:
+            raise ValueError(
+                "indexed host copy blocks per group must be between 1 and 64"
+            )
+
+        def progress(blocks: int, target_stream: Any) -> None:
+            nonlocal next_indexed_object
+            if next_indexed_object is None:
+                self.epoch.phases.progress_host(self.runtime, blocks, target_stream)
+                return
+            if indexed_host_prevalidated:
+                self.epoch.phases.progress_validated_indexed_host_range_parallel(
+                    self.runtime,
+                    next_indexed_object,
+                    blocks,
+                    indexed_host_copy_blocks_per_group,
+                    target_stream,
+                )
+            else:
+                self.epoch.phases.progress_indexed_host_range(
+                    self.runtime, next_indexed_object, blocks, target_stream
+                )
+            next_indexed_object += blocks
+
+        if any(
+            count > self.plan.work_item_count - initial_ready_work_count
+            for count in launch_counts
+        ):
+            raise ValueError("resume launch bound exceeds work after initial fragment")
+        if stream is None and progress_stream is not None:
+            import torch
+
+            stream = torch.cuda.current_stream()
         scale = 1.0 / math.sqrt(q.shape[-1]) if sm_scale is None else sm_scale
         self._prepare(stream)
         has_external = self.plan.has_external
+        if ready_event is not None:
+            if stream is None:
+                raise ValueError("preloaded host work requires an explicit CUDA stream")
+            stream.wait_event(ready_event)
 
         def launch() -> None:
+            # Discovery uses FlashInfer's canonical grid. Resume waves below
+            # remap a bounded physical prefix through the device runnable set.
             self._launch(
                 wrapper,
                 q,
                 paged_kv_cache,
                 out,
                 scale,
-                (SKIP_MERGE | BIND_CURRENT_GENERATION) if has_external else 0,
+                BIND_CURRENT_GENERATION if has_external else 0,
+                None,
                 run_options,
             )
 
@@ -250,16 +381,19 @@ class FlashInferLayerEpoch:
             launch()
             return 0
 
-        def ready(_progress_pass: int, final_pass: bool) -> None:
+        def ready(progress_pass: int, _final_pass: bool) -> None:
+            # The merge kernel is request-gated: completed requests publish now
+            # while incomplete requests retain their split-K scratch state.
             self._launch(
                 wrapper,
                 q,
                 paged_kv_cache,
                 out,
                 scale,
-                RUNNABLE_WORK
-                | BIND_CURRENT_GENERATION
-                | (SKIP_MERGE if not final_pass else 0),
+                BIND_CURRENT_GENERATION
+                | RUNNABLE_WORK
+                | (initial_ready_work_count << RUNNABLE_OFFSET_SHIFT),
+                launch_counts[progress_pass - 1],
                 run_options,
             )
 
@@ -269,44 +403,59 @@ class FlashInferLayerEpoch:
             self.epoch.work_ticket_count,
             stream,
         )
-        launch()
         stream_address = int(getattr(stream, "cuda_stream", stream or 0))
         progress_address = int(
             getattr(progress_stream, "cuda_stream", progress_stream or 0)
         )
-        pipelined = (
-            progress_stream is not None
-            and stream_address != progress_address
-            and len(block_counts) > 1
-        )
+        pipelined = progress_stream is not None and stream_address != progress_address
         if not pipelined:
+            if progress_profile is not None:
+                progress_profile[0].record(stream)
+            launch()
             for progress_pass, blocks in enumerate(block_counts, 1):
-                self.epoch.phases.progress_host(self.runtime, blocks, stream)
+                progress(blocks, stream)
                 ready(progress_pass, progress_pass == len(block_counts))
+            if progress_profile is not None:
+                progress_profile[1].record(stream)
             return len(block_counts)
 
         import torch
 
-        if stream is None:
-            stream = torch.cuda.current_stream()
-        events: list[Any] = []
-        initial_done = torch.cuda.Event()
-        initial_done.record(stream)
-        events.append(initial_done)
-        previous_publication = initial_done
-        for progress_pass, blocks in enumerate(block_counts, 1):
-            progress_stream.wait_event(previous_publication)
-            self.epoch.phases.progress_host(
-                self.runtime, blocks, progress_stream
+        self.epoch.phases.discover(self.runtime, self.plan, stream)
+        if sync_events is None:
+            discovery_done = torch.cuda.Event()
+            arrival_events = tuple(torch.cuda.Event() for _ in block_counts)
+        else:
+            discovery_done, arrival_events = sync_events
+            if len(arrival_events) != len(block_counts):
+                raise ValueError(
+                    "synchronization events must match the finite progress bound"
+                )
+        events: list[Any] = [discovery_done]
+        discovery_done.record(stream)
+        progress_stream.wait_event(discovery_done)
+        if progress_profile is not None:
+            progress_profile[0].record(progress_stream)
+        if initial_ready_work_count:
+            self._launch(
+                wrapper,
+                q,
+                paged_kv_cache,
+                out,
+                scale,
+                BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+                initial_ready_work_count,
+                run_options,
             )
-            arrival = torch.cuda.Event()
+        for progress_pass, blocks in enumerate(block_counts, 1):
+            progress(blocks, progress_stream)
+            arrival = arrival_events[progress_pass - 1]
             arrival.record(progress_stream)
             stream.wait_event(arrival)
-            publication = torch.cuda.Event()
-            publication.record(stream)
             ready(progress_pass, progress_pass == len(block_counts))
-            events.extend((arrival, publication))
-            previous_publication = publication
+            events.append(arrival)
+        if progress_profile is not None:
+            progress_profile[1].record(progress_stream)
         # Retain event wrappers through at least the next call on this epoch.
         self._inflight_events = tuple(events)
         return self.epoch.max_progress_passes
@@ -337,6 +486,7 @@ class FlashInferLayerEpoch:
             out,
             scale,
             6,
+            None,
             run_options,
         )
 
@@ -390,20 +540,20 @@ class FlashInferLayerEpoch:
                 paged_kv_cache,
                 out,
                 scale,
-                SKIP_MERGE | BIND_CURRENT_GENERATION,
+                BIND_CURRENT_GENERATION,
+                None,
                 run_options,
             )
 
-        def ready(_progress_pass: int, final_pass: bool) -> None:
+        def ready(_progress_pass: int, _final_pass: bool) -> None:
             self._launch(
                 wrapper,
                 q,
                 paged_kv_cache,
                 out,
                 scale,
-                RUNNABLE_WORK
-                | BIND_CURRENT_GENERATION
-                | (SKIP_MERGE if not final_pass else 0),
+                BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+                None,
                 run_options,
             )
 

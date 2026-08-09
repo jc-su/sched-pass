@@ -8,7 +8,7 @@ in this document take precedence over the previous prototype's design notes.
 `SYSTEM_PLAN.md` governs the target system motivation and implementation order;
 this document governs implemented mechanism invariants and status.
 
-Implementation status (2026-08-02): M0-M3 have a working vertical slice tested
+Implementation status (2026-08-09): M0-M3 have a working vertical slice tested
 on an NVIDIA RTX PRO 6000 Blackwell Server Edition. M5 has a numerically checked
 split-K paged-attention mechanism workload and version-checked JIT hooks
 executed in FlashInfer 0.6.12 decode and FA2 paged-prefill kernels. This is not
@@ -26,7 +26,23 @@ on the common mechanism; production MoE baselines remain open. A 10,000-epoch
 runtime/graph lifecycle stress passes; the two-device ownership test is present
 but skips on this one-GPU host.
 
-ABI v20 defines one engine-neutral device work item, fixed-capacity dependency
+The current end-to-end SGLang/FlashInfer dense result is exact and
+fallback-free but negative: the ABI-v23 v10 2K mixed point has 0.977x stock
+throughput and 1.012x resident P99 inter-token latency. A five-trial
+acquisition-admission ablation was worse and has been removed. Separately, the
+canonical FlashInfer bounded-HBM operator now beats atomic CPU-DRAM promotion
+by 1.1714x with a paired-bootstrap 95% interval of [1.1660x, 1.1732x] while
+using 4x less staging HBM; a heterogeneous-shape run improves by 1.1100x with
+4.83x less staging. `TIER_STREAMING.md` defines that result and its claim
+boundary. The architecture therefore has a positive operator mechanism and an
+open serving integration hypothesis, not a production or OSDI result.
+Generated FlashInfer modules now export a versioned family/form/capability
+contract plus a typed request-coordinate/partial-state/reduction plan that eager
+and graph consumers validate before launch. Paired ragged-prefill direct and
+incremental forms are implemented; arbitrary-kernel recognition and the paged
+SGLang operator remain open.
+
+ABI v25 defines one engine-neutral device work item, fixed-capacity dependency
 segments, completion-driven reverse dependency edges, and a compact runnable
 work queue. The completion CTA that satisfies the final dependency performs the
 single `Pending -> Ready` transition and appends the ticket; a bounded
@@ -62,10 +78,12 @@ We will test the following research hypothesis:
 > with data arrival and later request admission across memory tiers, without
 > persistent GPU workers or loss of the native complete-data path.
 
-The primary workload is dense external KV for online serving with heterogeneous
-arrival time. Dense KV tests overlap of useful partial computation with data
-movement. GPU-selected sparse KV additionally tests avoided transfer and is not
-the scope of the system. The mechanism is designed for request-conditioned
+Dense external KV for online serving is the mandatory no-regression and
+batch-barrier stress workload. Canonical FlashInfer now demonstrates a dense
+CPU-DRAM crossover by preserving `(V, LSE)` partials while bounded staging
+overlaps transfer and computation. The remaining flagship gate is to generate
+and use that form in real model execution and beat equal-state serving
+baselines. The mechanism is designed for request-conditioned
 external tensors and object ranges rather than for KV alone. The complete
 co-design and evaluation roadmap is in `SYSTEM_PLAN.md`.
 
@@ -188,7 +206,7 @@ not independent production policies.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v20 registers each staged directory entry as one acquisition tile. Direct
+ABI v25 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
 this makes duplicate suppression exact without a range-availability bitmap.
 
@@ -418,7 +436,7 @@ external miss
 The queue lease protects only command construction and publication. It is
 released before the CTA returns and is never held across device I/O. The CTA
 does not inspect completion state. A separate finite progress invocation drains
-the CQ, releases credits, and publishes data availability. ABI v20 implements this for
+the CQ, releases credits, and publishes data availability. ABI v25 implements this for
 NVMe; RDMA remains inactive until a real backend and RNIC testbed exist.
 
 The fast path is intentionally opportunistic. Backend demand is atomically
@@ -430,6 +448,22 @@ from suppressing NVMe submission while preserving the global request-aware
 scheduler for contested NVMe work. Direct construction is capped at 32
 destination PRP pages; larger transfers retain warp-cooperative PRP construction
 and batched doorbells in the scheduled progress kernel.
+
+For scheduler-selected indexed CPU-DRAM objects, host progress is also bounded
+but uses enough transfer parallelism for serving-sized KV rows. One host call
+enqueues three finite kernels on the progress stream:
+
+```text
+claim + validate intents and byte credits
+    -> copy each object with 16 row-specialized CTAs
+    -> publish object transitions and release credits
+```
+
+The split is intentional. It prevents any object or work ticket from becoming
+available before every copy CTA has retired, while avoiding a grid barrier,
+device-side allocation, polling CTA, or persistent kernel. The optimized range
+path requires the scheduler's contiguous object interval; arbitrary queued host
+work retains the urgency-queue progress kernel.
 
 ### 6.6 No arbitrary live-state capture
 
@@ -481,8 +515,9 @@ FlashInfer is the first typed frontend: a version- and source-hash-checked C++
 template overlay retains its scheduler request/tile coordinates, inserts the
 work hook before shared/variant state initialization, and threads request-local
 merge groups into cascade reduction. The LLVM pass remains the backend legality
-verifier. A second generated-kernel frontend and generation of distinct direct
-and incremental forms from one typed operator remain open.
+verifier. Paired direct and preacquired-partial ragged-prefill forms now export
+one typed execution plan. A second generated-kernel frontend and automatic
+recognition of arbitrary production kernels remain open.
 
 ### 7.3 Phase C: object-key derivation
 
@@ -523,7 +558,7 @@ thread-derived operands, but LLVM IR alone cannot prove that an unrelated CTA
 never writes a plain global address; unsupported frontends must not assert this
 contract without equivalent ownership.
 
-The ABI-v20 IR suite includes a positive device-selected-object case whose slot,
+The ABI-v25 IR suite includes a positive device-selected-object case whose slot,
 identity, version, range, and direct pointer are loaded from a catalog selected
 by CTA identity. The pass lowers that case and tags it `split-phase-cta` while
 the existing thread/lane-derived fixtures remain rejected. This establishes
@@ -618,7 +653,7 @@ graph must choose a compatible control strategy; it cannot combine those two
 features as if they were independently composable. See the
 [CUDA Graphs programming guide](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html).
 
-ABI v20 also allows the missing application CTA to attempt one NVMe submission.
+ABI v25 also allows the missing application CTA to attempt one NVMe submission.
 A backend-local queue lease serializes it with the finite progress kernel. The
 CTA rings at most one doorbell, never waits for the lease or completion, and
 publishes an intent on any recoverable failure. This is a latency path, not a
@@ -653,11 +688,21 @@ conditions.
 
 The current implementation carries request generation, tenant, priority, and
 deadline into every intent. Request, tenant, and backend byte credits are
-reserved without waiting and rolled back on admission failure. NVMe consumes
-tagged per-backend urgency buckets, skipping stale heads without a normal-path
-capacity scan. Weighted tenant service is accounted but not yet enforced as an
-ordering rule within one bucket. CTA try-issue is permitted only when that
-backend has no older queued intent; otherwise the same scheduler orders it. Host
+reserved without waiting and rolled back on admission failure. ABI v25 accounts
+pending, executable, completed, and expected compiler-attributed compute plus
+unavailable bytes for each request generation. Checked subtraction makes
+counter underflow fail closed; rejected same-generation epoch attribution is
+observable, while stale generations do not modify replacement request state.
+NVMe consumes tagged per-backend
+urgency buckets, skipping stale heads without a normal-path capacity scan. On
+insertion and requeue, deadline urgency includes live backend outstanding bytes,
+estimated latency/bandwidth, and current request compute. Without an explicit
+deadline, equal-priority requests receive only a bounded shortest-critical-work
+preference; priority classes still dominate. CTA count alone is not a policy
+signal. Weighted tenant service is accounted but not yet enforced as
+an ordering rule within one bucket. CTA try-issue is opt-in and permitted only
+when that backend has no older queued intent; otherwise the same scheduler
+orders it. Host
 staging launches independent finite copy CTAs and enforces byte isolation, but
 does not yet impose global priority order because those copies can run
 concurrently. Remaining policy work is:
@@ -678,6 +723,16 @@ predicted_ready =
 ```
 
 The unified scheduler is not a claim of uniform transport behavior.
+
+The device transport queue consumes this state on every insertion and requeue.
+For a request, it estimates acquisition from current queue delay and bytes,
+overlaps that with already executable compute, then adds compute still blocked
+on data. Deadline slack and priority select the bucket from which transport
+service is popped. This is a causal online estimate; future arrivals are not
+inputs. A CUDA test proves live compiler-attributed compute changes I/O service
+order for equal-priority requests. `CriticalWorkPlan` is the matching host
+reference model. SGLang publication of request policy is implemented, while
+using snapshots for later batch formation remains an open integration gate.
 
 ## 11. Primary KV path
 
@@ -1091,7 +1146,7 @@ consumes direct pages or exits for finite staged acquisition. Runnable work is
 mapped back through the ticket rather than assuming request index equals slot.
 This is not yet a FlashInfer or SGLang sparse-attention integration.
 
-The ABI-v20 dependency-set workload separately acquires up to 32 mixed-tier
+The ABI-v25 dependency-set workload separately acquires up to 32 mixed-tier
 objects per CTA, supports cancellation, stale generations, stale object
 versions, and duplicate coalescing, and resumes only after the complete set is
 ready. Global-load and TMA attention now consume the same common work and

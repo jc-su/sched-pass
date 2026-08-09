@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 11
+API_VERSION = 22
 
 
 class RuntimeError(Exception):
@@ -35,6 +35,53 @@ class WorkTicketState(enum.IntEnum):
     INITIALIZING = 6
 
 
+class OperatorFamily(enum.IntEnum):
+    GENERIC = 0
+    FLASHINFER_DECODE = 1
+    FLASHINFER_PAGED_PREFILL = 2
+
+
+class OperatorForm(enum.IntEnum):
+    UNSPECIFIED = 0
+    DIRECT = 1
+    INCREMENTAL = 2
+
+
+class OperatorCapability(enum.IntFlag):
+    REQUEST_BINDING = 1 << 0
+    OBJECT_DEPENDENCIES = 1 << 1
+    FINITE_DEFERRAL = 1 << 2
+    PARTIAL_PUBLICATION = 1 << 3
+    COMPLETE_CONTRIBUTOR_MERGE = 1 << 4
+    RUNNABLE_COMPACTION = 1 << 5
+    GRAPH_REPLAY = 1 << 6
+    TYPED_FLASHINFER_FRONTEND = 1 << 7
+    PREACQUIRED_PARTIAL_ENTRY = 1 << 8
+
+
+class OperatorCoordinateMap(enum.IntEnum):
+    UNSPECIFIED = 0
+    FLASHINFER_REQUEST_CONTIGUOUS = 1
+
+
+class OperatorPartialState(enum.IntEnum):
+    NONE = 0
+    ONLINE_SOFTMAX_VALUE_LSE = 1
+
+
+class OperatorReduction(enum.IntEnum):
+    NONE = 0
+    ORDERED_MERGE_STATE = 1
+
+
+class OperatorPlanFlag(enum.IntFlag):
+    FIXED_CAPACITY = 1 << 0
+    GRAPH_STABLE = 1 << 1
+    EXTERNAL_WAVE_SOURCES = 1 << 2
+    GENERATION_BOUND = 1 << 3
+    EXACT_COMPLETE_MERGE = 1 << 4
+
+
 class _RuntimeConfig(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
@@ -50,6 +97,131 @@ class _RuntimeConfig(ctypes.Structure):
         ("tenant_capacity", ctypes.c_uint32),
         ("staging_byte_capacity", ctypes.c_uint64),
     ]
+
+
+class _OperatorContract(ctypes.Structure):
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("schema_version", ctypes.c_uint16),
+        ("struct_bytes", ctypes.c_uint16),
+        ("runtime_abi_version", ctypes.c_uint32),
+        ("family", ctypes.c_uint32),
+        ("form", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("capabilities", ctypes.c_uint64),
+        ("source_fingerprint_low", ctypes.c_uint64),
+        ("source_fingerprint_high", ctypes.c_uint64),
+    ]
+
+
+class _OperatorPlan(ctypes.Structure):
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("schema_version", ctypes.c_uint16),
+        ("struct_bytes", ctypes.c_uint16),
+        ("runtime_abi_version", ctypes.c_uint32),
+        ("family", ctypes.c_uint32),
+        ("supported_forms", ctypes.c_uint32),
+        ("coordinate_map", ctypes.c_uint32),
+        ("partial_state", ctypes.c_uint32),
+        ("reduction", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("source_fingerprint_low", ctypes.c_uint64),
+        ("source_fingerprint_high", ctypes.c_uint64),
+        ("plan_fingerprint_low", ctypes.c_uint64),
+        ("plan_fingerprint_high", ctypes.c_uint64),
+    ]
+
+
+@dataclasses.dataclass(frozen=True)
+class OperatorContract:
+    schema_version: int
+    runtime_abi_version: int
+    family: OperatorFamily
+    form: OperatorForm
+    capabilities: OperatorCapability
+    source_fingerprint: str
+
+    def require(
+        self,
+        *,
+        family: OperatorFamily,
+        form: OperatorForm,
+        capabilities: OperatorCapability = OperatorCapability(0),
+    ) -> None:
+        if self.family != family or self.form != form:
+            raise RuntimeError(
+                f"JIT operator contract is {self.family.name}/{self.form.name}, "
+                f"expected {family.name}/{form.name}"
+            )
+        missing = capabilities & ~self.capabilities
+        if missing:
+            raise RuntimeError(
+                f"JIT operator contract lacks capabilities {missing!s}"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class OperatorPlan:
+    schema_version: int
+    runtime_abi_version: int
+    family: OperatorFamily
+    supported_forms: int
+    coordinate_map: OperatorCoordinateMap
+    partial_state: OperatorPartialState
+    reduction: OperatorReduction
+    flags: OperatorPlanFlag
+    source_fingerprint: str
+    plan_fingerprint: str
+
+    def supports(self, form: OperatorForm) -> bool:
+        return form != OperatorForm.UNSPECIFIED and bool(
+            self.supported_forms & (1 << int(form))
+        )
+
+    def require(
+        self,
+        *,
+        family: OperatorFamily,
+        forms: tuple[OperatorForm, ...],
+        coordinate_map: OperatorCoordinateMap,
+        partial_state: OperatorPartialState,
+        reduction: OperatorReduction,
+        flags: OperatorPlanFlag = OperatorPlanFlag(0),
+    ) -> None:
+        if self.family != family or any(not self.supports(form) for form in forms):
+            raise RuntimeError("JIT operator plan lacks the required family or forms")
+        if (
+            self.coordinate_map != coordinate_map
+            or self.partial_state != partial_state
+            or self.reduction != reduction
+        ):
+            raise RuntimeError("JIT operator plan has incompatible numerical semantics")
+        missing = flags & ~self.flags
+        if missing:
+            raise RuntimeError(f"JIT operator plan lacks flags {missing!s}")
+
+
+def require_operator_pair(
+    direct: "JitPhaseProgram", incremental: "JitPhaseProgram"
+) -> OperatorPlan:
+    """Return the common typed plan or reject an independently generated pair."""
+
+    direct_contract = direct.operator_contract
+    incremental_contract = incremental.operator_contract
+    if (
+        direct_contract.form != OperatorForm.DIRECT
+        or incremental_contract.form != OperatorForm.INCREMENTAL
+        or direct_contract.family != incremental_contract.family
+        or direct_contract.source_fingerprint
+        != incremental_contract.source_fingerprint
+        or direct.operator_plan != incremental.operator_plan
+    ):
+        raise RuntimeError(
+            "JIT direct and incremental modules have incompatible operator plans"
+        )
+    return direct.operator_plan
 
 
 class _Replica(ctypes.Structure):
@@ -197,14 +369,33 @@ class _RequestProgress(ctypes.Structure):
         ("unavailable_bytes", ctypes.c_uint64),
         ("runnable_compute_ns", ctypes.c_uint64),
         ("completed_compute_ns", ctypes.c_uint64),
+        ("pending_compute_ns", ctypes.c_uint64),
+        ("expected_compute_ns", ctypes.c_uint64),
+        ("dropped_attributions", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64),
+    ]
+
+
+class _RequestSpec(ctypes.Structure):
+    _fields_ = [
+        ("request_id", ctypes.c_uint64),
+        ("deadline_clock", ctypes.c_uint64),
+        ("max_outstanding_bytes", ctypes.c_uint64),
+        ("slot", ctypes.c_uint32),
+        ("generation", ctypes.c_uint32),
+        ("tenant_id", ctypes.c_uint32),
+        ("priority", ctypes.c_uint32),
     ]
 
 
 def _validate_abi_layouts() -> None:
     layouts = (
+        ("OperatorContract", ctypes.sizeof(_OperatorContract), 48),
+        ("OperatorPlan", ctypes.sizeof(_OperatorPlan), 72),
         ("AcquireRequirement", ctypes.sizeof(AcquireRequirement), 48),
         ("WorkItem", ctypes.sizeof(WorkItem), 64),
-        ("RequestProgress", ctypes.sizeof(_RequestProgress), 64),
+        ("RequestProgress", ctypes.sizeof(_RequestProgress), 96),
+        ("RequestSpec", ctypes.sizeof(_RequestSpec), 40),
     )
     invalid = [
         f"{name}={observed} (expected {expected})"
@@ -227,7 +418,7 @@ class RuntimeConfig:
     max_replicas_per_object: int = 1
     max_dependencies_per_work_ticket: int = 8
     device_ordinal: int = -1
-    enable_cta_nvme_try_issue: bool = True
+    enable_cta_nvme_try_issue: bool = False
     tenant_capacity: int = 0
     staging_byte_capacity: int = (1 << 64) - 1
 
@@ -245,6 +436,28 @@ class RuntimeConfig:
             int(self.enable_cta_nvme_try_issue),
             self.tenant_capacity,
             self.staging_byte_capacity,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RequestSpec:
+    slot: int
+    request_id: int
+    generation: int
+    tenant_id: int = 0
+    priority: int = 0
+    deadline_clock: int = 0
+    max_outstanding_bytes: int = (1 << 64) - 1
+
+    def native(self) -> _RequestSpec:
+        return _RequestSpec(
+            self.request_id,
+            self.deadline_clock,
+            self.max_outstanding_bytes,
+            self.slot,
+            self.generation,
+            self.tenant_id,
+            self.priority,
         )
 
 
@@ -376,6 +589,9 @@ class RequestProgress:
     unavailable_bytes: int
     runnable_compute_ns: int
     completed_compute_ns: int
+    pending_compute_ns: int
+    expected_compute_ns: int
+    dropped_attributions: int
 
     @property
     def complete(self) -> bool:
@@ -385,6 +601,30 @@ class RequestProgress:
             and self.failed_work == 0
             and self.cancelled_work == 0
         )
+
+    @property
+    def remaining_compute_ns(self) -> int:
+        return max(0, self.expected_compute_ns - self.completed_compute_ns)
+
+
+def _request_progress_value(value: _RequestProgress) -> RequestProgress:
+    return RequestProgress(
+        value.request_id,
+        value.generation,
+        value.expected_work,
+        value.pending_work,
+        value.runnable_work,
+        value.completed_work,
+        value.failed_work,
+        value.cancelled_work,
+        value.epoch,
+        value.unavailable_bytes,
+        value.runnable_compute_ns,
+        value.completed_compute_ns,
+        value.pending_compute_ns,
+        value.expected_compute_ns,
+        value.dropped_attributions,
+    )
 
 
 def _library_candidates() -> Iterable[str]:
@@ -461,6 +701,14 @@ _runtime_set_request = _function(
     ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
+    ctypes.c_uint64,
+)
+_runtime_publish_requests_async = _function(
+    "nta_runtime_publish_requests_async",
+    ctypes.c_int,
+    _Handle,
+    ctypes.POINTER(_RequestSpec),
+    ctypes.c_uint32,
     ctypes.c_uint64,
 )
 _runtime_cancel_request = _function(
@@ -559,6 +807,12 @@ _runtime_epoch_status = _function(
     ctypes.c_uint32,
     ctypes.POINTER(_EpochStatus),
 )
+_runtime_sticky_failed_count = _function(
+    "nta_runtime_read_sticky_failed_count",
+    ctypes.c_int,
+    _Handle,
+    ctypes.POINTER(ctypes.c_uint32),
+)
 _runtime_request_progress = _function(
     "nta_runtime_read_request_progress",
     ctypes.c_int,
@@ -573,6 +827,15 @@ _runtime_request_progress_range = _function(
     ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.POINTER(_RequestProgress),
+)
+_runtime_copy_request_progress_async = _function(
+    "nta_runtime_copy_request_progress_async",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
 )
 _runtime_work_ticket_state = _function(
     "nta_runtime_read_work_ticket_state",
@@ -640,22 +903,48 @@ _device_pointer_dlpack = _function(
     ctypes.c_int32,
     ctypes.POINTER(ctypes.c_void_p),
 )
-_dlpack_destroy = _function(
-    "nta_dlpack_managed_tensor_destroy", None, ctypes.c_void_p
-)
-_stream_synchronize = _function(
-    "nta_stream_synchronize", ctypes.c_int, ctypes.c_uint64
+_dlpack_destroy = _function("nta_dlpack_managed_tensor_destroy", None, ctypes.c_void_p)
+_stream_synchronize = _function("nta_stream_synchronize", ctypes.c_int, ctypes.c_uint64)
+_copy_host_to_device = _function(
+    "nta_copy_host_to_device_async",
+    ctypes.c_int,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
 )
 _phase_create = _function(
     "nta_jit_phase_program_create", ctypes.c_int, ctypes.c_char_p, _HandlePointer
 )
 _phase_destroy = _function("nta_jit_phase_program_destroy", None, _Handle)
+_phase_operator_contract = _function(
+    "nta_jit_phase_operator_contract",
+    ctypes.c_int,
+    _Handle,
+    ctypes.POINTER(_OperatorContract),
+)
+_phase_operator_plan = _function(
+    "nta_jit_phase_operator_plan",
+    ctypes.c_int,
+    _Handle,
+    ctypes.POINTER(_OperatorPlan),
+)
 _phase_reset = _function(
     "nta_jit_phase_reset",
     ctypes.c_int,
     _Handle,
     _Handle,
     ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_discover = _function(
+    "nta_jit_phase_discover",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
@@ -668,6 +957,28 @@ _phase_invalidate_cached_objects = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_phase_validate_indexed_host_range = _function(
+    "nta_jit_phase_validate_indexed_host_range",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_rebind_indexed_host_pairs = _function(
+    "nta_jit_phase_rebind_indexed_host_pairs",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
 _phase_preload_host = _function(
     "nta_jit_phase_preload_host",
     ctypes.c_int,
@@ -677,11 +988,60 @@ _phase_preload_host = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_phase_preload_host_pairs = _function(
+    "nta_jit_phase_preload_host_pairs",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_alias_preloaded = _function(
+    "nta_jit_phase_alias_preloaded_objects",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
 _phase_host = _function(
     "nta_jit_phase_progress_host",
     ctypes.c_int,
     _Handle,
     _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_indexed_host_range = _function(
+    "nta_jit_phase_progress_indexed_host_range",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_validated_indexed_host_range = _function(
+    "nta_jit_phase_progress_validated_indexed_host_range",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_validated_indexed_host_range_parallel = _function(
+    "nta_jit_phase_progress_validated_indexed_host_range_parallel",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
@@ -710,6 +1070,15 @@ _phase_complete = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_phase_complete_stream_ordered = _function(
+    "nta_jit_phase_complete_stream_ordered",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
 
 
 if _api_version() != API_VERSION:
@@ -732,6 +1101,18 @@ def _stream_address(value: Any) -> int:
 
 def synchronize_stream(stream: Any = None) -> None:
     _check(_stream_synchronize(_stream_address(stream)))
+
+
+def copy_host_to_device_async(
+    destination: int, source: int, bytes: int, stream: Any = None
+) -> None:
+    if min(destination, source, bytes) <= 0:
+        raise ValueError("host-to-device copy needs addresses and bytes")
+    _check(
+        _copy_host_to_device(
+            destination, source, bytes, _stream_address(stream)
+        )
+    )
 
 
 def _device_byte_tensor(address: int, device_ordinal: int):
@@ -891,6 +1272,29 @@ class Runtime(_Owner):
             )
         )
 
+    def publish_requests_async(
+        self, requests: Iterable[RequestSpec], stream: Any = None
+    ) -> None:
+        """Publish changed request slots before later work on ``stream``.
+
+        The stream must be ordered after every old generation that uses the
+        supplied slots. This method does not synchronize the calling thread.
+        """
+        values = sorted(requests, key=lambda request: request.slot)
+        if not values:
+            raise ValueError("request publication batch cannot be empty")
+        if len({request.slot for request in values}) != len(values):
+            raise ValueError("request publication slots must be unique")
+        native = (_RequestSpec * len(values))(*(request.native() for request in values))
+        _check(
+            _runtime_publish_requests_async(
+                self._handle,
+                native,
+                len(values),
+                _stream_address(stream),
+            )
+        )
+
     def cancel_request(self, slot: int, generation: int) -> None:
         _check(_runtime_cancel_request(self._handle, slot, generation))
 
@@ -1041,9 +1445,7 @@ class Runtime(_Owner):
     def work_ticket_state(self, work_ticket: int) -> int:
         value = ctypes.c_uint32()
         _check(
-            _runtime_work_ticket_state(
-                self._handle, work_ticket, ctypes.byref(value)
-            )
+            _runtime_work_ticket_state(self._handle, work_ticket, ctypes.byref(value))
         )
         return int(value.value)
 
@@ -1051,11 +1453,7 @@ class Runtime(_Owner):
         if work_ticket_count <= 0:
             raise ValueError("work ticket count must be positive")
         values = (ctypes.c_uint64 * work_ticket_count)()
-        _check(
-            _runtime_work_runnable_ns(
-                self._handle, work_ticket_count, values
-            )
-        )
+        _check(_runtime_work_runnable_ns(self._handle, work_ticket_count, values))
         return tuple(int(value) for value in values)
 
     def epoch_status(self, work_ticket_count: int | None = None) -> EpochStatus:
@@ -1077,27 +1475,18 @@ class Runtime(_Owner):
             value.initializing,
         )
 
+    @property
+    def sticky_failed_count(self) -> int:
+        value = ctypes.c_uint32()
+        _check(_runtime_sticky_failed_count(self._handle, ctypes.byref(value)))
+        return int(value.value)
+
     def request_progress(self, request_slot: int) -> RequestProgress:
         value = _RequestProgress()
         _check(
-            _runtime_request_progress(
-                self._handle, request_slot, ctypes.byref(value)
-            )
+            _runtime_request_progress(self._handle, request_slot, ctypes.byref(value))
         )
-        return RequestProgress(
-            value.request_id,
-            value.generation,
-            value.expected_work,
-            value.pending_work,
-            value.runnable_work,
-            value.completed_work,
-            value.failed_work,
-            value.cancelled_work,
-            value.epoch,
-            value.unavailable_bytes,
-            value.runnable_compute_ns,
-            value.completed_compute_ns,
-        )
+        return _request_progress_value(value)
 
     def request_progress_range(
         self, first_request_slot: int, request_count: int
@@ -1110,23 +1499,91 @@ class Runtime(_Owner):
                 self._handle, first_request_slot, request_count, values
             )
         )
-        return tuple(
-            RequestProgress(
-                value.request_id,
-                value.generation,
-                value.expected_work,
-                value.pending_work,
-                value.runnable_work,
-                value.completed_work,
-                value.failed_work,
-                value.cancelled_work,
-                value.epoch,
-                value.unavailable_bytes,
-                value.runnable_compute_ns,
-                value.completed_compute_ns,
-            )
-            for value in values
+        return tuple(_request_progress_value(value) for value in values)
+
+    def request_progress_snapshot(
+        self, capacity: int | None = None
+    ) -> "RequestProgressSnapshot":
+        return RequestProgressSnapshot(
+            self,
+            self._config.request_capacity if capacity is None else capacity,
         )
+
+
+class RequestProgressSnapshot:
+    """Reusable stream-ordered request-progress snapshot in pinned memory."""
+
+    def __init__(self, runtime: Runtime, capacity: int) -> None:
+        if capacity <= 0 or capacity > runtime._config.request_capacity:
+            raise ValueError("request progress snapshot capacity is invalid")
+        import torch
+
+        self._runtime = runtime
+        self._capacity = capacity
+        self._storage = torch.empty(
+            capacity * ctypes.sizeof(_RequestProgress),
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+        self._event = torch.cuda.Event()
+        self._pending: tuple[int, int] | None = None
+
+    @property
+    def pending(self) -> bool:
+        return self._pending is not None
+
+    @property
+    def ready(self) -> bool:
+        return self._pending is not None and self._event.query()
+
+    def capture(
+        self, first_request_slot: int, request_count: int, stream: Any = None
+    ) -> None:
+        if request_count <= 0 or request_count > self._capacity:
+            raise ValueError("request progress snapshot count is invalid")
+        if self._pending is not None and not self._event.query():
+            raise RuntimeError("request progress snapshot is still in flight")
+        import torch
+
+        selected_stream = (
+            torch.cuda.current_stream(self._runtime.device_ordinal)
+            if stream is None
+            else stream
+        )
+        _check(
+            _runtime_copy_request_progress_async(
+                self._runtime._handle,
+                first_request_slot,
+                request_count,
+                self._storage.data_ptr(),
+                _stream_address(selected_stream),
+            )
+        )
+        self._event.record(selected_stream)
+        self._pending = (first_request_slot, request_count)
+
+    def query(self) -> tuple[RequestProgress, ...] | None:
+        if self._pending is None or not self._event.query():
+            return None
+        return self._consume()
+
+    def wait(self) -> tuple[RequestProgress, ...]:
+        if self._pending is None:
+            raise RuntimeError("request progress snapshot has not been captured")
+        self._event.synchronize()
+        return self._consume()
+
+    def _consume(self) -> tuple[RequestProgress, ...]:
+        assert self._pending is not None
+        _, request_count = self._pending
+        base = self._storage.data_ptr()
+        stride = ctypes.sizeof(_RequestProgress)
+        result = tuple(
+            _request_progress_value(_RequestProgress.from_address(base + index * stride))
+            for index in range(request_count)
+        )
+        self._pending = None
+        return result
 
 
 class DeviceWorkPlan(_Owner):
@@ -1243,6 +1700,71 @@ class JitPhaseProgram(_Owner):
         self._handle = _Handle()
         path = os.fsencode(shared_object)
         _check(_phase_create(path, ctypes.byref(self._handle)))
+        native = _OperatorContract()
+        _check(_phase_operator_contract(self._handle, ctypes.byref(native)))
+        if native.magic != 0x4F41544E or native.struct_bytes != ctypes.sizeof(native):
+            self.close()
+            raise RuntimeError("JIT module returned an invalid operator contract")
+        fingerprint = (
+            int(native.source_fingerprint_low).to_bytes(8, "little")
+            + int(native.source_fingerprint_high).to_bytes(8, "little")
+        ).hex()
+        self._operator_contract = OperatorContract(
+            int(native.schema_version),
+            int(native.runtime_abi_version),
+            OperatorFamily(native.family),
+            OperatorForm(native.form),
+            OperatorCapability(native.capabilities),
+            fingerprint,
+        )
+        native_plan = _OperatorPlan()
+        _check(_phase_operator_plan(self._handle, ctypes.byref(native_plan)))
+        if native_plan.magic != 0x5041544E or native_plan.struct_bytes != ctypes.sizeof(
+            native_plan
+        ):
+            self.close()
+            raise RuntimeError("JIT module returned an invalid operator plan")
+        source_fingerprint = (
+            int(native_plan.source_fingerprint_low).to_bytes(8, "little")
+            + int(native_plan.source_fingerprint_high).to_bytes(8, "little")
+        ).hex()
+        plan_fingerprint = (
+            int(native_plan.plan_fingerprint_low).to_bytes(8, "little")
+            + int(native_plan.plan_fingerprint_high).to_bytes(8, "little")
+        ).hex()
+        self._operator_plan = OperatorPlan(
+            int(native_plan.schema_version),
+            int(native_plan.runtime_abi_version),
+            OperatorFamily(native_plan.family),
+            int(native_plan.supported_forms),
+            OperatorCoordinateMap(native_plan.coordinate_map),
+            OperatorPartialState(native_plan.partial_state),
+            OperatorReduction(native_plan.reduction),
+            OperatorPlanFlag(native_plan.flags),
+            source_fingerprint,
+            plan_fingerprint,
+        )
+        if (
+            self._operator_plan.family != self._operator_contract.family
+            or not self._operator_plan.supports(self._operator_contract.form)
+            or self._operator_plan.runtime_abi_version
+            != self._operator_contract.runtime_abi_version
+            or self._operator_plan.source_fingerprint
+            != self._operator_contract.source_fingerprint
+            or self._operator_plan.plan_fingerprint == "0" * 32
+        ):
+            self.close()
+            raise RuntimeError(
+                "JIT operator plan does not match the module contract"
+            )
+
+    @property
+    def operator_contract(self) -> OperatorContract:
+        return self._operator_contract
+
+    @property
+    def operator_plan(self) -> OperatorPlan:
+        return self._operator_plan
 
     def reset(
         self,
@@ -1257,6 +1779,22 @@ class JitPhaseProgram(_Owner):
                 runtime._handle,
                 object_count,
                 work_ticket_count,
+                _stream_address(stream),
+            )
+        )
+
+    def discover(
+        self, runtime: Runtime, plan: DeviceWorkPlan, stream: Any = None
+    ) -> None:
+        if runtime.device_ordinal != plan.device_ordinal:
+            raise ValueError("runtime and work plan must own the same CUDA device")
+        _check(
+            _phase_discover(
+                self._handle,
+                runtime._handle,
+                plan.work_items_address,
+                plan.dependencies_address,
+                plan.work_item_count,
                 _stream_address(stream),
             )
         )
@@ -1278,9 +1816,104 @@ class JitPhaseProgram(_Owner):
             )
         )
 
+    def validate_indexed_host_range(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        stream: Any = None,
+    ) -> None:
+        _check(
+            _phase_validate_indexed_host_range(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
+                _stream_address(stream),
+            )
+        )
+
+    def rebind_indexed_host_pairs(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        pair_count: int,
+        key_source: int,
+        key_staging: int,
+        value_source: int,
+        value_staging: int,
+        stream: Any = None,
+    ) -> None:
+        _check(
+            _phase_rebind_indexed_host_pairs(
+                self._handle,
+                runtime._handle,
+                first_object,
+                pair_count,
+                key_source,
+                key_staging,
+                value_source,
+                value_staging,
+                _stream_address(stream),
+            )
+        )
+
     def progress_host(self, runtime: Runtime, blocks: int, stream: Any = None) -> None:
         _check(
             _phase_host(self._handle, runtime._handle, blocks, _stream_address(stream))
+        )
+
+    def progress_indexed_host_range(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        stream: Any = None,
+    ) -> None:
+        _check(
+            _phase_indexed_host_range(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
+                _stream_address(stream),
+            )
+        )
+
+    def progress_validated_indexed_host_range(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        stream: Any = None,
+    ) -> None:
+        _check(
+            _phase_validated_indexed_host_range(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
+                _stream_address(stream),
+            )
+        )
+
+    def progress_validated_indexed_host_range_parallel(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        copy_blocks_per_group: int,
+        stream: Any = None,
+    ) -> None:
+        _check(
+            _phase_validated_indexed_host_range_parallel(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
+                copy_blocks_per_group,
+                _stream_address(stream),
+            )
         )
 
     def preload_host(
@@ -1296,6 +1929,46 @@ class JitPhaseProgram(_Owner):
                 runtime._handle,
                 first_object,
                 object_count,
+                _stream_address(stream),
+            )
+        )
+
+    def preload_host_pairs(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        pair_count: int,
+        stream: Any = None,
+    ) -> None:
+        _check(
+            _phase_preload_host_pairs(
+                self._handle,
+                runtime._handle,
+                first_object,
+                pair_count,
+                _stream_address(stream),
+            )
+        )
+
+    def alias_preloaded_objects(
+        self,
+        runtime: Runtime,
+        source_first: int,
+        destination_first: int,
+        object_count: int,
+        object_id_base: int,
+        version: int,
+        stream: Any = None,
+    ) -> None:
+        _check(
+            _phase_alias_preloaded(
+                self._handle,
+                runtime._handle,
+                source_first,
+                destination_first,
+                object_count,
+                object_id_base,
+                version,
                 _stream_address(stream),
             )
         )
@@ -1337,6 +2010,21 @@ class JitPhaseProgram(_Owner):
                 self._handle,
                 runtime._handle,
                 work_ticket_count,
+                _stream_address(stream),
+            )
+        )
+
+    def complete_stream_ordered(
+        self, runtime: Runtime, plan: DeviceWorkPlan, stream: Any = None
+    ) -> None:
+        if runtime.device_ordinal != plan.device_ordinal:
+            raise ValueError("runtime and work plan must own the same CUDA device")
+        _check(
+            _phase_complete_stream_ordered(
+                self._handle,
+                runtime._handle,
+                plan.work_items_address,
+                plan.work_item_count,
                 _stream_address(stream),
             )
         )

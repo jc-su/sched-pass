@@ -50,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-total-tokens", type=int, default=320)
     parser.add_argument("--context-length", type=int, default=512)
     parser.add_argument("--mem-fraction-static", type=float, default=0.35)
+    parser.add_argument("--hicache-ratio", type=float, default=4.0)
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument(
         "--cuda-graph-decode",
@@ -73,6 +74,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("token counts and iterations must be positive")
     if args.resident_tokens < 0:
         parser.error("resident token count cannot be negative")
+    if args.hicache_ratio <= 1.0:
+        parser.error("HiCache ratio must exceed the device-cache size")
     if args.max_attempts is None:
         args.max_attempts = 4 * args.iterations
     if args.max_attempts < args.iterations:
@@ -142,7 +145,16 @@ def generation_results(result: Any) -> list[dict[str, Any]]:
 
 def host_cached_tokens(result: dict[str, Any]) -> int:
     details = result.get("meta_info", {}).get("cached_tokens_details", {})
+    if not isinstance(details, dict):
+        return 0
     return int(details.get("host", 0))
+
+
+def device_cached_tokens(result: dict[str, Any]) -> int:
+    details = result.get("meta_info", {}).get("cached_tokens_details", {})
+    if not isinstance(details, dict):
+        return 0
+    return int(details.get("device", 0))
 
 
 def main() -> int:
@@ -156,9 +168,20 @@ def main() -> int:
         make_prompt(tokenizer, f"hot-prefix-{index}", args.hot_tokens)
         for index in range(args.hot_requests)
     ]
+    shape_warmup = [
+        make_prompt(tokenizer, f"shape-warmup-hot-{index}", args.hot_tokens)
+        for index in range(args.hot_requests)
+    ]
+    if args.resident_tokens:
+        shape_warmup.append(
+            make_prompt(
+                tokenizer, "shape-warmup-resident", args.resident_tokens
+            )
+        )
+    eviction_rounds = args.max_total_tokens // args.churn_tokens + 1
     churn = [
         make_prompt(tokenizer, f"eviction-{attempt}", args.churn_tokens)
-        for attempt in range(args.max_attempts + 1)
+        for attempt in range(eviction_rounds * (args.max_attempts + 1))
     ]
     resident = (
         [
@@ -182,14 +205,23 @@ def main() -> int:
         cuda_graph_backend_prefill="disabled",
         chunked_prefill_size=args.context_length,
         enable_hierarchical_cache=True,
-        hicache_ratio=2.0,
+        hicache_ratio=args.hicache_ratio,
         hicache_write_policy="write_through",
         hicache_io_backend="kernel",
         hicache_mem_layout="page_first",
     ) as engine:
         load_seconds = time.perf_counter() - load_started
+        generation_results(engine.generate(shape_warmup, sampling))
+        # Warm the exact two-cache-hit attention shape outside the timed region.
+        # Placement does not affect FlashInfer specialization; the measured arm
+        # below separately proves host versus device residency from SGLang's
+        # response metadata.
+        generation_results(engine.generate(shape_warmup, sampling))
         generation_results(engine.generate(hot, sampling))
-        generated_text(engine.generate(churn[0], sampling))
+        churn_cursor = 0
+        for _ in range(eviction_rounds):
+            generated_text(engine.generate(churn[churn_cursor], sampling))
+            churn_cursor += 1
         samples: list[float] = []
         metadata: list[Any] = []
         attempt_seconds: list[float] = []
@@ -198,6 +230,11 @@ def main() -> int:
         generated_samples: list[list[str]] = []
         digest = hashlib.sha256()
         for attempt in range(args.max_attempts):
+            if resident:
+                # Make the peer a device-cache hit, rather than an uncached
+                # prefill that SGLang can place in a different forward batch.
+                # This setup is deliberately excluded from the measured call.
+                generated_text(engine.generate(resident[attempt], sampling))
             started = time.perf_counter()
             prompts = hot + ([resident[attempt]] if resident else [])
             result = engine.generate(prompts, sampling)
@@ -207,10 +244,15 @@ def main() -> int:
             result_metadata = [value.get("meta_info", {}) for value in values]
             attempt_seconds.append(elapsed)
             attempt_metadata.append(result_metadata)
-            if all(
+            hot_is_external = all(
                 host_cached_tokens(value) > 0
                 for value in values[: args.hot_requests]
-            ):
+            )
+            peer_is_resident = not resident or (
+                device_cached_tokens(values[args.hot_requests]) > 0
+                and host_cached_tokens(values[args.hot_requests]) == 0
+            )
+            if hot_is_external and peer_is_resident:
                 samples.append(elapsed)
                 metadata.append(result_metadata)
                 external_attempt_indices.append(attempt)
@@ -218,7 +260,9 @@ def main() -> int:
                 for text in texts:
                     digest.update(text.encode("utf-8"))
                     digest.update(b"\0")
-            generated_text(engine.generate(churn[attempt + 1], sampling))
+            for _ in range(eviction_rounds):
+                generated_text(engine.generate(churn[churn_cursor], sampling))
+                churn_cursor += 1
             if len(samples) == args.iterations:
                 break
         if len(samples) != args.iterations:
@@ -266,6 +310,9 @@ def main() -> int:
         "hot_tokens": args.hot_tokens,
         "hot_requests": args.hot_requests,
         "churn_tokens": args.churn_tokens,
+        "eviction_rounds": eviction_rounds,
+        "eviction_tokens_per_attempt": eviction_rounds * args.churn_tokens,
+        "hicache_ratio": args.hicache_ratio,
         "resident_tokens": args.resident_tokens,
         "batch_width": args.hot_requests + (1 if resident else 0),
         "max_total_tokens": args.max_total_tokens,
@@ -274,6 +321,9 @@ def main() -> int:
         "max_attempts": args.max_attempts,
         "external_attempt_indices": external_attempt_indices,
         "load_seconds": load_seconds,
+        "shape_warmup_excluded": True,
+        "resident_setup_excluded": bool(resident),
+        "placement_proof_required": bool(resident),
         "promotion_seconds_samples": samples,
         "attempt_seconds_samples": attempt_seconds,
         "median_promotion_seconds": median,

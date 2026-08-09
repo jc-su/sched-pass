@@ -63,6 +63,7 @@ template <typename T> T downloadOne(const T *source, std::uint32_t slot) {
 
 struct HostRuntime::Impl {
   static constexpr std::size_t DirectoryUploadDepth = 4;
+  static constexpr std::size_t RequestUploadDepth = 4;
 
   struct OwnedReplica {
     Placement placement;
@@ -80,6 +81,13 @@ struct HostRuntime::Impl {
   struct DirectoryUpload {
     abi::ObjectEntry *objects = nullptr;
     abi::ReplicaEntry *replicas = nullptr;
+    cudaEvent_t complete = nullptr;
+    bool pending = false;
+  };
+
+  struct RequestUpload {
+    abi::RequestContext *requests = nullptr;
+    abi::RequestProgress *progress = nullptr;
     cudaEvent_t complete = nullptr;
     bool pending = false;
   };
@@ -198,6 +206,21 @@ struct HostRuntime::Impl {
                                            cudaEventDisableTiming),
                   "cudaEventCreate directory upload");
       }
+      for (RequestUpload &upload : requestUploads) {
+        checkCuda(cudaHostAlloc(
+                      reinterpret_cast<void **>(&upload.requests),
+                      config.requestCapacity * sizeof(abi::RequestContext),
+                      cudaHostAllocPortable),
+                  "cudaHostAlloc request-directory staging");
+        checkCuda(cudaHostAlloc(
+                      reinterpret_cast<void **>(&upload.progress),
+                      config.requestCapacity * sizeof(abi::RequestProgress),
+                      cudaHostAllocPortable),
+                  "cudaHostAlloc request-progress staging");
+        checkCuda(cudaEventCreateWithFlags(&upload.complete,
+                                           cudaEventDisableTiming),
+                  "cudaEventCreate request upload");
+      }
 
       const auto backend = [](abi::SourceKind kind, bool active,
                               std::uint64_t state, std::uint64_t latencyNs,
@@ -302,6 +325,7 @@ struct HostRuntime::Impl {
           0,
           0,
           abi::Version,
+          0,
       };
       view = deviceAllocate<abi::RuntimeView>(1);
       checkCuda(
@@ -348,6 +372,21 @@ struct HostRuntime::Impl {
 
   void release() noexcept {
     detail::NoexceptCudaDeviceGuard deviceGuard(config.deviceOrdinal);
+    for (RequestUpload &upload : requestUploads) {
+      if (upload.pending && upload.complete != nullptr) {
+        (void)cudaEventSynchronize(upload.complete);
+      }
+      if (upload.complete != nullptr) {
+        (void)cudaEventDestroy(upload.complete);
+      }
+      if (upload.progress != nullptr) {
+        (void)cudaFreeHost(upload.progress);
+      }
+      if (upload.requests != nullptr) {
+        (void)cudaFreeHost(upload.requests);
+      }
+      upload = {};
+    }
     for (DirectoryUpload &upload : directoryUploads) {
       if (upload.pending && upload.complete != nullptr) {
         (void)cudaEventSynchronize(upload.complete);
@@ -549,6 +588,8 @@ struct HostRuntime::Impl {
   std::shared_ptr<NvmeTransport> nvme;
   std::array<DirectoryUpload, DirectoryUploadDepth> directoryUploads{};
   std::size_t nextDirectoryUpload = 0;
+  std::array<RequestUpload, RequestUploadDepth> requestUploads{};
+  std::size_t nextRequestUpload = 0;
   std::uint64_t ownedStagingBytes = 0;
   std::uint64_t stagingHighWaterBytes = 0;
 };
@@ -595,8 +636,89 @@ void HostRuntime::setRequest(std::uint32_t slot, std::uint64_t requestId,
   impl_->requestInstalled[slot] = true;
   uploadOne(impl_->requests, slot, request);
   uploadOne(impl_->requestProgress, slot,
-            abi::RequestProgress{requestId, generation, 0, 0, 0, 0, 0, 0,
-                                 0, 0, 0, 0});
+            abi::RequestProgress{requestId, generation, 0, 0, 0, 0, 0, 0, 0, 0,
+                                 0, 0, 0, 0, 0});
+}
+
+void HostRuntime::publishRequestsAsync(std::span<const RequestSpec> requests,
+                                       cudaStream_t stream) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
+  if (requests.empty()) {
+    throw std::invalid_argument("request publication batch cannot be empty");
+  }
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    const RequestSpec &request = requests[index];
+    impl_->checkRequestSlot(request.slot);
+    if (request.tenantId >= impl_->config.tenantCapacity) {
+      throw std::out_of_range("tenant id exceeds runtime capacity");
+    }
+    if (index != 0 && requests[index - 1].slot >= request.slot) {
+      throw std::invalid_argument(
+          "asynchronous request slots must be unique and increasing");
+    }
+  }
+
+  Impl::RequestUpload &upload =
+      impl_->requestUploads[impl_->nextRequestUpload++ %
+                            impl_->requestUploads.size()];
+  if (upload.pending) {
+    checkCuda(cudaEventSynchronize(upload.complete),
+              "recycle request upload staging");
+    upload.pending = false;
+  }
+
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    const RequestSpec &spec = requests[index];
+    const abi::RequestContext request{
+        spec.requestId,
+        spec.deadlineClock,
+        spec.maxOutstandingBytes,
+        0,
+        spec.generation,
+        spec.tenantId,
+        spec.priority,
+        0,
+    };
+    upload.requests[index] = request;
+    upload.progress[index] = abi::RequestProgress{
+        spec.requestId, spec.generation, 0, 0, 0, 0, 0, 0,
+        0,              0,               0, 0, 0, 0, 0};
+  }
+
+  try {
+    std::size_t begin = 0;
+    while (begin < requests.size()) {
+      std::size_t end = begin + 1;
+      while (end < requests.size() &&
+             requests[end].slot == requests[end - 1].slot + 1) {
+        ++end;
+      }
+      const std::size_t count = end - begin;
+      const std::uint32_t firstSlot = requests[begin].slot;
+      checkCuda(cudaMemcpyAsync(impl_->requests + firstSlot,
+                                upload.requests + begin,
+                                count * sizeof(abi::RequestContext),
+                                cudaMemcpyHostToDevice, stream),
+                "publish request directory asynchronously");
+      checkCuda(cudaMemcpyAsync(impl_->requestProgress + firstSlot,
+                                upload.progress + begin,
+                                count * sizeof(abi::RequestProgress),
+                                cudaMemcpyHostToDevice, stream),
+                "publish request progress asynchronously");
+      begin = end;
+    }
+    checkCuda(cudaEventRecord(upload.complete, stream),
+              "record request directory upload");
+    upload.pending = true;
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+      const std::uint32_t slot = requests[index].slot;
+      impl_->requestsHost[slot] = upload.requests[index];
+      impl_->requestInstalled[slot] = true;
+    }
+  } catch (...) {
+    (void)cudaStreamSynchronize(stream);
+    throw;
+  }
 }
 
 void HostRuntime::setTenantBudget(std::uint32_t tenantId,
@@ -1186,6 +1308,7 @@ abi::RequestProgress
 HostRuntime::readRequestProgress(std::uint32_t slot) const {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkRequestSlot(slot);
+  checkCuda(cudaDeviceSynchronize(), "quiesce request-progress writers");
   return downloadOne(impl_->requestProgress, slot);
 }
 
@@ -1197,12 +1320,43 @@ HostRuntime::readRequestProgress(std::uint32_t firstSlot,
       count > impl_->config.requestCapacity - firstSlot) {
     throw std::out_of_range("request-progress range exceeds runtime capacity");
   }
+  checkCuda(cudaDeviceSynchronize(), "quiesce request-progress writers");
   std::vector<abi::RequestProgress> progress(count);
   checkCuda(cudaMemcpy(progress.data(), impl_->requestProgress + firstSlot,
                        progress.size() * sizeof(progress.front()),
                        cudaMemcpyDeviceToHost),
             "download request-progress range");
   return progress;
+}
+
+void HostRuntime::copyRequestProgressAsync(
+    std::uint32_t firstSlot,
+    std::span<abi::RequestProgress> destination,
+    cudaStream_t stream) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
+  const std::uint32_t count = static_cast<std::uint32_t>(destination.size());
+  if (destination.empty() || destination.size() > UINT32_MAX ||
+      firstSlot > impl_->config.requestCapacity ||
+      count > impl_->config.requestCapacity - firstSlot) {
+    throw std::out_of_range("request-progress snapshot exceeds runtime capacity");
+  }
+  cudaPointerAttributes attributes{};
+  const cudaError_t attributeStatus =
+      cudaPointerGetAttributes(&attributes, destination.data());
+  if (attributeStatus != cudaSuccess) {
+    (void)cudaGetLastError();
+    throw std::invalid_argument(
+        "request-progress snapshot destination is not CUDA page-locked host memory");
+  }
+  if (attributes.type != cudaMemoryTypeHost) {
+    throw std::invalid_argument(
+        "request-progress snapshot destination is not CUDA page-locked host memory");
+  }
+  checkCuda(cudaMemcpyAsync(destination.data(),
+                            impl_->requestProgress + firstSlot,
+                            destination.size_bytes(), cudaMemcpyDeviceToHost,
+                            stream),
+            "enqueue request-progress snapshot");
 }
 
 abi::ObjectEntry HostRuntime::readObject(std::uint32_t slot) const {
@@ -1316,6 +1470,16 @@ HostRuntime::readEpochStatus(std::uint32_t workTicketCount) const {
   return status;
 }
 
+std::uint32_t HostRuntime::readStickyFailedCount() const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
+  std::uint32_t value = 0;
+  const auto *address = reinterpret_cast<const std::byte *>(impl_->view) +
+                        offsetof(abi::RuntimeView, stickyFailedCount);
+  checkCuda(cudaMemcpy(&value, address, sizeof(value), cudaMemcpyDeviceToHost),
+            "download sticky failure count");
+  return value;
+}
+
 std::uint32_t HostRuntime::readPendingIndexCount() const {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   return downloadOne(impl_->pendingCount, 0);
@@ -1330,6 +1494,8 @@ DeviceWorkPlan HostRuntime::uploadWorkPlan(const WorkPlan &plan) const {
   for (const abi::WorkItem &work : plan.workItems) {
     if (work.requestSlot >= impl_->config.requestCapacity ||
         !impl_->requestInstalled[work.requestSlot] ||
+        work.workTicket >= impl_->config.workTicketCapacity ||
+        work.reductionGroup >= impl_->config.workTicketCapacity ||
         work.dependencyCount > impl_->config.maxDependenciesPerWorkTicket) {
       throw std::invalid_argument(
           "work plan does not fit the runtime request/dependency contract");

@@ -15,13 +15,27 @@ from nta_runtime import (
     AcquireRequirement,
     DeviceWorkPlan,
     FlashInferLayerEpoch,
+    IndexedHostObject,
     JitPhaseProgram,
+    OperatorCapability,
+    OperatorCoordinateMap,
+    OperatorFamily,
+    OperatorForm,
+    OperatorPartialState,
+    OperatorPlanFlag,
+    OperatorReduction,
     Placement,
     Replica,
     RequestRange,
     Runtime,
     RuntimeConfig,
     WorkItem,
+    require_operator_pair,
+)
+from nta_runtime.flashinfer import (
+    BIND_CURRENT_GENERATION,
+    RUNNABLE_WORK,
+    request_bound_attention_jit_args,
 )
 from tools.flashinfer.schedule import decode_schedule, paged_prefill_schedule
 
@@ -65,7 +79,11 @@ class RuntimeFixture:
                 "partitioned objects need a host source and implicit row maps"
             )
         if indexed:
-            if host_source is None or source_indices is None or destination_indices is None:
+            if (
+                host_source is None
+                or source_indices is None
+                or destination_indices is None
+            ):
                 raise ValueError("indexed transfers need a host source and both maps")
             if source_indices.numel() != destination_indices.numel():
                 raise ValueError("indexed transfer maps must have equal length")
@@ -157,9 +175,7 @@ class RuntimeFixture:
             direct_bases = [0] * work_count
         else:
             placement = (
-                Placement.HOST_STAGED
-                if host_source is not None
-                else Placement.HBM
+                Placement.HOST_STAGED if host_source is not None else Placement.HBM
             )
             source = host_source if host_source is not None else kv
             direct = self.native_runtime.register_object(
@@ -223,9 +239,7 @@ class RuntimeFixture:
                 end += 1
             if request_index in request_indices[end:]:
                 raise RuntimeError("FlashInfer request work must be contiguous")
-            ranges.append(
-                RequestRange(begin, end - begin, request_index, GENERATION)
-            )
+            ranges.append(RequestRange(begin, end - begin, request_index, GENERATION))
             begin = end
         self.plan = DeviceWorkPlan(
             work_count, work_count, self.native_runtime.device_ordinal
@@ -246,14 +260,53 @@ class RuntimeFixture:
 
 
 class PhaseFunctions:
-    def __init__(
-        self, module_name: str = "nta_batch_decode_default_v2_hooked"
-    ) -> None:
+    def __init__(self, module_name: str = "nta_batch_decode_default_v2_hooked") -> None:
         workspace = pathlib.Path(os.environ["FLASHINFER_WORKSPACE_BASE"])
         modules = list(workspace.rglob(f"{module_name}.so"))
         if len(modules) != 1:
             raise RuntimeError(f"expected one hooked decode module, found {modules}")
         self.program = JitPhaseProgram(modules[0])
+        family = (
+            OperatorFamily.FLASHINFER_DECODE
+            if "decode" in module_name
+            else OperatorFamily.FLASHINFER_PAGED_PREFILL
+        )
+        form = (
+            OperatorForm.DIRECT
+            if "request_bound" in module_name
+            else OperatorForm.INCREMENTAL
+        )
+        required = (
+            OperatorCapability.REQUEST_BINDING
+            | OperatorCapability.TYPED_FLASHINFER_FRONTEND
+        )
+        if form == OperatorForm.DIRECT:
+            required |= OperatorCapability.GRAPH_REPLAY
+        else:
+            required |= (
+                OperatorCapability.OBJECT_DEPENDENCIES
+                | OperatorCapability.FINITE_DEFERRAL
+                | OperatorCapability.PARTIAL_PUBLICATION
+                | OperatorCapability.COMPLETE_CONTRIBUTOR_MERGE
+                | OperatorCapability.RUNNABLE_COMPACTION
+            )
+        self.program.operator_contract.require(
+            family=family, form=form, capabilities=required
+        )
+        self.program.operator_plan.require(
+            family=family,
+            forms=(OperatorForm.DIRECT, OperatorForm.INCREMENTAL),
+            coordinate_map=OperatorCoordinateMap.FLASHINFER_REQUEST_CONTIGUOUS,
+            partial_state=OperatorPartialState.ONLINE_SOFTMAX_VALUE_LSE,
+            reduction=OperatorReduction.ORDERED_MERGE_STATE,
+            flags=(
+                OperatorPlanFlag.FIXED_CAPACITY
+                | OperatorPlanFlag.GRAPH_STABLE
+                | OperatorPlanFlag.EXTERNAL_WAVE_SOURCES
+                | OperatorPlanFlag.GENERATION_BOUND
+                | OperatorPlanFlag.EXACT_COMPLETE_MERGE
+            ),
+        )
 
     def call(self, name: str, fixture: RuntimeFixture, *arguments: int) -> None:
         stream = torch.cuda.current_stream()
@@ -314,9 +367,29 @@ def make_baseline_wrapper() -> flashinfer.BatchDecodeWithPagedKVCacheWrapper:
     )
 
 
-def make_prefill_wrapper() -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
+def make_request_bound_decode_wrapper(
+    module_name: str,
+) -> flashinfer.BatchDecodeWithPagedKVCacheWrapper:
+    jit_args = request_bound_attention_jit_args(
+        module_name,
+        dtype_q=torch.float16,
+        dtype_kv=torch.float16,
+        dtype_o=torch.float16,
+        idtype=torch.int32,
+        head_dim_qk=128,
+        head_dim_vo=128,
+    )
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    return flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "NHD", backend="fa2", jit_args=jit_args
+    )
+
+
+def make_prefill_wrapper(
+    module_name: str = "nta_batch_prefill_default_v2_hooked",
+) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
     jit_args = [
-        "nta_batch_prefill_default_v2_hooked",
+        module_name,
         torch.float16,
         torch.float16,
         torch.float16,
@@ -330,6 +403,24 @@ def make_prefill_wrapper() -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
         VARIANT_NAME,
         VARIANT_DECL,
     ]
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "NHD", backend="fa2", jit_args=jit_args
+    )
+
+
+def make_request_bound_prefill_wrapper(
+    module_name: str,
+) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
+    jit_args = request_bound_attention_jit_args(
+        module_name,
+        dtype_q=torch.float16,
+        dtype_kv=torch.float16,
+        dtype_o=torch.float16,
+        idtype=torch.int32,
+        head_dim_qk=128,
+        head_dim_vo=128,
+    )
     workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace, "NHD", backend="fa2", jit_args=jit_args
@@ -366,9 +457,7 @@ def plan_uniform_batch(
             dtype=torch.int32,
             device="cuda",
         ),
-        torch.arange(
-            batch_size * pages_per_request, dtype=torch.int32, device="cuda"
-        ),
+        torch.arange(batch_size * pages_per_request, dtype=torch.int32, device="cuda"),
         torch.full((batch_size,), 16, dtype=torch.int32, device="cuda"),
         4,
         2,
@@ -420,7 +509,10 @@ def run_hooked(
     fixture: RuntimeFixture,
     output: torch.Tensor,
     skip_merge: bool = False,
+    launch_flags: int | None = None,
+    launch_work_count: int | None = None,
 ) -> None:
+    flags = int(skip_merge) if launch_flags is None else launch_flags
     wrapper.run(
         q,
         kv,
@@ -428,8 +520,8 @@ def run_hooked(
         fixture.work_items,
         fixture.requirements,
         1.0 / math.sqrt(128),
-        fixture.work_count,
-        int(skip_merge),
+        fixture.work_count if launch_work_count is None else launch_work_count,
+        flags,
         out=output,
     )
 
@@ -520,9 +612,7 @@ def main() -> None:
     mixed_reference_kv = mixed_host_kv.to("cuda")
     mixed_staging_kv = torch.zeros_like(mixed_reference_kv)
     mixed_staging_kv[:mixed_pages].copy_(mixed_reference_kv[:mixed_pages])
-    mixed_q = torch.randn(
-        (mixed_batch, 4, 128), dtype=torch.float16, device="cuda"
-    )
+    mixed_q = torch.randn((mixed_batch, 4, 128), dtype=torch.float16, device="cuda")
     plan_uniform_batch(stock, mixed_batch, mixed_pages)
     mixed_expected = stock.run(mixed_q, mixed_reference_kv)
     plan_uniform_batch(hooked, mixed_batch, mixed_pages)
@@ -585,14 +675,50 @@ def main() -> None:
     )
     pipelined_result = pipelined_epoch.check(passes, torch.cuda.current_stream())
     if pipelined_result.progress_passes != 2:
-        raise RuntimeError(
-            f"unexpected pipelined host rounds: {pipelined_result}"
-        )
+        raise RuntimeError(f"unexpected pipelined host rounds: {pipelined_result}")
     pipelined.assert_all_states(3)
     torch.testing.assert_close(pipelined_staging_kv, mixed_reference_kv, rtol=0, atol=0)
-    torch.testing.assert_close(
-        pipelined_output, mixed_expected, rtol=2e-3, atol=2e-3
+    torch.testing.assert_close(pipelined_output, mixed_expected, rtol=2e-3, atol=2e-3)
+
+    lookahead_staging_kv = torch.zeros_like(mixed_reference_kv)
+    lookahead = RuntimeFixture(
+        lookahead_staging_kv,
+        mixed_host_kv,
+        work_count=2,
+        request_indices=[0, 1],
+        partitioned_objects=True,
     )
+    lookahead_output = torch.full_like(mixed_expected, math.nan)
+    lookahead_stream = torch.cuda.Stream(priority=0)
+    lookahead_ready = torch.cuda.Event()
+    with torch.cuda.stream(lookahead_stream):
+        phases.program.preload_host(lookahead.native_runtime, 0, 1, lookahead_stream)
+        lookahead_ready.record(lookahead_stream)
+    lookahead_epoch = FlashInferLayerEpoch(
+        lookahead.native_runtime,
+        lookahead.plan,
+        phases.program,
+        object_count=2,
+        max_progress_passes=1,
+    )
+    passes = lookahead_epoch.enqueue_host(
+        hooked,
+        mixed_q,
+        lookahead_staging_kv,
+        lookahead_output,
+        progress_blocks=(1,),
+        stream=torch.cuda.current_stream(),
+        progress_stream=lookahead_stream,
+        ready_event=lookahead_ready,
+        ready_work_counts=(1,),
+        initial_ready_work_count=1,
+    )
+    lookahead_result = lookahead_epoch.check(passes, torch.cuda.current_stream())
+    if lookahead_result.progress_passes != 1:
+        raise RuntimeError(f"unexpected fragment-lookahead rounds: {lookahead_result}")
+    lookahead.assert_all_states(3)
+    torch.testing.assert_close(lookahead_staging_kv, mixed_reference_kv, rtol=0, atol=0)
+    torch.testing.assert_close(lookahead_output, mixed_expected, rtol=2e-3, atol=2e-3)
 
     plan(hooked)
     indexed_staging = torch.zeros_like(reference_kv)
@@ -605,16 +731,124 @@ def main() -> None:
     phases.call("nta_jit_reset_epoch", indexed, 1, 1)
     indexed_output = torch.full_like(expected, math.nan)
     run_hooked(hooked, q, indexed_staging, indexed, indexed_output)
-    phases.call("nta_jit_progress_host", indexed, 1)
+    phases.program.progress_indexed_host_range(
+        indexed.native_runtime, 0, 1, torch.cuda.current_stream()
+    )
     phases.call("nta_jit_publish_ready", indexed, 1)
     torch.cuda.synchronize()
     indexed.assert_all_states(2)
     torch.testing.assert_close(indexed_staging[0], reference_kv[3], rtol=0, atol=0)
     torch.testing.assert_close(indexed_staging[2], reference_kv[1], rtol=0, atol=0)
-    if torch.count_nonzero(indexed_staging[1]).item() != 0 or torch.count_nonzero(
-        indexed_staging[3]
-    ).item() != 0:
+    if (
+        torch.count_nonzero(indexed_staging[1]).item() != 0
+        or torch.count_nonzero(indexed_staging[3]).item() != 0
+    ):
         raise RuntimeError("indexed host acquisition overwrote an unselected row")
+
+    preload_rows = 513
+    preload_host = torch.randn(
+        (preload_rows, 256), dtype=torch.float16, pin_memory=True
+    )
+    preload_staging = torch.zeros(
+        (preload_rows, 256), dtype=torch.float16, device="cuda"
+    )
+    preload_source = torch.arange(
+        preload_rows - 1, -1, -1, dtype=torch.int32, device="cuda"
+    )
+    preload_destination = torch.arange(preload_rows, dtype=torch.int32, device="cuda")
+    preload = RuntimeFixture(
+        preload_staging,
+        preload_host,
+        source_indices=preload_source,
+        destination_indices=preload_destination,
+    )
+    phases.program.preload_host(
+        preload.native_runtime, 0, 1, torch.cuda.current_stream()
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        preload_staging, preload_host.flip(0).to("cuda"), rtol=0, atol=0
+    )
+    pair_key_host = torch.randn_like(preload_host, pin_memory=True)
+    pair_value_host = torch.randn_like(preload_host, pin_memory=True)
+    pair_key_staging = torch.zeros_like(preload_staging)
+    pair_value_staging = torch.zeros_like(preload_staging)
+    pair_runtime = Runtime(
+        RuntimeConfig(
+            request_capacity=1,
+            object_capacity=2,
+            intent_capacity=2,
+            work_ticket_capacity=1,
+            max_dependencies_per_work_ticket=1,
+        )
+    )
+    pair_runtime.register_indexed_host_objects(
+        0,
+        (
+            IndexedHostObject(
+                OBJECT_ID,
+                1,
+                pair_key_host.data_ptr(),
+                pair_key_staging.data_ptr(),
+                preload_source.data_ptr(),
+                preload_destination.data_ptr(),
+                preload_rows,
+                512,
+                512,
+                512,
+                preload_rows,
+                preload_rows,
+            ),
+            IndexedHostObject(
+                OBJECT_ID + 1,
+                1,
+                pair_value_host.data_ptr(),
+                pair_value_staging.data_ptr(),
+                preload_source.data_ptr(),
+                preload_destination.data_ptr(),
+                preload_rows,
+                512,
+                512,
+                512,
+                preload_rows,
+                preload_rows,
+            ),
+        ),
+        stream=torch.cuda.current_stream(),
+    )
+    phases.program.preload_host_pairs(pair_runtime, 0, 1, torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        pair_key_staging, pair_key_host.flip(0).to("cuda"), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        pair_value_staging, pair_value_host.flip(0).to("cuda"), rtol=0, atol=0
+    )
+    rebound_key_host = torch.randn_like(pair_key_host, pin_memory=True)
+    rebound_value_host = torch.randn_like(pair_value_host, pin_memory=True)
+    rebound_key_staging = torch.zeros_like(pair_key_staging)
+    rebound_value_staging = torch.zeros_like(pair_value_staging)
+    phases.program.rebind_indexed_host_pairs(
+        pair_runtime,
+        0,
+        1,
+        rebound_key_host.data_ptr(),
+        rebound_key_staging.data_ptr(),
+        rebound_value_host.data_ptr(),
+        rebound_value_staging.data_ptr(),
+        torch.cuda.current_stream(),
+    )
+    phases.program.preload_host_pairs(pair_runtime, 0, 1, torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        rebound_key_staging, rebound_key_host.flip(0).to("cuda"), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        rebound_value_staging,
+        rebound_value_host.flip(0).to("cuda"),
+        rtol=0,
+        atol=0,
+    )
 
     invalid_staging = torch.zeros_like(reference_kv)
     invalid_indexed = RuntimeFixture(
@@ -627,17 +861,26 @@ def main() -> None:
     invalid_output = torch.full_like(expected, math.nan)
     run_hooked(hooked, q, invalid_staging, invalid_indexed, invalid_output)
     phases.call("nta_jit_complete_launched", invalid_indexed, 1)
-    phases.call("nta_jit_progress_host", invalid_indexed, 1)
+    phases.program.progress_indexed_host_range(
+        invalid_indexed.native_runtime, 0, 1, torch.cuda.current_stream()
+    )
     phases.call("nta_jit_publish_ready", invalid_indexed, 1)
     torch.cuda.synchronize()
     invalid_indexed.assert_all_states(5)
     if torch.count_nonzero(invalid_staging).item() != 0:
         raise RuntimeError("out-of-range indexed acquisition wrote staging memory")
+    sticky_failures = invalid_indexed.native_runtime.sticky_failed_count
+    if sticky_failures == 0:
+        raise RuntimeError("failed acquisition did not poison the runtime")
+    phases.call("nta_jit_reset_epoch", invalid_indexed, 1, 1)
+    torch.cuda.synchronize()
+    if invalid_indexed.native_runtime.sticky_failed_count != sticky_failures:
+        raise RuntimeError("epoch reset erased a sticky acquisition failure")
     if options.sanitizer:
         print(
             f"flashinfer_version={flashinfer.__version__} sanitizer_path=pass "
             f"shared_kv_head_ctas=2 indexed_host=pass indexed_bounds=pass "
-            f"ready_wave=pass "
+            f"indexed_preload=pass paired_preload=pass ready_wave=pass "
             f"max_abs_error={maximum:.6g}"
         )
         return
@@ -667,9 +910,7 @@ def main() -> None:
         raise RuntimeError("deferred split-K launch consumed incomplete scratch state")
     phases.call("nta_jit_progress_host", split, 1)
     phases.call("nta_jit_publish_ready", split, split_work)
-    run_hooked(
-        hooked, q, split_staging_kv, split, split_output, skip_merge=True
-    )
+    run_hooked(hooked, q, split_staging_kv, split, split_output, skip_merge=True)
     phases.call("nta_jit_complete_launched", split, split_work)
     torch.cuda.synchronize()
     split.assert_all_states(3)
@@ -694,6 +935,95 @@ def main() -> None:
     torch.testing.assert_close(split_staging_kv, split_reference_kv, rtol=0, atol=0)
     torch.testing.assert_close(split_output, split_expected, rtol=2e-3, atol=2e-3)
     split_maximum = (split_output.float() - split_expected.float()).abs().max().item()
+
+    if split_work % 2 != 0:
+        raise RuntimeError(
+            f"fragmented split-K test needs an even schedule: {split_schedule}"
+        )
+    fragmented_staging = torch.zeros_like(split_reference_kv)
+    fragmented = RuntimeFixture(
+        fragmented_staging,
+        split_host_kv,
+        split_work,
+        request_indices=list(split_schedule.request_indices),
+        partitioned_objects=True,
+    )
+    phases.call("nta_jit_reset_epoch", fragmented, split_work, split_work)
+    fragmented_output = torch.full_like(split_expected, 19)
+    run_hooked(
+        hooked,
+        q,
+        fragmented_staging,
+        fragmented,
+        fragmented_output,
+        launch_flags=BIND_CURRENT_GENERATION,
+    )
+    phases.call("nta_jit_progress_host", fragmented, split_work // 2)
+    run_hooked(
+        hooked,
+        q,
+        fragmented_staging,
+        fragmented,
+        fragmented_output,
+        launch_flags=BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+        launch_work_count=split_work // 2,
+    )
+    torch.cuda.synchronize()
+    fragmented_states = [
+        fragmented.work_ticket_state(index) for index in range(split_work)
+    ]
+    if (
+        fragmented_states.count(3) != split_work // 2
+        or fragmented_states.count(1) != split_work // 2
+    ):
+        raise RuntimeError(
+            "first fragmented wave did not retire exactly half the contributors: "
+            f"{fragmented_states}"
+        )
+    if not torch.all(fragmented_output == 19):
+        raise RuntimeError("fragmented split-K merged an incomplete request")
+    if torch.count_nonzero(fragmented_staging).item() == 0:
+        raise RuntimeError("first fragmented wave did not stage contributor data")
+
+    phases.call("nta_jit_progress_host", fragmented, split_work // 2)
+    run_hooked(
+        hooked,
+        q,
+        fragmented_staging,
+        fragmented,
+        fragmented_output,
+        launch_flags=BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+        launch_work_count=split_work,
+    )
+    torch.cuda.synchronize()
+    fragmented.assert_all_states(3)
+    torch.testing.assert_close(fragmented_staging, split_reference_kv, rtol=0, atol=0)
+    torch.testing.assert_close(fragmented_output, split_expected, rtol=2e-3, atol=2e-3)
+
+    phases.program.invalidate_cached_objects(
+        fragmented.native_runtime, 0, split_work, torch.cuda.current_stream()
+    )
+    fragmented_staging.zero_()
+    fragmented_output.fill_(23)
+    fragmented_epoch = FlashInferLayerEpoch(
+        fragmented.native_runtime,
+        fragmented.plan,
+        phases.program,
+        object_count=split_work,
+        max_progress_passes=2,
+    )
+    fragmented_result = fragmented_epoch.run_host(
+        hooked,
+        q,
+        fragmented_staging,
+        fragmented_output,
+        progress_blocks=(split_work // 2, split_work // 2),
+        stream=torch.cuda.current_stream(),
+    )
+    if fragmented_result.progress_passes != 2:
+        raise RuntimeError(f"unexpected fragmented host rounds: {fragmented_result}")
+    fragmented.assert_all_states(3)
+    torch.testing.assert_close(fragmented_output, split_expected, rtol=2e-3, atol=2e-3)
 
     mixed_pages = 128
     mixed_shape = (2 * mixed_pages, 2, 16, 2, 128)
@@ -739,11 +1069,62 @@ def main() -> None:
                 "request-local merge setup produced an unexpected ticket state: "
                 f"{mixed_states}"
             )
-    torch.testing.assert_close(
-        mixed_output[0], mixed_expected[0], rtol=2e-3, atol=2e-3
-    )
+    torch.testing.assert_close(mixed_output[0], mixed_expected[0], rtol=2e-3, atol=2e-3)
     if not torch.all(mixed_output[1] == 17):
         raise RuntimeError("incomplete request consumed split-K scratch state")
+
+    external_work = sum(
+        index not in resident_work for index in range(mixed_schedule.work_count)
+    )
+    phases.call("nta_jit_progress_host", mixed, 1)
+    run_hooked(
+        hooked,
+        mixed_q,
+        mixed_staging_kv,
+        mixed,
+        mixed_output,
+        launch_flags=BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+        launch_work_count=external_work,
+    )
+    torch.cuda.synchronize()
+    mixed.assert_all_states(3)
+    torch.testing.assert_close(mixed_output, mixed_expected, rtol=2e-3, atol=2e-3)
+
+    compact_staging_kv = torch.zeros_like(mixed_reference_kv)
+    compact_staging_kv[:mixed_pages].copy_(mixed_reference_kv[:mixed_pages])
+    compact = RuntimeFixture(
+        compact_staging_kv,
+        mixed_host_kv,
+        mixed_schedule.work_count,
+        request_indices=mixed_request_indices,
+        direct_work_indices=resident_work,
+    )
+    compact_output = torch.full_like(mixed_expected, 29)
+    compact_epoch = FlashInferLayerEpoch(
+        compact.native_runtime,
+        compact.plan,
+        phases.program,
+        object_count=1,
+        max_progress_passes=1,
+    )
+    compact_progress_stream = torch.cuda.Stream(priority=0)
+    compact_passes = compact_epoch.enqueue_host(
+        hooked,
+        mixed_q,
+        compact_staging_kv,
+        compact_output,
+        progress_blocks=(1,),
+        stream=torch.cuda.current_stream(),
+        progress_stream=compact_progress_stream,
+        ready_work_counts=(external_work,),
+        initial_ready_work_count=len(resident_work),
+    )
+    compact_result = compact_epoch.check(compact_passes, torch.cuda.current_stream())
+    if compact_result.progress_passes != 1:
+        raise RuntimeError(f"unexpected compact progress rounds: {compact_result}")
+    compact.assert_all_states(3)
+    torch.testing.assert_close(compact_staging_kv, mixed_reference_kv, rtol=0, atol=0)
+    torch.testing.assert_close(compact_output, mixed_expected, rtol=2e-3, atol=2e-3)
 
     prefill_query_tokens = 256
     prefill_q = torch.randn(
@@ -774,9 +1155,7 @@ def main() -> None:
         prefill_resident,
         prefill_resident_output,
     )
-    prefill_phases.call(
-        "nta_jit_complete_launched", prefill_resident, prefill_work
-    )
+    prefill_phases.call("nta_jit_complete_launched", prefill_resident, prefill_work)
     torch.cuda.synchronize()
     prefill_resident.assert_all_states(3)
     torch.testing.assert_close(
@@ -800,9 +1179,7 @@ def main() -> None:
         prefill_output,
         skip_merge=True,
     )
-    prefill_phases.call(
-        "nta_jit_complete_launched", prefill_deferred, prefill_work
-    )
+    prefill_phases.call("nta_jit_complete_launched", prefill_deferred, prefill_work)
     torch.cuda.synchronize()
     prefill_deferred.assert_all_states(1)
     prefill_phases.call("nta_jit_progress_host", prefill_deferred, 1)
@@ -817,9 +1194,7 @@ def main() -> None:
         prefill_output,
         skip_merge=True,
     )
-    prefill_phases.call(
-        "nta_jit_complete_launched", prefill_deferred, prefill_work
-    )
+    prefill_phases.call("nta_jit_complete_launched", prefill_deferred, prefill_work)
     torch.cuda.synchronize()
     prefill_deferred.assert_all_states(3)
     run_prefill_hooked(
@@ -837,8 +1212,23 @@ def main() -> None:
 
     tiny_prefill_q = torch.randn((1, 4, 128), dtype=torch.float16, device="cuda")
     plan_prefill(stock_prefill, 1, 4)
-    plan_prefill(hooked_prefill, 1, 4)
-    tiny_schedule = paged_prefill_schedule(hooked_prefill)
+    request_bound_module = "nta_batch_prefill_default_v2_request_bound"
+    request_bound_decode_module = "nta_batch_decode_default_v3_request_bound"
+    request_bound_filter = os.environ.get("NTA_JIT_REQUEST_BOUND_SOURCE", "")
+    os.environ["NTA_JIT_REQUEST_BOUND_SOURCE"] = ",".join(
+        token
+        for token in (
+            request_bound_filter,
+            request_bound_module,
+            request_bound_decode_module,
+        )
+        if token
+    )
+    request_bound_prefill = make_request_bound_prefill_wrapper(request_bound_module)
+    plan_prefill(request_bound_prefill, 1, 4)
+    request_bound_phases = PhaseFunctions(request_bound_module)
+    require_operator_pair(request_bound_phases.program, prefill_phases.program)
+    tiny_schedule = paged_prefill_schedule(request_bound_prefill)
     tiny_runtime = RuntimeFixture(
         reference_kv,
         None,
@@ -858,15 +1248,12 @@ def main() -> None:
 
     def tiny_prefill_hooked_call() -> None:
         runtime_tensor = tiny_runtime.runtime
-        hooked_prefill.run(
+        request_bound_prefill.run(
             tiny_prefill_q,
             reference_kv,
             runtime_tensor,
-            runtime_tensor,
-            runtime_tensor,
             1.0 / math.sqrt(128),
-            1,
-            14,
+            0,
             out=tiny_hooked_output,
         )
 
@@ -888,15 +1275,12 @@ def main() -> None:
     tiny_runtime.native_runtime.cancel_request(0, GENERATION)
     cancelled_output = torch.full_like(tiny_prefill_q, 17)
     runtime_tensor = tiny_runtime.runtime
-    hooked_prefill.run(
+    request_bound_prefill.run(
         tiny_prefill_q,
         reference_kv,
         runtime_tensor,
-        runtime_tensor,
-        runtime_tensor,
         1.0 / math.sqrt(128),
-        1,
-        14,
+        0,
         out=cancelled_output,
     )
     torch.cuda.synchronize()
@@ -914,11 +1298,19 @@ def main() -> None:
         (benchmark_batch, 4, 128), dtype=torch.float16, device="cuda"
     )
     baseline = make_baseline_wrapper()
+    request_bound_decode = make_request_bound_decode_wrapper(
+        request_bound_decode_module
+    )
+    request_bound_decode_phases = PhaseFunctions(request_bound_decode_module)
+    require_operator_pair(request_bound_decode_phases.program, phases.program)
     plan_uniform_batch(baseline, benchmark_batch, benchmark_pages)
     plan_uniform_batch(hooked, benchmark_batch, benchmark_pages)
+    plan_uniform_batch(request_bound_decode, benchmark_batch, benchmark_pages)
     benchmark_schedule = decode_schedule(hooked)
     if benchmark_schedule.request_indices != tuple(range(benchmark_batch)):
-        raise RuntimeError(f"unexpected resident benchmark schedule {benchmark_schedule}")
+        raise RuntimeError(
+            f"unexpected resident benchmark schedule {benchmark_schedule}"
+        )
     benchmark_runtime = RuntimeFixture(
         benchmark_kv,
         None,
@@ -927,6 +1319,7 @@ def main() -> None:
     )
     phases.call("nta_jit_reset_epoch", benchmark_runtime, 1, benchmark_batch)
     baseline_output = torch.empty_like(benchmark_q)
+    direct_output = torch.empty_like(benchmark_q)
     hooked_output = torch.empty_like(benchmark_q)
 
     def baseline_call() -> None:
@@ -946,25 +1339,44 @@ def main() -> None:
             hooked_output,
         )
 
+    def direct_call() -> None:
+        request_bound_decode.run(
+            benchmark_q,
+            benchmark_kv,
+            benchmark_runtime.runtime,
+            1.0 / math.sqrt(128),
+            0,
+            out=direct_output,
+        )
+
     baseline_samples = []
+    direct_samples = []
     hooked_samples = []
     for sample in range(5):
         if sample % 2 == 0:
             baseline_samples.append(benchmark(baseline_call))
+            direct_samples.append(benchmark(direct_call))
             hooked_samples.append(benchmark(hooked_call))
         else:
             hooked_samples.append(benchmark(hooked_call))
+            direct_samples.append(benchmark(direct_call))
             baseline_samples.append(benchmark(baseline_call))
     baseline_us = statistics.median(baseline_samples)
+    direct_us = statistics.median(direct_samples)
     hooked_us = statistics.median(hooked_samples)
+    torch.testing.assert_close(direct_output, baseline_output, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(hooked_output, baseline_output, rtol=2e-3, atol=2e-3)
-    overhead = (hooked_us / baseline_us - 1.0) * 100.0
-    if overhead > 8.0:
-        raise RuntimeError(f"resident hook overhead {overhead:.2f}% exceeds 8%")
+    direct_overhead = (direct_us / baseline_us - 1.0) * 100.0
+    incremental_overhead = (hooked_us / baseline_us - 1.0) * 100.0
+    if direct_overhead > 5.0:
+        raise RuntimeError(
+            f"resident direct-form overhead {direct_overhead:.2f}% exceeds 5%"
+        )
 
     print(
         f"flashinfer_version={flashinfer.__version__} resident=pass "
         f"host_staged=pass indexed_host=pass indexed_bounds=pass "
+        f"indexed_preload=pass paired_preload=pass "
         f"shared_kv_head_ctas=2 "
         f"ready_wave=pass "
         f"merge_gate=pass "
@@ -976,8 +1388,10 @@ def main() -> None:
         f"tiny_prefill_hooked_us={tiny_hooked_us:.3f} "
         f"tiny_prefill_overhead_pct={tiny_overhead:.2f} "
         f"planless_cancel=pass "
-        f"baseline_us={baseline_us:.3f} hooked_us={hooked_us:.3f} "
-        f"resident_overhead_pct={overhead:.2f}"
+        f"baseline_us={baseline_us:.3f} direct_us={direct_us:.3f} "
+        f"direct_overhead_pct={direct_overhead:.2f} "
+        f"incremental_us={hooked_us:.3f} "
+        f"incremental_resident_overhead_pct={incremental_overhead:.2f}"
     )
 
 

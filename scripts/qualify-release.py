@@ -132,7 +132,7 @@ def production_checks(
     evidence_dir: pathlib.Path, revision: str
 ) -> list[dict[str, Any]]:
     evidence, error = read_json(
-        evidence_dir / "production-evidence.json", expected_schema=2
+        evidence_dir / "production-evidence.json", expected_schema=3
     )
     if evidence is None:
         return [check("production evidence", False, error)]
@@ -175,16 +175,29 @@ def production_checks(
             "serving integration",
             serving.get("engine") in {"sglang", "vllm"}
             and serving.get("mechanism_integrated") is True
-            and serving.get("mechanism_mode") == "incremental_demand"
+            and serving.get("mechanism_mode") == "request_aware_dual_form"
             and serving.get("correctness") is True
             and serving.get("transfer_verification") is True
             and serving.get("all_attention_layers_executed") is True
             and serving.get("baseline_and_mechanism") is True
             and serving.get("zero_fallback") is True
-            and serving.get("post_acquisition_instrumented_launches") == 0
+            and serving.get("all_attention_transformed") is True
+            and serving.get("bounded_hbm_tier_streaming") is True
+            and serving.get("generation_safe_request_completion") is True
+            and serving.get("jit_cache_primed") is True
+            and serving.get("compiler_contract_verified") is True
+            and serving.get("compiler_plan_verified") is True
+            and serving.get("verified_operator_modules", 0) > 0
+            and serving.get("verified_operator_pairs", 0) > 0
+            and serving.get("verified_operator_plan_pairs", 0) > 0
+            and serving.get("transformed_direct_launches", 0) > 0
+            and serving.get("ticketed_incremental_launches", 0) > 0
+            and serving.get("stock_attention_launches") == 0
             and serving.get("matched_cache_and_admission") is True,
-            "requires a real demand-mode integration with complete execution, "
-            "verified transfers, matched state, and zero fallback",
+            "requires both compiler-generated forms in a real integration with "
+            "complete execution, verified transfers, matched state, no stock "
+            "dispatch, generation-safe bounded-HBM streaming, verified compiler "
+            "contracts, warm JIT caches, and zero fallback",
         ),
         check(
             "serving graph path",
@@ -202,8 +215,11 @@ def production_checks(
         ),
         check(
             "serving tier coverage",
-            sequence_contains(serving.get("tiers"), {"host_staged", "nvme"}),
-            "requires real CPU-DRAM and NVMe serving paths",
+            sequence_contains(serving.get("tiers"), {"host_staged", "nvme"})
+            and serving.get("simultaneous_host_nvme") is True
+            and serving.get("cancellation_and_slot_reuse") is True,
+            "requires simultaneous CPU-DRAM/NVMe serving plus cancellation "
+            "and request-slot reuse",
         ),
         check(
             "serving coverage",
@@ -237,7 +253,7 @@ def production_checks(
 
 def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any]]:
     evidence, error = read_json(
-        evidence_dir / "osdi-evidence.json", expected_schema=2
+        evidence_dir / "osdi-evidence.json", expected_schema=3
     )
     if evidence is None:
         return [check("OSDI evidence", False, error)]
@@ -282,6 +298,7 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
     scheduler = evidence.get("scheduler", {})
     sparse = evidence.get("sparse_flashinfer", {})
     performance = evidence.get("performance", {})
+    workload = evidence.get("workload", {})
     return [
         check(
             "OSDI evidence provenance",
@@ -320,17 +337,56 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
             compiler.get("same_source_direct_and_incremental") is True
             and compiler.get("generated_kernel_family_count", 0) >= 2
             and compiler.get("convergence_verified") is True
-            and compiler.get("differential_correctness") is True,
-            "requires sound same-source forms for at least two generated-kernel families",
+            and compiler.get("acquired_edge_identity_verified") is True
+            and compiler.get("exactly_once_publication_verified") is True
+            and compiler.get("differential_correctness") is True
+            and compiler.get("versioned_operator_contracts") is True
+            and compiler.get("typed_operator_plans") is True
+            and compiler.get("runtime_abi_verified") is True
+            and compiler.get("direct_incremental_source_fingerprint_match") is True
+            and compiler.get("direct_incremental_plan_fingerprint_match") is True
+            and compiler.get("online_softmax_plan_verified") is True,
+            "requires sound same-source forms, convergence, identity continuity, "
+            "and exactly-once publication for at least two generated-kernel families",
         ),
         check(
             "real FlashInfer incremental execution",
             incremental.get("decode") is True
             and incremental.get("paged_prefill") is True
+            and incremental.get("canonical_flashinfer_attention") is True
+            and incremental.get("custom_attention_kernel") is False
             and incremental.get("partial_before_last_arrival") is True
+            and incremental.get("generation_safe_request_completion") is True
             and incremental.get("stock_output_parity") is True
-            and incremental.get("demand_cuda_graph_replay") is True,
-            "requires real decode/prefill partial execution and demand graph replay",
+            and incremental.get("demand_cuda_graph_replay") is True
+            and incremental.get("all_attention_transformed") is True
+            and incremental.get("transformed_direct_launches", 0) > 0
+            and incremental.get("ticketed_incremental_launches", 0) > 0
+            and incremental.get("stock_attention_launches") == 0
+            and isinstance(
+                incremental.get("bounded_hbm_staging_reduction"), (int, float)
+            )
+            and incremental["bounded_hbm_staging_reduction"] >= 4.0
+            and isinstance(
+                incremental.get("speedup_over_atomic_promotion"), (int, float)
+            )
+            and incremental["speedup_over_atomic_promotion"] >= 1.15
+            and isinstance(incremental.get("speedup_95ci_lower"), (int, float))
+            and incremental["speedup_95ci_lower"] > 1.0,
+            "requires canonical FlashInfer decode/prefill partial execution, "
+            "graph replay, generation-safe request completion, a bounded-HBM "
+            "crossover, and proof that no NTA arm dispatched stock attention",
+        ),
+        check(
+            "heterogeneous serving workload",
+            workload.get("mixed_resident_external_requests") is True
+            and workload.get("heterogeneous_context_and_prefix") is True
+            and workload.get("fragmented_kv_placement") is True
+            and workload.get("simultaneous_host_nvme") is True
+            and workload.get("admission_churn") is True
+            and workload.get("cancellation_and_slot_reuse") is True,
+            "requires the complete long-context/agent batch-barrier scenario, "
+            "not separate homogeneous tier microbenchmarks",
         ),
         check(
             "unified scheduler and engine feedback",
@@ -343,20 +399,49 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
             "requires one online policy, admission feedback, and bounded identical-snapshot regret",
         ),
         check(
-            "real GPU-selected sparse stress",
+            "real GPU-selected FlashInfer acquisition",
             sparse.get("gpu_selected_pages") is True
             and sparse.get("nta_hot_path_host_identity_round_trips") == 0
             and sparse.get("real_flashinfer_selector") is True
             and sparse.get("real_flashinfer_attention") is True
+            and sparse.get("all_policy_attention_transformed") is True
+            and sparse.get("paired_operator_contract_verified") is True
             and sparse.get("stock_output_parity") is True
             and sparse.get("candidate_sweep_points", 0) >= 5
             and sparse.get("selectivity_crossover_measured") is True
             and isinstance(sparse.get("peak_speedup_over_overfetch"), (int, float))
             and sparse["peak_speedup_over_overfetch"] >= 2.0
+            and isinstance(
+                sparse.get("peak_speedup_bootstrap_95_percent_ci"), list
+            )
+            and len(sparse["peak_speedup_bootstrap_95_percent_ci"]) == 2
+            and sparse["peak_speedup_bootstrap_95_percent_ci"][0] > 1.0
+            and isinstance(sparse.get("maximum_online_policy_regret"), (int, float))
+            and sparse["maximum_online_policy_regret"] <= 1.05
+            and sparse.get("policy_regret_definition")
+            == "same_trial_chosen_over_best"
+            and sparse.get("candidate_retained_baseline") is True
+            and isinstance(
+                sparse.get(
+                    "minimum_cold_indexed_latency_ratio_to_candidate_retained"
+                ),
+                (int, float),
+            )
+            and sparse[
+                "minimum_cold_indexed_latency_ratio_to_candidate_retained"
+            ] >= 1.0
+            and sparse.get("no_selectivity_policy_mode") == "bulk"
+            and isinstance(sparse.get("no_selectivity_speedup"), (int, float))
+            and sparse["no_selectivity_speedup"] >= 0.99
+            and isinstance(
+                sparse.get("no_selectivity_forced_indexed_throughput_ratio"),
+                (int, float),
+            )
             and isinstance(sparse.get("maximum_regret_to_offline_oracle"), (int, float))
             and sparse["maximum_regret_to_offline_oracle"] <= 2.0,
-            "requires real FlashInfer selection/attention, a five-point crossover, "
-            "a matched overfetch win, and bounded regret to an offline oracle",
+            "requires paired transformed FlashInfer forms, a five-point crossover, "
+            "a confidence-bounded overfetch win, same-trial policy regret, "
+            "explicit forced-indexed and resident-candidate costs, and bounded oracle regret",
         ),
         check(
             "mechanism performance bounds",

@@ -170,7 +170,7 @@ void qualifyGpuNvmePath(const detail::NvmeQueueResources &resources,
 
 struct NvmeTransport::Impl {
   struct RetiredMapping {
-    void *hostAddress = nullptr;
+    void *hostAllocation = nullptr;
     std::uint64_t *devicePageList = nullptr;
     std::uint64_t mappingHandle = 0;
     std::uint64_t mappingKey = 0;
@@ -357,9 +357,9 @@ struct NvmeTransport::Impl {
       (void)cudaFree(mapping.devicePageList);
       mapping.devicePageList = nullptr;
     }
-    if (mapping.hostAddress != nullptr) {
-      (void)cudaFreeHost(mapping.hostAddress);
-      mapping.hostAddress = nullptr;
+    if (mapping.hostAllocation != nullptr) {
+      (void)cudaFreeHost(mapping.hostAllocation);
+      mapping.hostAllocation = nullptr;
     }
   }
 
@@ -408,8 +408,9 @@ struct NvmeBuffer::Impl {
         owner == nullptr ? 0 : owner->deviceOrdinal);
     if (owner != nullptr) {
       owner->releaseMapping(
-          {hostAddress, devicePageList, mappingHandle,
+          {hostAllocation, devicePageList, mappingHandle,
            reinterpret_cast<std::uint64_t>(devicePageList)});
+      hostAllocation = nullptr;
       hostAddress = nullptr;
       devicePageList = nullptr;
       mappingHandle = 0;
@@ -417,6 +418,7 @@ struct NvmeBuffer::Impl {
   }
 
   std::shared_ptr<NvmeTransport::Impl> owner;
+  void *hostAllocation = nullptr;
   void *hostAddress = nullptr;
   void *deviceAddress = nullptr;
   std::uint64_t *devicePageList = nullptr;
@@ -506,12 +508,22 @@ NvmeTransport::allocate(std::size_t bytes) {
   }
   const std::size_t allocationBytes =
       roundUp(bytes, impl_->capabilities.controllerPageSize);
+  const std::size_t alignment = impl_->capabilities.controllerPageSize;
+  if (allocationBytes >
+      std::numeric_limits<std::size_t>::max() - (alignment - 1U)) {
+    throw std::overflow_error("NVMe pinned allocation size overflows size_t");
+  }
+  const std::size_t pinnedBytes = allocationBytes + alignment - 1U;
   auto buffer = std::make_unique<NvmeBuffer::Impl>();
   buffer->owner = impl_;
   buffer->allocationBytes = allocationBytes;
   checkCuda(
-      cudaHostAlloc(&buffer->hostAddress, allocationBytes, cudaHostAllocMapped),
+      cudaHostAlloc(&buffer->hostAllocation, pinnedBytes, cudaHostAllocMapped),
       "cudaHostAlloc NVMe mapped destination");
+  const auto pinnedAddress =
+      reinterpret_cast<std::uintptr_t>(buffer->hostAllocation);
+  buffer->hostAddress = reinterpret_cast<void *>(
+      (pinnedAddress + alignment - 1U) & ~(alignment - 1U));
   checkCuda(
       cudaHostGetDevicePointer(&buffer->deviceAddress, buffer->hostAddress, 0),
       "cudaHostGetDevicePointer NVMe mapped destination");

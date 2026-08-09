@@ -5,11 +5,13 @@ root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bdf=${NTA_NVME_BDF:-0000:d8:00.0}
 device=/sys/bus/pci/devices/$bdf
 reference=${NTA_NVME_REFERENCE:-/tmp/nta-nvme-reference.bin}
+reference_bytes=${NTA_NVME_REFERENCE_BYTES:-67108864}
 nsid=${NTA_NVME_NSID:-1}
 depth=${NTA_NVME_QUEUE_DEPTH:-64}
 gpu=${NTA_GPU:-0}
 media_policy=${NTA_NVME_MEDIA_POLICY:-hardware-write-protect}
 probe=${NTA_VFIO_PROBE:-$root_dir/build/nta-vfio-nvme-probe}
+benchmark=${NTA_NVME_BENCHMARK:-$root_dir/build/nta-nvme-bench}
 state=/run/nta-vfio-${bdf}.driver
 
 die() {
@@ -72,6 +74,9 @@ require_containment() {
   [[ $depth =~ ^[1-9][0-9]*$ && $depth -ge 2 && $depth -le 4096 ]] ||
     die "NTA_NVME_QUEUE_DEPTH must be between 2 and 4096"
   [[ $gpu =~ ^[0-9]+$ ]] || die "NTA_GPU must be a non-negative integer"
+  [[ $reference_bytes =~ ^[1-9][0-9]*$ &&
+    $((reference_bytes % 4096)) == 0 ]] ||
+    die "NTA_NVME_REFERENCE_BYTES must be a positive multiple of 4096"
   [[ $media_policy == hardware-write-protect ||
     $media_policy == trusted-read-only-code ]] ||
     die "NTA_NVME_MEDIA_POLICY must be hardware-write-protect or trusted-read-only-code"
@@ -81,7 +86,8 @@ capture_reference() {
   local block
   for block in "$device"/nvme/nvme*/nvme*n*; do
     [[ -e $block ]] || continue
-    sudo dd if="/dev/$(basename "$block")" bs=4096 count=512 \
+    sudo dd if="/dev/$(basename "$block")" bs=4096 \
+      count="$((reference_bytes / 4096))" \
       iflag=direct status=none | dd of="$reference" bs=4096 status=none
     return
   done
@@ -151,6 +157,26 @@ bind-and-probe)
     exit 1
   fi
   ;;
+qualify)
+  bind_vfio
+  restore_on_exit() {
+    "$0" restore >/dev/null 2>&1 || true
+  }
+  trap restore_on_exit EXIT
+  [[ -x $benchmark ]] || die "benchmark executable is absent; build nta-nvme-bench"
+  sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}" \
+    NTA_REVISION="${NTA_REVISION:-$(git -C "$root_dir" rev-parse HEAD)}" \
+    "$benchmark" \
+    --device="vfio:$bdf" \
+    --gpu="$gpu" \
+    --namespace="$nsid" \
+    --queue-depth="$depth" \
+    --media-policy="$media_policy" \
+    --reference="$reference" \
+    "${@:2}"
+  "$0" restore
+  trap - EXIT
+  ;;
 restore)
   require_safe_device
   if [[ $(current_driver) == vfio-pci ]]; then
@@ -167,6 +193,6 @@ restore)
   "$0" status
   ;;
 *)
-  die "usage: $0 {status|preflight|bind|probe|bind-and-probe|restore}"
+  die "usage: $0 {status|preflight|bind|probe|bind-and-probe|qualify|restore}"
   ;;
 esac

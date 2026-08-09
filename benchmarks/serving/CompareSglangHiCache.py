@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resident-tokens", type=int, default=0)
     parser.add_argument("--max-total-tokens", type=int, default=320)
     parser.add_argument("--context-length", type=int, default=512)
+    parser.add_argument("--hicache-ratio", type=float, default=4.0)
     parser.add_argument(
         "--cuda-graph-decode",
         choices=("disabled", "full"),
@@ -77,7 +78,7 @@ def parse_report(output: str) -> dict[str, Any]:
 
 def require_clean_mechanism(
     report: dict[str, Any], *, require_graph_replay: bool
-) -> None:
+) -> dict[str, Any]:
     stats = [
         entry
         for entry in report.get("engine_stats", [])
@@ -91,26 +92,154 @@ def require_clean_mechanism(
         raise RuntimeError(f"NTA HiCache trial used {fallbacks} fallback batches")
     if claimed == 0:
         raise RuntimeError("NTA HiCache trial did not claim an external batch")
-    planless = sum(
-        int(entry.get("planless_preacquired_launches", 0)) for entry in stats
+    transformed = sum(
+        int(entry.get("transformed_direct_launches", 0)) for entry in stats
     )
-    if planless != 0:
-        raise RuntimeError(
-            f"NTA timed {planless} instrumented launches after acquisition"
-        )
     stock_launches = sum(
-        int(entry.get("stock_bulk_launches", 0)) for entry in stats
+        int(entry.get("stock_attention_launches", 0)) for entry in stats
     )
-    if stock_launches == 0:
-        raise RuntimeError("NTA preacquired path did not execute stock FlashInfer")
-    external_launches = sum(
-        int(entry.get("external_launches", 0)) for entry in stats
-    )
+    if stock_launches != 0:
+        raise RuntimeError(f"NTA timed {stock_launches} stock FlashInfer launches")
+    external_launches = sum(int(entry.get("external_launches", 0)) for entry in stats)
     prefetched_layers = sum(int(entry.get("prefetched_layers", 0)) for entry in stats)
-    if external_launches == 0 or external_launches != prefetched_layers:
+    demand_layers = sum(int(entry.get("demand_host_layers", 0)) for entry in stats)
+    if external_launches == 0 or external_launches != prefetched_layers + demand_layers:
         raise RuntimeError(
             "NTA did not execute exactly one external attention layer for every "
-            f"prefetched layer ({external_launches} != {prefetched_layers})"
+            "acquired layer "
+            f"({external_launches} != {prefetched_layers} + {demand_layers})"
+        )
+    lookahead_layers = sum(
+        int(entry.get("lookahead_acquisition_layers", 0)) for entry in stats
+    )
+    lookahead_bound = sum(
+        int(entry.get("lookahead_bound_launches", 0)) for entry in stats
+    )
+    pipeline_host = any(
+        bool(
+            entry.get(
+                "pipeline_host_enabled",
+                os.environ.get("NTA_SGLANG_PIPELINE_HOST", "1") != "0",
+            )
+        )
+        for entry in stats
+    )
+    if pipeline_host and (
+        lookahead_layers != prefetched_layers or lookahead_bound != external_launches
+    ):
+        raise RuntimeError(
+            "NTA lookahead trial did not acquire and bind every external layer "
+            f"({lookahead_layers}/{lookahead_bound} versus "
+            f"{prefetched_layers}/{external_launches})"
+        )
+    ticketed = sum(
+        int(entry.get("ticketed_incremental_launches", 0)) for entry in stats
+    )
+    total_attention = sum(
+        int(entry.get("decode_launches", 0)) + int(entry.get("prefill_launches", 0))
+        for entry in stats
+    )
+    if total_attention == 0 or transformed + ticketed != total_attention:
+        raise RuntimeError(
+            "NTA did not account every attention launch to a transformed form "
+            f"({transformed} + {ticketed} != {total_attention})"
+        )
+    verified_modules = sum(
+        int(entry.get("verified_operator_modules", 0)) for entry in stats
+    )
+    contracts = [
+        contract
+        for entry in stats
+        for contract in entry.get("operator_contracts", [])
+    ]
+    if verified_modules == 0 or not contracts:
+        raise RuntimeError(
+            "NTA HiCache trial did not verify compiler operator contracts"
+        )
+    verified_pairs = sum(
+        int(entry.get("verified_operator_pairs", 0)) for entry in stats
+    )
+    if ticketed and verified_pairs == 0:
+        raise RuntimeError(
+            "incremental HiCache attention ran without a paired direct form"
+        )
+    if os.environ.get("NTA_SGLANG_FORCE_INCREMENTAL") == "1" and ticketed == 0:
+        raise RuntimeError("forced incremental trial executed no ticketed attention")
+    fragment_layers = sum(
+        int(entry.get("fragment_lookahead_layers", 0)) for entry in stats
+    )
+    fragment_objects = sum(
+        int(entry.get("fragment_lookahead_objects", 0)) for entry in stats
+    )
+    fragment_rounds = sum(
+        int(entry.get("fragment_remaining_rounds", 0)) for entry in stats
+    )
+    request_overlap_layers = sum(
+        int(entry.get("request_overlap_layers", 0)) for entry in stats
+    )
+    mixed_dependency_layers = sum(
+        int(entry.get("mixed_dependency_layers", 0)) for entry in stats
+    )
+    compact_initial_launches = sum(
+        int(entry.get("compact_initial_launches", 0)) for entry in stats
+    )
+    compact_initial_ctas = sum(
+        int(entry.get("compact_initial_cta_bound", 0)) for entry in stats
+    )
+    canonical_initial_ctas = sum(
+        int(entry.get("canonical_initial_cta_bound", 0)) for entry in stats
+    )
+    compact_launches = sum(
+        int(entry.get("compact_resume_launches", 0)) for entry in stats
+    )
+    compact_ctas = sum(int(entry.get("compact_resume_cta_bound", 0)) for entry in stats)
+    canonical_ctas = sum(
+        int(entry.get("canonical_resume_cta_bound", 0)) for entry in stats
+    )
+    if (
+        os.environ.get("NTA_SGLANG_FORCE_INCREMENTAL") == "1"
+        and os.environ.get("NTA_SGLANG_PIPELINE_HOST", "1") == "0"
+        and os.environ.get("NTA_SGLANG_FRAGMENT_LOOKAHEAD", "1") != "0"
+        and ticketed > 1
+        and request_overlap_layers == 0
+        and min(fragment_layers, fragment_objects, fragment_rounds) == 0
+    ):
+        raise RuntimeError(
+            "fragmented trial executed ticketed attention without inter-layer "
+            "fragment acquisition"
+        )
+    if (
+        os.environ.get("NTA_SGLANG_REQUIRE_MIXED_ATTENTION") == "1"
+        and mixed_dependency_layers == 0
+    ):
+        raise RuntimeError(
+            "trial formed no FlashInfer layer containing both direct and external work"
+        )
+    if os.environ.get("NTA_SGLANG_FORCE_INCREMENTAL") == "1" and (
+        compact_launches == 0
+        or compact_ctas == 0
+        or canonical_ctas == 0
+        or compact_ctas >= canonical_ctas
+    ):
+        raise RuntimeError(
+            "forced incremental trial did not physically compact resume work "
+            f"({compact_launches} launches, {compact_ctas}/{canonical_ctas} CTAs)"
+        )
+    if (fragment_layers or request_overlap_layers) and (
+        compact_initial_launches == 0
+        or compact_initial_ctas == 0
+        or canonical_initial_ctas == 0
+        or compact_initial_ctas >= canonical_initial_ctas
+    ):
+        raise RuntimeError(
+            "incremental trial did not physically compact initial work "
+            f"({compact_initial_launches} launches, "
+            f"{compact_initial_ctas}/{canonical_initial_ctas} CTAs)"
+        )
+    if transformed + ticketed < external_launches:
+        raise RuntimeError(
+            "NTA did not execute a transformed attention kernel for every "
+            f"external layer ({transformed} + {ticketed} < {external_launches})"
         )
     if require_graph_replay:
         replays = sum(int(entry.get("graph_replays", 0)) for entry in stats)
@@ -119,6 +248,54 @@ def require_clean_mechanism(
             raise RuntimeError(
                 "NTA HiCache graph trial did not capture and replay a decode graph"
             )
+        if transformed == 0:
+            raise RuntimeError("NTA graph trial did not replay a transformed kernel")
+    return {
+        "all_attention_transformed": True,
+        "active_forms": [
+            name
+            for name, count in (
+                ("direct", transformed),
+                ("incremental", ticketed),
+            )
+            if count > 0
+        ],
+        "transformed_direct_launches": transformed,
+        "ticketed_incremental_launches": ticketed,
+        "total_attention_launches": total_attention,
+        "external_launches": external_launches,
+        "stock_launches": stock_launches,
+        "fallback_batches": fallbacks,
+        "verified_operator_modules": verified_modules,
+        "verified_operator_pairs": verified_pairs,
+        "lookahead_acquisition_layers": lookahead_layers,
+        "lookahead_bound_launches": lookahead_bound,
+        "fragment_lookahead_layers": fragment_layers,
+        "fragment_lookahead_objects": fragment_objects,
+        "fragment_remaining_rounds": fragment_rounds,
+        "request_overlap_layers": request_overlap_layers,
+        "mixed_dependency_layers": mixed_dependency_layers,
+        "compact_initial_launches": compact_initial_launches,
+        "compact_initial_cta_bound": compact_initial_ctas,
+        "canonical_initial_cta_bound": canonical_initial_ctas,
+        "compact_initial_cta_ratio": (
+            compact_initial_ctas / canonical_initial_ctas
+            if canonical_initial_ctas
+            else None
+        ),
+        "compact_resume_launches": compact_launches,
+        "compact_resume_cta_bound": compact_ctas,
+        "canonical_resume_cta_bound": canonical_ctas,
+        "compact_resume_cta_ratio": (
+            compact_ctas / canonical_ctas if canonical_ctas else None
+        ),
+        "compact_total_cta_ratio": (
+            (compact_initial_ctas + compact_ctas)
+            / (canonical_initial_ctas + canonical_ctas)
+            if canonical_initial_ctas + canonical_ctas
+            else None
+        ),
+    }
 
 
 def run(
@@ -153,6 +330,8 @@ def run(
         str(args.max_total_tokens),
         "--context-length",
         str(args.context_length),
+        "--hicache-ratio",
+        str(args.hicache_ratio),
         "--cuda-graph-decode",
         args.cuda_graph_decode,
         "--flashinfer-workspace-base",
@@ -191,9 +370,22 @@ def main() -> int:
     reports = {backend: run(args, backend) for backend in execution_order}
     baseline = reports["flashinfer"]
     mechanism = reports["nta_flashinfer"]
-    require_clean_mechanism(
+    activation = require_clean_mechanism(
         mechanism, require_graph_replay=args.cuda_graph_decode == "full"
     )
+    if not baseline.get("shape_warmup_excluded") or not mechanism.get(
+        "shape_warmup_excluded"
+    ):
+        raise RuntimeError("matched HiCache trials did not exclude shape JIT warmup")
+    if args.resident_tokens and (
+        not baseline.get("resident_setup_excluded")
+        or not mechanism.get("resident_setup_excluded")
+        or not baseline.get("placement_proof_required")
+        or not mechanism.get("placement_proof_required")
+    ):
+        raise RuntimeError(
+            "matched heterogeneous trials did not prove host/device placement"
+        )
     if baseline.get("revision") != mechanism.get("revision"):
         raise RuntimeError("stock and NTA trials used different revisions")
     if baseline["generated_text_sha256"] != mechanism["generated_text_sha256"]:
@@ -248,6 +440,7 @@ def main() -> int:
         "randomization_seed": args.seed,
         "baseline": baseline,
         "mechanism": mechanism,
+        "mechanism_activation": activation,
         "promotion_throughput_ratio": baseline_time / mechanism_time,
         "promotion_latency_change_fraction": latency_change,
         "max_latency_regression_percent": args.max_latency_regression_percent,

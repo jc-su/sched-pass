@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 11U
+#define NTA_RUNTIME_C_API_VERSION 22U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -178,18 +178,63 @@ typedef struct nta_request_progress {
   uint64_t unavailable_bytes;
   uint64_t runnable_compute_ns;
   uint64_t completed_compute_ns;
+  uint64_t pending_compute_ns;
+  uint64_t expected_compute_ns;
+  uint64_t dropped_attributions;
+  uint64_t reserved;
 } nta_request_progress;
+
+typedef struct nta_request_spec {
+  uint64_t request_id;
+  uint64_t deadline_clock;
+  uint64_t max_outstanding_bytes;
+  uint32_t slot;
+  uint32_t generation;
+  uint32_t tenant_id;
+  uint32_t priority;
+} nta_request_spec;
+
+typedef struct nta_operator_contract {
+  uint32_t magic;
+  uint16_t schema_version;
+  uint16_t struct_bytes;
+  uint32_t runtime_abi_version;
+  uint32_t family;
+  uint32_t form;
+  uint32_t reserved;
+  uint64_t capabilities;
+  uint64_t source_fingerprint_low;
+  uint64_t source_fingerprint_high;
+} nta_operator_contract;
+
+typedef struct nta_operator_plan {
+  uint32_t magic;
+  uint16_t schema_version;
+  uint16_t struct_bytes;
+  uint32_t runtime_abi_version;
+  uint32_t family;
+  uint32_t supported_forms;
+  uint32_t coordinate_map;
+  uint32_t partial_state;
+  uint32_t reduction;
+  uint32_t flags;
+  uint32_t reserved;
+  uint64_t source_fingerprint_low;
+  uint64_t source_fingerprint_high;
+  uint64_t plan_fingerprint_low;
+  uint64_t plan_fingerprint_high;
+} nta_operator_plan;
 
 uint32_t nta_runtime_c_api_version(void);
 uint32_t nta_runtime_device_abi_version(void);
 const char *nta_last_error(void);
 
-nta_status nta_nvme_transport_create(
-    const nta_nvme_transport_options *options,
-    nta_nvme_transport **transport_out);
+nta_status nta_nvme_transport_create(const nta_nvme_transport_options *options,
+                                     nta_nvme_transport **transport_out);
 void nta_nvme_transport_destroy(nta_nvme_transport *transport);
-nta_status nta_nvme_transport_get_capabilities(
-    const nta_nvme_transport *transport, nta_nvme_capabilities *capabilities);
+nta_status
+nta_nvme_transport_get_capabilities(const nta_nvme_transport *transport,
+                                    nta_nvme_capabilities *capabilities);
 nta_status nta_nvme_transport_read_stats(const nta_nvme_transport *transport,
                                          nta_nvme_queue_stats *stats);
 
@@ -197,25 +242,32 @@ nta_status nta_runtime_create(const nta_runtime_config *config,
                               nta_nvme_transport *nvme,
                               nta_runtime **runtime_out);
 void nta_runtime_destroy(nta_runtime *runtime);
-nta_status nta_runtime_set_request(
-    nta_runtime *runtime, uint32_t slot, uint64_t request_id,
-    uint32_t generation, uint32_t tenant_id, uint32_t priority,
-    uint64_t deadline_clock, uint64_t max_outstanding_bytes);
+nta_status nta_runtime_set_request(nta_runtime *runtime, uint32_t slot,
+                                   uint64_t request_id, uint32_t generation,
+                                   uint32_t tenant_id, uint32_t priority,
+                                   uint64_t deadline_clock,
+                                   uint64_t max_outstanding_bytes);
+nta_status nta_runtime_publish_requests_async(nta_runtime *runtime,
+                                              const nta_request_spec *requests,
+                                              uint32_t request_count,
+                                              uint64_t cuda_stream);
 nta_status nta_runtime_cancel_request(nta_runtime *runtime, uint32_t slot,
                                       uint32_t generation);
 nta_status nta_runtime_set_tenant_budget(nta_runtime *runtime,
                                          uint32_t tenant_id,
                                          uint64_t max_outstanding_bytes,
                                          uint32_t weight);
-nta_status nta_runtime_register_object(
-    nta_runtime *runtime, uint32_t slot, uint64_t object_id,
-    uint32_t version, uint64_t bytes, uint64_t staging_device_address,
-    const nta_registered_replica *replicas, uint32_t replica_count,
-    uint64_t *direct_device_base_out);
+nta_status nta_runtime_register_object(nta_runtime *runtime, uint32_t slot,
+                                       uint64_t object_id, uint32_t version,
+                                       uint64_t bytes,
+                                       uint64_t staging_device_address,
+                                       const nta_registered_replica *replicas,
+                                       uint32_t replica_count,
+                                       uint64_t *direct_device_base_out);
 nta_status nta_runtime_register_indexed_host_object(
-    nta_runtime *runtime, uint32_t slot, uint64_t object_id,
-    uint32_t version, uint64_t source_device_address,
-    uint64_t staging_device_address, uint64_t source_indices_device_address,
+    nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
+    uint64_t source_device_address, uint64_t staging_device_address,
+    uint64_t source_indices_device_address,
     uint64_t staging_indices_device_address, uint32_t index_count,
     uint32_t element_bytes, uint32_t source_stride_bytes,
     uint32_t staging_stride_bytes, uint32_t source_index_limit,
@@ -232,24 +284,32 @@ nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
                                         uint32_t relative_replica,
                                         uint64_t replica_tensor_map,
                                         uint64_t staging_tensor_map);
-nta_status nta_runtime_install_nvme_object(
-    nta_runtime *runtime, uint32_t slot, uint64_t object_id,
-    uint32_t version, uint64_t source_byte_offset, uint64_t bytes,
-    uint64_t *destination_device_address_out);
+nta_status
+nta_runtime_install_nvme_object(nta_runtime *runtime, uint32_t slot,
+                                uint64_t object_id, uint32_t version,
+                                uint64_t source_byte_offset, uint64_t bytes,
+                                uint64_t *destination_device_address_out);
 nta_status nta_runtime_read_pending_count(const nta_runtime *runtime,
                                           uint32_t *pending_count);
 nta_status nta_runtime_read_epoch_status(const nta_runtime *runtime,
                                          uint32_t work_ticket_count,
                                          nta_epoch_status *status);
+nta_status nta_runtime_read_sticky_failed_count(const nta_runtime *runtime,
+                                                uint32_t *failed_count);
 nta_status nta_runtime_read_request_progress(const nta_runtime *runtime,
                                              uint32_t request_slot,
                                              nta_request_progress *progress);
 nta_status nta_runtime_read_request_progress_range(
     const nta_runtime *runtime, uint32_t first_request_slot,
     uint32_t request_count, nta_request_progress *progress);
+// host_destination must point to request_count entries in CUDA page-locked
+// host memory and remain live until cuda_stream reaches the copy.
+nta_status nta_runtime_copy_request_progress_async(
+    const nta_runtime *runtime, uint32_t first_request_slot,
+    uint32_t request_count, uint64_t host_destination, uint64_t cuda_stream);
 nta_status nta_runtime_read_work_ticket_state(const nta_runtime *runtime,
-                                               uint32_t work_ticket,
-                                               uint32_t *state);
+                                              uint32_t work_ticket,
+                                              uint32_t *state);
 nta_status nta_runtime_read_work_runnable_ns(const nta_runtime *runtime,
                                              uint32_t work_ticket_count,
                                              uint64_t *runnable_ns);
@@ -261,10 +321,12 @@ int32_t nta_runtime_device_ordinal(const nta_runtime *runtime);
 // never the CUDA allocation. Call nta_dlpack_managed_tensor_destroy only when
 // the descriptor was not consumed.
 nta_status nta_device_pointer_dlpack(uint64_t device_address, uint64_t bytes,
-                                    int32_t device_ordinal,
-                                    void **managed_tensor_out);
+                                     int32_t device_ordinal,
+                                     void **managed_tensor_out);
 void nta_dlpack_managed_tensor_destroy(void *managed_tensor);
 nta_status nta_stream_synchronize(uint64_t cuda_stream);
+nta_status nta_copy_host_to_device_async(uint64_t destination, uint64_t source,
+                                         uint64_t bytes, uint64_t cuda_stream);
 
 nta_status nta_device_work_plan_create(uint32_t work_item_capacity,
                                        uint32_t dependency_capacity,
@@ -273,54 +335,88 @@ nta_status nta_device_work_plan_create(uint32_t work_item_capacity,
 void nta_device_work_plan_destroy(nta_device_work_plan *plan);
 nta_status nta_device_work_plan_upload(
     nta_device_work_plan *plan, const nta_work_item *work_items,
-    uint32_t work_item_count,
-    const nta_acquire_requirement *dependencies, uint32_t dependency_count,
-    const nta_request_work_range *requests, uint32_t request_count,
-    uint64_t cuda_stream);
+    uint32_t work_item_count, const nta_acquire_requirement *dependencies,
+    uint32_t dependency_count, const nta_request_work_range *requests,
+    uint32_t request_count, uint64_t cuda_stream);
 nta_status nta_device_work_plan_wait_on(const nta_device_work_plan *plan,
                                         uint64_t cuda_stream);
-nta_status nta_device_work_plan_synchronize_upload(
-    const nta_device_work_plan *plan);
+nta_status
+nta_device_work_plan_synchronize_upload(const nta_device_work_plan *plan);
 uint64_t nta_device_work_plan_work_items(const nta_device_work_plan *plan);
 uint64_t nta_device_work_plan_dependencies(const nta_device_work_plan *plan);
-uint32_t nta_device_work_plan_work_item_count(
-    const nta_device_work_plan *plan);
-uint32_t nta_device_work_plan_dependency_count(
-    const nta_device_work_plan *plan);
-int32_t nta_device_work_plan_device_ordinal(
-    const nta_device_work_plan *plan);
+uint32_t nta_device_work_plan_work_item_count(const nta_device_work_plan *plan);
+uint32_t
+nta_device_work_plan_dependency_count(const nta_device_work_plan *plan);
+int32_t nta_device_work_plan_device_ordinal(const nta_device_work_plan *plan);
 
 nta_status nta_jit_phase_program_create(const char *shared_object,
                                         nta_jit_phase_program **program_out);
 void nta_jit_phase_program_destroy(nta_jit_phase_program *program);
+nta_status nta_jit_phase_operator_contract(const nta_jit_phase_program *program,
+                                           nta_operator_contract *contract_out);
+nta_status nta_jit_phase_operator_plan(const nta_jit_phase_program *program,
+                                       nta_operator_plan *plan_out);
 nta_status nta_jit_phase_reset(const nta_jit_phase_program *program,
                                nta_runtime *runtime, uint32_t object_count,
                                uint32_t work_ticket_count,
                                uint64_t cuda_stream);
+nta_status nta_jit_phase_discover(const nta_jit_phase_program *program,
+                                  nta_runtime *runtime, uint64_t work_items,
+                                  uint64_t dependencies,
+                                  uint32_t work_item_count,
+                                  uint64_t cuda_stream);
 nta_status nta_jit_phase_invalidate_cached_objects(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
+nta_status nta_jit_phase_validate_indexed_host_range(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
+nta_status nta_jit_phase_rebind_indexed_host_pairs(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t pair_count, uint64_t key_source,
+    uint64_t key_staging, uint64_t value_source, uint64_t value_staging,
+    uint64_t cuda_stream);
 nta_status nta_jit_phase_preload_host(const nta_jit_phase_program *program,
                                       nta_runtime *runtime,
                                       uint32_t first_object,
                                       uint32_t object_count,
                                       uint64_t cuda_stream);
+nta_status
+nta_jit_phase_preload_host_pairs(const nta_jit_phase_program *program,
+                                 nta_runtime *runtime, uint32_t first_object,
+                                 uint32_t pair_count, uint64_t cuda_stream);
+nta_status nta_jit_phase_alias_preloaded_objects(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t source_first, uint32_t destination_first, uint32_t object_count,
+    uint64_t object_id_base, uint32_t version, uint64_t cuda_stream);
 nta_status nta_jit_phase_progress_host(const nta_jit_phase_program *program,
                                        nta_runtime *runtime, uint32_t blocks,
                                        uint64_t cuda_stream);
+nta_status nta_jit_phase_progress_indexed_host_range(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
+nta_status nta_jit_phase_progress_validated_indexed_host_range(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
+nta_status nta_jit_phase_progress_validated_indexed_host_range_parallel(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count,
+    uint32_t copy_blocks_per_group, uint64_t cuda_stream);
 nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        nta_runtime *runtime,
                                        uint32_t issue_budget,
                                        uint32_t completion_budget,
                                        uint64_t cuda_stream);
 nta_status nta_jit_phase_publish(const nta_jit_phase_program *program,
-                                 nta_runtime *runtime,
-                                 uint32_t pending_budget,
+                                 nta_runtime *runtime, uint32_t pending_budget,
                                  uint64_t cuda_stream);
 nta_status nta_jit_phase_complete(const nta_jit_phase_program *program,
                                   nta_runtime *runtime,
                                   uint32_t work_ticket_count,
                                   uint64_t cuda_stream);
+nta_status nta_jit_phase_complete_stream_ordered(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint64_t work_items, uint32_t work_item_count, uint64_t cuda_stream);
 
 #ifdef __cplusplus
 }

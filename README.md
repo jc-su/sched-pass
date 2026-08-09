@@ -21,6 +21,9 @@ systems contribution.
 
 The architecture contract and implementation sequence are defined in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The canonical FlashInfer bounded-HBM crossover, request semantics, reproduction
+command, and remaining compiler/SGLang boundary are in
+[docs/TIER_STREAMING.md](docs/TIER_STREAMING.md).
 The revised motivation, incremental-execution co-design, scalable implementation
 order, and claim gates are defined in
 [docs/SYSTEM_PLAN.md](docs/SYSTEM_PLAN.md).
@@ -52,18 +55,28 @@ workloads:
 
 - per-CTA request/generation binding in batched kernels;
 - compiler proof of a canonical finite-kernel deferral boundary;
-- an engine-neutral `WorkPlan` model and ABI-v20 bounded dependency sets, so one
+- compiler-verified convergent numerical regions whose publication
+  post-dominates acquired execution, with request/reduction operands lowered to
+  `!nta.partial` and `!nta.operator` contracts;
+- an engine-neutral `WorkPlan` model and ABI-v25 bounded dependency sets, so one
   work ticket can wait for several pages, experts, or object shards;
 - one reusable device-plan allocation with two pinned, asynchronous upload
   slots and no unconditional hot-path event synchronization;
 - a versioned shared-library C API and owning Python binding for engine
   allocations, work plans, finite JIT phases, work ticket state, and VFIO NVMe;
+- a schema-versioned JIT operator contract that records runtime ABI, operator
+  family, direct/incremental form, capabilities, and a paired source
+  fingerprint; native, Python, SGLang eager, and SGLang graph paths validate it
+  before launch;
+- a typed operator execution plan that fixes request-coordinate mapping,
+  online-softmax partial state, deterministic merge semantics, graph stability,
+  generation binding, and source/plan fingerprints across paired forms;
 - zero-copy DLPack views of the native runtime and plan plus a bounded
   FlashInfer layer executor whose fixed enqueue path can be captured after its
   structural plan is uploaded;
-- full SGLang decode CUDA-graph replay through stock FlashInfer wrappers after
-  stream-ordered acquisition, with exact live request metadata preserved across
-  the engine's padded replay view;
+- full SGLang decode CUDA-graph replay through compiler-transformed FlashInfer
+  wrappers after stream-ordered acquisition, with exact live request metadata
+  preserved across the engine's padded replay view;
 - non-owning registration of existing engine HBM and device-visible host
   allocations;
 - public finite-kernel host and device policies, replacing benchmark-specific
@@ -82,8 +95,9 @@ workloads:
 - completion-driven reverse dependency edges, direct exact-once runnable-work
   publication, and tagged urgency queues, so normal progress scales with
   arrivals rather than scanning configured ticket or intent capacity;
-- per-request blocked-byte, runnable-compute, completed-compute, and terminal
-  work summaries plus request-local reduction counters;
+- per-request blocked-byte, pending/runnable/completed compute, expected and
+  terminal work summaries, checked conservation, dropped-attribution telemetry,
+  and request-local reduction counters;
 - fixed request, tenant, and backend byte credits plus priority/deadline NVMe
   admission;
 - a backend-neutral directory with bounded per-object physical replicas;
@@ -118,17 +132,15 @@ workloads:
 - phase-aware FlashInfer split-K execution that refuses to merge each request's
   decode or paged-prefill rows until that request's current-generation
   contributors complete, without blocking complete peers in the same merge;
-- request-bound runnable-work launches that map a compact physical CTA prefix
-  back to the original FlashInfer request/tile schedule while the launch is
-  stream-ordered;
+- request-bound FlashInfer waves that preserve the original request/tile
+  schedule and admit contributors from current-generation ticket state while
+  transfer and compute streams overlap;
 - an installed SGLang 0.5.14 plugin backend that binds real request IDs,
-  generations, and priorities for unresolved demand, overlaps HiCache's tuned
-  layer copies with model execution, retains stock FlashInfer after acquisition,
-  routes only unresolved multi-round work through guarded instrumented
-  FlashInfer, mirrors request aborts, keys plan reuse by exact host/device page
-  pairs, and fails
-  closed on claimed-batch planning errors unless availability-only fallback is
-  explicitly enabled.
+  generations, and priorities for every batch, overlaps HiCache's tuned layer
+  copies with model execution, executes resident/preacquired work through the
+  transformed direct form, routes unresolved work through generation-keyed
+  tickets, mirrors request aborts, reuses one structural plan across layers,
+  and fails closed instead of switching to stock attention;
 - a hard capacity and high-water telemetry for HBM staging allocations owned by
   the runtime; engine-owned KV staging remains governed by the engine cache.
 
@@ -142,22 +154,65 @@ HiCache adapter are implemented. vLLM is not registered: vLLM 0.13 exposes an
 experimental KVConnector lifecycle, but its stock offload path completes loads
 before attention and its Blackwell FlashInfer backend normally selects TRTLLM
 entry points outside the current hook. The compiler currently consumes explicit
-acquisition
-markers; automatic recognition of arbitrary production load/cp.async/TMA
-address cones is an open gate. The pass does prove CTA-uniform control and
-operands for explicit sites; lane-divergent collective calls are rejected.
+acquisition and partial-region markers; automatic recognition of arbitrary
+production load/cp.async/TMA address cones is an open gate. The pass proves
+CTA-uniform acquisition control and operands, rejects lane-divergent collective
+calls, and rejects partial regions with non-convergent endpoints, mismatched
+request/work-ticket identity, an acquisition bypass, a bypassed publication,
+or multiple publications. FlashInfer demand kernels use compiler-lowered
+publication instead of updating reduction counters in adapter code.
 The real FlashInfer GPU-selected path is an operator-level result, not a claim
 that the current SGLang path uses sparse attention or improves an end-to-end
-serving SLO. Dense SGLang remains the production integration target. Current
-one-GPU dense CPU-DRAM opportunity traces do not justify forced incremental
-execution, so the online path dispatches the stock bulk form there. Custom CUDA
-attention and MoE programs remain correctness fixtures rather than production
-performance evidence.
+serving SLO. Dense SGLang remains the production integration target. The older
+whole-layer CPU-DRAM path remains a negative baseline. A newer canonical
+FlashInfer bounded-HBM experiment establishes reusable numerical overlap.
+After moving wrapper construction, copy-slot lifetime, partial execution,
+merge, and graph-safe source rebinding into the runtime operator, exact
+request-aware streaming is `1.1714x` faster than atomic promotion with a 95%
+confidence interval of `[1.1660x, 1.1732x]` and `4x` lower staging capacity.
+The heterogeneous-shape run is `1.1100x` faster with `4.83x` lower staging.
+Both positive arms use compiler-transformed canonical FlashInfer and validate a
+paired typed execution plan, dynamic-source graph replay, generation reuse, and
+cancellation isolation; custom CUDA attention and MoE programs remain
+correctness fixtures rather than production performance evidence.
+The same operator also has a real GPU-initiated mapped-host producer. It passes
+the graph, lifecycle, and numerical gates, but measures `0.479x` versus atomic
+copy-engine promotion on this host. CPU DRAM therefore remains copy-engine
+driven; GPU initiation is retained for device-discovered demand and transports
+whose queue semantics justify it, rather than being claimed as universally
+faster.
 The existing code implements the unavailable-data work-ticket mechanism,
-request-local partial reduction, real FlashInfer hooks, and SGLang decode graph
-replay. It does not yet generate direct and incremental forms from one typed
-operator, feed progress into SGLang batch admission, or put the demand-mode
-progress loop inside SGLang graph replay as described in `SYSTEM_PLAN.md`.
+compiler-verified request-local partial reduction, real FlashInfer hooks, and
+SGLang decode graph replay. Demand mode also reuses one structural plan,
+rebinds layer K/V directories on the GPU, and stages one next-layer contributor
+wave during post-attention compute before progressing the remaining waves. It
+does not yet generate the same bounded-staging forms for SGLang's paged decode
+operator, feed partial progress into
+SGLang batch admission, or put the demand-mode progress loop inside SGLang graph
+replay as described in `SYSTEM_PLAN.md`. The latest matched fragmented
+Qwen2.5-3B CPU-DRAM tests remain negative: `0.863x` stock throughput at 8K and
+`0.927x` at 16K. They execute 36 real ticketed FlashInfer layers, 35 first-wave
+lookaheads, zero stock launch/fallback, and produce identical output. The trend
+does not establish a crossover. The current ABI-v23 v10 2K mixed point is also
+negative: exact output, all 1,080 attention launches transformed, zero fallback,
+`0.977x` throughput, `1.012x` resident P99 inter-token latency, and `1.021x`
+external TTFT. A five-trial admission/re-merge policy regressed the causal tail
+metric and was removed. No end-to-end SGLang speedup, production-ready status,
+or OSDI-level claim is supported yet. The immediate gate is to execute the
+now-positive typed direct/stream operator inside SGLang decode and paged prefill
+with zero stock fallback.
+The corrected real FlashInfer device-selected sweep chooses transformed bulk
+at zero avoided bytes, where forced indexed acquisition delivers only `0.6431x`
+throughput. At 75%-93.75% avoided bytes it reaches `2.1259x`-`8.1731x` over
+forced candidate overfetch with same-trial policy regret `1.0000x`. An
+all-candidate-resident arm is at least `9.15x` faster than cold indexed
+acquisition, so this is useful-byte reduction evidence and an explicit
+acquisition-overhead target, not a universal-win claim.
+The current warm-cache resident Qwen2.5-3B graph smoke executes 4,068
+compiler-transformed attention launches, 36 captures, and 32 replays with zero
+stock/fallback launches and measures `1.021x` stock throughput. Three samples
+establish graph integration and the resident-overhead gate only; no incremental
+external work executes in that row.
 There is no placeholder RDMA backend. The only NVMe control plane uses
 VFIO PCI cdev ownership and a private IOMMUFD IOAS; the existing device ABI and
 finite GPU data path are unchanged. Hardware write protection remains the
@@ -243,8 +298,9 @@ intentionally unaligned staged source:
 ```
 
 `HostMapped` lets the GPU consume mapped pinned DRAM directly. `HostStaged`
-uses a finite GPU progress CTA to copy into caller-provided HBM and publish data
-availability; it has vectorized aligned and safe unaligned paths. RNIC/RDMA is
+uses finite GPU progress to copy into caller-provided HBM and publish data
+availability; it has vectorized aligned, row-specialized multi-CTA, and safe
+unaligned paths. RNIC/RDMA is
 deferred and remains inactive rather than being simulated.
 
 Run the engine-neutral MoE generality workload:
@@ -285,7 +341,7 @@ overfetch, a precomputed selected-copy oracle, and the online cost decision:
 ```bash
 tools/jit/activate.py --build-dir build --flashinfer-hook -- \
   python3 scripts/run-selected-pages-sweep.py \
-  --output results/selected-pages-sweep-v20.json \
+  --output results/selected-pages-sweep-v25-corrected.json \
   --require-peak-speedup
 ```
 
@@ -363,19 +419,14 @@ cmake --build build --target nta-vfio-nvme-probe nta-nvme-bench
 ./scripts/nta-vfio-device.sh preflight
 NTA_NVME_MEDIA_POLICY=trusted-read-only-code \
   ./scripts/nta-vfio-device.sh bind-and-probe
-sudo env LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64 \
-  ./build/nta-nvme-bench \
-  --device=vfio:0000:d8:00.0 \
-  --gpu=0 \
-  --reference=/tmp/nta-nvme-reference.bin \
-  --requests=16 \
-  --bytes=65536 \
-  --cta-try-issue=1 \
-  --progress-passes=8 \
-  --iterations=1000 \
-  --media-policy=trusted-read-only-code \
-  --output=results/hardware/nvme-abi19.json
 ./scripts/nta-vfio-device.sh restore
+./scripts/run-nvme-qualification.py \
+  --media-policy=trusted-read-only-code \
+  --bytes=$((2 * 1024 * 1024)) \
+  --requests=32 \
+  --progress-passes=32 \
+  --iterations=20 \
+  --require-ready
 ```
 
 The helper refuses mounted/open devices, block holders, shared IOMMU groups,
@@ -394,5 +445,7 @@ completed all 32,000 measured commands with matching data at 1,624.42 MiB/s
 physical throughput and zero failure. The benchmark invalidates its staging entries at
 the start of every measured graph; cache-hit replay is therefore not counted as
 SSD bandwidth. This is a single-machine mechanism result, not production
-serving or paper-level evaluation, and it must be rerun on ABI v20 before use as
-current evidence.
+serving or paper-level evaluation. The ABI-v25 harness now completes exact
+2-MiB reads at 58.23% of a matched `fio` baseline on this host; its latest
+artifact is dirty-revision diagnostic evidence and must be repeated after the
+final qualification commit.

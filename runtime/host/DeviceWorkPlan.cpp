@@ -35,6 +35,13 @@ void validate(const WorkPlan &plan) {
   const std::uint32_t dependencyCount =
       checkedCount(plan.dependencies.size(), "dependency count");
   (void)checkedCount(plan.requests.size(), "request count");
+  const std::uint32_t workTicketBase = plan.workItems.front().workTicket;
+  const std::uint32_t reductionGroupBase =
+      plan.workItems.front().reductionGroup;
+  if (workTicketBase > abi::InvalidIndex - workCount ||
+      reductionGroupBase > abi::InvalidIndex - plan.requests.size()) {
+    throw std::invalid_argument("work plan global index range overflows");
+  }
   std::uint32_t workCursor = 0;
   for (std::uint32_t requestIndex = 0; requestIndex < plan.requests.size();
        ++requestIndex) {
@@ -49,7 +56,7 @@ void validate(const WorkPlan &plan) {
       if (work.requestIndex != requestIndex ||
           work.requestSlot != request.requestSlot ||
           work.generation != request.generation ||
-          work.reductionGroup != requestIndex ||
+          work.reductionGroup != reductionGroupBase + requestIndex ||
           work.contributorIndex != relative ||
           work.contributorCount != request.workCount) {
         throw std::invalid_argument(
@@ -63,7 +70,7 @@ void validate(const WorkPlan &plan) {
   }
   for (std::uint32_t index = 0; index < workCount; ++index) {
     const abi::WorkItem &work = plan.workItems[index];
-    if (work.workTicket != index || work.dependencyCount == 0 ||
+    if (work.workTicket != workTicketBase + index || work.dependencyCount == 0 ||
         work.directDependencyCount > work.dependencyCount ||
         work.dependencyBegin > dependencyCount ||
         work.dependencyCount > dependencyCount - work.dependencyBegin ||

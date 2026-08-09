@@ -14,6 +14,20 @@ inline constexpr std::uint64_t Preacquired = 1ULL << 1;
 inline constexpr std::uint64_t BindCurrentGeneration = 1ULL << 2;
 inline constexpr std::uint64_t PlanlessPreacquired = 1ULL << 3;
 inline constexpr std::uint64_t RunnableWork = 1ULL << 4;
+inline constexpr std::uint64_t RunnableOffsetShift = 32;
+inline constexpr std::uint64_t WorkCountMask = 0xffffffffULL;
+
+[[nodiscard]] constexpr std::uint64_t
+packWorkMetadata(std::uint32_t workCount, std::uint32_t requestCount) {
+  return (static_cast<std::uint64_t>(requestCount) << 32U) | workCount;
+}
+
+template <typename Params>
+[[nodiscard]] __host__ __device__ __forceinline__ std::uint32_t
+workCount(const Params &params) {
+  return static_cast<std::uint32_t>(
+      static_cast<std::uint64_t>(params.nta_work_count) & WorkCountMask);
+}
 
 template <typename Params, typename = void>
 struct HasWorkPlan : std::false_type {};
@@ -32,6 +46,19 @@ template <typename Params>
 inline constexpr bool HasWorkPlanV = HasWorkPlan<Params>::value;
 
 template <typename Params, typename = void>
+struct HasRequestBinding : std::false_type {};
+
+template <typename Params>
+struct HasRequestBinding<
+    Params,
+    std::void_t<decltype(std::declval<const Params &>().nta_runtime),
+                decltype(std::declval<const Params &>().nta_request_slot_offset)>>
+    : std::true_type {};
+
+template <typename Params>
+inline constexpr bool HasRequestBindingV = HasRequestBinding<Params>::value;
+
+template <typename Params, typename = void>
 struct HasPagedBatchSize : std::false_type {};
 
 template <typename Params>
@@ -42,6 +69,13 @@ struct HasPagedBatchSize<
 
 template <typename Params>
 [[nodiscard]] inline std::uint32_t requestGroupCount(const Params &params) {
+  if constexpr (HasWorkPlanV<Params>) {
+    const std::uint32_t encoded = static_cast<std::uint32_t>(
+        static_cast<std::uint64_t>(params.nta_work_count) >> 32U);
+    if (encoded != 0) {
+      return encoded;
+    }
+  }
   if constexpr (HasPagedBatchSize<Params>::value) {
     return static_cast<std::uint32_t>(params.paged_kv.batch_size);
   } else {
@@ -64,28 +98,46 @@ validWork(const Params &params, std::uint32_t schedulerIndex,
     return false;
   } else {
     if (params.nta_runtime == nullptr || params.nta_work_items == nullptr ||
-        params.nta_dependencies == nullptr || params.nta_work_count <= 0 ||
-        schedulerIndex >= static_cast<std::uint64_t>(params.nta_work_count)) {
+        workCount(params) == 0) {
       return false;
     }
+#if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+    if (params.nta_dependencies == nullptr) {
+      return false;
+    }
+#endif
     auto *runtime = reinterpret_cast<abi::RuntimeView *>(params.nta_runtime);
+    const bool runnable =
+        (static_cast<std::uint64_t>(params.nta_skip_merge) & RunnableWork) != 0;
+    const std::uint64_t schedulerLimit =
+        runnable ? runtime->workTicketCapacity
+                 : static_cast<std::uint64_t>(workCount(params));
+    if (schedulerIndex >= schedulerLimit) {
+      return false;
+    }
     const auto *items =
         reinterpret_cast<const abi::WorkItem *>(params.nta_work_items);
     const abi::WorkItem &item = items[schedulerIndex];
-    return runtime != nullptr && runtime->abiVersion == abi::Version &&
+    const bool baseValid =
+           runtime != nullptr && runtime->abiVersion == abi::Version &&
            item.requestIndex == requestIndex &&
            item.requestSlot < runtime->requestCapacity &&
            item.workTicket < runtime->workTicketCapacity &&
-           item.reductionGroup < runtime->workTicketCapacity &&
+           item.reductionGroup < runtime->workTicketCapacity;
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+    return baseValid;
+#else
+    return baseValid &&
            item.contributorCount != 0 &&
            item.contributorIndex < item.contributorCount;
+#endif
   }
 }
 
 template <typename Params>
 [[nodiscard]] __device__ __forceinline__ abi::RuntimeView *
 runtime(const Params &params) {
-  if constexpr (HasWorkPlanV<Params>) {
+  if constexpr (HasWorkPlanV<Params> || HasRequestBindingV<Params>) {
     return reinterpret_cast<abi::RuntimeView *>(params.nta_runtime);
   } else {
     (void)params;
@@ -157,8 +209,46 @@ usesPlanlessPreacquired(const Params &params) {
   }
 }
 
+// Compile-time request-bound kernels retain NTA's per-request generation guard
+// but deliberately cannot discover or issue external dependencies. They are
+// valid only after stream-ordered acquisition has completed.
 template <typename Params>
 [[nodiscard]] __device__ __forceinline__ bool
+validRequestBoundLaunch(const Params &params, abi::RuntimeView *runtime) {
+  if constexpr (!HasRequestBindingV<Params>) {
+    (void)params;
+    (void)runtime;
+    return false;
+  } else {
+    return runtime != nullptr && runtime->abiVersion == abi::Version &&
+           runtime->requests != nullptr;
+  }
+}
+
+template <typename Params>
+[[nodiscard]] __device__ __forceinline__ bool
+bindValidatedRequestOnly(const Params &params, abi::RuntimeView *runtime,
+                         std::uint32_t requestIndex) {
+  if constexpr (!HasRequestBindingV<Params>) {
+    (void)params;
+    (void)runtime;
+    (void)requestIndex;
+    return false;
+  } else {
+    const std::uint64_t requestSlot64 =
+        static_cast<std::uint64_t>(params.nta_request_slot_offset) + requestIndex;
+    if (requestSlot64 >= runtime->requestCapacity) {
+      return false;
+    }
+    const std::uint32_t requestSlot = static_cast<std::uint32_t>(requestSlot64);
+    const std::uint32_t generation = runtime->requests[requestSlot].generation;
+    __nta_bind_request(requestSlot, generation);
+    return __nta_acquire_set_marker(runtime, nullptr, 0, 0, abi::InvalidIndex);
+  }
+}
+
+template <typename Params>
+[[nodiscard]] __host__ __device__ __forceinline__ bool
 usesRunnableWork(const Params &params) {
   if constexpr (HasWorkPlanV<Params>) {
     return (static_cast<std::uint64_t>(params.nta_skip_merge) & RunnableWork) !=
@@ -167,6 +257,25 @@ usesRunnableWork(const Params &params) {
     (void)params;
     return false;
   }
+}
+
+template <typename Params>
+[[nodiscard]] __host__ __device__ __forceinline__ std::uint32_t
+runnableWorkOffset(const Params &params) {
+  if constexpr (HasWorkPlanV<Params>) {
+    return static_cast<std::uint32_t>(
+        static_cast<std::uint64_t>(params.nta_skip_merge) >>
+        RunnableOffsetShift);
+  } else {
+    (void)params;
+    return 0;
+  }
+}
+
+template <typename Params>
+[[nodiscard]] __host__ __device__ __forceinline__ std::uint32_t
+reductionGroupOffset(const Params &params) {
+  return usesRunnableWork(params) ? 0U : runnableWorkOffset(params);
 }
 
 // Runnable work is physically compacted at the front of the fixed framework
@@ -181,20 +290,41 @@ launchWorkIndex(const Params &params, abi::RuntimeView *runtime,
   }
   if (runtime == nullptr || runtime->abiVersion != abi::Version ||
       runtime->readyCount == nullptr || runtime->readyWorkTickets == nullptr ||
-      params.nta_work_count <= 0) {
+      workCount(params) == 0) {
     return abi::InvalidIndex;
   }
   // Publication and this launch are stream ordered. No producer mutates the
   // runnable-work set while an application kernel consumes it.
   const std::uint32_t ready = *runtime->readyCount;
-  if (launchIndex >= ready ||
-      launchIndex >= static_cast<std::uint64_t>(params.nta_work_count)) {
+  const std::uint32_t offset = runnableWorkOffset(params);
+  const std::uint64_t queueIndex =
+      static_cast<std::uint64_t>(offset) + launchIndex;
+  if (offset > ready || queueIndex >= ready ||
+      launchIndex >= static_cast<std::uint64_t>(workCount(params))) {
     return abi::InvalidIndex;
   }
-  const std::uint32_t workIndex = runtime->readyWorkTickets[launchIndex];
-  return workIndex < static_cast<std::uint64_t>(params.nta_work_count)
+  const std::uint32_t workIndex = runtime->readyWorkTickets[queueIndex];
+  return workIndex < runtime->workTicketCapacity
              ? workIndex
              : abi::InvalidIndex;
+}
+
+// In runnable mode nta_work_count is a conservative physical launch bound;
+// canonical identity and active count remain device-owned in readyWorkTickets.
+// Initial/discovery launches retain the framework's complete scheduler grid.
+template <typename Params>
+[[nodiscard]] inline std::uint32_t
+launchWorkCount(const Params &params, std::uint32_t frameworkWorkCount) {
+  if constexpr (HasWorkPlanV<Params>) {
+    const std::uint64_t flags =
+        static_cast<std::uint64_t>(params.nta_skip_merge);
+    const std::uint64_t requested = workCount(params);
+    if ((flags & RunnableWork) != 0 && requested != 0) {
+      return static_cast<std::uint32_t>(
+          requested < frameworkWorkCount ? requested : frameworkWorkCount);
+    }
+  }
+  return frameworkWorkCount;
 }
 
 template <typename Params>
@@ -205,60 +335,15 @@ shouldRun(const Params &params, abi::RuntimeView *runtime,
 }
 
 // FlashInfer maps one canonical x-coordinate to one or more y/z head CTAs.
-// Every participating CTA calls this after its output stores. The final sibling
-// retires the ticket, replacing a stream-ordered full-grid completion launch.
+// Every participating CTA publishes after its output stores. Publication is an
+// explicit compiler effect: the pass proves its acquired-path placement and
+// lowers it to the generation-checked request-local reduction protocol.
 template <typename Params>
 __device__ __forceinline__ void finish(const Params &params,
                                        abi::RuntimeView *runtime,
                                        const kernel::WorkContext &work) {
-  if (!tracksCompletion(params)) {
-    return;
-  }
-  __syncthreads();
-  if (runtime == nullptr || runtime->ctaCompletions == nullptr ||
-      work.item.workTicket >= runtime->workTicketCapacity || threadIdx.x != 0 ||
-      threadIdx.y != 0 || threadIdx.z != 0) {
-    return;
-  }
-  const std::uint64_t siblingCount64 =
-      static_cast<std::uint64_t>(gridDim.y) * gridDim.z;
-  if (siblingCount64 == 0 || siblingCount64 > UINT32_MAX) {
-    atomicExch(&runtime->workTickets[work.item.workTicket].state,
-               static_cast<std::uint32_t>(abi::WorkTicketState::Failed));
-    return;
-  }
-  const std::uint32_t completed =
-      atomicAdd(&runtime->ctaCompletions[work.item.workTicket], 1U) + 1U;
-  if (completed != static_cast<std::uint32_t>(siblingCount64)) {
-    return;
-  }
-  abi::WorkTicket &ticket = runtime->workTickets[work.item.workTicket];
-  const auto state =
-      static_cast<abi::WorkTicketState>(atomicAdd(&ticket.state, 0U));
-  if (state == abi::WorkTicketState::New) {
-    if (!device::requestLive(runtime, work.item.requestSlot,
-                             work.item.generation)) {
-      device::failWorkTicket(runtime, work.item.workTicket,
-                             abi::WorkTicketState::Cancelled);
-      return;
-    }
-    ticket.requestId = runtime->requests[work.item.requestSlot].requestId;
-    ticket.requestSlot = work.item.requestSlot;
-    ticket.generation = work.item.generation;
-    ticket.logicalTile = work.item.workTicket;
-    ticket.epoch = device::currentEpoch(runtime);
-    ticket.unavailableBytes = 0;
-    ticket.estimatedComputeNs = work.item.estimatedComputeNs;
-    ticket.reductionGroup = work.item.reductionGroup;
-    ticket.contributorCount = work.item.contributorCount;
-    __threadfence();
-  } else if (!device::ticketMatches(runtime, ticket, work.item.requestSlot,
-                                    work.item.generation)) {
-    device::failWorkTicket(runtime, work.item.workTicket,
-                           abi::WorkTicketState::Failed);
-    return;
-  }
-  (void)device::completeWorkTicket(runtime, work.item.workTicket);
+  (void)params;
+  kernel::commitPartial(runtime, work);
 }
 
 [[nodiscard]] __device__ __forceinline__ bool
@@ -272,20 +357,29 @@ epochComplete(const abi::RuntimeView *runtime, std::uint32_t expectedWork) {
 
 struct MergeGate {
   const abi::RuntimeView *runtime;
+  std::uint32_t reductionGroupOffset;
 };
 
 template <typename Params>
 [[nodiscard]] inline MergeGate mergeGate(const Params &params) {
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  // The request directory is frozen for this finite graph launch. FlashInfer's
+  // own stream order makes every partial visible to its merge kernel; the
+  // exact work plan is retired immediately after wrapper completion.
+  (void)params;
+  return {nullptr, 0};
+#else
   if constexpr (HasWorkPlanV<Params>) {
-    if (params.nta_runtime != nullptr && params.nta_work_count > 0 &&
+    if (params.nta_runtime != nullptr && workCount(params) != 0 &&
         (static_cast<std::uint64_t>(params.nta_skip_merge) & Preacquired) ==
             0) {
       const auto *runtime =
           reinterpret_cast<const abi::RuntimeView *>(params.nta_runtime);
-      return {runtime};
+      return {runtime, reductionGroupOffset(params)};
     }
   }
-  return {nullptr};
+  return {nullptr, 0};
+#endif
 }
 
 template <typename Params>

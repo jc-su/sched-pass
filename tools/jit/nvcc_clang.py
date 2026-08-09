@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import re
@@ -44,6 +45,38 @@ def matches_filter(arguments: list[str], variable: str) -> bool:
                if token.strip())
 
 
+def operator_family(arguments: list[str]) -> int:
+    """Return the semantic family of the generated operator module.
+
+    FlashInfer's tensor-core decode module is implemented with paged-prefill
+    translation units, so a source filename cannot identify the public
+    operator. The generated module directory is present in every compile
+    command and remains stable across those internal implementation choices.
+    """
+    command = " ".join(arguments)
+    module_tokens = (
+        (("nta_sglang_decode_", "nta_batch_decode_"), 1),
+        (("nta_sglang_prefill_", "nta_batch_prefill_"), 2),
+    )
+    families = {
+        family
+        for tokens, family in module_tokens
+        if any(token in command for token in tokens)
+    }
+    if len(families) > 1:
+        raise RuntimeError("JIT command names multiple NTA operator families")
+    if families:
+        return families.pop()
+
+    # Standalone generic integrations do not necessarily use an NTA module
+    # name. Preserve source-based identification only for those modules.
+    if "batch_decode_kernel.cu" in command:
+        return 1
+    if "batch_prefill_paged_kernel" in command:
+        return 2
+    return 0
+
+
 def translate(arguments: list[str], instrument: bool) -> list[str]:
     command = [
         CLANG,
@@ -76,8 +109,55 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
         command.append(f"-fpass-plugin={PLUGIN}")
         if os.environ.get("NTA_FLASHINFER_HOOK"):
             phase_source = matches_filter(arguments, "NTA_JIT_PHASE_SOURCE")
+            request_bound = matches_filter(
+                arguments, "NTA_JIT_REQUEST_BOUND_SOURCE"
+            )
+            stream_ordered_direct = (
+                "nta_sglang_prefill_demand_acquire_tier_v4_"
+                in " ".join(arguments)
+            )
+            family = operator_family(arguments)
+            operator_form = 1 if request_bound else 2
+            direct_capabilities = (1 << 0) | (1 << 6) | (1 << 7)
+            incremental_capabilities = sum(1 << bit for bit in range(8))
+            capabilities = (
+                direct_capabilities if request_bound else incremental_capabilities
+            )
+            fingerprint = hashlib.sha256(
+                os.environ.get("NTA_JIT_CACHE_TAG", "").encode("utf-8")
+            ).digest()
+            hash_low = int.from_bytes(fingerprint[:8], "little")
+            hash_high = int.from_bytes(fingerprint[8:16], "little")
+            coordinate_map = 1 if family in (1, 2) else 0
+            partial_state = 1 if family in (1, 2) else 0
+            reduction = 1 if family in (1, 2) else 0
+            plan_flags = 0x1F if family in (1, 2) else 0x9
+            plan_fingerprint = hashlib.sha256(
+                (
+                    f"{os.environ.get('NTA_JIT_CACHE_TAG', '')}|{family}|6|"
+                    f"{coordinate_map}|{partial_state}|{reduction}|{plan_flags}"
+                ).encode("utf-8")
+            ).digest()
+            plan_hash_low = int.from_bytes(plan_fingerprint[:8], "little")
+            plan_hash_high = int.from_bytes(plan_fingerprint[8:16], "little")
             command.extend([
                 f"-DNTA_DEVICE_PHASE_KERNELS={1 if phase_source else 0}",
+                f"-DNTA_FLASHINFER_REQUEST_BOUND={1 if request_bound else 0}",
+                "-DNTA_FLASHINFER_PREACQUIRED_ONLY=0",
+                "-DNTA_FLASHINFER_STREAM_ORDERED_DIRECT="
+                f"{1 if stream_ordered_direct else 0}",
+                f"-DNTA_OPERATOR_FAMILY={family}",
+                f"-DNTA_OPERATOR_FORM={operator_form}",
+                f"-DNTA_OPERATOR_CAPABILITIES={capabilities}ULL",
+                f"-DNTA_OPERATOR_SOURCE_HASH_LOW={hash_low}ULL",
+                f"-DNTA_OPERATOR_SOURCE_HASH_HIGH={hash_high}ULL",
+                "-DNTA_OPERATOR_SUPPORTED_FORMS=6U",
+                f"-DNTA_OPERATOR_COORDINATE_MAP={coordinate_map}U",
+                f"-DNTA_OPERATOR_PARTIAL_STATE={partial_state}U",
+                f"-DNTA_OPERATOR_REDUCTION={reduction}U",
+                f"-DNTA_OPERATOR_PLAN_FLAGS={plan_flags}U",
+                f"-DNTA_OPERATOR_PLAN_HASH_LOW={plan_hash_low}ULL",
+                f"-DNTA_OPERATOR_PLAN_HASH_HIGH={plan_hash_high}ULL",
                 "-include",
                 str(
                     ROOT / (

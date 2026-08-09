@@ -110,7 +110,8 @@ int main() {
         runtime.readRequestProgress(0);
     require(requestProgress.requestId == 1001 &&
                 requestProgress.generation == 7 &&
-                requestProgress.expectedWork == 0,
+                requestProgress.expectedWork == 0 &&
+                requestProgress.droppedAttributions == 0,
             "request progress was not initialized with request identity");
     std::uint32_t pendingCount = 1;
     require(cudaMemcpy(&pendingCount, hostView.pendingCount,

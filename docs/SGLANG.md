@@ -3,9 +3,12 @@
 Status: SGLang 0.5.14 and FlashInfer 0.6.12 are integrated through SGLang's
 installed plugin mechanism. The adapter handles eager CPU-DRAM HiCache
 promotion and full decode CUDA-graph replay. Preacquired and resident work uses
-stock FlashInfer; only unresolved multi-round demand work uses instrumented
-wrappers. This is a locally validated integration, not a production-readiness
-claim.
+the compiler-transformed direct form; unresolved multi-round demand uses the
+same transformed wrapper with work tickets. Multi-round demand can stage the
+first contributor wave for layer `L+1` after layer `L` attention and overlap it
+with post-attention model compute; later waves remain ticketed. Stock fallback
+is not part of the NTA backend. This is a locally validated integration, not a
+production-readiness claim.
 
 ## Plugin Boundary
 
@@ -16,7 +19,7 @@ sglang.srt.plugins: nta = nta_runtime.plugins.sglang:register
 ```
 
 SGLang loads it in frontend and spawned scheduler processes. Registration adds
-the `nta_flashinfer` attention backend and three lifecycle hooks:
+the `nta_flashinfer` attention backend and five lifecycle hooks:
 
 1. `HiCacheController.start_loading`: claim a supported host load before
    SGLang copies it, preserving its page map, completion events, and ACKs.
@@ -24,45 +27,66 @@ the `nta_flashinfer` attention backend and three lifecycle hooks:
    NTA's current request generations before SGLang mutates its queues.
 3. `Scheduler.release_host_resources`: atomically flush engine statistics on
    graceful scheduler shutdown.
+4. `ForwardBatch.init_new`: attach request priorities to the exact engine batch.
+5. `Scheduler._get_new_batch_prefill_raw`: observe bounded acquisition progress
+   for external-only admission; an already formed mixed batch is released
+   immediately because delaying and re-forming it regressed tail latency.
 
 The plugin also preserves live request IDs and priorities when SGLang 0.5.14
 constructs its padded decode-graph replay view. The patch is version-pinned and
 fails closed if upstream metadata no longer matches the validated structure;
 synthetic padding slots receive distinct non-user request IDs.
 
-Before unresolved demand planning, the adapter binds `ForwardBatch.rids` to
-compact engine-neutral request slots with monotonically changing generations.
-The preacquired stock path has no NTA work ticket or CTA hook and therefore does
-not publish unused bindings. At SGLang's HiCache producer point, that path
-enqueues each layer's existing tuned indexed-copy kernel on a dedicated finite
-CUDA stream and records a preallocated data-available event. The consumer stream
-waits only for the layer it is about to use, then unchanged stock FlashInfer
-consumes that layer.
+Every transformed shared object exports a schema-1 operator contract containing
+the runtime ABI, FlashInfer family, direct or incremental form, capability bits,
+and a 128-bit source fingerprint. Eager and graph paths validate the contract
+before first launch. When both forms execute, SGLang also requires their source
+fingerprints to match; module names, counters, or successful symbol loading are
+not accepted as compiler evidence by themselves.
+
+Before attention planning, the adapter binds `ForwardBatch.rids` to compact
+engine-neutral request slots with monotonically changing generations. Changed
+bindings are bulk-published from pinned staging on the current CUDA stream; no
+per-request synchronization is performed. At SGLang's HiCache producer point,
+the preacquired path enqueues each layer's existing tuned indexed-copy kernel
+on a dedicated finite CUDA stream and records a preallocated data-available
+event. The consumer stream waits only for the layer it is about to use, then
+transformed FlashInfer checks the current request generation before consuming
+that layer.
 
 ```text
 SGLang request and HiCache page map
   -> early layer-wise indexed copy on a finite CUDA stream
   -> preallocated per-layer data-available event
-  -> stock FlashInfer after acquisition
+  -> transformed direct FlashInfer request guard
   -> SGLang-owned output tensor and HiCache completion
 
 Unresolved demand
   -> compact request slot/generation binding
-  -> ABI-20 guarded incremental CTAs
+  -> ABI-24 guarded incremental CTAs
 ```
 
-This preacquired path allocates no per-batch `WorkItem` array, publishes no
-object directory, launches no reset/progress/completion kernels, and performs
-no model-thread page-map download. `NTA_SGLANG_PIPELINE_HOST=0` selects the
+The resident-only preacquired direct path allocates no per-batch `WorkItem`
+array, publishes no object directory, and launches no
+reset/progress/completion kernels. Preacquired external layers retain a
+validated structural work plan so CTA-to-request identity cannot be inferred
+from launch shape alone. `NTA_SGLANG_PIPELINE_HOST=0` selects the
 schedule-aware policy path: it extracts FlashInfer's request/KV-tile schedule
 and evaluates the calibrated bulk-versus-incremental cost model before building
 a device plan. A one-round decision uses SGLang's tuned layer transfer and the
-stock FlashInfer wrapper without allocating or uploading CTA plan state. A
+transformed direct wrapper without allocating or uploading CTA plan state. A
 multi-round decision registers exact indexed K/V objects and runs bounded CTA
 acquisition epochs. `NTA_SGLANG_FORCE_INCREMENTAL=1` is an evaluation ablation
-that overrides the cost gate. Every incremental epoch is checked before its
-output is returned; transport failure, cancellation, or an exhausted finite
-bound therefore fails closed rather than exposing an incomplete merge. All
+that overrides the cost gate. The structural work plan is uploaded once. Later
+layers use a GPU directory-rebind kernel instead of rebuilding object
+descriptors on the model thread. When multiple rounds are selected and one
+FlashInfer wrapper serves the model, the first K/V contributor wave for the
+next layer is copied after the current attention kernel and overlaps the MLP.
+The next epoch preserves those completed directory entries, executes their
+contributors in its initial transformed launch, and progresses only the
+remaining waves. `NTA_SGLANG_FRAGMENT_LOOKAHEAD=0` disables this optimization
+for ablation. The final model boundary checks the epoch and a monotonic sticky
+failure counter; transfer-verification modes retain per-layer checks. All
 instrumented paths preserve request-generation checks and the finite-kernel
 contract.
 
@@ -72,11 +96,8 @@ important: CPU-free data movement does not mean CPU-free kernel submission.
 
 ## Supported Profile
 
-The adapter fails at construction for incompatible global settings. Once it
-claims a HiCache batch, planning errors fail closed before attention. Setting
-`NTA_SGLANG_ALLOW_FALLBACK=1` explicitly enables stock fallback for
-availability testing; measured runs require that variable unset and the
-fallback counter equal zero.
+The adapter fails at construction for incompatible global settings. Planning
+errors fail closed before attention; there is no stock fallback mode.
 
 | Property | Supported |
 | --- | --- |
@@ -88,22 +109,20 @@ fallback counter equal zero.
 | Host layout | `page_first` or `layer_first` |
 | Speculative decoding | disabled |
 | CUDA graphs | full decode replay; prefill disabled in the validated profile |
-| Resident-only batch | untouched stock FlashInfer wrapper |
+| Resident-only batch | transformed direct FlashInfer wrapper, no tickets |
 
 Unsupported HiCache ownership, malformed page maps, schedule mismatch, or
-capacity exhaustion is recorded before attention and raises by default. An
-explicit availability fallback calls SGLang's original layer-wise transfer
-before the stock attention path. A claimed batch never silently switches after
-partially executing attention. `hicache_claimed_batches`,
+capacity exhaustion is recorded before attention and raises. A claimed batch
+never silently switches after partially executing attention. `hicache_claimed_batches`,
 `hicache_fallback_batches`, and the last fallback reason are written to the
 engine statistics file.
 
-Incremental-plan reuse is keyed by the exact immutable host/device page-pair
-tuples, FlashInfer request/tile schedule, request slots, KV allocation addresses,
-byte extents, and prefetch state. Transient generations are rebound from the
-runtime request directory at the compiler hook. Shape equality alone is not a
-cache hit: a different page map forces indexed-object registration, advances
-the object version, and uploads a new plan.
+Incremental-plan reuse is keyed by exact host/device page-pair tuples,
+FlashInfer request/tile schedule, and request slot/generation pairs. One
+structural plan is reused across transformer layers; each layer republishes its
+K/V addresses through the stream-ordered object directory. Shape equality
+alone is not a cache hit: a different page map or generation advances the
+object version and uploads a new plan.
 
 ## Running
 
@@ -143,15 +162,17 @@ engine = sglang.Engine(
 ```
 
 Structural graph planning delegates to SGLang and FlashInfer before capture.
-Replay invokes the real stock FA2 wrapper without publishing unused NTA request
-bindings. A pending HiCache transfer is ordered before graph replay; CUDA
+Replay invokes the real transformed FA2 wrapper with graph-stable runtime
+arguments and current request bindings. A pending HiCache transfer is ordered
+before graph replay; CUDA
 stream-capture isolation forbids capturing a wait on uncaptured producer-stream
 work. Eager prefill retains per-layer copy/compute overlap. The demand-mode
 reset/progress/runnable loop is not yet embedded in SGLang's replay graph.
 
-`NTA_ENGINE_STATS_FILE=/path/report.json` enables per-process statistics. Demand
-mode already synchronizes once per layer to enforce its terminal epoch result.
-The following additional checks are available only for qualification:
+`NTA_ENGINE_STATS_FILE=/path/report.json` enables per-process statistics. Normal
+demand mode is stream ordered across layers and checks the final epoch plus the
+runtime-lifetime failure sequence at the model boundary. The following
+additional checks are available only for qualification:
 
 - `NTA_SGLANG_VERIFY_TRANSFER=1`: compare every promoted K/V row with host. This
   synchronizes and copies data, so it must run in a separate correctness arm and
@@ -191,7 +212,7 @@ PARALLEL_SLOTS="$(python3 -c \
   --require-proceed
 ```
 
-ABI v20 stores one relative `%globaltimer` timestamp per bounded work ticket.
+ABI v25 stores one relative `%globaltimer` timestamp per bounded work ticket.
 Zero means the tile was resident or already staged at epoch start; a positive
 value is written exactly once when the ticket enters the runnable tile set.
 With `NTA_OPPORTUNITY_MEASURE_COMPUTE=1`, `compute_ns` is calibrated by a
@@ -216,12 +237,23 @@ cannot make data available for the new occupant.
 
 ## Incremental Co-Scheduling Target
 
+The adapter never selects an untouched attention kernel for an NTA batch. It
+selects between two compiler-generated forms of the same FlashInfer operator:
+
+- **transformed direct** checks request generation and consumes data already
+  ordered on the CUDA stream, without allocating tickets; and
+- **transformed incremental** externalizes unavailable request/tile work into
+  bounded tickets and relaunches only runnable work.
+
 The current serving-adapter default is early layer-preacquired execution. The
-schedule-aware eager path additionally chooses tuned bulk transfer when its
-online model predicts no benefit and compiler-generated incremental FlashInfer
-execution when it predicts multiple useful rounds. Progress is not yet fed back
-into SGLang's next batch admission decision, and the incremental loop is not yet
-inside decode graph replay.
+schedule-aware eager path chooses transformed direct execution when its online
+model predicts that one coalesced transfer round is cheaper, and transformed
+incremental execution when multiple useful rounds should repay ticket and
+launch setup. This is mechanism specialization, not dispatch to vanilla
+FlashInfer. Progress is available to SGLang's external-only admission hook.
+Mixed batches are not delayed because the measured re-merge policy shifted
+rather than reduced latency. The incremental loop is not yet inside decode
+graph replay.
 
 SGLang will publish request generation, SLO slack, cancellation, page mapping,
 and batch admission state. NTA will return per-request completed contributors,
@@ -253,48 +285,97 @@ requires identical stock/NTA residency sequences and generated output, and
 fails on insufficient host promotions. This avoids averaging resident hits
 into an external-I/O result.
 
-An ABI-v18 local graph run collected three qualified host promotions in five
-attempts with a 96-token hot request and 64-token fresh peer. Stock measured
-18.614 ms median promotion latency; `nta_flashinfer` measured 11.469 ms, a
-38.39% reduction and 1.623x promotion-throughput ratio. Generated output and
-qualified-attempt indices matched, and NTA recorded four graph captures, ten
-decode graph replays, three claimed HiCache batches, and zero fallback. The
-promotions executed in eager prefill and the following decode used resident
-graph replay (`graph_external_batches=0`), so this result validates composition
-of promotion with graph decode, not graph-captured demand acquisition or
-incremental execution. Five attempts on a tiny model with uncontrolled clocks
-are insufficient for a paper performance claim.
+For the heterogeneous arrival test, run arm-balanced trials and retain every
+raw pair:
 
-The one-GPU Llama-160M runs predate ABI v18 and are retained as historical
-integration measurements, not current-ABI evidence. They measured 15 qualified promotions. The
-single-request case used a 96-token host-cached prefix. A conservative mixed
-run added a 64-token fresh request:
+```bash
+python benchmarks/serving/CompareSglangHiCacheLoadTrials.py \
+  --trials 5 \
+  --artifact-dir results/serving/hicache-trials \
+  --output results/serving/hicache-qualification.json \
+  -- \
+  --model /path/to/model \
+  --external-requests 1 --external-tokens 2048 \
+  --resident-requests 1 --resident-tokens 2048 \
+  --resident-output-tokens 32 --external-output-tokens 1 \
+  --batch-mode coalesced --cuda-graph-decode full
+```
 
-| Workload | Stock | `nta_flashinfer` | Latency change |
-| --- | ---: | ---: | ---: |
-| host promotion | 13.361 ms | 13.016 ms | -2.58% |
-| host promotion + fresh peer | 14.762 ms | 14.079 ms | -4.62% |
+The reducer alternates the first arm and reports geometric means with bootstrap
+95% intervals. Exact generated output, all transformed attention, and zero
+fallback are mandatory. Resident P99 inter-token latency is the causal
+interference metric; resident TTFT occurs before the external arrival in this
+fixture and is reported only as a general latency diagnostic.
 
-The runs used identical qualified-attempt indices, generated identical output,
-and reported zero fallback. The corresponding promotion-throughput changes
-were +2.65% and +4.85%. These are local regression measurements on one tiny
-model with uncontrolled clocks, not a general performance or production
-claim. A subsequent complete comparison measured 20.073 ms stock and 13.866
-ms NTA because SGLang co-batched the peer more often in the NTA process. The
-report therefore also records per-request latency and peer delay; controlled
-arrival traces and repeated confidence intervals are required before
-attributing that scheduler-sensitive 30.92% difference to the mechanism.
+The last ABI-v24 serving diagnostics require every NTA attention launch to be
+compiler-transformed and reject stock launch or fallback counters. They are
+dirty-tree, uncontrolled-clock smoke runs, not qualification results:
 
-An ABI-v20 schedule-aware run disabled early acquisition so the adapter had to
-choose after observing the real FlashInfer schedule. For a 96-token host-cached
-request, the online model selected one bulk round, issued all 12 layer
-promotions on the transfer stream, and overlapped later layers with attention.
-Five qualified promotions measured 12.993 ms stock and 13.333 ms NTA median
-latency, a 2.62% cost and 0.974x throughput ratio. Output and residency traces
-matched, with zero fallback, zero plan uploads, and zero CTA work because this
-trace had no predicted incremental opportunity. This clears the local 5%
-regression gate and demonstrates low-regret selection; it is not evidence that
-incremental execution improves a workload with arrival skew.
+| Workload | Stock | NTA | Throughput ratio | Active NTA form |
+| --- | ---: | ---: | ---: | --- |
+| Qwen2.5-3B resident, full decode graph, warm JIT cache | 56.791 ms | 55.618 ms | 1.021x | 4,068 direct launches, 36 captures, 32 replays, 2 verified modules |
+| Llama-160M resident | 26.325 ms | 26.392 ms | 0.997x | 228 direct launches |
+| Llama-160M, 1,024-token host prefix + 512-token resident peer | 21.013 ms | 21.057 ms | 0.998x | 288 direct launches, 36 promoted layers |
+| Qwen2.5-3B, 2,048-token host prefix + 1,024-token resident peer | 67.027 ms | 62.453 ms | 1.073x | 684 direct launches, 72 promoted layers |
+| Llama-160M forced incremental | 25.993 ms | 34.584 ms | 0.752x | 12 ticketed layers, one reused plan |
+| Qwen2.5-3B, 8K host + 8K resident, two fragment waves | 73.750 ms | 85.473 ms | 0.863x | 36 ticketed layers, 35 first-wave lookaheads, 0 stock/fallback |
+| Qwen2.5-3B, 16K host + 16K resident, two fragment waves | 110.205 ms | 118.824 ms | 0.927x | 36 ticketed layers, 35 first-wave lookaheads, 0 stock/fallback |
+| Qwen2.5-3B, coalesced 2K host + 2K resident | 374.601 ms | 393.013 ms | 0.953x | 36 mixed/ticketed/parallel-progress layers, 0 stock/fallback |
+| Qwen2.5-3B, coalesced 4K host + four 4K resident | 446.294 ms | 484.507 ms | 0.921x | 36 mixed/ticketed layers, 132 direct + 32 external work items |
+| Qwen2.5-3B, coalesced 4K host + 4K resident, full graph | 211.949 ms | 221.794 ms | 0.956x | 754 direct + 2 ticketed launches, 70 bounded-lookahead layers, 0 stock/fallback |
+
+All rows produced identical output and reported zero fallback. The Qwen row
+contains only two qualified promotions and may include process-level scheduler
+variance. It is evidence that the active transformed path can compose with a
+real engine without the prior regression, not a speedup claim. The forced row
+shows that tickets are still too expensive when all demand is known before the
+operator and one bulk round is available. The fragmented rows use real
+FlashInfer split-K contributors and exact output, but each has one sample. The
+16K point narrows the gap from 0.863x at 8K to 0.927x as transfer grows. Neither
+is a speedup or paper-quality evidence. The coalesced rows close the earlier
+scheduler-segregation gap: SGLang forms a real mixed FlashInfer schedule and NTA
+executes both compiler forms. They remain negative because eager per-layer
+control and resume cost exceed the overlap benefit. Demand-mode graph/device
+control is the next performance gate.
+
+The latest graph run also uses a warp-cooperative compiler-lowered request
+guard: one lane per warp reads the immutable request directory and broadcasts
+the generation/cancellation decision without a CTA barrier. The isolated tiny
+request-bound prefill measured 12.311 us versus 12.998 us stock, so the direct
+guard is not the dominant external-serving regression. One-, eight-, and
+default-width GPU mover diagnostics remained negative; the dense loss is
+instead concentrated in ticketed first-layer setup and transfer interference
+with resident decode.
+
+Three arm-balanced repetitions of that graph workload produced an
+output-throughput geometric mean of `0.9447x` with bootstrap interval
+`[0.9337x, 0.9578x]`. External TTFT was `1.3386x` and resident P99 inter-token
+latency was `1.4991x`; SLO goodput was `0.7498x`. Every output matched, all
+attention was transformed, and fallback remained zero. Three repetitions are
+a diagnostic counter-result, not paper-level statistical evidence. The positive
+path requires device-selected demand
+that avoids transfer the early-known bulk baseline cannot avoid.
+
+The resident graph row has only three measured samples and performs no external
+acquisition. It proves that contract-validated transformed graph replay can meet
+the resident overhead gate; it is not evidence for incremental execution. The
+matched harness now enables full decode graphs and runs an unmeasured priming
+process for each backend by default so first-use JIT compilation cannot be
+reported as serving speedup.
+
+Older measurements that dispatched preacquired or graph work to stock
+FlashInfer are rejected as contribution evidence, including the 18.614 ms
+versus 11.469 ms and 13.333 ms versus 12.993 ms comparisons. They may describe
+transfer scheduling, but they do not measure the compiler/runtime mechanism
+required by this project.
+
+The ABI-v23 v10 immediate-mixed point produced exact output with 1,080
+compiler-transformed attention launches, one mixed ticketed layer, 35
+preacquired suffix layers, and zero stock/fallback. It measured 0.977x stock
+throughput, 1.012x resident P99 inter-token latency, and 1.021x external TTFT.
+A five-trial admission/re-merge policy worsened all causal metrics and was
+removed. These results validate integration and falsify the current dense
+performance hypothesis; they do not support a production or OSDI claim.
 
 ## Other Engines
 

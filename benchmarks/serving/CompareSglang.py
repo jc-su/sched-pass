@@ -23,6 +23,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-iterations", type=int, default=2)
     parser.add_argument("--context-length", type=int, default=2048)
     parser.add_argument("--mem-fraction-static", type=float, default=0.35)
+    parser.add_argument(
+        "--cuda-graph-decode",
+        choices=("disabled", "full"),
+        default="full",
+    )
+    parser.add_argument(
+        "--skip-cache-prime",
+        action="store_true",
+        help="skip the unmeasured per-backend JIT-cache priming runs",
+    )
     parser.add_argument("--build-dir", default="build")
     parser.add_argument(
         "--cache-root",
@@ -48,7 +58,9 @@ def parse_report(output: str) -> dict[str, Any]:
     raise RuntimeError("SGLang trial did not emit a JSON report")
 
 
-def require_clean_mechanism(report: dict[str, Any]) -> None:
+def require_clean_mechanism(
+    report: dict[str, Any], *, require_graph_replay: bool
+) -> dict[str, Any]:
     stats = [
         entry
         for entry in report.get("engine_stats", [])
@@ -59,6 +71,78 @@ def require_clean_mechanism(report: dict[str, Any]) -> None:
     fallbacks = sum(int(entry.get("hicache_fallback_batches", 0)) for entry in stats)
     if fallbacks != 0:
         raise RuntimeError(f"NTA trial used {fallbacks} HiCache fallback batches")
+    transformed = sum(
+        int(entry.get("transformed_direct_launches", 0)) for entry in stats
+    )
+    if transformed == 0:
+        raise RuntimeError("NTA trial did not execute transformed FlashInfer")
+    stock = sum(int(entry.get("stock_attention_launches", 0)) for entry in stats)
+    if stock != 0:
+        raise RuntimeError(f"NTA trial executed {stock} stock attention launches")
+    ticketed = sum(
+        int(entry.get("ticketed_incremental_launches", 0)) for entry in stats
+    )
+    total = sum(
+        int(entry.get("decode_launches", 0)) + int(entry.get("prefill_launches", 0))
+        for entry in stats
+    )
+    if total == 0 or transformed + ticketed != total:
+        raise RuntimeError(
+            "NTA did not account every attention launch to a transformed form "
+            f"({transformed} + {ticketed} != {total})"
+        )
+    verified_modules = sum(
+        int(entry.get("verified_operator_modules", 0)) for entry in stats
+    )
+    contracts = [
+        contract
+        for entry in stats
+        for contract in entry.get("operator_contracts", [])
+    ]
+    if verified_modules == 0 or not contracts:
+        raise RuntimeError("NTA trial did not verify compiler operator contracts")
+    plans = [
+        plan for entry in stats for plan in entry.get("operator_plans", [])
+    ]
+    verified_pairs = sum(
+        int(entry.get("verified_operator_pairs", 0)) for entry in stats
+    )
+    verified_plan_pairs = sum(
+        int(entry.get("verified_operator_plan_pairs", 0)) for entry in stats
+    )
+    if not plans:
+        raise RuntimeError("NTA trial did not verify compiler operator plans")
+    if ticketed and (verified_pairs == 0 or verified_plan_pairs == 0):
+        raise RuntimeError(
+            "incremental attention ran without a paired direct execution plan"
+        )
+    graph_captures = sum(int(entry.get("graph_captures", 0)) for entry in stats)
+    graph_replays = sum(int(entry.get("graph_replays", 0)) for entry in stats)
+    if require_graph_replay and (graph_captures == 0 or graph_replays == 0):
+        raise RuntimeError(
+            "full decode graph was requested but transformed capture/replay was absent"
+        )
+    return {
+        "all_attention_transformed": True,
+        "active_forms": [
+            name
+            for name, count in (
+                ("direct", transformed),
+                ("incremental", ticketed),
+            )
+            if count > 0
+        ],
+        "transformed_direct_launches": transformed,
+        "ticketed_incremental_launches": ticketed,
+        "total_attention_launches": total,
+        "stock_launches": stock,
+        "fallback_batches": fallbacks,
+        "verified_operator_modules": verified_modules,
+        "verified_operator_pairs": verified_pairs,
+        "verified_operator_plan_pairs": verified_plan_pairs,
+        "graph_captures": graph_captures,
+        "graph_replays": graph_replays,
+    }
 
 
 def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
@@ -87,6 +171,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         str(args.context_length),
         "--mem-fraction-static",
         str(args.mem_fraction_static),
+        "--cuda-graph-decode",
+        args.cuda_graph_decode,
         "--attention-backend",
         backend,
         "--flashinfer-workspace-base",
@@ -111,9 +197,14 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
+    if not args.skip_cache_prime:
+        run(args, "flashinfer")
+        run(args, "nta_flashinfer")
     baseline = run(args, "flashinfer")
     mechanism = run(args, "nta_flashinfer")
-    require_clean_mechanism(mechanism)
+    activation = require_clean_mechanism(
+        mechanism, require_graph_replay=args.cuda_graph_decode == "full"
+    )
     if baseline["generated_text_sha256"] != mechanism["generated_text_sha256"]:
         raise RuntimeError("stock and NTA SGLang runs generated different output")
     baseline_time = float(baseline["median_batch_seconds"])
@@ -122,8 +213,10 @@ def main() -> int:
         "schema": 1,
         "classification": "matched-sglang-serving-comparison",
         "correctness": True,
+        "jit_cache_primed": not args.skip_cache_prime,
         "baseline": baseline,
         "mechanism": mechanism,
+        "mechanism_activation": activation,
         "throughput_ratio": baseline_time / mechanism_time,
         "latency_overhead_fraction": mechanism_time / baseline_time - 1.0,
     }

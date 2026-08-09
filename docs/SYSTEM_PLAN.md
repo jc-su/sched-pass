@@ -1,6 +1,8 @@
-# Request-Aware Incremental Execution Plan
+# Request-Aware Incremental GPU Operators
 
-Status: canonical research and implementation roadmap
+Status: canonical research and implementation roadmap; compiler/runtime
+mechanism implemented, completion-driven FlashInfer serving and OSDI evidence
+open
 
 This document defines the revised problem, co-design, implementation order, and
 claim boundary. `ARCHITECTURE.md` remains the mechanism contract. Historical
@@ -17,6 +19,8 @@ language uses the terms below.
 | Incremental operator | A compiled operator that can execute valid subsets over several finite launches and merge complete partial results |
 | Runnable-work launch | A finite launch over a compiler-validated runnable tile set |
 | All-or-nothing kernel barrier | The delay caused when an engine waits for every input before launching any part of an otherwise decomposable operator |
+| Contributor | One request-owned numerical partial with explicit data dependencies and one exact reduction identity |
+| Critical work | Current data service plus executable and data-blocked compute that can delay a request; not CTA count alone |
 
 `Ready` remains the internal ABI state meaning that all dependencies of one work
 ticket are available. It is not the research abstraction or system name.
@@ -44,6 +48,14 @@ useful computation for the rest of the batch. A serving scheduler may skip a
 whole request, but it cannot know whether already available chunks provide
 valuable partial progress or how to preserve and merge that progress without
 kernel-specific logic.
+
+There is a strict dense-serving limit: finishing resident CTAs inside one
+attention launch does not let that request enter the next transformer layer
+while another request's activation is incomplete. CTA progress is valuable
+only when it contributes a reusable numerical partial, shortens the current
+operator's critical path, or combines with scheduler separation that preserves
+end-to-end progress. The v10 SGLang experiment confirms that merely delaying
+and later re-forming a dense mixed batch shifts latency and is not a benefit.
 
 ### 2.2 The three-way semantic gap
 
@@ -111,16 +123,30 @@ outcomes of the same algorithm, not independent production policies.
 
 ## 3. Research Question
 
-> Can a compiler turn an all-or-nothing batched GPU kernel into an incrementally
-> executable operator that performs useful request/tile work as data arrives
-> from HBM, CPU DRAM, or storage, while a serving runtime jointly schedules data
-> grouping, runnable computation, and request admission without sacrificing the
-> native all-resident path?
+> Can a compiler expose request-owned data dependencies, executable
+> contributors, and exact completion conditions from optimized finite GPU
+> operators, enabling an SLO runtime to jointly prioritize external data and
+> GPU computation without persistent kernels or resident-path regression?
 
 The target is broad applicability and low regret, not strict speedup at every
 point. Production has no oracle. Controlled identical-snapshot experiments may
 compare each scheduling decision with the best alternative; real traces compare
 the complete system against every fixed baseline from the same initial state.
+
+### 3.1 Decision after the whole-layer experiments
+
+The `0.929x` 4K-load and `0.904x` 8K-saturated results reject a system whose
+main action is to move a complete layer and then run attention. More tuning of
+that path would reproduce a weaker cache/prefetch scheduler. The project keeps
+coalesced movement, cache state, and GPU-initiated I/O as substrates, but no
+longer treats them as the performance contribution.
+
+The decisive unit is one request-owned numerical contributor inside a real
+operator. A valid experiment must show at least one contributor executing
+before the last dependency of its request arrives, preserve its `(V, LSE)`
+state, and expose that progress to later admission. If real fragmented traces
+and manually split FlashInfer cannot pass that test, the compiler/serving thesis
+is false and the project must narrow to a runtime mechanism.
 
 ## 4. Co-Design
 
@@ -154,6 +180,75 @@ K_merge        merge only complete current-generation contributors
 `K_direct` must retain the original optimized mainloop and launch geometry. The
 incremental form may externalize only reconstructible state; registers, shared
 memory, and barriers never survive a finite CTA exit.
+
+The LLVM contract now has a delimited numerical effect:
+
+```text
+bind(request, generation)
+acquire(dependencies, work ticket) or defer-and-exit
+begin_partial(work ticket)
+    optimized numerical body
+commit_partial(reduction group, contributor, cost)
+```
+
+Acquisition sites retain the strict CTA-uniform control-dependence proof. The
+partial endpoints use a different proof appropriate for optimized SIMT code:
+request/reduction operands are CTA-uniform, every path into the region crosses
+an identity-matched acquired edge, and publication post-dominates the region
+despite thread-divergent loops inside it. Acquisition, region begin, and
+publication must carry the same request binding and work ticket. Both endpoints
+carry LLVM `convergent` semantics. Lowering emits `!nta.partial` and
+function-level `!nta.operator` metadata and calls the generation-checked
+ticket/reduction protocol. This is a compiler effect, not sampled monitoring.
+
+The LLVM layer should become more capable, but not by guessing request or
+reduction semantics from arbitrary NVVM pointer arithmetic. The implementation
+boundary is:
+
+1. A typed FlashInfer/Triton/MLIR frontend supplies request, tile, dependency,
+   reduction, and reconstructible-coordinate facts while those facts exist.
+2. LLVM proves CTA-uniform acquisition, zero live state on finite exit,
+   convergence, identity continuity, and exactly-once publication.
+3. LLVM specializes one typed operator into direct and incremental entry forms,
+   emits a versioned operator plan, and lowers runtime effects.
+4. The engine consumes the plan and measured progress; it does not reimplement
+   kernel mapping in Python.
+
+Items 1 and 2 exist for the checked FlashInfer frontend. Item 3 currently
+lowers explicitly selected forms but does not yet generate both forms or a full
+runtime-consumed plan automatically. That automation plus a second typed
+frontend is the next compiler contribution, not broader marker insertion.
+
+#### Current performance boundary
+
+The coalesced SGLang integration now forms a real heterogeneous FlashInfer batch;
+the earlier scheduler-segregation blocker is closed. A Qwen2.5-3B smoke point
+executed 36 mixed layers with both compiler forms, compacted the combined
+initial/resume CTA bounds to 50%, used parallel indexed progress, matched stock
+output, and used no fallback or stock attention. It delivered only `0.953x`
+stock throughput, however, and a four-resident 4K point delivered `0.921x`.
+
+The last ABI-v24 graph point adds four-layer transfer waves and a
+warp-cooperative request guard. It executed 754 transformed direct launches
+and two ticketed incremental launches with exact output and no fallback, but
+still delivered only `0.956x` stock throughput. Restricting the GPU mover to
+one or eight CTAs did not recover the loss.
+
+Three arm-balanced repetitions placed the output-throughput geometric mean at
+`0.9447x` with bootstrap interval `[0.9337x, 0.9578x]`, external TTFT at
+`1.3386x`, resident P99 inter-token latency at `1.4991x`, and SLO goodput at
+`0.7498x`. Three repetitions are diagnostic rather than paper-level
+statistical evidence. Dense
+early-known acquisition is therefore a measured non-goal for the current
+mechanism, not a workload on which to imply a universal win.
+
+This falsifies the claim that CTA-level granularity alone wins. The remaining
+cost is dominated by ticketed setup, launch/event control, and GPU mover
+interference with resident decode rather than the request-bound direct guard.
+The next performance milestone is therefore a
+captured demand-mode operator loop with per-step structural publication and
+device-selected progress/skip control. Transfer tuning without that control
+change is not sufficient evidence for the paper thesis.
 
 ### 4.2 Runtime: schedule data and computation together
 
@@ -224,39 +319,47 @@ Implemented today are:
   the pre-state work hook, and carries request-local merge groups before those
   facts are erased into pointer arithmetic;
 - explicit-marker LLVM lowering with post-dominator control-dependence checks,
-  fatal rejection of unsafe sites, and request/generation plus object/version
-  binding;
+  fatal rejection of unsafe sites, request/generation plus object/version
+  binding, and delimited `begin_partial`/`commit_partial` verification that
+  rejects bypassed, duplicate, or acquisition-free publication;
 - fixed-capacity work tickets, reverse object-to-ticket dependency edges,
   direct exact-once runnable-work publication, tagged per-backend urgency
   queues, and stale-generation isolation;
 - direct HBM and mapped-DRAM consumption, staged DRAM, a retained
   `(object_id, version)` HBM staging entry, a hard byte budget for staging
   allocations owned by the runtime, and one-queue VFIO NVMe;
-- ABI-v20 work metadata carrying request reduction groups, contributor counts,
+- ABI-v25 work metadata carrying request reduction groups, contributor counts,
   unavailable bytes, and estimated compute cost;
-- per-request blocked-byte/runnable-compute/completed-compute summaries and
-  request-local complete-contributor counters;
+- per-request pending/runnable/completed/expected compute, blocked-byte, and
+  complete-contributor summaries with generation-stamped identities;
+- a causal critical-work policy and device transport urgency that combine live
+  backend queue delay, transfer service, deadline, priority, and remaining
+  compiler-attributed compute instead of ranking by CTA count;
 - one bounded per-ticket GPU timestamp array that records when each real
   FlashInfer tile first becomes runnable, allowing measured barrier traces
   without a host poll in each progress round;
 - optimized FlashInfer decode and paged-prefill hooks, compact runnable-work
-  remapping, and request-local split-K merge gates tested with one complete and
-  one blocked request in the same real FlashInfer launch;
+  remapping, physically bounded eager initial/resume grids, and request-local
+  split-K merge gates tested with one complete and one blocked request in the
+  same real FlashInfer launch;
 - a finite host-DRAM execution model that chooses one bulk round or bounded
-  rounds, with two-stream transfer/compute overlap;
+  rounds, or a coalesced request-level transfer overlapped with resident-request
+  compute; it uses two streams, one cached structural plan, GPU directory
+  rebinding, and first-wave next-layer fragment acquisition when finer partials
+  have predicted value;
 - a real FlashInfer GPU-selected page path with a stable device-only index
   table, bounded source/destination validation, cold and retained staging, and
   a no-oracle bulk-versus-indexed cost decision; and
 - an SGLang HiCache adapter that publishes request generations and priorities,
   preserves exact page-map identity, exposes the complete demand path and the
-  preacquired fast path, and replays stock FlashInfer decode CUDA graphs after
-  stream-ordered acquisition.
+  transformed direct path, and replays transformed FlashInfer decode CUDA
+  graphs after stream-ordered acquisition.
 
-Not implemented today are compiler generation of separate complete-data and
-incremental forms from one typed operator, a second Triton/MLIR or TileLang
-frontend, a measured elastic
+Not implemented today are automatic compiler generation of separate
+complete-data and incremental launch forms from one typed operator, a second
+Triton/MLIR or TileLang frontend, a measured elastic
 range-coalescing objective, runtime-generic HBM eviction/refcounts, graph replay
-of the demand-mode progress loop, use of partial progress in engine batch
+  of the demand-mode progress loop, use of current critical work in engine batch
 admission, end-to-end serving use of the GPU-selected path, multiple NVMe queue
 pairs, a vLLM adapter, or RNIC/RDMA. Current-ABI VFIO NVMe has one
 single-controller local
@@ -298,7 +401,10 @@ direct execution: identical kernel path with O(1) launch dispatch
 ```
 
 Full object-table or full work-table scans are qualification fallbacks, not a
-production design.
+production design. Current eager FlashInfer incremental waves use a
+conservative physical bound and map that compact launch through canonical
+runnable-work IDs. Demand-mode CUDA graph replay still requires a fixed graph
+grid or validated device-updated conditional launch and remains open.
 
 ### 6.2 Hierarchical summaries
 
@@ -331,12 +437,14 @@ not once per layer.
 
 ### 6.5 Graph and launch efficiency
 
-- Dispatch untouched FlashInfer for an all-resident batch.
+- Use the compiler-generated NTA direct form for an all-resident batch; untouched
+  FlashInfer is an evaluation control, never an internal fallback in the NTA arm.
 - Capture the incremental phase only after structural plan upload.
 - Skip empty transport and runnable-work nodes using graph-compatible device
   predicates.
 - Size runnable launches from the compact count where the framework permits;
-  otherwise use a fixed graph grid with an early collective bound check.
+  eager FlashInfer now does this. For graph replay, use a fixed graph grid with
+  an early collective bound check until conditional device control is validated.
 - Fuse completion publication into backend progress when doing so preserves
   ownership and visibility ordering.
 
@@ -421,18 +529,34 @@ batch scheduling.
 Gate: reproducible traces from at least two real models and CPU-DRAM plus NVMe
 arrival distributions demonstrate material all-or-nothing barrier cost.
 
-Current result: local Llama-160M and Qwen2.5-3B CPU-DRAM traces did not pass the
-predeclared dense opportunity gate after finite SM parallelism was modeled.
-The project therefore does not force the incremental form for dense host-DRAM
-batches. This narrows the current performance claim to device-generated demand
-and leaves dense NVMe skew as a measured research question.
+Current result: local Llama-160M and Qwen2.5-3B whole-prefix CPU-DRAM traces did
+not pass the predeclared opportunity gate after finite SM parallelism was
+modeled. They contain layer-complete transfer demand, not fragmented
+within-request page arrivals that can preserve split-K partials. They falsify
+the mover-only design and forced ticketing for known bulk demand. The new
+canonical FlashInfer tier-streaming experiment does preserve real `(V, LSE)`
+partials and passes the CPU-DRAM operator gate: `1.1714x` over atomic promotion
+with a `[1.1660x, 1.1732x]` 95% interval and `4x` lower HBM staging. A separate
+heterogeneous-shape point improves by `1.1100x` with `4.83x` lower staging.
+The runtime now owns FlashInfer wrappers, partial execution, merge, bounded
+slots, and dynamic-source graph replay; paired compiler artifacts validate one
+typed request/reduction plan. The measured implementation uses a fixed host
+wave order, so it establishes numerical/operator feasibility and a bounded-HBM
+crossover, not completion-driven scheduling or an end-to-end serving gain.
+Dense real-model CPU/NVMe arrival traces remain the P0 claim gate.
 
 ### P1: compiler soundness and incremental form
 
-- Replace ad-hoc collective analysis with principled control dependence and
-  convergence validation.
-- Define typed frontend semantics and a versioned compiler plan.
-- Emit `K_direct` and `K_incremental` from one real kernel source.
+- Keep post-dominator control dependence for acquisition. Implemented.
+- Require convergent partial endpoints, identity-matched acquired edges, no
+  acquisition bypass, and exactly-once post-dominating publication. Implemented.
+- Migrate the endpoints from the convergent attribute to explicit LLVM
+  convergence-control tokens.
+- Define typed frontend semantics and a versioned compiler plan. The JIT now
+  exports and validates a schema-versioned family/form/capability/source
+  contract. Implemented for canonical ragged prefill.
+- Emit `K_direct` and `K_incremental` from one real kernel source. Implemented
+  for canonical ragged prefill; paged decode/prefill remain open.
 - Stamp work tickets and partial contributors with epoch and generation.
 - Refuse final merge until every current contributor is complete.
 
@@ -447,6 +571,8 @@ and an untouched resident-path comparison all pass.
 - Preserve FlashInfer `(V, LSE)` partials and deterministic merge order.
 - Add the object/version HBM staging cache.
 - Remove per-layer plan upload and host synchronization.
+- Publish already-available work without constructing suspended-ticket state
+  and physically compact both the initial and resumed eager grids. Implemented.
 
 Gate: all-resident median overhead at most 5%; dense all-miss performance at
 least 90% of the matched bulk path; mixed arrival executes useful partials
@@ -457,8 +583,16 @@ before the last page arrives and matches stock output.
 - Implement elastic grouping with a calibrated request-delay and transfer-cost
   objective.
 - Replace capacity scans with changed-object propagation, urgency buckets, and
-  compact runnable queues.
-- Export per-request progress and blocked-data summaries.
+  compact runnable queues. Changed-object propagation and transport urgency are
+  implemented; exact compact launch sizing remains open.
+- Export per-request progress and blocked-data summaries. ABI v25 exports
+  pending, runnable, completed, and expected compute plus unavailable bytes,
+  checked conservation, and dropped-attribution telemetry.
+- Rank data and executable contributors from current request critical work.
+  The device I/O queue now consumes live request critical work on insertion and
+  requeue; a CUDA test verifies that compiler-attributed compute changes
+  service order. The host model is a reference/control-plane policy. SGLang
+  batch admission consumption remains open.
 - Keep forced bulk, fine-grained, and whole-request-delay controls for
   evaluation only.
 
@@ -474,6 +608,11 @@ useful computation earlier.
 - Extend the implemented decode graph replay to the demand-mode phase and paged
   prefill, with no capture-illegal upload or synchronization.
 - Assert zero fallback and identical request/cache traces in measured trials.
+- Treat resident P99 inter-token latency, not causally prior resident TTFT, as
+  the primary interference metric. Implemented.
+- Do not reinstate the measured admission/re-merge policy without a workload
+  where it reduces the critical path; five exact trials regressed throughput,
+  resident P99 inter-token latency, and external TTFT.
 
 Gate: controlled end-to-end TTFT, TPOT, throughput, and SLO goodput improve over
 stock layer waiting, coalesced bulk, and request skip/rebatch at equal cache and
@@ -482,7 +621,7 @@ admission state.
 ### P5: NVMe scale and reliability
 
 - Preserve the historical ABI-v18 single-controller qualification as a
-  regression, rerun it on ABI v20, and repeat it across platforms.
+  regression, rerun it on ABI v25, and repeat it across platforms.
 - Add multiple queue pairs and depth/transfer sizing from Little's law.
 - Separate buffer lifetime from transport lifetime and validate backpressure,
   timeout, reset, cancellation, and stale completion behavior.
@@ -555,10 +694,16 @@ The following are established techniques and remain necessary system parts:
 
 The candidate contribution is:
 
-> Compiler and serving-runtime co-design that transforms an atomic, finite,
-> batched GPU operator into request-scoped incremental execution, then jointly
-> schedules arriving data, useful partial computation, and subsequent request
-> admission while preserving the original complete-data path.
+> A compiler-verified arrival-driven contributor form for finite batched GPU
+> operators: request-owned CTAs may exit before acquiring external data, later
+> execute a zero-frame numerical region, publish exactly one reduction
+> contributor, and expose exact remaining data and compute to one SLO policy
+> without a persistent kernel or partial-CTA polling.
+
+The runtime and engine co-design makes this effect useful: versioned external
+data completion unlocks compact CTA work, complete reduction groups unlock
+request output, and actual remaining data/compute feeds later batch admission.
+Neither the IR effect nor the scheduler alone is the full contribution.
 
 Syncopate is the closest compiler comparison because it aligns computation with
 communication-chunk availability inside transformed Triton kernels. NTA must
@@ -618,11 +763,27 @@ Stop or narrow the project if:
 
 ## 12. Immediate Order
 
-Integrate the implemented GPU-selected FlashInfer path into a real long-context
-serving loop and compare it with overfetch, CPU materialization, ECHO-style
-recall, and skip/rebatch at identical cache state. Preserve stock bulk dispatch
-for the dense CPU-DRAM regime that failed P0. In parallel, finish same-source
-direct/incremental generation, collect dense NVMe opportunity traces, and add a
-second typed frontend. Scale NVMe only after a workload demonstrates exposed
-operator overlap or avoided bytes. RDMA remains deferred until real hardware
-and a matched network baseline are available.
+The canonical FlashInfer operator experiment now demonstrates exposed overlap
+and a bounded-HBM crossover. The next order is therefore fixed:
+
+1. **Implemented:** move wrapper construction, copy-slot lifetime,
+   partial-attention, merge, completion, and graph-safe source rebinding out of
+   the benchmark into the engine-neutral FlashInfer runtime operator.
+2. **Implemented boundary:** export and fail-closed validate a versioned JIT
+   operator contract across native, Python, SGLang eager, and SGLang graph
+   paths. This proves module identity but does not generate the operator forms.
+3. Generate direct and incremental forms plus request/range/reduction metadata from
+   the typed FlashInfer frontend, with LLVM retaining convergence,
+   generation-identity, and exactly-once publication proofs.
+4. Consume that generated plan in SGLang paged prefill and decode, including
+   CUDA graph replay, cancellation, and slot reuse with zero stock fallback.
+5. Consume ABI-v25 critical-work snapshots in SGLang admission and acquisition
+   grouping, then compare atomic promotion, layer wait, and skip/rebatch from
+   identical request/cache states. The policy may use only current progress and
+   online service calibration, never a future-arrival trace.
+6. Attach VFIO NVMe as a producer for the same bounded slots and collect real
+   GPU-timestamped CPU-DRAM plus NVMe traces. Scale queues only after the
+   end-to-end critical path is measured.
+7. Add a second typed generated-kernel frontend and clean multi-machine
+   reproduction. RDMA remains deferred until real hardware and a matched
+   network baseline are available.

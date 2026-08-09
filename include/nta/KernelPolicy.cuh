@@ -5,6 +5,10 @@
 
 #include <cstdint>
 
+#ifndef NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+#define NTA_FLASHINFER_STREAM_ORDERED_DIRECT 0
+#endif
+
 namespace nta::kernel {
 
 // Request identity needed by a single-object acquisition site. The compiler
@@ -76,14 +80,47 @@ acquireCurrentWork(abi::RuntimeView *runtime, const abi::WorkItem *workItems,
   context.item = workItems[workIndex];
   context.item.generation =
       runtime->requests[context.item.requestSlot].generation;
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  context.dependencies = nullptr;
+#else
   context.dependencies = dependencies + context.item.dependencyBegin;
+#endif
   __nta_bind_request(context.item.requestSlot, context.item.generation);
   if (!prepareWorkTicket(runtime, context.item)) {
     return false;
   }
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  return __nta_acquire_set_marker(runtime, nullptr, 0, 0,
+                                  context.item.workTicket);
+#else
   return __nta_acquire_set_marker(
       runtime, context.dependencies, context.item.dependencyCount,
       context.item.directDependencyCount, context.item.workTicket);
+#endif
+}
+
+// A stream-ordered acquisition event can satisfy the data dependency while the
+// structural work plan still supplies the exact CTA-to-request mapping. Keep
+// the compiler-visible request guard, but do not rediscover dependencies or
+// mutate work-ticket state for this launch.
+[[nodiscard]] __device__ __forceinline__ bool
+acquirePreacquiredWork(abi::RuntimeView *runtime,
+                       const abi::WorkItem *workItems, std::uint32_t workIndex,
+                       WorkContext &context) {
+  context.item = workItems[workIndex];
+  if (context.item.requestSlot >= runtime->requestCapacity) {
+    return false;
+  }
+  context.item.generation =
+      runtime->requests[context.item.requestSlot].generation;
+  context.item.workTicket = abi::InvalidIndex;
+  context.item.reductionGroup = abi::InvalidIndex;
+  context.item.contributorIndex = 0;
+  context.item.contributorCount = 0;
+  context.item.estimatedComputeNs = 0;
+  context.dependencies = nullptr;
+  __nta_bind_request(context.item.requestSlot, context.item.generation);
+  return __nta_acquire_set_marker(runtime, nullptr, 0, 0, abi::InvalidIndex);
 }
 
 // Pre-acquired engine batches use requestIndex as a compact runtime slot. The
@@ -108,6 +145,31 @@ acquireCurrentRequest(abi::RuntimeView *runtime, std::uint32_t requestIndex,
 __device__ __forceinline__ void defer(abi::RuntimeView *runtime,
                                       const WorkContext &context) {
   __nta_defer_marker(runtime, context.item.workTicket);
+}
+
+__device__ __forceinline__ void beginPartial(abi::RuntimeView *runtime,
+                                             const WorkContext &context) {
+  __nta_bind_request(context.item.requestSlot, context.item.generation);
+  __nta_begin_partial_marker(runtime, context.item.workTicket);
+}
+
+// Publish one request-owned numerical partial. The compiler turns this marker
+// into the generation-checked ticket/reduction protocol; callers do not update
+// completion counters directly.
+__device__ __forceinline__ void commitPartial(abi::RuntimeView *runtime,
+                                              const WorkContext &context) {
+  __nta_bind_request(context.item.requestSlot, context.item.generation);
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  __nta_commit_stream_ordered_partial_marker(
+      runtime, context.item.workTicket, context.item.reductionGroup,
+      context.item.contributorIndex, context.item.contributorCount,
+      context.item.estimatedComputeNs);
+#else
+  __nta_commit_partial_marker(
+      runtime, context.item.workTicket, context.item.reductionGroup,
+      context.item.contributorIndex, context.item.contributorCount,
+      context.item.estimatedComputeNs);
+#endif
 }
 
 [[nodiscard]] __device__ __forceinline__ const void *

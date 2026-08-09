@@ -42,6 +42,7 @@ def main() -> int:
     parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--minimum-peak-speedup", type=float, default=2.0)
     parser.add_argument("--maximum-oracle-regret", type=float, default=2.0)
+    parser.add_argument("--maximum-policy-regret", type=float, default=1.05)
     parser.add_argument("--require-peak-speedup", action="store_true")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     arguments = parser.parse_args()
@@ -61,6 +62,8 @@ def main() -> int:
         parser.error("minimum peak speedup must be at least one")
     if arguments.maximum_oracle_regret < 1:
         parser.error("maximum oracle regret must be at least one")
+    if arguments.maximum_policy_regret < 1:
+        parser.error("maximum policy regret must be at least one")
 
     raw_directory = arguments.output.parent / f"{arguments.output.stem}-raw"
     raw_directory.mkdir(parents=True, exist_ok=True)
@@ -103,6 +106,16 @@ def main() -> int:
         and point.get("offline_oracle_precomputed") is True
         and point.get("real_flashinfer_selector") is True
         and point.get("real_flashinfer_attention") is True
+        and point.get("all_policy_attention_transformed") is True
+        and point.get("paired_operator_contract_verified") is True
+        and isinstance(point.get("adaptive_us", {}).get("samples"), list)
+        and point.get("adaptive_us", {}).get("derived_from")
+        in {"nta_cold_us", "overfetch_us"}
+        and isinstance(point.get("candidate_retained_us", {}).get("samples"), list)
+        and all(
+            float(value) >= 1.0
+            for value in point.get("online_policy_regret_samples", ())
+        )
         and point.get("stock_output_parity") is True
         for point in points
     ):
@@ -116,17 +129,36 @@ def main() -> int:
         ),
         None,
     )
-    peak = max(float(point["speedup_over_overfetch"]) for point in points)
-    peak_point = max(points, key=lambda point: float(point["speedup_over_overfetch"]))
+    peak = max(
+        float(point["online_policy_speedup_over_forced_overfetch"])
+        for point in points
+    )
+    peak_point = max(
+        points,
+        key=lambda point: float(
+            point["online_policy_speedup_over_forced_overfetch"]
+        ),
+    )
     maximum_regret = max(float(point["regret_to_offline_oracle"]) for point in points)
+    maximum_policy_regret = max(
+        float(point["online_policy_regret_to_best_measured"]) for point in points
+    )
     minimum_online_speedup = min(
         float(point["online_policy_speedup_over_forced_overfetch"]) for point in points
     )
+    cold_indexed_over_candidate_retained = [
+        float(point["nta_cold_us"]["median_with_topk"])
+        / float(point["candidate_retained_us"]["median_with_topk"])
+        for point in points
+    ]
     selective_points = [
         point for point in points if float(point["bytes_avoided_fraction"]) >= 0.75
     ]
     selective_speedup = min(
-        (float(point["speedup_over_overfetch"]) for point in selective_points),
+        (
+            float(point["online_policy_speedup_over_forced_overfetch"])
+            for point in selective_points
+        ),
         default=0.0,
     )
     no_selectivity = next(
@@ -138,6 +170,7 @@ def main() -> int:
         and peak >= arguments.minimum_peak_speedup
         and selective_speedup >= arguments.minimum_peak_speedup
         and maximum_regret <= arguments.maximum_oracle_regret
+        and maximum_policy_regret <= arguments.maximum_policy_regret
     )
     report = {
         "schema": 1,
@@ -147,6 +180,8 @@ def main() -> int:
         "nta_hot_path_host_identity_round_trips": 0,
         "real_flashinfer_selector": True,
         "real_flashinfer_attention": True,
+        "all_policy_attention_transformed": True,
+        "paired_operator_contract_verified": True,
         "stock_output_parity": True,
         "batch_size": arguments.batch_size,
         "top_k": arguments.top_k,
@@ -155,17 +190,40 @@ def main() -> int:
         "crossover_candidate_pages": crossing,
         "selectivity_crossover_measured": crossing is not None,
         "peak_speedup_over_overfetch": peak,
+        "peak_speedup_bootstrap_95_percent_ci": peak_point[
+            "online_policy_speedup_bootstrap_95_percent_ci"
+        ],
         "peak_candidate_pages": int(peak_point["candidate_pages_per_request"]),
         "minimum_speedup_at_or_above_75pct_bytes_avoided": selective_speedup,
         "maximum_regret_to_offline_oracle": maximum_regret,
+        "maximum_online_policy_regret": maximum_policy_regret,
+        "policy_regret_definition": "same_trial_chosen_over_best",
+        "candidate_retained_baseline": True,
+        "minimum_cold_indexed_latency_ratio_to_candidate_retained": min(
+            cold_indexed_over_candidate_retained
+        ),
+        "maximum_cold_indexed_latency_ratio_to_candidate_retained": max(
+            cold_indexed_over_candidate_retained
+        ),
         "minimum_online_policy_speedup_over_forced_overfetch": (minimum_online_speedup),
         "no_selectivity_speedup": (
             None
             if no_selectivity is None
+            else float(
+                no_selectivity["online_policy_speedup_over_forced_overfetch"]
+            )
+        ),
+        "no_selectivity_forced_indexed_throughput_ratio": (
+            None
+            if no_selectivity is None
             else float(no_selectivity["speedup_over_overfetch"])
+        ),
+        "no_selectivity_policy_mode": (
+            None if no_selectivity is None else no_selectivity["online_transfer_mode"]
         ),
         "minimum_peak_speedup": arguments.minimum_peak_speedup,
         "maximum_oracle_regret": arguments.maximum_oracle_regret,
+        "maximum_policy_regret": arguments.maximum_policy_regret,
         "proceed": proceed,
         "points": points,
     }

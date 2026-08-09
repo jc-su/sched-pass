@@ -28,11 +28,58 @@ fi
 "${opt}" \
   -load-pass-plugin="${plugin}" \
   -passes=nta-acquire \
+  -S "${source_dir}/partial-publication.ll" \
+  -o "${output_dir}/partial-publication.lowered.ll"
+rg -q 'call void @nta_commit_partial' \
+  "${output_dir}/partial-publication.lowered.ll"
+rg -q '!nta.partial' "${output_dir}/partial-publication.lowered.ll"
+rg -q '!nta.operator' "${output_dir}/partial-publication.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker|begin_partial_marker|commit_partial_marker)' \
+  "${output_dir}/partial-publication.lowered.ll"; then
+  echo "lowered partial-publication module still contains an NTA marker" >&2
+  exit 1
+fi
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
+  -S "${source_dir}/stream-ordered-partial.ll" \
+  -o "${output_dir}/stream-ordered-partial.lowered.ll"
+rg -q 'call i1 @nta_request_live_cta' \
+  "${output_dir}/stream-ordered-partial.lowered.ll"
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
+  -S "${source_dir}/request-guard-inline.ll" \
+  -o "${output_dir}/request-guard-inline.lowered.ll"
+if rg -q 'call i1 @nta_request_live_cta' \
+    "${output_dir}/request-guard-inline.lowered.ll"; then
+  echo "locally defined request guard was not inlined" >&2
+  exit 1
+fi
+rg -q 'icmp ne ptr %runtime, null' \
+  "${output_dir}/request-guard-inline.lowered.ll"
+if rg -q 'call void @nta_commit_(stream_ordered_)?partial' \
+  "${output_dir}/stream-ordered-partial.lowered.ll"; then
+  echo "stream-ordered partial retained an in-CTA publication call" >&2
+  exit 1
+fi
+rg -q '!nta.operator' "${output_dir}/stream-ordered-partial.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_set_marker|begin_partial_marker|commit_stream_ordered_partial_marker)' \
+  "${output_dir}/stream-ordered-partial.lowered.ll"; then
+  echo "lowered stream-ordered module still contains an NTA marker" >&2
+  exit 1
+fi
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
   -S "${source_dir}/dependency-set.ll" \
   -o "${output_dir}/dependency-set.lowered.ll"
 rg -q 'call i1 @nta_acquire_set_slow' \
   "${output_dir}/dependency-set.lowered.ll"
-rg -Fq '!{!"request-bound", i32 20, !"dependency-set", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 25, !"dependency-set", !"split-phase-cta"}' \
   "${output_dir}/dependency-set.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
   "${output_dir}/dependency-set.lowered.ll"; then
@@ -62,7 +109,7 @@ fi
   -o "${output_dir}/tensor-map.lowered.ll"
 rg -q 'call ptr @nta_acquire_tensor_map_slow' \
   "${output_dir}/tensor-map.lowered.ll"
-rg -Fq '!{!"request-bound", i32 20, !"tensor-map", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 25, !"tensor-map", !"split-phase-cta"}' \
   "${output_dir}/tensor-map.lowered.ll"
 rg -q 'phi ptr \[ null, %entry \], \[ %direct.map, %nta.acquire.direct \]' \
   "${output_dir}/tensor-map.lowered.ll"
@@ -79,7 +126,7 @@ fi
   -o "${output_dir}/late-bound.lowered.ll"
 rg -q 'call ptr @nta_acquire_slow' "${output_dir}/late-bound.lowered.ll"
 rg -q 'and i32 %cta, %catalog.mask' "${output_dir}/late-bound.lowered.ll"
-rg -Fq '!{!"request-bound", i32 20, !"byte-address", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 25, !"byte-address", !"split-phase-cta"}' \
   "${output_dir}/late-bound.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
   "${output_dir}/late-bound.lowered.ll"; then
@@ -98,6 +145,14 @@ fixtures=(
   "reject-divergent-operand:acquisition marker has a non-CTA-uniform operand"
   "reject-divergent-value-phi:request binding has a non-CTA-uniform operand"
   "reject-device-helper:acquisition markers must be inlined into a GPU kernel entry"
+  "reject-partial-bypass:partial publication must post-dominate its numerical region"
+  "reject-partial-without-acquire:partial region is not on an acquired path with the same request binding and work ticket"
+  "reject-partial-wrong-ticket:partial region is not on an acquired path with the same request binding and work ticket"
+  "reject-partial-nonconvergent:partial-region marker must carry LLVM convergent semantics"
+  "reject-partial-acquire-bypass:partial region has a path that bypasses acquisition"
+  "reject-partial-duplicate-commit:partial numerical region publishes more than once"
+  "reject-partial-missing-commit:partial numerical region has no publication"
+  "reject-partial-commit-wrong-ticket:partial publication is not in a matching numerical region"
 )
 for entry in "${fixtures[@]}"; do
   fixture=${entry%%:*}

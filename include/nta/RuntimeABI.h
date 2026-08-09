@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 20;
+inline constexpr std::uint32_t Version = 25;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 5;
 inline constexpr std::uint32_t UrgencyBucketCount = 8;
@@ -26,6 +26,10 @@ enum ReplicaFlags : std::uint32_t {
   // two index arrays contain uint32_t entries; transferShape packs the source
   // and destination row strides in bytes.
   ReplicaIndexed = 1U << 2,
+  // The current index arrays were checked against both directory bounds by a
+  // stream-ordered validation kernel. Address rebinding does not invalidate
+  // this bit because the index arrays and transfer geometry are unchanged.
+  ReplicaIndicesValidated = 1U << 3,
 };
 
 enum BackendFlags : std::uint32_t {
@@ -86,8 +90,17 @@ struct alignas(32) RequestProgress {
   std::uint64_t unavailableBytes;
   std::uint64_t runnableComputeNs;
   std::uint64_t completedComputeNs;
+  // Compiler-attributed service still blocked on external data and total
+  // service represented by this request's contributors in the current epoch.
+  // These make progress useful to an SLO policy without treating CTA count as
+  // a proxy for heterogeneous work.
+  std::uint64_t pendingComputeNs;
+  std::uint64_t expectedComputeNs;
+  // Attributions rejected because a slot, generation, or epoch changed before
+  // publication. A nonzero value makes conservation failure observable.
+  std::uint64_t droppedAttributions;
 };
-static_assert(sizeof(RequestProgress) == 64);
+static_assert(sizeof(RequestProgress) == 96);
 
 struct alignas(64) ObjectEntry {
   std::uint64_t objectId;
@@ -424,6 +437,8 @@ struct alignas(64) RuntimeView {
   std::uint32_t completedCount;
   std::uint32_t failedCount;
   std::uint32_t abiVersion;
+  // Runtime-lifetime failure sequence; epoch reset deliberately preserves it.
+  std::uint32_t stickyFailedCount;
 };
 static_assert(sizeof(RuntimeView) == 320);
 

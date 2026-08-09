@@ -188,7 +188,7 @@ public:
               "upload staged test contents");
 
     requests.upload({1, 0, Bytes, 0, 7, 0, 4, 0});
-    requestProgress.upload({1, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    requestProgress.upload({1, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
     tenants.upload({Capacity * Bytes, 0, 1, 1, 0});
     objects.upload({ObjectId, reinterpret_cast<std::uint64_t>(staging.get()),
                     Bytes, 0, 3,
@@ -325,7 +325,8 @@ public:
                          Bytes, cudaMemcpyHostToDevice),
               "upload second staged test contents");
     requests.upload({2, 0, Bytes, 0, 8, 0, 3, 0}, slot);
-    requestProgress.upload({2, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, slot);
+    requestProgress.upload({2, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+                           slot);
     objects.upload(
         {objectId,
          reinterpret_cast<std::uint64_t>(staging.get() + contents.size()),
@@ -397,7 +398,7 @@ public:
     workTickets.upload(
         {0, 0, 0, static_cast<std::uint32_t>(nta::abi::WorkTicketState::New), 0,
          0, nta::abi::InvalidIndex, 0, 0, 0, 0, 1});
-    requestProgress.upload({1, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+    requestProgress.upload({1, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
     pendingCount.upload(0);
     ctaCompletions.upload(0);
     readyCount.upload(0);
@@ -515,11 +516,12 @@ void verifyDirectPath(QueueFixture &fixture, const KernelModule &kernels,
           "direct issue did not publish its reverse dependency edge");
   const nta::abi::RequestProgress pendingProgress =
       fixture.requestProgress.download();
-  require(pendingProgress.expectedWork == 1 &&
-              pendingProgress.pendingWork == 1 &&
-              pendingProgress.runnableWork == 0 &&
-              pendingProgress.completedWork == 0,
-          "request feedback did not account for pending work");
+  require(
+      pendingProgress.expectedWork == 1 && pendingProgress.pendingWork == 1 &&
+          pendingProgress.runnableWork == 0 &&
+          pendingProgress.completedWork == 0 &&
+          pendingProgress.pendingComputeNs == pendingProgress.expectedComputeNs,
+      "request feedback did not account for pending work");
   const std::uint32_t submissionIndex =
       (issued.sqTail + QueueFixture::Depth - 1U) % QueueFixture::Depth;
   const nta::abi::NvmeSubmission submission =
@@ -565,7 +567,10 @@ void verifyDirectPath(QueueFixture &fixture, const KernelModule &kernels,
               completedProgress.pendingWork == 0 &&
               completedProgress.runnableWork == 0 &&
               completedProgress.completedWork == 1 &&
-              completedProgress.failedWork == 0,
+              completedProgress.failedWork == 0 &&
+              completedProgress.pendingComputeNs == 0 &&
+              completedProgress.completedComputeNs ==
+                  completedProgress.expectedComputeNs,
           "request feedback did not account for completed work");
 }
 

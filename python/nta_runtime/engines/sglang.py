@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import atexit
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import logging
 import math
 import os
 import pathlib
+import threading
 import time
 from typing import Any
 
@@ -23,8 +24,11 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
 from nta_runtime.flashinfer import (
+    BIND_CURRENT_GENERATION,
     FlashInferLayerEpoch,
+    PREACQUIRED,
     attention_jit_args,
+    request_bound_attention_jit_args,
 )
 from nta_runtime.flashinfer_schedule import (
     Schedule,
@@ -33,8 +37,10 @@ from nta_runtime.flashinfer_schedule import (
     require_supported_version,
 )
 from nta_runtime.execution_policy import (
+    conservative_resume_counts,
     HostCostModel,
     HostExecutionPlan,
+    indexed_copy_blocks_per_group,
     plan_host_execution,
 )
 from nta_runtime.opportunity import OperatorArrival, TileArrival, append_json_line
@@ -45,17 +51,82 @@ from nta_runtime.runtime import (
     DeviceWorkPlan,
     IndexedHostObject,
     JitPhaseProgram,
+    OperatorCapability,
+    OperatorContract,
+    OperatorCoordinateMap,
+    OperatorFamily,
+    OperatorForm,
+    OperatorPartialState,
+    OperatorPlan,
+    OperatorPlanFlag,
+    OperatorReduction,
     RequestRange,
     Runtime,
     RuntimeConfig,
     WorkItem,
+    require_operator_pair,
 )
 
 
 _OBJECT_ID_BASE = 0x4E54410000000000
+_LOOKAHEAD_ALIAS_ID_BASE = _OBJECT_ID_BASE | 0x00000000FFFF0000
+_LOOKAHEAD_VERSION = 1
 _MAX_ABI_BYTES = (1 << 32) - 1
 logger = logging.getLogger(__name__)
 _PagePair = tuple[tuple[int, ...], tuple[int, ...]]
+
+
+class _StatsPublisher:
+    """Coalesce evaluation snapshots and write them off the scheduler thread."""
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self._path = path
+        self._condition = threading.Condition()
+        self._pending: tuple[int, dict[str, Any]] | None = None
+        self._submitted = 0
+        self._completed = 0
+        self._error: Exception | None = None
+        self._thread = threading.Thread(
+            target=self._run, name="nta-stats-publisher", daemon=True
+        )
+        self._thread.start()
+
+    def publish(self, report: dict[str, Any], *, wait: bool = False) -> None:
+        with self._condition:
+            self._submitted += 1
+            sequence = self._submitted
+            self._pending = (sequence, report)
+            self._condition.notify()
+            if wait:
+                self._condition.wait_for(
+                    lambda: self._completed >= sequence or self._error is not None
+                )
+                if self._error is not None:
+                    raise RuntimeError(
+                        "failed to publish NTA engine statistics"
+                    ) from self._error
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._pending is not None)
+                sequence, report = self._pending
+                self._pending = None
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+                temporary.write_text(
+                    json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                temporary.replace(self._path)
+            except Exception as error:
+                with self._condition:
+                    self._error = error
+                    self._condition.notify_all()
+                return
+            with self._condition:
+                self._completed = sequence
+                self._condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -67,6 +138,20 @@ class _PrefetchedLayer:
     version: int
     key_bytes: int
     value_bytes: int
+    ready_event: torch.cuda.Event
+    transfer_first_slot: int
+
+
+@dataclass(frozen=True)
+class _FragmentLookahead:
+    layer_id: int
+    wrapper_id: int
+    object_count: int
+    preloaded_object_count: int
+    key_source: int
+    key_staging: int
+    value_source: int
+    value_staging: int
     ready_event: torch.cuda.Event
 
 
@@ -80,6 +165,8 @@ class _ActiveBatch:
     prefetched_layers: dict[int, _PrefetchedLayer]
     prefetch_tensors: tuple[torch.Tensor, ...]
     host_execution: HostExecutionPlan | None = None
+    acquisition_grouping: str = "request"
+    fragment_lookahead: dict[int, _FragmentLookahead] = field(default_factory=dict)
 
 
 @dataclass
@@ -91,6 +178,12 @@ class _PlanAllocation:
     index_tensors: tuple[torch.Tensor, ...] = ()
     host_execution: HostExecutionPlan | None = None
     object_version: int = 0
+    transfer_bytes: int = 0
+    indexed_geometry: tuple[int, ...] | None = None
+    max_object_fanout: int = 1
+    min_unresolved_dependencies: int = 1
+    direct_work_count: int = 0
+    external_object_slots: tuple[tuple[int, ...], ...] = ()
 
 
 def _positive_environment(name: str, default: int) -> int:
@@ -114,6 +207,35 @@ def _gain_environment(name: str, default: float) -> float:
     return value
 
 
+def _frontier_transfer_bytes(pending: PendingHostLoad) -> int:
+    key_layers = pending.controller.mem_pool_host.k_data_refs
+    value_layers = pending.controller.mem_pool_host.v_data_refs
+    if len(key_layers) != len(value_layers):
+        raise RuntimeError("HiCache host K/V layer counts disagree")
+    page_count = int(pending.host_indices.numel())
+    if page_count <= 0:
+        raise RuntimeError("HiCache acquisition frontier has no host pages")
+    return page_count * sum(
+        int(key[0].numel()) * key.element_size()
+        + int(value[0].numel()) * value.element_size()
+        for key, value in zip(key_layers, value_layers, strict=True)
+    )
+
+
+def _pipeline_object_range(
+    object_capacity: int, consumer_index: int, layer_count: int
+) -> tuple[int, int]:
+    """Reserve one producer's layer objects from the directory's high end."""
+    if object_capacity <= 0 or consumer_index < 0 or layer_count <= 0:
+        raise RuntimeError("HiCache layer-object geometry is invalid")
+    object_count = 2 * layer_count
+    end = object_capacity - consumer_index * object_count
+    begin = end - object_count
+    if begin < 2 or end > object_capacity:
+        raise RuntimeError("HiCache layer objects exceed NTA directory capacity")
+    return begin, end
+
+
 def _dtype_tag(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.").replace("_", "")
 
@@ -122,9 +244,7 @@ def _plan_cache_signature(
     request_indices: tuple[int, ...],
     kv_tile_indices: tuple[int, ...],
     page_pairs: tuple[_PagePair, ...],
-    request_slots: tuple[int, ...],
-    key_pointer: int,
-    value_pointer: int,
+    request_bindings: tuple[tuple[int, int], ...],
     key_bytes: int,
     value_bytes: int,
     prefetched_bytes: tuple[int, int] | None,
@@ -134,12 +254,43 @@ def _plan_cache_signature(
         request_indices,
         kv_tile_indices,
         page_pairs,
-        request_slots,
-        key_pointer,
-        value_pointer,
+        request_bindings,
         key_bytes,
         value_bytes,
         prefetched_bytes,
+    )
+
+
+def _group_external_pages_by_request(
+    schedule: Schedule, page_pairs: tuple[_PagePair, ...]
+) -> tuple[_PagePair, ...]:
+    """Share one exact indexed K/V acquisition group across request CTAs."""
+    if schedule.work_count != len(page_pairs):
+        raise RuntimeError("FlashInfer work and page-pair counts disagree")
+    pages_by_request: dict[int, dict[int, int]] = {}
+    for request_index, (host_pages, device_pages) in zip(
+        schedule.request_indices, page_pairs
+    ):
+        if len(host_pages) != len(device_pages):
+            raise RuntimeError("HiCache host/device page mappings disagree")
+        request_pages = pages_by_request.setdefault(request_index, {})
+        for host_page, device_page in zip(host_pages, device_pages):
+            previous = request_pages.setdefault(device_page, host_page)
+            if previous != host_page:
+                raise RuntimeError(
+                    "one device KV page maps to multiple host cache pages"
+                )
+
+    grouped = {
+        request_index: (tuple(pages.values()), tuple(pages))
+        for request_index, pages in pages_by_request.items()
+        if pages
+    }
+    return tuple(
+        grouped.get(request_index, ((), ())) if host_pages else ((), ())
+        for request_index, (host_pages, _device_pages) in zip(
+            schedule.request_indices, page_pairs
+        )
     )
 
 
@@ -173,19 +324,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if self.prefill_backend != "fa2" or self.decode_backend != "fa2":
             raise ValueError("NTA requires FlashInfer's FA2 attention kernels")
 
-        self._stock_decode_wrappers = self.decode_wrappers
-        self._stock_prefill_wrappers_paged = self.prefill_wrappers_paged
-        self._stock_prefill_wrappers_verify = self.prefill_wrappers_verify
         self._hicache_enabled = bool(model_runner.server_args.enable_hierarchical_cache)
         self._decode_jit_args: list[Any] | None = None
         self._prefill_jit_args: list[Any] | None = None
-        if self._hicache_enabled:
-            self._install_instrumented_wrappers(model_runner, skip_prefill)
-        else:
-            self._nta_decode_wrappers = self._stock_decode_wrappers
-            self._nta_prefill_wrappers_paged = self._stock_prefill_wrappers_paged
-            self._nta_prefill_wrappers_verify = self._stock_prefill_wrappers_verify
-            self._wrapper_modules = {}
+        self._install_instrumented_wrappers(model_runner, skip_prefill)
 
         request_capacity = int(model_runner.req_to_token_pool.req_to_token.shape[0])
         default_tickets = max(4096, request_capacity * 8)
@@ -208,29 +350,56 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._request_slots = RequestSlotTracker(self._runtime, request_capacity)
         self._hicache = SglangHiCacheBridge(self.token_to_kv_pool)
         self._prefetch_stream = torch.cuda.Stream(priority=0)
+        self._progress_stream = torch.cuda.Stream(priority=-1)
         self._host_cost_model = HostCostModel(
             bandwidth_bytes_per_second=_positive_environment(
                 "NTA_SGLANG_HOST_BANDWIDTH_BPS", 30_000_000_000
             ),
             round_overhead_ns=_nonnegative_environment(
-                "NTA_SGLANG_ROUND_OVERHEAD_NS", 15_000
+                "NTA_SGLANG_ROUND_OVERHEAD_NS", 50_000
             ),
-            tile_compute_ns=_positive_environment(
-                "NTA_SGLANG_TILE_COMPUTE_NS", 3_000
+            incremental_setup_ns=_nonnegative_environment(
+                "NTA_SGLANG_INCREMENTAL_SETUP_NS", 300_000
             ),
+            tile_compute_ns=_positive_environment("NTA_SGLANG_TILE_COMPUTE_NS", 3_000),
             max_rounds=_positive_environment("NTA_SGLANG_MAX_HOST_ROUNDS", 4),
             minimum_predicted_gain=_gain_environment(
                 "NTA_SGLANG_MIN_PREDICTED_GAIN", 1.03
             ),
         )
+        self._indexed_copy_target_bytes = _positive_environment(
+            "NTA_SGLANG_INDEXED_COPY_BYTES_PER_CTA", 1024 * 1024
+        )
+        self._indexed_copy_max_blocks = min(
+            64,
+            _positive_environment("NTA_SGLANG_INDEXED_COPY_MAX_CTAS", 32),
+        )
+        self._frontier_layers_per_wave = min(
+            64,
+            _positive_environment("NTA_SGLANG_FRONTIER_LAYERS_PER_WAVE", 4),
+        )
         self._pipeline_host = (
             self._hicache_enabled
             and os.environ.get("NTA_SGLANG_PIPELINE_HOST", "1") != "0"
         )
-        self._allow_fallback = os.environ.get("NTA_SGLANG_ALLOW_FALLBACK") == "1"
-        self._force_incremental = (
-            os.environ.get("NTA_SGLANG_FORCE_INCREMENTAL") == "1"
+        self._force_incremental = os.environ.get("NTA_SGLANG_FORCE_INCREMENTAL") == "1"
+        self._request_overlap = os.environ.get("NTA_SGLANG_REQUEST_OVERLAP", "1") != "0"
+        self._cross_layer_frontier = (
+            self._request_overlap
+            and os.environ.get("NTA_SGLANG_CROSS_LAYER_FRONTIER", "1") != "0"
         )
+        self._fragment_lookahead = (
+            self._hicache_enabled
+            and not self._pipeline_host
+            and os.environ.get("NTA_SGLANG_FRAGMENT_LOOKAHEAD", "1") != "0"
+        )
+        self._acquisition_grouping = os.environ.get(
+            "NTA_SGLANG_ACQUISITION_GROUPING", "adaptive"
+        )
+        if self._acquisition_grouping not in {"adaptive", "request", "tile"}:
+            raise RuntimeError(
+                "NTA_SGLANG_ACQUISITION_GROUPING must be adaptive, request, or tile"
+            )
         self._prefetch_ready_events: tuple[tuple[torch.cuda.Event, ...], ...] = ()
         self._bulk_events: tuple[torch.cuda.Event, ...] = ()
         layer_count = getattr(model_runner.model_config, "num_hidden_layers", None)
@@ -239,19 +408,42 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 model_runner.model_config.hf_config, "num_hidden_layers"
             )
         self._model_layer_count = int(layer_count)
-        self._model_start_layer = int(
-            getattr(self.token_to_kv_pool, "start_layer", 0)
-        )
+        self._model_start_layer = int(getattr(self.token_to_kv_pool, "start_layer", 0))
         self._cuda_graph_mode = False
         self._active_batch: _ActiveBatch | None = None
         self._plans: dict[tuple[int, int], _PlanAllocation] = {}
         self._phase_programs: dict[str, JitPhaseProgram] = {}
+        self._operator_contracts: dict[
+            tuple[OperatorFamily, OperatorForm], OperatorContract
+        ] = {}
+        self._operator_plans: dict[
+            tuple[OperatorFamily, OperatorForm], OperatorPlan
+        ] = {}
+        self._operator_programs: dict[
+            tuple[OperatorFamily, OperatorForm], JitPhaseProgram
+        ] = {}
+        self._demand_sync_events: dict[
+            tuple[int, int, int], tuple[torch.cuda.Event, tuple[torch.cuda.Event, ...]]
+        ] = {}
         self._stats = {
             "schema": 1,
             "engine": "sglang",
             "backend": "nta_flashinfer",
             "revision": os.environ.get("NTA_REVISION", "unknown"),
             "pid": os.getpid(),
+            "pipeline_host_enabled": self._pipeline_host,
+            "request_overlap_enabled": self._request_overlap,
+            "cross_layer_frontier_enabled": self._cross_layer_frontier,
+            "fragment_lookahead_enabled": self._fragment_lookahead,
+            "sglang_mixed_chunk_enabled": bool(
+                model_runner.server_args.enable_mixed_chunk
+            ),
+            "max_host_rounds": self._host_cost_model.max_rounds,
+            "minimum_predicted_gain": self._host_cost_model.minimum_predicted_gain,
+            "incremental_setup_ns": self._host_cost_model.incremental_setup_ns,
+            "indexed_copy_target_bytes": self._indexed_copy_target_bytes,
+            "indexed_copy_max_blocks": self._indexed_copy_max_blocks,
+            "frontier_layers_per_wave": self._frontier_layers_per_wave,
             "batches": 0,
             "decode_launches": 0,
             "prefill_launches": 0,
@@ -260,18 +452,44 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "request_rebindings": 0,
             "request_cancellations": 0,
             "external_launches": 0,
-            "resident_stock_batches": 0,
+            "resident_transformed_batches": 0,
             "hicache_claimed_batches": 0,
             "hicache_fallback_batches": 0,
             "indexed_host_objects": 0,
+            "request_acquisition_groups": 0,
+            "tile_acquisition_groups": 0,
+            "adaptive_request_batches": 0,
+            "adaptive_tile_batches": 0,
             "indexed_host_bytes": 0,
             "prefetched_layers": 0,
             "prefetched_host_bytes": 0,
+            "lookahead_acquisition_layers": 0,
+            "lookahead_acquisition_objects": 0,
+            "lookahead_bound_launches": 0,
             "demand_host_layers": 0,
             "incremental_host_layers": 0,
+            "request_overlap_layers": 0,
+            "mixed_dependency_layers": 0,
+            "mixed_forward_batches": 0,
+            "mixed_forward_requests": 0,
+            "mixed_scheduled_requests": 0,
+            "mixed_direct_work_items": 0,
+            "mixed_external_work_items": 0,
             "bulk_host_batches": 0,
-            "stock_bulk_launches": 0,
+            "transformed_direct_launches": 0,
+            "ticketed_incremental_launches": 0,
+            "stock_attention_launches": 0,
             "host_progress_rounds": 0,
+            "parallel_indexed_progress_layers": 0,
+            "fragment_lookahead_layers": 0,
+            "fragment_lookahead_objects": 0,
+            "fragment_remaining_rounds": 0,
+            "compact_initial_launches": 0,
+            "compact_initial_cta_bound": 0,
+            "canonical_initial_cta_bound": 0,
+            "compact_resume_launches": 0,
+            "compact_resume_cta_bound": 0,
+            "canonical_resume_cta_bound": 0,
             "predicted_atomic_ns": 0,
             "predicted_incremental_ns": 0,
             "progress_snapshots": 0,
@@ -281,9 +499,29 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "graph_captures": 0,
             "graph_replays": 0,
             "graph_external_batches": 0,
+            "verified_operator_modules": 0,
             "started_unix_ns": time.time_ns(),
         }
+        configured_stats = os.environ.get("NTA_ENGINE_STATS_FILE")
+        self._stats_publisher: _StatsPublisher | None = None
+        if configured_stats:
+            stats_path = pathlib.Path(configured_stats)
+            if stats_path.suffix:
+                stats_path = stats_path.with_name(
+                    f"{stats_path.stem}.{os.getpid()}{stats_path.suffix}"
+                )
+            else:
+                stats_path = stats_path / f"nta-sglang-{os.getpid()}.json"
+            self._stats_publisher = _StatsPublisher(stats_path)
         self._profile_cpu = os.environ.get("NTA_SGLANG_PROFILE_CPU") == "1"
+        self._profile_transfer = os.environ.get("NTA_SGLANG_PROFILE_TRANSFER") == "1"
+        self._profile_gpu = os.environ.get("NTA_SGLANG_PROFILE_GPU") == "1"
+        self._transfer_profiles: list[
+            tuple[torch.cuda.Event, torch.cuda.Event, int, str]
+        ] = []
+        self._operator_profiles: list[
+            tuple[torch.cuda.Event, torch.cuda.Event, str]
+        ] = []
         trace_file = os.environ.get("NTA_OPPORTUNITY_TRACE_FILE")
         self._opportunity_trace = pathlib.Path(trace_file) if trace_file else None
         self._opportunity_revision = os.environ.get("NTA_REVISION", "")
@@ -291,9 +529,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "NTA_OPPORTUNITY_MODEL",
             str(getattr(model_runner.model_config, "model_path", "unknown")),
         )
-        self._opportunity_tier = os.environ.get(
-            "NTA_OPPORTUNITY_TIER", "host_staged"
-        )
+        self._opportunity_tier = os.environ.get("NTA_OPPORTUNITY_TIER", "host_staged")
         self._opportunity_batch = 0
         self._active_opportunity_batch = -1
         self._measure_opportunity_compute = (
@@ -317,6 +553,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 )
         if self._pipeline_host:
             self._hicache.set_prefetch_callback(self._prepare_host_pipeline)
+        elif self._cross_layer_frontier and self._model_layer_count > 1:
+            self._hicache.set_prefetch_callback(self._publish_cross_layer_frontier)
         atexit.register(self._write_stats)
 
     def cancel_requests(self, request_id_prefix: str, *, all: bool = False) -> int:
@@ -331,94 +569,159 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         kv_dtype = model_runner.kv_cache_dtype
         head_dim = int(model_runner.model_config.head_dim)
         signature = f"h{head_dim}_{_dtype_tag(q_dtype)}_{_dtype_tag(kv_dtype)}"
-        decode_name = (
-            f"nta_sglang_decode_default_v2_"
+        decode_base = (
+            f"nta_sglang_decode_{{policy}}_v11_"
             f"{'tc' if self.decode_use_tensor_cores else 'cc'}_"
             f"{signature}"
         )
-        prefill_name = f"nta_sglang_prefill_default_v2_{signature}"
+        prefill_base = f"nta_sglang_prefill_{{policy}}_v11_{signature}"
         self._wrapper_modules: dict[int, str] = {}
 
-        decode_args = attention_jit_args(
-            decode_name,
-            dtype_q=q_dtype,
-            dtype_kv=kv_dtype,
-            dtype_o=q_dtype,
-            idtype=torch.int32,
-            head_dim_qk=head_dim,
-            head_dim_vo=head_dim,
-        )
-        self._decode_jit_args = decode_args
-        self._nta_decode_wrappers = []
-        for _ in range(self.num_wrappers):
-            wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                backend="fa2",
-                use_tensor_cores=self.decode_use_tensor_cores,
-                jit_args=decode_args,
+        def decode_wrappers(policy: str) -> tuple[list[Any], list[Any]]:
+            name = decode_base.format(policy=policy)
+            jit_builder = (
+                request_bound_attention_jit_args
+                if policy == "request_bound"
+                else attention_jit_args
             )
-            self._nta_decode_wrappers.append(wrapper)
-            self._wrapper_modules[id(wrapper)] = decode_name
+            args = jit_builder(
+                name,
+                dtype_q=q_dtype,
+                dtype_kv=kv_dtype,
+                dtype_o=q_dtype,
+                idtype=torch.int32,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+            )
+            wrappers = []
+            for _ in range(self.num_wrappers):
+                wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    backend="fa2",
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                    jit_args=args,
+                )
+                wrappers.append(wrapper)
+                self._wrapper_modules[id(wrapper)] = name
+            return wrappers, args
+
+        self._nta_request_bound_decode_wrappers, self._decode_jit_args = (
+            decode_wrappers("request_bound")
+        )
+        self._nta_demand_decode_wrappers, _ = decode_wrappers("demand_acquire")
 
         if skip_prefill:
+            self._select_wrappers(False)
             return
-        prefill_args = attention_jit_args(
-            prefill_name,
-            dtype_q=q_dtype,
-            dtype_kv=kv_dtype,
-            dtype_o=q_dtype,
-            idtype=torch.int32,
-            head_dim_qk=head_dim,
-            head_dim_vo=head_dim,
-        )
-        self._prefill_jit_args = prefill_args
 
-        def make_prefill() -> BatchPrefillWithPagedKVCacheWrapper:
-            wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                backend="fa2",
-                jit_args=prefill_args,
+        def prefill_wrappers(policy: str) -> tuple[list[Any], list[Any]]:
+            name = prefill_base.format(policy=policy)
+            jit_builder = (
+                request_bound_attention_jit_args
+                if policy == "request_bound"
+                else attention_jit_args
             )
-            self._wrapper_modules[id(wrapper)] = prefill_name
-            return wrapper
+            args = jit_builder(
+                name,
+                dtype_q=q_dtype,
+                dtype_kv=kv_dtype,
+                dtype_o=q_dtype,
+                idtype=torch.int32,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+            )
+            wrappers = []
+            for _ in range(2 * self.num_wrappers):
+                wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    backend="fa2",
+                    jit_args=args,
+                )
+                wrappers.append(wrapper)
+                self._wrapper_modules[id(wrapper)] = name
+            return wrappers, args
 
-        self._nta_prefill_wrappers_paged = [
-            make_prefill() for _ in range(self.num_wrappers)
-        ]
-        self._nta_prefill_wrappers_verify = [
-            make_prefill() for _ in range(self.num_wrappers)
-        ]
+        request_prefill, self._prefill_jit_args = prefill_wrappers("request_bound")
+        demand_prefill, _ = prefill_wrappers("demand_acquire")
+        split = self.num_wrappers
+        self._nta_request_bound_prefill_paged = request_prefill[:split]
+        self._nta_request_bound_prefill_verify = request_prefill[split:]
+        self._nta_demand_prefill_paged = demand_prefill[:split]
+        self._nta_demand_prefill_verify = demand_prefill[split:]
         self._select_wrappers(False)
 
-    def _select_wrappers(self, external: bool) -> None:
+    def _select_wrappers(self, demand_acquire: bool) -> None:
         self.decode_wrappers = (
-            self._nta_decode_wrappers if external else self._stock_decode_wrappers
+            self._nta_demand_decode_wrappers
+            if demand_acquire
+            else self._nta_request_bound_decode_wrappers
         )
         if self.skip_prefill:
             return
         self.prefill_wrappers_paged = (
-            self._nta_prefill_wrappers_paged
-            if external
-            else self._stock_prefill_wrappers_paged
+            self._nta_demand_prefill_paged
+            if demand_acquire
+            else self._nta_request_bound_prefill_paged
         )
         self.prefill_wrappers_verify = (
-            self._nta_prefill_wrappers_verify
-            if external
-            else self._stock_prefill_wrappers_verify
+            self._nta_demand_prefill_verify
+            if demand_acquire
+            else self._nta_request_bound_prefill_verify
         )
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list[Any]:
-        # External graph batches are accepted only after all layers have been
-        # acquired by the stream-ordered pipeline. Keep the captured attention
-        # kernels byte-for-byte identical to SGLang's stock graph path.
-        return super()._create_decode_wrappers(bs, num_tokens)
+        if self._decode_jit_args is None:
+            raise RuntimeError("NTA decode JIT arguments are not initialized")
+        wrappers = [
+            BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend="fa2",
+                use_cuda_graph=True,
+                use_tensor_cores=self.decode_use_tensor_cores,
+                paged_kv_indptr_buffer=self.kv_indptr[index][: num_tokens + 1],
+                paged_kv_indices_buffer=self.cuda_graph_kv_indices[index],
+                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+                jit_args=self._decode_jit_args,
+            )
+            for index in range(self.num_wrappers)
+        ]
+        for wrapper in wrappers:
+            self._wrapper_modules[id(wrapper)] = self._decode_jit_args[0]
+        return wrappers
 
     def _create_prefill_wrappers(
         self, bs: int, use_custom_mask: bool = False
     ) -> list[Any]:
-        return super()._create_prefill_wrappers(bs, use_custom_mask)
+        if self._prefill_jit_args is None:
+            raise RuntimeError("NTA prefill JIT arguments are not initialized")
+        wrappers = []
+        for index in range(self.num_wrappers):
+            extra = (
+                {
+                    "custom_mask_buf": self.cuda_graph_custom_mask,
+                    "mask_indptr_buf": self.cuda_graph_qk_indptr[index][: bs + 1],
+                }
+                if use_custom_mask
+                else {}
+            )
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                backend="fa2",
+                qo_indptr_buf=self.cuda_graph_qo_indptr[index][: bs + 1],
+                paged_kv_indptr_buf=self.kv_indptr[index][: bs + 1],
+                paged_kv_indices_buf=self.cuda_graph_kv_indices[index],
+                paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                jit_args=self._prefill_jit_args,
+                **extra,
+            )
+            self._wrapper_modules[id(wrapper)] = self._prefill_jit_args[0]
+            wrappers.append(wrapper)
+        return wrappers
 
     def init_cuda_graph_state(self, *args: Any, **kwargs: Any) -> None:
         super().init_cuda_graph_state(*args, **kwargs)
@@ -445,12 +748,16 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
         )
         bindings = self._request_slots.bind(
-            request_ids, range(batch_size), priorities=priorities
+            request_ids,
+            range(batch_size),
+            priorities=priorities,
+            stream=torch.cuda.current_stream(),
         )
         self._stats["request_rebindings"] += self._request_slots.last_publish_count
-        self._stats["request_policy_updates"] = self._stats.get(
-            "request_policy_updates", 0
-        ) + self._request_slots.last_policy_publish_count
+        self._stats["request_policy_updates"] = (
+            self._stats.get("request_policy_updates", 0)
+            + self._request_slots.last_policy_publish_count
+        )
         return bindings
 
     def init_forward_metadata_out_graph(
@@ -458,22 +765,22 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
     ) -> None:
         self._cuda_graph_mode = True
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
-        if not self._hicache_enabled:
-            self._active_batch = None
-            return
-
+        bindings = self._bind_forward_requests(
+            forward_batch, allow_capture_ids=in_capture
+        )
         counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
         if pending is None:
-            self._active_batch = None
+            self._active_batch = _ActiveBatch(bindings, {}, None, {}, {}, {}, ())
+            self._stats["resident_transformed_batches"] += 1
         else:
             if not self._pipeline_host or not pending.prefetched_layers:
                 raise RuntimeError(
                     "CUDA graph replay requires the stream-ordered HiCache pipeline"
                 )
             self._active_batch = _ActiveBatch(
-                (),
+                bindings,
                 {},
                 pending,
                 {},
@@ -498,75 +805,51 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata(self, forward_batch: Any) -> None:
         self._cuda_graph_mode = False
+        if forward_batch.forward_mode.is_mixed():
+            self._stats["mixed_forward_batches"] += 1
+            self._stats["mixed_forward_requests"] += len(
+                tuple(getattr(forward_batch, "rids", ()) or ())
+            )
         counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
-        if pending is None:
-            self._select_wrappers(False)
-            self._active_batch = None
-            super().init_forward_metadata(forward_batch)
-            self._stats["batches"] += 1
-            self._stats["resident_stock_batches"] += 1
-            return
-
-        # Transfer scheduling and attention execution are independent. The
-        # stream-ordered pipeline has acquired every layer before its attention
-        # launch, so it must retain stock FlashInfer. Only an unresolved
-        # incremental batch is replanned below with the typed acquisition hook.
-        self._select_wrappers(False)
+        demand_acquire = (
+            pending is not None
+            and not self._pipeline_host
+            and (
+                self._force_incremental
+                or self._request_overlap
+                or self._fast_bulk_policy(pending).rounds > 1
+            )
+        )
+        self._select_wrappers(demand_acquire)
         original_use_paged = self.use_paged
         self.use_paged = True
         try:
             super().init_forward_metadata(forward_batch)
-            if not self._pipeline_host and not self._force_incremental:
-                fast_policy = self._fast_bulk_policy(pending)
-                if fast_policy.rounds == 1:
-                    self._active_batch = _ActiveBatch(
-                        (), {}, pending, {}, {}, {}, (), fast_policy
-                    )
-                    self._stats["batches"] += 1
-                    self._stats["hicache_claimed_batches"] += 1
-                    return
-            policy = self._init_external_metadata(forward_batch, pending)
-            if (
-                not self._pipeline_host
-                and policy is not None
-                and (policy.rounds > 1 or self._force_incremental)
-            ):
-                bindings = self._active_batch.bindings
-                self._select_wrappers(True)
-                super().init_forward_metadata(forward_batch)
-                instrumented_policy = self._init_external_metadata(
-                    forward_batch,
-                    pending,
-                    bindings=bindings,
-                    count_batch=False,
-                )
-                if instrumented_policy != policy:
-                    raise RuntimeError(
-                        "stock and instrumented FlashInfer schedules selected "
-                        "different host execution policies"
-                    )
+            bind_started = time.perf_counter_ns() if self._profile_cpu else 0
+            bindings = self._bind_forward_requests(
+                forward_batch, allow_capture_ids=False
+            )
+            if self._profile_cpu:
+                self._stats["request_bind_cpu_ns"] = self._stats.get(
+                    "request_bind_cpu_ns", 0
+                ) + (time.perf_counter_ns() - bind_started)
+            if pending is None:
+                self._active_batch = _ActiveBatch(bindings, {}, None, {}, {}, {}, ())
+                self._stats["batches"] += 1
+                self._stats["resident_transformed_batches"] += 1
+                return
+            self._init_external_metadata(forward_batch, pending, bindings=bindings)
         except Exception as error:
             self._active_batch = None
             self._stats["hicache_fallback_batches"] += 1
             self._stats["last_hicache_fallback"] = str(error)
             self._write_stats()
-            if not self._allow_fallback:
-                raise RuntimeError(
-                    "NTA failed to bind a claimed HiCache batch; set "
-                    "NTA_SGLANG_ALLOW_FALLBACK=1 only for availability testing"
-                ) from error
-            logger.error(
-                "NTA could not bind a HiCache batch; explicit stock fallback: %s",
-                error,
-            )
-            self._hicache.fallback(pending)
-            self._select_wrappers(False)
-            self.use_paged = original_use_paged
-            super().init_forward_metadata(forward_batch)
-            self._stats["batches"] += 1
-            return
+            raise RuntimeError(
+                "NTA failed to bind the FlashInfer batch; stock fallback is "
+                "disabled because it would bypass request-level semantics"
+            ) from error
         finally:
             self.use_paged = original_use_paged
 
@@ -590,42 +873,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 raise RuntimeError("NTA requires SGLang paged prefill metadata")
             wrappers = self.forward_metadata.prefill_wrappers
             extractor = paged_prefill_schedule
-        if self._pipeline_host:
-            if not pending.prefetched_layers:
-                raise RuntimeError("HiCache producer did not publish prefetched layers")
-            self._active_batch = _ActiveBatch(
-                (),
-                {},
-                pending,
-                {},
-                {},
-                pending.prefetched_layers,
-                pending.prefetch_tensors,
-            )
-            if self._profile_cpu:
-                self._stats["metadata_cpu_ns"] = self._stats.get(
-                    "metadata_cpu_ns", 0
-                ) + (time.perf_counter_ns() - metadata_started)
-            if count_batch:
-                self._stats["batches"] += 1
-                self._stats["hicache_claimed_batches"] += 1
-            return None
+        if self._pipeline_host and not pending.prefetched_layers:
+            raise RuntimeError("HiCache producer did not publish NTA lookahead objects")
 
-        request_ids = forward_batch.rids
-        if request_ids is None:
-            raise RuntimeError("SGLang did not publish request IDs to NTA")
-        # NTA owns compact batch-local request slots. Engine allocator slots
-        # are intentionally volatile and would force identical CTA plans to
-        # be rebuilt whenever SGLang recycles its request pool.
-        bind_started = time.perf_counter_ns() if self._profile_cpu else 0
         if bindings is None:
             bindings = self._bind_forward_requests(
                 forward_batch, allow_capture_ids=False
             )
-        if self._profile_cpu and count_batch:
-            self._stats["request_bind_cpu_ns"] = self._stats.get(
-                "request_bind_cpu_ns", 0
-            ) + (time.perf_counter_ns() - bind_started)
 
         schedules: dict[int, Schedule] = {}
         for wrapper in wrappers:
@@ -634,10 +888,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             schedules[id(wrapper)] = schedule
         pending_pages = set(pending.materialize_mapping())
         planned_pages: set[int] = set()
-        page_pairs: dict[int, tuple[_PagePair, ...]] = {}
+        tile_page_pairs: dict[int, tuple[_PagePair, ...]] = {}
         for wrapper in wrappers:
             planned_pages.update(self._wrapper_pages(wrapper))
-            page_pairs[id(wrapper)] = self._work_page_pairs(
+            tile_page_pairs[id(wrapper)] = self._work_page_pairs(
                 wrapper, schedules[id(wrapper)], pending
             )
         missing = pending_pages - planned_pages
@@ -645,23 +899,70 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError(
                 f"attention metadata omits {len(missing)} promoted HiCache pages"
             )
-        host_execution = self._metadata_execution_policy(
-            schedules, page_pairs, pending
+        request_page_pairs = {
+            wrapper_id: _group_external_pages_by_request(schedules[wrapper_id], pairs)
+            for wrapper_id, pairs in tile_page_pairs.items()
+        }
+        if forward_batch.forward_mode.is_mixed():
+            representative_id = next(iter(schedules))
+            representative_schedule = schedules[representative_id]
+            representative_pairs = request_page_pairs[representative_id]
+            self._stats["mixed_scheduled_requests"] += len(
+                set(representative_schedule.request_indices)
+            )
+            self._stats["mixed_direct_work_items"] += sum(
+                not pair[0] for pair in representative_pairs
+            )
+            self._stats["mixed_external_work_items"] += sum(
+                bool(pair[0]) for pair in representative_pairs
+            )
+        request_execution = self._metadata_execution_policy(
+            schedules, request_page_pairs, pending
         )
+        tile_execution = self._metadata_execution_policy(
+            schedules, tile_page_pairs, pending
+        )
+        grouping = self._acquisition_grouping
+        if grouping == "adaptive":
+            if self._force_incremental:
+                grouping = "tile"
+            else:
+                grouping = (
+                    "tile"
+                    if tile_execution.predicted_incremental_ns
+                    < request_execution.predicted_incremental_ns
+                    else "request"
+                )
+            self._stats[f"adaptive_{grouping}_batches"] += 1
+        if grouping == "tile":
+            page_pairs = tile_page_pairs
+            host_execution = tile_execution
+        else:
+            page_pairs = request_page_pairs
+            host_execution = request_execution
         self._active_batch = _ActiveBatch(
             bindings,
             schedules,
             pending,
             page_pairs,
             {},
-            {},
-            (),
+            (
+                pending.prefetched_layers
+                if self._pipeline_host or self._cross_layer_frontier
+                else {}
+            ),
+            (
+                pending.prefetch_tensors
+                if self._pipeline_host or self._cross_layer_frontier
+                else ()
+            ),
             host_execution,
+            grouping,
         )
         if self._profile_cpu:
-            self._stats["metadata_cpu_ns"] = self._stats.get(
-                "metadata_cpu_ns", 0
-            ) + (time.perf_counter_ns() - metadata_started)
+            self._stats["metadata_cpu_ns"] = self._stats.get("metadata_cpu_ns", 0) + (
+                time.perf_counter_ns() - metadata_started
+            )
         if count_batch:
             self._stats["batches"] += 1
             self._stats["hicache_claimed_batches"] += 1
@@ -672,8 +973,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
         Padded work and one object pair per possible work item deliberately
         overestimate incremental opportunity. A one-round result is therefore
-        safe to send directly to stock FlashInfer; uncertain batches continue
-        through exact request/tile binding.
+        safe to send through transformed direct attention after bulk transfer;
+        uncertain batches continue through exact request/tile binding.
         """
         if self.forward_metadata is None:
             raise RuntimeError("bulk policy has no FlashInfer metadata")
@@ -701,21 +1002,39 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             transfer_bytes=transfer_bytes,
             runnable_tiles=padded_work,
             model=self._host_cost_model,
+            force_rounds=(
+                self._host_cost_model.max_rounds if self._force_incremental else None
+            ),
         )
 
-    def _prepare_host_pipeline(self, pending: PendingHostLoad) -> None:
+    def _prepare_host_pipeline(
+        self, pending: PendingHostLoad, *, first_local_layer: int = 0
+    ) -> None:
         pipeline_started = time.perf_counter_ns() if self._profile_cpu else 0
         controller = pending.controller
         layer_count = int(controller.layer_num)
-        if layer_count <= 0 or 2 * layer_count > self._object_capacity:
-            raise RuntimeError("HiCache layer objects exceed NTA directory capacity")
+        if first_local_layer < 0 or first_local_layer >= layer_count:
+            raise RuntimeError("HiCache acquisition frontier is outside the model")
+        acquired_layer_count = layer_count - first_local_layer
+        transfer_first_slot, _ = _pipeline_object_range(
+            self._object_capacity, pending.consumer_index, layer_count
+        )
         transfer_count = int(pending.host_indices.numel())
         if transfer_count <= 0 or transfer_count != int(pending.device_indices.numel()):
             raise RuntimeError("HiCache host pipeline has no promoted pages")
+        device_pool = controller.mem_pool_device
         transfer_source_indices, transfer_staging_indices = controller.move_indices(
             pending.host_indices, pending.device_indices
         )
-        pending.producer_event.start_event.record()
+        # NTA's indexed-transfer ABI is uint32. SGLang currently publishes
+        # int64 cache indices, so passing its storage through would interleave
+        # every real index with a zero high word and corrupt the destination map.
+        transfer_source_indices = transfer_source_indices.to(
+            device=device_pool.device, dtype=torch.int32, non_blocking=True
+        )
+        transfer_staging_indices = transfer_staging_indices.to(
+            device=device_pool.device, dtype=torch.int32, non_blocking=True
+        )
         if not self._prefetch_ready_events:
             self._prefetch_ready_events = tuple(
                 tuple(torch.cuda.Event() for _ in range(layer_count))
@@ -725,15 +1044,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("SGLang published an invalid HiCache producer slot")
         ready_events = self._prefetch_ready_events[pending.consumer_index]
         if layer_count > len(ready_events):
-            raise RuntimeError("SGLang HiCache layer count changed after initialization")
-
-        device_pool = controller.mem_pool_device
+            raise RuntimeError(
+                "SGLang HiCache layer count changed after initialization"
+            )
         start_layer = int(getattr(device_pool, "start_layer", 0))
-        # Slots identify stable layer objects. Stream ordering and the recorded
-        # ready event version each batch's contents, so plans can remain cached
-        # across engine request-generation changes.
-        version = 1
         layer_geometry: list[tuple[int, int]] = []
+        transfer_objects: list[IndexedHostObject] = []
+        paired_copy = True
         for local_layer in range(layer_count):
             layer_id = start_layer + local_layer
             key_cache = device_pool._get_key_buffer(layer_id)
@@ -747,57 +1064,166 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 raise RuntimeError("HiCache host and device KV dtypes disagree")
             key_element_bytes = key_cache[0].numel() * key_cache.element_size()
             value_element_bytes = value_cache[0].numel() * value_cache.element_size()
+            paired_copy &= (
+                key_element_bytes == value_element_bytes
+                and key_element_bytes in {128, 256, 512, 1024, 2048}
+            )
             key_bytes = transfer_count * key_element_bytes
             value_bytes = transfer_count * value_element_bytes
             if max(key_bytes, value_bytes) > _MAX_ABI_BYTES:
                 raise RuntimeError("HiCache layer transfer exceeds the NTA ABI limit")
             layer_geometry.append((key_bytes, value_bytes))
+            first_slot = transfer_first_slot + 2 * local_layer
+            object_id_base = (
+                _OBJECT_ID_BASE
+                + (1 << 44)
+                + pending.consumer_index * 2 * layer_count
+                + 2 * local_layer
+            )
+            transfer_objects.extend(
+                (
+                    IndexedHostObject(
+                        object_id_base,
+                        _LOOKAHEAD_VERSION,
+                        host_key.data_ptr(),
+                        key_cache.data_ptr(),
+                        transfer_source_indices.data_ptr(),
+                        transfer_staging_indices.data_ptr(),
+                        transfer_count,
+                        key_element_bytes,
+                        host_key.stride(0) * host_key.element_size(),
+                        key_cache.stride(0) * key_cache.element_size(),
+                        int(host_key.shape[0]),
+                        int(key_cache.shape[0]),
+                    ),
+                    IndexedHostObject(
+                        object_id_base + 1,
+                        _LOOKAHEAD_VERSION,
+                        host_value.data_ptr(),
+                        value_cache.data_ptr(),
+                        transfer_source_indices.data_ptr(),
+                        transfer_staging_indices.data_ptr(),
+                        transfer_count,
+                        value_element_bytes,
+                        host_value.stride(0) * host_value.element_size(),
+                        value_cache.stride(0) * value_cache.element_size(),
+                        int(host_value.shape[0]),
+                        int(value_cache.shape[0]),
+                    ),
+                )
+            )
 
         prefetched_layers: dict[int, _PrefetchedLayer] = {}
+        profile_start = (
+            torch.cuda.Event(enable_timing=True) if self._profile_transfer else None
+        )
+        profile_finish = (
+            torch.cuda.Event(enable_timing=True) if self._profile_transfer else None
+        )
         try:
+            producer_stream = torch.cuda.current_stream()
+            self._runtime.register_indexed_host_objects(
+                transfer_first_slot, transfer_objects, stream=producer_stream
+            )
+            pending.producer_event.start_event.record(producer_stream)
+            phase_program = self._phase_program(self._nta_demand_decode_wrappers[0])
             with torch.cuda.stream(self._prefetch_stream):
                 pending.producer_event.start_event.wait(self._prefetch_stream)
-                for local_layer, (key_bytes, value_bytes) in enumerate(
-                    layer_geometry
-                ):
-                    first_slot = 2 * local_layer
-                    controller.mem_pool_host.load_to_device_per_layer(
-                        device_pool,
-                        transfer_source_indices,
-                        transfer_staging_indices,
-                        local_layer,
-                        controller.io_backend,
+                if profile_start is not None:
+                    profile_start.record(self._prefetch_stream)
+                local_layer = first_local_layer
+                while local_layer < layer_count:
+                    wave_end = min(
+                        layer_count, local_layer + self._frontier_layers_per_wave
                     )
-                    ready_event = ready_events[local_layer]
-                    ready_event.record(self._prefetch_stream)
-                    prefetched_layers[local_layer] = _PrefetchedLayer(
-                        first_slot,
-                        _OBJECT_ID_BASE | (local_layer << 32),
-                        first_slot + 1,
-                        (_OBJECT_ID_BASE | (local_layer << 32)) | 1,
-                        version,
-                        key_bytes,
-                        value_bytes,
-                        ready_event,
-                    )
+                    first_slot = transfer_first_slot + 2 * local_layer
+                    if paired_copy:
+                        phase_program.preload_host_pairs(
+                            self._runtime,
+                            first_slot,
+                            wave_end - local_layer,
+                            self._prefetch_stream,
+                        )
+                    else:
+                        phase_program.preload_host(
+                            self._runtime,
+                            first_slot,
+                            2 * (wave_end - local_layer),
+                            self._prefetch_stream,
+                        )
+                    if profile_finish is not None and wave_end == layer_count:
+                        profile_finish.record(self._prefetch_stream)
+                    for ready_layer in range(local_layer, wave_end):
+                        key_bytes, value_bytes = layer_geometry[ready_layer]
+                        ready_event = ready_events[ready_layer]
+                        ready_event.record(self._prefetch_stream)
+                        prefetched_layers[ready_layer] = _PrefetchedLayer(
+                            0,
+                            _LOOKAHEAD_ALIAS_ID_BASE,
+                            1,
+                            _LOOKAHEAD_ALIAS_ID_BASE + 1,
+                            _LOOKAHEAD_VERSION,
+                            key_bytes,
+                            value_bytes,
+                            ready_event,
+                            transfer_first_slot + 2 * ready_layer,
+                        )
+                    self._stats["lookahead_copy_waves"] = self._stats.get(
+                        "lookahead_copy_waves", 0
+                    ) + 1
+                    local_layer = wave_end
         except Exception:
-            # Stock fallback uses another stream. Drain any earlier layer
-            # writes before it reuses the same destination rows.
             self._prefetch_stream.synchronize()
+            self._stats["hicache_fallback_batches"] += 1
             raise
         pending.prefetched_layers = prefetched_layers
         pending.prefetch_tensors = (
             transfer_source_indices,
             transfer_staging_indices,
         )
-        self._stats["prefetched_layers"] += layer_count
+        frontier_geometry = layer_geometry[first_local_layer:]
+        if profile_start is not None and profile_finish is not None:
+            transfer_bytes = sum(
+                key_bytes + value_bytes
+                for key_bytes, value_bytes in frontier_geometry
+            )
+            self._transfer_profiles.append(
+                (profile_start, profile_finish, transfer_bytes, "pipeline")
+            )
+        self._stats["prefetched_layers"] += acquired_layer_count
         self._stats["prefetched_host_bytes"] += sum(
-            key_bytes + value_bytes for key_bytes, value_bytes in layer_geometry
+            key_bytes + value_bytes for key_bytes, value_bytes in frontier_geometry
         )
+        self._stats["lookahead_acquisition_layers"] += acquired_layer_count
+        self._stats["lookahead_acquisition_objects"] += 2 * acquired_layer_count
+        if paired_copy:
+            self._stats["paired_lookahead_layers"] = (
+                self._stats.get("paired_lookahead_layers", 0)
+                + acquired_layer_count
+            )
         if self._profile_cpu:
-            self._stats["pipeline_cpu_ns"] = self._stats.get(
-                "pipeline_cpu_ns", 0
-            ) + (time.perf_counter_ns() - pipeline_started)
+            self._stats["pipeline_cpu_ns"] = self._stats.get("pipeline_cpu_ns", 0) + (
+                time.perf_counter_ns() - pipeline_started
+            )
+
+    def _prepare_cross_layer_frontier(self, pending: PendingHostLoad) -> None:
+        self._prepare_host_pipeline(pending, first_local_layer=1)
+        self._stats["cross_layer_frontier_batches"] = (
+            self._stats.get("cross_layer_frontier_batches", 0) + 1
+        )
+        self._stats["cross_layer_frontier_layers"] = self._stats.get(
+            "cross_layer_frontier_layers", 0
+        ) + len(pending.prefetched_layers)
+
+    def _publish_cross_layer_frontier(self, pending: PendingHostLoad) -> None:
+        transfer_bytes = _frontier_transfer_bytes(pending)
+        self._prepare_cross_layer_frontier(pending)
+        self._stats["frontier_proactive_batches"] = self._stats.get(
+            "frontier_proactive_batches", 0
+        ) + 1
+        self._stats["frontier_published_bytes"] = self._stats.get(
+            "frontier_published_bytes", 0
+        ) + transfer_bytes
 
     def _wrapper_layout(
         self, wrapper: Any
@@ -900,7 +1326,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             for wrapper_id, schedule in schedules.items()
         }
         if len(policies) != 1:
-            raise RuntimeError("FlashInfer wrappers selected inconsistent host policies")
+            raise RuntimeError(
+                "FlashInfer wrappers selected inconsistent host policies"
+            )
         return policies.pop()
 
     def _execution_policy(
@@ -922,6 +1350,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             transfer_bytes=transfer_bytes,
             runnable_tiles=schedule.work_count,
             model=self._host_cost_model,
+            force_rounds=(
+                self._host_cost_model.max_rounds if self._force_incremental else None
+            ),
+            initial_runnable_tiles=sum(not pair[0] for pair in pairs),
         )
 
     def _run_bulk_host_layer(
@@ -948,6 +1380,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if prefetched is None:
             raise RuntimeError(f"bulk host policy omitted layer {layer.layer_id}")
         stream.wait_event(prefetched.ready_event)
+        self._upload_plan(wrapper, int(layer.layer_id), kv_cache)
         self._run_preacquired_attention(
             wrapper, q, kv_cache, output, layer, run_options
         )
@@ -965,13 +1398,66 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         batch = self._active_batch
         if batch is None:
             raise RuntimeError("preacquired attention has no active batch")
-        if id(wrapper) in self._wrapper_modules:
+        if id(wrapper) not in self._wrapper_modules:
             raise RuntimeError(
-                "preacquired attention was incorrectly planned with an "
-                "instrumented FlashInfer wrapper"
+                "NTA direct attention requires a compiler-transformed "
+                "FlashInfer wrapper"
             )
-        wrapper.run(q, kv_cache, out=output, **run_options)
-        self._stats["stock_bulk_launches"] += 1
+        # Loading the contract is a one-time dictionary hit after the first
+        # launch. It prevents a fast direct module from bypassing source/form
+        # pairing with the incremental module used by the same backend.
+        self._phase_program(wrapper)
+        runtime_tensor = self._runtime.device_view_tensor
+        module_name = self._wrapper_modules[id(wrapper)]
+        pending = batch.pending_host_load
+        allocation = None
+        schedule = None
+        if pending is not None:
+            schedule = batch.schedules.get(id(wrapper))
+            allocation = self._plans.get((id(wrapper), -1))
+            if (
+                schedule is None
+                or allocation is None
+                or allocation.plan.work_item_count != schedule.work_count
+            ):
+                raise RuntimeError(
+                    "preacquired external attention has no validated CTA work plan"
+                )
+        if "request_bound" in module_name:
+            request_slots = tuple(binding.request_slot for binding in batch.bindings)
+            if not request_slots or request_slots != tuple(
+                range(request_slots[0], request_slots[0] + len(request_slots))
+            ):
+                raise RuntimeError(
+                    "NTA direct attention requires contiguous request slots"
+                )
+            wrapper.run(
+                q,
+                kv_cache,
+                runtime_tensor,
+                layer.scaling,
+                request_slots[0],
+                out=output,
+                **run_options,
+            )
+        else:
+            if allocation is None or schedule is None:
+                raise RuntimeError(
+                    "incremental FlashInfer wrapper requires a validated work plan"
+                )
+            wrapper.run(
+                q,
+                kv_cache,
+                runtime_tensor,
+                allocation.plan.work_items_tensor,
+                allocation.plan.dependencies_tensor,
+                layer.scaling,
+                schedule.work_count,
+                PREACQUIRED | BIND_CURRENT_GENERATION,
+                out=output,
+                **run_options,
+            )
+        self._stats["transformed_direct_launches"] += 1
 
     def _ensure_plan(
         self, wrapper: Any, layer_id: int, schedule: Schedule
@@ -988,6 +1474,34 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._plans[key] = _PlanAllocation(plan, capacity)
         return plan
 
+    def _record_demand_plan_stats(
+        self,
+        batch: _ActiveBatch,
+        schedule: Schedule,
+        object_count: int,
+        transfer_bytes: int,
+        host_execution: HostExecutionPlan,
+    ) -> None:
+        self._stats["demand_host_layers"] += 1
+        self._stats["cta_work_items"] += schedule.work_count
+        self._stats["indexed_host_objects"] += object_count
+        group_counter = (
+            "request_acquisition_groups"
+            if batch.acquisition_grouping == "request"
+            else "tile_acquisition_groups"
+        )
+        self._stats[group_counter] += object_count // 2
+        self._stats["indexed_host_bytes"] += transfer_bytes
+        self._stats["host_progress_rounds"] += host_execution.rounds
+        self._stats["predicted_atomic_ns"] += host_execution.predicted_atomic_ns
+        self._stats["predicted_incremental_ns"] += (
+            host_execution.predicted_incremental_ns
+        )
+        if host_execution.rounds > 1 or host_execution.overlap_initial:
+            self._stats["incremental_host_layers"] += 1
+        if host_execution.overlap_initial:
+            self._stats["request_overlap_layers"] += 1
+
     def _upload_plan(
         self,
         wrapper: Any,
@@ -998,6 +1512,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         Schedule,
         int,
         torch.cuda.Event | None,
+        int,
         HostExecutionPlan,
     ]:
         profile_started = time.perf_counter_ns() if self._profile_cpu else 0
@@ -1033,20 +1548,24 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             schedule.request_indices,
             schedule.kv_tile_indices,
             page_pairs,
-            tuple(binding.request_slot for binding in batch.bindings),
-            key_cache.data_ptr(),
-            value_cache.data_ptr(),
+            tuple(
+                (binding.request_slot, binding.generation) for binding in batch.bindings
+            ),
             key_bytes,
             value_bytes,
             None
             if prefetched is None
             else (prefetched.key_bytes, prefetched.value_bytes),
         )
-        plan = self._ensure_plan(wrapper, layer_id, schedule)
-        allocation = self._plans[(id(wrapper), layer_id)]
-        if allocation.signature == signature:
-            if allocation.host_execution is None:
-                raise RuntimeError("cached demand plan has no host execution policy")
+        # Work/ticket topology is layer invariant. Layer K/V addresses are
+        # republished through the object directory on the consumer stream.
+        plan = self._ensure_plan(wrapper, -1, schedule)
+        allocation = self._plans[(id(wrapper), -1)]
+        rebuild_plan = allocation.signature != signature
+        if prefetched is not None and not rebuild_plan:
+            if allocation.host_execution is None or allocation.object_count != 2:
+                raise RuntimeError("cached HiCache plan is incomplete")
+            self._stats["cta_work_items"] += schedule.work_count
             if self._profile_cpu:
                 self._stats["plan_cpu_ns"] = self._stats.get("plan_cpu_ns", 0) + (
                     time.perf_counter_ns() - profile_started
@@ -1055,7 +1574,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 plan,
                 schedule,
                 allocation.object_count,
-                None if prefetched is None else prefetched.ready_event,
+                prefetched.ready_event,
+                0,
                 allocation.host_execution,
             )
 
@@ -1068,9 +1588,100 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if key_element_bytes <= 0 or value_element_bytes <= 0:
             raise RuntimeError("HiCache exposed an empty KV row")
 
-        allocation.object_version = (allocation.object_version + 1) & 0xFFFFFFFF
-        allocation.object_version = allocation.object_version or 1
-        version = allocation.object_version
+        indexed_geometry = (
+            key_element_bytes,
+            value_element_bytes,
+            host_key.stride(0) * host_key.element_size(),
+            host_value.stride(0) * host_value.element_size(),
+            key_cache.stride(0) * key_cache.element_size(),
+            value_cache.stride(0) * value_cache.element_size(),
+            int(host_key.shape[0]),
+            int(host_value.shape[0]),
+            int(key_cache.shape[0]),
+            int(value_cache.shape[0]),
+        )
+        if (
+            not rebuild_plan
+            and allocation.indexed_geometry is not None
+            and allocation.indexed_geometry != indexed_geometry
+        ):
+            rebuild_plan = True
+
+        if not rebuild_plan and prefetched is None:
+            host_execution = allocation.host_execution
+            object_count = allocation.object_count
+            if (
+                host_execution is None
+                or object_count == 0
+                or object_count % 2 != 0
+                or allocation.transfer_bytes == 0
+                or allocation.indexed_geometry != indexed_geometry
+            ):
+                raise RuntimeError("cached demand plan is incomplete")
+            stream = torch.cuda.current_stream()
+            lookahead = batch.fragment_lookahead.pop(layer_id, None)
+            preloaded_event = None
+            preloaded_object_count = 0
+            if lookahead is not None:
+                expected = (
+                    id(wrapper),
+                    object_count,
+                    host_key.data_ptr(),
+                    key_cache.data_ptr(),
+                    host_value.data_ptr(),
+                    value_cache.data_ptr(),
+                )
+                actual = (
+                    lookahead.wrapper_id,
+                    lookahead.object_count,
+                    lookahead.key_source,
+                    lookahead.key_staging,
+                    lookahead.value_source,
+                    lookahead.value_staging,
+                )
+                if actual != expected:
+                    raise RuntimeError(
+                        "fragment lookahead no longer matches the next attention layer"
+                    )
+                preloaded_event = lookahead.ready_event
+                preloaded_object_count = lookahead.preloaded_object_count
+            else:
+                self._phase_program(wrapper).rebind_indexed_host_pairs(
+                    self._runtime,
+                    0,
+                    object_count // 2,
+                    host_key.data_ptr(),
+                    key_cache.data_ptr(),
+                    host_value.data_ptr(),
+                    value_cache.data_ptr(),
+                    stream,
+                )
+            self._record_demand_plan_stats(
+                batch,
+                schedule,
+                object_count,
+                allocation.transfer_bytes,
+                host_execution,
+            )
+            if self._profile_cpu:
+                self._stats["plan_cpu_ns"] = self._stats.get("plan_cpu_ns", 0) + (
+                    time.perf_counter_ns() - profile_started
+                )
+            return (
+                plan,
+                schedule,
+                object_count,
+                preloaded_event,
+                preloaded_object_count,
+                host_execution,
+            )
+
+        if rebuild_plan and prefetched is None:
+            allocation.object_version = (allocation.object_version + 1) & 0xFFFFFFFF
+            allocation.object_version = allocation.object_version or 1
+        version = (
+            prefetched.version if prefetched is not None else allocation.object_version
+        )
         indexed_objects: list[IndexedHostObject] = []
         index_tensors: list[torch.Tensor] = []
         pair_objects: dict[_PagePair, tuple[int, int, int, int]] = {}
@@ -1101,7 +1712,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             source_indices, staging_indices = index_map
             index_tensors.extend((source_indices, staging_indices))
             key_slot = len(indexed_objects)
-            key_object_id = _OBJECT_ID_BASE | (local_layer << 32) | key_slot
+            key_object_id = _OBJECT_ID_BASE | key_slot
             indexed_objects.append(
                 IndexedHostObject(
                     key_object_id,
@@ -1119,7 +1730,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 )
             )
             value_slot = len(indexed_objects)
-            value_object_id = _OBJECT_ID_BASE | (local_layer << 32) | value_slot
+            value_object_id = _OBJECT_ID_BASE | value_slot
             indexed_objects.append(
                 IndexedHostObject(
                     value_object_id,
@@ -1144,6 +1755,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         dependencies: list[AcquireRequirement] = []
         contributor_counts = Counter(schedule.request_indices)
         contributor_indices = {request_index: 0 for request_index in contributor_counts}
+        object_fanout: Counter[int] = Counter()
+        unresolved_dependencies: list[int] = []
+        direct_work_count = 0
+        external_object_slots: list[tuple[int, ...]] = []
         for work_ticket, (request_index, kv_tile, pair) in enumerate(
             zip(schedule.request_indices, schedule.kv_tile_indices, page_pairs)
         ):
@@ -1185,32 +1800,38 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         ),
                     )
                 )
+                object_fanout[key_slot] += 1
+                object_fanout[value_slot] += 1
+                unresolved_dependencies.append(2)
+                external_object_slots.append((key_slot, value_slot))
                 direct_dependencies = 0
             else:
                 dependencies.extend(
                     (
                         AcquireRequirement(
-                            key_cache.data_ptr(),
+                            self._runtime.device_view,
                             0,
-                            _OBJECT_ID_BASE | (layer_id << 1),
+                            _OBJECT_ID_BASE | 0xFFFFFFF0,
                             0,
                             0,
                             1,
-                            key_bytes,
+                            1,
                             0,
                         ),
                         AcquireRequirement(
-                            value_cache.data_ptr(),
+                            self._runtime.device_view,
                             0,
-                            _OBJECT_ID_BASE | (layer_id << 1) | 1,
+                            _OBJECT_ID_BASE | 0xFFFFFFF1,
                             0,
                             1,
                             1,
-                            value_bytes,
+                            1,
                             0,
                         ),
                     )
                 )
+                direct_work_count += 1
+                external_object_slots.append(())
                 direct_dependencies = 2
             work_items.append(
                 WorkItem(
@@ -1256,6 +1877,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 f"HiCache layer needs {object_count} objects; configured capacity is "
                 f"{self._object_capacity}"
             )
+        if prefetched is None and pending.prefetched_layers:
+            pipeline_first_slot = min(
+                min(layer.key_slot, layer.value_slot)
+                for layer in pending.prefetched_layers.values()
+            )
+            if object_count > pipeline_first_slot:
+                raise RuntimeError(
+                    "demand and proactive HiCache object ranges overlap"
+                )
         transfer_bytes = (
             prefetched.key_bytes + prefetched.value_bytes
             if prefetched is not None
@@ -1268,16 +1898,28 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             object_count=object_count,
             transfer_bytes=transfer_bytes,
             runnable_tiles=schedule.work_count,
+            initial_runnable_tiles=(direct_work_count if self._request_overlap else 0),
             model=self._host_cost_model,
+            force_rounds=(
+                self._host_cost_model.max_rounds if self._force_incremental else None
+            ),
         )
         stream = torch.cuda.current_stream()
         if prefetched is None:
             self._runtime.register_indexed_host_objects(
                 0, indexed_objects, stream=stream
             )
-            self._stats["demand_host_layers"] += 1
-        incremental = host_execution.rounds > 1 or self._force_incremental
-        if incremental:
+            self._phase_program(wrapper).validate_indexed_host_range(
+                self._runtime, 0, object_count, stream
+            )
+        incremental = (
+            host_execution.rounds > 1
+            or host_execution.overlap_initial
+            or self._force_incremental
+            or (self._cross_layer_frontier and local_layer == 0)
+        )
+        needs_plan = prefetched is not None or incremental
+        if needs_plan and rebuild_plan:
             upload_started = time.perf_counter_ns() if self._profile_cpu else 0
             plan.upload(work_items, dependencies, ranges, stream)
             if self._profile_cpu:
@@ -1285,26 +1927,30 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     "native_plan_upload_cpu_ns", 0
                 ) + (time.perf_counter_ns() - upload_started)
             self._stats["plan_uploads"] += 1
+        if needs_plan and prefetched is not None:
             self._stats["cta_work_items"] += schedule.work_count
         allocation.signature = signature
         allocation.object_count = object_count
         allocation.index_tensors = tuple(index_tensors)
         allocation.host_execution = host_execution
+        allocation.transfer_bytes = transfer_bytes
+        allocation.indexed_geometry = indexed_geometry
+        allocation.max_object_fanout = max(object_fanout.values(), default=1)
+        allocation.min_unresolved_dependencies = min(unresolved_dependencies, default=1)
+        allocation.direct_work_count = direct_work_count
+        allocation.external_object_slots = tuple(external_object_slots)
         if prefetched is None:
-            self._stats["indexed_host_objects"] += object_count
-            self._stats["indexed_host_bytes"] += sum(
+            transfer_bytes = sum(
                 object_.index_count * object_.element_bytes
                 for object_ in indexed_objects
             )
-            self._stats["host_progress_rounds"] += host_execution.rounds
-            self._stats["predicted_atomic_ns"] += (
-                host_execution.predicted_atomic_ns
+            self._record_demand_plan_stats(
+                batch,
+                schedule,
+                object_count,
+                transfer_bytes,
+                host_execution,
             )
-            self._stats["predicted_incremental_ns"] += (
-                host_execution.predicted_incremental_ns
-            )
-            if host_execution.rounds > 1:
-                self._stats["incremental_host_layers"] += 1
         if self._profile_cpu:
             self._stats["plan_cpu_ns"] = self._stats.get("plan_cpu_ns", 0) + (
                 time.perf_counter_ns() - profile_started
@@ -1314,6 +1960,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             schedule,
             object_count,
             None if prefetched is None else prefetched.ready_event,
+            0,
             host_execution,
         )
 
@@ -1345,6 +1992,111 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             pairs.append((host_pages, device_pages))
         return tuple(pairs)
 
+    def _enqueue_fragment_lookahead(
+        self,
+        wrapper: Any,
+        layer_id: int,
+        object_count: int,
+        host_execution: HostExecutionPlan,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Stage one next-layer contributor wave during post-attention compute."""
+        if (
+            not self._fragment_lookahead
+            or self.num_wrappers != 1
+            or host_execution.rounds <= 1
+        ):
+            return
+        batch = self._active_batch
+        if batch is None or batch.pending_host_load is None:
+            return
+        pending = batch.pending_host_load
+        device_pool = pending.controller.mem_pool_device
+        start_layer = int(getattr(device_pool, "start_layer", 0))
+        next_layer_id = layer_id + 1
+        next_local_layer = next_layer_id - start_layer
+        if next_local_layer < 0 or next_local_layer >= int(
+            pending.controller.layer_num
+        ):
+            return
+        if next_layer_id in batch.fragment_lookahead:
+            raise RuntimeError("duplicate fragment lookahead for one attention layer")
+
+        allocation = self._plans.get((id(wrapper), -1))
+        if (
+            allocation is None
+            or allocation.object_count != object_count
+            or allocation.indexed_geometry is None
+            or object_count % 2 != 0
+        ):
+            raise RuntimeError("fragment lookahead has no reusable indexed directory")
+        first_object_count = host_execution.block_counts[0]
+        if (
+            first_object_count <= 0
+            or first_object_count >= object_count
+            or first_object_count % 2 != 0
+        ):
+            raise RuntimeError("fragment lookahead requires one complete K/V wave")
+
+        host_key = pending.controller.mem_pool_host.k_data_refs[next_local_layer]
+        host_value = pending.controller.mem_pool_host.v_data_refs[next_local_layer]
+        key_cache = device_pool._get_key_buffer(next_layer_id)
+        value_cache = device_pool._get_value_buffer(next_layer_id)
+        geometry = (
+            key_cache[0].numel() * key_cache.element_size(),
+            value_cache[0].numel() * value_cache.element_size(),
+            host_key.stride(0) * host_key.element_size(),
+            host_value.stride(0) * host_value.element_size(),
+            key_cache.stride(0) * key_cache.element_size(),
+            value_cache.stride(0) * value_cache.element_size(),
+            int(host_key.shape[0]),
+            int(host_value.shape[0]),
+            int(key_cache.shape[0]),
+            int(value_cache.shape[0]),
+        )
+        if geometry != allocation.indexed_geometry:
+            raise RuntimeError(
+                "next-layer KV geometry changed during fragment lookahead"
+            )
+
+        attention_done = torch.cuda.Event()
+        ready_event = torch.cuda.Event()
+        attention_done.record(stream)
+        phase_program = self._phase_program(wrapper)
+        with torch.cuda.stream(self._prefetch_stream):
+            self._prefetch_stream.wait_event(attention_done)
+            phase_program.rebind_indexed_host_pairs(
+                self._runtime,
+                0,
+                object_count // 2,
+                host_key.data_ptr(),
+                key_cache.data_ptr(),
+                host_value.data_ptr(),
+                value_cache.data_ptr(),
+                self._prefetch_stream,
+            )
+            phase_program.preload_host_pairs(
+                self._runtime,
+                0,
+                first_object_count // 2,
+                self._prefetch_stream,
+            )
+            ready_event.record(self._prefetch_stream)
+        batch.fragment_lookahead[next_layer_id] = _FragmentLookahead(
+            next_layer_id,
+            id(wrapper),
+            object_count,
+            first_object_count,
+            host_key.data_ptr(),
+            key_cache.data_ptr(),
+            host_value.data_ptr(),
+            value_cache.data_ptr(),
+            ready_event,
+        )
+        self._stats["fragment_lookahead_layers"] += 1
+        self._stats["fragment_lookahead_objects"] += first_object_count
+        self._stats["fragment_remaining_rounds"] += host_execution.rounds - 1
+
     def _phase_program(self, wrapper: Any) -> JitPhaseProgram:
         module_name = self._wrapper_modules[id(wrapper)]
         program = self._phase_programs.get(module_name)
@@ -1363,8 +2115,91 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 f"found {len(modules)}"
             )
         program = JitPhaseProgram(modules[0])
+        family = (
+            OperatorFamily.FLASHINFER_DECODE
+            if "decode" in module_name
+            else OperatorFamily.FLASHINFER_PAGED_PREFILL
+        )
+        form = (
+            OperatorForm.DIRECT
+            if "request_bound" in module_name
+            else OperatorForm.INCREMENTAL
+        )
+        required = (
+            OperatorCapability.REQUEST_BINDING
+            | OperatorCapability.TYPED_FLASHINFER_FRONTEND
+        )
+        if form == OperatorForm.DIRECT:
+            required |= OperatorCapability.GRAPH_REPLAY
+        else:
+            required |= (
+                OperatorCapability.OBJECT_DEPENDENCIES
+                | OperatorCapability.FINITE_DEFERRAL
+                | OperatorCapability.PARTIAL_PUBLICATION
+                | OperatorCapability.COMPLETE_CONTRIBUTOR_MERGE
+                | OperatorCapability.RUNNABLE_COMPACTION
+            )
+        contract = program.operator_contract
+        contract.require(family=family, form=form, capabilities=required)
+        plan = program.operator_plan
+        plan.require(
+            family=family,
+            forms=(OperatorForm.DIRECT, OperatorForm.INCREMENTAL),
+            coordinate_map=OperatorCoordinateMap.FLASHINFER_REQUEST_CONTIGUOUS,
+            partial_state=OperatorPartialState.ONLINE_SOFTMAX_VALUE_LSE,
+            reduction=OperatorReduction.ORDERED_MERGE_STATE,
+            flags=(
+                OperatorPlanFlag.FIXED_CAPACITY
+                | OperatorPlanFlag.GRAPH_STABLE
+                | OperatorPlanFlag.EXTERNAL_WAVE_SOURCES
+                | OperatorPlanFlag.GENERATION_BOUND
+                | OperatorPlanFlag.EXACT_COMPLETE_MERGE
+            ),
+        )
+        peer_form = (
+            OperatorForm.INCREMENTAL
+            if form == OperatorForm.DIRECT
+            else OperatorForm.DIRECT
+        )
+        peer = self._operator_contracts.get((family, peer_form))
+        peer_program = self._operator_programs.get((family, peer_form))
+        if peer is not None:
+            if peer_program is None:
+                program.close()
+                raise RuntimeError("paired FlashInfer contract has no loaded program")
+            try:
+                if form == OperatorForm.DIRECT:
+                    require_operator_pair(program, peer_program)
+                else:
+                    require_operator_pair(peer_program, program)
+            except Exception:
+                program.close()
+                raise
+        self._operator_contracts[(family, form)] = contract
+        self._operator_plans[(family, form)] = plan
+        self._operator_programs[(family, form)] = program
+        self._stats["verified_operator_modules"] += 1
         self._phase_programs[module_name] = program
         return program
+
+    def _layer_sync_events(
+        self,
+        layer_id: int,
+        progress_passes: int,
+        stream: torch.cuda.Stream,
+    ) -> tuple[torch.cuda.Event, tuple[torch.cuda.Event, ...]]:
+        stream_address = int(stream.cuda_stream)
+        progress_address = int(self._progress_stream.cuda_stream)
+        key = (layer_id, stream_address, progress_address)
+        existing = self._demand_sync_events.get(key)
+        if existing is not None and len(existing[1]) == progress_passes:
+            return existing
+        events = (
+            torch.cuda.Event(),
+            tuple(torch.cuda.Event() for _ in range(progress_passes)),
+        )
+        self._demand_sync_events[key] = events
+        return events
 
     def _run_attention(
         self,
@@ -1390,6 +2225,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         output = torch.empty_like(q)
         verify_attention = os.environ.get("NTA_SGLANG_VERIFY_ATTENTION") == "1"
+        if (
+            verify_attention
+            and os.environ.get("NTA_SGLANG_VERIFY_ATTENTION_MIXED_ONLY") == "1"
+        ):
+            verify_attention = len(self._active_batch.bindings) > 1
         verify_execution = (
             verify_attention or os.environ.get("NTA_SGLANG_VERIFY_EXECUTION") == "1"
         )
@@ -1400,29 +2240,54 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         wrapper._logits_soft_cap = 0.0
         wrapper._sm_scale = layer.scaling
         batch = self._active_batch
+        if batch is None:
+            raise RuntimeError("NTA attention ran without request metadata")
         pending = batch.pending_host_load
-        if pending is None:
-            raise RuntimeError("eager external attention has no HiCache transfer")
-        local_layer = int(layer.layer_id) - int(
-            getattr(pending.controller.mem_pool_device, "start_layer", 0)
-        )
-        prefetched = batch.prefetched_layers.get(local_layer)
         stream = torch.cuda.current_stream()
         run_options = {
             "k_scale": layer.k_scale_float,
             "v_scale": layer.v_scale_float,
         }
+        final_layer = (
+            int(layer.layer_id) - self._model_start_layer + 1 == self._model_layer_count
+        )
         enqueue_started = time.perf_counter_ns() if self._profile_cpu else 0
+        gpu_profile = None
+        if self._profile_gpu:
+            gpu_profile = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            gpu_profile[0].record(stream)
+        attention_form = "direct"
         epoch = None
         progress_passes = 0
-        if prefetched is not None:
+        if pending is None:
+            self._run_preacquired_attention(
+                wrapper, q, kv_cache, output, layer, run_options
+            )
+            local_layer = -1
+        else:
+            local_layer = int(layer.layer_id) - int(
+                getattr(pending.controller.mem_pool_device, "start_layer", 0)
+            )
+            prefetched = batch.prefetched_layers.get(local_layer)
+        if pending is not None and prefetched is not None:
+            attention_form = "preloaded"
             stream.wait_event(prefetched.ready_event)
             self._run_preacquired_attention(
                 wrapper, q, kv_cache, output, layer, run_options
             )
-        else:
+            self._stats["lookahead_bound_launches"] += 1
+        elif pending is not None:
             selected_policy = self._layer_execution_policy(wrapper, kv_cache)
-            if selected_policy.rounds == 1 and not self._force_incremental:
+            if (
+                selected_policy.rounds == 1
+                and not selected_policy.overlap_initial
+                and not self._force_incremental
+                and not (self._cross_layer_frontier and local_layer == 0)
+            ):
+                attention_form = "bulk"
                 self._run_bulk_host_layer(
                     wrapper,
                     q,
@@ -1440,58 +2305,195 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     selected_policy.predicted_incremental_ns
                 )
             else:
-                plan, schedule, object_count, _, host_execution = self._upload_plan(
-                    wrapper, int(layer.layer_id), kv_cache
-                )
+                attention_form = "incremental"
+                (
+                    plan,
+                    schedule,
+                    object_count,
+                    preloaded_event,
+                    preloaded_object_count,
+                    host_execution,
+                ) = self._upload_plan(wrapper, int(layer.layer_id), kv_cache)
                 if host_execution != selected_policy:
                     raise RuntimeError("host execution policy changed during planning")
+                progress_blocks = host_execution.block_counts
+                if preloaded_event is not None:
+                    if preloaded_object_count != progress_blocks[0]:
+                        raise RuntimeError(
+                            "fragment lookahead does not match the execution plan"
+                        )
+                    progress_blocks = progress_blocks[1:]
+                if not progress_blocks:
+                    raise RuntimeError("incremental attention has no remaining wave")
+                allocation = self._plans[(id(wrapper), -1)]
+                if 0 < allocation.direct_work_count < schedule.work_count:
+                    self._stats["mixed_dependency_layers"] += 1
+                initial_ready_work_count = allocation.direct_work_count + sum(
+                    1
+                    for object_slots in allocation.external_object_slots
+                    if object_slots
+                    and all(
+                        object_slot < preloaded_object_count
+                        for object_slot in object_slots
+                    )
+                )
+                if initial_ready_work_count >= schedule.work_count:
+                    raise RuntimeError(
+                        "incremental attention has no work after its initial fragment"
+                    )
+                self._stats["compact_initial_launches"] += int(
+                    initial_ready_work_count != 0
+                )
+                self._stats["compact_initial_cta_bound"] += initial_ready_work_count
+                self._stats["canonical_initial_cta_bound"] += schedule.work_count
+                ready_work_counts = conservative_resume_counts(
+                    block_counts=tuple(progress_blocks),
+                    work_count=schedule.work_count - initial_ready_work_count,
+                    max_object_fanout=allocation.max_object_fanout,
+                    min_unresolved_dependencies=allocation.min_unresolved_dependencies,
+                )
+                self._stats["compact_resume_launches"] += len(ready_work_counts)
+                self._stats["compact_resume_cta_bound"] += sum(ready_work_counts)
+                self._stats["canonical_resume_cta_bound"] += (
+                    len(ready_work_counts) * schedule.work_count
+                )
                 epoch = FlashInferLayerEpoch(
                     self._runtime,
                     plan,
                     self._phase_program(wrapper),
                     object_count=object_count,
-                    max_progress_passes=host_execution.rounds,
+                    max_progress_passes=len(progress_blocks),
                     wait_for_plan=False,
                 )
-                progress_passes = host_execution.rounds
+                progress_passes = len(progress_blocks)
+                transfer_profile = None
+                if self._profile_transfer:
+                    transfer_profile = (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
+                    )
                 epoch.enqueue_host(
                     wrapper,
                     q,
                     kv_cache,
                     output,
-                    progress_blocks=host_execution.block_counts,
+                    progress_blocks=progress_blocks,
                     sm_scale=layer.scaling,
                     stream=stream,
-                    progress_stream=self._prefetch_stream,
+                    progress_stream=self._progress_stream,
+                    ready_event=preloaded_event,
+                    ready_work_counts=ready_work_counts,
+                    initial_ready_work_count=initial_ready_work_count,
+                    indexed_host_first_object=preloaded_object_count,
+                    indexed_host_prevalidated=True,
+                    indexed_host_copy_blocks_per_group=indexed_copy_blocks_per_group(
+                        transfer_bytes=allocation.transfer_bytes,
+                        object_count=object_count,
+                        target_bytes_per_block=self._indexed_copy_target_bytes,
+                        maximum_blocks=self._indexed_copy_max_blocks,
+                    ),
+                    sync_events=self._layer_sync_events(
+                        int(layer.layer_id), len(progress_blocks), stream
+                    ),
+                    progress_profile=transfer_profile,
                     run_options=run_options,
                 )
-                epoch.check(progress_passes, stream)
-                progress = self._runtime.request_progress_range(
-                    0, len(batch.bindings)
+                self._stats["parallel_indexed_progress_layers"] += 1
+                self._stats["prevalidated_indexed_progress_layers"] = (
+                    self._stats.get("prevalidated_indexed_progress_layers", 0) + 1
                 )
-                if any(
-                    item.failed_work != 0
-                    or item.cancelled_work != 0
-                    or item.completed_work != item.expected_work
-                    or item.pending_work != 0
-                    or item.runnable_work != 0
-                    or item.unavailable_bytes != 0
-                    or item.runnable_compute_ns != 0
-                    for item in progress
-                ):
-                    raise RuntimeError(
-                        "request-level progress disagrees with the completed epoch"
+                if transfer_profile is not None:
+                    self._transfer_profiles.append(
+                        (*transfer_profile, allocation.transfer_bytes, "demand")
                     )
-                self._stats["progress_snapshots"] += 1
-                self._stats["request_work_completed"] += sum(
-                    item.completed_work for item in progress
+                if (
+                    self._cross_layer_frontier
+                    and local_layer == 0
+                    and self._model_layer_count > 1
+                    and host_execution.rounds == 1
+                    and not pending.prefetched_layers
+                ):
+                        self._prepare_cross_layer_frontier(pending)
+                        batch.prefetched_layers.update(pending.prefetched_layers)
+                self._enqueue_fragment_lookahead(
+                    wrapper,
+                    int(layer.layer_id),
+                    object_count,
+                    host_execution,
+                    stream,
                 )
-                self._stats["request_work_failed"] += sum(
-                    item.failed_work + item.cancelled_work for item in progress
+                self._stats["ticketed_incremental_launches"] += 1
+                collect_progress = (
+                    verify_execution or self._opportunity_trace is not None
                 )
-                self._stats["request_compute_completed_ns"] += sum(
-                    item.completed_compute_ns for item in progress
-                )
+                verify_transfer = os.environ.get("NTA_SGLANG_VERIFY_TRANSFER") == "1"
+                if final_layer or collect_progress or verify_transfer:
+                    epoch.check(progress_passes, stream)
+                if final_layer and self._runtime.sticky_failed_count != 0:
+                    raise RuntimeError(
+                        "an earlier asynchronous acquisition epoch failed"
+                    )
+                if collect_progress:
+                    request_slots = tuple(
+                        binding.request_slot for binding in batch.bindings
+                    )
+                    first_request_slot = min(request_slots)
+                    progress_range = self._runtime.request_progress_range(
+                        first_request_slot,
+                        max(request_slots) - first_request_slot + 1,
+                    )
+                    progress = tuple(
+                        progress_range[request_slot - first_request_slot]
+                        for request_slot in request_slots
+                    )
+                    external_requests = {
+                        schedule.request_indices[index]
+                        for index, object_slots in enumerate(
+                            allocation.external_object_slots
+                        )
+                        if object_slots
+                    }
+                    if any(
+                        item.failed_work != 0
+                        or item.cancelled_work != 0
+                        or item.dropped_attributions != 0
+                        or item.completed_work != item.expected_work
+                        or item.pending_work != 0
+                        or item.runnable_work != 0
+                        or item.unavailable_bytes != 0
+                        or item.runnable_compute_ns != 0
+                        or item.pending_compute_ns != 0
+                        or item.completed_compute_ns != item.expected_compute_ns
+                        for item in progress
+                    ):
+                        raise RuntimeError(
+                            "request-level progress disagrees with the completed epoch"
+                        )
+                    if any(
+                        progress[request_index].expected_work == 0
+                        for request_index in external_requests
+                    ):
+                        raise RuntimeError(
+                            "external request produced no progress attribution"
+                        )
+                    self._stats["progress_snapshots"] += 1
+                    self._stats["request_work_completed"] += sum(
+                        item.completed_work for item in progress
+                    )
+                    self._stats["request_work_failed"] += sum(
+                        item.failed_work + item.cancelled_work for item in progress
+                    )
+                    self._stats["request_compute_completed_ns"] += sum(
+                        item.completed_compute_ns for item in progress
+                    )
+                    self._stats["request_compute_expected_ns"] = self._stats.get(
+                        "request_compute_expected_ns", 0
+                    ) + sum(item.expected_compute_ns for item in progress)
+                else:
+                    self._stats["request_work_completed"] += schedule.work_count
+                    self._stats["request_compute_completed_ns"] += (
+                        schedule.work_count * self._host_cost_model.tile_compute_ns
+                    )
                 if self._opportunity_trace is not None:
                     tile_compute_ns = self._host_cost_model.tile_compute_ns
                     compute_source = "calibrated"
@@ -1543,10 +2545,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         ),
                     )
         if self._profile_cpu:
+            elapsed_ns = time.perf_counter_ns() - enqueue_started
             self._stats["phase_enqueue_cpu_ns"] = self._stats.get(
                 "phase_enqueue_cpu_ns", 0
-            ) + (time.perf_counter_ns() - enqueue_started)
-        if os.environ.get("NTA_SGLANG_VERIFY_TRANSFER") == "1":
+            ) + elapsed_ns
+            self._stats[f"{attention_form}_enqueue_cpu_ns"] = self._stats.get(
+                f"{attention_form}_enqueue_cpu_ns", 0
+            ) + elapsed_ns
+            self._stats[f"{attention_form}_enqueue_layers"] = self._stats.get(
+                f"{attention_form}_enqueue_layers", 0
+            ) + 1
+        if gpu_profile is not None:
+            gpu_profile[1].record(stream)
+            self._operator_profiles.append((*gpu_profile, attention_form))
+        if pending is not None and os.environ.get("NTA_SGLANG_VERIFY_TRANSFER") == "1":
             self._verify_layer_transfer(int(layer.layer_id), kv_cache)
         if verify_execution:
             if epoch is None:
@@ -1565,10 +2577,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 causal=causal,
                 window_left=window_left,
             )
-        self._stats["external_launches"] += 1
-        self._hicache.complete_layer(pending, local_layer)
-        if local_layer + 1 == int(pending.controller.layer_num):
-            self._write_stats()
+        if pending is not None:
+            self._stats["external_launches"] += 1
+            self._hicache.complete_layer(pending, local_layer)
+        if final_layer:
+            self._publish_stats()
         return output.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _measure_flashinfer_tile_compute(
@@ -1600,11 +2613,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             q,
             kv_cache,
             runtime_tensor,
-            runtime_tensor,
-            runtime_tensor,
             layer.scaling,
-            len(batch.bindings),
-            14,
+            batch.bindings[0].request_slot,
             out=output,
             **run_options,
         )
@@ -1613,12 +2623,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         kernel_ns = max(1, math.ceil(start.elapsed_time(finish) * 1_000_000))
         active_slots = min(work_count, self._opportunity_parallel_slots)
         tile_ns = max(1, math.ceil(kernel_ns * active_slots / work_count))
-        self._stats["opportunity_calibration_launches"] = self._stats.get(
-            "opportunity_calibration_launches", 0
-        ) + 1
-        self._stats["opportunity_calibration_kernel_ns"] = self._stats.get(
-            "opportunity_calibration_kernel_ns", 0
-        ) + kernel_ns
+        self._stats["opportunity_calibration_launches"] = (
+            self._stats.get("opportunity_calibration_launches", 0) + 1
+        )
+        self._stats["opportunity_calibration_kernel_ns"] = (
+            self._stats.get("opportunity_calibration_kernel_ns", 0) + kernel_ns
+        )
         return tile_ns
 
     def _run_graph_attention(
@@ -1647,19 +2657,30 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         wrapper._window_left = window_left
         wrapper._logits_soft_cap = 0.0
         wrapper._sm_scale = layer.scaling
-        if id(wrapper) in self._wrapper_modules:
+        if id(wrapper) not in self._wrapper_modules:
             raise RuntimeError(
-                "preacquired CUDA graph was incorrectly captured with an "
-                "instrumented FlashInfer wrapper"
+                "NTA graph replay requires a compiler-transformed FlashInfer wrapper"
             )
+        self._phase_program(wrapper)
+        runtime_tensor = self._runtime.device_view_tensor
+        request_slots = tuple(binding.request_slot for binding in batch.bindings)
+        if not request_slots or request_slots != tuple(
+            range(request_slots[0], request_slots[0] + len(request_slots))
+        ):
+            raise RuntimeError("NTA graph attention requires contiguous request slots")
         wrapper.run(
             q,
             kv_cache,
+            runtime_tensor,
+            layer.scaling,
+            request_slots[0],
             out=output,
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
-        self._stats["stock_bulk_launches"] += 1
+        self._stats["transformed_direct_launches"] += 1
+        if local_layer + 1 == self._model_layer_count:
+            self._publish_stats()
         return output.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _verify_attention_output(
@@ -1789,8 +2810,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
         if self._active_batch is None:
-            return super().forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
+            raise RuntimeError(
+                "NTA decode ran without transformed request metadata; stock "
+                "dispatch is disabled"
             )
         wrapper = self.forward_metadata.decode_wrappers[self._get_wrapper_idx(layer)]
         cache_loc = (
@@ -1834,8 +2856,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
         if self._active_batch is None:
-            return super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
+            raise RuntimeError(
+                "NTA prefill ran without transformed request metadata; stock "
+                "dispatch is disabled"
             )
         if self.forward_metadata.use_ragged:
             raise RuntimeError("NTA requires paged FlashInfer prefill")
@@ -1883,20 +2906,124 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             window_left=window_left,
         )
 
-    def _write_stats(self) -> None:
-        configured = os.environ.get("NTA_ENGINE_STATS_FILE")
-        if not configured:
-            return
-        path = pathlib.Path(configured)
-        if path.suffix:
-            path = path.with_name(f"{path.stem}.{os.getpid()}{path.suffix}")
-        else:
-            path = path / f"nta-sglang-{os.getpid()}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
+    def _collect_transfer_profiles(self) -> None:
+        pending: list[tuple[torch.cuda.Event, torch.cuda.Event, int, str]] = []
+        for start, finish, transfer_bytes, kind in self._transfer_profiles:
+            if not finish.query():
+                pending.append((start, finish, transfer_bytes, kind))
+                continue
+            milliseconds = start.elapsed_time(finish)
+            self._stats["profiled_transfer_batches"] = (
+                self._stats.get("profiled_transfer_batches", 0) + 1
+            )
+            self._stats["profiled_transfer_bytes"] = (
+                self._stats.get("profiled_transfer_bytes", 0) + transfer_bytes
+            )
+            self._stats["profiled_transfer_gpu_ms"] = (
+                self._stats.get("profiled_transfer_gpu_ms", 0.0) + milliseconds
+            )
+            prefix = f"profiled_{kind}_transfer"
+            self._stats[f"{prefix}_batches"] = (
+                self._stats.get(f"{prefix}_batches", 0) + 1
+            )
+            self._stats[f"{prefix}_bytes"] = (
+                self._stats.get(f"{prefix}_bytes", 0) + transfer_bytes
+            )
+            self._stats[f"{prefix}_gpu_ms"] = (
+                self._stats.get(f"{prefix}_gpu_ms", 0.0) + milliseconds
+            )
+        self._transfer_profiles = pending
+        milliseconds = float(self._stats.get("profiled_transfer_gpu_ms", 0.0))
+        if milliseconds > 0:
+            self._stats["profiled_transfer_gib_per_second"] = (
+                float(self._stats["profiled_transfer_bytes"])
+                / (1 << 30)
+                / (milliseconds / 1_000.0)
+            )
+        for kind in ("pipeline", "demand"):
+            prefix = f"profiled_{kind}_transfer"
+            kind_milliseconds = float(self._stats.get(f"{prefix}_gpu_ms", 0.0))
+            if kind_milliseconds > 0:
+                self._stats[f"{prefix}_gib_per_second"] = (
+                    float(self._stats[f"{prefix}_bytes"])
+                    / (1 << 30)
+                    / (kind_milliseconds / 1_000.0)
+                )
+        pending_operators: list[
+            tuple[torch.cuda.Event, torch.cuda.Event, str]
+        ] = []
+        for start, finish, kind in self._operator_profiles:
+            if not finish.query():
+                pending_operators.append((start, finish, kind))
+                continue
+            milliseconds = start.elapsed_time(finish)
+            prefix = f"profiled_{kind}_operator"
+            self._stats[f"{prefix}_layers"] = (
+                self._stats.get(f"{prefix}_layers", 0) + 1
+            )
+            self._stats[f"{prefix}_gpu_ms"] = (
+                self._stats.get(f"{prefix}_gpu_ms", 0.0) + milliseconds
+            )
+        self._operator_profiles = pending_operators
+
+    def _stats_report(self) -> dict[str, Any]:
+        self._collect_transfer_profiles()
         report = dict(self._stats)
-        report["finished_unix_ns"] = time.time_ns()
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+        contracts = sorted(
+            self._operator_contracts.values(),
+            key=lambda contract: (int(contract.family), int(contract.form)),
         )
-        temporary.replace(path)
+        report["operator_contracts"] = [
+            {
+                "schema_version": contract.schema_version,
+                "runtime_abi_version": contract.runtime_abi_version,
+                "family": contract.family.name.lower(),
+                "form": contract.form.name.lower(),
+                "capabilities": int(contract.capabilities),
+                "source_fingerprint": contract.source_fingerprint,
+            }
+            for contract in contracts
+        ]
+        report["operator_plans"] = [
+            {
+                "schema_version": plan.schema_version,
+                "runtime_abi_version": plan.runtime_abi_version,
+                "family": plan.family.name.lower(),
+                "supported_forms": plan.supported_forms,
+                "coordinate_map": plan.coordinate_map.name.lower(),
+                "partial_state": plan.partial_state.name.lower(),
+                "reduction": plan.reduction.name.lower(),
+                "flags": int(plan.flags),
+                "source_fingerprint": plan.source_fingerprint,
+                "plan_fingerprint": plan.plan_fingerprint,
+            }
+            for plan in sorted(
+                self._operator_plans.values(),
+                key=lambda candidate: (int(candidate.family), candidate.plan_fingerprint),
+            )
+        ]
+        families = {contract.family for contract in contracts}
+        report["verified_operator_pairs"] = sum(
+            (family, OperatorForm.DIRECT) in self._operator_contracts
+            and (family, OperatorForm.INCREMENTAL) in self._operator_contracts
+            for family in families
+        )
+        report["verified_operator_plan_pairs"] = sum(
+            (family, OperatorForm.DIRECT) in self._operator_plans
+            and (family, OperatorForm.INCREMENTAL) in self._operator_plans
+            and self._operator_plans[(family, OperatorForm.DIRECT)]
+            == self._operator_plans[(family, OperatorForm.INCREMENTAL)]
+            for family in families
+        )
+        report.update(self._hicache.admission_stats())
+        report["finished_unix_ns"] = time.time_ns()
+        return report
+
+    def _publish_stats(self) -> None:
+        if self._stats_publisher is None:
+            return
+        self._stats_publisher.publish(self._stats_report())
+
+    def _write_stats(self) -> None:
+        if self._stats_publisher is not None:
+            self._stats_publisher.publish(self._stats_report(), wait=True)

@@ -138,8 +138,9 @@ extern "C" __global__ void nta_test_request_reduction_groups(
   observation[7] = runtime->failedCount;
 }
 
-extern "C" __global__ void nta_test_intent_priority_queue(
-    nta::abi::RuntimeView *runtime, std::uint32_t *observation) {
+extern "C" __global__ void
+nta_test_intent_priority_queue(nta::abi::RuntimeView *runtime,
+                               std::uint32_t *observation) {
   using namespace nta;
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
@@ -177,4 +178,112 @@ extern "C" __global__ void nta_test_intent_priority_queue(
   observation[3] = device::popIntent(runtime, abi::SourceKind::HostStaged);
   observation[4] = device::popIntent(runtime, abi::SourceKind::HostStaged);
   observation[5] = device::popIntent(runtime, abi::SourceKind::HostStaged);
+  observation[6] = device::urgencyBucket(0, 1'000'100, 1'000'000, 200);
+
+  // Prove the semantic loop is active, not telemetry-only. Two equal-priority
+  // requests share one deadline and transport. Compiler-attributed pending
+  // compute pushes the longer critical path into the highest urgency bucket.
+  for (std::uint32_t head = 0;
+       head < abi::BackendCount * abi::UrgencyBucketCount; ++head) {
+    runtime->intentQueueHeads[head] =
+        device::taggedIntentHead(2, abi::InvalidIndex);
+  }
+  runtime->backends[static_cast<std::uint32_t>(abi::SourceKind::HostStaged)] = {
+      0,
+      0,
+      1'000'000'000'000ULL,
+      0,
+      UINT64_MAX,
+      static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
+      1,
+      static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
+      0,
+      0,
+  };
+  runtime->requestProgress[0] = {
+      42, 3, 1, 1, 0, 0, 0, 0, 2, 4096, 0, 0, 600'000, 600'000, 0,
+  };
+  runtime->requestProgress[1] = {
+      43, 4, 1, 1, 0, 0, 0, 0, 2, 4096, 0, 0, 10'000, 10'000, 0,
+  };
+  const std::uint64_t sharedDeadline = device::globalTimerNs() + 500'000ULL;
+  for (std::uint32_t slotIndex = 0; slotIndex < 2; ++slotIndex) {
+    abi::IntentSlot &slot = runtime->intents[slotIndex];
+    slot.sequence = 10 + slotIndex;
+    slot.sourceKind = static_cast<std::uint32_t>(abi::SourceKind::HostStaged);
+    slot.epoch = 2;
+    slot.intent = {};
+    slot.intent.bytes = 4096;
+    slot.intent.requestSlot = slotIndex;
+    slot.intent.generation = 3 + slotIndex;
+    slot.intent.valid = 1;
+    slot.intent.deadlineClock = sharedDeadline;
+    runtime->intentQueueEntries[slotIndex] = {};
+    if (!device::queueIntent(runtime, slot, abi::SourceKind::HostStaged)) {
+      observation[7] = 2;
+      return;
+    }
+  }
+  observation[8] = device::popIntent(runtime, abi::SourceKind::HostStaged);
+  observation[9] = device::urgencyBucket(0, sharedDeadline,
+                                         sharedDeadline - 500'000ULL,
+                                         600'005ULL);
+  observation[10] = device::urgencyBucket(0, sharedDeadline,
+                                          sharedDeadline - 500'000ULL,
+                                          10'005ULL);
+}
+
+extern "C" __global__ void
+nta_test_request_progress_fail_closed(nta::abi::RuntimeView *runtime,
+                                      std::uint32_t *observation) {
+  using namespace nta;
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  runtime->epoch = 5;
+  runtime->failedCount = 0;
+  const std::uint32_t stickyBefore = runtime->stickyFailedCount;
+  runtime->reductionExpected[0] = 0;
+  runtime->reductionCompleted[0] = 0;
+  runtime->reductionFailed[0] = 0;
+  runtime->requestProgress[0] = {
+      42, 3, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0,
+  };
+  runtime->workTickets[0] = {
+      42,
+      0,
+      3,
+      static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+      1,
+      0,
+      0,
+      5,
+      4096,
+      2500,
+      0,
+      1,
+  };
+
+  device::recordPendingWork(runtime, runtime->workTickets[0]);
+  observation[0] = static_cast<std::uint32_t>(
+      runtime->requestProgress[0].droppedAttributions);
+  observation[1] = runtime->requestProgress[0].expectedWork;
+
+  runtime->workTickets[0].generation = 4;
+  device::recordPendingWork(runtime, runtime->workTickets[0]);
+  observation[2] = static_cast<std::uint32_t>(
+      runtime->requestProgress[0].droppedAttributions);
+
+  runtime->workTickets[0].generation = 3;
+  runtime->requestProgress[0].epoch = 5;
+  device::recordRunnableWork(runtime, runtime->workTickets[0]);
+  observation[3] = static_cast<std::uint32_t>(
+      runtime->requestProgress[0].droppedAttributions);
+  observation[4] = runtime->failedCount;
+  observation[5] = runtime->stickyFailedCount - stickyBefore;
+  observation[6] = runtime->requestProgress[0].pendingWork;
+  observation[7] = static_cast<std::uint32_t>(
+      runtime->requestProgress[0].unavailableBytes);
+  observation[8] = static_cast<std::uint32_t>(
+      runtime->requestProgress[0].pendingComputeNs);
 }

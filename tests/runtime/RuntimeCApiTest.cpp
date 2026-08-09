@@ -66,10 +66,16 @@ int main() {
 
     requireOk(nta_runtime_set_tenant_budget(runtime, 0, 4096, 1),
               "set tenant budget");
-    requireOk(nta_runtime_set_request(
-                  runtime, 0, 17, 3, 0, 4, 0,
-                  std::numeric_limits<std::uint64_t>::max()),
-              "set request");
+    requireOk(
+        nta_runtime_set_request(runtime, 0, 17, 3, 0, 4, 0,
+                                std::numeric_limits<std::uint64_t>::max()),
+        "set request");
+    const nta_request_spec requestUpdate{
+        29, 7000, std::numeric_limits<std::uint64_t>::max(), 1, 5, 0, 2,
+    };
+    requireOk(nta_runtime_publish_requests_async(runtime, &requestUpdate, 1, 0),
+              "publish request batch asynchronously");
+    requireOk(nta_stream_synchronize(0), "synchronize request publication");
 
     void *deviceObject = nullptr;
     requireCuda(cudaMalloc(&deviceObject, 4096), "cudaMalloc object");
@@ -78,22 +84,20 @@ int main() {
         reinterpret_cast<std::uintptr_t>(deviceObject);
     replica.placement = NTA_PLACEMENT_HBM;
     std::uint64_t directBase = 0;
-    requireOk(nta_runtime_register_object(runtime, 0, 101, 7, 4096, 0,
-                                          &replica, 1, &directBase),
+    requireOk(nta_runtime_register_object(runtime, 0, 101, 7, 4096, 0, &replica,
+                                          1, &directBase),
               "register C object");
     require(directBase == reinterpret_cast<std::uintptr_t>(deviceObject),
             "C object direct base mismatch");
 
     nta_device_work_plan *plan = nullptr;
-    requireOk(nta_device_work_plan_create(2, 2,
-                                          nta_runtime_device_ordinal(runtime),
-                                          &plan),
+    requireOk(nta_device_work_plan_create(
+                  2, 2, nta_runtime_device_ordinal(runtime), &plan),
               "create C work plan");
     nta_acquire_requirement dependency{
         directBase, 0, 101, 0, 0, 7, 4096, 0,
     };
-    nta_work_item work{0, 0, 3, 11, 0, 1, 1, 0,
-                       0, 0, 1, 2500, 0, 0, 0, 0};
+    nta_work_item work{0, 0, 3, 11, 0, 1, 1, 0, 0, 0, 1, 2500, 0, 0, 0, 0};
     nta_request_work_range request{0, 1, 0, 3};
     requireOk(nta_device_work_plan_upload(plan, &work, 1, &dependency, 1,
                                           &request, 1, 0),
@@ -126,27 +130,66 @@ int main() {
               "read C epoch status");
     require(epoch.total == 2 && epoch.fresh == 2 && epoch.pending == 0,
             "C epoch status did not summarize work-ticket state");
+    std::uint32_t stickyFailures = 1;
+    requireOk(nta_runtime_read_sticky_failed_count(runtime, &stickyFailures),
+              "read C sticky failure count");
+    require(stickyFailures == 0,
+            "new C runtime unexpectedly reported a sticky failure");
     nta_request_progress progress{};
     requireOk(nta_runtime_read_request_progress(runtime, 0, &progress),
               "read C request progress");
     require(progress.expected_work == 0 && progress.completed_work == 0 &&
                 progress.unavailable_bytes == 0 &&
                 progress.runnable_compute_ns == 0 &&
-                progress.completed_compute_ns == 0,
+                progress.completed_compute_ns == 0 &&
+                progress.dropped_attributions == 0 &&
+                progress.pending_compute_ns == 0 &&
+                progress.expected_compute_ns == 0,
             "new C runtime unexpectedly reported request work");
     nta_request_progress progressRange[2]{};
-    requireOk(nta_runtime_read_request_progress_range(runtime, 0, 2,
-                                                       progressRange),
-              "read C request-progress range");
+    requireOk(
+        nta_runtime_read_request_progress_range(runtime, 0, 2, progressRange),
+        "read C request-progress range");
     require(progressRange[0].request_id == 17 &&
-                progressRange[0].generation == 3,
+                progressRange[0].generation == 3 &&
+                progressRange[1].request_id == 29 &&
+                progressRange[1].generation == 5,
             "C request-progress range lost request identity");
+    require(nta_runtime_copy_request_progress_async(
+                runtime, 0, 2,
+                reinterpret_cast<std::uintptr_t>(progressRange), 0) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C request-progress snapshot accepted pageable memory");
+    nta_request_progress *progressSnapshot = nullptr;
+    requireCuda(cudaHostAlloc(reinterpret_cast<void **>(&progressSnapshot),
+                              sizeof(progressRange), cudaHostAllocPortable),
+                "allocate request-progress snapshot");
+    requireOk(nta_runtime_copy_request_progress_async(
+                  runtime, 0, 2,
+                  reinterpret_cast<std::uintptr_t>(progressSnapshot), 0),
+              "capture request progress asynchronously");
+    requireOk(nta_stream_synchronize(0),
+              "synchronize asynchronous request-progress snapshot");
+    require(progressSnapshot[0].request_id == 17 &&
+                progressSnapshot[0].generation == 3 &&
+                progressSnapshot[1].request_id == 29 &&
+                progressSnapshot[1].generation == 5,
+            "asynchronous request-progress snapshot lost request identity");
+    requireCuda(cudaFreeHost(progressSnapshot),
+                "free request-progress snapshot");
     std::uint64_t runnableNs[2]{1, 1};
     requireOk(nta_runtime_read_work_runnable_ns(runtime, 2, runnableNs),
               "read C work runnable timestamps");
     require(runnableNs[0] == 0 && runnableNs[1] == 0,
             "new C runtime unexpectedly reported runnable delay");
     requireOk(nta_stream_synchronize(0), "synchronize C default stream");
+    require(nta_copy_host_to_device_async(0, 0, 0, 0) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted an invalid host-to-device copy");
+    nta_operator_plan operatorPlan{};
+    require(nta_jit_phase_operator_plan(nullptr, &operatorPlan) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted a null JIT program for an operator plan");
 
     nta_nvme_transport_options nvme{};
     nvme.struct_size = sizeof(nvme);

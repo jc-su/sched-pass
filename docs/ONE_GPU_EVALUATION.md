@@ -6,9 +6,9 @@ incremental execution of an otherwise all-or-nothing GPU operator.
 
 ## Research Question
 
-Can a compiler turn a real batched attention kernel into an incrementally
-executable operator, then let the runtime jointly group arriving data, launch
-runnable request/tile work, and inform later batch admission without a
+Can a compiler expose request-owned data dependencies, executable contributors,
+and exact completion conditions in real FlashInfer kernels, then let one SLO
+runtime jointly prioritize external data and GPU computation without a
 persistent kernel or an all-resident regression?
 
 The intended result is not "CTA granularity is always faster than layer
@@ -18,6 +18,54 @@ granularity." The testable claim is:
 > heterogeneous data arrival, while request-aware grouping preserves dense
 > transfer efficiency and the compiler-generated direct form preserves the
 > resident path.
+
+The bounded operator-feasibility gate passes with canonical FlashInfer math:
+bounded CPU-DRAM streaming is `1.1714x` faster than atomic promotion at the
+64K-context/256-query point with `4x` lower staging HBM, and a separate
+heterogeneous context/query point improves by `1.1100x` with `4.83x` lower
+staging. Both confidence intervals exclude 1.0. Both runs also verify
+dynamic-source graph replay, request-slot generation reuse, and cancellation
+isolation. The measured producer order is fixed by the host, so this result
+proves useful exact partials and bounded HBM, not the completion-driven
+scheduler or an end-to-end serving gain. SGLang's paged decode operator does
+not yet consume the generated arrival-driven plan.
+
+The mapped-host GPU-initiated producer is also implemented and exact, but is a
+negative ablation (`0.479x` versus atomic copy-engine promotion at the headline
+shape). CPU-DRAM performance claims therefore use the copy engine. NVMe must be
+measured separately because its queue, latency, and P2P path are physically
+different.
+
+## Target Serving Scenario
+
+The primary scenario is heterogeneous batch-barrier amplification in
+long-context and agent serving. One admitted attention batch contains requests
+with different context lengths, prefix-cache histories, and cancellation
+lifetimes. Their KV pages are fragmented across HBM and external tiers; a
+single request can span resident HBM, CPU DRAM, and NVMe while another request
+is fully resident. Conventional launch boundaries either wait for the slowest
+request's complete layer or remove and reform work at request granularity.
+
+NTA instead preserves request identity at the kernel boundary and compiles one
+operator into direct and incremental forms. The direct form handles resident
+and already-ordered data with a generation guard and no tickets. The
+incremental form externalizes only unavailable request/tile work, so finite
+kernel launches can consume arrived data without retaining a polling CTA. The
+online policy selects between these NTA forms; it never declares a win by
+dispatching the NTA arm to an untouched kernel.
+
+The full evaluation must cover all of these dimensions together:
+
+- mixed resident and offloaded requests;
+- different context lengths and prefix-cache states;
+- fragmented KV placement within requests;
+- simultaneous CPU-DRAM and NVMe sources; and
+- admission churn, request cancellation, and slot reuse.
+
+The current real SGLang integration validates resident plus CPU-DRAM mixtures.
+The VFIO NVMe transport is validated separately at mechanism level. A single
+canonical FlashInfer run with simultaneous CPU-DRAM and NVMe pages remains an
+open claim gate and must not be inferred from those separate results.
 
 Production execution has no oracle. For end-to-end traces, replay every forced
 policy from the same initial state and report B6 against each one and the
@@ -64,10 +112,76 @@ Prism is not a direct baseline for NTA. Its useful methodology here is
 dedicated-baseline SLO calibration, bursty contention traces, load scaling,
 and an all-resident/no-op overhead test.
 
+### Sarathi-Serve And Llumnix
+
+Sarathi-Serve evaluates four model/deployment configurations, two workload
+families, maximum sustainable load under strict and relaxed tail-latency SLOs,
+and the isolated overhead and contribution of each scheduling mechanism.
+Llumnix uses 16 GPUs, ShareGPT and BurstGPT length distributions, generated
+long-tail mixes, Poisson and Gamma arrivals, and explicit burstiness sweeps; it
+reports mean and tail behavior, migration interference, priority, and cost.
+
+Their methodological requirement for NTA is a capacity curve under an SLO, not
+one latency point: sweep arrival rate through saturation, include burstiness and
+length heterogeneity, report p50/p95/p99 TTFT and TPOT plus goodput, and isolate
+incremental execution from grouping and admission in ablations.
+
+### InfiniGen And ECHO
+
+InfiniGen evaluates multiple model architectures and sizes, UVM and explicit
+offload environments, batch/sequence sensitivity, wall-clock performance, and
+accuracy/perplexity against selective-KV and quantization baselines. ECHO uses
+real sparse-attention serving on an eight-GPU system, compares vLLM and SGLang,
+and separates graph-friendly cache management, numerical prefetch, and fused
+kernel overlap.
+
+Their methodological requirement is that avoided-byte results include model
+quality, candidate fraction, context length, and an equal-accuracy or lossless
+comparison. Sparse selectivity cannot stand in for the dense fragmented-KV
+claim, and a custom kernel cannot stand in for canonical FlashInfer.
+
+### ServerlessLLM, Parrot, And Prism Production Replay
+
+ServerlessLLM combines storage/load microbenchmarks, component breakdowns, and
+end-to-end model-start scenarios across model sizes. Parrot starts from a
+measured semantic gap between application workflows and request-level serving,
+then evaluates complete multi-request applications rather than only its
+metadata abstraction. Prism validates production deployment with shadow replay
+of the same online workload.
+
+Their methodological requirement is a chain of evidence: first quantify the
+semantic gap, then show the mechanism in isolation, then replay the same
+requests through the complete serving system. NTA must archive identical
+request order, cache state, placement, and output hashes for every arm.
+
+### Combined Evaluation Rule
+
+No single related paper defines the matrix. The OSDI-level method used here is:
+
+1. Diagnose the phenomenon from real or faithfully replayed traces before
+   selecting a favorable mechanism point.
+2. Compare against structurally different alternatives: layer wait, coalesced
+   bulk, request skip/rebatch, compiler direct form, and forced incremental.
+3. Sweep offered load, burstiness, context length, HBM pressure, page
+   fragmentation, tier latency, and request mix.
+4. Report end-to-end SLO goodput and tail latency separately from bandwidth,
+   launch tax, SM occupancy, useful partial work, and physical bytes.
+5. Include no-op, dense all-miss, sensitivity, ablation, failure, and quality
+   cases, with randomized repeated trials and confidence intervals.
+6. Require mechanism-active accounting: every proposed-system attention launch
+   names its compiler form, every contributor has a request generation and
+   completion state, and zero stock fallback is asserted rather than inferred.
+
 Primary sources:
 
 - Strata: <https://www.usenix.org/conference/osdi26/presentation/xie-zhiqiang>
 - Prism: <https://www.usenix.org/conference/osdi26/presentation/yu-shan>
+- Sarathi-Serve: <https://www.usenix.org/conference/osdi24/presentation/agrawal>
+- Llumnix: <https://www.usenix.org/conference/osdi24/presentation/sun-biao>
+- InfiniGen: <https://www.usenix.org/conference/osdi24/presentation/lee>
+- ECHO: <https://www.usenix.org/conference/osdi26/presentation/liu-guangda>
+- ServerlessLLM: <https://www.usenix.org/conference/osdi24/presentation/fu>
+- Parrot: <https://www.usenix.org/conference/osdi24/presentation/lin-chaofan>
 
 ## Testbed
 
@@ -207,6 +321,14 @@ useful partial, first request, 50% of requests, and all requests complete. Also
 report blocked CTAs, runnable CTAs per finite round, empty runnable-work
 launches, and time spent in progress kernels.
 
+For each geometry, replay at least four arrival orders: homogeneous, one delayed
+request, interleaved tiers within every request, and an adversarial order that
+delays the lowest-index contributor. Deterministic output must be independent of
+arrival order. Compare three online scores from the same current state: CTA
+count only, bytes plus transport time, and ABI-v25 critical work (data service
+plus pending/runnable compute). This isolates whether compiler-attributed cost
+and the request bridge improve decisions beyond trivial ordering.
+
 Fine-grained incremental execution wins only when avoided transfer and earlier
 useful compute exceed its command, bookkeeping, and resumption cost. For a
 baseline transfer of `B_layer` bytes and an incremental transfer of `B_inc`
@@ -293,8 +415,9 @@ goodput.
    resident fraction, required fraction, and I/O/compute ratio.
 5. Time-to-first-partial/50%/complete CDF under heterogeneous data arrival.
 6. Dense all-miss bandwidth and all-resident overhead.
-7. Ablation of request semantics, engine progress feedback, elastic grouping,
-   CTA direct issue, and incremental execution.
+7. Ablation of request semantics, CTA-count versus critical-work scoring, engine
+   progress feedback, elastic grouping, CTA direct issue, and incremental
+   execution.
 8. Nsight timeline showing direct CTAs computing while blocked CTAs have exited
    and finite progress handles external data.
 
@@ -331,6 +454,9 @@ Runnable now:
 - resident, mapped-DRAM, staged-DRAM, and mixed placement;
 - global-load and TMA consumers;
 - real FlashInfer resident/deferred correctness and resident-hook latency;
+- real FlashInfer split-K decode with canonical request/tile coordinates,
+  request-local merge gates, one preloaded contributor wave, and one remaining
+  demand wave;
 - real FlashInfer GPU top-k page selection feeding a stable device index table,
   bounded pinned-host gather, compact paged decode, matched candidate
   overfetch, and a precomputed selected-copy oracle;
@@ -343,19 +469,80 @@ Runnable now:
 These establish mechanism feasibility. The custom sparse-attention and MoE
 programs are not primary performance evidence.
 
+Matched real SGLang/Qwen2.5-3B whole-prefix CPU-DRAM runs remain negative
+evidence. Earlier 4K and saturated 8K transformed-direct tests delivered
+`0.929x` and `0.904x` stock throughput and executed no ticketed partial work.
+The new fragmented tests do: every external layer uses real FlashInfer split-K,
+the first next-layer wave overlaps post-attention compute, and the remaining
+wave is acquired through tickets. With zero stock launch/fallback and identical
+output, the 8K test delivered `0.863x` and the 16K test delivered `0.927x`.
+The narrowing gap is consistent with transfer becoming more exposed, but one
+sample per point establishes neither a crossover nor a serving gain.
+
+The physically compact 16K rerun reduced resumed application CTA positions to
+`50.98%` of the canonical grids but initially delivered only `0.806x`; the
+cause was full suspended-ticket initialization for work that was already
+available. Lightweight exact-once publication removed that accidental work.
+The next matched run compacted the combined initial and resume grids to
+`50.01%`, matched stock output, used zero fallback/stock launches, and delivered
+`0.935x` throughput (`121.043 ms` versus `113.150 ms`). This is still a `6.98%`
+latency cost and therefore negative evidence. It rejects empty-CTA elimination
+as a sufficient optimization and motivates the coalesced request-level overlap
+form for dense batches.
+
+The coalesced load fixture now establishes cross-request execution but not a
+performance win. SGLang mixed-chunk batching plus NTA's acquisition admission
+hook formed one real FlashInfer schedule with 17 direct and 16 external work
+items at the 2K point. All 36 layers used ticketed incremental attention and the
+new bounded parallel indexed-progress path; the combined initial/resume CTA
+bound was 50.0% of two full grids. Output matched and stock/fallback counters
+were zero, but throughput was only `0.953x`, resident TPOT was `1.055x`, and
+external TTFT was `1.230x` stock. A four-resident 4K point reached only `0.921x`.
+These rows validate the batch-barrier experiment itself and reject the current
+eager per-layer control implementation as the paper result.
+
+The ABI-v23 v10 acquisition-frontier rerun corrected the causal metric. Since
+external arrivals are gated on the resident's first token, resident TTFT cannot
+measure external interference. The harness now records P99 inter-token latency.
+The current immediate-mixed point is 0.977x throughput, 1.012x resident P99
+inter-token latency, and 1.021x external TTFT. A five-trial policy that delayed
+the external request and re-formed the transformed mixed batch measured 0.972x
+throughput, 1.048x resident P99 inter-token latency, and 1.295x external TTFT;
+it was removed. Dense admission shifting is therefore a rejected ablation, not
+the primary result.
+
+ABI v25 exports blocked-byte, pending-compute, executable-compute,
+completed-compute, and expected-compute summaries plus observable dropped
+attribution. The device
+transport queue recomputes deadline urgency from live queue delay, transfer
+service, and compiler-attributed request compute on insertion and requeue. The
+device transport path consumes this state directly: insertion and requeue map
+live critical service to urgency buckets, and the GPU test verifies that it
+changes service order for equal-priority requests. The Python
+`CriticalWorkPlan` is a reference/control-plane model, not the hot-path
+scheduler. SGLang batch admission still does not consume progress snapshots,
+so this remains mechanism status rather than an E3/E4 result.
+
 The implemented five-point operator sweep captures the required crossover: a
 forced indexed path loses at zero byte avoidance, while the online cost model
 keeps bulk there and selects indexed transfer at 75% or greater avoidance. The
-current peak is 8.826x over forced candidate overfetch; see `VALIDATION.md` for
-the exact claim boundary.
+corrected peak is 8.1731x over forced candidate overfetch. At zero avoidance,
+forced indexed acquisition is 0.6431x while the online policy selects bulk and
+is exactly 1.0000x. See `VALIDATION.md` for the exact claim boundary and
+resident-candidate upper bound.
 
 Still required before E3/E4 are paper evidence:
 
-- demand-mode SGLang execution of the request/tile ticket path under a
-  production dense mixed-residency workload; the current integrated fast path
-  is preacquired and does not exercise unavailable-data work tickets;
-- compiler-generated direct and incremental FlashInfer forms plus the unified
-  grouping scheduler under the same kernel math and cache policy;
+- demand-mode graph/device control that removes per-layer Python launch and
+  event construction while preserving compiler-generated direct/incremental
+  forms;
+
+- repeated workloads with measured per-tile arrival skew where transformed
+  incremental FlashInfer beats transformed direct, whole-layer wait, and skip/rebatch under
+  the same kernel math, cache state, and request order; forced ticketing is
+  currently slower on the all-known CPU-DRAM fixture;
+- one canonical FlashInfer batch containing resident, CPU-DRAM, and NVMe pages,
+  including cancellation and request-slot reuse while I/O is outstanding;
 - end-to-end serving use of the implemented GPU-selected FlashInfer path with
   model-generated scores and quality evaluation;
 - trace preprocessing and an arrival-driven serving client with per-request

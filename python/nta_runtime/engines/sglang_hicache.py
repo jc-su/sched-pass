@@ -34,6 +34,21 @@ class PendingHostLoad:
         return self.host_by_device
 
 
+@dataclass(frozen=True)
+class HostLoadProgress:
+    """Nonblocking snapshot of an NTA-owned HiCache transfer."""
+
+    consumer_index: int
+    leading_layers: int
+    total_layers: int
+    leading_bytes: int
+    total_bytes: int
+
+    @property
+    def complete(self) -> bool:
+        return self.total_layers > 0 and self.leading_layers == self.total_layers
+
+
 class SglangHiCacheBridge:
     """Own intercepted HiCache loads until the final attention layer retires."""
 
@@ -42,6 +57,7 @@ class SglangHiCacheBridge:
         self._pending: dict[int, PendingHostLoad] = {}
         self._lock = threading.Lock()
         self._prefetch_callback: Any = None
+        self._admission_stats: dict[str, int] = {}
         _register_bridge(device_pool, self)
 
     def set_prefetch_callback(self, callback: Any) -> None:
@@ -108,6 +124,63 @@ class SglangHiCacheBridge:
             return None
         with self._lock:
             return self._pending.get(consumer_index)
+
+    def progress(self, consumer_index: int) -> HostLoadProgress | None:
+        """Query ordered layer progress without synchronizing a CUDA stream."""
+        pending = self.get(consumer_index)
+        if pending is None or not pending.prefetched_layers:
+            return None
+        ordered = tuple(
+            pending.prefetched_layers[index]
+            for index in sorted(pending.prefetched_layers)
+        )
+        total_bytes = sum(
+            int(layer.key_bytes) + int(layer.value_bytes) for layer in ordered
+        )
+        leading_layers = 0
+        leading_bytes = 0
+        for layer in ordered:
+            if not layer.ready_event.query():
+                break
+            leading_layers += 1
+            leading_bytes += int(layer.key_bytes) + int(layer.value_bytes)
+        return HostLoadProgress(
+            consumer_index,
+            leading_layers,
+            len(ordered),
+            leading_bytes,
+            total_bytes,
+        )
+
+    def transfer_bytes(self, consumer_index: int) -> int:
+        """Return pending K/V bytes from shape metadata without touching page data."""
+        pending = self.get(consumer_index)
+        if pending is None:
+            return 0
+        page_count = int(pending.host_indices.numel())
+        controller = pending.controller
+        keys = tuple(controller.mem_pool_host.k_data_refs)
+        values = tuple(controller.mem_pool_host.v_data_refs)
+        if page_count <= 0 or len(keys) != len(values):
+            return 0
+        return page_count * sum(
+            int(key[0].numel()) * key.element_size()
+            + int(value[0].numel()) * value.element_size()
+            for key, value in zip(keys, values)
+        )
+
+    def record_admission(self, **increments: int) -> None:
+        with self._lock:
+            for name, value in increments.items():
+                if value < 0:
+                    raise ValueError("admission counters cannot decrease")
+                self._admission_stats[name] = self._admission_stats.get(name, 0) + int(
+                    value
+                )
+
+    def admission_stats(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._admission_stats)
 
     def complete_layer(self, pending: PendingHostLoad, local_layer: int) -> None:
         if local_layer != pending.completed_layers:

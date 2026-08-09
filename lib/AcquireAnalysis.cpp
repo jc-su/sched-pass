@@ -1,8 +1,10 @@
 #include "AcquireAnalysisInternal.h"
 
 #include "nta/AcquireIR.h"
+#include "nta/RuntimeABI.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/CFG.h"
@@ -84,6 +86,36 @@ std::optional<std::string> validateDefer(CallInst &call) {
       !call.getArgOperand(ir::DeferRuntime)->getType()->isPointerTy() ||
       !isInteger(call.getArgOperand(ir::DeferWorkTicket), 32)) {
     return "defer marker has an incompatible ABI";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> validatePartialCommit(CallInst &call) {
+  if (call.arg_size() != ir::CommitPartialArgumentCount ||
+      !call.getType()->isVoidTy() ||
+      !call.getArgOperand(ir::CommitRuntime)->getType()->isPointerTy() ||
+      !isInteger(call.getArgOperand(ir::CommitWorkTicket), 32) ||
+      !isInteger(call.getArgOperand(ir::CommitReductionGroup), 32) ||
+      !isInteger(call.getArgOperand(ir::CommitContributorIndex), 32) ||
+      !isInteger(call.getArgOperand(ir::CommitContributorCount), 32) ||
+      !isInteger(call.getArgOperand(ir::CommitEstimatedComputeNs), 64)) {
+    return "partial-publication marker has an incompatible ABI";
+  }
+  if (!call.isConvergent()) {
+    return "partial-publication marker must carry LLVM convergent semantics";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> validatePartialBegin(CallInst &call) {
+  if (call.arg_size() != ir::BeginPartialArgumentCount ||
+      !call.getType()->isVoidTy() ||
+      !call.getArgOperand(ir::BeginRuntime)->getType()->isPointerTy() ||
+      !isInteger(call.getArgOperand(ir::BeginWorkTicket), 32)) {
+    return "partial-region marker has an incompatible ABI";
+  }
+  if (!call.isConvergent()) {
+    return "partial-region marker must carry LLVM convergent semantics";
   }
   return std::nullopt;
 }
@@ -250,24 +282,33 @@ private:
 
 std::optional<std::string>
 validateCtaCollective(CallInst &marker, CallInst &binding,
-                      PostDominatorTree &postDominatorTree) {
+                      PostDominatorTree &postDominatorTree,
+                      StringRef effectName = "acquisition marker",
+                      bool validateControlDependence = true) {
   const CallingConv::ID callingConvention =
       marker.getFunction()->getCallingConv();
   if (callingConvention != CallingConv::PTX_Kernel &&
       callingConvention != CallingConv::AMDGPU_KERNEL &&
       callingConvention != CallingConv::SPIR_KERNEL) {
-    return "acquisition markers must be inlined into a GPU kernel entry";
+    if (effectName == "acquisition marker") {
+      return "acquisition markers must be inlined into a GPU kernel entry";
+    }
+    return effectName.str() + " must be inlined into a GPU kernel entry";
   }
   CtaUniformity uniformity(postDominatorTree);
   for (Use &argument : marker.args()) {
     if (!uniformity.isUniform(argument.get())) {
-      return "acquisition marker has a non-CTA-uniform operand";
+      return effectName.str() + " has a non-CTA-uniform operand";
     }
   }
   for (Use &argument : binding.args()) {
     if (!uniformity.isUniform(argument.get())) {
       return "request binding has a non-CTA-uniform operand";
     }
+  }
+
+  if (!validateControlDependence) {
+    return std::nullopt;
   }
 
   BasicBlock *markerBlock = marker.getParent();
@@ -297,8 +338,8 @@ validateCtaCollective(CallInst &marker, CallInst &binding,
         postDominatesSuccessor &&
         !postDominatorTree.dominates(markerBlock, controlBlock);
     if (controlsMarker && !uniformity.isUniform(condition)) {
-      return "acquisition marker is control-dependent on a non-CTA-uniform "
-             "branch";
+      return effectName.str() +
+             " is control-dependent on a non-CTA-uniform branch";
     }
   }
   return std::nullopt;
@@ -309,6 +350,63 @@ struct AcquisitionBranch {
   BasicBlock *pending;
   BasicBlock *ready;
 };
+
+Value *valueOnAcquiredEdge(Value *value, const AcquisitionBranch &branch) {
+  auto *phi = dyn_cast<PHINode>(value);
+  if (phi == nullptr || phi->getParent() != branch.ready) {
+    return value;
+  }
+  const int incoming = phi->getBasicBlockIndex(branch.condition->getParent());
+  return incoming >= 0 ? phi->getIncomingValue(incoming) : value;
+}
+
+bool sameValueOnAcquiredEdge(Value *merged, Value *source,
+                             const AcquisitionBranch &branch) {
+  return valueOnAcquiredEdge(merged, branch) == source;
+}
+
+bool sameBindingOnAcquiredEdge(CallInst &merged, CallInst &source,
+                               const AcquisitionBranch &branch) {
+  return sameValueOnAcquiredEdge(merged.getArgOperand(ir::RequestSlot),
+                                 source.getArgOperand(ir::RequestSlot),
+                                 branch) &&
+         sameValueOnAcquiredEdge(merged.getArgOperand(ir::RequestGeneration),
+                                 source.getArgOperand(ir::RequestGeneration),
+                                 branch);
+}
+
+bool sameBinding(CallInst &left, CallInst &right) {
+  return left.getArgOperand(ir::RequestSlot) ==
+             right.getArgOperand(ir::RequestSlot) &&
+         left.getArgOperand(ir::RequestGeneration) ==
+             right.getArgOperand(ir::RequestGeneration);
+}
+
+bool reachableWithoutEdges(
+    Function &function, BasicBlock *target,
+    ArrayRef<std::pair<BasicBlock *, BasicBlock *>> removedEdges) {
+  SmallVector<BasicBlock *, 16> worklist{&function.getEntryBlock()};
+  SmallPtrSet<BasicBlock *, 16> visited;
+  while (!worklist.empty()) {
+    BasicBlock *block = worklist.pop_back_val();
+    if (!visited.insert(block).second) {
+      continue;
+    }
+    if (block == target) {
+      return true;
+    }
+    for (BasicBlock *successor : successors(block)) {
+      bool removed = false;
+      for (const auto &edge : removedEdges) {
+        removed |= edge.first == block && edge.second == successor;
+      }
+      if (!removed) {
+        worklist.push_back(successor);
+      }
+    }
+  }
+  return false;
+}
 
 std::optional<AcquisitionBranch> acquisitionBranch(CallInst &marker) {
   if (marker.getType()->isIntegerTy(1)) {
@@ -385,6 +483,17 @@ validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
   const unsigned workTicketArgument =
       dependencySet ? static_cast<unsigned>(ir::SetWorkTicket)
                     : static_cast<unsigned>(ir::WorkTicket);
+  const auto *requirementCount =
+      dependencySet
+          ? dyn_cast<ConstantInt>(marker.getArgOperand(ir::RequirementCount))
+          : nullptr;
+  const auto *directRequirementCount =
+      dependencySet ? dyn_cast<ConstantInt>(
+                          marker.getArgOperand(ir::DirectRequirementCount))
+                    : nullptr;
+  const bool requestGuardOnly =
+      requirementCount != nullptr && requirementCount->isZero() &&
+      directRequirementCount != nullptr && directRequirementCount->isZero();
 
   for (User *user : marker.users()) {
     if (user == branch->condition) {
@@ -437,9 +546,12 @@ validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
     worklist.push_back(branch->getSuccessor(0));
   }
 
-  if (deferCount != 1 || !foundReturn) {
-    return "pending edge must defer exactly once and return from the finite "
-           "kernel";
+  const unsigned expectedDefers = requestGuardOnly ? 0U : 1U;
+  if (deferCount != expectedDefers || !foundReturn) {
+    return requestGuardOnly
+               ? "request-guard false edge must return without deferral"
+               : "pending edge must defer exactly once and return from the "
+                 "finite kernel";
   }
   return std::nullopt;
 }
@@ -450,6 +562,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
   FunctionPlan plan;
   SmallVector<CallInst *, 8> acquireMarkers;
   SmallVector<CallInst *, 8> deferMarkers;
+  SmallVector<CallInst *, 8> partialBeginMarkers;
+  SmallVector<CallInst *, 8> partialCommitMarkers;
 
   for (BasicBlock &block : function) {
     for (Instruction &instruction : block) {
@@ -469,11 +583,17 @@ FunctionPlan analyzeAcquisitions(Function &function) {
         acquireMarkers.push_back(call);
       } else if (hasName(*call, ir::DeferMarker)) {
         deferMarkers.push_back(call);
+      } else if (hasName(*call, ir::BeginPartialMarker)) {
+        partialBeginMarkers.push_back(call);
+      } else if (hasName(*call, ir::CommitPartialMarker) ||
+                 hasName(*call, ir::StreamCommitPartialMarker)) {
+        partialCommitMarkers.push_back(call);
       }
     }
   }
 
-  if (acquireMarkers.empty() && deferMarkers.empty()) {
+  if (acquireMarkers.empty() && deferMarkers.empty() &&
+      partialBeginMarkers.empty() && partialCommitMarkers.empty()) {
     return plan;
   }
 
@@ -504,6 +624,141 @@ FunctionPlan analyzeAcquisitions(Function &function) {
       continue;
     }
     plan.acquisitions.push_back({marker, binding});
+  }
+
+  for (CallInst *marker : partialBeginMarkers) {
+    if (std::optional<std::string> error = validatePartialBegin(*marker)) {
+      plan.rejected.push_back({marker, std::move(*error)});
+      continue;
+    }
+    CallInst *binding =
+        nearestDominatingBinding(*marker, plan.bindings, dominatorTree);
+    if (binding == nullptr) {
+      plan.rejected.push_back(
+          {marker, "no valid request binding dominates partial region"});
+      continue;
+    }
+    if (std::optional<std::string> error =
+            validateCtaCollective(*marker, *binding, postDominatorTree,
+                                  "partial-region marker", false)) {
+      plan.rejected.push_back({marker, std::move(*error)});
+      continue;
+    }
+
+    SmallVector<std::pair<BasicBlock *, BasicBlock *>, 4> acquiredEdges;
+    for (BoundSite &acquisition : plan.acquisitions) {
+      const bool dependencySet =
+          hasName(*acquisition.marker, ir::AcquireSetMarker);
+      const unsigned runtimeArgument =
+          dependencySet ? static_cast<unsigned>(ir::SetRuntime)
+                        : static_cast<unsigned>(ir::Runtime);
+      std::optional<AcquisitionBranch> branch =
+          acquisitionBranch(*acquisition.marker);
+      const unsigned ticketArgument =
+          dependencySet ? static_cast<unsigned>(ir::SetWorkTicket)
+                        : static_cast<unsigned>(ir::WorkTicket);
+      const bool matches =
+          acquisition.marker->getArgOperand(runtimeArgument) ==
+              marker->getArgOperand(ir::BeginRuntime) &&
+          branch.has_value() &&
+          dominatorTree.dominates(branch->ready, marker->getParent()) &&
+          sameBindingOnAcquiredEdge(*binding, *acquisition.binding, *branch) &&
+          sameValueOnAcquiredEdge(
+              marker->getArgOperand(ir::BeginWorkTicket),
+              acquisition.marker->getArgOperand(ticketArgument), *branch);
+      if (!matches) {
+        continue;
+      }
+      acquiredEdges.emplace_back(branch->condition->getParent(), branch->ready);
+    }
+    if (acquiredEdges.empty()) {
+      plan.rejected.push_back(
+          {marker,
+           "partial region is not on an acquired path with the same request "
+           "binding and work ticket"});
+      continue;
+    }
+    if (reachableWithoutEdges(function, marker->getParent(), acquiredEdges)) {
+      plan.rejected.push_back(
+          {marker, "partial region has a path that bypasses acquisition"});
+      continue;
+    }
+    plan.partialBegins.push_back({marker, binding});
+  }
+
+  DenseMap<CallInst *, unsigned> commitsPerBegin;
+  for (CallInst *marker : partialCommitMarkers) {
+    if (std::optional<std::string> error = validatePartialCommit(*marker)) {
+      plan.rejected.push_back({marker, std::move(*error)});
+      continue;
+    }
+    CallInst *binding =
+        nearestDominatingBinding(*marker, plan.bindings, dominatorTree);
+    if (binding == nullptr) {
+      plan.rejected.push_back(
+          {marker, "no valid request binding dominates partial publication"});
+      continue;
+    }
+    if (std::optional<std::string> error =
+            validateCtaCollective(*marker, *binding, postDominatorTree,
+                                  "partial-publication marker", false)) {
+      plan.rejected.push_back({marker, std::move(*error)});
+      continue;
+    }
+
+    BoundSite *matched = nullptr;
+    bool regionWithoutPublication = false;
+    for (BoundSite &begin : plan.partialBegins) {
+      if (begin.marker->getArgOperand(ir::BeginRuntime) !=
+          marker->getArgOperand(ir::CommitRuntime)) {
+        continue;
+      }
+      if (!sameBinding(*begin.binding, *binding) ||
+          begin.marker->getArgOperand(ir::BeginWorkTicket) !=
+              marker->getArgOperand(ir::CommitWorkTicket)) {
+        continue;
+      }
+      if (!dominatorTree.dominates(begin.marker, marker)) {
+        continue;
+      }
+      if (!postDominatorTree.dominates(marker->getParent(),
+                                       begin.marker->getParent())) {
+        regionWithoutPublication = true;
+        continue;
+      }
+      if (matched != nullptr) {
+        plan.rejected.push_back(
+            {marker, "partial publication is ambiguous across regions"});
+        matched = nullptr;
+        break;
+      }
+      matched = &begin;
+    }
+
+    if (matched == nullptr) {
+      if (plan.rejected.empty() || plan.rejected.back().marker != marker) {
+        plan.rejected.push_back(
+            {marker,
+             regionWithoutPublication
+                 ? "partial publication must post-dominate its numerical region"
+                 : "partial publication is not in a matching numerical "
+                   "region"});
+      }
+      continue;
+    }
+    if (++commitsPerBegin[matched->marker] != 1) {
+      plan.rejected.push_back(
+          {marker, "partial numerical region publishes more than once"});
+      continue;
+    }
+    plan.partialCommits.push_back({marker, binding});
+  }
+
+  for (const BoundSite &begin : plan.partialBegins) {
+    if (commitsPerBegin.lookup(begin.marker) == 0) {
+      plan.rejected.push_back(
+          {begin.marker, "partial numerical region has no publication"});
+    }
   }
 
   for (CallInst *marker : deferMarkers) {

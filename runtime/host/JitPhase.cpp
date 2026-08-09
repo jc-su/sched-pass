@@ -10,17 +10,37 @@ namespace nta {
 namespace {
 
 using AbiVersion = std::uint32_t (*)();
+using OperatorContract = const operator_contract::Contract *(*)();
+using OperatorPlan = const operator_contract::Plan *(*)();
 using Reset = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                               cudaStream_t);
+using Discover = cudaError_t (*)(void *, const void *, const void *,
+                                 std::uint32_t, cudaStream_t);
 using InvalidateCachedObjects = cudaError_t (*)(void *, std::uint32_t,
                                                 std::uint32_t, cudaStream_t);
+using ValidateIndexedHostRange = cudaError_t (*)(void *, std::uint32_t,
+                                                 std::uint32_t, cudaStream_t);
+using RebindIndexedHostPairs = cudaError_t (*)(void *, std::uint32_t,
+                                               std::uint32_t, std::uint64_t,
+                                               std::uint64_t, std::uint64_t,
+                                               std::uint64_t, cudaStream_t);
 using PreloadHost = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                                     cudaStream_t);
+using AliasPreloadedObjects = cudaError_t (*)(void *, std::uint32_t,
+                                              std::uint32_t, std::uint32_t,
+                                              std::uint64_t, std::uint32_t,
+                                              cudaStream_t);
 using ProgressHost = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
+using ProgressIndexedHostRange = cudaError_t (*)(void *, std::uint32_t,
+                                                 std::uint32_t, cudaStream_t);
+using ProgressIndexedHostRangeParallel = cudaError_t (*)(
+    void *, std::uint32_t, std::uint32_t, std::uint32_t, cudaStream_t);
 using ProgressNvme = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                                      cudaStream_t);
 using Publish = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using Complete = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
+using CompleteStreamOrdered = cudaError_t (*)(void *, const void *,
+                                              std::uint32_t, cudaStream_t);
 
 template <typename Function> Function load(void *library, const char *name) {
   dlerror();
@@ -59,14 +79,51 @@ struct JitPhaseProgram::Impl {
         throw std::runtime_error(
             "instrumented JIT module uses an incompatible NTA ABI");
       }
+      const OperatorContract readContract =
+          load<OperatorContract>(library, "nta_jit_operator_contract");
+      const operator_contract::Contract *loadedContract = readContract();
+      if (loadedContract == nullptr) {
+        throw std::runtime_error(
+            "instrumented JIT module returned a null operator contract");
+      }
+      contract = *loadedContract;
+      operator_contract::validate(contract);
+      const OperatorPlan readPlan =
+          load<OperatorPlan>(library, "nta_jit_operator_plan");
+      const operator_contract::Plan *loadedPlan = readPlan();
+      if (loadedPlan == nullptr) {
+        throw std::runtime_error(
+            "instrumented JIT module returned a null operator plan");
+      }
+      plan = *loadedPlan;
+      operator_contract::validate(plan, contract);
       reset = load<Reset>(library, "nta_jit_reset_epoch");
+      discover = load<Discover>(library, "nta_jit_discover_work");
       invalidateCachedObjects = load<InvalidateCachedObjects>(
           library, "nta_jit_invalidate_cached_objects");
+      validateIndexedHostRange = load<ValidateIndexedHostRange>(
+          library, "nta_jit_validate_indexed_host_range");
+      rebindIndexedHostPairs = load<RebindIndexedHostPairs>(
+          library, "nta_jit_rebind_indexed_host_pairs");
       preloadHost = load<PreloadHost>(library, "nta_jit_preload_host");
+      preloadHostPairs =
+          load<PreloadHost>(library, "nta_jit_preload_host_pairs");
+      aliasPreloadedObjects = load<AliasPreloadedObjects>(
+          library, "nta_jit_alias_preloaded_objects");
       progressHost = load<ProgressHost>(library, "nta_jit_progress_host");
+      progressIndexedHostRange = load<ProgressIndexedHostRange>(
+          library, "nta_jit_progress_indexed_host_range");
+      progressValidatedIndexedHostRange = load<ProgressIndexedHostRange>(
+          library, "nta_jit_progress_validated_indexed_host_range");
+      progressValidatedIndexedHostRangeParallel =
+          load<ProgressIndexedHostRangeParallel>(
+              library,
+              "nta_jit_progress_validated_indexed_host_range_parallel");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
       publish = load<Publish>(library, "nta_jit_publish_ready");
       complete = load<Complete>(library, "nta_jit_complete_launched");
+      completeStreamOrdered = load<CompleteStreamOrdered>(
+          library, "nta_jit_complete_stream_ordered");
     } catch (...) {
       dlclose(library);
       library = nullptr;
@@ -82,12 +139,24 @@ struct JitPhaseProgram::Impl {
 
   void *library = nullptr;
   Reset reset = nullptr;
+  Discover discover = nullptr;
   InvalidateCachedObjects invalidateCachedObjects = nullptr;
+  ValidateIndexedHostRange validateIndexedHostRange = nullptr;
+  RebindIndexedHostPairs rebindIndexedHostPairs = nullptr;
   PreloadHost preloadHost = nullptr;
+  PreloadHost preloadHostPairs = nullptr;
+  AliasPreloadedObjects aliasPreloadedObjects = nullptr;
   ProgressHost progressHost = nullptr;
+  ProgressIndexedHostRange progressIndexedHostRange = nullptr;
+  ProgressIndexedHostRange progressValidatedIndexedHostRange = nullptr;
+  ProgressIndexedHostRangeParallel progressValidatedIndexedHostRangeParallel =
+      nullptr;
   ProgressNvme progressNvme = nullptr;
   Publish publish = nullptr;
   Complete complete = nullptr;
+  CompleteStreamOrdered completeStreamOrdered = nullptr;
+  operator_contract::Contract contract{};
+  operator_contract::Plan plan{};
 };
 
 JitPhaseProgram::JitPhaseProgram(std::string_view sharedObject)
@@ -97,6 +166,15 @@ JitPhaseProgram::~JitPhaseProgram() = default;
 JitPhaseProgram::JitPhaseProgram(JitPhaseProgram &&) noexcept = default;
 JitPhaseProgram &
 JitPhaseProgram::operator=(JitPhaseProgram &&) noexcept = default;
+
+const operator_contract::Contract &
+JitPhaseProgram::operatorContract() const noexcept {
+  return impl_->contract;
+}
+
+const operator_contract::Plan &JitPhaseProgram::operatorPlan() const noexcept {
+  return impl_->plan;
+}
 
 void JitPhaseProgram::reset(cudaStream_t stream, abi::RuntimeView *runtime,
                             std::uint32_t objectCount,
@@ -109,15 +187,58 @@ void JitPhaseProgram::reset(cudaStream_t stream, abi::RuntimeView *runtime,
         "nta_jit_reset_epoch");
 }
 
-void JitPhaseProgram::invalidateCachedObjects(
-    cudaStream_t stream, abi::RuntimeView *runtime,
-    std::uint32_t firstObject, std::uint32_t objectCount) const {
+void JitPhaseProgram::discover(cudaStream_t stream, abi::RuntimeView *runtime,
+                               const abi::WorkItem *workItems,
+                               const abi::AcquireRequirement *dependencies,
+                               std::uint32_t workItemCount) const {
+  if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
+      workItemCount == 0) {
+    throw std::invalid_argument(
+        "JIT discovery needs runtime work items and dependencies");
+  }
+  check(
+      impl_->discover(runtime, workItems, dependencies, workItemCount, stream),
+      "nta_jit_discover_work");
+}
+
+void JitPhaseProgram::invalidateCachedObjects(cudaStream_t stream,
+                                              abi::RuntimeView *runtime,
+                                              std::uint32_t firstObject,
+                                              std::uint32_t objectCount) const {
   if (runtime == nullptr || objectCount == 0) {
     throw std::invalid_argument(
         "JIT cache invalidation needs a runtime and non-zero object count");
   }
-  check(impl_->invalidateCachedObjects(runtime, firstObject, objectCount, stream),
-        "nta_jit_invalidate_cached_objects");
+  check(
+      impl_->invalidateCachedObjects(runtime, firstObject, objectCount, stream),
+      "nta_jit_invalidate_cached_objects");
+}
+
+void JitPhaseProgram::validateIndexedHostRange(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount) const {
+  if (runtime == nullptr || objectCount == 0) {
+    throw std::invalid_argument("JIT indexed host validation needs a runtime "
+                                "and non-zero object count");
+  }
+  check(impl_->validateIndexedHostRange(runtime, firstObject, objectCount,
+                                        stream),
+        "nta_jit_validate_indexed_host_range");
+}
+
+void JitPhaseProgram::rebindIndexedHostPairs(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t pairCount, std::uint64_t keySource, std::uint64_t keyStaging,
+    std::uint64_t valueSource, std::uint64_t valueStaging) const {
+  if (runtime == nullptr || pairCount == 0 || keySource == 0 ||
+      keyStaging == 0 || valueSource == 0 || valueStaging == 0) {
+    throw std::invalid_argument(
+        "JIT indexed host rebinding needs object pairs and K/V addresses");
+  }
+  check(impl_->rebindIndexedHostPairs(runtime, firstObject, pairCount,
+                                      keySource, keyStaging, valueSource,
+                                      valueStaging, stream),
+        "nta_jit_rebind_indexed_host_pairs");
 }
 
 void JitPhaseProgram::preloadHost(cudaStream_t stream,
@@ -132,6 +253,32 @@ void JitPhaseProgram::preloadHost(cudaStream_t stream,
         "nta_jit_preload_host");
 }
 
+void JitPhaseProgram::preloadHostPairs(cudaStream_t stream,
+                                       abi::RuntimeView *runtime,
+                                       std::uint32_t firstObject,
+                                       std::uint32_t pairCount) const {
+  if (runtime == nullptr || pairCount == 0) {
+    throw std::invalid_argument(
+        "JIT paired host preload needs a runtime and non-zero pair count");
+  }
+  check(impl_->preloadHostPairs(runtime, firstObject, pairCount, stream),
+        "nta_jit_preload_host_pairs");
+}
+
+void JitPhaseProgram::aliasPreloadedObjects(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t sourceFirst,
+    std::uint32_t destinationFirst, std::uint32_t objectCount,
+    std::uint64_t objectIdBase, std::uint32_t version) const {
+  if (runtime == nullptr || objectCount == 0 || version == 0) {
+    throw std::invalid_argument(
+        "JIT object aliasing needs a runtime, objects, and version");
+  }
+  check(impl_->aliasPreloadedObjects(runtime, sourceFirst, destinationFirst,
+                                     objectCount, objectIdBase, version,
+                                     stream),
+        "nta_jit_alias_preloaded_objects");
+}
+
 void JitPhaseProgram::progressHost(cudaStream_t stream,
                                    abi::RuntimeView *runtime,
                                    std::uint32_t blocks) const {
@@ -140,6 +287,42 @@ void JitPhaseProgram::progressHost(cudaStream_t stream,
         "JIT host progress needs a runtime and non-zero blocks");
   }
   check(impl_->progressHost(runtime, blocks, stream), "nta_jit_progress_host");
+}
+
+void JitPhaseProgram::progressIndexedHostRange(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount) const {
+  if (runtime == nullptr || objectCount == 0) {
+    throw std::invalid_argument(
+        "JIT indexed host progress needs a runtime and non-zero object count");
+  }
+  check(impl_->progressIndexedHostRange(runtime, firstObject, objectCount,
+                                        stream),
+        "nta_jit_progress_indexed_host_range");
+}
+
+void JitPhaseProgram::progressValidatedIndexedHostRange(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount) const {
+  if (runtime == nullptr || objectCount == 0) {
+    throw std::invalid_argument("JIT validated indexed progress needs a "
+                                "runtime and non-zero object count");
+  }
+  check(impl_->progressValidatedIndexedHostRange(runtime, firstObject,
+                                                 objectCount, stream),
+        "nta_jit_progress_validated_indexed_host_range");
+}
+
+void JitPhaseProgram::progressValidatedIndexedHostRangeParallel(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount, std::uint32_t copyBlocksPerGroup) const {
+  if (runtime == nullptr || objectCount == 0 || copyBlocksPerGroup == 0) {
+    throw std::invalid_argument("JIT parallel validated indexed progress needs "
+                                "a runtime and non-zero geometry");
+  }
+  check(impl_->progressValidatedIndexedHostRangeParallel(
+            runtime, firstObject, objectCount, copyBlocksPerGroup, stream),
+        "nta_jit_progress_validated_indexed_host_range_parallel");
 }
 
 void JitPhaseProgram::progressNvme(cudaStream_t stream,
@@ -172,6 +355,17 @@ void JitPhaseProgram::complete(cudaStream_t stream, abi::RuntimeView *runtime,
   }
   check(impl_->complete(runtime, workTicketCount, stream),
         "nta_jit_complete_launched");
+}
+
+void JitPhaseProgram::completeStreamOrdered(
+    cudaStream_t stream, abi::RuntimeView *runtime,
+    const abi::WorkItem *workItems, std::uint32_t workItemCount) const {
+  if (runtime == nullptr || workItems == nullptr || workItemCount == 0) {
+    throw std::invalid_argument(
+        "stream-ordered completion needs a runtime and exact work plan");
+  }
+  check(impl_->completeStreamOrdered(runtime, workItems, workItemCount, stream),
+        "nta_jit_complete_stream_ordered");
 }
 
 } // namespace nta

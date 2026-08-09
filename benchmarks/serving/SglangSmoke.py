@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-length", type=int, default=2048)
     parser.add_argument("--mem-fraction-static", type=float, default=0.35)
     parser.add_argument(
+        "--cuda-graph-decode",
+        choices=("disabled", "full"),
+        default="full",
+    )
+    parser.add_argument(
         "--attention-backend",
         choices=("flashinfer", "nta_flashinfer"),
         default="flashinfer",
@@ -85,6 +90,8 @@ def configure_jit_environment(args: argparse.Namespace) -> pathlib.Path:
         else args.flashinfer_workspace_base.resolve()
     )
     workspace.mkdir(parents=True, exist_ok=True)
+    for stale in workspace.glob("nta-engine.*.json"):
+        stale.unlink()
     os.environ["NTA_ENGINE_STATS_FILE"] = str(workspace / "nta-engine.json")
 
     os.environ["CC"] = str(host_cxx)
@@ -124,7 +131,7 @@ def main() -> int:
         dtype="float16",
         mem_fraction_static=args.mem_fraction_static,
         context_length=args.context_length,
-        cuda_graph_backend_decode="disabled",
+        cuda_graph_backend_decode=args.cuda_graph_decode,
         cuda_graph_backend_prefill="disabled",
         chunked_prefill_size=512,
     ) as engine:
@@ -176,6 +183,7 @@ def main() -> int:
         "requests": args.requests,
         "iterations": args.iterations,
         "warmup_iterations": args.warmup_iterations,
+        "cuda_graph_decode": args.cuda_graph_decode,
         "generated_tokens": generated,
         "generated_text_sha256": output_digest.hexdigest(),
         "load_seconds": load_seconds,

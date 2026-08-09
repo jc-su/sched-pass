@@ -1,10 +1,13 @@
 #include "AcquireAnalysisInternal.h"
 #include "DeferralLoweringInternal.h"
+#include "PartialLoweringInternal.h"
 
 #include "nta/AcquireIR.h"
 #include "nta/Passes.h"
 #include "nta/RuntimeABI.h"
 
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -15,6 +18,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/WithColor.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include <utility>
 #include <vector>
@@ -24,6 +31,7 @@
 using namespace llvm;
 
 STATISTIC(AcquisitionsLowered, "Number of NTA acquisitions lowered");
+STATISTIC(RequestGuardsInlined, "Number of request-only guards inlined");
 STATISTIC(SitesRejected, "Number of unsafe NTA sites rejected");
 
 namespace nta {
@@ -51,10 +59,11 @@ MDNode *dependencySetMetadata(LLVMContext &context) {
   return MDNode::get(context, fields);
 }
 
-bool lowerDependencySet(Module &module, const BoundSite &site) {
+bool lowerDependencySet(Module &module, const BoundSite &site,
+                        bool streamOrderedCompletion,
+                        SmallPtrSetImpl<Function *> &cleanupFunctions) {
   CallInst *marker = site.marker;
   CallInst *binding = site.binding;
-  Function *function = marker->getFunction();
   LLVMContext &context = module.getContext();
 
   Value *runtime = marker->getArgOperand(ir::SetRuntime);
@@ -68,9 +77,57 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
   Type *i1 = Type::getInt1Ty(context);
   Type *i32 = Type::getInt32Ty(context);
 
-  FunctionCallee requestLive = module.getOrInsertFunction(
-      ir::RequestLive,
-      FunctionType::get(i1, {runtime->getType(), i32, i32}, false));
+  const auto *constantRequirementCount =
+      dyn_cast<ConstantInt>(requirementCount);
+  const auto *constantDirectRequirementCount =
+      dyn_cast<ConstantInt>(directRequirementCount);
+  const auto *constantWorkTicket = dyn_cast<ConstantInt>(workTicket);
+  const bool requestGuardOnly =
+      constantRequirementCount != nullptr &&
+      constantRequirementCount->isZero() &&
+      constantDirectRequirementCount != nullptr &&
+      constantDirectRequirementCount->isZero();
+
+  if (requestGuardOnly) {
+    // A finite stream-ordered operator retires its exact work plan after the
+    // application launch. Its in-kernel acquire remains a request-liveness
+    // guard, but must not race that batched retirement by mutating tickets.
+    const bool tracksWork =
+        !streamOrderedCompletion &&
+        (constantWorkTicket == nullptr ||
+         constantWorkTicket->getZExtValue() != abi::InvalidIndex);
+    FunctionCallee requestLiveCta = module.getOrInsertFunction(
+        tracksWork ? ir::RequestLiveWorkCta : ir::RequestLiveCta,
+        FunctionType::get(
+            i1,
+            tracksWork
+                ? ArrayRef<Type *>{runtime->getType(), i32, i32, i32}
+                : ArrayRef<Type *>{runtime->getType(), i32, i32},
+            false));
+    IRBuilder<> builder(marker);
+    builder.SetCurrentDebugLocation(marker->getDebugLoc());
+    SmallVector<Value *, 4> arguments{runtime, requestSlot, generation};
+    if (tracksWork) {
+      arguments.push_back(workTicket);
+    }
+    CallInst *ready = builder.CreateCall(
+        requestLiveCta, arguments, "nta.request.collective.live");
+    ready->setMetadata(ir::AcquisitionMetadata, dependencySetMetadata(context));
+    marker->replaceAllUsesWith(ready);
+    marker->eraseFromParent();
+    Function *guard = ready->getCalledFunction();
+    if (guard != nullptr && !guard->isDeclaration()) {
+      Function *caller = ready->getFunction();
+      InlineFunctionInfo inlineInfo;
+      if (InlineFunction(*ready, inlineInfo).isSuccess()) {
+        cleanupFunctions.insert(caller);
+        ++RequestGuardsInlined;
+      }
+    }
+    ++AcquisitionsLowered;
+    return true;
+  }
+
   FunctionCallee acquireSet = module.getOrInsertFunction(
       ir::AcquireSetSlow,
       FunctionType::get(i1,
@@ -78,56 +135,29 @@ bool lowerDependencySet(Module &module, const BoundSite &site) {
                          i32, i32, i32},
                         false));
 
-  BasicBlock *entry = marker->getParent();
-  Instruction *afterMarker = marker->getNextNode();
-  BasicBlock *workTicketBlock =
-      entry->splitBasicBlock(afterMarker, "nta.acquire-set.cont");
-  entry->getTerminator()->eraseFromParent();
-  BasicBlock *classifyBlock = BasicBlock::Create(
-      context, "nta.acquire-set.classify", function, workTicketBlock);
-  BasicBlock *slowBlock = BasicBlock::Create(context, "nta.acquire-set.slow",
-                                             function, workTicketBlock);
-
-  IRBuilder<> entryBuilder(entry);
-  entryBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
-  CallInst *live = entryBuilder.CreateCall(
-      requestLive, {runtime, requestSlot, generation}, "nta.request.live");
-  entryBuilder.CreateCondBr(live, classifyBlock, workTicketBlock);
-
-  IRBuilder<> classifyBuilder(classifyBlock);
-  classifyBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
-  Value *allDirect = classifyBuilder.CreateICmpEQ(
-      directRequirementCount, requirementCount, "nta.dependencies.direct");
-  classifyBuilder.CreateCondBr(allDirect, workTicketBlock, slowBlock);
-
-  IRBuilder<> slowBuilder(slowBlock);
-  slowBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
-  CallInst *ready = slowBuilder.CreateCall(
-      acquireSet,
-      {runtime, requestSlot, generation, requirements, requirementCount,
-       directRequirementCount, workTicket},
-      "nta.dependencies.ready");
+  IRBuilder<> builder(marker);
+  builder.SetCurrentDebugLocation(marker->getDebugLoc());
+  CallInst *ready =
+      builder.CreateCall(acquireSet,
+                         {runtime, requestSlot, generation, requirements,
+                          requirementCount, directRequirementCount, workTicket},
+                         "nta.dependencies.ready");
   ready->setMetadata(ir::AcquisitionMetadata, dependencySetMetadata(context));
-  slowBuilder.CreateBr(workTicketBlock);
-
-  IRBuilder<> workTicketBuilder(&workTicketBlock->front());
-  workTicketBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
-  PHINode *result = workTicketBuilder.CreatePHI(i1, 3, "nta.ready");
-  result->addIncoming(ConstantInt::getFalse(context), entry);
-  result->addIncoming(ConstantInt::getTrue(context), classifyBlock);
-  result->addIncoming(ready, slowBlock);
-  marker->replaceAllUsesWith(result);
+  marker->replaceAllUsesWith(ready);
   marker->eraseFromParent();
   ++AcquisitionsLowered;
   return true;
 }
 
-bool lowerAcquisition(Module &module, const BoundSite &site) {
+bool lowerAcquisition(Module &module, const BoundSite &site,
+                      bool streamOrderedCompletion,
+                      SmallPtrSetImpl<Function *> &cleanupFunctions) {
   CallInst *marker = site.marker;
   const auto *called =
       dyn_cast<Function>(marker->getCalledOperand()->stripPointerCasts());
   if (called != nullptr && called->getName() == ir::AcquireSetMarker) {
-    return lowerDependencySet(module, site);
+    return lowerDependencySet(module, site, streamOrderedCompletion,
+                              cleanupFunctions);
   }
   CallInst *binding = site.binding;
   Function *function = marker->getFunction();
@@ -210,8 +240,7 @@ bool lowerAcquisition(Module &module, const BoundSite &site) {
 
   IRBuilder<> workTicketBuilder(&workTicketBlock->front());
   workTicketBuilder.SetCurrentDebugLocation(marker->getDebugLoc());
-  PHINode *result =
-      workTicketBuilder.CreatePHI(pointerType, 3, "nta.address");
+  PHINode *result = workTicketBuilder.CreatePHI(pointerType, 3, "nta.address");
   result->addIncoming(ConstantPointerNull::get(cast<PointerType>(pointerType)),
                       entry);
   result->addIncoming(directAddress, directBlock);
@@ -248,6 +277,7 @@ AcquireLoweringPass::run(Module &module,
 
   bool changed = false;
   bool rejectedAny = false;
+  SmallPtrSet<Function *, 8> cleanupFunctions;
   for (FunctionPlan &plan : plans) {
     for (const RejectedSite &rejected : plan.rejected) {
       ++SitesRejected;
@@ -266,10 +296,19 @@ AcquireLoweringPass::run(Module &module,
   }
 
   for (FunctionPlan &plan : plans) {
+    const bool streamOrderedCompletion = llvm::any_of(
+        plan.partialCommits, [](const BoundSite &site) {
+          const auto *called = dyn_cast<Function>(
+              site.marker->getCalledOperand()->stripPointerCasts());
+          return called != nullptr &&
+                 called->getName() == ir::StreamCommitPartialMarker;
+        });
     for (const BoundSite &site : plan.acquisitions) {
-      changed |= lowerAcquisition(module, site);
+      changed |= lowerAcquisition(module, site, streamOrderedCompletion,
+                                  cleanupFunctions);
     }
     changed |= lowerDeferrals(module, plan);
+    changed |= lowerPartialCommits(module, plan);
 
     if (plan.rejected.empty()) {
       for (CallInst *binding : plan.bindings) {
@@ -287,6 +326,27 @@ AcquireLoweringPass::run(Module &module,
     removeUnusedMarker(module, ir::AcquireTensorMapMarker);
     removeUnusedMarker(module, ir::AcquireSetMarker);
     removeUnusedMarker(module, ir::DeferMarker);
+    removeUnusedMarker(module, ir::BeginPartialMarker);
+    removeUnusedMarker(module, ir::CommitPartialMarker);
+    removeUnusedMarker(module, ir::StreamCommitPartialMarker);
+
+    // The plugin runs at optimizer-last so lowering can verify the final CUDA
+    // control flow. Explicitly inlined request guards would otherwise miss the
+    // normal scalar cleanup pipeline and inflate attention-kernel live ranges.
+    FunctionPassManager cleanup;
+    cleanup.addPass(InstCombinePass());
+    cleanup.addPass(SimplifyCFGPass());
+    cleanup.addPass(EarlyCSEPass());
+    cleanup.addPass(InstCombinePass());
+    cleanup.addPass(SimplifyCFGPass());
+    auto &functionAnalyses =
+        analysisManager
+            .getResult<FunctionAnalysisManagerModuleProxy>(module)
+            .getManager();
+    for (Function *function : cleanupFunctions) {
+      functionAnalyses.invalidate(*function, PreservedAnalyses::none());
+      cleanup.run(*function, functionAnalyses);
+    }
   }
 
   return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

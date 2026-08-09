@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import hashlib
-from collections.abc import Sequence
 from typing import Any
+
+from .runtime import RequestSpec
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,7 @@ class RequestSlotTracker:
         *,
         priorities: Sequence[int] | None = None,
         deadline_clocks: Sequence[int] | None = None,
+        stream: Any = None,
     ) -> tuple[RequestBinding, ...]:
         if len(request_ids) != len(request_slots):
             raise ValueError("request IDs and slots must have equal length")
@@ -58,6 +61,8 @@ class RequestSlotTracker:
         self.last_publish_count = 0
         self.last_policy_publish_count = 0
         bindings: list[RequestBinding] = []
+        updates: list[RequestSpec] = []
+        slot_updates: list[tuple[int, tuple[str, int, int, int]]] = []
         for request_index, (request_id, request_slot, priority, deadline_clock) in enumerate(
             zip(request_ids, request_slots, priorities, deadline_clocks)
         ):
@@ -80,14 +85,16 @@ class RequestSlotTracker:
                     generation = 1
             current = (request_id, generation, priority, deadline_clock)
             if previous != current:
-                self._runtime.set_request(
-                    request_slot,
-                    stable_request_id(request_id),
-                    generation,
-                    priority=priority,
-                    deadline_clock=deadline_clock,
+                updates.append(
+                    RequestSpec(
+                        request_slot,
+                        stable_request_id(request_id),
+                        generation,
+                        priority=priority,
+                        deadline_clock=deadline_clock,
+                    )
                 )
-                self._slots[request_slot] = current
+                slot_updates.append((request_slot, current))
                 if previous is None or previous[:2] != current[:2]:
                     self.last_publish_count += 1
                 else:
@@ -102,6 +109,20 @@ class RequestSlotTracker:
                     deadline_clock,
                 )
             )
+        if updates:
+            if stream is None:
+                for update in updates:
+                    self._runtime.set_request(
+                        update.slot,
+                        update.request_id,
+                        update.generation,
+                        priority=update.priority,
+                        deadline_clock=update.deadline_clock,
+                    )
+            else:
+                self._runtime.publish_requests_async(updates, stream)
+            for request_slot, current in slot_updates:
+                self._slots[request_slot] = current
         return tuple(bindings)
 
     def cancel(self, request_id: str) -> bool:

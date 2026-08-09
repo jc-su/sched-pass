@@ -95,7 +95,8 @@ def machine_metadata() -> dict[str, Any]:
         "gpu_clocks": command_output(
             [
                 "nvidia-smi",
-                "--query-gpu=index,clocks.current.sm,clocks.applications.sm,power.limit",
+                "--query-gpu=index,clocks.current.sm,clocks.current.memory,"
+                "clocks.applications.graphics,clocks.applications.memory,power.limit",
                 "--format=csv,noheader",
             ]
         ),

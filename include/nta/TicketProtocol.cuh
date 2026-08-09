@@ -11,6 +11,15 @@ namespace nta::device {
 __device__ __forceinline__ std::uint32_t
 currentEpoch(const abi::RuntimeView *runtime);
 
+__device__ __forceinline__ void recordFailure(abi::RuntimeView *runtime);
+
+__device__ __forceinline__ void
+recordDroppedAttribution(abi::RequestProgress &progress) {
+  atomicAdd(reinterpret_cast<unsigned long long *>(
+                &progress.droppedAttributions),
+            1ULL);
+}
+
 __device__ __forceinline__ abi::RequestProgress *
 requestProgress(abi::RuntimeView *runtime, const abi::WorkTicket &ticket) {
   if (runtime == nullptr || runtime->requestProgress == nullptr ||
@@ -18,16 +27,17 @@ requestProgress(abi::RuntimeView *runtime, const abi::WorkTicket &ticket) {
     return nullptr;
   }
   abi::RequestProgress &progress = runtime->requestProgress[ticket.requestSlot];
-  if (progress.requestId == ticket.requestId &&
-      progress.generation == ticket.generation) {
-    const std::uint32_t epoch = currentEpoch(runtime);
-    const std::uint32_t observed = atomicCAS(&progress.epoch, 0U, epoch);
-    if (observed != 0U && observed != epoch) {
-      return nullptr;
-    }
-    return &progress;
+  if (progress.requestId != ticket.requestId ||
+      progress.generation != ticket.generation) {
+    return nullptr;
   }
-  return nullptr;
+  const std::uint32_t epoch = currentEpoch(runtime);
+  const std::uint32_t observed = atomicCAS(&progress.epoch, 0U, epoch);
+  if (observed != 0U && observed != epoch) {
+    recordDroppedAttribution(progress);
+    return nullptr;
+  }
+  return &progress;
 }
 
 __device__ __forceinline__ void addProgressValue(std::uint64_t *value,
@@ -38,12 +48,35 @@ __device__ __forceinline__ void addProgressValue(std::uint64_t *value,
   }
 }
 
-__device__ __forceinline__ void subtractProgressValue(std::uint64_t *value,
+__device__ __forceinline__ bool subtractProgressValue(std::uint64_t *value,
                                                       std::uint64_t decrement) {
-  if (decrement != 0) {
-    atomicAdd(reinterpret_cast<unsigned long long *>(value),
-              0ULL - static_cast<unsigned long long>(decrement));
+  if (decrement == 0) {
+    return true;
   }
+  auto *atomicValue = reinterpret_cast<unsigned long long *>(value);
+  unsigned long long observed = atomicAdd(atomicValue, 0ULL);
+  while (observed >= decrement) {
+    const unsigned long long previous = atomicCAS(
+        atomicValue, observed, observed - static_cast<unsigned long long>(decrement));
+    if (previous == observed) {
+      return true;
+    }
+    observed = previous;
+  }
+  return false;
+}
+
+__device__ __forceinline__ bool subtractProgressCounter(std::uint32_t *value,
+                                                        std::uint32_t decrement) {
+  std::uint32_t observed = atomicAdd(value, 0U);
+  while (observed >= decrement) {
+    const std::uint32_t previous = atomicCAS(value, observed, observed - decrement);
+    if (previous == observed) {
+      return true;
+    }
+    observed = previous;
+  }
+  return false;
 }
 
 __device__ __forceinline__ bool
@@ -88,7 +121,9 @@ recordPendingWork(abi::RuntimeView *runtime, const abi::WorkTicket &ticket) {
   abi::RequestProgress *progress = requestProgress(runtime, ticket);
   if (progress != nullptr) {
     atomicAdd(&progress->expectedWork, 1U);
+    addProgressValue(&progress->expectedComputeNs, ticket.estimatedComputeNs);
     atomicAdd(&progress->pendingWork, 1U);
+    addProgressValue(&progress->pendingComputeNs, ticket.estimatedComputeNs);
     addProgressValue(&progress->unavailableBytes, ticket.unavailableBytes);
   }
   if (!recordReductionExpected(runtime, ticket) &&
@@ -102,12 +137,19 @@ __device__ __forceinline__ void
 recordRunnableWork(abi::RuntimeView *runtime, const abi::WorkTicket &ticket) {
   abi::RequestProgress *progress = requestProgress(runtime, ticket);
   if (progress != nullptr) {
-    atomicSub(&progress->pendingWork, 1U);
+    const bool bytesRetired = subtractProgressValue(
+        &progress->unavailableBytes, ticket.unavailableBytes);
+    const bool computeRetired = subtractProgressValue(
+        &progress->pendingComputeNs, ticket.estimatedComputeNs);
+    const bool workRetired =
+        subtractProgressCounter(&progress->pendingWork, 1U);
+    if (!bytesRetired || !computeRetired || !workRetired) {
+      recordDroppedAttribution(*progress);
+      recordFailure(runtime);
+      return;
+    }
+    addProgressValue(&progress->runnableComputeNs, ticket.estimatedComputeNs);
     atomicAdd(&progress->runnableWork, 1U);
-    subtractProgressValue(&progress->unavailableBytes,
-                          ticket.unavailableBytes);
-    addProgressValue(&progress->runnableComputeNs,
-                     ticket.estimatedComputeNs);
   }
 }
 
@@ -119,19 +161,38 @@ recordTerminalWork(abi::RuntimeView *runtime, const abi::WorkTicket &ticket,
   if (progress != nullptr) {
     if (previous == abi::WorkTicketState::New) {
       atomicAdd(&progress->expectedWork, 1U);
+      addProgressValue(&progress->expectedComputeNs, ticket.estimatedComputeNs);
     } else if (previous == abi::WorkTicketState::Pending) {
-      atomicSub(&progress->pendingWork, 1U);
-      subtractProgressValue(&progress->unavailableBytes,
-                            ticket.unavailableBytes);
+      const bool bytesRetired = subtractProgressValue(
+          &progress->unavailableBytes, ticket.unavailableBytes);
+      const bool computeRetired = subtractProgressValue(
+          &progress->pendingComputeNs, ticket.estimatedComputeNs);
+      const bool workRetired =
+          subtractProgressCounter(&progress->pendingWork, 1U);
+      if (!bytesRetired || !computeRetired || !workRetired) {
+        recordDroppedAttribution(*progress);
+        recordFailure(runtime);
+        recordReductionTerminal(runtime, ticket,
+                                abi::WorkTicketState::Failed);
+        return;
+      }
     } else if (previous == abi::WorkTicketState::Ready) {
-      atomicSub(&progress->runnableWork, 1U);
-      subtractProgressValue(&progress->runnableComputeNs,
-                            ticket.estimatedComputeNs);
+      const bool computeRetired = subtractProgressValue(
+          &progress->runnableComputeNs, ticket.estimatedComputeNs);
+      const bool workRetired =
+          subtractProgressCounter(&progress->runnableWork, 1U);
+      if (!computeRetired || !workRetired) {
+        recordDroppedAttribution(*progress);
+        recordFailure(runtime);
+        recordReductionTerminal(runtime, ticket,
+                                abi::WorkTicketState::Failed);
+        return;
+      }
     }
     if (terminal == abi::WorkTicketState::Done) {
-      atomicAdd(&progress->completedWork, 1U);
       addProgressValue(&progress->completedComputeNs,
                        ticket.estimatedComputeNs);
+      atomicAdd(&progress->completedWork, 1U);
     } else if (terminal == abi::WorkTicketState::Cancelled) {
       atomicAdd(&progress->cancelledWork, 1U);
     } else {
@@ -166,6 +227,11 @@ __device__ __forceinline__ bool requestLive(abi::RuntimeView *runtime,
   return request.generation == generation && request.cancelled == 0;
 }
 
+__device__ __forceinline__ void recordFailure(abi::RuntimeView *runtime) {
+  atomicAdd(&runtime->failedCount, 1U);
+  atomicAdd(&runtime->stickyFailedCount, 1U);
+}
+
 __device__ __forceinline__ void failWorkTicket(abi::RuntimeView *runtime,
                                                std::uint32_t workTicket,
                                                abi::WorkTicketState state) {
@@ -193,7 +259,7 @@ __device__ __forceinline__ void failWorkTicket(abi::RuntimeView *runtime,
   const bool changed = previous != abi::WorkTicketState::Initializing;
   if (changed) {
     recordTerminalWork(runtime, ticket, previous, state);
-    atomicAdd(&runtime->failedCount, 1U);
+    recordFailure(runtime);
   }
 }
 
@@ -211,7 +277,7 @@ failBoundWorkTicket(abi::RuntimeView *runtime, std::uint32_t workTicket,
           static_cast<std::uint32_t>(abi::WorkTicketState::Pending)) {
     recordTerminalWork(runtime, record, abi::WorkTicketState::Pending,
                        abi::WorkTicketState::Failed);
-    atomicAdd(&runtime->failedCount, 1U);
+    recordFailure(runtime);
   }
 }
 

@@ -2,7 +2,7 @@
 
 Public design documents call work whose inputs are available a runnable tile and
 call its finite execution a runnable-work launch. `Ready` remains only the
-literal ABI-v20 ticket state for a tile whose dependencies are available.
+literal ABI-v25 ticket state for a tile whose dependencies are available.
 
 NTA is integrated at two independent boundaries: an engine publishes request
 and object metadata, and a source-available finite GPU kernel calls one policy
@@ -57,6 +57,7 @@ exported launchers and verifies `nta::abi::Version` before use:
 
 ```cpp
 nta::JitPhaseProgram phases(flashinfer_module_path);
+const nta::OperatorContract &contract = phases.operatorContract();
 phases.enqueueHost(stream, runtime.deviceView(), config,
   [&] { flashinfer_initial_run(); },
   [&] { flashinfer_ready_run(); });
@@ -75,7 +76,12 @@ Every operation returns a status and thread-local diagnostic, validates struct
 size/API version, and leaves output handles null on failure. The API exposes
 non-owning object and tensor-map registration, asynchronous plan upload,
 work ticket state, phase launches, VFIO transport construction, NVMe object
-installation, capabilities, and queue statistics.
+installation, capabilities, queue statistics, operator-contract and typed-plan
+queries, and a capture-safe asynchronous host-to-device copy used by bounded
+tier streaming. C API v22 also exposes a stream-ordered request-progress copy
+into caller-owned pinned memory. It permits generation-safe policy snapshots
+without `cudaDeviceSynchronize`; the caller records an event on the same stream
+and must not reuse the destination before that event completes.
 
 The dependency-free `python/nta_runtime` module binds that API with `ctypes` and
 accepts integer addresses from Torch or another CUDA framework:
@@ -88,6 +94,9 @@ direct = runtime.register_object(
     [nta_runtime.Replica(kv_page.data_ptr(), nta_runtime.Placement.HBM)],
 )
 plan.upload(work_items, dependencies, request_ranges, torch.cuda.current_stream())
+snapshot = runtime.request_progress_snapshot()
+snapshot.capture(first_request_slot, request_count, torch.cuda.current_stream())
+progress = snapshot.query()  # None until the stream-ordered copy completes
 ```
 
 The Python owner keeps an attached NVMe transport alive for the runtime, reuses
@@ -112,10 +121,10 @@ force a device synchronization or repack KV rows on the CPU.
 The installed `sglang.srt.plugins` entry point registers `nta_flashinfer` for
 SGLang 0.5.14. It translates SGLang request slots, HiCache page maps, and
 FlashInfer schedule coordinates into this host boundary. Resident batches
-and preacquired host-backed batches retain stock FlashInfer; unresolved
-multi-round batches publish request generations and use instrumented wrappers.
-Planning failures restore SGLang's original transfer path before attention
-starts. Scheduler aborts are mirrored into any current request generation. See
+and preacquired host-backed batches use the transformed direct form;
+unresolved multi-round batches use generation-keyed work tickets. Planning
+failures abort instead of switching attention implementations. Scheduler
+aborts are mirrored into any current request generation. See
 `SGLANG.md` for the exact support matrix and command line.
 
 vLLM has no registered adapter. vLLM 0.13's experimental KVConnector carries

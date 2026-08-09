@@ -10,6 +10,7 @@ class Runtime:
     def __init__(self) -> None:
         self.updates: list[tuple[int, int, int, int, int]] = []
         self.cancellations: list[tuple[int, int]] = []
+        self.async_updates = []
 
     def set_request(
         self,
@@ -23,6 +24,9 @@ class Runtime:
         self.updates.append(
             (slot, request_id, generation, priority, deadline_clock)
         )
+
+    def publish_requests_async(self, requests, stream) -> None:
+        self.async_updates.append((tuple(requests), stream))
 
     def cancel_request(self, slot: int, generation: int) -> None:
         self.cancellations.append((slot, generation))
@@ -61,3 +65,15 @@ tracker.bind(["agent/branch-a", "agent/branch-b", "other"], [0, 1, 3])
 assert tracker.cancel_matching("agent/") == 2
 assert runtime.cancellations[-2:] == [(0, 2), (1, 1)]
 assert tracker.cancel_matching(all=True) == 4
+
+async_runtime = Runtime()
+async_tracker = RequestSlotTracker(async_runtime, 4)
+async_bindings = async_tracker.bind(
+    ["request-z", "request-y"], [1, 0], stream=1234
+)
+assert [binding.request_slot for binding in async_bindings] == [1, 0]
+assert async_runtime.updates == []
+assert len(async_runtime.async_updates) == 1
+updates, stream = async_runtime.async_updates[0]
+assert stream == 1234
+assert [update.slot for update in updates] == [1, 0]

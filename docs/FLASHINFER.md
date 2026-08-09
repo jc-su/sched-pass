@@ -6,7 +6,9 @@ implemented and executed for FlashInfer 0.6.12. The eager SGLang 0.5.14
 HiCache lifecycle and full decode CUDA-graph replay are integrated through its
 plugin system. FlashInfer top-k selection now feeds bounded device-indexed host
 page acquisition and real paged decode without a host identity round trip.
-vLLM, serving use of that path, demand-mode graph phases, and paged-prefill
+Canonical ragged FlashInfer now also establishes an exact bounded-HBM streaming
+crossover over atomic CPU-DRAM promotion. vLLM, compiler generation of that
+streaming form, serving use of it, demand-mode graph phases, and paged-prefill
 graph validation remain open.
 
 ## Boundary
@@ -43,6 +45,9 @@ heuristic. It operates while FlashInfer still has scheduler request/tile types,
 places the work hook before kernel state initialization, and carries
 request-local contributor groups into cascade merge. The raw LLVM pass then
 checks CTA collectivity, control dependence, and the finite return boundary.
+Each generated shared object exports a schema-versioned family/form/capability
+contract and source fingerprint; runtime and SGLang reject an ABI mismatch,
+wrong operator family, missing capability, or unpaired source revision.
 
 The installed 0.6.12 package also exposes
 `top_k_page_table_transform`, `BlockSparseAttentionWrapper`, and
@@ -71,6 +76,23 @@ The LLVM pass proves CTA-uniform operands and control, requires the direct
 non-inlined device helper. Direct dependencies take a compiler-generated fast
 edge that avoids the noinline acquisition helper while retaining request
 liveness and work ticket-state checks.
+
+Demand-mode kernels also delimit their numerical effect:
+
+```text
+acquire(work ticket) or collective return
+begin_partial(work ticket)
+  unchanged FlashInfer numerical mainloop
+commit_partial(reduction group, contributor, count, cost)
+```
+
+The begin and commit calls carry LLVM `convergent` semantics. The pass proves
+that they share the acquisition's request binding and work ticket, that commit
+post-dominates begin, and that each region publishes exactly once. It then
+erases begin and lowers commit to the generation-checked runtime protocol with
+`!nta.partial` and function-level `!nta.operator` metadata. This moves partial
+completion out of a hand-written hook and makes malformed incremental control
+flow a compile error.
 
 The hook uses the common backend policy. With CTA NVMe try-issue enabled, the
 FlashInfer CTA leader can construct and ring one read before the collective
@@ -113,14 +135,18 @@ version adapter.
 The Python integration passes `Runtime` and optional `DeviceWorkPlan`
 allocations as zero-copy DLPack byte tensors, satisfying FlashInfer's
 custom-tensor ABI without reproducing native layouts in an engine.
-Preacquired batches pass only the runtime view and request count; the compiler
-emits request-liveness guards without plan, reset, progress, or retirement
-work. Demand-driven batches use `FlashInferLayerEpoch`, whose eager `run_*` and
-fixed `enqueue_*` methods retain the bounded work-ticket protocol. The fixed
-methods can be captured only after structural work-plan upload; the upload path
-rejects capture rather than synchronizing illegally. SGLang owns the
-request-guarded decode replay path, but does not yet replay these demand-mode
-phase nodes.
+Preacquired batches use a separately named request-bound module and pass only
+the runtime view and request count; the compiler emits request-liveness guards
+without plan, reset, progress, or retirement work. One lane per warp reads the
+immutable request directory and broadcasts the CTA-uniform decision, avoiding
+both per-lane metadata reads and a CTA barrier. Demand-driven modules require
+completion tracking and contain the acquisition plus partial-region contract;
+they cannot be invoked as request-bound modules by changing a runtime flag.
+Demand-driven batches use `FlashInferLayerEpoch`, whose eager `run_*` and fixed
+`enqueue_*` methods retain the bounded work-ticket protocol. The fixed methods
+can be captured only after structural work-plan upload; the upload path rejects
+capture rather than synchronizing illegally. SGLang owns the request-guarded
+decode replay path, but does not yet replay these demand-mode phase nodes.
 
 ## Finite Incremental Execution
 
@@ -141,12 +167,13 @@ item; work ticket initialization uses a single CAS owner and publishes
 CTA does not spin or issue against partial state. No CTA polls for external
 completion and no persistent kernel is used.
 
-Publication writes original scheduler work-ticket indices into a stable
-runnable-tile array. A runnable-work launch maps the physical front-of-grid CTA
-prefix through that array before FlashInfer derives request or KV-tile identity.
-CTAs outside the published prefix return at the hook. This compacts useful work
-inside the fixed framework grid; reducing the physical launch width still
-requires graph or device-launch integration.
+Publication updates the original scheduler work ticket. Each FlashInfer wave
+retains the canonical grid and request/KV-tile coordinates; the compiler hook
+admits only tickets that are available in the current request generation, and
+all other CTAs return before state initialization. This avoids mutating one
+shared runnable-index list while transfer and compute streams overlap. It does
+not compact the physical grid, so reducing launch width still requires graph or
+device-launch integration.
 
 Work ticket state is scoped to one attention-layer invocation. The
 runnable-work launch retires that layer's work as `Done`; the next layer must begin a new
@@ -156,23 +183,32 @@ integration contract.
 
 When the engine already enqueued acquisition at its producer boundary, a
 post-transfer event orders the consumer stream and the kernel uses the
-stock FlashInfer wrapper without a work ticket or NTA hook. Request generation
-remains bound for engine lifecycle accounting. The full instrumented cycle
-above, including CTA-side generation validation, remains available when tile
-demand is unresolved at kernel execution.
+transformed direct form without a work ticket. Every CTA still executes the
+compiler-inserted current-generation guard. The full ticketed cycle above is
+used when tile demand is unresolved at kernel execution.
 
-Split-K decode and paged prefill are phase aware. The custom ABI carries
-`nta_skip_merge`; initial and intermediate runnable-work launches write only
-scratch partitions, and the final bounded launch performs one stock FlashInfer
-reduction. The patched cascade merge maps each decode row directly to its
-request reduction group and each prefill row through FlashInfer's query indptr.
+Split-K decode and paged prefill are phase aware. Every wave writes only the
+scratch partitions owned by contributors admitted in that wave, then reaches
+FlashInfer's original numerical reduction behind an NTA completion gate. The
+patched cascade merge maps each decode row directly to its request reduction
+group and each prefill row through FlashInfer's query indptr.
 It reads device-owned expected/completed/failed contributor arrays after the
 grid dependency and skips incomplete or failed request rows before reading
 scratch. A complete request may therefore merge while a peer remains blocked.
 The overlay modifies one decode, both prefill split-K dispatch sites, and the
 cascade merge after verifying exact source hashes and insertion anchors.
-Ragged prefill is intentionally not hooked because it does not consume external
-paged KV through this boundary.
+Ragged prefill is compiler transformed for the canonical bounded-HBM operator
+experiment. It is not used as SGLang's external paged-KV hook; SGLang demand
+uses the version-checked FA2 paged-prefill and decode insertion points.
+
+For SGLang multi-round CPU-DRAM demand, the structural work/dependency topology
+is reused across layers. After layer `L` attention finishes, a GPU kernel
+rebinds the indexed directory to layer `L+1`, and a finite copy stages the first
+contributor wave while the model executes post-attention work. Epoch reset
+preserves those completed directory entries. The next canonical initial wave
+consumes them, and bounded progress acquires only the remaining waves. This is
+an online layer-order optimization, not an offline demand oracle; page identity
+and request generation still come from the current SGLang batch.
 
 ## Incremental Operator Boundary
 
@@ -198,6 +234,19 @@ launches the resulting runnable tile set, and feeds actual partial progress into
 later batch decisions. Forced endpoints remain only for evaluation. This is the
 co-design boundary described in `SYSTEM_PLAN.md`.
 
+The first canonical performance result now uses FlashInfer's real ragged
+prefill and online-softmax merge, not a custom attention kernel. At the 64K
+context/256-query point, bounded double buffering is `1.1714x` faster than one
+atomic promotion with a 95% interval of `[1.1660x, 1.1732x]` and uses `4x` less
+staging HBM. A separate heterogeneous context/query run is `1.1100x` faster
+with `4.83x` less staging. `TIER_STREAMING.md` contains the exact shape,
+commands, per-request completion evidence, and claim boundary. The reusable
+runtime operator now owns wrapper construction, wave metadata, copy slots,
+partials, merge, completion, and dynamic-source graph replay. Paired compiler
+artifacts export and validate one typed request-coordinate, `(V, LSE)`, and
+ordered-merge plan. This closes the compiler/runtime operator
+performance-opportunity gate; it does not close the SGLang integration gate.
+
 For the sparse stress case, selected page IDs must remain on device:
 
 ```text
@@ -214,13 +263,13 @@ does not.
 
 ## Validation
 
-Correctness gates below run on ABI v20. Any quoted sanitizer and performance
-numbers that predate v20 must be regenerated before use as current evidence.
+Correctness gates below run on ABI v25. Any quoted sanitizer and performance
+numbers that predate v22 must be regenerated before use as current evidence.
 
 The local CTest gate covers:
 
 - real multi-source decode and paged-prefill JIT compilation with NTA Params;
-- C and C++ loading of the exported ABI-20 phase functions;
+- C and C++ loading of the exported ABI-25 phase functions;
 - resident and pinned-host deferred decode;
 - heterogeneous request remapping where only the nonzero scheduler ticket is
   ready and physical CTA zero must execute it;
@@ -239,17 +288,19 @@ pages. The five-point sweep and current numbers are recorded in
 `VALIDATION.md`.
 
 Memcheck, racecheck, and synccheck are clean on the shared-work ticket deferred
-path. A matched 64-request custom-variant microbenchmark has an 8% CTest
-regression limit; the latest local median measured 4.63% resident overhead.
+path. A matched 64-request custom-variant microbenchmark has a 5% CTest
+regression limit on the compiler-transformed request-bound direct form; the
+latest three consecutive cached runs measured 1.76%-2.59% overhead. The
+incremental form measured 5.82%-6.41% on the same runs and is
+reported separately rather than being mislabeled as resident direct overhead.
 This is a local regression gate, not controlled multi-machine performance
 evidence.
 
 The matched SGLang 0.5.14 environment completes both a stock smoke workload
 and an NTA HiCache workload through the installed `sglang.srt.plugins` entry
 point. The plugin registers `nta_flashinfer`, intercepts HiCache loads, and
-routes external paged-KV batches through the stock
-wrappers after acquisition. Only unresolved incremental batches use the
-instrumented wrappers and publish request slot generations to NTA.
+routes resident, preacquired, graph, and unresolved batches through transformed
+wrappers. The benchmark gate rejects any observed stock attention launch.
 
 ```bash
 ./benchmarks/serving/SglangSmoke.py \
@@ -260,7 +311,7 @@ The runner selects a CUDA-compatible host compiler before importing SGLang,
 uses an isolated FlashInfer JIT cache, and emits machine-readable JSON. It is a
 stock serving baseline and deliberately records `nta_integrated=false`.
 `CompareSglangHiCache.py` is the integrated matched gate. It rejects fallback,
-post-acquisition instrumented launches, mismatched output, and mismatched
+stock attention launches, missing transformed/ticketed launches, mismatched output, and mismatched
 residency sequences. `--verify-transfer` executes synchronous row-by-row KV
 verification in a separate arm so it cannot inflate only NTA's timed result.
 See `SGLANG.md` for the supported profile and the limits of local
@@ -268,9 +319,9 @@ single-machine measurements.
 
 ## Open Gates
 
-- compiler-generated direct and incremental forms of the same real FlashInfer
-  dense kernel, followed by unified grouping, engine feedback, best-fixed trace
-  comparison, and resettable decision-regret evaluation;
+- SGLang consumption of the compiler-generated direct and incremental forms,
+  followed by unified grouping, engine feedback, best-fixed trace comparison,
+  and resettable decision-regret evaluation;
 - end-to-end SGLang or vLLM use of the GPU-selected page path, including real
   model-generated scores rather than controlled random scores;
 - a vLLM request-generation/KV-offload adapter, SGLang demand-mode graph
@@ -283,6 +334,6 @@ single-machine measurements.
   the current local-memory-and-storage scope; and
 - upstream FlashInfer hook and scheduler-metadata APIs.
 
-Therefore this is a functioning optimized-kernel integration for one validated
-FlashInfer revision. It is not yet a production serving integration or an
-OSDI-level evaluation.
+Therefore this is a functioning optimized-kernel integration plus a positive
+canonical-FlashInfer bounded-HBM mechanism for one validated revision. It is
+not yet a production serving integration or an OSDI-level evaluation.

@@ -16,8 +16,8 @@ namespace nta::device {
 
 __device__ __forceinline__ std::uint64_t globalTimerNs();
 
-__device__ __forceinline__ bool
-publishRunnableWork(abi::RuntimeView *runtime, std::uint32_t workTicket) {
+__device__ __forceinline__ bool publishRunnableWork(abi::RuntimeView *runtime,
+                                                    std::uint32_t workTicket) {
   if (runtime == nullptr || runtime->workTickets == nullptr ||
       runtime->remainingDependencies == nullptr ||
       runtime->readyCount == nullptr || runtime->readyWorkTickets == nullptr ||
@@ -38,15 +38,15 @@ publishRunnableWork(abi::RuntimeView *runtime, std::uint32_t workTicket) {
         pending) {
       recordTerminalWork(runtime, ticket, abi::WorkTicketState::Pending,
                          abi::WorkTicketState::Failed);
-      atomicAdd(&runtime->failedCount, 1U);
+      recordFailure(runtime);
     }
     return false;
   }
   const abi::RequestContext &request = runtime->requests[ticket.requestSlot];
   if (request.generation != ticket.generation || request.cancelled != 0) {
     if (atomicCAS(&ticket.state, pending,
-                  static_cast<std::uint32_t>(abi::WorkTicketState::Cancelled)) ==
-        pending) {
+                  static_cast<std::uint32_t>(
+                      abi::WorkTicketState::Cancelled)) == pending) {
       recordTerminalWork(runtime, ticket, abi::WorkTicketState::Pending,
                          abi::WorkTicketState::Cancelled);
     }
@@ -72,12 +72,12 @@ publishRunnableWork(abi::RuntimeView *runtime, std::uint32_t workTicket) {
              static_cast<std::uint32_t>(abi::WorkTicketState::Failed));
   recordTerminalWork(runtime, ticket, abi::WorkTicketState::Ready,
                      abi::WorkTicketState::Failed);
-  atomicAdd(&runtime->failedCount, 1U);
+  recordFailure(runtime);
   return false;
 }
 
-__device__ __forceinline__ bool
-enqueueChangedWork(abi::RuntimeView *runtime, std::uint32_t workTicket) {
+__device__ __forceinline__ bool enqueueChangedWork(abi::RuntimeView *runtime,
+                                                   std::uint32_t workTicket) {
   if (runtime == nullptr || runtime->changedWorkTickets == nullptr ||
       runtime->changedQueued == nullptr || runtime->changedCount == nullptr ||
       runtime->changedOverflow == nullptr ||
@@ -104,8 +104,8 @@ dependencyRange(abi::RuntimeView *runtime, std::uint32_t workTicket,
       workTicket >= runtime->workTicketCapacity ||
       dependencyCount > runtime->maxDependenciesPerWorkTicket ||
       runtime->maxDependenciesPerWorkTicket == 0 ||
-      workTicket > runtime->dependencyCapacity /
-                         runtime->maxDependenciesPerWorkTicket) {
+      workTicket >
+          runtime->dependencyCapacity / runtime->maxDependenciesPerWorkTicket) {
     return false;
   }
   dependencyStart = workTicket * runtime->maxDependenciesPerWorkTicket;
@@ -115,8 +115,7 @@ dependencyRange(abi::RuntimeView *runtime, std::uint32_t workTicket,
 
 __device__ __forceinline__ bool
 dependencyBelongsToTicket(const abi::RuntimeView *runtime,
-                          std::uint32_t dependency,
-                          std::uint32_t workTicket) {
+                          std::uint32_t dependency, std::uint32_t workTicket) {
   if (runtime == nullptr || workTicket >= runtime->workTicketCapacity ||
       dependency >= runtime->dependencyCapacity) {
     return false;
@@ -127,8 +126,8 @@ dependencyBelongsToTicket(const abi::RuntimeView *runtime,
          dependency - ticket.dependencyStart < ticket.dependencyCount;
 }
 
-__device__ __forceinline__ bool
-satisfyDependency(abi::RuntimeView *runtime, std::uint32_t dependency) {
+__device__ __forceinline__ bool satisfyDependency(abi::RuntimeView *runtime,
+                                                  std::uint32_t dependency) {
   if (runtime == nullptr || runtime->dependencySatisfied == nullptr ||
       runtime->remainingDependencies == nullptr ||
       runtime->maxDependenciesPerWorkTicket == 0 ||
@@ -142,8 +141,7 @@ satisfyDependency(abi::RuntimeView *runtime, std::uint32_t dependency) {
   }
   abi::WorkTicket &ticket = runtime->workTickets[workTicket];
   const std::uint32_t state = atomicAdd(&ticket.state, 0U);
-  if (state !=
-          static_cast<std::uint32_t>(abi::WorkTicketState::Initializing) &&
+  if (state != static_cast<std::uint32_t>(abi::WorkTicketState::Initializing) &&
       state != static_cast<std::uint32_t>(abi::WorkTicketState::Pending)) {
     return false;
   }
@@ -165,8 +163,8 @@ satisfyDependency(abi::RuntimeView *runtime, std::uint32_t dependency) {
   return true;
 }
 
-__device__ __forceinline__ bool
-failDependency(abi::RuntimeView *runtime, std::uint32_t dependency) {
+__device__ __forceinline__ bool failDependency(abi::RuntimeView *runtime,
+                                               std::uint32_t dependency) {
   if (runtime == nullptr || runtime->dependencySatisfied == nullptr ||
       runtime->maxDependenciesPerWorkTicket == 0 ||
       dependency >= runtime->dependencyCapacity) {
@@ -185,16 +183,16 @@ failDependency(abi::RuntimeView *runtime, std::uint32_t dependency) {
       static_cast<std::uint32_t>(abi::WorkTicketState::Pending)) {
     recordTerminalWork(runtime, ticket, abi::WorkTicketState::Pending,
                        abi::WorkTicketState::Failed);
-    atomicAdd(&runtime->failedCount, 1U);
+    recordFailure(runtime);
   }
   return true;
 }
 
 __device__ __forceinline__ bool
 initializeWorkTicket(abi::RuntimeView *runtime, std::uint32_t requestSlot,
-                       std::uint32_t generation, std::uint32_t workTicket,
-                       const abi::AcquireRequirement *requirements,
-                       std::uint32_t requirementCount) {
+                     std::uint32_t generation, std::uint32_t workTicket,
+                     const abi::AcquireRequirement *requirements,
+                     std::uint32_t requirementCount) {
   std::uint32_t dependencyStart = 0;
   if (requirementCount == 0 ||
       !dependencyRange(runtime, workTicket, requirementCount,
@@ -287,17 +285,16 @@ initializeWorkTicket(abi::RuntimeView *runtime, std::uint32_t requestSlot,
       runtime->dependencySatisfied[dependency] = 2U;
       continue;
     }
-    runtime->dependencyNext[dependency] =
-        atomicExch(&runtime->objectDependentHeads[requirement.objectSlot],
-                   dependency);
+    runtime->dependencyNext[dependency] = atomicExch(
+        &runtime->objectDependentHeads[requirement.objectSlot], dependency);
   }
   __threadfence();
 
   // Reconcile after every edge is visible. If completion raced ahead of edge
   // insertion, this pass observes the terminal object state; if completion
   // followed insertion, the per-edge CAS makes the duplicate observation free.
-  for (std::uint32_t dependencyOffset = 0;
-       dependencyOffset < externalCount; ++dependencyOffset) {
+  for (std::uint32_t dependencyOffset = 0; dependencyOffset < externalCount;
+       ++dependencyOffset) {
     const std::uint32_t dependency = dependencyStart + dependencyOffset;
     if (runtime->dependencySatisfied[dependency] == 2U) {
       continue;
@@ -321,8 +318,8 @@ initializeWorkTicket(abi::RuntimeView *runtime, std::uint32_t requestSlot,
     atomicExch(&record.state,
                static_cast<std::uint32_t>(abi::WorkTicketState::Pending));
     recordPendingWork(runtime, record);
-    for (std::uint32_t dependencyOffset = 0;
-         dependencyOffset < externalCount; ++dependencyOffset) {
+    for (std::uint32_t dependencyOffset = 0; dependencyOffset < externalCount;
+         ++dependencyOffset) {
       setupFailed |=
           runtime->dependencySatisfied[dependencyStart + dependencyOffset] ==
           2U;
@@ -334,7 +331,7 @@ initializeWorkTicket(abi::RuntimeView *runtime, std::uint32_t requestSlot,
             static_cast<std::uint32_t>(abi::WorkTicketState::Pending)) {
       recordTerminalWork(runtime, record, abi::WorkTicketState::Pending,
                          abi::WorkTicketState::Failed);
-      atomicAdd(&runtime->failedCount, 1U);
+      recordFailure(runtime);
       return false;
     }
     if (atomicAdd(&runtime->remainingDependencies[workTicket], 0U) == 0U) {
@@ -345,7 +342,7 @@ initializeWorkTicket(abi::RuntimeView *runtime, std::uint32_t requestSlot,
                static_cast<std::uint32_t>(abi::WorkTicketState::Failed));
     recordTerminalWork(runtime, record, abi::WorkTicketState::New,
                        abi::WorkTicketState::Failed);
-    atomicAdd(&runtime->failedCount, 1U);
+    recordFailure(runtime);
     return false;
   }
   return true;
@@ -476,24 +473,116 @@ __device__ __forceinline__ void releaseTenantBytes(abi::RuntimeView *runtime,
   }
 }
 
-__device__ __forceinline__ std::uint32_t urgencyBucket(std::uint32_t priority,
-                                                       std::uint64_t deadline,
-                                                       std::uint64_t now) {
-  std::uint32_t urgency = priority > 7U ? 7U : priority;
-  if (deadline == 0) {
-    return urgency;
-  }
-  const std::uint64_t slack = deadline > now ? deadline - now : 0;
-  const std::uint32_t deadlineUrgency = slack <= 50'000ULL      ? 7U
-                                        : slack <= 200'000ULL   ? 6U
-                                        : slack <= 1'000'000ULL ? 5U
-                                        : slack <= 5'000'000ULL ? 4U
-                                                                : 0U;
-  return urgency > deadlineUrgency ? urgency : deadlineUrgency;
+__device__ __forceinline__ std::uint64_t saturatingAdd(std::uint64_t left,
+                                                       std::uint64_t right) {
+  return right > UINT64_MAX - left ? UINT64_MAX : left + right;
 }
 
 __device__ __forceinline__ std::uint64_t
-taggedIntentHead(std::uint32_t tag, std::uint32_t index) {
+bytesToNanoseconds(std::uint64_t bytes, std::uint64_t bandwidth) {
+  if (bytes == 0 || bandwidth == 0) {
+    return 0;
+  }
+  constexpr std::uint64_t billion = 1'000'000'000ULL;
+  const std::uint64_t seconds = bytes / bandwidth;
+  const std::uint64_t remainder = bytes % bandwidth;
+  if (seconds > UINT64_MAX / billion || remainder > UINT64_MAX / billion) {
+    return UINT64_MAX;
+  }
+  const std::uint64_t product = remainder * billion;
+  return saturatingAdd(seconds * billion,
+                       product / bandwidth + (product % bandwidth != 0));
+}
+
+__device__ __forceinline__ std::uint64_t
+criticalServiceNs(abi::RuntimeView *runtime, const abi::AcquireIntent &intent,
+                  abi::SourceKind source) {
+  if (runtime == nullptr) {
+    return 0;
+  }
+  std::uint64_t acquisitionNs = 0;
+  const std::uint32_t sourceIndex = static_cast<std::uint32_t>(source);
+  if (runtime->backends != nullptr && sourceIndex < runtime->backendCapacity) {
+    const abi::BackendView &backend = runtime->backends[sourceIndex];
+    if (backend.sourceKind == sourceIndex &&
+        backend.estimatedBandwidthBytesPerSecond != 0) {
+      const std::uint64_t queued =
+          atomicAdd(reinterpret_cast<unsigned long long *>(
+                        const_cast<std::uint64_t *>(&backend.outstandingBytes)),
+                    0ULL);
+      acquisitionNs = saturatingAdd(
+          backend.estimatedLatencyNs,
+          bytesToNanoseconds(saturatingAdd(queued, intent.bytes),
+                             backend.estimatedBandwidthBytesPerSecond));
+    }
+  }
+
+  std::uint64_t pendingComputeNs = 0;
+  std::uint64_t runnableComputeNs = 0;
+  if (runtime->requestProgress != nullptr &&
+      intent.requestSlot < runtime->requestCapacity) {
+    const abi::RequestProgress &progress =
+        runtime->requestProgress[intent.requestSlot];
+    if (progress.generation == intent.generation) {
+      pendingComputeNs = atomicAdd(
+          reinterpret_cast<unsigned long long *>(
+              const_cast<std::uint64_t *>(&progress.pendingComputeNs)),
+          0ULL);
+      runnableComputeNs = atomicAdd(
+          reinterpret_cast<unsigned long long *>(
+              const_cast<std::uint64_t *>(&progress.runnableComputeNs)),
+          0ULL);
+    }
+  }
+  // The first queue insertion precedes Pending publication. Include the ticket
+  // estimate exactly once in that initializing window; requeues observe it in
+  // RequestProgress instead.
+  if (runtime->workTickets != nullptr &&
+      intent.workTicket < runtime->workTicketCapacity) {
+    const abi::WorkTicket &ticket = runtime->workTickets[intent.workTicket];
+    if (atomicAdd(const_cast<std::uint32_t *>(&ticket.state), 0U) ==
+        static_cast<std::uint32_t>(abi::WorkTicketState::Initializing)) {
+      pendingComputeNs =
+          saturatingAdd(pendingComputeNs, ticket.estimatedComputeNs);
+    }
+  }
+  return saturatingAdd(acquisitionNs > runnableComputeNs ? acquisitionNs
+                                                         : runnableComputeNs,
+                       pendingComputeNs);
+}
+
+__device__ __forceinline__ std::uint32_t
+urgencyBucket(std::uint32_t priority, std::uint64_t deadline, std::uint64_t now,
+              std::uint64_t criticalService) {
+  std::uint32_t urgency = priority > 7U ? 7U : priority;
+  if (deadline == 0) {
+    // With no explicit SLO, combine the caller's priority with a bounded
+    // shortest-critical-work preference to reduce mean completion time.
+    const std::uint32_t serviceUrgency = criticalService == 0              ? 0U
+                                         : criticalService <= 100'000ULL   ? 3U
+                                         : criticalService <= 500'000ULL   ? 2U
+                                         : criticalService <= 2'000'000ULL ? 1U
+                                                                           : 0U;
+    return urgency > serviceUrgency ? urgency : serviceUrgency;
+  }
+  const std::uint64_t slack = deadline > now ? deadline - now : 0;
+  const std::uint32_t deadlineUrgency =
+      slack == 0 || (criticalService != 0 && slack <= criticalService) ? 7U
+      : criticalService != 0 &&
+              slack <= saturatingAdd(criticalService, criticalService)
+          ? 6U
+      : criticalService != 0 &&
+              slack <=
+                  saturatingAdd(saturatingAdd(criticalService, criticalService),
+                                saturatingAdd(criticalService, criticalService))
+          ? 5U
+      : slack <= 5'000'000ULL ? 4U
+                              : 0U;
+  return urgency > deadlineUrgency ? urgency : deadlineUrgency;
+}
+
+__device__ __forceinline__ std::uint64_t taggedIntentHead(std::uint32_t tag,
+                                                          std::uint32_t index) {
   return (static_cast<std::uint64_t>(tag) << 32U) | index;
 }
 
@@ -504,9 +593,10 @@ intentQueueAvailable(const abi::RuntimeView *runtime) {
          runtime->intentCapacity != 0;
 }
 
-__device__ __forceinline__ bool
-pushIntentQueueEntry(abi::RuntimeView *runtime, std::uint32_t slotIndex,
-                     abi::SourceKind source, std::uint32_t urgency) {
+__device__ __forceinline__ bool pushIntentQueueEntry(abi::RuntimeView *runtime,
+                                                     std::uint32_t slotIndex,
+                                                     abi::SourceKind source,
+                                                     std::uint32_t urgency) {
   if (!intentQueueAvailable(runtime) || slotIndex >= runtime->intentCapacity ||
       urgency >= abi::UrgencyBucketCount) {
     return false;
@@ -521,15 +611,14 @@ pushIntentQueueEntry(abi::RuntimeView *runtime, std::uint32_t slotIndex,
   entry.sourceKind = sourceIndex;
   entry.urgency = urgency;
   auto *head = reinterpret_cast<unsigned long long *>(
-      &runtime->intentQueueHeads[sourceIndex * abi::UrgencyBucketCount +
-                                 urgency]);
+      &runtime
+           ->intentQueueHeads[sourceIndex * abi::UrgencyBucketCount + urgency]);
   unsigned long long observed = atomicAdd(head, 0ULL);
   for (;;) {
     entry.next = static_cast<std::uint32_t>(observed);
     __threadfence();
     const std::uint32_t tag = static_cast<std::uint32_t>(observed >> 32U);
-    const unsigned long long desired =
-        taggedIntentHead(tag + 1U, slotIndex);
+    const unsigned long long desired = taggedIntentHead(tag + 1U, slotIndex);
     const unsigned long long prior = atomicCAS(head, observed, desired);
     if (prior == observed) {
       return true;
@@ -538,9 +627,9 @@ pushIntentQueueEntry(abi::RuntimeView *runtime, std::uint32_t slotIndex,
   }
 }
 
-__device__ __forceinline__ bool
-queueIntent(abi::RuntimeView *runtime, abi::IntentSlot &slot,
-            abi::SourceKind source) {
+__device__ __forceinline__ bool queueIntent(abi::RuntimeView *runtime,
+                                            abi::IntentSlot &slot,
+                                            abi::SourceKind source) {
   if (!intentQueueAvailable(runtime)) {
     return false;
   }
@@ -554,9 +643,9 @@ queueIntent(abi::RuntimeView *runtime, abi::IntentSlot &slot,
     return false;
   }
   entry.sequence = slot.sequence;
-  const std::uint32_t urgency =
-      urgencyBucket(slot.intent.priority, slot.intent.deadlineClock,
-                    globalTimerNs());
+  const std::uint32_t urgency = urgencyBucket(
+      slot.intent.priority, slot.intent.deadlineClock, globalTimerNs(),
+      criticalServiceNs(runtime, slot.intent, source));
   if (pushIntentQueueEntry(runtime, slotIndex, source, urgency)) {
     return true;
   }
@@ -564,8 +653,8 @@ queueIntent(abi::RuntimeView *runtime, abi::IntentSlot &slot,
   return false;
 }
 
-__device__ __forceinline__ std::uint32_t
-popIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
+__device__ __forceinline__ std::uint32_t popIntent(abi::RuntimeView *runtime,
+                                                   abi::SourceKind source) {
   if (!intentQueueAvailable(runtime)) {
     return abi::InvalidIndex;
   }
@@ -615,9 +704,9 @@ popIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
   return abi::InvalidIndex;
 }
 
-__device__ __forceinline__ bool
-requeueIntent(abi::RuntimeView *runtime, std::uint32_t slotIndex,
-              abi::SourceKind source) {
+__device__ __forceinline__ bool requeueIntent(abi::RuntimeView *runtime,
+                                              std::uint32_t slotIndex,
+                                              abi::SourceKind source) {
   if (!intentQueueAvailable(runtime) || slotIndex >= runtime->intentCapacity) {
     return false;
   }
@@ -627,9 +716,9 @@ requeueIntent(abi::RuntimeView *runtime, std::uint32_t slotIndex,
   }
   abi::IntentSlot &slot = runtime->intents[slotIndex];
   entry.sequence = slot.sequence;
-  const std::uint32_t urgency =
-      urgencyBucket(slot.intent.priority, slot.intent.deadlineClock,
-                    globalTimerNs());
+  const std::uint32_t urgency = urgencyBucket(
+      slot.intent.priority, slot.intent.deadlineClock, globalTimerNs(),
+      criticalServiceNs(runtime, slot.intent, source));
   if (pushIntentQueueEntry(runtime, slotIndex, source, urgency)) {
     return true;
   }
@@ -794,12 +883,13 @@ replicaReadyCost(const abi::ReplicaEntry &replica,
   }
   const auto transferTime = [&](std::uint64_t queuedBytes) {
     return queuedBytes > UINT64_MAX / 1'000'000'000ULL
-          ? UINT64_MAX
-          : queuedBytes * 1'000'000'000ULL /
-                replica.estimatedBandwidthBytesPerSecond;
+               ? UINT64_MAX
+               : queuedBytes * 1'000'000'000ULL /
+                     replica.estimatedBandwidthBytesPerSecond;
   };
   const std::uint64_t transfer = transferTime(bytes);
-  const std::uint64_t queued = transferTime(loadCounter(&backend.outstandingBytes));
+  const std::uint64_t queued =
+      transferTime(loadCounter(&backend.outstandingBytes));
   if (replica.estimatedLatencyNs > UINT64_MAX - transfer ||
       replica.estimatedLatencyNs + transfer > UINT64_MAX - queued) {
     return UINT64_MAX;
@@ -875,6 +965,56 @@ __device__ __forceinline__ void consumeIntent(abi::RuntimeView *runtime,
       reinterpret_cast<unsigned long long *>(&runtime->intentPool->consumed),
       1ULL);
   atomicSub(&runtime->intentPool->active, 1U);
+}
+
+__device__ __forceinline__ bool tryClaimValidatedIndexedHostIntent(
+    abi::RuntimeView *runtime, abi::IntentSlot &intentSlot,
+    abi::ObjectEntry &object, const abi::ReplicaEntry &replica) {
+  if ((replica.flags &
+       (abi::ReplicaIndexed | abi::ReplicaIndicesValidated)) !=
+          (abi::ReplicaIndexed | abi::ReplicaIndicesValidated) ||
+      replica.sourceKind !=
+          static_cast<std::uint32_t>(abi::SourceKind::HostStaged) ||
+      replica.sourceAddress == 0 || object.stagingAddress == 0) {
+    return false;
+  }
+  const abi::AcquireIntent intent = intentSlot.intent;
+  const bool live = requestLive(runtime, intent.requestSlot, intent.generation);
+  bool accepted = true;
+  if (live) {
+    accepted = tryReserveRequestBytes(runtime, intent.requestSlot,
+                                      intent.generation, intent.bytes);
+    if (accepted &&
+        !tryReserveTenantBytes(runtime, intent.tenantId, intent.bytes)) {
+      releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
+                          intent.bytes);
+      accepted = false;
+    }
+  }
+  if (accepted && !tryReserveBackendBytes(
+                      runtime, abi::SourceKind::HostStaged, intent.bytes)) {
+    if (live) {
+      releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
+                          intent.bytes);
+      releaseTenantBytes(runtime, intent.tenantId, intent.bytes);
+    }
+    accepted = false;
+  }
+  if (accepted && !claimIntent(intentSlot)) {
+    if (live) {
+      releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
+                          intent.bytes);
+      releaseTenantBytes(runtime, intent.tenantId, intent.bytes);
+    }
+    releaseBackendBytes(runtime, abi::SourceKind::HostStaged, intent.bytes);
+    accepted = false;
+  }
+  if (accepted) {
+    __threadfence();
+    atomicExch(&object.state,
+               static_cast<std::uint32_t>(abi::ObjectState::Issued));
+  }
+  return accepted;
 }
 
 enum class TryIssueResult : std::uint32_t {
@@ -1082,7 +1222,7 @@ tryIssueNvmeFromCta(abi::RuntimeView *runtime, const abi::AcquireIntent &intent,
     publishObjectTransition(runtime, intent.objectSlot,
                             abi::ObjectState::Failed);
     failBoundWorkTicket(runtime, intent.workTicket, intent.requestSlot,
-                          intent.generation);
+                        intent.generation);
     atomicAdd(reinterpret_cast<unsigned long long *>(&queue.failed), 1ULL);
     atomicCAS(&queue.error, 0U, 0xfffffffcU);
     result = TryIssueResult::Failed;
@@ -1094,7 +1234,7 @@ tryIssueNvmeFromCta(abi::RuntimeView *runtime, const abi::AcquireIntent &intent,
     publishObjectTransition(runtime, intent.objectSlot,
                             abi::ObjectState::Failed);
     failBoundWorkTicket(runtime, intent.workTicket, intent.requestSlot,
-                          intent.generation);
+                        intent.generation);
     ++queue.failed;
     queue.error = 0xfffffffeU;
     result = TryIssueResult::Failed;
@@ -1176,6 +1316,45 @@ nta_request_live(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
   return nta::device::requestLive(runtime, requestSlot, generation);
 }
 
+// Request-directory publication is ordered on the application stream, and the
+// synchronous cancellation API waits for prior GPU work. The directory is thus
+// immutable for one finite kernel launch. The compiler separately proves that
+// every lane supplies the same slot and generation, so one lane per warp can
+// load the entry and broadcast the CTA-uniform decision without a CTA barrier.
+__device__ __forceinline__ bool
+nta_request_live_warp(nta::abi::RuntimeView *runtime,
+                      std::uint32_t requestSlot,
+                      std::uint32_t generation) {
+  const std::uint32_t linearThread =
+      threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+  const unsigned active = __activemask();
+  const int leader = __ffs(static_cast<int>(active)) - 1;
+  const bool live = static_cast<int>(linearThread & 31U) == leader
+                        ? nta::device::requestLive(runtime, requestSlot,
+                                                   generation)
+                        : false;
+  return __shfl_sync(active, static_cast<unsigned>(live), leader) != 0;
+}
+
+extern "C" __device__ __forceinline__ __attribute__((used)) bool
+nta_request_live_cta(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+                     std::uint32_t generation) {
+  return nta_request_live_warp(runtime, requestSlot, generation);
+}
+
+extern "C" __device__ __forceinline__ __attribute__((used)) bool
+nta_request_live_work_cta(nta::abi::RuntimeView *runtime,
+                          std::uint32_t requestSlot,
+                          std::uint32_t generation,
+                          std::uint32_t workTicket) {
+  const bool live = nta_request_live_warp(runtime, requestSlot, generation);
+  if (!live && threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    nta::device::failWorkTicket(runtime, workTicket,
+                                nta::abi::WorkTicketState::Cancelled);
+  }
+  return live;
+}
+
 extern "C" __device__ __attribute__((used, noinline)) void *
 nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
                  std::uint32_t generation, std::uint32_t objectSlot,
@@ -1185,21 +1364,19 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
   using namespace nta;
   if (!device::requestLive(runtime, requestSlot, generation)) {
     device::failWorkTicket(runtime, workTicket,
-                             abi::WorkTicketState::Cancelled);
+                           abi::WorkTicketState::Cancelled);
     return nullptr;
   }
   if (objectSlot >= runtime->objectCapacity ||
       workTicket >= runtime->workTicketCapacity) {
-    device::failWorkTicket(runtime, workTicket,
-                             abi::WorkTicketState::Failed);
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
     return nullptr;
   }
 
   abi::ObjectEntry &object = runtime->objects[objectSlot];
   if (object.objectId != objectId || object.version != objectVersion ||
       offset > object.bytes || bytes > object.bytes - offset) {
-    device::failWorkTicket(runtime, workTicket,
-                             abi::WorkTicketState::Failed);
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
     return nullptr;
   }
 
@@ -1253,23 +1430,20 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
            static_cast<std::uint32_t>(abi::SourceKind::Nvme) &&
        (device::nvmeQueue(runtime) == nullptr ||
         selected->dmaPageListAddress == 0 || selected->dmaPageCount == 0))) {
-    device::failWorkTicket(runtime, workTicket,
-                             abi::WorkTicketState::Failed);
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
     return nullptr;
   }
   // Directory entries are acquisition tiles. A staged transfer owns
   // the whole tile, so duplicate suppression cannot alias different ranges.
   if (offset != 0 || bytes != object.bytes) {
-    device::failWorkTicket(runtime, workTicket,
-                             abi::WorkTicketState::Failed);
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
     return nullptr;
   }
   if (state == abi::ObjectState::Ready) {
     return reinterpret_cast<std::byte *>(object.stagingAddress) + offset;
   }
   if (state == abi::ObjectState::Failed) {
-    device::failWorkTicket(runtime, workTicket,
-                             abi::WorkTicketState::Failed);
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
     return nullptr;
   }
 
@@ -1281,12 +1455,11 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
       const abi::AcquireRequirement requirement{
           0, 0, objectId, offset, objectSlot, objectVersion, bytes, 0};
       (void)device::initializeWorkTicket(runtime, requestSlot, generation,
-                                           workTicket, &requirement, 1);
+                                         workTicket, &requirement, 1);
     }
   }
 
-  const abi::WorkTicket &workTicketRecord =
-      runtime->workTickets[workTicket];
+  const abi::WorkTicket &workTicketRecord = runtime->workTickets[workTicket];
   if (threadIdx.x == 0 &&
       atomicAdd(const_cast<std::uint32_t *>(&workTicketRecord.state), 0U) ==
           static_cast<std::uint32_t>(abi::WorkTicketState::Pending) &&
@@ -1319,8 +1492,7 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
                  static_cast<std::uint32_t>(abi::ObjectState::Failed));
       device::publishObjectTransition(runtime, objectSlot,
                                       abi::ObjectState::Failed);
-      device::failBoundWorkTicket(runtime, workTicket, requestSlot,
-                                    generation);
+      device::failBoundWorkTicket(runtime, workTicket, requestSlot, generation);
       return nullptr;
     }
     atomicAdd(reinterpret_cast<unsigned long long *>(
@@ -1340,6 +1512,10 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
         pending.valid = 2U;
         intentSlot->intent = pending;
         device::publishIntent(runtime, *intentSlot, source);
+        if (source == abi::SourceKind::HostStaged) {
+          (void)device::tryClaimValidatedIndexedHostIntent(
+              runtime, *intentSlot, object, *selected);
+        }
         if (!device::backendAcceptsIntent(runtime, source) &&
             device::claimIntent(*intentSlot)) {
           atomicExch(&object.state,
@@ -1347,7 +1523,7 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
           device::publishObjectTransition(runtime, objectSlot,
                                           abi::ObjectState::Failed);
           device::failBoundWorkTicket(runtime, workTicket, requestSlot,
-                                        generation);
+                                      generation);
           device::consumeIntent(runtime, *intentSlot);
         }
       } else {
@@ -1359,7 +1535,7 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
         device::publishObjectTransition(runtime, objectSlot,
                                         abi::ObjectState::Failed);
         device::failBoundWorkTicket(runtime, workTicket, requestSlot,
-                                      generation);
+                                    generation);
       }
     }
   }
@@ -1401,32 +1577,38 @@ nta_acquire_tensor_map_slow(nta::abi::RuntimeView *runtime,
   }
 
   nta::device::failWorkTicket(runtime, workTicket,
-                                nta::abi::WorkTicketState::Failed);
+                              nta::abi::WorkTicketState::Failed);
   return nullptr;
 }
 
-extern "C" __device__ __forceinline__ __attribute__((used)) bool
-nta_acquire_set_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
-                     std::uint32_t generation,
-                     const nta::abi::AcquireRequirement *requirements,
-                     std::uint32_t requirementCount,
-                     std::uint32_t directRequirementCount,
-                     std::uint32_t workTicket) {
+extern "C" __device__ __attribute__((used, noinline)) std::uint32_t
+nta_acquire_set_leader(nta::abi::RuntimeView *runtime,
+                       std::uint32_t requestSlot, std::uint32_t generation,
+                       const nta::abi::AcquireRequirement *requirements,
+                       std::uint32_t requirementCount,
+                       std::uint32_t directRequirementCount,
+                       std::uint32_t workTicket) {
   using namespace nta;
-  // The compiler-emitted request-live guard dominates this internal helper.
-  // Transport misses revalidate in nta_acquire_slow before publishing work.
-  std::uint32_t dependencyStart = 0;
-  if (requirements == nullptr || directRequirementCount > requirementCount ||
-      !device::dependencyRange(runtime, workTicket, requirementCount,
-                               dependencyStart)) {
+  if (!device::requestLive(runtime, requestSlot, generation)) {
     device::failWorkTicket(runtime, workTicket,
-                             abi::WorkTicketState::Failed);
-    return false;
+                           abi::WorkTicketState::Cancelled);
+    return 0;
   }
+
+  std::uint32_t dependencyStart = 0;
+  const bool validSet =
+      directRequirementCount <= requirementCount &&
+      (requirementCount == 0 ||
+       (requirements != nullptr &&
+        (directRequirementCount == requirementCount ||
+         device::dependencyRange(runtime, workTicket, requirementCount,
+                                 dependencyStart))));
   (void)dependencyStart;
-  if (directRequirementCount == requirementCount) {
-    return true;
+  if (!validSet) {
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
+    return 0;
   }
+
   bool allReady = true;
   for (std::uint32_t index = 0; index < requirementCount; ++index) {
     const abi::AcquireRequirement &requirement = requirements[index];
@@ -1448,34 +1630,47 @@ nta_acquire_set_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
                 objectState == abi::ObjectState::Ready;
   }
   if (allReady) {
-    return true;
+    return 1;
   }
 
-  const auto workTicketState = static_cast<abi::WorkTicketState>(
+  const auto state = static_cast<abi::WorkTicketState>(
       atomicAdd(&runtime->workTickets[workTicket].state, 0U));
-  if (workTicketState == abi::WorkTicketState::Cancelled ||
-      workTicketState == abi::WorkTicketState::Failed) {
-    return false;
+  if (state == abi::WorkTicketState::Cancelled ||
+      state == abi::WorkTicketState::Failed) {
+    return 0;
   }
-
-  if (threadIdx.x == 0) {
-    (void)device::initializeWorkTicket(runtime, requestSlot, generation,
-                                         workTicket, requirements,
-                                         requirementCount);
-  }
-
-  bool ready = true;
+  (void)device::initializeWorkTicket(runtime, requestSlot, generation,
+                                     workTicket, requirements,
+                                     requirementCount);
+  bool acquired = true;
   for (std::uint32_t index = 0; index < requirementCount; ++index) {
     const abi::AcquireRequirement &requirement = requirements[index];
     if (requirement.directBase != 0) {
       continue;
     }
-    ready &= nta_acquire_slow(runtime, requestSlot, generation,
-                              requirement.objectSlot, requirement.objectId,
-                              requirement.objectVersion, requirement.offset,
-                              requirement.bytes, workTicket) != nullptr;
+    acquired &= nta_acquire_slow(runtime, requestSlot, generation,
+                                 requirement.objectSlot, requirement.objectId,
+                                 requirement.objectVersion, requirement.offset,
+                                 requirement.bytes, workTicket) != nullptr;
   }
-  return ready;
+  return acquired ? 1U : 0U;
+}
+
+extern "C" __device__ __forceinline__ __attribute__((used)) bool
+nta_acquire_set_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+                     std::uint32_t generation,
+                     const nta::abi::AcquireRequirement *requirements,
+                     std::uint32_t requirementCount,
+                     std::uint32_t directRequirementCount,
+                     std::uint32_t workTicket) {
+  __shared__ std::uint32_t ctaReady;
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    ctaReady = nta_acquire_set_leader(runtime, requestSlot, generation,
+                                      requirements, requirementCount,
+                                      directRequirementCount, workTicket);
+  }
+  __syncthreads();
+  return ctaReady != 0;
 }
 
 extern "C" __device__ __forceinline__ __attribute__((used)) const void *
@@ -1586,9 +1781,8 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
         contextValid = atomicAdd(&stored.active, 0U) != 0;
         if (contextValid) {
           const abi::NvmeCommandContext context = stored;
-          bool objectCurrent =
-              context.epoch == device::currentEpoch(runtime) &&
-              context.objectSlot < runtime->objectCapacity;
+          bool objectCurrent = context.epoch == device::currentEpoch(runtime) &&
+                               context.objectSlot < runtime->objectCapacity;
           if (objectCurrent) {
             abi::ObjectEntry &object = runtime->objects[context.objectSlot];
             const abi::ReplicaEntry *replica =
@@ -1610,8 +1804,8 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
               device::publishObjectTransition(runtime, context.objectSlot,
                                               abi::ObjectState::Failed);
               device::failBoundWorkTicket(runtime, context.workTicket,
-                                            context.requestSlot,
-                                            context.generation);
+                                          context.requestSlot,
+                                          context.generation);
               ++queue.failed;
               queue.error = statusField >> 1U;
             }
@@ -1667,8 +1861,7 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
     std::uint64_t chargedBytes = 0;
     std::uint64_t backendBytes = 0;
     if (lane == 0 && queue.outstanding + 1U < queue.depth) {
-      intentSlotIndex =
-          device::popIntent(runtime, abi::SourceKind::Nvme);
+      intentSlotIndex = device::popIntent(runtime, abi::SourceKind::Nvme);
       if (intentSlotIndex != abi::InvalidIndex &&
           intentSlotIndex < runtime->intentPool->capacity &&
           intentSlotIndex < runtime->intentCapacity) {
@@ -1694,9 +1887,8 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
                                          replica)) {
             if (device::claimIntent(selectedSlot)) {
               if (objectCurrent) {
-                atomicExch(
-                    &object.state,
-                    static_cast<std::uint32_t>(abi::ObjectState::Failed));
+                atomicExch(&object.state, static_cast<std::uint32_t>(
+                                              abi::ObjectState::Failed));
                 device::publishObjectTransition(runtime, selected.objectSlot,
                                                 abi::ObjectState::Failed);
               }
@@ -1813,12 +2005,10 @@ nta_defer(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
   if (!device::requestLive(runtime, requestSlot, generation)) {
     record.requestSlot = requestSlot;
     record.generation = generation;
-    if (atomicExch(&record.state,
-                   static_cast<std::uint32_t>(
-                       abi::WorkTicketState::Cancelled)) ==
+    if (atomicExch(&record.state, static_cast<std::uint32_t>(
+                                      abi::WorkTicketState::Cancelled)) ==
         static_cast<std::uint32_t>(abi::WorkTicketState::Pending)) {
-      device::recordTerminalWork(runtime, record,
-                                 abi::WorkTicketState::Pending,
+      device::recordTerminalWork(runtime, record, abi::WorkTicketState::Pending,
                                  abi::WorkTicketState::Cancelled);
     }
     return;
@@ -1839,6 +2029,107 @@ nta_defer(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
   }
 }
 
+namespace nta::device {
+
+template <bool StreamOrdered>
+__device__ __forceinline__ void
+commitPartial(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+              std::uint32_t generation, std::uint32_t workTicket,
+              std::uint32_t reductionGroup, std::uint32_t contributorIndex,
+              std::uint32_t contributorCount,
+              std::uint64_t estimatedComputeNs) {
+  using namespace nta;
+
+  // Every writer makes its numerical partial globally visible before the CTA
+  // collectively publishes completion. The final sibling CTA may then make the
+  // request-local reduction group mergeable.
+  if constexpr (!StreamOrdered) {
+    __threadfence();
+  }
+  __syncthreads();
+  if (threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0) {
+    return;
+  }
+  if (runtime == nullptr || runtime->abiVersion != abi::Version ||
+      runtime->ctaCompletions == nullptr ||
+      workTicket >= runtime->workTicketCapacity ||
+      reductionGroup >= runtime->workTicketCapacity || contributorCount == 0 ||
+      contributorIndex >= contributorCount) {
+    if (runtime != nullptr && workTicket < runtime->workTicketCapacity) {
+      device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
+    }
+    return;
+  }
+
+  const std::uint64_t siblingCount64 =
+      static_cast<std::uint64_t>(gridDim.y) * gridDim.z;
+  if (siblingCount64 == 0 || siblingCount64 > UINT32_MAX) {
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
+    return;
+  }
+  const std::uint32_t siblingCount = static_cast<std::uint32_t>(siblingCount64);
+  const std::uint32_t completed =
+      atomicAdd(&runtime->ctaCompletions[workTicket], 1U) + 1U;
+  if (completed < siblingCount) {
+    return;
+  }
+  if (completed != siblingCount) {
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
+    return;
+  }
+
+  abi::WorkTicket &ticket = runtime->workTickets[workTicket];
+  const auto state =
+      static_cast<abi::WorkTicketState>(atomicAdd(&ticket.state, 0U));
+  if (state == abi::WorkTicketState::New) {
+    if (!device::requestLive(runtime, requestSlot, generation)) {
+      device::failWorkTicket(runtime, workTicket,
+                             abi::WorkTicketState::Cancelled);
+      return;
+    }
+    ticket.requestId = runtime->requests[requestSlot].requestId;
+    ticket.requestSlot = requestSlot;
+    ticket.generation = generation;
+    ticket.logicalTile = workTicket;
+    ticket.epoch = device::currentEpoch(runtime);
+    ticket.unavailableBytes = 0;
+    ticket.estimatedComputeNs = estimatedComputeNs;
+    ticket.reductionGroup = reductionGroup;
+    ticket.contributorCount = contributorCount;
+    __threadfence();
+  } else if (!device::ticketMatches(runtime, ticket, requestSlot, generation) ||
+             ticket.reductionGroup != reductionGroup ||
+             ticket.contributorCount != contributorCount) {
+    device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
+    return;
+  }
+  (void)device::completeWorkTicket(runtime, workTicket);
+}
+
+} // namespace nta::device
+
+extern "C" __device__ __attribute__((used, noinline, convergent)) void
+nta_commit_partial(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+                   std::uint32_t generation, std::uint32_t workTicket,
+                   std::uint32_t reductionGroup, std::uint32_t contributorIndex,
+                   std::uint32_t contributorCount,
+                   std::uint64_t estimatedComputeNs) {
+  nta::device::commitPartial<false>(
+      runtime, requestSlot, generation, workTicket, reductionGroup,
+      contributorIndex, contributorCount, estimatedComputeNs);
+}
+
+extern "C" __device__ __attribute__((used, noinline, convergent)) void
+nta_commit_stream_ordered_partial(
+    nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+    std::uint32_t generation, std::uint32_t workTicket,
+    std::uint32_t reductionGroup, std::uint32_t contributorIndex,
+    std::uint32_t contributorCount, std::uint64_t estimatedComputeNs) {
+  nta::device::commitPartial<true>(
+      runtime, requestSlot, generation, workTicket, reductionGroup,
+      contributorIndex, contributorCount, estimatedComputeNs);
+}
+
 #if NTA_DEVICE_PHASE_KERNELS
 namespace nta::device {
 
@@ -1851,7 +2142,7 @@ __device__ __forceinline__ uint4 loadNoAllocate(const uint4 *address) {
 }
 
 __device__ __forceinline__ void storeNoAllocate(uint4 *address,
-                                                 const uint4 &value) {
+                                                const uint4 &value) {
   asm volatile("st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};"
                :
                : "l"(address), "r"(value.x), "r"(value.y), "r"(value.z),
@@ -1859,18 +2150,16 @@ __device__ __forceinline__ void storeNoAllocate(uint4 *address,
                : "memory");
 }
 
-__device__ __forceinline__ void
-copyIndexedHostObject(const abi::ObjectEntry &object,
-                      const abi::ReplicaEntry &replica,
-                      std::uint32_t objectBlock = 0,
-                      std::uint32_t blocksPerObject = 1) {
+__device__ __forceinline__ void copyIndexedHostObject(
+    const abi::ObjectEntry &object, const abi::ReplicaEntry &replica,
+    std::uint32_t objectBlock = 0, std::uint32_t blocksPerObject = 1) {
   const auto *source =
       reinterpret_cast<const std::byte *>(replica.sourceAddress);
   auto *destination = reinterpret_cast<std::byte *>(object.stagingAddress);
-  const auto *sourceIndices = reinterpret_cast<const std::uint32_t *>(
-      replica.dmaPageListAddress);
-  const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
-      object.stagingTensorMapAddress);
+  const auto *sourceIndices =
+      reinterpret_cast<const std::uint32_t *>(replica.dmaPageListAddress);
+  const auto *destinationIndices =
+      reinterpret_cast<const std::uint32_t *>(object.stagingTensorMapAddress);
   const std::uint32_t sourceStride =
       abi::sourceTransferStride(replica.transferShape);
   const std::uint32_t destinationStride =
@@ -1886,23 +2175,22 @@ copyIndexedHostObject(const abi::ObjectEntry &object,
   const std::uint32_t lane = threadIdx.x % ThreadsPerWorker;
   const std::uint32_t worker = threadIdx.x / ThreadsPerWorker;
   const std::uint32_t workersPerBlock = blockDim.x / ThreadsPerWorker;
-  const std::uint32_t firstElement =
-      objectBlock * workersPerBlock + worker;
+  const std::uint32_t firstElement = objectBlock * workersPerBlock + worker;
   const std::uint32_t elementStride = workersPerBlock * blocksPerObject;
   if (vectorAligned) {
     const std::uint32_t vectorsPerElement = elementBytes / sizeof(uint4);
-    for (std::uint32_t element = firstElement;
-         element < replica.dmaPageCount; element += elementStride) {
-      const std::uint32_t sourceIndex = __shfl_sync(
-          0xffffffffU, lane == 0 ? sourceIndices[element] : 0U, 0);
+    for (std::uint32_t element = firstElement; element < replica.dmaPageCount;
+         element += elementStride) {
+      const std::uint32_t sourceIndex =
+          __shfl_sync(0xffffffffU, lane == 0 ? sourceIndices[element] : 0U, 0);
       const std::uint32_t destinationIndex = __shfl_sync(
           0xffffffffU, lane == 0 ? destinationIndices[element] : 0U, 0);
       for (std::uint32_t within = lane; within < vectorsPerElement;
            within += ThreadsPerWorker) {
-        auto *target = destination +
-                       static_cast<std::uint64_t>(destinationIndex) *
-                           destinationStride +
-                       static_cast<std::uint64_t>(within) * sizeof(uint4);
+        auto *target =
+            destination +
+            static_cast<std::uint64_t>(destinationIndex) * destinationStride +
+            static_cast<std::uint64_t>(within) * sizeof(uint4);
         const auto *origin =
             source + static_cast<std::uint64_t>(sourceIndex) * sourceStride +
             static_cast<std::uint64_t>(within) * sizeof(uint4);
@@ -1913,10 +2201,10 @@ copyIndexedHostObject(const abi::ObjectEntry &object,
     }
     return;
   }
-  for (std::uint32_t element = firstElement;
-       element < replica.dmaPageCount; element += elementStride) {
-    const std::uint32_t sourceIndex = __shfl_sync(
-        0xffffffffU, lane == 0 ? sourceIndices[element] : 0U, 0);
+  for (std::uint32_t element = firstElement; element < replica.dmaPageCount;
+       element += elementStride) {
+    const std::uint32_t sourceIndex =
+        __shfl_sync(0xffffffffU, lane == 0 ? sourceIndices[element] : 0U, 0);
     const std::uint32_t destinationIndex = __shfl_sync(
         0xffffffffU, lane == 0 ? destinationIndices[element] : 0U, 0);
     for (std::uint32_t within = lane; within < elementBytes;
@@ -1934,10 +2222,10 @@ __device__ __forceinline__ void
 validateIndexedTransferIndices(const abi::ObjectEntry &object,
                                const abi::ReplicaEntry &replica,
                                std::uint32_t *invalid) {
-  const auto *sourceIndices = reinterpret_cast<const std::uint32_t *>(
-      replica.dmaPageListAddress);
-  const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
-      object.stagingTensorMapAddress);
+  const auto *sourceIndices =
+      reinterpret_cast<const std::uint32_t *>(replica.dmaPageListAddress);
+  const auto *destinationIndices =
+      reinterpret_cast<const std::uint32_t *>(object.stagingTensorMapAddress);
   const std::uint32_t sourceLimit =
       abi::sourceTransferIndexLimit(replica.tensorMapAddress);
   const std::uint32_t destinationLimit =
@@ -1956,10 +2244,9 @@ validateIndexedTransferIndices(const abi::ObjectEntry &object,
 // Scheduler-selected finite prefetch. It moves registered indexed host objects
 // ahead of their consumer kernels; a consumer still validates object identity,
 // version, request liveness, and data availability at its CTA entry.
-extern "C" __global__ __launch_bounds__(1024, 1) void
-nta_preload_indexed_host(nta::abi::RuntimeView *runtime,
-                         std::uint32_t firstObject,
-                         std::uint32_t objectCount) {
+extern "C" __global__ __launch_bounds__(1024, 1) void nta_preload_indexed_host(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount) {
   using namespace nta;
   constexpr std::uint32_t BlocksPerObject = 2;
   const std::uint32_t relativeObject = blockIdx.x / BlocksPerObject;
@@ -1974,7 +2261,8 @@ nta_preload_indexed_host(nta::abi::RuntimeView *runtime,
   abi::ObjectEntry &object = runtime->objects[slot];
   const abi::ReplicaEntry *replica = device::replica(runtime, object, 0);
   const std::uint32_t sourceStride =
-      replica == nullptr ? 0 : abi::sourceTransferStride(replica->transferShape);
+      replica == nullptr ? 0
+                         : abi::sourceTransferStride(replica->transferShape);
   const std::uint32_t destinationStride =
       replica == nullptr
           ? 0
@@ -2024,8 +2312,7 @@ nta_preload_indexed_host(nta::abi::RuntimeView *runtime,
   if (!bounded) {
     return;
   }
-  device::copyIndexedHostObject(object, *replica, objectBlock,
-                                BlocksPerObject);
+  device::copyIndexedHostObject(object, *replica, objectBlock, BlocksPerObject);
   __syncthreads();
   // The stream event recorded after this finite kernel is the publication
   // boundary. Block zero updates the directory for the consumer's post-event
@@ -2033,6 +2320,336 @@ nta_preload_indexed_host(nta::abi::RuntimeView *runtime,
   if (threadIdx.x == 0 && objectBlock == 0) {
     __threadfence_system();
     atomicExch(&object.state,
+               static_cast<std::uint32_t>(abi::ObjectState::Ready));
+  }
+}
+
+namespace nta::device {
+
+template <std::uint32_t ElementBytes, std::uint32_t ThreadsPerRow>
+__device__ __forceinline__ void copyIndexedHostObjectFixed(
+    const abi::ObjectEntry &object, const abi::ReplicaEntry &replica,
+    std::uint32_t objectBlock = 0, std::uint32_t blocksPerObject = 1) {
+  static_assert(ElementBytes % (ThreadsPerRow * sizeof(uint4)) == 0);
+  constexpr std::uint32_t Segments =
+      ElementBytes / (ThreadsPerRow * sizeof(uint4));
+  const std::uint32_t lane = threadIdx.x % ThreadsPerRow;
+  const std::uint32_t worker = threadIdx.x / ThreadsPerRow;
+  const std::uint32_t workersPerBlock = blockDim.x / ThreadsPerRow;
+  const auto *sourceIndices =
+      reinterpret_cast<const std::uint32_t *>(replica.dmaPageListAddress);
+  const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
+      object.stagingTensorMapAddress);
+  const std::uint32_t sourceStride =
+      abi::sourceTransferStride(replica.transferShape);
+  const std::uint32_t destinationStride =
+      abi::destinationTransferStride(replica.transferShape);
+  const auto *source =
+      reinterpret_cast<const std::byte *>(replica.sourceAddress);
+  auto *destination = reinterpret_cast<std::byte *>(object.stagingAddress);
+
+  const std::uint32_t firstElement = objectBlock * workersPerBlock + worker;
+  const std::uint32_t elementStride = workersPerBlock * blocksPerObject;
+  for (std::uint32_t element = firstElement; element < replica.dmaPageCount;
+       element += elementStride) {
+    const std::uint32_t sourceIndex = sourceIndices[element];
+    const std::uint32_t destinationIndex = destinationIndices[element];
+    uint4 values[Segments];
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      values[segment] = loadNoAllocate(reinterpret_cast<const uint4 *>(
+          source + static_cast<std::uint64_t>(sourceIndex) * sourceStride +
+          static_cast<std::uint64_t>(vector) * sizeof(uint4)));
+    }
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      storeNoAllocate(reinterpret_cast<uint4 *>(
+                          destination +
+                          static_cast<std::uint64_t>(destinationIndex) *
+                              destinationStride +
+                          static_cast<std::uint64_t>(vector) * sizeof(uint4)),
+                      values[segment]);
+    }
+  }
+}
+
+template <std::uint32_t ElementBytes, std::uint32_t ThreadsPerRow>
+__device__ __forceinline__ void copyIndexedHostPair(
+    const abi::ObjectEntry &keyObject, const abi::ReplicaEntry &keyReplica,
+    const abi::ObjectEntry &valueObject, const abi::ReplicaEntry &valueReplica,
+    std::uint32_t pairBlock, std::uint32_t blocksPerPair) {
+  static_assert(ElementBytes % (ThreadsPerRow * sizeof(uint4)) == 0);
+  constexpr std::uint32_t Segments =
+      ElementBytes / (ThreadsPerRow * sizeof(uint4));
+  const std::uint32_t lane = threadIdx.x % ThreadsPerRow;
+  const std::uint32_t worker = threadIdx.x / ThreadsPerRow;
+  const std::uint32_t workersPerBlock = blockDim.x / ThreadsPerRow;
+  const std::uint32_t firstElement = pairBlock * workersPerBlock + worker;
+  const std::uint32_t elementStride = workersPerBlock * blocksPerPair;
+  const auto *sourceIndices =
+      reinterpret_cast<const std::uint32_t *>(keyReplica.dmaPageListAddress);
+  const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
+      keyObject.stagingTensorMapAddress);
+  const std::uint32_t keySourceStride =
+      abi::sourceTransferStride(keyReplica.transferShape);
+  const std::uint32_t keyDestinationStride =
+      abi::destinationTransferStride(keyReplica.transferShape);
+  const std::uint32_t valueSourceStride =
+      abi::sourceTransferStride(valueReplica.transferShape);
+  const std::uint32_t valueDestinationStride =
+      abi::destinationTransferStride(valueReplica.transferShape);
+  const auto *keySource =
+      reinterpret_cast<const std::byte *>(keyReplica.sourceAddress);
+  auto *keyDestination =
+      reinterpret_cast<std::byte *>(keyObject.stagingAddress);
+  const auto *valueSource =
+      reinterpret_cast<const std::byte *>(valueReplica.sourceAddress);
+  auto *valueDestination =
+      reinterpret_cast<std::byte *>(valueObject.stagingAddress);
+
+  for (std::uint32_t element = firstElement; element < keyReplica.dmaPageCount;
+       element += elementStride) {
+    // Redundant index loads within a row subgroup hit in L1 and avoid a warp
+    // shuffle on the PCIe copy's critical instruction stream.
+    const std::uint32_t sourceIndex = sourceIndices[element];
+    const std::uint32_t destinationIndex = destinationIndices[element];
+    uint4 values[Segments];
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      values[segment] = loadNoAllocate(reinterpret_cast<const uint4 *>(
+          keySource +
+          static_cast<std::uint64_t>(sourceIndex) * keySourceStride +
+          static_cast<std::uint64_t>(vector) * sizeof(uint4)));
+    }
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      storeNoAllocate(reinterpret_cast<uint4 *>(
+                          keyDestination +
+                          static_cast<std::uint64_t>(destinationIndex) *
+                              keyDestinationStride +
+                          static_cast<std::uint64_t>(vector) * sizeof(uint4)),
+                      values[segment]);
+    }
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      values[segment] = loadNoAllocate(reinterpret_cast<const uint4 *>(
+          valueSource +
+          static_cast<std::uint64_t>(sourceIndex) * valueSourceStride +
+          static_cast<std::uint64_t>(vector) * sizeof(uint4)));
+    }
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      storeNoAllocate(reinterpret_cast<uint4 *>(
+                          valueDestination +
+                          static_cast<std::uint64_t>(destinationIndex) *
+                              valueDestinationStride +
+                          static_cast<std::uint64_t>(vector) * sizeof(uint4)),
+                      values[segment]);
+    }
+  }
+}
+
+template <std::uint32_t ElementBytes, std::uint32_t ThreadsPerRow>
+__device__ __forceinline__ void copyIndexedHostObjectPairFixed(
+    const abi::ObjectEntry &firstObject,
+    const abi::ReplicaEntry &firstReplica,
+    const abi::ObjectEntry &secondObject,
+    const abi::ReplicaEntry &secondReplica, std::uint32_t objectBlock,
+    std::uint32_t blocksPerObject) {
+  static_assert(ElementBytes % (ThreadsPerRow * sizeof(uint4)) == 0);
+  constexpr std::uint32_t Segments =
+      ElementBytes / (ThreadsPerRow * sizeof(uint4));
+  const std::uint32_t lane = threadIdx.x % ThreadsPerRow;
+  const std::uint32_t worker = threadIdx.x / ThreadsPerRow;
+  const std::uint32_t workersPerBlock = blockDim.x / ThreadsPerRow;
+  const auto *sourceIndices = reinterpret_cast<const std::uint32_t *>(
+      firstReplica.dmaPageListAddress);
+  const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
+      firstObject.stagingTensorMapAddress);
+  const std::uint32_t sourceStride =
+      abi::sourceTransferStride(firstReplica.transferShape);
+  const std::uint32_t destinationStride =
+      abi::destinationTransferStride(firstReplica.transferShape);
+  const auto *firstSource =
+      reinterpret_cast<const std::byte *>(firstReplica.sourceAddress);
+  const auto *secondSource =
+      reinterpret_cast<const std::byte *>(secondReplica.sourceAddress);
+  auto *firstDestination =
+      reinterpret_cast<std::byte *>(firstObject.stagingAddress);
+  auto *secondDestination =
+      reinterpret_cast<std::byte *>(secondObject.stagingAddress);
+
+  const std::uint32_t firstElement = objectBlock * workersPerBlock + worker;
+  const std::uint32_t elementStride = workersPerBlock * blocksPerObject;
+  for (std::uint32_t element = firstElement;
+       element < firstReplica.dmaPageCount; element += elementStride) {
+    const std::uint32_t sourceIndex = sourceIndices[element];
+    const std::uint32_t destinationIndex = destinationIndices[element];
+    uint4 values[Segments];
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      values[segment] = loadNoAllocate(reinterpret_cast<const uint4 *>(
+          firstSource + static_cast<std::uint64_t>(sourceIndex) * sourceStride +
+          static_cast<std::uint64_t>(vector) * sizeof(uint4)));
+    }
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      storeNoAllocate(
+          reinterpret_cast<uint4 *>(
+              firstDestination +
+              static_cast<std::uint64_t>(destinationIndex) * destinationStride +
+              static_cast<std::uint64_t>(vector) * sizeof(uint4)),
+          values[segment]);
+    }
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      values[segment] = loadNoAllocate(reinterpret_cast<const uint4 *>(
+          secondSource + static_cast<std::uint64_t>(sourceIndex) * sourceStride +
+          static_cast<std::uint64_t>(vector) * sizeof(uint4)));
+    }
+#pragma unroll
+    for (std::uint32_t segment = 0; segment < Segments; ++segment) {
+      const std::uint32_t vector = segment * ThreadsPerRow + lane;
+      storeNoAllocate(
+          reinterpret_cast<uint4 *>(
+              secondDestination +
+              static_cast<std::uint64_t>(destinationIndex) * destinationStride +
+              static_cast<std::uint64_t>(vector) * sizeof(uint4)),
+          values[segment]);
+    }
+  }
+}
+
+} // namespace nta::device
+
+// KV-aware lookahead mover. Two CTAs cooperatively copy one adjacent K/V
+// object pair while preserving the generic object-directory representation.
+extern "C" __global__ __launch_bounds__(
+    1024, 1) void nta_preload_indexed_host_pairs(nta::abi::RuntimeView *runtime,
+                                                 std::uint32_t firstObject,
+                                                 std::uint32_t pairCount) {
+  using namespace nta;
+  constexpr std::uint32_t BlocksPerPair = 2;
+  const std::uint32_t relativePair = blockIdx.x / BlocksPerPair;
+  const std::uint32_t pairBlock = blockIdx.x % BlocksPerPair;
+  const std::uint64_t keySlot64 =
+      static_cast<std::uint64_t>(firstObject) + 2ULL * relativePair;
+  if (runtime == nullptr || relativePair >= pairCount ||
+      keySlot64 >= runtime->objectCapacity ||
+      keySlot64 + 1 >= runtime->objectCapacity) {
+    return;
+  }
+  const std::uint32_t keySlot = static_cast<std::uint32_t>(keySlot64);
+  const std::uint32_t valueSlot = keySlot + 1;
+  abi::ObjectEntry &keyObject = runtime->objects[keySlot];
+  abi::ObjectEntry &valueObject = runtime->objects[valueSlot];
+  const abi::ReplicaEntry *keyReplica = device::replica(runtime, keyObject, 0);
+  const abi::ReplicaEntry *valueReplica =
+      device::replica(runtime, valueObject, 0);
+  const std::uint32_t elementBytes =
+      keyReplica == nullptr || keyReplica->dmaPageCount == 0
+          ? 0
+          : static_cast<std::uint32_t>(keyObject.bytes /
+                                       keyReplica->dmaPageCount);
+  const bool supportedElement = elementBytes == 128 || elementBytes == 256 ||
+                                elementBytes == 512 || elementBytes == 1024 ||
+                                elementBytes == 2048;
+  const bool valid =
+      keyReplica != nullptr && valueReplica != nullptr && supportedElement &&
+      (keyReplica->flags & abi::ReplicaIndexed) != 0 &&
+      (valueReplica->flags & abi::ReplicaIndexed) != 0 &&
+      keyReplica->sourceKind ==
+          static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
+      valueReplica->sourceKind ==
+          static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
+      keyReplica->dmaPageCount == valueReplica->dmaPageCount &&
+      keyObject.bytes ==
+          static_cast<std::uint64_t>(keyReplica->dmaPageCount) * elementBytes &&
+      valueObject.bytes ==
+          static_cast<std::uint64_t>(valueReplica->dmaPageCount) *
+              elementBytes &&
+      keyReplica->dmaPageListAddress != 0 &&
+      keyReplica->dmaPageListAddress == valueReplica->dmaPageListAddress &&
+      keyObject.stagingTensorMapAddress != 0 &&
+      keyObject.stagingTensorMapAddress ==
+          valueObject.stagingTensorMapAddress &&
+      keyReplica->sourceAddress != 0 && valueReplica->sourceAddress != 0 &&
+      keyObject.stagingAddress != 0 && valueObject.stagingAddress != 0 &&
+      abi::sourceTransferStride(keyReplica->transferShape) >= elementBytes &&
+      abi::destinationTransferStride(keyReplica->transferShape) >=
+          elementBytes &&
+      abi::sourceTransferStride(valueReplica->transferShape) >= elementBytes &&
+      abi::destinationTransferStride(valueReplica->transferShape) >=
+          elementBytes;
+
+  __shared__ std::uint32_t invalidIndex;
+  if (threadIdx.x == 0) {
+    invalidIndex = 0;
+  }
+  __syncthreads();
+  if (valid) {
+    device::validateIndexedTransferIndices(keyObject, *keyReplica,
+                                           &invalidIndex);
+    device::validateIndexedTransferIndices(valueObject, *valueReplica,
+                                           &invalidIndex);
+  }
+  __syncthreads();
+  const bool bounded = valid && invalidIndex == 0;
+  if (threadIdx.x == 0 && pairBlock == 0) {
+    keyObject.selectedReplica = 0;
+    valueObject.selectedReplica = 0;
+    atomicExch(&keyObject.state,
+               static_cast<std::uint32_t>(bounded ? abi::ObjectState::Issued
+                                                  : abi::ObjectState::Failed));
+    atomicExch(&valueObject.state,
+               static_cast<std::uint32_t>(bounded ? abi::ObjectState::Issued
+                                                  : abi::ObjectState::Failed));
+  }
+  if (!bounded) {
+    return;
+  }
+  switch (elementBytes) {
+  case 128:
+    device::copyIndexedHostPair<128, 8>(keyObject, *keyReplica, valueObject,
+                                        *valueReplica, pairBlock,
+                                        BlocksPerPair);
+    break;
+  case 256:
+    device::copyIndexedHostPair<256, 8>(keyObject, *keyReplica, valueObject,
+                                        *valueReplica, pairBlock,
+                                        BlocksPerPair);
+    break;
+  case 512:
+    device::copyIndexedHostPair<512, 32>(keyObject, *keyReplica, valueObject,
+                                         *valueReplica, pairBlock,
+                                         BlocksPerPair);
+    break;
+  case 1024:
+    device::copyIndexedHostPair<1024, 16>(keyObject, *keyReplica, valueObject,
+                                          *valueReplica, pairBlock,
+                                          BlocksPerPair);
+    break;
+  case 2048:
+    device::copyIndexedHostPair<2048, 32>(keyObject, *keyReplica, valueObject,
+                                          *valueReplica, pairBlock,
+                                          BlocksPerPair);
+    break;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && pairBlock == 0) {
+    __threadfence_system();
+    atomicExch(&keyObject.state,
+               static_cast<std::uint32_t>(abi::ObjectState::Ready));
+    atomicExch(&valueObject.state,
                static_cast<std::uint32_t>(abi::ObjectState::Ready));
   }
 }
@@ -2047,10 +2664,10 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   __shared__ std::uint32_t selectedFromQueue;
   if (threadIdx.x == 0) {
     selectedFromQueue = device::intentQueueAvailable(runtime) ? 1U : 0U;
-    selectedIntent = selectedFromQueue != 0U
-                         ? device::popIntent(runtime,
-                                             abi::SourceKind::HostStaged)
-                         : static_cast<std::uint32_t>(blockIdx.x);
+    selectedIntent =
+        selectedFromQueue != 0U
+            ? device::popIntent(runtime, abi::SourceKind::HostStaged)
+            : static_cast<std::uint32_t>(blockIdx.x);
   }
   __syncthreads();
   if (selectedIntent == abi::InvalidIndex ||
@@ -2075,7 +2692,7 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   if (intent.objectSlot >= runtime->objectCapacity) {
     if (threadIdx.x == 0 && device::claimIntent(intentSlot)) {
       device::failBoundWorkTicket(runtime, intent.workTicket,
-                                    intent.requestSlot, intent.generation);
+                                  intent.requestSlot, intent.generation);
       device::consumeIntent(runtime, intentSlot);
     }
     return;
@@ -2088,7 +2705,8 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   const bool indexed =
       replica != nullptr && (replica->flags & abi::ReplicaIndexed) != 0;
   const std::uint32_t sourceStride =
-      replica == nullptr ? 0 : abi::sourceTransferStride(replica->transferShape);
+      replica == nullptr ? 0
+                         : abi::sourceTransferStride(replica->transferShape);
   const std::uint32_t destinationStride =
       replica == nullptr
           ? 0
@@ -2103,15 +2721,15 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
           : abi::destinationTransferIndexLimit(replica->tensorMapAddress);
   const bool indexedShapeValid =
       !indexed ||
-      (replica->dmaPageListAddress != 0 && object.stagingTensorMapAddress != 0 &&
-       replica->dmaPageCount != 0 && sourceLimit != 0 &&
-       destinationLimit != 0 &&
+      (replica->dmaPageListAddress != 0 &&
+       object.stagingTensorMapAddress != 0 && replica->dmaPageCount != 0 &&
+       sourceLimit != 0 && destinationLimit != 0 &&
        intent.bytes % replica->dmaPageCount == 0 &&
        sourceStride >= intent.bytes / replica->dmaPageCount &&
        destinationStride >= intent.bytes / replica->dmaPageCount);
   const bool transferValid =
-      objectCurrent && replica != nullptr &&
-      replica->sourceAddress != 0 && object.stagingAddress != 0 &&
+      objectCurrent && replica != nullptr && replica->sourceAddress != 0 &&
+      object.stagingAddress != 0 &&
       replica->sourceKind ==
           static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
       intent.offset == 0 && intent.bytes == object.bytes &&
@@ -2136,7 +2754,7 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
                                           abi::ObjectState::Failed);
         }
         device::failBoundWorkTicket(runtime, intent.workTicket,
-                                      intent.requestSlot, intent.generation);
+                                    intent.requestSlot, intent.generation);
         device::consumeIntent(runtime, intentSlot);
       }
     }
@@ -2199,48 +2817,26 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   auto *destination = reinterpret_cast<std::byte *>(object.stagingAddress);
 
   if (indexed) {
-    const auto *sourceIndices = reinterpret_cast<const std::uint32_t *>(
-        replica->dmaPageListAddress);
-    const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
-        object.stagingTensorMapAddress);
     const std::uint32_t elementBytes = intent.bytes / replica->dmaPageCount;
-    const bool vectorAligned =
-        ((reinterpret_cast<std::uintptr_t>(source) |
-          reinterpret_cast<std::uintptr_t>(destination) | sourceStride |
-          destinationStride | elementBytes) &
-         (alignof(uint4) - 1U)) == 0;
-    if (vectorAligned) {
-      const std::uint32_t vectorsPerElement = elementBytes / sizeof(uint4);
-      const std::uint64_t vectorCount =
-          static_cast<std::uint64_t>(replica->dmaPageCount) * vectorsPerElement;
-      for (std::uint64_t vector = threadIdx.x; vector < vectorCount;
-           vector += blockDim.x) {
-        const std::uint32_t element = vector / vectorsPerElement;
-        const std::uint32_t within = vector % vectorsPerElement;
-        auto *target = destination +
-                       static_cast<std::uint64_t>(destinationIndices[element]) *
-                           destinationStride +
-                       static_cast<std::uint64_t>(within) * sizeof(uint4);
-        const auto *origin =
-            source + static_cast<std::uint64_t>(sourceIndices[element]) *
-                         sourceStride +
-            static_cast<std::uint64_t>(within) * sizeof(uint4);
-        device::storeNoAllocate(
-            reinterpret_cast<uint4 *>(target),
-            device::loadNoAllocate(reinterpret_cast<const uint4 *>(origin)));
-      }
-    } else {
-      for (std::uint64_t linear = threadIdx.x; linear < intent.bytes;
-           linear += blockDim.x) {
-        const std::uint32_t element = linear / elementBytes;
-        const std::uint32_t within = linear % elementBytes;
-        destination[static_cast<std::uint64_t>(destinationIndices[element]) *
-                        destinationStride +
-                    within] =
-            source[static_cast<std::uint64_t>(sourceIndices[element]) *
-                       sourceStride +
-                   within];
-      }
+    switch (elementBytes) {
+    case 128:
+      device::copyIndexedHostObjectFixed<128, 8>(object, *replica);
+      break;
+    case 256:
+      device::copyIndexedHostObjectFixed<256, 8>(object, *replica);
+      break;
+    case 512:
+      device::copyIndexedHostObjectFixed<512, 8>(object, *replica);
+      break;
+    case 1024:
+      device::copyIndexedHostObjectFixed<1024, 16>(object, *replica);
+      break;
+    case 2048:
+      device::copyIndexedHostObjectFixed<2048, 32>(object, *replica);
+      break;
+    default:
+      device::copyIndexedHostObject(object, *replica);
+      break;
     }
   } else {
     const bool vectorAligned =
@@ -2283,6 +2879,342 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
                                 backendBytes);
   }
 }
+
+// Scheduler-selected indexed host progress uses three finite kernels. The
+// claim phase preserves the generic intent/credit protocol. The copy phase
+// gives each adjacent object pair a small block quota, matching the K/V access
+// shape while bounding PCIe read pressure. Stream ordering keeps publication
+// after every copy CTA has retired.
+extern "C" __global__ void nta_validate_indexed_host_range(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount) {
+  using namespace nta;
+  const std::uint32_t relative = blockIdx.x;
+  const std::uint64_t objectSlot64 =
+      static_cast<std::uint64_t>(firstObject) + relative;
+  if (runtime == nullptr || relative >= objectCount ||
+      objectSlot64 >= runtime->objectCapacity) {
+    return;
+  }
+  abi::ObjectEntry &object = runtime->objects[objectSlot64];
+  abi::ReplicaEntry *replica =
+      object.replicaCount == 1 && object.replicaStart < runtime->replicaCapacity
+          ? &runtime->replicas[object.replicaStart]
+          : nullptr;
+  const std::uint32_t sourceStride =
+      replica == nullptr ? 0
+                         : abi::sourceTransferStride(replica->transferShape);
+  const std::uint32_t destinationStride =
+      replica == nullptr
+          ? 0
+          : abi::destinationTransferStride(replica->transferShape);
+  const bool valid =
+      replica != nullptr &&
+      replica->sourceKind ==
+          static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
+      (replica->flags & abi::ReplicaIndexed) != 0 &&
+      replica->sourceAddress != 0 && object.stagingAddress != 0 &&
+      replica->dmaPageListAddress != 0 &&
+      object.stagingTensorMapAddress != 0 && replica->dmaPageCount != 0 &&
+      abi::sourceTransferIndexLimit(replica->tensorMapAddress) != 0 &&
+      abi::destinationTransferIndexLimit(replica->tensorMapAddress) != 0 &&
+      object.bytes != 0 && object.bytes % replica->dmaPageCount == 0 &&
+      sourceStride >= object.bytes / replica->dmaPageCount &&
+      destinationStride >= object.bytes / replica->dmaPageCount;
+  __shared__ std::uint32_t invalidIndex;
+  if (threadIdx.x == 0) {
+    invalidIndex = 0;
+  }
+  __syncthreads();
+  if (valid) {
+    device::validateIndexedTransferIndices(object, *replica, &invalidIndex);
+  }
+  __syncthreads();
+  if (threadIdx.x != 0) {
+    return;
+  }
+  if (!valid || invalidIndex != 0) {
+    atomicExch(&object.state,
+               static_cast<std::uint32_t>(abi::ObjectState::Failed));
+    device::recordFailure(runtime);
+    return;
+  }
+  atomicOr(&replica->flags, abi::ReplicaIndicesValidated);
+}
+
+extern "C" __global__ void nta_claim_indexed_host_range(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount) {
+  using namespace nta;
+  const std::uint32_t relative = blockIdx.x;
+  const std::uint64_t objectSlot64 =
+      static_cast<std::uint64_t>(firstObject) + relative;
+  if (runtime == nullptr || runtime->intentPool == nullptr ||
+      relative >= objectCount || objectSlot64 >= runtime->objectCapacity ||
+      objectSlot64 >= runtime->intentCapacity ||
+      objectSlot64 >= runtime->intentPool->capacity) {
+    return;
+  }
+  const std::uint32_t objectSlot = static_cast<std::uint32_t>(objectSlot64);
+  abi::IntentSlot &intentSlot = runtime->intents[objectSlot];
+  abi::AcquireIntent &intent = intentSlot.intent;
+  abi::ObjectEntry &object = runtime->objects[objectSlot];
+  const abi::ReplicaEntry *replica =
+      device::replica(runtime, object, object.selectedReplica);
+  const std::uint32_t sourceStride =
+      replica == nullptr ? 0
+                         : abi::sourceTransferStride(replica->transferShape);
+  const std::uint32_t destinationStride =
+      replica == nullptr
+          ? 0
+          : abi::destinationTransferStride(replica->transferShape);
+  const std::uint32_t sourceLimit =
+      replica == nullptr
+          ? 0
+          : abi::sourceTransferIndexLimit(replica->tensorMapAddress);
+  const std::uint32_t destinationLimit =
+      replica == nullptr
+          ? 0
+          : abi::destinationTransferIndexLimit(replica->tensorMapAddress);
+  const bool valid =
+      atomicAdd(&intent.valid, 0U) == 1U &&
+      intentSlot.epoch == device::currentEpoch(runtime) &&
+      intentSlot.sourceKind ==
+          static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
+      atomicAdd(&object.state, 0U) ==
+          static_cast<std::uint32_t>(abi::ObjectState::Queued) &&
+      intent.objectSlot == objectSlot && intent.objectId == object.objectId &&
+      intent.objectVersion == object.version && intent.offset == 0 &&
+      intent.bytes == object.bytes && replica != nullptr &&
+      replica->sourceKind ==
+          static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
+      (replica->flags & abi::ReplicaIndexed) != 0 &&
+      replica->sourceAddress != 0 && object.stagingAddress != 0 &&
+      replica->dmaPageListAddress != 0 &&
+      object.stagingTensorMapAddress != 0 && replica->dmaPageCount != 0 &&
+      sourceLimit != 0 && destinationLimit != 0 && object.bytes != 0 &&
+      object.bytes % replica->dmaPageCount == 0 &&
+      sourceStride >= object.bytes / replica->dmaPageCount &&
+      destinationStride >= object.bytes / replica->dmaPageCount;
+
+  __shared__ std::uint32_t invalidIndex;
+  if (threadIdx.x == 0) {
+    invalidIndex = 0;
+  }
+  __syncthreads();
+  if (valid && (replica->flags & abi::ReplicaIndicesValidated) == 0) {
+    device::validateIndexedTransferIndices(object, *replica, &invalidIndex);
+  }
+  __syncthreads();
+  if (threadIdx.x != 0) {
+    return;
+  }
+  if (!valid || invalidIndex != 0) {
+    if (device::claimIntent(intentSlot)) {
+      atomicExch(&object.state,
+                 static_cast<std::uint32_t>(abi::ObjectState::Failed));
+      device::publishObjectTransition(runtime, objectSlot,
+                                      abi::ObjectState::Failed);
+      device::failBoundWorkTicket(runtime, intent.workTicket,
+                                  intent.requestSlot, intent.generation);
+      device::consumeIntent(runtime, intentSlot);
+    }
+    return;
+  }
+
+  const bool live =
+      device::requestLive(runtime, intent.requestSlot, intent.generation);
+  bool accepted = true;
+  if (live) {
+    accepted = device::tryReserveRequestBytes(
+        runtime, intent.requestSlot, intent.generation, intent.bytes);
+    if (accepted && !device::tryReserveTenantBytes(runtime, intent.tenantId,
+                                                   intent.bytes)) {
+      device::releaseRequestBytes(runtime, intent.requestSlot,
+                                  intent.generation, intent.bytes);
+      accepted = false;
+    }
+  }
+  if (accepted && !device::tryReserveBackendBytes(
+                      runtime, abi::SourceKind::HostStaged, intent.bytes)) {
+    if (live) {
+      device::releaseRequestBytes(runtime, intent.requestSlot,
+                                  intent.generation, intent.bytes);
+      device::releaseTenantBytes(runtime, intent.tenantId, intent.bytes);
+    }
+    accepted = false;
+  }
+  if (accepted && !device::claimIntent(intentSlot)) {
+    if (live) {
+      device::releaseRequestBytes(runtime, intent.requestSlot,
+                                  intent.generation, intent.bytes);
+      device::releaseTenantBytes(runtime, intent.tenantId, intent.bytes);
+    }
+    device::releaseBackendBytes(runtime, abi::SourceKind::HostStaged,
+                                intent.bytes);
+    accepted = false;
+  }
+  if (accepted) {
+    __threadfence();
+    atomicExch(&object.state,
+               static_cast<std::uint32_t>(abi::ObjectState::Issued));
+  }
+}
+
+extern "C" __global__ void nta_copy_indexed_host_range(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount, std::uint32_t blocksPerObject) {
+  using namespace nta;
+  if (runtime == nullptr || blocksPerObject == 0) {
+    return;
+  }
+  constexpr std::uint32_t ObjectsPerGroup = 2;
+  const std::uint32_t relativeGroup = blockIdx.x / blocksPerObject;
+  const std::uint32_t objectBlock = blockIdx.x % blocksPerObject;
+  const std::uint32_t firstRelative = relativeGroup * ObjectsPerGroup;
+  const std::uint64_t firstSlot64 =
+      static_cast<std::uint64_t>(firstObject) + firstRelative;
+  const std::uint64_t secondSlot64 = firstSlot64 + 1U;
+  if (firstRelative + 1U < objectCount &&
+      secondSlot64 < runtime->objectCapacity) {
+    abi::ObjectEntry &first = runtime->objects[firstSlot64];
+    abi::ObjectEntry &second = runtime->objects[secondSlot64];
+    const abi::ReplicaEntry *firstReplica =
+        device::replica(runtime, first, first.selectedReplica);
+    const abi::ReplicaEntry *secondReplica =
+        device::replica(runtime, second, second.selectedReplica);
+    const bool paired =
+        atomicAdd(&first.state, 0U) ==
+            static_cast<std::uint32_t>(abi::ObjectState::Issued) &&
+        atomicAdd(&second.state, 0U) ==
+            static_cast<std::uint32_t>(abi::ObjectState::Issued) &&
+        firstReplica != nullptr && secondReplica != nullptr &&
+        firstReplica->dmaPageCount != 0 &&
+        firstReplica->dmaPageCount == secondReplica->dmaPageCount &&
+        firstReplica->dmaPageListAddress ==
+            secondReplica->dmaPageListAddress &&
+        first.stagingTensorMapAddress == second.stagingTensorMapAddress &&
+        firstReplica->transferShape == secondReplica->transferShape &&
+        first.bytes == second.bytes;
+    if (paired) {
+      const std::uint32_t elementBytes = static_cast<std::uint32_t>(
+          first.bytes / firstReplica->dmaPageCount);
+      switch (elementBytes) {
+      case 128:
+        device::copyIndexedHostObjectPairFixed<128, 8>(
+            first, *firstReplica, second, *secondReplica, objectBlock,
+            blocksPerObject);
+        return;
+      case 256:
+        device::copyIndexedHostObjectPairFixed<256, 8>(
+            first, *firstReplica, second, *secondReplica, objectBlock,
+            blocksPerObject);
+        return;
+      case 512:
+        device::copyIndexedHostObjectPairFixed<512, 32>(
+            first, *firstReplica, second, *secondReplica, objectBlock,
+            blocksPerObject);
+        return;
+      case 1024:
+        device::copyIndexedHostObjectPairFixed<1024, 16>(
+            first, *firstReplica, second, *secondReplica, objectBlock,
+            blocksPerObject);
+        return;
+      case 2048:
+        device::copyIndexedHostObjectPairFixed<2048, 32>(
+            first, *firstReplica, second, *secondReplica, objectBlock,
+            blocksPerObject);
+        return;
+      default:
+        break;
+      }
+    }
+  }
+  for (std::uint32_t groupObject = 0; groupObject < ObjectsPerGroup;
+       ++groupObject) {
+    const std::uint32_t relative = firstRelative + groupObject;
+    const std::uint64_t objectSlot64 =
+        static_cast<std::uint64_t>(firstObject) + relative;
+    if (relative >= objectCount || objectSlot64 >= runtime->objectCapacity) {
+      continue;
+    }
+    abi::ObjectEntry &object = runtime->objects[objectSlot64];
+    if (atomicAdd(&object.state, 0U) !=
+        static_cast<std::uint32_t>(abi::ObjectState::Issued)) {
+      continue;
+    }
+    const abi::ReplicaEntry *replica =
+        device::replica(runtime, object, object.selectedReplica);
+    if (replica == nullptr || replica->dmaPageCount == 0) {
+      continue;
+    }
+    const std::uint32_t elementBytes =
+        static_cast<std::uint32_t>(object.bytes / replica->dmaPageCount);
+    switch (elementBytes) {
+    case 128:
+      device::copyIndexedHostObjectFixed<128, 8>(
+          object, *replica, objectBlock, blocksPerObject);
+      break;
+    case 256:
+      device::copyIndexedHostObjectFixed<256, 8>(
+          object, *replica, objectBlock, blocksPerObject);
+      break;
+    case 512:
+      device::copyIndexedHostObjectFixed<512, 8>(
+          object, *replica, objectBlock, blocksPerObject);
+      break;
+    case 1024:
+      device::copyIndexedHostObjectFixed<1024, 16>(
+          object, *replica, objectBlock, blocksPerObject);
+      break;
+    case 2048:
+      device::copyIndexedHostObjectFixed<2048, 32>(
+          object, *replica, objectBlock, blocksPerObject);
+      break;
+    default:
+      device::copyIndexedHostObject(object, *replica, objectBlock,
+                                    blocksPerObject);
+      break;
+    }
+  }
+}
+
+extern "C" __global__ void nta_finalize_indexed_host_range(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount) {
+  using namespace nta;
+  const std::uint32_t relative = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint64_t objectSlot64 =
+      static_cast<std::uint64_t>(firstObject) + relative;
+  if (runtime == nullptr || relative >= objectCount ||
+      objectSlot64 >= runtime->objectCapacity ||
+      objectSlot64 >= runtime->intentCapacity) {
+    return;
+  }
+  const std::uint32_t objectSlot = static_cast<std::uint32_t>(objectSlot64);
+  abi::ObjectEntry &object = runtime->objects[objectSlot];
+  abi::IntentSlot &intentSlot = runtime->intents[objectSlot];
+  abi::AcquireIntent &intent = intentSlot.intent;
+  if (atomicAdd(&object.state, 0U) !=
+          static_cast<std::uint32_t>(abi::ObjectState::Issued) ||
+      atomicAdd(&intent.valid, 0U) != 2U || intent.objectSlot != objectSlot ||
+      intentSlot.epoch != device::currentEpoch(runtime)) {
+    return;
+  }
+  __threadfence_system();
+  atomicExch(&object.state,
+             static_cast<std::uint32_t>(abi::ObjectState::Ready));
+  device::publishObjectTransition(runtime, objectSlot, abi::ObjectState::Ready);
+  const bool live =
+      device::requestLive(runtime, intent.requestSlot, intent.generation);
+  device::releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
+                              live ? intent.bytes : 0);
+  device::releaseTenantBytes(runtime, intent.tenantId,
+                             live ? intent.bytes : 0);
+  device::releaseBackendBytes(runtime, abi::SourceKind::HostStaged,
+                              intent.bytes);
+  device::consumeIntent(runtime, intentSlot);
+}
 #endif
 
 #if NTA_DEVICE_PHASE_KERNELS
@@ -2305,11 +3237,11 @@ extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
     const std::uint32_t changed =
         supportsChanged ? atomicExch(runtime->changedCount, 0U) : 0U;
     changedMode = supportsChanged && !overflow ? 1U : 0U;
-    workCount = changedMode != 0
-                    ? min(changed, runtime->workTicketCapacity)
-                    : min(min(atomicAdd(runtime->pendingCount, 0U),
-                              pendingBudget),
-                          runtime->workTicketCapacity);
+    workCount =
+        changedMode != 0
+            ? min(changed, runtime->workTicketCapacity)
+            : min(min(atomicAdd(runtime->pendingCount, 0U), pendingBudget),
+                  runtime->workTicketCapacity);
   }
   __syncthreads();
 
@@ -2337,17 +3269,16 @@ extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
         device::recordTerminalWork(runtime, workTicket,
                                    abi::WorkTicketState::Pending,
                                    abi::WorkTicketState::Failed);
-        atomicAdd(&runtime->failedCount, 1U);
+        device::recordFailure(runtime);
       }
       continue;
     }
     if (!device::requestLive(runtime, workTicket.requestSlot,
                              workTicket.generation)) {
-      if (atomicCAS(&workTicket.state,
-                    static_cast<std::uint32_t>(
-                        abi::WorkTicketState::Pending),
-                    static_cast<std::uint32_t>(
-                        abi::WorkTicketState::Cancelled)) ==
+      if (atomicCAS(
+              &workTicket.state,
+              static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+              static_cast<std::uint32_t>(abi::WorkTicketState::Cancelled)) ==
           static_cast<std::uint32_t>(abi::WorkTicketState::Pending)) {
         device::recordTerminalWork(runtime, workTicket,
                                    abi::WorkTicketState::Pending,
@@ -2357,27 +3288,23 @@ extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
     }
     std::uint32_t dependencyStart = 0;
     if (!device::dependencyRange(runtime, workTicketIndex,
-                                 workTicket.dependencyCount,
-                                 dependencyStart) ||
+                                 workTicket.dependencyCount, dependencyStart) ||
         dependencyStart != workTicket.dependencyStart) {
       if (atomicCAS(&workTicket.state,
-                    static_cast<std::uint32_t>(
-                        abi::WorkTicketState::Pending),
-                    static_cast<std::uint32_t>(
-                        abi::WorkTicketState::Failed)) ==
+                    static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+                    static_cast<std::uint32_t>(abi::WorkTicketState::Failed)) ==
           static_cast<std::uint32_t>(abi::WorkTicketState::Pending)) {
         device::recordTerminalWork(runtime, workTicket,
                                    abi::WorkTicketState::Pending,
                                    abi::WorkTicketState::Failed);
-        atomicAdd(&runtime->failedCount, 1U);
+        device::recordFailure(runtime);
       }
       continue;
     }
 
     bool ready = true;
     bool failed = false;
-    for (std::uint32_t index = 0; index < workTicket.dependencyCount;
-         ++index) {
+    for (std::uint32_t index = 0; index < workTicket.dependencyCount; ++index) {
       const abi::WorkDependency dependency =
           runtime->dependencies[dependencyStart + index];
       if (dependency.objectSlot >= runtime->objectCapacity) {
@@ -2400,15 +3327,13 @@ extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
     }
     if (failed) {
       if (atomicCAS(&workTicket.state,
-                    static_cast<std::uint32_t>(
-                        abi::WorkTicketState::Pending),
-                    static_cast<std::uint32_t>(
-                        abi::WorkTicketState::Failed)) ==
+                    static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+                    static_cast<std::uint32_t>(abi::WorkTicketState::Failed)) ==
           static_cast<std::uint32_t>(abi::WorkTicketState::Pending)) {
         device::recordTerminalWork(runtime, workTicket,
                                    abi::WorkTicketState::Pending,
                                    abi::WorkTicketState::Failed);
-        atomicAdd(&runtime->failedCount, 1U);
+        device::recordFailure(runtime);
       }
       continue;
     }
@@ -2421,6 +3346,35 @@ extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
 #endif
 
 #if NTA_DEVICE_PHASE_KERNELS
+extern "C" __global__ void nta_rebind_indexed_host_pairs(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t pairCount, std::uint64_t keySource,
+    std::uint64_t keyStaging, std::uint64_t valueSource,
+    std::uint64_t valueStaging) {
+  using namespace nta;
+  const std::uint32_t relative = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint64_t objectCount = static_cast<std::uint64_t>(pairCount) * 2U;
+  const std::uint64_t slot64 = static_cast<std::uint64_t>(firstObject) + relative;
+  if (runtime == nullptr || relative >= objectCount ||
+      slot64 >= runtime->objectCapacity) {
+    return;
+  }
+  const std::uint32_t slot = static_cast<std::uint32_t>(slot64);
+  abi::ObjectEntry &object = runtime->objects[slot];
+  if (object.replicaCount != 1 || object.replicaStart >= runtime->replicaCapacity) {
+    device::recordFailure(runtime);
+    return;
+  }
+  const bool key = (relative & 1U) == 0;
+  abi::ReplicaEntry &replica = runtime->replicas[object.replicaStart];
+  replica.sourceAddress = key ? keySource : valueSource;
+  object.stagingAddress = key ? keyStaging : valueStaging;
+  object.selectedReplica = abi::InvalidIndex;
+  object.issueCount = 0;
+  __threadfence();
+  object.state = static_cast<std::uint32_t>(abi::ObjectState::New);
+}
+
 extern "C" __global__ void
 nta_invalidate_cached_objects(nta::abi::RuntimeView *runtime,
                               std::uint32_t firstObject,
@@ -2433,7 +3387,8 @@ nta_invalidate_cached_objects(nta::abi::RuntimeView *runtime,
       slot64 >= runtime->objectCapacity) {
     return;
   }
-  abi::ObjectEntry &object = runtime->objects[static_cast<std::uint32_t>(slot64)];
+  abi::ObjectEntry &object =
+      runtime->objects[static_cast<std::uint32_t>(slot64)];
   (void)atomicCAS(&object.state,
                   static_cast<std::uint32_t>(abi::ObjectState::Ready),
                   static_cast<std::uint32_t>(abi::ObjectState::New));
@@ -2469,17 +3424,15 @@ extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
        requestSlot += stride) {
     const abi::RequestContext &request = runtime->requests[requestSlot];
     runtime->requestProgress[requestSlot] = {
-        request.requestId, request.generation, 0, 0, 0, 0,
-        0,                 0,                  0, 0, 0, 0,
+        request.requestId, request.generation, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     };
   }
   for (std::uint32_t queueHead = index;
        runtime->intentQueueHeads != nullptr &&
        queueHead < abi::BackendCount * abi::UrgencyBucketCount;
        queueHead += stride) {
-    runtime->intentQueueHeads[queueHead] =
-        device::taggedIntentHead(device::currentEpoch(runtime),
-                                 abi::InvalidIndex);
+    runtime->intentQueueHeads[queueHead] = device::taggedIntentHead(
+        device::currentEpoch(runtime), abi::InvalidIndex);
   }
   for (std::uint32_t intentSlot = index;
        runtime->intentQueueEntries != nullptr &&
@@ -2487,8 +3440,8 @@ extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
        intentSlot += stride) {
     runtime->intentQueueEntries[intentSlot].state = 0;
   }
-  for (std::uint32_t objectSlot = index;
-       objectSlot < runtime->objectCapacity; objectSlot += stride) {
+  for (std::uint32_t objectSlot = index; objectSlot < runtime->objectCapacity;
+       objectSlot += stride) {
     if (objectSlot < objectCount) {
       runtime->objects[objectSlot].issueCount = 0;
     }
@@ -2503,8 +3456,7 @@ extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
       runtime->workRunnableNs[index] = 0;
     }
     abi::WorkTicket &workTicket = runtime->workTickets[index];
-    workTicket.state =
-        static_cast<std::uint32_t>(abi::WorkTicketState::New);
+    workTicket.state = static_cast<std::uint32_t>(abi::WorkTicketState::New);
     workTicket.dependencyCount = 0;
     workTicket.dependencyStart = abi::InvalidIndex;
     workTicket.epoch = 0;
@@ -2534,7 +3486,8 @@ extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
 }
 
 // Retire only work that executed in the preceding stream-ordered kernel.
-// Pending work remains eligible for runnable-work publication and a later launch.
+// Pending work remains eligible for runnable-work publication and a later
+// launch.
 extern "C" __global__ void
 nta_complete_launched(nta::abi::RuntimeView *runtime,
                       std::uint32_t workTicketCount) {
@@ -2549,8 +3502,74 @@ nta_complete_launched(nta::abi::RuntimeView *runtime,
   if (atomicAdd(&workTicket.state, 0U) ==
       static_cast<std::uint32_t>(nta::abi::WorkTicketState::New)) {
     workTicket.epoch = nta::device::currentEpoch(runtime);
-    __threadfence();
   }
   (void)nta::device::completeWorkTicket(runtime, index);
+}
+
+// Retire one exact work plan after its application kernel. Kernel-launch stream
+// order supplies the data-publication boundary, so each ticket is initialized
+// and completed once instead of every CTA contending on the same record.
+extern "C" __global__ void nta_complete_stream_ordered(
+    nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *workItems,
+    std::uint32_t workItemCount) {
+  using namespace nta;
+  if (runtime == nullptr || workItems == nullptr) {
+    return;
+  }
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= workItemCount) {
+    return;
+  }
+  const abi::WorkItem item = workItems[index];
+  if (item.workTicket >= runtime->workTicketCapacity ||
+      item.requestSlot >= runtime->requestCapacity ||
+      item.reductionGroup >= runtime->workTicketCapacity ||
+      item.contributorCount == 0 ||
+      item.contributorIndex >= item.contributorCount) {
+    device::recordFailure(runtime);
+    return;
+  }
+
+  abi::WorkTicket &ticket = runtime->workTickets[item.workTicket];
+  const auto state =
+      static_cast<abi::WorkTicketState>(atomicAdd(&ticket.state, 0U));
+  const abi::RequestContext &request = runtime->requests[item.requestSlot];
+  if (state == abi::WorkTicketState::New) {
+    ticket.requestId = request.requestId;
+    ticket.requestSlot = item.requestSlot;
+    ticket.generation = request.generation;
+    ticket.dependencyCount = 0;
+    ticket.logicalTile = item.logicalWork;
+    ticket.dependencyStart = abi::InvalidIndex;
+    ticket.epoch = device::currentEpoch(runtime);
+    ticket.unavailableBytes = 0;
+    ticket.estimatedComputeNs = item.estimatedComputeNs;
+    ticket.reductionGroup = item.reductionGroup;
+    ticket.contributorCount = item.contributorCount;
+  } else if (state != abi::WorkTicketState::Ready ||
+             !device::ticketMatches(runtime, ticket, item.requestSlot,
+                                    request.generation) ||
+             ticket.logicalTile != item.logicalWork ||
+             ticket.reductionGroup != item.reductionGroup ||
+             ticket.contributorCount != item.contributorCount) {
+    if (state != abi::WorkTicketState::Done &&
+        state != abi::WorkTicketState::Cancelled) {
+      device::recordFailure(runtime);
+    }
+    return;
+  }
+
+  if (request.cancelled != 0) {
+    const std::uint32_t expected = static_cast<std::uint32_t>(state);
+    if (atomicCAS(&ticket.state, expected,
+                  static_cast<std::uint32_t>(
+                      abi::WorkTicketState::Cancelled)) == expected) {
+      device::recordTerminalWork(runtime, ticket, state,
+                                 abi::WorkTicketState::Cancelled);
+      device::recordFailure(runtime);
+    }
+    return;
+  }
+  (void)device::completeWorkTicket(runtime, item.workTicket);
 }
 #endif
