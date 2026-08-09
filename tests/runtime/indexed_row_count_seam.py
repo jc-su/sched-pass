@@ -31,32 +31,33 @@ HEADS = 2
 DIM = 128
 
 
-def locate_module() -> pathlib.Path:
+def locate_module() -> pathlib.Path | None:
     configured = os.environ.get("NTA_PHASE_MODULE")
     if configured:
-        return pathlib.Path(configured)
+        path = pathlib.Path(configured)
+        if not path.exists():
+            raise RuntimeError(f"NTA_PHASE_MODULE does not exist: {path}")
+        return path
     cache = pathlib.Path.home() / ".cache/flashinfer"
     candidates = sorted(
         cache.rglob("nta_sglang_decode_demand*.so"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    if not candidates:
-        raise RuntimeError(
-            "no compiled phase module found; set NTA_PHASE_MODULE"
-        )
-    return candidates[0]
+    return candidates[0] if candidates else None
 
 
 def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA unavailable; seam reproducer skipped")
         return 0
+    module = locate_module()
+    if module is None:
+        print("no compiled phase module in the cache; seam reproducer skipped")
+        return 0
     # Phase modules link against TVM-FFI, whose symbols the serving process
     # provides by importing flashinfer before loading any module.
     import flashinfer  # noqa: F401
-
-    module = locate_module()
     phases = JitPhaseProgram(module)
     runtime = Runtime(
         RuntimeConfig(

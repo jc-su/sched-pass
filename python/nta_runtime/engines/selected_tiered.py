@@ -13,12 +13,20 @@ the prefix. Attention then runs over the chosen prefix rows plus the
 request's resident tail; peer requests in a mixed decode batch keep their
 full tables.
 
-Stage-3b boundaries, recorded: selection is host-orchestrated (device
-scoring, host argsort/index assembly — the device-resident tightening is a
-pre-campaign optimization); copies are not yet hit-skipped (the staged
-bitmap measures reuse for the economics without changing correctness); one
-tiered claim at a time; cross-request radix reuse of a tiered prefix is
-unsupported until the cache integration stage.
+Decode serving takes the fixed-shape fast path: retention always forces the
+sink and recent pages, so the kept row count is layer-invariant and the
+attention wrapper is planned once per forward — each layer only rewrites
+the planned indices buffer in place from a device-side selection whose
+shapes never depend on data. Staging is hit-skipped through the per-layer
+staged bitmap: a steady selection costs one boolean readback and zero
+copies. Verify mode runs the reference path instead — host selection, dual
+independently planned wrappers, byte-verification of staged rows, and a
+cross-check that the device selection equals the reference selection.
+
+Remaining boundaries, recorded: the miss path and the per-layer stage
+decision still touch the host (the device-resident seam count is the next
+ABI step); one tiered claim at a time; cross-request radix reuse of a
+tiered prefix is unsupported until the cache integration stage.
 """
 
 from __future__ import annotations
@@ -45,12 +53,14 @@ class TieredClaim:
         page_tokens: int,
         first_object_slot: int,
         verify: bool,
+        verify_fast: bool = False,
     ) -> None:
         self.pending = pending
         self.budget_pages = budget_pages
         self.page_tokens = page_tokens
         self.first_object_slot = first_object_slot
         self.verify = verify
+        self.verify_fast = verify_fast
         controller = pending.controller
         self.layer_count = int(controller.layer_num)
         host_indices, device_indices = controller.move_indices(
@@ -162,6 +172,31 @@ class TieredClaim:
         self.rows_rehit = 0
         self.layers_served = 0
 
+        # Fixed-shape decode selection: with sink and recent retention the
+        # forced set is {0, pages-2, pages-1}, the tail page is always kept,
+        # and the free budget is constant — so every per-layer tensor has a
+        # data-independent shape and the kept row count never changes.
+        self.free_budget = budget_pages - 3
+        self.fast_ok = self.pages > budget_pages and self.free_budget > 0
+        if self.fast_ok:
+            self.forced_pages = torch.tensor(
+                [0, self.pages - 2, self.pages - 1],
+                dtype=torch.int64, device=device,
+            )
+            self.full_forced_pages = self.forced_pages[:2]
+            self.tail_positions = torch.arange(
+                (self.pages - 1) * page_tokens, self.token_count,
+                dtype=torch.int64, device=device,
+            )
+            self.page_arange = torch.arange(
+                page_tokens, dtype=torch.int64, device=device
+            )
+            self.kept_prefix_rows = (
+                (self.free_budget + 2) * page_tokens
+                + int(self.tail_positions.numel())
+            )
+        self.ctx: dict[str, Any] | None = None
+
     def page_row_count(self, chosen: list[int]) -> int:
         tail_rows = self.token_count - (self.pages - 1) * self.page_tokens
         count = 0
@@ -169,12 +204,8 @@ class TieredClaim:
             count += tail_rows if page == self.pages - 1 else self.page_tokens
         return count
 
-    def stage_layer(
-        self, engine: Any, local_layer: int, chosen: list[int],
-        stream: Any,
-    ) -> torch.Tensor:
-        """Copy the chosen pages' rows for one layer; return kept positions."""
-        positions = torch.cat(
+    def _positions_of(self, pages: list[int]) -> torch.Tensor:
+        return torch.cat(
             [
                 torch.arange(
                     page * self.page_tokens,
@@ -182,13 +213,17 @@ class TieredClaim:
                     device=self.host_rows.device,
                     dtype=torch.int64,
                 )
-                for page in chosen
+                for page in pages
             ]
         )
-        count = int(positions.numel())
-        if count == 0 or count > self.capacity_rows:
+
+    def _stage_rows(
+        self, engine: Any, local_layer: int, positions: torch.Tensor,
+        count: int, stream: Any,
+    ) -> None:
+        if count <= 0 or count > self.capacity_rows:
             raise RuntimeError(
-                f"tiered selection produced {count} rows outside capacity "
+                f"tiered staging asked for {count} rows outside capacity "
                 f"{self.capacity_rows}"
             )
         self.source_index[:count] = self.host_rows[positions]
@@ -201,21 +236,99 @@ class TieredClaim:
         phases.progress_validated_indexed_host_range(
             engine._runtime, base, 2, stream=stream
         )
-        chosen_mask = torch.zeros(
-            self.pages, dtype=torch.bool, device=self.staged.device
-        )
+        self.rows_copied += count
+
+    def stage_layer(
+        self, engine: Any, local_layer: int, chosen: list[int],
+        stream: Any,
+    ) -> None:
+        """Reference staging: copy the chosen pages' rows that are not
+        already staged for this layer; verify the whole chosen set."""
         chosen_tensor = torch.tensor(
             chosen, dtype=torch.int64, device=self.staged.device
         )
-        chosen_mask[chosen_tensor] = True
-        previously = self.staged[local_layer] & chosen_mask
-        self.rows_rehit += int(previously.sum()) * self.page_tokens
-        self.staged[local_layer] |= chosen_mask
-        self.rows_copied += count
+        already = self.staged[local_layer, chosen_tensor].tolist()
+        new_pages = [p for p, hit in zip(chosen, already) if not hit]
+        self.rows_rehit += self.page_row_count(
+            [p for p, hit in zip(chosen, already) if hit]
+        )
+        if new_pages:
+            positions = self._positions_of(new_pages)
+            self._stage_rows(
+                engine, local_layer, positions, int(positions.numel()), stream
+            )
+            self.staged[
+                local_layer,
+                torch.tensor(
+                    new_pages, dtype=torch.int64, device=self.staged.device
+                ),
+            ] = True
+        if self.verify or self.verify_fast:
+            all_positions = self._positions_of(chosen)
+            self._verify_layer(
+                local_layer, all_positions, int(all_positions.numel())
+            )
 
-        if self.verify:
-            self._verify_layer(local_layer, positions, count)
-        return positions
+    def choose_free_pages(
+        self, local_layer: int, query: torch.Tensor, group_size: int
+    ) -> torch.Tensor:
+        """Device-side selection with data-independent shapes.
+
+        Masking the forced pages to -inf and taking the first ``free_budget``
+        entries of a stable descending argsort ranks the non-forced pages
+        exactly as the reference selection does (stable order among unmasked
+        pages is unchanged by re-keying the masked ones), so the union with
+        the forced set equals ``budgeted_page_selection`` — asserted by the
+        verify path. No host synchronization occurs.
+        """
+        scores = quest_page_scores(
+            query.to(torch.float32),
+            self.kmin[local_layer],
+            self.kmax[local_layer],
+            group_size=group_size,
+        ).sum(dim=0)
+        scores = scores.index_fill(
+            0, self.forced_pages, float("-inf")
+        )
+        order = torch.argsort(scores, descending=True, stable=True)
+        return order[: self.free_budget]
+
+    def kept_prefix_positions(self, free_pages: torch.Tensor) -> torch.Tensor:
+        """Claim positions kept this layer: full forced + free + tail."""
+        full = torch.cat([self.full_forced_pages, free_pages])
+        body = (
+            full.unsqueeze(1) * self.page_tokens + self.page_arange
+        ).reshape(-1)
+        return torch.cat([body, self.tail_positions])
+
+    def stage_missing(
+        self, engine: Any, local_layer: int, free_pages: torch.Tensor,
+        stream: Any,
+    ) -> None:
+        """Hit-skipped staging for the fast path.
+
+        The steady state — every chosen page already staged — costs one
+        boolean readback and no copies. Only a miss pays host assembly.
+        """
+        chosen = torch.cat([self.forced_pages, free_pages])
+        already = self.staged[local_layer, chosen]
+        if bool(already.all()):
+            self.rows_rehit += self.kept_prefix_rows
+            return
+        new_pages = chosen[~already].tolist()
+        positions = self._positions_of(new_pages)
+        self._stage_rows(
+            engine, local_layer, positions, int(positions.numel()), stream
+        )
+        self.staged[
+            local_layer,
+            torch.tensor(
+                new_pages, dtype=torch.int64, device=self.staged.device
+            ),
+        ] = True
+        self.rows_rehit += self.kept_prefix_rows - self.page_row_count(
+            new_pages
+        )
 
     def _verify_layer(
         self, local_layer: int, positions: torch.Tensor, count: int

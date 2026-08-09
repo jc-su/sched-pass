@@ -222,6 +222,29 @@ CUDA-matched C driver (`gcc-14`).
    centerpiece**; then 1A/1B.
 5. RQ3 ablations and RQ4 robustness last.
 
+**1D stage 4 first measurement (2026-08-09,
+`results/serving/selected-load-16k-b128-first.json`):** the three-arm
+harness (`benchmarks/serving/SglangSelectedLoad.py`) measured the v1
+tiered path at 16K/budget-128: the dense NTA arm reproduced stock output
+exactly at 1.05x external TTFT p95, and tiered served 84.4% avoided
+tokens but ran 7.5x slower than dense promotion (0.62s vs 0.08s external
+TTFT p95). The regression is orchestration, not transfer, with causes
+ranked by inspection of the v1 path: the dual verification wrapper pair
+was still planned and run on every serving layer; every layer paid a host
+`plan()`; per-layer host synchronization; and no hit-skipping (~33%
+measured excess copies). The optimization round in response: single
+planned wrapper when verification is off, plan-once-per-forward with
+in-place per-layer indices rewrite (sound because FlashInfer's decode
+planner consumes only indptr lengths, and retention keeps the tail page
+so kept counts are layer-invariant), fixed-shape device-side selection
+(no per-layer host sync in the steady path), and hit-skipped staging
+(steady selection costs one boolean readback, zero copies). Verification
+modes cover both paths: `NTA_SGLANG_SELECTED_TIERED_VERIFY=1` runs the
+reference path (dual wrappers, byte verification, device-vs-reference
+selection cross-check); `=fast` runs the timed fast path plus per-layer
+independent recomputation. The n=10 campaign starts only after the rerun
+shows tiered at parity or better against dense promotion.
+
 Go/no-go: if the integrated streaming operator cannot beat the layer-wise arm
 at real opportunity points by `>=1.10x` with the direct path within `3%`, and
 1D cannot reach its gate, the OSDI serving thesis is not claimable; the work

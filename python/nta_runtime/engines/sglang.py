@@ -795,6 +795,17 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             # by the new claim at the same base, and the bridge entry retires
             # so producer-slot reuse checks keep protecting live claims.
             self._hicache.retire(self._tiered_active.pending)
+            # Fold the released claim's transfer counters into the running
+            # totals; the serving layer reports totals + the live claim, so
+            # supersession must not discard history.
+            self._stats["tiered_rows_copied_released"] = (
+                self._stats.get("tiered_rows_copied_released", 0)
+                + self._tiered_active.rows_copied
+            )
+            self._stats["tiered_rows_rehit_released"] = (
+                self._stats.get("tiered_rows_rehit_released", 0)
+                + self._tiered_active.rows_rehit
+            )
             self._tiered_active = None
             self._stats["tiered_claims_released"] = (
                 self._stats.get("tiered_claims_released", 0) + 1
@@ -811,11 +822,17 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             page_tokens=self._selected_shadow.page_tokens,
             first_object_slot=first_slot,
             verify=os.environ.get("NTA_SGLANG_SELECTED_TIERED_VERIFY") == "1",
+            verify_fast=(
+                os.environ.get("NTA_SGLANG_SELECTED_TIERED_VERIFY") == "fast"
+            ),
         )
         for local_layer in range(claim.layer_count):
             pending.producer_event.complete(local_layer)
         self._tiered_active = claim
         self._stats["tiered_claims"] = self._stats.get("tiered_claims", 0) + 1
+        self._stats["tiered_claim_tokens"] = (
+            self._stats.get("tiered_claim_tokens", 0) + claim.token_count
+        )
 
     def cancel_requests(self, request_id_prefix: str, *, all: bool = False) -> int:
         cancelled = self._request_slots.cancel_matching(request_id_prefix, all=all)
@@ -2692,6 +2709,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             return output.view(-1, layer.tp_q_head_num * layer.head_dim)
         if (
             self._selected_shadow is not None
+            # Tiered mode confines selection to the claimed external prefix;
+            # claim-free batches take the stock dense path so the resident
+            # tail measures the mechanism, not stage-3a's verification pair.
+            and not self._tiered_enabled
             and pending is None
             and any(
                 wrapper is candidate
