@@ -680,6 +680,25 @@ is a distribution property rather than an extreme; the remaining mechanism
 suspects after H-A/H-B are per-transfer PCIe/memory contention and host-side
 planning jitter, discriminated next by a copy-engine wave path.
 
+The 256-token long-window series then ran at n=10
+(`results/serving/sglang-hicache-load-longwindow-qualification.json`,
+qualified, exact outputs, zero fallback). It splits the tail question in two.
+Typical-case interference is resolved: median resident P99 inter-token
+latency is **1.028x**, and four of ten trials measured the NTA arm's tail
+*better* than stock (0.58-0.78x). The geometric mean (1.1614x, CI [0.836,
+1.669]) is dominated by three episodic trials (2.19x, 2.35x, 3.25x, one of
+which also degraded both arms' TTFT and zeroed goodput). Forensically, the
+mechanism counters are identical across all ten trials — 3 graph captures, 4
+warmups, 6 replays, 10 ticketed incremental launches, 350 lookahead layers, 3
+mixed layers in pathological and healthy trials alike — so the episodes are
+not produced by variable acquisition work. The pathology is host- or
+scheduler-level variance striking ~3/10 runs. Next diagnostics: per-token
+timeline forensics of the pathological artifacts (spike position versus
+external arrival and churn phases), then a repeat with host-side controls
+(CPU pinning, allocator preallocation). The 1C gate is passed on the median
+and failed on the mean until the episodic source is identified; both numbers
+are reported.
+
 Resident TTFT is not used as the interference headline: the workload submits
 external requests only after a resident emits its first token, so that TTFT is
 causally prior to external acquisition. The benchmark now reports per-request
