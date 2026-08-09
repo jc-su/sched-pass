@@ -73,9 +73,10 @@ def parse_args() -> argparse.Namespace:
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
     )
     parser.add_argument(
-        "--skip-load-warmup",
-        action="store_true",
-        help="skip the performance-excluded mixed-arrival graph warmup",
+        "--load-warmup-iterations",
+        type=int,
+        default=2,
+        help="performance-excluded mixed arrivals before measurement",
     )
     args = parser.parse_args()
     if not args.model.is_dir():
@@ -96,6 +97,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("request and token counts must be positive")
     if args.external_suffix_tokens < 0:
         parser.error("external suffix token count cannot be negative")
+    if args.load_warmup_iterations < 0:
+        parser.error("load warmup iterations cannot be negative")
     if args.request_rate <= 0:
         parser.error("request rate must be positive")
     if args.hicache_ratio <= 1:
@@ -289,7 +292,7 @@ def main() -> int:
     eviction_rounds = args.max_total_tokens // args.churn_tokens + 1
     churn_prompts = [
         make_prompt(tokenizer, f"load-churn-{index}", args.churn_tokens)
-        for index in range(3 * eviction_rounds)
+        for index in range((2 + args.load_warmup_iterations) * eviction_rounds)
     ]
     setup_sampling = {"temperature": 0, "max_new_tokens": 1}
 
@@ -330,13 +333,15 @@ def main() -> int:
             if device_cached_tokens(resident_probe) <= 0:
                 raise RuntimeError("resident warmup did not remain in device cache")
 
-        if not args.skip_load_warmup:
-            # Exercise this mixed-arrival shape once outside measurement so a
-            # repeated finite operator can capture/replay without timed setup.
+        for warmup in range(args.load_warmup_iterations):
+            # Demand graphs warm on the first occurrence and capture on the
+            # second. Both are excluded so the measured occurrence is replay.
             engine.loop.run_until_complete(
                 _run_load(engine, resident_prompts, external_prompts, args)
             )
-            for prompt in churn_prompts[2 * eviction_rounds :]:
+            begin = (2 + warmup) * eviction_rounds
+            end = begin + eviction_rounds
+            for prompt in churn_prompts[begin:end]:
                 generated_text(engine.generate(prompt, setup_sampling))
             for prompt in resident_prompts:
                 generated_text(engine.generate(prompt, setup_sampling))
@@ -401,7 +406,8 @@ def main() -> int:
         "mixed_chunk_enabled": args.batch_mode == "coalesced",
         "hicache_ratio": args.hicache_ratio,
         "cuda_graph_decode": args.cuda_graph_decode,
-        "load_warmup_excluded": not args.skip_load_warmup,
+        "load_warmup_iterations": args.load_warmup_iterations,
+        "load_warmup_excluded": args.load_warmup_iterations >= 2,
         "load_seconds": load_seconds,
         "elapsed_seconds": elapsed,
         "request_throughput": len(records) / elapsed,

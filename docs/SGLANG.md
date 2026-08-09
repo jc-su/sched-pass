@@ -341,9 +341,10 @@ python benchmarks/serving/CompareSglangHiCacheLoadTrials.py \
 
 The reducer alternates the first arm and reports geometric means with bootstrap
 95% intervals. Exact generated output, all transformed attention, and zero
-fallback are mandatory. Each arm runs one performance-excluded mixed-arrival
-warmup so the timed NTA occurrence can capture or replay its finite operator
-graph; `--require-demand-graph` rejects an eager-only report. Resident P99
+fallback are mandatory. Each arm runs two performance-excluded mixed-arrival
+occurrences: the first warms and the second captures the finite operator graph,
+so the timed NTA occurrence replays it. `--require-demand-graph` rejects an
+eager-only report. Resident P99
 inter-token latency is the causal
 interference metric; resident TTFT occurs before the external arrival in this
 fixture and is reported only as a general latency diagnostic.
