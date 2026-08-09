@@ -699,6 +699,23 @@ external arrival and churn phases), then a repeat with host-side controls
 and failed on the mean until the episodic source is identified; both numbers
 are reported.
 
+Per-token forensics of the long-window artifacts sharpen the episodic
+signature. Median inter-token latency is identical in both arms of every
+trial (10.2-11.5 ms), including the pathological ones. The pathological NTA
+arms show two-to-four *consecutive* stretched intervals (43.2/42.6/42.2 ms at
+22% of the timeline; 55.9/35.4 at 49%; 37.0/26.0/24.2 at 41%) — one sustained
+roughly-100 ms disruption landing mid-decode during the external-arrival and
+claim phase — while stock arms in other trials spike up to 37.7 ms with
+different placement. Pre-declared hypothesis **H-C**: the claim-time
+registration and planning burst serializes the scheduler thread — the pinned
+directory-upload ring is compile-time depth 4 (`Runtime.cpp`,
+`DirectoryUploadDepth`) and event-synchronizes when exhausted — and when that
+burst's stochastic timing collides with resident decode steps, consecutive
+intervals stretch. Discriminating tests: deepen or make configurable the
+upload ring, move claim-time registration off the scheduler thread, and
+re-run the long-window series; the hypothesis is falsified if the clustered
+mid-timeline spikes survive both changes.
+
 Resident TTFT is not used as the interference headline: the workload submits
 external requests only after a resident emits its first token, so that TTFT is
 causally prior to external acquisition. The benchmark now reports per-request
