@@ -644,8 +644,23 @@ measurement of incremental execution itself. The consistently regressed metric
 is resident P99 inter-token latency, and the acquisition mover streams ran at
 elevated CUDA priority (`-1`) above the decode stream in every dense run
 recorded above; movers now default to the lowest priority
-(`NTA_SGLANG_MOVER_STREAM_PRIORITY=0`), and the interference series must be
-re-measured before further dense conclusions are drawn.
+(`NTA_SGLANG_MOVER_STREAM_PRIORITY=0`).
+
+The corrected-priority interference series ran on 2026-08-09 as the first
+ten-trial, arm-balanced, `evidence_grade=qualified` measurement of this
+workload (`results/serving/sglang-hicache-load-moverfix-qualification.json`,
+clean revision, exact outputs, all attention transformed, zero fallback).
+Resident P99 inter-token latency remained **1.2407x** geometric mean, median
+1.1763x, bootstrap CI [1.1433, 1.3801]; output throughput was 0.9402x
+[0.9174, 0.9642]; external P95 TTFT 1.1219x; goodput 0.8185x, with two trials
+(1.754x and 1.586x ITL spikes) crossing the SLO threshold and driving the
+goodput tail. The mover-priority hypothesis is therefore **measured and
+rejected as the dominant cause**: lowering mover priority did not close the
+tail regression. Remaining suspects are copy-kernel SM residency (priority
+arbitrates issue, not occupancy), memory-bandwidth contention during decode
+steps, and per-layer host planning work; decomposing them is the RQ4
+interference ablation. The 1C resident-tail gate (<=1.05x) is failed at this
+configuration and remains failed until that decomposition lands.
 
 Resident TTFT is not used as the interference headline: the workload submits
 external requests only after a resident emits its first token, so that TTFT is
