@@ -242,13 +242,25 @@ statistical evidence. Dense
 early-known acquisition is therefore a measured non-goal for the current
 mechanism, not a workload on which to imply a universal win.
 
-This falsifies the claim that CTA-level granularity alone wins. The remaining
-cost is dominated by ticketed setup, launch/event control, and GPU mover
-interference with resident decode rather than the request-bound direct guard.
-The next performance milestone is therefore a
-captured demand-mode operator loop with per-step structural publication and
-device-selected progress/skip control. Transfer tuning without that control
-change is not sufficient evidence for the paper thesis.
+This falsifies the claim that CTA-level granularity alone wins. The finite
+demand-mode operator loop, structural plan reuse across request generations,
+and exact-shape graph replay are now implemented. On clean revision `ae7c56a`,
+one coalesced 2K host/2K resident diagnostic executed 5,148 transformed
+attention launches, ten ticketed launches, three mixed layers, three demand
+graph captures and six graph launches with zero fallback. It reached only
+`0.9169x` output throughput; external TTFT was `1.1014x`, resident P99 ITL was
+`1.8843x`, and stock-derived SLO goodput was `0.4584x`. One process trial is
+diagnostic, not a confidence claim.
+
+The remaining limitation is architectural rather than another launch-control
+omission: only mixed incremental layers preserve partial progress. Once the
+external request enters the proactive layer frontier, the resident request
+cannot independently advance through subsequent transformer layers inside the
+same dense forward. The next positive gate is therefore end-to-end
+model-generated demand that avoids bytes, or within-request arrival skew where
+FlashInfer partials overlap transfer, followed by an engine decision that uses
+the exported progress. Transfer tuning on early-known dense demand is not
+sufficient evidence for the paper thesis.
 
 ### 4.2 Runtime: schedule data and computation together
 

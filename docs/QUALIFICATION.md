@@ -34,6 +34,15 @@ This rejects the dense
 early-known-demand performance hypothesis; it is not folded into the positive
 device-selected acquisition claim.
 
+The ABI-v25 finite demand graph closes the earlier eager-control gap but does
+not reverse that dense boundary. On clean revision `ae7c56a`, one
+performance-excluded-warmup 2K host/2K resident run replayed the demand graph,
+used both compiler forms, compacted the combined physical CTA bound to 50%, and
+reported zero stock/fallback launches with exact output. It delivered `0.9169x`
+output throughput, `1.1014x` external TTFT, `1.8843x` resident P99 ITL, and
+`0.4584x` stock-derived SLO goodput. This is one diagnostic process trial, not
+paper evidence; it proves graph activation and preserves the negative result.
+
 The latest `local` qualifier returned `READY` after 46 CTests (one multi-GPU
 case skipped on the one-GPU host), CUDA sanitizer coverage, a 10,000-epoch
 lifecycle stress, CPU-only tests, Clang static analysis, Python package checks,

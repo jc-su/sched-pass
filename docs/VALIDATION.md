@@ -566,6 +566,7 @@ data:
 | Qwen2.5-3B 2K coalesced requests | 374.601 ms | 393.013 ms | 0.953x | 36 mixed/ticketed/parallel-progress layers, 50.0% combined CTA bound, 0 stock/fallback |
 | Qwen2.5-3B 4K, four resident peers | 446.294 ms | 484.507 ms | 0.921x | 36 mixed/ticketed layers, 132 direct + 32 external work items, 0 stock/fallback |
 | Qwen2.5-3B 2K acquisition frontier v10 | 204.643 ms | 209.384 ms | 0.977x | 1 mixed ticketed layer, 35 preacquired suffix layers, 0 stock/fallback |
+| Qwen2.5-3B 2K coalesced, finite demand graph replay | 347.890 ms | 379.436 ms | 0.917x | clean `ae7c56a`; 3 mixed, 10 ticketed, 3 captures/6 graph launches, 50% combined CTA bound, 0 stock/fallback |
 
 Generated output matched in every row and fallback was zero. The isolated
 `1.073x` Qwen result is only a smoke point; it is too small and noisy for a
@@ -617,6 +618,13 @@ attention was transformed, and fallback was zero. Three repetitions are
 diagnostic negative evidence for dense, early-known host demand, not a
 paper-level confidence claim; they do not invalidate the separately measured
 device-selected crossover.
+
+The clean ABI-v25 row excludes two mixed-arrival warmup occurrences so the
+timed occurrence uses the finite demand graph rather than charging first-use
+setup. External TTFT was `1.1014x`, resident P99 ITL was `1.8843x`, and
+stock-derived SLO goodput was `0.4584x`. This rules out missing demand-graph
+capture as the complete explanation for the dense loss. It does not establish
+a repeated confidence interval or an end-to-end device-selected-demand win.
 
 Resident TTFT is not used as the interference headline: the workload submits
 external requests only after a resident emits its first token, so that TTFT is
