@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Any
 
 from .epoch import BoundedEpoch, EpochResult
@@ -270,6 +271,7 @@ class FlashInferLayerEpoch:
         indexed_host_copy_blocks_per_group: int = 2,
         sync_events: tuple[Any, tuple[Any, ...]] | None = None,
         progress_profile: tuple[Any, Any] | None = None,
+        on_discovered: Callable[[Any], None] | None = None,
         run_options: dict[str, Any] | None = None,
     ) -> int:
         """Enqueue a fixed host epoch; call ``check`` after execution."""
@@ -412,6 +414,8 @@ class FlashInferLayerEpoch:
             if progress_profile is not None:
                 progress_profile[0].record(stream)
             launch()
+            if on_discovered is not None:
+                on_discovered(stream)
             for progress_pass, blocks in enumerate(block_counts, 1):
                 progress(blocks, stream)
                 ready(progress_pass, progress_pass == len(block_counts))
@@ -422,6 +426,8 @@ class FlashInferLayerEpoch:
         import torch
 
         self.epoch.phases.discover(self.runtime, self.plan, stream)
+        if on_discovered is not None:
+            on_discovered(stream)
         if sync_events is None:
             discovery_done = torch.cuda.Event()
             arrival_events = tuple(torch.cuda.Event() for _ in block_counts)

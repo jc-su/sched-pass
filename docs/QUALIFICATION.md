@@ -151,7 +151,8 @@ The `serving` object must establish all of the following:
   warm JIT caches, validated versioned compiler contracts with at least one
   direct/incremental pair, positive transformed-direct and ticketed launch
   counts, and zero stock attention launches in the NTA arm;
-- demand-mode decode CUDA graph replay and paged-prefill integration;
+- whole-model decode replay, paged-prefill integration, and positive finite
+  demand-operator graph capture/replay counters;
 - no more than 5% p50 resident overhead and at least 90% of matched dense bulk
   throughput;
 - simultaneous real `host_staged` and `nvme` serving paths with cancellation
@@ -181,8 +182,9 @@ The executable gate now matches `SYSTEM_PLAN.md` and requires:
   runtime-ABI validation, matching source fingerprints, and differential
   correctness;
 - real FlashInfer decode and paged-prefill execution where useful partials run
-  before the last arrival, output matches stock, and demand mode replays in a
-  CUDA graph, with every NTA attention launch accounted to a transformed form,
+  before the last arrival, output matches stock, and demand mode replays in
+  finite decode and paged-prefill CUDA operator graphs, with every NTA attention
+  launch accounted to a transformed form,
   zero stock launches, generation-safe request completion, at least 4x staging
   reduction, at least 1.15x speedup over atomic promotion, and a 95% speedup
   interval whose lower bound exceeds 1.0;

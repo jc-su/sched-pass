@@ -6,6 +6,9 @@ from __future__ import annotations
 import inspect
 import multiprocessing as mp
 import types
+from contextlib import nullcontext
+from dataclasses import replace
+from unittest.mock import patch
 
 
 def load_in_spawn(result) -> None:
@@ -91,7 +94,12 @@ def main() -> None:
         AcquisitionAdmission,
         AdmissionConfig,
     )
-    from nta_runtime.engines.sglang_hicache import HostLoadProgress
+    from nta_runtime.engines.sglang_hicache import (
+        HostLoadProgress,
+        SglangHiCacheBridge,
+    )
+    from nta_runtime.requests import RequestBinding, stable_request_id
+    from nta_runtime.runtime import RequestProgress
 
     class Request:
         def __init__(self, rid: str) -> None:
@@ -105,6 +113,7 @@ def main() -> None:
         def __init__(self) -> None:
             self.leading_layers = 0
             self.stats = {}
+            self.critical_plan = None
 
         def progress(self, consumer_index: int) -> HostLoadProgress:
             return HostLoadProgress(
@@ -118,6 +127,12 @@ def main() -> None:
         def record_admission(self, **increments: int) -> None:
             for name, value in increments.items():
                 self.stats[name] = self.stats.get(name, 0) + value
+
+        def poll_critical_work(self, request_ids: set[int]):
+            del request_ids
+            result = self.critical_plan
+            self.critical_plan = None
+            return result
 
     clock = [1_000]
     config = AdmissionConfig(True, 4, 100, 1)
@@ -169,9 +184,74 @@ def main() -> None:
     assert bridge.stats["admission_released_mixed_batches"] == 1
     assert bridge.stats["admission_external_bytes"] >= 768
 
+    bridge.critical_plan = types.SimpleNamespace(
+        compute_order=(),
+        data_order=((stable_request_id("resident"), 1),),
+    )
+    admission = AcquisitionAdmission(config, clock=lambda: clock[0])
+    assert admission.consider(scheduler, batch, bridge) is batch
+    assert bridge.stats["admission_feedback_data_blocked"] == 1
+    assert bridge.stats["admission_released_feedback_data_blocked"] == 1
+
+    bridge.critical_plan = types.SimpleNamespace(
+        compute_order=((stable_request_id("resident"), 1),),
+        data_order=(),
+    )
+    admission = AcquisitionAdmission(config, clock=lambda: clock[0])
+    assert admission.consider(scheduler, batch, bridge) is None
+    assert bridge.stats["admission_feedback_executable"] == 1
+
+    class DevicePool:
+        pass
+
+    class Snapshot:
+        def __init__(self, rows) -> None:
+            self.pending = True
+            self.rows = rows
+
+        def query(self):
+            rows = self.rows
+            self.rows = None
+            self.pending = False
+            return rows
+
+    device_pool = DevicePool()
+    progress_bridge = SglangHiCacheBridge(device_pool)
+    resident_id = stable_request_id("resident")
+    binding = RequestBinding(0, 0, 4, resident_id, priority=3)
+    blocked = RequestProgress(
+        resident_id,
+        4,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        7,
+        4096,
+        0,
+        0,
+        3000,
+        3000,
+        0,
+    )
+    progress_bridge.publish_request_progress(
+        Snapshot((blocked,)),
+        (binding,),
+        bandwidth_bytes_per_second=10_000_000_000,
+    )
+    critical = progress_bridge.poll_critical_work({resident_id})
+    assert critical is not None
+    assert critical.data_order == ((resident_id, 4),)
+    assert critical.compute_order == ()
+    assert progress_bridge.poll_critical_work({resident_id}) is None
+    assert progress_bridge.admission_stats()["progress_feedback_consumed"] == 1
+
     from nta_runtime.engines.sglang import (
         NtaFlashInferAttnBackend,
         _ActiveBatch,
+        _demand_graph_key,
         _frontier_transfer_bytes,
         _group_external_pages_by_request,
         _pipeline_object_range,
@@ -204,6 +284,148 @@ def main() -> None:
     assert signature != remapped, "plan cache aliased different HiCache page rows"
     assert signature == rebound, "request rebinding invalidated a structural plan"
     assert signature != regenerated, "plan cache aliased a reused request generation"
+
+    import torch
+
+    query = torch.empty((2, 4, 8), dtype=torch.float16)
+    key_cache = torch.empty((16, 1), dtype=torch.float16)
+    value_cache = torch.empty((16, 1), dtype=torch.float16)
+    graph_wrapper = types.SimpleNamespace(
+        _plan_info=(1, 2, 3),
+        _qo_indptr_buf=torch.tensor((0, 2), dtype=torch.int32),
+    )
+    graph_plan = types.SimpleNamespace(
+        work_items_address=0x1000,
+        dependencies_address=0x2000,
+    )
+    graph_runtime = torch.empty(1, dtype=torch.uint8)
+    graph_key_arguments = {
+        "operator_family": "decode",
+        "wrapper": graph_wrapper,
+        "layer_id": 3,
+        "plan": graph_plan,
+        "runtime_tensor": graph_runtime,
+        "work_count": 8,
+        "object_count": 4,
+        "progress_blocks": (2, 2),
+        "ready_work_counts": (4, 8),
+        "initial_ready_work_count": 0,
+        "indexed_copy_blocks_per_group": 2,
+        "query": query,
+        "kv_cache": (key_cache, value_cache),
+        "sm_scale": 0.125,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+        "causal": False,
+        "window_left": -1,
+    }
+    graph_key = _demand_graph_key(**graph_key_arguments)
+    same_graph_key = _demand_graph_key(**graph_key_arguments)
+    changed_graph_key = _demand_graph_key(
+        **(
+            graph_key_arguments
+            | {"progress_blocks": (4,), "ready_work_counts": (8,)}
+        )
+    )
+    assert graph_key == same_graph_key
+    assert graph_key != changed_graph_key
+
+    graph_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
+    graph_backend._demand_graphs = {}
+    graph_backend._demand_graph_warmups = {}
+    graph_backend._demand_graph_capacity = 4
+    graph_backend._stats = {
+        "demand_graph_warmups": 0,
+        "demand_graph_captures": 0,
+        "demand_graph_replays": 0,
+        "demand_graph_evictions": 0,
+    }
+    enqueue_calls = []
+
+    def enqueue_graph(query_arg, output_arg, events_arg, callback_arg) -> None:
+        enqueue_calls.append((query_arg, output_arg, events_arg, callback_arg))
+
+    eager_events = (object(), (object(), object()))
+    callback = object()
+    eager_output = torch.empty_like(query)
+    assert (
+        graph_backend._enqueue_demand_graph(
+            graph_key,
+            graph_wrapper,
+            query,
+            eager_output,
+            object(),
+            enqueue_graph,
+            eager_events,
+            callback,
+        )
+        is eager_output
+    )
+    assert enqueue_calls == [(query, eager_output, eager_events, callback)]
+    assert graph_backend._stats["demand_graph_warmups"] == 1
+
+    class Event:
+        pass
+
+    class Graph:
+        def __init__(self) -> None:
+            self.replays = 0
+
+        def replay(self) -> None:
+            self.replays += 1
+
+    with (
+        patch("torch.cuda.Event", Event),
+        patch("torch.cuda.CUDAGraph", Graph),
+        patch("torch.cuda.graph", lambda *args, **kwargs: nullcontext()),
+    ):
+        captured_output = graph_backend._enqueue_demand_graph(
+            graph_key,
+            graph_wrapper,
+            query,
+            torch.empty_like(query),
+            object(),
+            enqueue_graph,
+            eager_events,
+            callback,
+        )
+    assert graph_backend._stats["demand_graph_captures"] == 1
+    assert enqueue_calls[-1][3] is None
+    assert len(enqueue_calls[-1][2][1]) == 2
+    captured = graph_backend._demand_graphs[graph_key]
+    assert captured_output is captured.output
+    assert captured.graph.replays == 1
+    assert graph_backend._stats["demand_graph_replays"] == 1
+    graph_wrapper._qo_indptr_buf = torch.tensor((0, 7), dtype=torch.int32)
+    replay_output = graph_backend._enqueue_demand_graph(
+        graph_key,
+        graph_wrapper,
+        query.fill_(3),
+        torch.empty_like(query),
+        object(),
+        enqueue_graph,
+        eager_events,
+        callback,
+    )
+    assert replay_output is captured.output
+    assert captured.graph.replays == 2
+    assert torch.equal(captured.query, query)
+    assert torch.equal(captured.wrapper_metadata[0][1], graph_wrapper._qo_indptr_buf)
+    assert graph_backend._stats["demand_graph_replays"] == 2
+    graph_backend._discard_demand_graphs(graph_plan)
+    assert graph_key not in graph_backend._demand_graphs
+    assert graph_key not in graph_backend._demand_graph_warmups
+    graph_backend._demand_graph_capacity = 1
+    graph_backend._demand_graph_warmups[graph_key] = None
+    graph_backend._demand_graphs[graph_key] = captured
+    synchronized = []
+    graph_backend._reserve_demand_graph_key(
+        replace(graph_key, layer_id=4),
+        types.SimpleNamespace(synchronize=lambda: synchronized.append(True)),
+    )
+    assert synchronized == [True]
+    assert graph_key not in graph_backend._demand_graphs
+    assert graph_backend._stats["demand_graph_evictions"] == 1
 
     class TensorGeometry:
         def __init__(self, elements: int, element_bytes: int) -> None:

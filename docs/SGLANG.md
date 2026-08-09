@@ -166,8 +166,18 @@ Replay invokes the real transformed FA2 wrapper with graph-stable runtime
 arguments and current request bindings. A pending HiCache transfer is ordered
 before graph replay; CUDA
 stream-capture isolation forbids capturing a wait on uncaptured producer-stream
-work. Eager prefill retains per-layer copy/compute overlap. The demand-mode
-reset/progress/runnable loop is not yet embedded in SGLang's replay graph.
+work. SGLang's full model graph therefore uses preacquired external data.
+
+Demand mode has a separate finite operator graph. For an exact structural key,
+the first epoch runs eagerly, the second captures and launches the
+reset/discover/progress/runnable sequence, and later epochs replay it. The key
+covers the operator family, plan/runtime addresses, launch bounds, query and KV
+layout, scales, FlashInfer plan record, and every metadata-tensor layout.
+Captured page-table tensors remain owned by the graph and receive stream-ordered
+copies from the current FlashInfer plan before replay. Work-plan contents,
+request generations, object versions, and source addresses remain dynamic
+stream inputs. `NTA_SGLANG_DEMAND_GRAPH=0` disables this path for an eager
+ablation; it never selects stock attention.
 
 `NTA_ENGINE_STATS_FILE=/path/report.json` enables per-process statistics. Normal
 demand mode is stream ordered across layers and checks the final epoch plus the
@@ -250,17 +260,20 @@ schedule-aware eager path chooses transformed direct execution when its online
 model predicts that one coalesced transfer round is cheaper, and transformed
 incremental execution when multiple useful rounds should repay ticket and
 launch setup. This is mechanism specialization, not dispatch to vanilla
-FlashInfer. Progress is available to SGLang's external-only admission hook.
+FlashInfer. After compiler discovery, a bounded pinned snapshot publishes
+generation-checked pending/runnable/completed work and blocked bytes. SGLang's
+external-only admission hook consumes the resulting critical-work plan: it
+continues resident overlap when executable contributors remain and releases a
+staged external batch when the active resident set is data-blocked or terminal.
 Mixed batches are not delayed because the measured re-merge policy shifted
-rather than reduced latency. The incremental loop is not yet inside decode
-graph replay.
+instead of reducing latency.
 
-SGLang will publish request generation, SLO slack, cancellation, page mapping,
-and batch admission state. NTA will return per-request completed contributors,
-remaining unavailable bytes, predicted data arrival, and runnable compute cost.
-The scheduler will use those summaries for the next batch without downloading
-per-tile arrays. Forced layer-wait, bulk, fine-grained, and skip/rebatch paths
-remain matched baselines rather than production policy modes.
+SGLang publishes request generation, priority, cancellation, page mapping, and
+batch admission state. NTA returns per-request completed contributors,
+remaining unavailable bytes, predicted data service, and runnable compute cost
+without downloading per-tile arrays. Deadline/slack propagation and a measured
+closed-loop SLO win remain open. Forced layer-wait, bulk, fine-grained, and
+skip/rebatch paths remain matched baselines rather than production policy modes.
 
 ## Matched Benchmark
 
@@ -278,6 +291,25 @@ python benchmarks/serving/CompareSglangHiCache.py \
   --cuda-graph-decode full \
   --max-latency-regression-percent 5
 ```
+
+The mechanism-active operator-graph gate uses the same harness with demand
+mode forced and the model graph disabled:
+
+```bash
+NTA_SGLANG_PIPELINE_HOST=0 \
+NTA_SGLANG_FORCE_INCREMENTAL=1 \
+NTA_SGLANG_FRAGMENT_LOOKAHEAD=0 \
+NTA_SGLANG_CROSS_LAYER_FRONTIER=0 \
+python benchmarks/serving/CompareSglangHiCache.py \
+  --model /path/to/model --iterations 10 \
+  --hot-tokens 96 --churn-tokens 184 \
+  --max-total-tokens 192 --context-length 256 \
+  --cuda-graph-decode disabled --require-demand-graph
+```
+
+`--require-demand-graph` rejects reports unless the NTA arm has positive eager
+warmup, capture, and graph-launch counters. SGLang model-graph counters cannot
+satisfy this gate.
 
 An iteration qualifies only when SGLang reports host-cached tokens for the hot
 request. The runner collects the requested number of qualified promotions,

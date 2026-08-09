@@ -352,15 +352,17 @@ Implemented today are:
   a no-oracle bulk-versus-indexed cost decision; and
 - an SGLang HiCache adapter that publishes request generations and priorities,
   preserves exact page-map identity, exposes the complete demand path and the
-  transformed direct path, and replays transformed FlashInfer decode CUDA
-  graphs after stream-ordered acquisition.
+  transformed direct path, consumes generation-checked compiler progress in
+  external-batch admission, replays transformed FlashInfer decode graphs after
+  stream-ordered acquisition, and captures exact-shape finite demand decode or
+  paged-prefill epochs in a separately keyed operator graph.
 
 Not implemented today are automatic compiler generation of separate
 complete-data and incremental launch forms from one typed operator, a second
 Triton/MLIR or TileLang frontend, a measured elastic
 range-coalescing objective, runtime-generic HBM eviction/refcounts, graph replay
-  of the demand-mode progress loop, use of current critical work in engine batch
-admission, end-to-end serving use of the GPU-selected path, multiple NVMe queue
+inside SGLang's full model graph, deadline/slack propagation into the admission
+consumer, end-to-end serving use of the GPU-selected path, multiple NVMe queue
 pairs, a vLLM adapter, or RNIC/RDMA. Current-ABI VFIO NVMe has one
 single-controller local
 qualification point, not the multi-platform reliability evidence required for
@@ -591,8 +593,9 @@ before the last page arrives and matches stock output.
 - Rank data and executable contributors from current request critical work.
   The device I/O queue now consumes live request critical work on insertion and
   requeue; a CUDA test verifies that compiler-attributed compute changes
-  service order. The host model is a reference/control-plane policy. SGLang
-  batch admission consumption remains open.
+  service order. SGLang external-batch admission now consumes a nonblocking,
+  generation-checked critical-work snapshot; decision-regret and SLO evidence
+  remain open.
 - Keep forced bulk, fine-grained, and whole-request-delay controls for
   evaluation only.
 
@@ -602,11 +605,15 @@ useful computation earlier.
 
 ### P4: SGLang co-scheduling and CUDA graphs
 
-- Replace the current preacquired-only fast result with the real incremental
-  FlashInfer path.
+- Execute the real incremental FlashInfer path with no stock fallback.
+  Implemented for eager demand mode.
 - Feed actual partial progress and predicted data arrival into batch admission.
-- Extend the implemented decode graph replay to the demand-mode phase and paged
-  prefill, with no capture-illegal upload or synchronization.
+  Implemented for the external-batch admission decision; SLO benefit remains
+  unvalidated.
+- Capture the demand reset/progress/runnable sequence for decode and paged
+  prefill without capture-illegal upload or synchronization. Implemented as an
+  exact-shape NTA operator graph; integration into SGLang's whole-model graph
+  remains open.
 - Assert zero fallback and identical request/cache traces in measured trials.
 - Treat resident P99 inter-token latency, not causally prior resident TTFT, as
   the primary interference metric. Implemented.

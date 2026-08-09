@@ -49,6 +49,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-demand-graph",
+        action="store_true",
+        help=(
+            "require captures and launches of the finite incremental NTA "
+            "operator graph, not only SGLang's model decode graph"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=pathlib.Path,
         default=ROOT / "results" / "serving" / "sglang-hicache.json",
@@ -77,7 +85,7 @@ def parse_report(output: str) -> dict[str, Any]:
 
 
 def require_clean_mechanism(
-    report: dict[str, Any], *, require_graph_replay: bool
+    report: dict[str, Any], *, require_graph_replay: bool, require_demand_graph: bool
 ) -> dict[str, Any]:
     stats = [
         entry
@@ -250,6 +258,23 @@ def require_clean_mechanism(
             )
         if transformed == 0:
             raise RuntimeError("NTA graph trial did not replay a transformed kernel")
+    demand_graph_warmups = sum(
+        int(entry.get("demand_graph_warmups", 0)) for entry in stats
+    )
+    demand_graph_captures = sum(
+        int(entry.get("demand_graph_captures", 0)) for entry in stats
+    )
+    demand_graph_replays = sum(
+        int(entry.get("demand_graph_replays", 0)) for entry in stats
+    )
+    if require_demand_graph and min(
+        demand_graph_warmups, demand_graph_captures, demand_graph_replays
+    ) == 0:
+        raise RuntimeError(
+            "NTA trial did not warm, capture, and launch the finite demand graph "
+            f"({demand_graph_warmups}/{demand_graph_captures}/"
+            f"{demand_graph_replays})"
+        )
     return {
         "all_attention_transformed": True,
         "active_forms": [
@@ -286,6 +311,9 @@ def require_clean_mechanism(
         "compact_resume_launches": compact_launches,
         "compact_resume_cta_bound": compact_ctas,
         "canonical_resume_cta_bound": canonical_ctas,
+        "demand_graph_warmups": demand_graph_warmups,
+        "demand_graph_captures": demand_graph_captures,
+        "demand_graph_replays": demand_graph_replays,
         "compact_resume_cta_ratio": (
             compact_ctas / canonical_ctas if canonical_ctas else None
         ),
@@ -371,7 +399,9 @@ def main() -> int:
     baseline = reports["flashinfer"]
     mechanism = reports["nta_flashinfer"]
     activation = require_clean_mechanism(
-        mechanism, require_graph_replay=args.cuda_graph_decode == "full"
+        mechanism,
+        require_graph_replay=args.cuda_graph_decode == "full",
+        require_demand_graph=args.require_demand_graph,
     )
     if not baseline.get("shape_warmup_excluded") or not mechanism.get(
         "shape_warmup_excluded"
@@ -406,6 +436,7 @@ def main() -> int:
         require_clean_mechanism(
             transfer_verification,
             require_graph_replay=args.cuda_graph_decode == "full",
+            require_demand_graph=args.require_demand_graph,
         )
         if (
             transfer_verification["generated_text_sha256"]

@@ -1136,8 +1136,9 @@ also executes in version-checked FlashInfer 0.6.12 decode and FA2 paged-prefill
 JIT kernels. SGLang 0.5.14 HiCache is wired through the plugin adapter; vLLM
 request lifecycle and KV ownership remain open. Stock FlashInfer decode replays
 through SGLang's full CUDA-graph mode after stream-ordered acquisition; the
-demand progress loop and paged-prefill graph remain open. There is still no
-TTFT/TPOT/SLO benefit claim.
+finite demand progress loop now captures and replays in a separately keyed NTA
+operator graph for decode and paged prefill. Whole-model demand capture and an
+end-to-end TTFT/TPOT/SLO benefit claim remain open.
 
 The separate sparse fixture runs one CTA per request over a resident summary
 catalog. An upstream device kernel materializes the query; the attention CTA

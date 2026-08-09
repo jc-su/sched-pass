@@ -5,10 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 import threading
+import time
 import weakref
 from typing import Any
 
 import torch
+
+from nta_runtime.critical_work import (
+    CriticalWorkPlan,
+    RequestWork,
+    ServiceModel,
+    plan_critical_work,
+)
 
 
 @dataclass
@@ -49,6 +57,13 @@ class HostLoadProgress:
         return self.total_layers > 0 and self.leading_layers == self.total_layers
 
 
+@dataclass(frozen=True)
+class _ProgressPublication:
+    snapshot: Any
+    bindings: tuple[Any, ...]
+    model: ServiceModel
+
+
 class SglangHiCacheBridge:
     """Own intercepted HiCache loads until the final attention layer retires."""
 
@@ -58,6 +73,10 @@ class SglangHiCacheBridge:
         self._lock = threading.Lock()
         self._prefetch_callback: Any = None
         self._admission_stats: dict[str, int] = {}
+        self._progress_publications: list[_ProgressPublication] = []
+        self._latest_request_work: dict[
+            tuple[int, int], tuple[RequestWork, ServiceModel]
+        ] = {}
         _register_bridge(device_pool, self)
 
     def set_prefetch_callback(self, callback: Any) -> None:
@@ -181,6 +200,118 @@ class SglangHiCacheBridge:
     def admission_stats(self) -> dict[str, int]:
         with self._lock:
             return dict(self._admission_stats)
+
+    def progress_publication_available(self) -> bool:
+        """Return whether another nonblocking compiler snapshot can be retained."""
+        self._drain_progress_publications()
+        with self._lock:
+            return len(self._progress_publications) < 8
+
+    def publish_request_progress(
+        self,
+        snapshot: Any,
+        bindings: tuple[Any, ...],
+        *,
+        bandwidth_bytes_per_second: int,
+        fixed_latency_ns: int = 0,
+    ) -> None:
+        """Publish one post-discovery snapshot for serving admission.
+
+        The snapshot owns pinned storage until its stream event completes. A
+        bounded number may be in flight; callers must check
+        ``progress_publication_available`` before capturing a new one.
+        """
+        if not bindings or not getattr(snapshot, "pending", False):
+            raise ValueError("request-progress publication is empty")
+        model = ServiceModel(
+            bandwidth_bytes_per_second,
+            fixed_latency_ns=fixed_latency_ns,
+        )
+        model.validate()
+        self._drain_progress_publications()
+        with self._lock:
+            if len(self._progress_publications) >= 8:
+                raise RuntimeError("request-progress publication ring is full")
+            self._progress_publications.append(
+                _ProgressPublication(snapshot, tuple(bindings), model)
+            )
+            self._admission_stats["progress_feedback_published"] = (
+                self._admission_stats.get("progress_feedback_published", 0) + 1
+            )
+
+    def poll_critical_work(
+        self, request_ids: set[int]
+    ) -> CriticalWorkPlan | None:
+        """Consume current-generation compiler work for active engine requests."""
+        if not request_ids:
+            return None
+        self._drain_progress_publications()
+        with self._lock:
+            selected_keys = [
+                key
+                for key, (work, _) in self._latest_request_work.items()
+                if work.request_id in request_ids
+            ]
+            selected = [self._latest_request_work.pop(key) for key in selected_keys]
+        if not selected:
+            return None
+        models = {model for _, model in selected}
+        if len(models) != 1:
+            raise RuntimeError("request-progress feedback mixed service models")
+        plan = plan_critical_work(
+            (work for work, _ in selected),
+            now_ns=time.monotonic_ns(),
+            model=models.pop(),
+        )
+        self.record_admission(
+            progress_feedback_consumed=1,
+            progress_feedback_requests=len(plan.requests),
+        )
+        return plan
+
+    def _drain_progress_publications(self) -> None:
+        with self._lock:
+            publications = tuple(self._progress_publications)
+            self._progress_publications.clear()
+        incomplete: list[_ProgressPublication] = []
+        completed: list[tuple[RequestWork, ServiceModel]] = []
+        stale = 0
+        for publication in publications:
+            progress = publication.snapshot.query()
+            if progress is None:
+                incomplete.append(publication)
+                continue
+            if len(progress) != len(publication.bindings):
+                raise RuntimeError("request-progress snapshot changed row count")
+            for binding, item in zip(publication.bindings, progress):
+                if (
+                    item.request_id != binding.request_id
+                    or item.generation != binding.generation
+                ):
+                    stale += 1
+                    continue
+                completed.append(
+                    (
+                        RequestWork.from_progress(
+                            item,
+                            priority=binding.priority,
+                            deadline_ns=0,
+                        ),
+                        publication.model,
+                    )
+                )
+        with self._lock:
+            self._progress_publications.extend(incomplete)
+            for work, model in completed:
+                self._latest_request_work[(work.request_id, work.generation)] = (
+                    work,
+                    model,
+                )
+            if stale:
+                self._admission_stats["progress_feedback_stale_rows"] = (
+                    self._admission_stats.get("progress_feedback_stale_rows", 0)
+                    + stale
+                )
 
     def complete_layer(self, pending: PendingHostLoad, local_layer: int) -> None:
         if local_layer != pending.completed_layers:

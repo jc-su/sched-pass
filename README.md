@@ -183,13 +183,14 @@ whose queue semantics justify it, rather than being claimed as universally
 faster.
 The existing code implements the unavailable-data work-ticket mechanism,
 compiler-verified request-local partial reduction, real FlashInfer hooks, and
-SGLang decode graph replay. Demand mode also reuses one structural plan,
-rebinds layer K/V directories on the GPU, and stages one next-layer contributor
-wave during post-attention compute before progressing the remaining waves. It
-does not yet generate the same bounded-staging forms for SGLang's paged decode
-operator, feed partial progress into
-SGLang batch admission, or put the demand-mode progress loop inside SGLang graph
-replay as described in `SYSTEM_PLAN.md`. The latest matched fragmented
+SGLang decode graph replay. Demand mode reuses one structural plan, rebinds
+layer K/V directories on the GPU, and stages one next-layer contributor wave
+during post-attention compute before progressing the remaining waves. A
+generation-checked post-discovery snapshot now feeds SGLang's external-batch
+admission decision. Exact-shape demand decode and paged-prefill epochs warm,
+capture, and replay as finite NTA operator graphs with retained FlashInfer
+metadata; this is separate from SGLang's full model graph, whose external path
+still requires preacquisition. The latest matched fragmented
 Qwen2.5-3B CPU-DRAM tests remain negative: `0.863x` stock throughput at 8K and
 `0.927x` at 16K. They execute 36 real ticketed FlashInfer layers, 35 first-wave
 lookaheads, zero stock launch/fallback, and produce identical output. The trend
@@ -198,9 +199,9 @@ negative: exact output, all 1,080 attention launches transformed, zero fallback,
 `0.977x` throughput, `1.012x` resident P99 inter-token latency, and `1.021x`
 external TTFT. A five-trial admission/re-merge policy regressed the causal tail
 metric and was removed. No end-to-end SGLang speedup, production-ready status,
-or OSDI-level claim is supported yet. The immediate gate is to execute the
-now-positive typed direct/stream operator inside SGLang decode and paged prefill
-with zero stock fallback.
+or OSDI-level claim is supported yet. The immediate gate is an end-to-end
+model-generated selected-demand workload and a heterogeneous SLO result that
+beats equal-state bulk and skip/rebatch baselines with zero stock fallback.
 The corrected real FlashInfer device-selected sweep chooses transformed bulk
 at zero avoided bytes, where forced indexed acquisition delivers only `0.6431x`
 throughput. At 75%-93.75% avoided bytes it reaches `2.1259x`-`8.1731x` over

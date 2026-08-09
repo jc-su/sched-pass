@@ -202,8 +202,12 @@ def production_checks(
         check(
             "serving graph path",
             serving.get("decode_cuda_graph_replay") is True
-            and serving.get("paged_prefill_integrated") is True,
-            "requires demand-mode decode graph replay and paged-prefill integration",
+            and serving.get("paged_prefill_integrated") is True
+            and serving.get("demand_operator_graph_replay") is True
+            and serving.get("demand_graph_captures", 0) > 0
+            and serving.get("demand_graph_replays", 0) > 0,
+            "requires whole-model decode replay, paged-prefill integration, and "
+            "positive finite demand-operator graph capture/replay counters",
         ),
         check(
             "serving performance bounds",
@@ -359,6 +363,12 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
             and incremental.get("generation_safe_request_completion") is True
             and incremental.get("stock_output_parity") is True
             and incremental.get("demand_cuda_graph_replay") is True
+            and sequence_contains(
+                incremental.get("demand_graph_families"),
+                {"decode", "paged_prefill"},
+            )
+            and incremental.get("demand_graph_captures", 0) > 0
+            and incremental.get("demand_graph_replays", 0) > 0
             and incremental.get("all_attention_transformed") is True
             and incremental.get("transformed_direct_launches", 0) > 0
             and incremental.get("ticketed_incremental_launches", 0) > 0

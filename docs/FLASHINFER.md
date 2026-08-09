@@ -146,7 +146,9 @@ Demand-driven batches use `FlashInferLayerEpoch`, whose eager `run_*` and fixed
 `enqueue_*` methods retain the bounded work-ticket protocol. The fixed methods
 can be captured only after structural work-plan upload; the upload path rejects
 capture rather than synchronizing illegally. SGLang owns the request-guarded
-decode replay path, but does not yet replay these demand-mode phase nodes.
+whole-model decode replay path. The adapter separately captures exact-shape
+demand decode and paged-prefill phase nodes in an NTA operator graph, retaining
+and refreshing FlashInfer's dynamic metadata tensors before every replay.
 
 ## Finite Incremental Execution
 
@@ -319,13 +321,13 @@ single-machine measurements.
 
 ## Open Gates
 
-- SGLang consumption of the compiler-generated direct and incremental forms,
-  followed by unified grouping, engine feedback, best-fixed trace comparison,
-  and resettable decision-regret evaluation;
+- best-fixed trace comparison and resettable decision-regret evaluation for the
+  SGLang consumer of compiler-generated progress;
 - end-to-end SGLang or vLLM use of the GPU-selected page path, including real
   model-generated scores rather than controlled random scores;
-- a vLLM request-generation/KV-offload adapter, SGLang demand-mode graph
-  phases, and paged-prefill graph validation;
+- a vLLM request-generation/KV-offload adapter and integration of demand phases
+  into SGLang's full model graph (the separately keyed finite operator graph is
+  implemented for decode and paged prefill);
 - 24-hour serving graph replay/cancellation soak and execution on multiple
   physical GPUs (the engine-neutral 10,000-epoch lifecycle gate passes locally,
   while the two-GPU test skips on this one-GPU host);

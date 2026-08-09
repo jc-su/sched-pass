@@ -8,10 +8,12 @@ from dataclasses import dataclass, field
 import json
 import logging
 import math
+import operator
 import os
 import pathlib
 import threading
 import time
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
@@ -184,6 +186,150 @@ class _PlanAllocation:
     min_unresolved_dependencies: int = 1
     direct_work_count: int = 0
     external_object_slots: tuple[tuple[int, ...], ...] = ()
+
+
+@dataclass(frozen=True)
+class _DemandGraph:
+    graph: torch.cuda.CUDAGraph
+    query: torch.Tensor
+    output: torch.Tensor
+    retained_events: tuple[torch.cuda.Event, ...]
+    wrapper_metadata: tuple[tuple[str, torch.Tensor], ...]
+
+
+@dataclass(frozen=True)
+class _DemandGraphKey:
+    operator_family: str
+    wrapper_id: int
+    layer_id: int
+    work_items_address: int
+    dependencies_address: int
+    runtime_address: int
+    work_count: int
+    object_count: int
+    progress_blocks: tuple[int, ...]
+    ready_work_counts: tuple[int, ...]
+    initial_ready_work_count: int
+    indexed_copy_blocks_per_group: int
+    query_shape: tuple[int, ...]
+    query_stride: tuple[int, ...]
+    query_dtype: str
+    query_device: str
+    key_cache_address: int
+    value_cache_address: int
+    sm_scale: float
+    k_scale: float | None
+    v_scale: float | None
+    causal: bool
+    window_left: int
+    wrapper_plan: Any
+    wrapper_metadata_layout: tuple[
+        tuple[str, tuple[int, ...], tuple[int, ...], str, str], ...
+    ]
+
+
+_GRAPH_WRAPPER_METADATA = (
+    "_qo_indptr_buf",
+    "_paged_kv_indptr_buf",
+    "_paged_kv_indices_buf",
+    "_paged_kv_last_page_len_buf",
+    "_custom_mask_buf",
+    "_mask_indptr_buf",
+    "_prefix_len_ptr",
+    "_token_pos_in_items_ptr",
+    "_max_item_len_ptr",
+    "_block_tables",
+)
+
+
+def _freeze_graph_plan(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    try:
+        return operator.index(value)
+    except TypeError:
+        pass
+    if isinstance(value, Iterable):
+        return tuple(_freeze_graph_plan(item) for item in value)
+    raise RuntimeError(
+        f"FlashInfer graph plan contains unsupported {type(value).__name__} state"
+    )
+
+
+def _graph_wrapper_metadata(wrapper: Any) -> tuple[tuple[str, torch.Tensor], ...]:
+    return tuple(
+        (name, value)
+        for name in _GRAPH_WRAPPER_METADATA
+        if torch.is_tensor(value := getattr(wrapper, name, None))
+    )
+
+
+def _graph_wrapper_metadata_layout(
+    wrapper: Any,
+) -> tuple[tuple[str, tuple[int, ...], tuple[int, ...], str, str], ...]:
+    return tuple(
+        (
+            name,
+            tuple(int(extent) for extent in value.shape),
+            tuple(int(stride) for stride in value.stride()),
+            str(value.dtype),
+            str(value.device),
+        )
+        for name, value in _graph_wrapper_metadata(wrapper)
+    )
+
+
+def _demand_graph_key(
+    *,
+    operator_family: str,
+    wrapper: Any,
+    layer_id: int,
+    plan: DeviceWorkPlan,
+    runtime_tensor: torch.Tensor,
+    work_count: int,
+    object_count: int,
+    progress_blocks: tuple[int, ...],
+    ready_work_counts: tuple[int, ...],
+    initial_ready_work_count: int,
+    indexed_copy_blocks_per_group: int,
+    query: torch.Tensor,
+    kv_cache: tuple[torch.Tensor, torch.Tensor],
+    sm_scale: float,
+    k_scale: float | None,
+    v_scale: float | None,
+    causal: bool,
+    window_left: int,
+) -> _DemandGraphKey:
+    """Describe every dynamic value baked into a demand graph launch."""
+    if operator_family not in {"decode", "paged_prefill"}:
+        raise ValueError("unsupported demand graph operator family")
+    return _DemandGraphKey(
+        operator_family,
+        id(wrapper),
+        int(layer_id),
+        int(plan.work_items_address),
+        int(plan.dependencies_address),
+        int(runtime_tensor.data_ptr()),
+        int(work_count),
+        int(object_count),
+        tuple(int(count) for count in progress_blocks),
+        tuple(int(count) for count in ready_work_counts),
+        int(initial_ready_work_count),
+        int(indexed_copy_blocks_per_group),
+        tuple(int(extent) for extent in query.shape),
+        tuple(int(stride) for stride in query.stride()),
+        str(query.dtype),
+        str(query.device),
+        int(kv_cache[0].data_ptr()),
+        int(kv_cache[1].data_ptr()),
+        float(sm_scale),
+        None if k_scale is None else float(k_scale),
+        None if v_scale is None else float(v_scale),
+        bool(causal),
+        int(window_left),
+        _freeze_graph_plan(getattr(wrapper, "_plan_info", None)),
+        _graph_wrapper_metadata_layout(wrapper),
+    )
 
 
 def _positive_environment(name: str, default: int) -> int:
@@ -425,6 +571,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._demand_sync_events: dict[
             tuple[int, int, int], tuple[torch.cuda.Event, tuple[torch.cuda.Event, ...]]
         ] = {}
+        self._demand_graphs: dict[_DemandGraphKey, _DemandGraph] = {}
+        self._demand_graph_warmups: dict[_DemandGraphKey, None] = {}
+        self._demand_graph_enabled = (
+            os.environ.get("NTA_SGLANG_DEMAND_GRAPH", "1") != "0"
+        )
+        self._demand_graph_capacity = _positive_environment(
+            "NTA_SGLANG_DEMAND_GRAPH_CAPACITY", max(64, 4 * self._model_layer_count)
+        )
         self._stats = {
             "schema": 1,
             "engine": "sglang",
@@ -499,6 +653,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "graph_captures": 0,
             "graph_replays": 0,
             "graph_external_batches": 0,
+            "demand_graph_enabled": self._demand_graph_enabled,
+            "demand_graph_capacity": self._demand_graph_capacity,
+            "demand_graph_warmups": 0,
+            "demand_graph_captures": 0,
+            "demand_graph_replays": 0,
+            "demand_graph_evictions": 0,
             "verified_operator_modules": 0,
             "started_unix_ns": time.time_ns(),
         }
@@ -1468,11 +1628,42 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             return allocation.plan
         if allocation is not None:
             torch.cuda.current_stream().synchronize()
+            self._discard_demand_graphs(allocation.plan)
             allocation.plan.close()
         capacity = schedule.work_count
         plan = DeviceWorkPlan(capacity, 2 * capacity, self._runtime.device_ordinal)
         self._plans[key] = _PlanAllocation(plan, capacity)
         return plan
+
+    def _discard_demand_graphs(self, plan: DeviceWorkPlan) -> None:
+        """Drop graph executables before releasing their captured plan buffers."""
+        work_items_address = int(plan.work_items_address)
+        dependencies_address = int(plan.dependencies_address)
+        stale = {
+            key
+            for key in self._demand_graph_warmups
+            if key.work_items_address == work_items_address
+            and key.dependencies_address == dependencies_address
+        }
+        for key in stale:
+            self._demand_graphs.pop(key, None)
+            self._demand_graph_warmups.pop(key, None)
+
+    def _reserve_demand_graph_key(
+        self, key: _DemandGraphKey, stream: torch.cuda.Stream
+    ) -> None:
+        """Reserve bounded graph-cache state, quiescing before pointer release."""
+        if key in self._demand_graph_warmups:
+            self._demand_graph_warmups.pop(key)
+            self._demand_graph_warmups[key] = None
+            return
+        if len(self._demand_graph_warmups) >= self._demand_graph_capacity:
+            stream.synchronize()
+            stale = next(iter(self._demand_graph_warmups))
+            self._demand_graph_warmups.pop(stale)
+            self._demand_graphs.pop(stale, None)
+            self._stats["demand_graph_evictions"] += 1
+        self._demand_graph_warmups[key] = None
 
     def _record_demand_plan_stats(
         self,
@@ -2201,6 +2392,101 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._demand_sync_events[key] = events
         return events
 
+    def _enqueue_demand_graph(
+        self,
+        key: _DemandGraphKey,
+        wrapper: Any,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        stream: torch.cuda.Stream,
+        enqueue: Callable[
+            [
+                torch.Tensor,
+                torch.Tensor,
+                tuple[torch.cuda.Event, tuple[torch.cuda.Event, ...]],
+                Callable[[Any], None] | None,
+            ],
+            None,
+        ],
+        eager_events: tuple[torch.cuda.Event, tuple[torch.cuda.Event, ...]],
+        on_discovered: Callable[[Any], None] | None,
+    ) -> torch.Tensor:
+        """Warm, capture, or replay one finite incremental operator."""
+        captured = self._demand_graphs.get(key)
+        if captured is not None:
+            self._reserve_demand_graph_key(key, stream)
+            current_metadata = dict(_graph_wrapper_metadata(wrapper))
+            for name, static_tensor in captured.wrapper_metadata:
+                current = current_metadata.get(name)
+                if current is None:
+                    raise RuntimeError(
+                        f"FlashInfer graph replay lost metadata tensor {name}"
+                    )
+                if (
+                    current.shape != static_tensor.shape
+                    or current.stride() != static_tensor.stride()
+                    or current.dtype != static_tensor.dtype
+                    or current.device != static_tensor.device
+                ):
+                    raise RuntimeError(
+                        f"FlashInfer graph metadata layout changed for {name}"
+                    )
+                static_tensor.copy_(current, non_blocking=True)
+            captured.query.copy_(query, non_blocking=True)
+            captured.graph.replay()
+            self._stats["demand_graph_replays"] += 1
+            family_counter = f"demand_graph_{key.operator_family}_replays"
+            self._stats[family_counter] = self._stats.get(family_counter, 0) + 1
+            return captured.output
+
+        if key not in self._demand_graph_warmups:
+            enqueue(query, output, eager_events, on_discovered)
+            self._reserve_demand_graph_key(key, stream)
+            self._stats["demand_graph_warmups"] += 1
+            family_counter = f"demand_graph_{key.operator_family}_warmups"
+            self._stats[family_counter] = self._stats.get(family_counter, 0) + 1
+            return output
+
+        self._reserve_demand_graph_key(key, stream)
+        static_query = torch.empty_like(query)
+        static_output = torch.empty_like(output)
+        static_query.copy_(query, non_blocking=True)
+        discovery_done = torch.cuda.Event()
+        arrival_events = tuple(
+            torch.cuda.Event() for _ in range(len(key.progress_blocks))
+        )
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, stream=stream, capture_error_mode="global"):
+                enqueue(
+                    static_query,
+                    static_output,
+                    (discovery_done, arrival_events),
+                    None,
+                )
+        except Exception as error:
+            raise RuntimeError(
+                "failed to capture the finite NTA demand operator graph"
+            ) from error
+        self._demand_graphs[key] = _DemandGraph(
+            graph,
+            static_query,
+            static_output,
+            (discovery_done, *arrival_events),
+            _graph_wrapper_metadata(wrapper),
+        )
+        self._stats["demand_graph_captures"] += 1
+        family_counter = f"demand_graph_{key.operator_family}_captures"
+        self._stats[family_counter] = self._stats.get(family_counter, 0) + 1
+        # Capture records the finite operator but does not produce this call's
+        # output. Launch it once after instantiation, preserving stream order
+        # with the current plan, directory, and static-query upload.
+        graph.replay()
+        self._stats["demand_graph_replays"] += 1
+        family_counter = f"demand_graph_{key.operator_family}_replays"
+        self._stats[family_counter] = self._stats.get(family_counter, 0) + 1
+        return static_output
+
     def _run_attention(
         self,
         wrapper: Any,
@@ -2372,32 +2658,133 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         torch.cuda.Event(enable_timing=True),
                         torch.cuda.Event(enable_timing=True),
                     )
-                epoch.enqueue_host(
-                    wrapper,
-                    q,
-                    kv_cache,
-                    output,
-                    progress_blocks=progress_blocks,
-                    sm_scale=layer.scaling,
-                    stream=stream,
-                    progress_stream=self._progress_stream,
-                    ready_event=preloaded_event,
-                    ready_work_counts=ready_work_counts,
-                    initial_ready_work_count=initial_ready_work_count,
-                    indexed_host_first_object=preloaded_object_count,
-                    indexed_host_prevalidated=True,
-                    indexed_host_copy_blocks_per_group=indexed_copy_blocks_per_group(
-                        transfer_bytes=allocation.transfer_bytes,
-                        object_count=object_count,
-                        target_bytes_per_block=self._indexed_copy_target_bytes,
-                        maximum_blocks=self._indexed_copy_max_blocks,
-                    ),
-                    sync_events=self._layer_sync_events(
-                        int(layer.layer_id), len(progress_blocks), stream
-                    ),
-                    progress_profile=transfer_profile,
-                    run_options=run_options,
+                on_discovered = None
+                if (
+                    local_layer == 0
+                    and self._hicache.progress_publication_available()
+                ):
+                    request_slots = tuple(
+                        binding.request_slot for binding in batch.bindings
+                    )
+                    first_request_slot = min(request_slots)
+                    if request_slots != tuple(
+                        range(first_request_slot, first_request_slot + len(request_slots))
+                    ):
+                        raise RuntimeError(
+                            "request-progress feedback requires contiguous slots"
+                        )
+                    progress_snapshot = self._runtime.request_progress_snapshot(
+                        len(request_slots)
+                    )
+
+                    def publish_progress(discovery_stream: Any) -> None:
+                        progress_snapshot.capture(
+                            first_request_slot,
+                            len(request_slots),
+                            discovery_stream,
+                        )
+                        self._hicache.publish_request_progress(
+                            progress_snapshot,
+                            batch.bindings,
+                            bandwidth_bytes_per_second=(
+                                self._host_cost_model.bandwidth_bytes_per_second
+                            ),
+                            fixed_latency_ns=self._host_cost_model.round_overhead_ns,
+                        )
+                        self._stats["progress_feedback_snapshots"] = (
+                            self._stats.get("progress_feedback_snapshots", 0) + 1
+                        )
+
+                    on_discovered = publish_progress
+                copy_blocks_per_group = indexed_copy_blocks_per_group(
+                    transfer_bytes=allocation.transfer_bytes,
+                    object_count=object_count,
+                    target_bytes_per_block=self._indexed_copy_target_bytes,
+                    maximum_blocks=self._indexed_copy_max_blocks,
                 )
+
+                def enqueue_demand(
+                    query: torch.Tensor,
+                    destination: torch.Tensor,
+                    sync_events: tuple[
+                        torch.cuda.Event, tuple[torch.cuda.Event, ...]
+                    ],
+                    discovery_callback: Callable[[Any], None] | None,
+                ) -> None:
+                    epoch.enqueue_host(
+                        wrapper,
+                        query,
+                        kv_cache,
+                        destination,
+                        progress_blocks=progress_blocks,
+                        sm_scale=layer.scaling,
+                        stream=stream,
+                        progress_stream=self._progress_stream,
+                        ready_event=preloaded_event,
+                        ready_work_counts=ready_work_counts,
+                        initial_ready_work_count=initial_ready_work_count,
+                        indexed_host_first_object=preloaded_object_count,
+                        indexed_host_prevalidated=True,
+                        indexed_host_copy_blocks_per_group=copy_blocks_per_group,
+                        sync_events=sync_events,
+                        progress_profile=transfer_profile,
+                        on_discovered=discovery_callback,
+                        run_options=run_options,
+                    )
+
+                eager_events = self._layer_sync_events(
+                    int(layer.layer_id), len(progress_blocks), stream
+                )
+                graph_eligible = (
+                    self._demand_graph_enabled
+                    and isinstance(
+                        wrapper,
+                        (
+                            BatchDecodeWithPagedKVCacheWrapper,
+                            BatchPrefillWithPagedKVCacheWrapper,
+                        ),
+                    )
+                    and preloaded_event is None
+                    and preloaded_object_count == 0
+                    and transfer_profile is None
+                )
+                if graph_eligible:
+                    graph_key = _demand_graph_key(
+                        operator_family=(
+                            "decode"
+                            if isinstance(wrapper, BatchDecodeWithPagedKVCacheWrapper)
+                            else "paged_prefill"
+                        ),
+                        wrapper=wrapper,
+                        layer_id=int(layer.layer_id),
+                        plan=plan,
+                        runtime_tensor=self._runtime.device_view_tensor,
+                        work_count=schedule.work_count,
+                        object_count=object_count,
+                        progress_blocks=tuple(progress_blocks),
+                        ready_work_counts=tuple(ready_work_counts),
+                        initial_ready_work_count=initial_ready_work_count,
+                        indexed_copy_blocks_per_group=copy_blocks_per_group,
+                        query=q,
+                        kv_cache=kv_cache,
+                        sm_scale=layer.scaling,
+                        k_scale=layer.k_scale_float,
+                        v_scale=layer.v_scale_float,
+                        causal=causal,
+                        window_left=window_left,
+                    )
+                    output = self._enqueue_demand_graph(
+                        graph_key,
+                        wrapper,
+                        q,
+                        output,
+                        stream,
+                        enqueue_demand,
+                        eager_events,
+                        on_discovered,
+                    )
+                else:
+                    enqueue_demand(q, output, eager_events, on_discovered)
                 self._stats["parallel_indexed_progress_layers"] += 1
                 self._stats["prevalidated_indexed_progress_layers"] = (
                     self._stats.get("prevalidated_indexed_progress_layers", 0) + 1

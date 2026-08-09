@@ -74,6 +74,11 @@ def main() -> None:
             "ticketed_incremental_launches": 5,
             "stock_attention_launches": 0,
             "matched_cache_and_admission": True,
+            "decode_cuda_graph_replay": True,
+            "paged_prefill_integrated": True,
+            "demand_operator_graph_replay": True,
+            "demand_graph_captures": 5,
+            "demand_graph_replays": 10,
         }
         (evidence / "production-evidence.json").write_text(
             json.dumps(current), encoding="utf-8"
@@ -140,6 +145,9 @@ def main() -> None:
             "generation_safe_request_completion": True,
             "stock_output_parity": True,
             "demand_cuda_graph_replay": True,
+            "demand_graph_families": ["decode", "paged_prefill"],
+            "demand_graph_captures": 10,
+            "demand_graph_replays": 20,
             "all_attention_transformed": True,
             "transformed_direct_launches": 10,
             "ticketed_incremental_launches": 10,

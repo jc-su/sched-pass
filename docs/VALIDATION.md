@@ -654,8 +654,9 @@ the compiler/runtime contribution and must not be used in a paper claim.
 
 - GPU-timestamped dense opportunity traces from two real models over CPU DRAM
   and NVMe, followed by the predeclared kill-criterion analysis;
-- vLLM request/KV-manager integration, SGLang demand-mode graph phases, and
-  paged-prefill graph validation;
+- vLLM request/KV-manager integration and whole-model SGLang demand capture;
+  exact-shape finite demand decode/paged-prefill operator graphs are implemented
+  but still require clean multi-trial serving evidence;
 - TTFT, TPOT, P99 inter-token latency, SLO attainment, serving goodput, CPU
   use, and SM tax;
 - direct-path comparison against untouched production kernels with controlled

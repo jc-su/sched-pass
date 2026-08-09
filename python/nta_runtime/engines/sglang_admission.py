@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable
 
 from nta_runtime.engines.sglang_hicache import SglangHiCacheBridge, find_bridge
+from nta_runtime.requests import stable_request_id
 
 
 _STATE_ATTRIBUTE = "_nta_acquisition_admission"
@@ -64,6 +65,31 @@ def _has_runnable_decode(scheduler: Any) -> bool:
         if not request.finished():
             return True
     return False
+
+
+def _running_request_ids(scheduler: Any) -> set[int]:
+    running = getattr(scheduler, "running_batch", None)
+    return {
+        stable_request_id(str(request.rid))
+        for request in tuple(getattr(running, "reqs", ()) or ())
+        if not request.finished() and getattr(request, "rid", None)
+    }
+
+
+def _compiler_feedback_reason(
+    scheduler: Any, bridge: SglangHiCacheBridge
+) -> str | None:
+    plan = bridge.poll_critical_work(_running_request_ids(scheduler))
+    if plan is None:
+        return None
+    if plan.compute_order:
+        bridge.record_admission(admission_feedback_executable=1)
+        return None
+    if plan.data_order:
+        bridge.record_admission(admission_feedback_data_blocked=1)
+        return "data_blocked"
+    bridge.record_admission(admission_feedback_terminal=1)
+    return "terminal"
 
 
 def _bridge_for_batch(batch: Any) -> SglangHiCacheBridge | None:
@@ -132,6 +158,12 @@ class AcquisitionAdmission:
         if not _has_runnable_decode(scheduler):
             bridge.record_admission(admission_released_without_decode=1)
             return batch
+        feedback_reason = _compiler_feedback_reason(scheduler, bridge)
+        if feedback_reason is not None:
+            bridge.record_admission(
+                **{f"admission_released_feedback_{feedback_reason}": 1}
+            )
+            return batch
         if self._has_lead(progress.leading_layers, progress.total_layers):
             bridge.record_admission(admission_released_with_initial_lead=1)
             return batch
@@ -171,6 +203,10 @@ class AcquisitionAdmission:
             reason = "deadline"
         elif not _has_runnable_decode(scheduler):
             reason = "no_decode"
+        else:
+            feedback_reason = _compiler_feedback_reason(scheduler, staged.bridge)
+            if feedback_reason is not None:
+                reason = f"feedback_{feedback_reason}"
         if not reason:
             staged.bridge.record_admission(admission_hidden_decode_steps=1)
             return None
