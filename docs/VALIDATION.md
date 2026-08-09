@@ -108,7 +108,7 @@ OSDI qualification evidence.
 
 ## Correctness Gates
 
-`ctest --test-dir build --output-on-failure` discovers 46 tests. On this
+`ctest --test-dir build --output-on-failure` discovers 47 tests. On this
 single-GPU host, 45 pass and `nta-multi-gpu` reports the configured skip code
 77 because a second physical CUDA device is unavailable. The gates cover:
 

@@ -43,7 +43,7 @@ output throughput, `1.1014x` external TTFT, `1.8843x` resident P99 ITL, and
 `0.4584x` stock-derived SLO goodput. This is one diagnostic process trial, not
 paper evidence; it proves graph activation and preserves the negative result.
 
-The latest `local` qualifier returned `READY` after 46 CTests (one multi-GPU
+The latest `local` qualifier returned `READY` after 47 CTests (one multi-GPU
 case skipped on the one-GPU host), CUDA sanitizer coverage, a 10,000-epoch
 lifecycle stress, CPU-only tests, Clang static analysis, Python package checks,
 ShellCheck, and patch hygiene. This is an implementation-quality result, not a
