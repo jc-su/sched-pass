@@ -145,10 +145,19 @@ remains mechanism evidence only.
 ### Execution order and go/no-go
 
 1. Mover-priority interference rerun (1C metric only) — already unblocked.
-2. 2A opportunity characterization on real traces.
-3. Streaming-operator integration into the SGLang paged path, at the points 2A
-   identifies; then 2B.
-4. Quest-retrofit selector and the 1D workload; then 1A/1B.
+2. 2A opportunity characterization on real traces. **Executed 2026-08-09:**
+   zero barrier stall at every measured point (2,048-24,576 external tokens,
+   360 waits each, load/compute 0.05-0.09); see `docs/VALIDATION.md`. The
+   dense-promotion 2A gate therefore fired **no-go**.
+3. ~~Streaming-operator integration into the SGLang paged path~~ — cancelled
+   by the 2A measurement for dense promotion: there is no blocked time to
+   reclaim, and the deployed lookahead pipeline already fully overlaps
+   transfer. The streaming operator remains operator-level evidence against
+   atomic promotion and a candidate for genuinely bandwidth-bound tiers
+   (multi-promotion contention, NVMe) if 2A over those configurations shows
+   nonzero stall. 2B proceeds as the controlled crossover study only.
+4. Quest-retrofit selector and the 1D workload — **now the campaign
+   centerpiece**; then 1A/1B.
 5. RQ3 ablations and RQ4 robustness last.
 
 Go/no-go: if the integrated streaming operator cannot beat the layer-wise arm

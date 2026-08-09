@@ -654,6 +654,28 @@ and aggregate P99 inter-token latency and includes it in the SLO-goodput gate.
 This change prevents scheduler startup variance from being mistaken for an
 acquisition benefit.
 
+The RQ2/2A barrier characterization
+(`benchmarks/serving/OpportunityCharacterize.py`,
+`results/serving/opportunity-characterization-qwen3b.json`) measured the
+compute-stream stall at every proactive layer-readiness wait on the real
+Qwen2.5-3B HiCache workload at external prefixes of 2,048, 8,192, and 24,576
+tokens. Every one of 360 waits per point measured **0.000 ms** of stall. The
+explanation is the load/compute ratio: wave-pipelined promotion moved
+1.0-7.2 GiB in 29-168 ms while the attention operators consumed 316-3,238 ms,
+a ratio of 0.05-0.09 that falls as context grows because promoted-prefix
+attention grows superlinearly while transfer grows linearly. Consequences:
+prefill-side promotion on this host exposes no blocked time for arrival-driven
+execution to reclaim, at any context size, because the existing lookahead
+pipeline already achieves complete overlap; the 1.1714x streaming-operator
+result is real but its baseline (atomic promotion) is not what the engine
+deploys; and the streaming-operator integration into dense SGLang promotion is
+therefore cancelled by measurement rather than attempted. The remaining
+candidate regime for arrival-driven benefit on this stack is per-step
+device-selected demand, where per-launch compute is small and per-step
+transfer is the object. Single model, CPU-DRAM tier, copy-engine movers, warm
+JIT cache; the conclusion is structural (an identical zero across 1,080
+measured waits), so clock control is immaterial to it.
+
 A stronger acquisition-admission experiment detached the mixed request until
 a complete suffix-layer lead was available and then re-formed the same
 compiler-transformed heterogeneous batch. Five arm-balanced exact trials had

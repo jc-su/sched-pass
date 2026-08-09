@@ -784,14 +784,16 @@ Stop or narrow the project if:
 
 The evaluation campaign, its four research questions, gates, model matrix, and
 go/no-go rule are fixed in `docs/ONE_GPU_EVALUATION.md` ("Research Questions
-And Execution Plan"). Engineering below feeds that plan in this order: the
-mover-priority interference rerun (unblocked; movers now default to the lowest
-CUDA stream priority), 2A opportunity characterization on real traces, then
-streaming-operator integration at the points 2A identifies, then the
-Quest-retrofit selected-demand workload. Dense early-known demand is a
-measured boundary (five diagnostics, latest at `bec105f`), not a target: it is
-rerun once under the corrected mover priority for the interference series and
-otherwise only as the RQ2 control arm.
+And Execution Plan"). The 2A barrier characterization executed on 2026-08-09
+and measured zero compute-stream stall at every proactive layer barrier across
+2K-24K external prefixes (load/compute 0.05-0.09): dense promotion on this
+host is already fully overlapped by the lookahead pipeline, so the planned
+streaming-operator integration into dense SGLang promotion is cancelled by
+measurement. The campaign centerpiece is now the Quest-retrofit
+device-selected demand workload (1D), with the mover-priority interference
+series (unblocked; movers now default to the lowest CUDA stream priority) as
+the 1C gate. Dense early-known demand is a measured boundary (five end-to-end
+diagnostics plus the zero-stall characterization), not a target.
 
 The canonical FlashInfer operator experiment now demonstrates exposed overlap
 and a bounded-HBM crossover. The next order is therefore fixed:
