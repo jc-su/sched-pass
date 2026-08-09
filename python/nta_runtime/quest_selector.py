@@ -79,6 +79,60 @@ def quest_page_scores(
     return per_coordinate.sum(dim=-1).sum(dim=2).sum(dim=1)
 
 
+def budgeted_page_selection(
+    scores: Any,
+    page_count: int,
+    budget: int,
+    *,
+    sink_pages: int,
+    recent_pages: int,
+) -> Any:
+    """Deployed-form selection: retention first, envelopes for the rest.
+
+    Returns the sorted page indices for one request: the recent window and
+    attention sinks are always retained (recent outranks sink when the budget
+    cannot hold both, because the local window carries the most mass), and
+    the remaining budget goes to the highest-scoring other pages. The result
+    is deterministic for tied scores via index order.
+    """
+    import torch
+
+    if page_count <= 0 or budget <= 0:
+        raise ValueError("page count and budget must be positive")
+    if sink_pages < 0 or recent_pages < 0:
+        raise ValueError("retention counts cannot be negative")
+    if scores.ndim != 1 or scores.shape[0] < page_count:
+        raise ValueError(
+            f"scores must cover all {page_count} pages; got "
+            f"{tuple(scores.shape)}"
+        )
+    recent = list(range(max(0, page_count - recent_pages), page_count))
+    sink = [
+        page for page in range(min(sink_pages, page_count))
+        if page not in set(recent)
+    ]
+    reserved = (recent + sink)[:budget]
+    reserved_set = set(reserved)
+    remaining = budget - len(reserved)
+    if remaining > 0:
+        order = torch.argsort(
+            scores[:page_count], descending=True, stable=True
+        )
+        for page in order.tolist():
+            if page in reserved_set:
+                continue
+            reserved.append(page)
+            reserved_set.add(page)
+            remaining -= 1
+            if remaining == 0:
+                break
+    result = torch.tensor(sorted(reserved), dtype=torch.int64,
+                          device=scores.device)
+    if result.numel() != min(budget, page_count):
+        raise AssertionError("selection failed to fill the available budget")
+    return result
+
+
 def quest_candidate_scores(
     query: Any, candidate_key_pages: Any, *, group_size: int
 ) -> Any:

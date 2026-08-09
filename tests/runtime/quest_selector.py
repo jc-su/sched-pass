@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 
 from nta_runtime.quest_selector import (
+    budgeted_page_selection,
     page_key_envelopes,
     quest_candidate_scores,
     quest_page_scores,
@@ -106,6 +107,64 @@ def check_candidate_view(device: str) -> None:
             raise AssertionError("per-request candidate scoring disagrees")
 
 
+def check_budgeted_selection() -> None:
+    generator = torch.Generator().manual_seed(3)
+    pages = 40
+    scores = torch.randn(pages, generator=generator)
+    chosen = budgeted_page_selection(
+        scores, pages, 10, sink_pages=1, recent_pages=2
+    )
+    chosen_list = chosen.tolist()
+    if len(chosen_list) != 10 or sorted(set(chosen_list)) != chosen_list:
+        raise AssertionError("selection must be unique, sorted, on-budget")
+    for retained in (0, 38, 39):
+        if retained not in chosen_list:
+            raise AssertionError(f"retained page {retained} was dropped")
+    envelope_pool = [p for p in range(pages) if p not in (0, 38, 39)]
+    best_free = sorted(
+        envelope_pool, key=lambda p: (-float(scores[p]), p)
+    )[:7]
+    if sorted(best_free + [0, 38, 39]) != chosen_list:
+        raise AssertionError("non-retained slots must follow score order")
+    again = budgeted_page_selection(
+        scores, pages, 10, sink_pages=1, recent_pages=2
+    )
+    if not torch.equal(chosen, again):
+        raise AssertionError("selection must be deterministic")
+
+    # Budget smaller than the retention set: recent outranks sink.
+    tight = budgeted_page_selection(
+        scores, pages, 2, sink_pages=1, recent_pages=2
+    )
+    if tight.tolist() != [38, 39]:
+        raise AssertionError(
+            f"tight budget must keep the recent window: {tight.tolist()}"
+        )
+
+    # Budget beyond the page count clips to every page exactly once.
+    clipped = budgeted_page_selection(
+        scores, 4, 16, sink_pages=1, recent_pages=2
+    )
+    if clipped.tolist() != [0, 1, 2, 3]:
+        raise AssertionError("over-budget selection must clip to all pages")
+
+    for bad in (
+        lambda: budgeted_page_selection(scores, 0, 4, sink_pages=1,
+                                        recent_pages=1),
+        lambda: budgeted_page_selection(scores, 4, 0, sink_pages=1,
+                                        recent_pages=1),
+        lambda: budgeted_page_selection(scores, pages + 1, 4, sink_pages=1,
+                                        recent_pages=1),
+        lambda: budgeted_page_selection(scores, 4, 4, sink_pages=-1,
+                                        recent_pages=1),
+    ):
+        try:
+            bad()
+        except ValueError:
+            continue
+        raise AssertionError("invalid budgeted selection was not rejected")
+
+
 def check_rejections() -> None:
     bad = [
         lambda: page_key_envelopes(torch.zeros((2, 3, 4))),
@@ -142,6 +201,7 @@ def main() -> int:
         check_planted_signal(device)
         check_gqa_routing(device)
         check_candidate_view(device)
+    check_budgeted_selection()
     check_rejections()
     print(f"quest selector properties hold on {devices}")
     return 0

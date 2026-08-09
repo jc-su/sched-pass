@@ -171,6 +171,30 @@ that without materializing attention, and per-KV-head selection remains a
 known refinement. This is measured selector evidence, not a quality-parity
 claim: 1D's gate still requires end-to-end task-quality evaluation.
 
+The 16K budget table now exists through the certified long-context path
+(verification on a materialized 512-token prefix, then reconstruction-only
+scoring; fp32 throughout because bfloat16 attention rows legitimately
+diverge ~1e-1 from exact and would force a meaningless tolerance). Two
+artifacts: `quest-recall-qwen25-3b-16k.json` (documents replicated x64) and
+`quest-recall-qwen25-3b-16k-distinct.json` (every repository document once,
+rotated per prompt). Replication depresses recall by 2-4.5 points at every
+budget — repetitive text spreads attention over near-duplicate keys — so
+replicated-prompt recall is a pessimistic bound, and long-context recall
+work must use distinct corpora. Distinct-corpus results at 16,384 tokens
+(1,024 pages), sink 1 and recent 2 retained: quest 0.717 at a 3.1% budget,
+0.762 at 6.2%, 0.813 at 12.5%, 0.875 at 25%, with the oracle at 0.764 /
+0.812 / 0.861 / 0.914. Two readings. First, the envelope selector stays
+within 4-6 points of perfect selection at every budget; the binding
+constraint is the oracle ceiling itself. Second, that ceiling is partly
+structural to this checkpoint: two KV heads with group size eight force
+sixteen query heads' preferences into one aggregated page ranking — the
+harshest head-mixing configuration — and per-KV-head selection (a finer
+acquisition unit the indexed machinery's strided rows can express) is the
+recorded lever if task quality demands it. Operating decision for 1D: enter
+the engine stage at budgets 128 and 256 (87.5% and 75% byte avoidance,
+whose acquisition speedups are already measured at 4.12x and 2.13x), and
+let the task-quality gate — not recall — select the shipping point.
+
 Qwen3-30B-A3B was smoke-verified on this host on 2026-08-09 through stock
 SGLang 0.5.14 with full decode CUDA graphs (4 requests, 255.9 output
 tokens/s, `mem_fraction_static=0.85`, `nta_integrated=false`). Enabling it

@@ -25,10 +25,34 @@ from typing import Any
 
 import torch
 
-from nta_runtime.quest_selector import page_key_envelopes, quest_page_scores
+from nta_runtime.quest_selector import (
+    budgeted_page_selection,
+    page_key_envelopes,
+    quest_page_scores,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PROMPT_SOURCES = ("README.md", "docs/ARCHITECTURE.md", "docs/SYSTEM_PLAN.md")
+
+
+def distinct_corpus(start_source: str) -> tuple[str, int]:
+    """Concatenate every repository document once, rotated to start at
+    ``start_source`` so prompts differ, replicating only if the distinct
+    corpus itself is too short.
+
+    Replicated text is the pathological case for attention concentration —
+    mass legitimately spreads over near-duplicate keys — so recall measured
+    on replicated prompts is a lower bound, not a workload estimate. The
+    report records whether replication was required.
+    """
+    documents = [ROOT / "README.md"] + sorted((ROOT / "docs").glob("*.md"))
+    names = [str(path.relative_to(ROOT)) for path in documents]
+    pivot = names.index(start_source) if start_source in names else 0
+    ordered = documents[pivot:] + documents[:pivot]
+    corpus = "\n\n".join(
+        path.read_text(encoding="utf-8") for path in ordered
+    )
+    return corpus, len(ordered)
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +70,16 @@ def parse_args() -> argparse.Namespace:
     # reproduce the raw-envelope ablation.
     parser.add_argument("--sink-pages", type=int, default=1)
     parser.add_argument("--recent-pages", type=int, default=2)
+    parser.add_argument(
+        "--verify-tokens",
+        type=int,
+        default=512,
+        help=(
+            "prefix length for the materialized-attention verification pass; "
+            "prompts longer than this score through the verified "
+            "reconstruction path without materializing attention"
+        ),
+    )
     parser.add_argument("--prompts", type=int, default=3)
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
@@ -140,17 +174,72 @@ def page_mass(row: torch.Tensor, page_tokens: int) -> torch.Tensor:
     )
 
 
-def evaluate_prompt(
-    model: Any, tokenizer: Any, text: str, args: argparse.Namespace
-) -> list[dict[str, Any]]:
+def reconstructed_row(query: torch.Tensor, key_states: torch.Tensor,
+                      group_size: int) -> torch.Tensor:
+    """Last-position attention row from the verified reconstruction path."""
+    head_dim = key_states.shape[-1]
+    grouped_keys = key_states.repeat_interleave(group_size, dim=1)
+    logits = torch.einsum("hd,shd->hs", query, grouped_keys) * head_dim ** -0.5
+    return torch.softmax(logits, dim=-1)
+
+
+def score_layer(
+    layer_index: int,
+    query: torch.Tensor,
+    key_states: torch.Tensor,
+    true_row: torch.Tensor,
+    group_size: int,
+    args: argparse.Namespace,
+    reconstruction_error: float | None,
+) -> dict[str, Any]:
+    seq = key_states.shape[0]
+    pages = seq // args.page_tokens
+    key_pages = key_states[: pages * args.page_tokens].view(
+        pages, args.page_tokens, key_states.shape[1], key_states.shape[2]
+    )
+    kmin, kmax = page_key_envelopes(key_pages)
+    quest = quest_page_scores(
+        query.unsqueeze(0), kmin, kmax, group_size=group_size
+    )[0]
+    mass = page_mass(true_row, args.page_tokens)
+    total = mass.sum()
+    oracle_rank = mass.sum(dim=0).argsort(descending=True)
+    row: dict[str, Any] = {
+        "layer": layer_index,
+        "pages": pages,
+        "reconstruction_max_abs_error": reconstruction_error,
+    }
+    for k in args.top_k_pages:
+        budget = min(k, pages)
+        chosen = budgeted_page_selection(
+            quest, pages, budget,
+            sink_pages=args.sink_pages, recent_pages=args.recent_pages,
+        )
+        oracle = oracle_rank[:budget]
+        row[f"quest_recall_at_{k}"] = float((mass[:, chosen].sum() / total))
+        row[f"oracle_recall_at_{k}"] = float((mass[:, oracle].sum() / total))
+    return row
+
+
+def tokenize_prompt(tokenizer: Any, text: str, model: Any,
+                    length: int) -> torch.Tensor:
     tokens = tokenizer(text, return_tensors="pt", truncation=True,
-                       max_length=args.prompt_tokens)
+                       max_length=length)
     input_ids = tokens["input_ids"].to(model.device)
-    if input_ids.shape[1] < args.prompt_tokens:
+    if input_ids.shape[1] < length:
         raise RuntimeError(
             f"prompt only produced {input_ids.shape[1]} tokens; supply "
-            "longer source text or lower --prompt-tokens"
+            "longer source text or lower the requested length"
         )
+    return input_ids
+
+
+def evaluate_prompt(
+    model: Any, tokenizer: Any, text: str, args: argparse.Namespace,
+    *, length: int, verify_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Materialized-attention pass: verifies reconstruction, then scores."""
+    input_ids = tokenize_prompt(tokenizer, text, model, length)
     captured, handles = capture_layer_inputs(model)
     try:
         with torch.no_grad():
@@ -165,65 +254,54 @@ def evaluate_prompt(
     group_size = config.num_attention_heads // config.num_key_value_heads
     results = []
     for layer_index, attention in enumerate(outputs.attentions):
-        # (heads, source) true attention of the final position.
         true_row = attention[0, :, -1, :].to(torch.float32).cpu()
         keys = outputs.past_key_values.layers[layer_index].keys
         key_states = keys[0].permute(1, 0, 2).to(torch.float32).cpu()
-        seq, kv_heads, head_dim = key_states.shape
-        pages = seq // args.page_tokens
-        key_pages = key_states[: pages * args.page_tokens].view(
-            pages, args.page_tokens, kv_heads, head_dim
-        )
         query = last_position_query(captured[layer_index]).cpu()
-
-        # Fail-closed verification: the reconstructed query must reproduce
-        # the model's own attention row.
-        scale = head_dim ** -0.5
-        grouped_keys = key_states.repeat_interleave(group_size, dim=1)
-        logits = torch.einsum("hd,shd->hs", query, grouped_keys) * scale
-        rebuilt = torch.softmax(logits, dim=-1)
+        rebuilt = reconstructed_row(query, key_states, group_size)
         error = (rebuilt - true_row).abs().max().item()
         if error > 5e-2:
             raise RuntimeError(
                 f"layer {layer_index}: reconstructed attention diverges from "
                 f"the model's row (max abs {error:.4f}); refusing to score"
             )
+        if not verify_only:
+            results.append(
+                score_layer(layer_index, query, key_states, true_row,
+                            group_size, args, error)
+            )
+    return results
 
-        kmin, kmax = page_key_envelopes(key_pages)
-        quest = quest_page_scores(
-            query.unsqueeze(0), kmin, kmax, group_size=group_size
-        )[0]
-        mass = page_mass(true_row, args.page_tokens)
-        total = mass.sum(dim=-1)
-        aggregate_mass = mass.sum(dim=0)
-        reserved = sorted(
-            set(range(min(args.sink_pages, pages)))
-            | set(range(max(0, pages - args.recent_pages), pages))
+
+def evaluate_prompt_long(
+    model: Any, tokenizer: Any, text: str, args: argparse.Namespace
+) -> list[dict[str, Any]]:
+    """Long-context pass over the verified reconstruction path.
+
+    No attention tensor is materialized; the true row comes from the same
+    query/key reconstruction that the short-prefix pass certifies against the
+    model's own attention on every run.
+    """
+    input_ids = tokenize_prompt(tokenizer, text, model, args.prompt_tokens)
+    captured, handles = capture_layer_inputs(model)
+    try:
+        with torch.no_grad():
+            outputs = model(input_ids, use_cache=True)
+    finally:
+        for handle in handles:
+            handle.remove()
+    config = model.config
+    group_size = config.num_attention_heads // config.num_key_value_heads
+    results = []
+    for layer_index in range(len(model.model.layers)):
+        keys = outputs.past_key_values.layers[layer_index].keys
+        key_states = keys[0].permute(1, 0, 2).to(torch.float32).cpu()
+        query = last_position_query(captured[layer_index]).cpu()
+        true_row = reconstructed_row(query, key_states, group_size)
+        results.append(
+            score_layer(layer_index, query, key_states, true_row,
+                        group_size, args, None)
         )
-        envelope_order = [
-            int(page)
-            for page in quest.argsort(descending=True)
-            if int(page) not in set(reserved)
-        ]
-        oracle_rank = aggregate_mass.argsort(descending=True)
-        row: dict[str, Any] = {
-            "layer": layer_index,
-            "pages": pages,
-            "reconstruction_max_abs_error": error,
-        }
-        for k in args.top_k_pages:
-            budget = min(k, pages)
-            chosen = torch.tensor(
-                (reserved + envelope_order)[:budget], dtype=torch.long
-            )
-            oracle = oracle_rank[:budget]
-            row[f"quest_recall_at_{k}"] = float(
-                (mass[:, chosen].sum() / total.sum()).item()
-            )
-            row[f"oracle_recall_at_{k}"] = float(
-                (mass[:, oracle].sum() / total.sum()).item()
-            )
-        results.append(row)
     return results
 
 
@@ -232,17 +310,35 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    # Measurement tool, not a serving path: float32 everywhere keeps the
+    # reconstruction certification meaningful. bfloat16 attention rows
+    # legitimately diverge ~1e-1 from the exact computation, which would
+    # force a tolerance too loose to certify anything.
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.float32 if args.device == "cpu" else torch.bfloat16,
+        torch_dtype=torch.float32,
         attn_implementation="eager",
     ).to(args.device)
     model.eval()
 
+    long_context = args.prompt_tokens > args.verify_tokens
     prompt_layers: list[dict[str, Any]] = []
+    corpus_replicated = False
     for source in PROMPT_SOURCES[: args.prompts]:
-        text = (ROOT / source).read_text(encoding="utf-8")
-        layers = evaluate_prompt(model, tokenizer, text * 8, args)
+        text, distinct_documents = distinct_corpus(source)
+        probe = tokenizer(text, return_tensors="pt")["input_ids"].shape[1]
+        if probe < args.prompt_tokens:
+            corpus_replicated = True
+            text = text * (args.prompt_tokens // max(probe, 1) + 1)
+        if long_context:
+            # Certify the reconstruction on the materialized prefix, then
+            # score the full length through the certified path.
+            evaluate_prompt(model, tokenizer, text, args,
+                            length=args.verify_tokens, verify_only=True)
+            layers = evaluate_prompt_long(model, tokenizer, text, args)
+        else:
+            layers = evaluate_prompt(model, tokenizer, text, args,
+                                     length=args.prompt_tokens)
         prompt_layers.append({"source": source, "layers": layers})
 
     top_k = args.top_k_pages
@@ -275,6 +371,9 @@ def main() -> int:
         "device": args.device,
         "prompt_tokens": args.prompt_tokens,
         "page_tokens": args.page_tokens,
+        "mode": "long-context-reconstructed" if long_context else "materialized",
+        "verified_prefix_tokens": args.verify_tokens if long_context else None,
+        "corpus_replicated": corpus_replicated,
         "prompts": [p["source"] for p in prompt_layers],
         "aggregate": aggregate,
         "per_prompt": prompt_layers,
