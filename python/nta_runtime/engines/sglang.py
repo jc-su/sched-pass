@@ -712,6 +712,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             tuple[torch.cuda.Event, torch.cuda.Event, int]
         ] = []
         self._barrier_stall_by_layer: dict[int, float] = {}
+        # 1D health-check 2: shadow-evaluate the selected form on resident
+        # decode batches without touching served output. Off unless a budget
+        # is configured.
+        selected_budget = int(
+            os.environ.get("NTA_SGLANG_SELECTED_BUDGET", "0") or 0
+        )
+        self._selected_shadow = None
+        if selected_budget > 0:
+            from nta_runtime.engines.selected_form import SelectedShadow
+
+            self._selected_shadow = SelectedShadow(
+                selected_budget,
+                _positive_environment("NTA_SGLANG_SELECTED_PAGE_TOKENS", 16),
+            )
         trace_file = os.environ.get("NTA_OPPORTUNITY_TRACE_FILE")
         self._opportunity_trace = pathlib.Path(trace_file) if trace_file else None
         self._opportunity_revision = os.environ.get("NTA_REVISION", "")
@@ -2584,6 +2598,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("NTA attention ran without request metadata")
         pending = batch.pending_host_load
         stream = torch.cuda.current_stream()
+        if (
+            self._selected_shadow is not None
+            and pending is None
+            and any(
+                wrapper is candidate
+                for candidate in (
+                    getattr(self.forward_metadata, "decode_wrappers", ())
+                    or ()
+                )
+            )
+        ):
+            self._selected_shadow.evaluate(
+                wrapper, q, kv_cache, layer, self._stats
+            )
         run_options = {
             "k_scale": layer.k_scale_float,
             "v_scale": layer.v_scale_float,
