@@ -94,7 +94,19 @@ def configure_jit_environment(args: argparse.Namespace) -> pathlib.Path:
         stale.unlink()
     os.environ["NTA_ENGINE_STATS_FILE"] = str(workspace / "nta-engine.json")
 
-    os.environ["CC"] = str(host_cxx)
+    # CC serves two masters: Triton compiles C11 launcher stubs through $CC
+    # (a C++ compiler breaks them), while FlashInfer's ninja passes $CC to
+    # nvcc as -ccbin (a CUDA-incompatible GCC breaks that). The CUDA-matched
+    # C driver paired with the chosen host C++ compiler satisfies both.
+    host_cc = os.environ.get("CC") or shutil.which(
+        host_cxx.name.replace("g++", "gcc")
+    )
+    if host_cc is None:
+        raise RuntimeError(
+            f"no CUDA-compatible C compiler matches {host_cxx.name}; "
+            "set CC explicitly"
+        )
+    os.environ["CC"] = str(host_cc)
     os.environ["CXX"] = str(host_cxx)
     os.environ["CUDAHOSTCXX"] = str(host_cxx)
     os.environ["NTA_NVCC_HOST_COMPILER"] = str(host_cxx)

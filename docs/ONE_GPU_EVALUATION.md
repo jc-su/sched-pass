@@ -153,6 +153,15 @@ deployable form of this workload and the honest local instantiation.
 Model-generated scores are mandatory for 1D: the controlled-random-score sweep
 remains mechanism evidence only.
 
+Qwen3-30B-A3B was smoke-verified on this host on 2026-08-09 through stock
+SGLang 0.5.14 with full decode CUDA graphs (4 requests, 255.9 output
+tokens/s, `mem_fraction_static=0.85`, `nta_integrated=false`). Enabling it
+required fixing a harness defect: the smoke benchmark exported the CUDA host
+C++ compiler as `CC`, which breaks Triton's C11 launcher builds the moment a
+model JITs Triton kernels, while FlashInfer's ninja simultaneously requires a
+CUDA-compatible `-ccbin` from the same variable; both are satisfied by the
+CUDA-matched C driver (`gcc-14`).
+
 ### Execution order and go/no-go
 
 1. Mover-priority interference rerun (1C metric only) — already unblocked.
