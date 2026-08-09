@@ -95,6 +95,20 @@ def _aggregate(reports: list[dict[str, Any]], seed: int) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for index, field in enumerate(RATIO_FIELDS):
         values = [float(report[field]) for report in reports]
+        zero_values = sum(1 for value in values if value == 0.0)
+        if zero_values and field == "goodput_ratio":
+            # A zero goodput arm makes the geometric mean undefined. Report
+            # the zero-trial count and aggregate the positive trials instead
+            # of discarding the entire series; consumers must read both.
+            positive = [value for value in values if value > 0.0]
+            result[field] = {
+                "zero_goodput_trials": zero_values,
+                "positive_trial_geometric_mean": (
+                    _geometric_mean(positive) if positive else None
+                ),
+                "paired_values": values,
+            }
+            continue
         low, high = _bootstrap_interval(values, seed=seed + index)
         result[field] = {
             "paired_values": values,

@@ -662,6 +662,24 @@ steps, and per-layer host planning work; decomposing them is the RQ4
 interference ablation. The 1C resident-tail gate (<=1.05x) is failed at this
 configuration and remains failed until that decomposition lands.
 
+Both pre-declared decomposition hypotheses then resolved negative at n=10
+(`results/serving/sglang-hicache-load-moverpri-neg1-qualification.json`,
+`.../sglang-hicache-load-wave1-qualification.json`). H-A: elevated mover
+priority measured 1.1357x [0.928, 1.380] — indistinguishable from lowest
+priority, so stream scheduling is irrelevant to the regression in either
+direction. H-B: one-layer waves measured 1.1667x [0.921, 1.431] — burst size
+has no clear effect, and the extremes widened (two trials near 2x, one at
+0.484x where the NTA arm's tail beat stock two-fold; one trial's NTA arm
+missed every SLO and is recorded as `zero_goodput_trials` rather than
+crashing the aggregate). The spread exposes a measurement limitation: with 32
+resident output tokens, P99 inter-token latency is effectively the maximum of
+about 31 intervals, so single scheduler hiccups in either arm dominate the
+statistic. Before any further interference conclusion, the series must be
+re-run with a longer decode window (>=256 resident output tokens) so the tail
+is a distribution property rather than an extreme; the remaining mechanism
+suspects after H-A/H-B are per-transfer PCIe/memory contention and host-side
+planning jitter, discriminated next by a copy-engine wave path.
+
 Resident TTFT is not used as the interference headline: the workload submits
 external requests only after a resident emits its first token, so that TTFT is
 causally prior to external acquisition. The benchmark now reports per-request
