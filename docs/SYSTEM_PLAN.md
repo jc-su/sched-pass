@@ -499,6 +499,30 @@ Each backend owns registration, submission, completion, recovery, and physical
 cost estimates. It receives immutable request/object identities and returns
 versioned completion; it never decides numerical completion or request reuse.
 
+Tier position (2026-08-09, from measurement). NVMe remains a first-class tier:
+it is one transport class behind the same replica directory, its current-ABI
+qualification stands at 6,743 MiB/s (57% of matched fio), and selection makes
+it *more* valuable, not less — dense decode from storage is
+bandwidth-impossible, but a 3-6% selected fraction of a cold pool served at
+NVMe rates is decode-viable byte arithmetic. This host also carries a real
+CXL memory expander (`/dev/dax0.0`, 128 GiB devdax, CXL `mem0`, target node
+2), and a root-privileged probe verified the GPU consumes it through the
+existing mapped-host mechanism: `cudaHostRegister` on the devdax mapping
+succeeds and a full-GiB GPU read measured **22.13 GiB/s** with verified
+contents. The measured single-host ladder is therefore HBM ~1.6 TiB/s, DRAM
+~41 GiB/s, CXL ~22 GiB/s, NVMe ~6.6 GiB/s. The CXL tier is deferred by
+decision, not by capability: it requires no new device mechanism, only the
+one ABI generalization it shares with any multi-instance tier — the backend
+table is currently keyed by `SourceKind`, conflating transport class with
+tier instance, so DRAM and CXL cannot yet carry separate credits, bandwidth
+estimates, and admission. Backend *instances* per tier are the recorded
+design change for the next ABI revision; replica-level cost fields already
+express CXL placement today. Transport choice is likewise a measured policy,
+not an identity: copy engines win bulk contiguous movement (0.479x SM-mover
+ablation), SM gathers win fragmented selected movement (8.17x selected-page
+crossover), and the NVMe queue serves the cold tier; the demand cost model
+must select the mover per transfer geometry.
+
 ### Cross-cutting engineering rules
 
 - Keep one native ABI definition and enforce native/C/Python size and offset
