@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -62,7 +63,24 @@ template <typename T> T downloadOne(const T *source, std::uint32_t slot) {
 } // namespace
 
 struct HostRuntime::Impl {
-  static constexpr std::size_t DirectoryUploadDepth = 4;
+  // Ring recycling waits on the entry's completion event, which stalls the
+  // caller (the engine scheduler thread) whenever the ring is shallower than
+  // the in-flight claim/plan bursts. The default preserves historical
+  // behavior; the override exists for the pre-declared H-C interference
+  // discrimination and for engines with deeper burst patterns.
+  static std::size_t directoryUploadDepth() {
+    const char *configured = std::getenv("NTA_DIRECTORY_UPLOAD_DEPTH");
+    if (configured == nullptr || *configured == '\0') {
+      return 4;
+    }
+    char *end = nullptr;
+    const long value = std::strtol(configured, &end, 10);
+    if (end == nullptr || *end != '\0' || value < 1 || value > 4096) {
+      throw std::invalid_argument(
+          "NTA_DIRECTORY_UPLOAD_DEPTH must be an integer in [1, 4096]");
+    }
+    return static_cast<std::size_t>(value);
+  }
   static constexpr std::size_t RequestUploadDepth = 4;
 
   struct OwnedReplica {
@@ -586,7 +604,8 @@ struct HostRuntime::Impl {
   std::vector<bool> objectInstalled;
   std::vector<std::optional<OwnedObject>> objects;
   std::shared_ptr<NvmeTransport> nvme;
-  std::array<DirectoryUpload, DirectoryUploadDepth> directoryUploads{};
+  std::vector<DirectoryUpload> directoryUploads =
+      std::vector<DirectoryUpload>(directoryUploadDepth());
   std::size_t nextDirectoryUpload = 0;
   std::array<RequestUpload, RequestUploadDepth> requestUploads{};
   std::size_t nextRequestUpload = 0;
