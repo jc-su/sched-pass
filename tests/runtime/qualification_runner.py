@@ -70,8 +70,12 @@ def main() -> None:
             stdout=subprocess.DEVNULL,
         )
         records = (output / "trials.jsonl").read_text(encoding="utf-8").splitlines()
+        metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
         summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
         assert len(records) == 4
+        assert metadata["spec"] == spec
+        assert "spec_sha256" not in metadata
+        assert all("log_sha256" not in json.loads(record) for record in records)
         metric = next(
             item
             for item in summary["summaries"]

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -186,10 +185,6 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
     return json.loads(raw_output.read_text(encoding="utf-8"))
 
 
-def digest(path: pathlib.Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def main() -> int:
     args = parse_args()
     git_revision, dirty = revision()
@@ -220,10 +215,7 @@ def main() -> int:
         "matched_bandwidth_ratio": ratio,
         "baseline": baseline,
         "gpu_controlled": gpu,
-        "raw_gpu_artifact": {
-            "path": str(raw_output.resolve()),
-            "sha256": digest(raw_output),
-        },
+        "raw_gpu_result": str(raw_output.resolve()),
     }
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, sort_keys=True))

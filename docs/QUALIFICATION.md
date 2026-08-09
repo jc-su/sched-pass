@@ -23,7 +23,7 @@ acquisition, exposing the remaining acquisition cost. A warm-cache resident SGLa
 direct-path bound, while the latest ticketed external SGLang measurements
 remain regressions. The positive operator results are compiler-transformed
 with validated typed plans, but they do not establish an end-to-end serving
-gain. Completing manifests alone cannot change the release verdict.
+gain. Completing evidence paperwork alone cannot change the release verdict.
 
 In the latest three arm-balanced Qwen2.5-3B graph trials, the fully transformed
 mixed host/resident path achieved `0.9447x` output-throughput geometric mean
@@ -87,9 +87,8 @@ of a report does not imply that the profile passed.
 
 The local profile configures both CUDA and CUDA-disabled builds from source,
 runs all CTests and sanitizers, executes 10,000 lifecycle epochs, runs Clang
-static analysis, Ruff, a no-isolation Python wheel build, and ShellCheck, and
-fingerprints the exact tracked and untracked workspace. `--skip-local` accepts
-a prior report only when that fingerprint still matches.
+static analysis, Ruff, a no-isolation Python wheel build, and ShellCheck.
+`--skip-local` accepts a prior report only for the same clean Git revision.
 
 The stock serving environment can be checked independently with:
 
@@ -131,25 +130,21 @@ a schema-1 trial specification with:
 
 These checked-in mechanism specifications do not constitute the full OSDI
 matrix. Site-specific serving, storage, portability, and fault-injection
-specifications must name the qualified models and hardware explicitly; the raw
-outputs from all specifications are referenced by the evidence manifests.
+specifications must name the qualified models and hardware explicitly. Their
+reducers populate the production and OSDI evidence reports.
 
 The runner refuses a dirty worktree by default, verifies an optional exact
 revision, randomizes repetition order and variant order within complete trial
-blocks, preserves every raw log with its digest, and
-emits per-variant 95% confidence summaries. `--allow-dirty` exists only for
-runner development and cannot satisfy the clean-revision release gate.
+blocks, preserves every raw log, and emits per-variant 95% confidence
+summaries. `--allow-dirty` exists only for runner development and cannot
+satisfy the clean-revision release gate.
 
 ## Production Evidence
 
-`results/qualification/production-evidence.json` uses schema 3. Earlier schemas
-are rejected because they could qualify a path that dispatched stock attention
-after transfer instead of exercising the compiler/runtime mechanism.
-
-The `artifacts` manifest must include `serving`, `correctness`, `reliability`,
-and `portability` classes. Each entry contains a repository-relative `path` and
-its `sha256`. Every JSON or JSONL record must carry the exact qualified
-`revision`.
+`results/qualification/production-evidence.json` uses schema 3 and records the
+exact qualified `revision` with `dirty=false`. Earlier schemas are rejected
+because they could qualify a path that dispatched stock attention after
+transfer instead of exercising the compiler/runtime mechanism.
 
 The `serving` object must establish all of the following:
 
@@ -177,9 +172,8 @@ models, and a physical multi-GPU run.
 
 ## OSDI Evidence
 
-`results/qualification/osdi-evidence.json` also uses schema 3. Its artifact
-manifest must include `opportunity`, `dense_flashinfer`, `sparse_flashinfer`,
-`baselines`, `ablations`, `statistics`, and `reproduction`.
+`results/qualification/osdi-evidence.json` also uses schema 3 and must identify
+the same clean revision.
 
 The executable gate now matches `SYSTEM_PLAN.md` and requires:
 
@@ -228,9 +222,19 @@ the runnable tile set, incremental kernel form, complete-contributor merge,
 elastic grouping, replica selection, engine progress feedback, and CTA
 try-issue.
 
-Both evidence files summarize raw artifacts; booleans do not replace logs,
-per-request timestamps, device telemetry, fault timelines, or checksums. A
-clean worktree is checked separately.
+Both evidence files are reducer outputs. They do not replace raw logs,
+per-request timestamps, device telemetry, or fault timelines, which must be
+published with a paper artifact. Local SHA-256 fields were deliberately removed:
+a report and hash created beside one another provide no independent trust. Git
+revision, clean-tree state, exact commands, raw samples, and independent
+artifact review provide the useful provenance.
+
+This cleanup does not remove hashes used by the running system. Operator source
+and plan fingerprints reject mismatched direct/incremental kernels; the JIT
+cache key prevents reuse across ABI or source changes; the FlashInfer overlay
+validator refuses to patch an unknown upstream tree; and output digests compare
+complete generated responses compactly. Those uses protect correctness rather
+than decorate evidence files.
 
 RNIC/RDMA is outside the scoped claim and therefore is not a release
 requirement. The paper must describe the system as local HBM/CPU-DRAM/NVMe

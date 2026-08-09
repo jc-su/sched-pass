@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import math
 import os
@@ -325,7 +324,7 @@ def main() -> int:
         "schema": 1,
         "revision": revision,
         "dirty": dirty,
-        "spec_sha256": hashlib.sha256(args.spec.read_bytes()).hexdigest(),
+        "spec": spec,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "machine": machine_metadata(),
     }
@@ -376,7 +375,6 @@ def main() -> int:
                 "log": str(log_path.relative_to(ROOT))
                 if log_path.is_relative_to(ROOT)
                 else str(log_path),
-                "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
                 "result": parsed,
             }
             records.append(record)

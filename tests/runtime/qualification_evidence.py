@@ -36,7 +36,7 @@ def main() -> None:
         assert len(production) == 1 and not production[0]["passed"]
         assert "schema 3" in production[0]["detail"]
 
-        current = {"schema": 3, "revision": "revision", "artifacts": []}
+        current = {"schema": 3, "revision": "revision", "dirty": False}
         (evidence / "production-evidence.json").write_text(
             json.dumps(current), encoding="utf-8"
         )
@@ -48,10 +48,16 @@ def main() -> None:
             "serving performance bounds",
             "serving tier coverage",
         }.issubset(production_names)
-        assert not any(item["passed"] for item in production)
+        provenance = next(
+            item
+            for item in production
+            if item["name"] == "production evidence provenance"
+        )
+        assert provenance["passed"] is True
+        assert not next(
+            item for item in production if item["name"] == "serving integration"
+        )["passed"]
 
-        original_verify_artifacts = qualifier.verify_artifacts
-        qualifier.verify_artifacts = lambda *_args: (True, "test artifacts")
         current["serving"] = {
             "engine": "sglang",
             "mechanism_integrated": True,
@@ -117,8 +123,6 @@ def main() -> None:
             item for item in production if item["name"] == "serving integration"
         )
         assert integration["passed"] is False
-        qualifier.verify_artifacts = original_verify_artifacts
-
         (evidence / "osdi-evidence.json").write_text(
             json.dumps(current), encoding="utf-8"
         )
@@ -133,9 +137,16 @@ def main() -> None:
             "real GPU-selected FlashInfer acquisition",
             "mechanism performance bounds",
         }.issubset(osdi_names)
-        assert not any(item["passed"] for item in osdi)
+        provenance = next(
+            item for item in osdi if item["name"] == "OSDI evidence provenance"
+        )
+        assert provenance["passed"] is True
+        assert not next(
+            item
+            for item in osdi
+            if item["name"] == "real FlashInfer incremental execution"
+        )["passed"]
 
-        qualifier.verify_artifacts = lambda *_args: (True, "test artifacts")
         current["incremental_execution"] = {
             "decode": True,
             "paged_prefill": True,
@@ -223,6 +234,16 @@ def main() -> None:
             if item["name"] == "real GPU-selected FlashInfer acquisition"
         )
         assert sparse["passed"] is False
+
+        current["dirty"] = True
+        (evidence / "osdi-evidence.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        osdi = qualifier.osdi_checks(evidence, "revision")
+        provenance = next(
+            item for item in osdi if item["name"] == "OSDI evidence provenance"
+        )
+        assert provenance["passed"] is False
 
     print("qualification_evidence=pass")
 

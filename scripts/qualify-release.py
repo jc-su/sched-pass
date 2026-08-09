@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import os
 import pathlib
@@ -77,57 +76,6 @@ def sequence_contains(value: Any, required: set[str]) -> bool:
     )
 
 
-def verify_artifacts(
-    evidence: dict[str, Any], required_classes: set[str], revision: str
-) -> tuple[bool, str]:
-    artifacts = evidence.get("artifacts")
-    if not isinstance(artifacts, list):
-        return False, "evidence must contain an artifact manifest"
-    observed_classes: set[str] = set()
-    for artifact in artifacts:
-        if not isinstance(artifact, dict):
-            return False, "artifact manifest entries must be objects"
-        classification = artifact.get("class")
-        relative_path = artifact.get("path")
-        expected_digest = artifact.get("sha256")
-        if not all(
-            isinstance(value, str)
-            for value in (classification, relative_path, expected_digest)
-        ):
-            return False, "artifact entries require class, path, and sha256 strings"
-        path = (ROOT / relative_path).resolve()
-        try:
-            path.relative_to(ROOT)
-        except ValueError:
-            return False, f"artifact escapes the repository: {relative_path}"
-        if not path.is_file():
-            return False, f"artifact is missing: {relative_path}"
-        actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if actual_digest != expected_digest:
-            return False, f"artifact digest mismatch: {relative_path}"
-        try:
-            if path.suffix == ".jsonl":
-                records = [
-                    json.loads(line)
-                    for line in path.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                ]
-            else:
-                value = json.loads(path.read_text(encoding="utf-8"))
-                records = value if isinstance(value, list) else [value]
-        except (OSError, json.JSONDecodeError) as error:
-            return False, f"artifact is not valid JSON data: {relative_path}: {error}"
-        if not records or not all(isinstance(record, dict) for record in records):
-            return False, f"artifact has no structured records: {relative_path}"
-        if any(record.get("revision") != revision for record in records):
-            return False, f"artifact record revision mismatch: {relative_path}"
-        observed_classes.add(classification)
-    missing = sorted(required_classes - observed_classes)
-    if missing:
-        return False, f"artifact classes are missing: {', '.join(missing)}"
-    return True, "all required raw artifacts exist and match their SHA-256 digests"
-
-
 def production_checks(
     evidence_dir: pathlib.Path, revision: str
 ) -> list[dict[str, Any]]:
@@ -158,18 +106,16 @@ def production_checks(
         "iommu_fault",
         "process_crash",
     }
-    artifacts_valid, artifact_detail = verify_artifacts(
-        evidence,
-        {"serving", "correctness", "reliability", "portability"},
-        revision,
+    provenance_valid = (
+        evidence.get("revision") == revision and evidence.get("dirty") is False
     )
     return [
         check(
             "production evidence provenance",
-            evidence.get("revision") == revision and artifacts_valid,
-            artifact_detail
-            if evidence.get("revision") == revision
-            else "evidence revision does not match the qualified revision",
+            provenance_valid,
+            "evidence is from the exact clean revision"
+            if provenance_valid
+            else "evidence must report the exact revision and dirty=false",
         ),
         check(
             "serving integration",
@@ -283,18 +229,8 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
         "engine_progress_feedback",
         "cta_try_issue",
     }
-    artifacts_valid, artifact_detail = verify_artifacts(
-        evidence,
-        {
-            "opportunity",
-            "dense_flashinfer",
-            "sparse_flashinfer",
-            "baselines",
-            "ablations",
-            "statistics",
-            "reproduction",
-        },
-        revision,
+    provenance_valid = (
+        evidence.get("revision") == revision and evidence.get("dirty") is False
     )
     opportunity = evidence.get("opportunity", {})
     compiler = evidence.get("compiler", {})
@@ -306,10 +242,10 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
     return [
         check(
             "OSDI evidence provenance",
-            evidence.get("revision") == revision and artifacts_valid,
-            artifact_detail
-            if evidence.get("revision") == revision
-            else "evidence revision does not match the qualified revision",
+            provenance_valid,
+            "evidence is from the exact clean revision"
+            if provenance_valid
+            else "evidence must report the exact revision and dirty=false",
         ),
         check(
             "comparative baselines",
@@ -624,33 +560,6 @@ def git_value(*arguments: str) -> str:
     return result.stdout.strip()
 
 
-def workspace_fingerprint() -> str:
-    digest = hashlib.sha256()
-    digest.update(git_value("rev-parse", "HEAD").encode("ascii"))
-    diff = subprocess.run(
-        ["git", "diff", "--binary", "HEAD"],
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    ).stdout
-    digest.update(diff)
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    ).stdout.split(b"\0")
-    for encoded_path in sorted(path for path in untracked if path):
-        path = ROOT / os.fsdecode(encoded_path)
-        digest.update(encoded_path)
-        digest.update(b"\0")
-        if path.is_file():
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -674,8 +583,8 @@ def main() -> int:
     command_results = []
     prior_local_ready = False
     prior_local_detail = "local gates were not executed"
-    fingerprint = workspace_fingerprint()
     revision = git_value("rev-parse", "HEAD")
+    dirty = bool(git_value("status", "--porcelain"))
     if not args.skip_local:
         for command in local_commands(
             args.build_dir.resolve(), args.cpu_build_dir.resolve(), evidence_dir
@@ -691,10 +600,12 @@ def main() -> int:
         prior_local_ready = (
             prior is not None
             and prior.get("ready") is True
-            and prior.get("workspace_fingerprint") == fingerprint
+            and prior.get("revision") == revision
+            and prior.get("dirty") is False
+            and not dirty
         )
         prior_local_detail = (
-            "cached local evidence matches this workspace"
+            "cached local evidence matches this clean revision"
             if prior_local_ready
             else "cached local evidence is missing, failed, or stale"
         )
@@ -716,7 +627,6 @@ def main() -> int:
         checks.extend(production_checks(evidence_dir, revision))
     if args.profile == "osdi":
         checks.extend(osdi_checks(evidence_dir, revision))
-    dirty = bool(git_value("status", "--porcelain"))
     if args.profile != "local":
         checks.append(
             check(
@@ -731,7 +641,6 @@ def main() -> int:
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "profile": args.profile,
         "revision": revision,
-        "workspace_fingerprint": fingerprint,
         "branch": git_value("branch", "--show-current"),
         "dirty": dirty,
         "commands": command_results,

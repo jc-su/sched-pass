@@ -173,7 +173,7 @@ Therefore the accurate current phrase is:
 > mechanism with a stable request-heterogeneous crossover.
 
 Use "OSDI-validated" only after `scripts/qualify-release.py --profile=osdi`
-returns `READY` for the exact clean revision and its raw artifact manifest.
+returns `READY` for the exact clean revision and its published raw results.
 
 ## Implementation Order
 

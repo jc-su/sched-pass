@@ -60,8 +60,8 @@ build and tests, 10,000 lifecycle epochs, Clang static analysis, Python and
 shell checks, package construction, and patch hygiene.
 
 The schema-3 production and OSDI qualifiers both report `NOT_READY` on this
-workspace. Production lacks its external evidence manifest and an immutable
-clean revision. OSDI additionally lacks the paper evidence manifest. This is
+workspace. Production lacks its external evidence report and an immutable
+clean revision. OSDI additionally lacks the paper evidence report. This is
 the expected claim boundary, not a local test failure.
 
 ## Canonical FlashInfer Tier Streaming
