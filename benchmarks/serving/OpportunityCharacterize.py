@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--external-token-points", type=token_points, default=(4096, 16384, 65536)
     )
-    parser.add_argument("--external-requests", type=int, default=3)
+    parser.add_argument("--external-requests", type=int, default=1)
     parser.add_argument("--resident-requests", type=int, default=1)
     parser.add_argument("--resident-tokens", type=int, default=8192)
     parser.add_argument("--resident-output-tokens", type=int, default=128)
@@ -88,21 +88,36 @@ def parse_args() -> argparse.Namespace:
     if not 0 < args.blocked_threshold < 1:
         parser.error("blocked threshold must be inside (0, 1)")
     largest = max(args.external_token_points)
-    if point_max_total_tokens(largest, args.resident_tokens) >= args.context_length:
+    if point_max_total_tokens(largest, args) >= args.context_length:
         parser.error(
             "context length must exceed the largest point's KV pool size"
         )
     return args
 
 
-def point_max_total_tokens(external_tokens: int, resident_tokens: int) -> int:
-    """KV pool sized so the point runs but its prefix must evict to host."""
-    return external_tokens + resident_tokens + 1024
+def point_max_total_tokens(external_tokens: int, args: argparse.Namespace) -> int:
+    """KV pool sized so every timed context fits but the hot prefix must
+    still evict to host before its measured promotion."""
+    return (
+        args.external_requests * external_tokens
+        + args.resident_requests
+        * (args.resident_tokens + args.resident_output_tokens)
+        + 1024
+    )
 
 
-def point_churn_tokens(external_tokens: int) -> int:
-    """Churn sized so hot + churn always exceeds the pool, forcing promotion."""
-    return external_tokens + 4096
+def point_churn_tokens(external_tokens: int, args: argparse.Namespace) -> int:
+    """Churn must itself fit the pool while hot + churn exceeds it.
+
+    fit:   churn <= max_total - generation overhead (1024 margin);
+    evict: churn > max_total - external, which holds for external > 1024.
+    """
+    if external_tokens <= 1024:
+        raise ValueError(
+            "external token points below 1025 cannot force eviction with a "
+            "pool-fitting churn prompt"
+        )
+    return point_max_total_tokens(external_tokens, args) - 1024
 
 
 def git_value(*arguments: str) -> str:
@@ -136,9 +151,9 @@ def run_load_point(args: argparse.Namespace, external_tokens: int) -> dict[str, 
         "--context-length",
         str(args.context_length),
         "--churn-tokens",
-        str(point_churn_tokens(external_tokens)),
+        str(point_churn_tokens(external_tokens, args)),
         "--max-total-tokens",
-        str(point_max_total_tokens(external_tokens, args.resident_tokens)),
+        str(point_max_total_tokens(external_tokens, args)),
         "--request-rate",
         str(args.request_rate),
         "--seed",
