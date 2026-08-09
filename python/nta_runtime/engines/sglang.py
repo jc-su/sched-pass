@@ -2072,8 +2072,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 f"{self._object_capacity}"
             )
         if prefetched is None and pending.prefetched_layers:
+            # key_slot/value_slot are the low alias slots used after a layer's
+            # transfer completes. The proactive allocation itself remains in
+            # the high range beginning at transfer_first_slot.
             pipeline_first_slot = min(
-                min(layer.key_slot, layer.value_slot)
+                layer.transfer_first_slot
                 for layer in pending.prefetched_layers.values()
             )
             if object_count > pipeline_first_slot:
