@@ -149,6 +149,16 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
+    NAME nta-page-summaries
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/page_summaries.py
+  )
+  set_tests_properties(
+    nta-page-summaries PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
     NAME nta-quest-selector
     COMMAND
       ${Python3_EXECUTABLE}
