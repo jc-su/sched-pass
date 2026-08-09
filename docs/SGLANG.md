@@ -300,16 +300,21 @@ NTA_SGLANG_PIPELINE_HOST=0 \
 NTA_SGLANG_FORCE_INCREMENTAL=1 \
 NTA_SGLANG_FRAGMENT_LOOKAHEAD=0 \
 NTA_SGLANG_CROSS_LAYER_FRONTIER=0 \
+NTA_SGLANG_REQUIRE_MIXED_ATTENTION=1 \
 python benchmarks/serving/CompareSglangHiCache.py \
   --model /path/to/model --iterations 10 \
-  --hot-tokens 96 --churn-tokens 184 \
+  --hot-tokens 96 --resident-tokens 64 --churn-tokens 184 \
   --max-total-tokens 192 --context-length 256 \
-  --cuda-graph-decode disabled --require-demand-graph
+  --cuda-graph-decode disabled --require-demand-graph \
+  --require-physical-compaction
 ```
 
 `--require-demand-graph` rejects reports unless the NTA arm has positive eager
 warmup, capture, and graph-launch counters. SGLang model-graph counters cannot
-satisfy this gate.
+satisfy this gate. `--require-physical-compaction` is deliberately separate:
+it rejects a run unless a mixed layer's incremental resume grid launches fewer
+CTAs than the canonical full grid. A single-request, one-CTA layer can exercise
+acquisition and graph replay but cannot provide compaction evidence.
 
 An iteration qualifies only when SGLang reports host-cached tokens for the hot
 request. The runner collects the requested number of qualified promotions,

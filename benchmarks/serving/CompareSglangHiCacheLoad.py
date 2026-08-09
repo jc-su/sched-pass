@@ -238,7 +238,9 @@ def main() -> int:
     stock = reports["flashinfer"]
     nta = reports["nta_flashinfer"]
     activation = require_clean_mechanism(
-        nta, require_graph_replay=args.cuda_graph_decode == "full"
+        nta,
+        require_graph_replay=args.cuda_graph_decode == "full",
+        require_physical_compaction=args.batch_mode == "coalesced",
     )
     if not stock["placement_proven"] or not nta["placement_proven"]:
         _write_failed_comparison(

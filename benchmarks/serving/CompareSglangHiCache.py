@@ -57,6 +57,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-physical-compaction",
+        action="store_true",
+        help=(
+            "require the incremental form to launch fewer resume CTAs than "
+            "the canonical full grid"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=pathlib.Path,
         default=ROOT / "results" / "serving" / "sglang-hicache.json",
@@ -85,7 +93,11 @@ def parse_report(output: str) -> dict[str, Any]:
 
 
 def require_clean_mechanism(
-    report: dict[str, Any], *, require_graph_replay: bool, require_demand_graph: bool
+    report: dict[str, Any],
+    *,
+    require_graph_replay: bool = False,
+    require_demand_graph: bool = False,
+    require_physical_compaction: bool = False,
 ) -> dict[str, Any]:
     stats = [
         entry
@@ -223,14 +235,14 @@ def require_clean_mechanism(
         raise RuntimeError(
             "trial formed no FlashInfer layer containing both direct and external work"
         )
-    if os.environ.get("NTA_SGLANG_FORCE_INCREMENTAL") == "1" and (
+    if require_physical_compaction and (
         compact_launches == 0
         or compact_ctas == 0
         or canonical_ctas == 0
         or compact_ctas >= canonical_ctas
     ):
         raise RuntimeError(
-            "forced incremental trial did not physically compact resume work "
+            "incremental trial did not physically compact resume work "
             f"({compact_launches} launches, {compact_ctas}/{canonical_ctas} CTAs)"
         )
     if (fragment_layers or request_overlap_layers) and (
@@ -402,6 +414,7 @@ def main() -> int:
         mechanism,
         require_graph_replay=args.cuda_graph_decode == "full",
         require_demand_graph=args.require_demand_graph,
+        require_physical_compaction=args.require_physical_compaction,
     )
     if not baseline.get("shape_warmup_excluded") or not mechanism.get(
         "shape_warmup_excluded"
@@ -437,6 +450,7 @@ def main() -> int:
             transfer_verification,
             require_graph_replay=args.cuda_graph_decode == "full",
             require_demand_graph=args.require_demand_graph,
+            require_physical_compaction=args.require_physical_compaction,
         )
         if (
             transfer_verification["generated_text_sha256"]

@@ -324,6 +324,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/qualification_evidence.py
     )
     add_test(
+      NAME nta-serving-evidence
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_evidence.py
+    )
+    add_test(
       NAME nta-opportunity-analysis
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity.py
@@ -335,7 +340,7 @@ if(NTA_ENABLE_CUDA)
     )
     set_tests_properties(
       nta-request-slots nta-sglang-plugin nta-qualification-runner
-      nta-qualification-evidence nta-jit-operator-family
+      nta-qualification-evidence nta-serving-evidence nta-jit-operator-family
       nta-opportunity-analysis
       nta-opportunity-study
       PROPERTIES TIMEOUT 60
