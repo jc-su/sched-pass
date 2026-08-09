@@ -719,6 +719,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             os.environ.get("NTA_SGLANG_SELECTED_BUDGET", "0") or 0
         )
         self._selected_shadow = None
+        # Stage 3a: serve the verified selected-attention result instead of
+        # only shadowing it. Output is approximate by design; the quality
+        # harness, not exactness against dense, is that stage's judge.
+        self._selected_serve = (
+            os.environ.get("NTA_SGLANG_SELECTED_SERVE") == "1"
+        )
         if selected_budget > 0:
             from nta_runtime.engines.selected_form import SelectedShadow
 
@@ -2609,9 +2615,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 )
             )
         ):
-            self._selected_shadow.evaluate(
-                wrapper, q, kv_cache, layer, self._stats
+            served = self._selected_shadow.evaluate(
+                wrapper, q, kv_cache, layer, self._stats,
+                serve_output=output if self._selected_serve else None,
             )
+            if served:
+                return output.view(-1, layer.tp_q_head_num * layer.head_dim)
         run_options = {
             "k_scale": layer.k_scale_float,
             "v_scale": layer.v_scale_float,

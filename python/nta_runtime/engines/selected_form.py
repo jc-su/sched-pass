@@ -107,9 +107,17 @@ class SelectedShadow:
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         layer: Any,
         stats: dict[str, Any],
-    ) -> None:
+        serve_output: torch.Tensor | None = None,
+    ) -> bool:
+        """Run the selection chain; optionally serve its result.
+
+        With ``serve_output`` set (stage 3a), the verified selected-attention
+        result is copied into the layer's output tensor and becomes the
+        served computation; the dual-wrapper equality and structural
+        invariants still gate every step. Returns whether output was served.
+        """
         if torch.cuda.is_current_stream_capturing():
-            return
+            return False
         key_cache, value_cache = kv_cache
         batch_size = q.shape[0]
         indptr = wrapper._paged_kv_indptr_buf[: batch_size + 1]
@@ -161,13 +169,14 @@ class SelectedShadow:
                 "selected form verification wrappers disagree over an "
                 "identical compact table"
             )
-        stats["selected_shadow_layers"] = (
-            stats.get("selected_shadow_layers", 0) + 1
+        prefix = "selected_serve" if serve_output is not None else "selected_shadow"
+        if serve_output is not None:
+            serve_output.copy_(outputs[0])
+        stats[f"{prefix}_layers"] = stats.get(f"{prefix}_layers", 0) + 1
+        stats[f"{prefix}_tokens_total"] = (
+            stats.get(f"{prefix}_tokens_total", 0) + total
         )
-        stats["selected_shadow_tokens_total"] = (
-            stats.get("selected_shadow_tokens_total", 0) + total
+        stats[f"{prefix}_tokens_kept"] = (
+            stats.get(f"{prefix}_tokens_kept", 0) + int(compact_indices.numel())
         )
-        stats["selected_shadow_tokens_kept"] = (
-            stats.get("selected_shadow_tokens_kept", 0)
-            + int(compact_indices.numel())
-        )
+        return serve_output is not None
