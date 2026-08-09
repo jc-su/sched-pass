@@ -71,7 +71,12 @@ struct HostRuntime::Impl {
   static std::size_t directoryUploadDepth() {
     const char *configured = std::getenv("NTA_DIRECTORY_UPLOAD_DEPTH");
     if (configured == nullptr || *configured == '\0') {
-      return 4;
+      // Depth 4 produced the confirmed H-C pathology: recycling syncs on the
+      // engine scheduler thread stretched consecutive decode intervals 2-3x
+      // whenever claim bursts collided with decode. Depth 32 removes the
+      // observed collisions at a bounded pinned-staging cost of
+      // (objectCapacity + replicaCapacity) * 64 bytes per slot.
+      return 32;
     }
     char *end = nullptr;
     const long value = std::strtol(configured, &end, 10);

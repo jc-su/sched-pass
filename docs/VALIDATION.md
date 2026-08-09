@@ -716,6 +716,21 @@ upload ring, move claim-time registration off the scheduler thread, and
 re-run the long-window series; the hypothesis is falsified if the clustered
 mid-timeline spikes survive both changes.
 
+**H-C is confirmed by the first discriminating test.** With the ring at depth
+64 (`NTA_DIRECTORY_UPLOAD_DEPTH=64`, same protocol, n=10, qualified, exact
+outputs, zero fallback,
+`results/serving/sglang-hicache-load-ring64-qualification.json`), the
+episodic spikes vanish entirely: every trial's resident P99 inter-token
+ratio lies in [0.938, 1.198] versus the depth-4 series' 2.19-3.25 events,
+no trial zeroes its goodput (goodput geometric mean 0.9318), and the ITL
+geometric mean improves from 1.1614 to **1.0821** with interval [1.034,
+1.128]. The compile-time depth-4 recycling synchronization on the engine
+scheduler thread was the episodic tail pathology; the default ring depth is
+now 32 with the environment override retained. The residual, now-consistent
+~8% tail cost against the 5% 1C gate is a steady-state optimization target
+(claim-work off the scheduler thread and the copy-engine wave path are the
+next candidates), no longer an episodic failure mode.
+
 Resident TTFT is not used as the interference headline: the workload submits
 external requests only after a resident emits its first token, so that TTFT is
 causally prior to external acquisition. The benchmark now reports per-request
