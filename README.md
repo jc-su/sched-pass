@@ -446,6 +446,6 @@ physical throughput and zero failure. The benchmark invalidates its staging entr
 the start of every measured graph; cache-hit replay is therefore not counted as
 SSD bandwidth. This is a single-machine mechanism result, not production
 serving or paper-level evaluation. The ABI-v25 harness now completes exact
-2-MiB reads at 58.23% of a matched `fio` baseline on this host; its latest
-artifact is dirty-revision diagnostic evidence and must be repeated after the
-final qualification commit.
+2-MiB reads at 58.16% of a matched `fio` baseline on this host from clean
+revision `5c26f8b8aa6c`. This is one-controller local scaling evidence, not
+serving or portability evidence.

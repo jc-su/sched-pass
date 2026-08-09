@@ -528,12 +528,11 @@ read-only `fio io_uring` baseline and the GPU-controlled VFIO path with 2-MiB
 requests at queue depth 32. The controller was attached to a private translated
 IOMMUFD IOAS and the BAR-write qualification passed. Across 20 measured GPU
 epochs, all 640 commands completed with exact checksums, zero failures, and
-zero outstanding commands. The CPU baseline measured 11,813.31 MiB/s and the
-GPU-controlled finite scheduler measured 6,879.10 MiB/s, or 58.23% of the
-matched baseline. This exceeds the predeclared 50% local scaling gate, but the
-artifact was collected from a dirty worktree and is therefore diagnostic until
-repeated from the final clean revision. It is not serving-SLO, portability, or
-recovery evidence.
+zero outstanding commands. The CPU baseline measured 11,812.71 MiB/s and the
+GPU-controlled finite scheduler measured 6,870.00 MiB/s, or 58.16% of the
+matched baseline. The artifact names clean revision `5c26f8b8aa6c` and exceeds
+the predeclared 50% local scaling gate. This remains one controller and one
+trial; it is not serving-SLO, portability, or recovery evidence.
 
 ## SGLang HiCache Integration
 
