@@ -395,6 +395,10 @@ nta_set_indexed_row_counts(nta::abi::RuntimeView *runtime,
   const std::uint64_t elementBytes = object.bytes / replica->dmaPageCount;
   const_cast<abi::ReplicaEntry *>(replica)->dmaPageCount = rowCount;
   object.bytes = elementBytes * rowCount;
+  // Registration leaves selectedReplica invalid until a protocol selects
+  // one; the copy kernel resolves through it and silently skips otherwise.
+  // The bounded direct path always uses the single indexed replica.
+  object.selectedReplica = 0;
   // Issued is the state the bounded indexed copy consumes. The tiered loop
   // owns these slots outside the intent/epoch protocol: finalize no-ops
   // without a claimed intent, and correctness is carried by stream order
