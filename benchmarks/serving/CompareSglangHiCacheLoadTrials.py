@@ -27,7 +27,7 @@ RATIO_FIELDS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--seed-base", type=int, default=20260801)
     parser.add_argument(
         "--artifact-dir",
@@ -150,6 +150,9 @@ def main() -> int:
         "schema": 1,
         "classification": "sglang-hicache-load-qualification",
         "trial_count": len(reports),
+        # Ten process-level trials are the documented evidence standard for a
+        # serving claim; smaller runs are diagnostics and must say so.
+        "evidence_grade": "qualified" if len(reports) >= 10 else "diagnostic",
         "arm_order": [report["execution_order"] for report in reports],
         "artifacts": artifacts,
         "all_outputs_exact": all(

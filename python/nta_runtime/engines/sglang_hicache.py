@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
+import os
 import threading
 import time
 import weakref
@@ -126,10 +127,25 @@ class SglangHiCacheBridge:
         if self._prefetch_callback is not None:
             try:
                 self._prefetch_callback(pending)
-            except Exception:
+            except Exception as error:
+                # A prefetch failure must not silently revert a claimed load to
+                # stock transfer: that bypasses request-level semantics and is
+                # invisible to the zero-fallback measurement gates. Restoring
+                # SGLang's own transfer is an explicit, counted opt-in for
+                # resilience deployments only.
+                if os.environ.get("NTA_SGLANG_ALLOW_PREFETCH_FALLBACK", "0") != "1":
+                    raise RuntimeError(
+                        "NTA early HiCache prefetch failed for a claimed load; "
+                        "set NTA_SGLANG_ALLOW_PREFETCH_FALLBACK=1 to restore "
+                        "SGLang transfer instead of failing"
+                    ) from error
                 logging.getLogger(__name__).exception(
                     "NTA early HiCache prefetch failed; restoring SGLang transfer"
                 )
+                with self._lock:
+                    self._admission_stats["prefetch_fallback_loads"] = (
+                        self._admission_stats.get("prefetch_fallback_loads", 0) + 1
+                    )
                 self.fallback(pending)
                 return producer_id
         with self._lock:

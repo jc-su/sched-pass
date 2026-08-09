@@ -36,6 +36,127 @@ shape). CPU-DRAM performance claims therefore use the copy engine. NVMe must be
 measured separately because its queue, latency, and P2P path are physically
 different.
 
+## Research Questions And Execution Plan (2026-08-09)
+
+This section is the authoritative campaign plan. The E0-E5 matrix below remains
+the detailed sweep inventory; each sweep now serves exactly one of four
+research questions, and no experiment runs unless its RQ, gate, and baseline
+set are declared here first. The paper carries three insights, each answered by
+one or two RQs:
+
+1. Model-generated demand is a first-class runtime data dependency that
+   existing systems serve with workload-specific point mechanisms
+   (motivation; RQ1, RQ2).
+2. Execution should advance only at exact, independently committable
+   contributor boundaries; byte arrival and CTA completion are not progress.
+   The dense negative series is this insight's boundary evidence (RQ2, RQ3).
+3. The contributor commit and suspension contract is compiler-verifiable, and
+   must be: the post-dominance control-dependence defect was invisible to
+   review and caught only by mechanical checking (RQ3).
+
+### RQ1 — Value: does exposing device-discovered demand improve end-to-end serving?
+
+- **1D (headline): model-generated selection.** A training-free Quest-style
+  page selector (per-page key summaries scored against the live query,
+  device-resident top-k) retrofitted onto a dense GQA checkpoint, tiered KV
+  under HBM pressure, served through the installed SGLang plugin. Metrics:
+  capacity curves (sustainable request rate at 99% SLO attainment), TTFT/TPOT
+  p50/p99, goodput, bytes moved, and task quality deltas against dense
+  attention on LongBench-class suites. Baselines: full promotion, overfetch
+  candidates, host-side selection with the identity round trip, and
+  prediction-based prefetch. Gate: `>=1.5x` goodput at quality parity against
+  the strongest baseline.
+- **1A: hierarchical long-context capacity.** LooGLE/NarrativeQA/ReviewMT
+  arrival sweeps from unloaded to overload; throughput-TTFT curves, not single
+  points. Gate: no worse than the strongest layer-wise baseline.
+- **1B: heterogeneous agent trace.** Mooncake-style repeated-prefix arrivals,
+  mixed resident/DRAM/NVMe placement, cancellation and admission churn,
+  thousands of requests. Gate: goodput and wasted-byte improvement under churn.
+- **1C: no-regression controls.** All-resident ShareGPT, short-context decode,
+  all-resident long-context decode. Gate: direct form within `3%` of stock
+  **and resident P99 inter-token latency within `1.05x`**, ten trials.
+
+### RQ2 — Mechanism: when does contributor-committed execution beat waiting, layer pipelining, bulk, or rebatch?
+
+- **2A (runs before any further integration): opportunity characterization.**
+  Instrument the default proactive path on real traces with CUDA events:
+  per-layer promotion time, attention compute time, blocked-at-barrier time,
+  and reusable-partial fraction. Output decides where 2B/1A run and whether
+  streaming integration proceeds at all. Implemented:
+  `benchmarks/serving/OpportunityCharacterize.py` drives the real
+  `SglangHiCacheLoad.py` workload with `NTA_SGLANG_PROFILE_BARRIER`,
+  `NTA_SGLANG_PROFILE_GPU`, and `NTA_SGLANG_PROFILE_TRANSFER` enabled, merges
+  the per-process device-event counters, fails closed if profiling did not
+  engage, and reports per-point blocked fraction, load/compute ratio, and
+  per-layer stall against a declared opportunity threshold.
+- **2B: operator crossover.** Context 8K-128K, resident fraction 0-100%,
+  arrival skew, group size, staging slots. Arms: wait-all, **layer-wise
+  pipelined promotion** (the strongest dense baseline; stock HiCache
+  approximates it and it must be present in every dense table), coalesced
+  bulk, forced fine incremental, skip/rebatch, NTA adaptive, hindsight best.
+- **2C: HBM-budget sweep with predicted crossover.** The bytes/bandwidth cost
+  model predicts the selectivity and budget crossovers first; the sweep then
+  measures them. Gate: prediction within `20%` of measurement, and bounded
+  staging sustains contexts atomic promotion cannot fit.
+
+Dense expectations are pre-declared: against layer-wise pipelining the
+realistic dense outcome is TTFT parity plus bounded staging and tail
+isolation, not a headline speedup. The dense series exists to bound regret and
+to evidence insight 2, and five prior dense negatives already delimit it.
+
+### RQ3 — Necessity: is the compiler/runtime/engine co-design required?
+
+One matched trace, one component removed at a time: no incremental form
+(bulk-only), no request identity (byte/CTA scheduling), no measured progress
+(predicted transfer time only), no reusable partials (discard available work),
+no engine feedback (mechanism without admission), manual hand-split operator
+(does LLVM generation add value), direct-only. Compiler coverage: paged
+decode, paged prefill, and device-routed MoE through the identical contract,
+each with stock-output parity, cancellation and generation reuse, graph
+replay, and convergence rejection. **Verifier mutation testing:** mutate
+kernels across each legality condition, require every mutant rejected, and
+demonstrate one representative mutant miscomputing with verification disabled.
+
+### RQ4 — Robustness: does one online policy stay efficient and safe across regimes?
+
+Nonstationary regime-switching trace against every fixed policy and the
+hindsight oracle (median regret `<=1.05`, p95 `<=1.10`, reported as *measured
+oracle regret*, never as a bound); the transport-geometry matrix (copy engine
+versus SM gather versus NVMe across object size and fragmentation — the
+`8.17x` fragmented-gather win and the `0.479x` bulk-mover loss are the two
+already-measured cells); cancellation storms; NVMe fault injection; 24-hour
+soak; request-slot reuse; and the mover-priority interference ablation
+(`NTA_SGLANG_MOVER_STREAM_PRIORITY`).
+
+### Models
+
+| Model | Role | Why |
+| --- | --- | --- |
+| Qwen2.5-14B-Instruct | 1A/1B/1C primary; 1D with Quest retrofit | Strata-comparable dense checkpoint that fits the GPU |
+| Llama-3.1-8B-Instruct | reproduction + fast sweeps; 1D second model | community-standard reproduction target |
+| Qwen3-30B-A3B | RQ3 MoE family; optional 1B MoE serving point | 128-expert top-8 MoE that fits 96 GiB; experts tier to host DRAM |
+
+Natively sparse production models (DeepSeek V3.2-class) exceed one-GPU memory;
+training-free selection retrofitted onto dense checkpoints is both the
+deployable form of this workload and the honest local instantiation.
+Model-generated scores are mandatory for 1D: the controlled-random-score sweep
+remains mechanism evidence only.
+
+### Execution order and go/no-go
+
+1. Mover-priority interference rerun (1C metric only) — already unblocked.
+2. 2A opportunity characterization on real traces.
+3. Streaming-operator integration into the SGLang paged path, at the points 2A
+   identifies; then 2B.
+4. Quest-retrofit selector and the 1D workload; then 1A/1B.
+5. RQ3 ablations and RQ4 robustness last.
+
+Go/no-go: if the integrated streaming operator cannot beat the layer-wise arm
+at real opportunity points by `>=1.10x` with the direct path within `3%`, and
+1D cannot reach its gate, the OSDI serving thesis is not claimable; the work
+reframes as a compiler/runtime mechanism paper. A failed gate is recorded, not
+retried until it passes.
+
 ## Target Serving Scenario
 
 The primary scenario is heterogeneous batch-barrier amplification in

@@ -626,6 +626,27 @@ stock-derived SLO goodput was `0.4584x`. This rules out missing demand-graph
 capture as the complete explanation for the dense loss. It does not establish
 a repeated confidence interval or an end-to-end device-selected-demand win.
 
+The clean `bec105f` three-trial diagnostic
+(`results/serving/sglang-hicache-load-bec105f-qualification.json`) exercised
+both compiler forms with graph replay, physical CTA compaction, exact outputs,
+and zero stock or fallback launches. Geometric means were `0.9791x` output
+throughput, `0.7771x` SLO goodput (one trial crossed the resident-ITL SLO
+threshold, so the two-request goodput metric amplifies a single violation),
+`0.9557x` resident P95 TTFT (better), `1.0394x` external P95 TTFT, and
+`1.2549x` resident P99 inter-token latency. Mechanism counters explain the
+shape: of 5,148 attention launches, 5,138 used the direct form and only 10 were
+ticketed incremental, because 350 of 360 external layers were satisfied by
+proactive lookahead acquisition before attention reached them and only 3 layers
+were mixed. The run therefore measures acquisition, planning, and mover
+interference around nearly all-direct attention; it is boundary evidence that
+dense, early-known demand exposes almost no incremental opportunity, not a
+measurement of incremental execution itself. The consistently regressed metric
+is resident P99 inter-token latency, and the acquisition mover streams ran at
+elevated CUDA priority (`-1`) above the decode stream in every dense run
+recorded above; movers now default to the lowest priority
+(`NTA_SGLANG_MOVER_STREAM_PRIORITY=0`), and the interference series must be
+re-measured before further dense conclusions are drawn.
+
 Resident TTFT is not used as the interference headline: the workload submits
 external requests only after a resident emits its first token, so that TTFT is
 causally prior to external acquisition. The benchmark now reports per-request

@@ -346,6 +346,16 @@ def _nonnegative_environment(name: str, default: int) -> int:
     return value
 
 
+def _mover_stream_priority() -> int:
+    value = int(os.environ.get("NTA_SGLANG_MOVER_STREAM_PRIORITY", "0"))
+    if value > 0:
+        raise ValueError(
+            "NTA_SGLANG_MOVER_STREAM_PRIORITY must be zero or negative because "
+            "CUDA stream priorities are non-positive"
+        )
+    return value
+
+
 def _gain_environment(name: str, default: float) -> float:
     value = float(os.environ.get(name, default))
     if value < 1.0:
@@ -500,8 +510,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._runtime.set_tenant_budget(0, (1 << 64) - 1)
         self._request_slots = RequestSlotTracker(self._runtime, request_capacity)
         self._hicache = SglangHiCacheBridge(self.token_to_kv_pool)
-        self._prefetch_stream = torch.cuda.Stream(priority=0)
-        self._progress_stream = torch.cuda.Stream(priority=-1)
+        # CUDA priorities are inverted: numerically lower values preempt higher
+        # ones, and SGLang's compute stream runs at the default priority 0.
+        # Acquisition movers must never outrank decode, so both streams default
+        # to the lowest priority; the override exists only for the documented
+        # mover-interference ablation (a negative value restores preemption).
+        mover_priority = _mover_stream_priority()
+        self._prefetch_stream = torch.cuda.Stream(priority=mover_priority)
+        self._progress_stream = torch.cuda.Stream(priority=mover_priority)
         self._host_cost_model = HostCostModel(
             bandwidth_bytes_per_second=_positive_environment(
                 "NTA_SGLANG_HOST_BANDWIDTH_BPS", 30_000_000_000
@@ -681,12 +697,21 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._profile_cpu = os.environ.get("NTA_SGLANG_PROFILE_CPU") == "1"
         self._profile_transfer = os.environ.get("NTA_SGLANG_PROFILE_TRANSFER") == "1"
         self._profile_gpu = os.environ.get("NTA_SGLANG_PROFILE_GPU") == "1"
+        # Barrier profiling measures how long the compute stream stalls at each
+        # proactive layer-readiness wait. It is the opportunity signal the
+        # RQ2/2A characterization consumes: stall > 0 means arrival, not
+        # compute, bounded that layer.
+        self._profile_barrier = os.environ.get("NTA_SGLANG_PROFILE_BARRIER") == "1"
         self._transfer_profiles: list[
             tuple[torch.cuda.Event, torch.cuda.Event, int, str]
         ] = []
         self._operator_profiles: list[
             tuple[torch.cuda.Event, torch.cuda.Event, str]
         ] = []
+        self._barrier_profiles: list[
+            tuple[torch.cuda.Event, torch.cuda.Event, int]
+        ] = []
+        self._barrier_stall_by_layer: dict[int, float] = {}
         trace_file = os.environ.get("NTA_OPPORTUNITY_TRACE_FILE")
         self._opportunity_trace = pathlib.Path(trace_file) if trace_file else None
         self._opportunity_revision = os.environ.get("NTA_REVISION", "")
@@ -1175,6 +1200,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
     def _prepare_host_pipeline(
         self, pending: PendingHostLoad, *, first_local_layer: int = 0
     ) -> None:
+        if self._profile_barrier:
+            # Drain outstanding barrier measurements before this batch
+            # re-records the shared per-layer ready events.
+            self._collect_barrier_profiles()
         pipeline_started = time.perf_counter_ns() if self._profile_cpu else 0
         controller = pending.controller
         layer_count = int(controller.layer_num)
@@ -1202,7 +1231,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         if not self._prefetch_ready_events:
             self._prefetch_ready_events = tuple(
-                tuple(torch.cuda.Event() for _ in range(layer_count))
+                tuple(
+                    torch.cuda.Event(enable_timing=self._profile_barrier)
+                    for _ in range(layer_count)
+                )
                 for _ in controller.layer_done_counter.events
             )
         if pending.consumer_index >= len(self._prefetch_ready_events):
@@ -1544,6 +1576,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         prefetched = pending.prefetched_layers.get(local_layer)
         if prefetched is None:
             raise RuntimeError(f"bulk host policy omitted layer {layer.layer_id}")
+        if self._profile_barrier:
+            arrive = torch.cuda.Event(enable_timing=True)
+            arrive.record(stream)
+            self._barrier_profiles.append(
+                (arrive, prefetched.ready_event, int(layer.layer_id))
+            )
         stream.wait_event(prefetched.ready_event)
         self._upload_plan(wrapper, int(layer.layer_id), kv_cache)
         self._run_preacquired_attention(
@@ -2566,6 +2604,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             prefetched = batch.prefetched_layers.get(local_layer)
         if pending is not None and prefetched is not None:
             attention_form = "preloaded"
+            if self._profile_barrier:
+                arrive = torch.cuda.Event(enable_timing=True)
+                arrive.record(stream)
+                self._barrier_profiles.append(
+                    (arrive, prefetched.ready_event, int(layer.layer_id))
+                )
             stream.wait_event(prefetched.ready_event)
             self._run_preacquired_attention(
                 wrapper, q, kv_cache, output, layer, run_options
@@ -3359,9 +3403,45 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
         self._operator_profiles = pending_operators
 
+    def _collect_barrier_profiles(self) -> None:
+        if not self._barrier_profiles:
+            return
+        # Barrier pairs reuse the per-layer ready events across batches.
+        # Profiling mode synchronizes before draining so every pair is final
+        # and no event is re-recorded while a measurement is outstanding; the
+        # sync cost is confined to NTA_SGLANG_PROFILE_BARRIER=1 runs, whose
+        # host-side throughput is never a claim.
+        torch.cuda.synchronize()
+        for arrive, ready, layer_id in self._barrier_profiles:
+            stall_ms = max(0.0, arrive.elapsed_time(ready))
+            self._stats["profiled_barrier_waits"] = (
+                self._stats.get("profiled_barrier_waits", 0) + 1
+            )
+            self._stats["profiled_barrier_stall_gpu_ms"] = (
+                self._stats.get("profiled_barrier_stall_gpu_ms", 0.0) + stall_ms
+            )
+            if stall_ms > 0.01:
+                self._stats["profiled_barrier_stalled_waits"] = (
+                    self._stats.get("profiled_barrier_stalled_waits", 0) + 1
+                )
+            self._stats["profiled_barrier_max_stall_gpu_ms"] = max(
+                float(self._stats.get("profiled_barrier_max_stall_gpu_ms", 0.0)),
+                stall_ms,
+            )
+            self._barrier_stall_by_layer[layer_id] = (
+                self._barrier_stall_by_layer.get(layer_id, 0.0) + stall_ms
+            )
+        self._barrier_profiles = []
+
     def _stats_report(self) -> dict[str, Any]:
         self._collect_transfer_profiles()
+        self._collect_barrier_profiles()
         report = dict(self._stats)
+        if self._barrier_stall_by_layer:
+            report["profiled_barrier_stall_by_layer_ms"] = {
+                str(layer): round(stall, 4)
+                for layer, stall in sorted(self._barrier_stall_by_layer.items())
+            }
         contracts = sorted(
             self._operator_contracts.values(),
             key=lambda contract: (int(contract.family), int(contract.form)),

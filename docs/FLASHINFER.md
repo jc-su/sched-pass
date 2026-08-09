@@ -203,6 +203,15 @@ Ragged prefill is compiler transformed for the canonical bounded-HBM operator
 experiment. It is not used as SGLang's external paged-KV hook; SGLang demand
 uses the version-checked FA2 paged-prefill and decode insertion points.
 
+The overlay also patches the MLA decode kernel anchors
+(`BatchDecodeWithPagedKVCacheKernelMLA` entry and exit) so the 0.6.12 source
+tree stays hash-consistent under one manifest. That MLA path is
+**patched but unvalidated**: no execution gate covers it, no performance or
+correctness claim includes it, and the SGLang plugin rejects MLA models at
+construction so the unvalidated hook cannot be reached from the supported
+profile. Validating or removing the MLA anchors is an open gate; until then any
+non-SGLang consumer must treat MLA as unsupported.
+
 For SGLang multi-round CPU-DRAM demand, the structural work/dependency topology
 is reused across layers. After layer `L` attention finishes, a GPU kernel
 rebinds the indexed directory to layer `L+1`, and a finite copy stages the first

@@ -398,6 +398,23 @@ a diagnostic counter-result, not paper-level statistical evidence. The positive
 path requires device-selected demand
 that avoids transfer the early-known bulk baseline cannot avoid.
 
+The final clean `bec105f` three-trial diagnostic sharpened that boundary:
+`0.9791x` throughput, `0.7771x` goodput, `0.9557x` resident P95 TTFT (better),
+`1.0394x` external P95 TTFT, and `1.2549x` resident P99 inter-token latency,
+with 5,138 of 5,148 launches in the direct form and only 10 ticketed
+incremental launches because lookahead acquisition satisfied 350 of 360
+external layers before attention. Dense early-known demand exposes almost no
+incremental opportunity; the persistent causal regression is resident-tail
+interference from acquisition movers, which ran at elevated stream priority in
+every recorded dense run. Movers now default to the lowest CUDA priority
+(`NTA_SGLANG_MOVER_STREAM_PRIORITY`), and the dense interference series must be
+re-measured under that default before any further dense conclusion. Detailed
+counters are in `docs/VALIDATION.md` and
+`results/serving/sglang-hicache-load-bec105f-qualification.json`. The
+qualification runner now defaults to ten paired trials and stamps
+`evidence_grade` (`diagnostic` below ten) into every report so a three-trial
+run can no longer be mistaken for qualified evidence.
+
 The resident graph row has only three measured samples and performs no external
 acquisition. It proves that contract-validated transformed graph replay can meet
 the resident overhead gate; it is not evidence for incremental execution. The

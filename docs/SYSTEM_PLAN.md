@@ -782,6 +782,17 @@ Stop or narrow the project if:
 
 ## 12. Immediate Order
 
+The evaluation campaign, its four research questions, gates, model matrix, and
+go/no-go rule are fixed in `docs/ONE_GPU_EVALUATION.md` ("Research Questions
+And Execution Plan"). Engineering below feeds that plan in this order: the
+mover-priority interference rerun (unblocked; movers now default to the lowest
+CUDA stream priority), 2A opportunity characterization on real traces, then
+streaming-operator integration at the points 2A identifies, then the
+Quest-retrofit selected-demand workload. Dense early-known demand is a
+measured boundary (five diagnostics, latest at `bec105f`), not a target: it is
+rerun once under the corrected mover priority for the interference series and
+otherwise only as the RQ2 control arm.
+
 The canonical FlashInfer operator experiment now demonstrates exposed overlap
 and a bounded-HBM crossover. The next order is therefore fixed:
 
