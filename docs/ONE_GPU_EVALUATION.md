@@ -125,8 +125,19 @@ oracle regret*, never as a bound); the transport-geometry matrix (copy engine
 versus SM gather versus NVMe across object size and fragmentation — the
 `8.17x` fragmented-gather win and the `0.479x` bulk-mover loss are the two
 already-measured cells); cancellation storms; NVMe fault injection; 24-hour
-soak; request-slot reuse; and the mover-priority interference ablation
-(`NTA_SGLANG_MOVER_STREAM_PRIORITY`).
+soak; request-slot reuse; and the resident-tail interference decomposition.
+
+Interference decomposition, pre-declared hypotheses (2026-08-09): the
+qualified ten-trial series measured resident P99 ITL `1.2407x` under
+lowest-priority movers, so priority is not dominant. H-A: elevating mover
+priority (`NTA_SGLANG_MOVER_STREAM_PRIORITY=-1`, n=10) worsens the tail
+measurably; if it does not, stream scheduling is irrelevant to the regression
+entirely. H-B: the tail is driven by wave bursts colliding with decode steps —
+`NTA_SGLANG_FRONTIER_LAYERS_PER_WAVE=1` (n=10) shrinks the tail at some
+external-TTFT cost; if it does not, the cause is per-transfer contention
+(PCIe/L2) or host-side planning, pointing to a copy-engine wave path or
+CPU-side batching as the fix. Each run records its hypothesis outcome
+regardless of direction.
 
 ### Models
 

@@ -43,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--trials", type=int, default=10)
+    parser.add_argument(
+        "--selector",
+        choices=("random", "quest"),
+        default="random",
+        help=(
+            "random preserves the controlled-score sweep; quest derives the "
+            "scores from the actual candidate keys and query via the "
+            "upper-bound envelope formula"
+        ),
+    )
     parser.add_argument("--output", type=pathlib.Path)
     arguments = parser.parse_args()
     if (
@@ -209,9 +219,22 @@ def main() -> int:
         (selected_count, *page_shape), dtype=torch.float16, device="cuda"
     )
     query = torch.randn((batch_size, 4, 128), dtype=torch.float16, device="cuda")
-    scores = torch.randn(
-        (batch_size, candidate_pages), dtype=torch.float16, device="cuda"
-    )
+    if arguments.selector == "quest":
+        from nta_runtime.quest_selector import quest_candidate_scores
+
+        candidate_keys = (
+            host_pages[:, 0]
+            .view(batch_size, candidate_pages, *page_shape[1:])
+            .to("cuda")
+        )
+        scores = quest_candidate_scores(
+            query, candidate_keys, group_size=query.shape[1] // page_shape[2]
+        ).to(torch.float16)
+        del candidate_keys
+    else:
+        scores = torch.randn(
+            (batch_size, candidate_pages), dtype=torch.float16, device="cuda"
+        )
     source_page_table = torch.arange(
         total_candidates, dtype=torch.int32, device="cuda"
     ).view(batch_size, candidate_pages)
@@ -475,6 +498,11 @@ def main() -> int:
         "selected_bytes": selected_bytes,
         "bytes_avoided_fraction": 1.0 - selected_bytes / candidate_bytes,
         "gpu_selected_pages": True,
+        "selector_mode": arguments.selector,
+        "content_derived_scores": arguments.selector == "quest",
+        # Scores are computed once at setup; per-step recomputation is the
+        # serving integration's job and is not claimed by this benchmark.
+        "scores_recomputed_per_step": False,
         "nta_hot_path_host_identity_round_trips": 0,
         "offline_oracle_host_identity_round_trips": 1,
         "offline_oracle_precomputed": True,
