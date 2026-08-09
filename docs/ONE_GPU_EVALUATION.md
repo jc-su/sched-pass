@@ -153,6 +153,24 @@ deployable form of this workload and the honest local instantiation.
 Model-generated scores are mandatory for 1D: the controlled-random-score sweep
 remains mechanism evidence only.
 
+Selection quality now has real-model measurements
+(`benchmarks/serving/QuestRecall.py`; artifacts
+`results/serving/quest-recall-{llama160m,qwen25-3b}.json`). The harness
+reconstructs each layer's decode query from the layer's own projections and
+rotary embeddings and refuses to score unless the reconstruction reproduces
+the model's actual attention row (max observed error 4.1e-6 across 108
+layer evaluations). Findings at 2,048 tokens: envelope selection tracks the
+true-attention oracle within 2 points on Llama-160M and within ~5 points on
+Qwen2.5-3B with sink+recent retention (recall@25% pages: quest 0.807 vs
+oracle 0.854) — the selector mechanism is near-oracle, and the binding
+constraint is the diffuseness of short-context attention itself (the oracle
+also captures only 85% at 25%). The 1D workload must therefore run at long
+context (16K+ tokens), where the candidate pool makes equal-mass selectivity
+a small fraction; the harness's verified logit-reconstruction path supports
+that without materializing attention, and per-KV-head selection remains a
+known refinement. This is measured selector evidence, not a quality-parity
+claim: 1D's gate still requires end-to-end task-quality evaluation.
+
 Qwen3-30B-A3B was smoke-verified on this host on 2026-08-09 through stock
 SGLang 0.5.14 with full decode CUDA graphs (4 requests, 255.9 output
 tokens/s, `mem_fraction_static=0.85`, `nta_integrated=false`). Enabling it

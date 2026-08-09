@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
         "--top-k-pages", type=lambda v: tuple(int(x) for x in v.split(",")),
         default=(4, 8, 16, 32),
     )
+    # Deployed sparse-attention selectors always retain attention sinks and
+    # the recent window; the envelope ranks only the remaining budget. Zeros
+    # reproduce the raw-envelope ablation.
+    parser.add_argument("--sink-pages", type=int, default=1)
+    parser.add_argument("--recent-pages", type=int, default=2)
     parser.add_argument("--prompts", type=int, default=3)
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
@@ -191,7 +196,15 @@ def evaluate_prompt(
         mass = page_mass(true_row, args.page_tokens)
         total = mass.sum(dim=-1)
         aggregate_mass = mass.sum(dim=0)
-        quest_rank = quest.argsort(descending=True)
+        reserved = sorted(
+            set(range(min(args.sink_pages, pages)))
+            | set(range(max(0, pages - args.recent_pages), pages))
+        )
+        envelope_order = [
+            int(page)
+            for page in quest.argsort(descending=True)
+            if int(page) not in set(reserved)
+        ]
         oracle_rank = aggregate_mass.argsort(descending=True)
         row: dict[str, Any] = {
             "layer": layer_index,
@@ -199,8 +212,11 @@ def evaluate_prompt(
             "reconstruction_max_abs_error": error,
         }
         for k in args.top_k_pages:
-            chosen = quest_rank[: min(k, pages)]
-            oracle = oracle_rank[: min(k, pages)]
+            budget = min(k, pages)
+            chosen = torch.tensor(
+                (reserved + envelope_order)[:budget], dtype=torch.long
+            )
+            oracle = oracle_rank[:budget]
             row[f"quest_recall_at_{k}"] = float(
                 (mass[:, chosen].sum() / total.sum()).item()
             )
