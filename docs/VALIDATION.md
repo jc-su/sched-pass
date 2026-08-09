@@ -11,7 +11,9 @@ Tables and command output retain ABI state `Ready` and legacy CLI policy
 runnable work, and device-generated demand; results are not renamed after
 collection.
 
-The source ABI is v25 and the public C API is v22. ABI v25 makes rejected
+The source ABI is v25 and the public C API is v23 (v23 adds the per-step
+indexed row-count bound the selected-demand loop uses to acquire only each
+step's misses). ABI v25 makes rejected
 same-generation epoch attribution observable, uses checked request-progress
 subtraction, and keeps stale generations isolated from reused slots. ABI v24
 added exact pending and expected compiler-attributed compute to the contract;

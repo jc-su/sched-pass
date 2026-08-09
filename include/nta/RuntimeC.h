@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 22U
+#define NTA_RUNTIME_C_API_VERSION 23U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -402,6 +402,12 @@ nta_status nta_jit_phase_progress_validated_indexed_host_range_parallel(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t object_count,
     uint32_t copy_blocks_per_group, uint64_t cuda_stream);
+/* C API v23: bound the next validated indexed copies to the in-place
+ * rewritten prefix of each object's registered index arrays. */
+nta_status nta_jit_phase_set_indexed_row_counts(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count, uint32_t row_count,
+    uint64_t cuda_stream);
 nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        nta_runtime *runtime,
                                        uint32_t issue_budget,

@@ -1173,6 +1173,19 @@ nta_status nta_jit_phase_progress_validated_indexed_host_range_parallel(
   });
 }
 
+nta_status nta_jit_phase_set_indexed_row_counts(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint32_t rowCount, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->setIndexedRowCounts(stream(cudaStream),
+                                        runtime->value->deviceView(),
+                                        firstObject, objectCount, rowCount);
+  });
+}
+
 nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        nta_runtime *runtime,
                                        std::uint32_t issueBudget,

@@ -363,6 +363,57 @@ nta_jit_progress_indexed_host_range(void *runtime, std::uint32_t firstObject,
   return nta::jit::launchStatus();
 }
 
+// Per-step selection needs a variable acquisition count: the selector
+// rewrites the registered index arrays in place with this step's misses and
+// then bounds the copy to that count. ObjectEntry::flags carries the
+// registered capacity; element geometry is preserved by scaling bytes with
+// the count. State returns to New so a shrunken set can never appear Ready
+// from a previous step, and any violation fails the object closed.
+extern "C" __global__ void
+nta_set_indexed_row_counts(nta::abi::RuntimeView *runtime,
+                           std::uint32_t firstObject,
+                           std::uint32_t objectCount, std::uint32_t rowCount) {
+  using namespace nta;
+  const std::uint32_t relative = blockIdx.x * blockDim.x + threadIdx.x;
+  if (runtime == nullptr || relative >= objectCount) {
+    return;
+  }
+  const std::uint64_t slot64 =
+      static_cast<std::uint64_t>(firstObject) + relative;
+  if (slot64 >= runtime->objectCapacity) {
+    return;
+  }
+  abi::ObjectEntry &object = runtime->objects[slot64];
+  const abi::ReplicaEntry *replica = device::replica(runtime, object, 0);
+  if (replica == nullptr || (replica->flags & abi::ReplicaIndexed) == 0 ||
+      rowCount == 0 || object.flags == 0 || rowCount > object.flags ||
+      replica->dmaPageCount == 0) {
+    atomicExch(&object.state,
+               static_cast<std::uint32_t>(abi::ObjectState::Failed));
+    return;
+  }
+  const std::uint64_t elementBytes = object.bytes / replica->dmaPageCount;
+  const_cast<abi::ReplicaEntry *>(replica)->dmaPageCount = rowCount;
+  object.bytes = elementBytes * rowCount;
+  atomicExch(&object.state,
+             static_cast<std::uint32_t>(abi::ObjectState::New));
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_set_indexed_row_counts(void *runtime, std::uint32_t firstObject,
+                               std::uint32_t objectCount,
+                               std::uint32_t rowCount, cudaStream_t stream) {
+  constexpr std::uint32_t threads = 256;
+  if (runtime == nullptr || objectCount == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_set_indexed_row_counts<<<(objectCount + threads - 1U) / threads, threads,
+                               0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), firstObject, objectCount,
+      rowCount);
+  return nta::jit::launchStatus();
+}
+
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_progress_validated_indexed_host_range(void *runtime,
                                               std::uint32_t firstObject,

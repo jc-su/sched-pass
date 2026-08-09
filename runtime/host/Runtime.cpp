@@ -1094,7 +1094,9 @@ void HostRuntime::registerIndexedHostObjects(
         replicaStart,
         1,
         object.preacquired ? 0U : abi::InvalidIndex,
-        0,
+        // For indexed objects, flags carries the registered index-array
+        // capacity so a device-side row-count update can validate against it.
+        object.indexCount,
         reinterpret_cast<std::uint64_t>(object.stagingIndicesDevice),
     });
   }
@@ -1183,7 +1185,9 @@ void HostRuntime::registerIndexedHostObjectsAsync(
         replicaStart,
         1,
         object.preacquired ? 0U : abi::InvalidIndex,
-        0,
+        // flags carries the registered index-array capacity; see the
+        // synchronous registration path.
+        object.indexCount,
         reinterpret_cast<std::uint64_t>(object.stagingIndicesDevice),
     };
   }

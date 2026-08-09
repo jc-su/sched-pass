@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 22
+API_VERSION = 23
 
 
 class RuntimeError(Exception):
@@ -1045,6 +1045,16 @@ _phase_validated_indexed_host_range_parallel = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_phase_set_indexed_row_counts = _function(
+    "nta_jit_phase_set_indexed_row_counts",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
 _phase_nvme = _function(
     "nta_jit_phase_progress_nvme",
     ctypes.c_int,
@@ -1893,6 +1903,26 @@ class JitPhaseProgram(_Owner):
                 runtime._handle,
                 first_object,
                 object_count,
+                _stream_address(stream),
+            )
+        )
+
+    def set_indexed_row_counts(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        row_count: int,
+        stream: Any = None,
+    ) -> None:
+        """Bound the next validated copies to each object's rewritten prefix."""
+        _check(
+            _phase_set_indexed_row_counts(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
+                row_count,
                 _stream_address(stream),
             )
         )

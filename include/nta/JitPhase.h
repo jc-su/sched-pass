@@ -70,6 +70,13 @@ public:
       cudaStream_t stream, abi::RuntimeView *runtime,
       std::uint32_t firstObject, std::uint32_t objectCount,
       std::uint32_t copyBlocksPerGroup) const;
+  // Bound the next validated indexed copy of each listed object to the
+  // in-place-rewritten prefix of its registered index arrays. The per-step
+  // selection loop uses this to acquire only the current step's misses.
+  void setIndexedRowCounts(cudaStream_t stream, abi::RuntimeView *runtime,
+                           std::uint32_t firstObject,
+                           std::uint32_t objectCount,
+                           std::uint32_t rowCount) const;
   void progressNvme(cudaStream_t stream, abi::RuntimeView *runtime,
                     std::uint32_t issueBudget,
                     std::uint32_t completionBudget) const;

@@ -119,6 +119,8 @@ struct JitPhaseProgram::Impl {
           load<ProgressIndexedHostRangeParallel>(
               library,
               "nta_jit_progress_validated_indexed_host_range_parallel");
+      setIndexedRowCounts = load<ProgressIndexedHostRangeParallel>(
+          library, "nta_jit_set_indexed_row_counts");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
       publish = load<Publish>(library, "nta_jit_publish_ready");
       complete = load<Complete>(library, "nta_jit_complete_launched");
@@ -151,6 +153,7 @@ struct JitPhaseProgram::Impl {
   ProgressIndexedHostRange progressValidatedIndexedHostRange = nullptr;
   ProgressIndexedHostRangeParallel progressValidatedIndexedHostRangeParallel =
       nullptr;
+  ProgressIndexedHostRangeParallel setIndexedRowCounts = nullptr;
   ProgressNvme progressNvme = nullptr;
   Publish publish = nullptr;
   Complete complete = nullptr;
@@ -311,6 +314,20 @@ void JitPhaseProgram::progressValidatedIndexedHostRange(
   check(impl_->progressValidatedIndexedHostRange(runtime, firstObject,
                                                  objectCount, stream),
         "nta_jit_progress_validated_indexed_host_range");
+}
+
+void JitPhaseProgram::setIndexedRowCounts(cudaStream_t stream,
+                                          abi::RuntimeView *runtime,
+                                          std::uint32_t firstObject,
+                                          std::uint32_t objectCount,
+                                          std::uint32_t rowCount) const {
+  if (runtime == nullptr || objectCount == 0 || rowCount == 0) {
+    throw std::invalid_argument(
+        "JIT indexed row-count update needs a runtime, objects, and rows");
+  }
+  check(impl_->setIndexedRowCounts(runtime, firstObject, objectCount,
+                                   rowCount, stream),
+        "nta_jit_set_indexed_row_counts");
 }
 
 void JitPhaseProgram::progressValidatedIndexedHostRangeParallel(
