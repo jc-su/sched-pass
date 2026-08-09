@@ -15,9 +15,12 @@ Run inside an activated NTA JIT environment, exactly like the trials runner:
       python3 benchmarks/serving/OpportunityCharacterize.py \
         --model /path/to/model \
         --flashinfer-workspace-base /path/to/workspace \
-        --context-length 131072 --max-total-tokens 140000 \
-        --external-token-points 4096,16384,65536 \
+        --context-length 32768 \
+        --external-token-points 2048,8192,24576 \
         --output results/serving/opportunity-characterization.json
+
+    The KV pool and churn are sized per point so every point both fits and is
+    forced to evict its hot prefix to the host tier before measurement.
 """
 
 from __future__ import annotations
@@ -68,7 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resident-tokens", type=int, default=8192)
     parser.add_argument("--resident-output-tokens", type=int, default=128)
     parser.add_argument("--context-length", type=int, required=True)
-    parser.add_argument("--max-total-tokens", type=int, required=True)
     parser.add_argument("--request-rate", type=float, default=12.0)
     parser.add_argument("--seed", type=int, default=20260809)
     parser.add_argument(
@@ -86,12 +88,21 @@ def parse_args() -> argparse.Namespace:
     if not 0 < args.blocked_threshold < 1:
         parser.error("blocked threshold must be inside (0, 1)")
     largest = max(args.external_token_points)
-    if largest + args.resident_tokens >= args.context_length:
+    if point_max_total_tokens(largest, args.resident_tokens) >= args.context_length:
         parser.error(
-            "context length must exceed the largest external point plus the "
-            "resident tokens"
+            "context length must exceed the largest point's KV pool size"
         )
     return args
+
+
+def point_max_total_tokens(external_tokens: int, resident_tokens: int) -> int:
+    """KV pool sized so the point runs but its prefix must evict to host."""
+    return external_tokens + resident_tokens + 1024
+
+
+def point_churn_tokens(external_tokens: int) -> int:
+    """Churn sized so hot + churn always exceeds the pool, forcing promotion."""
+    return external_tokens + 4096
 
 
 def git_value(*arguments: str) -> str:
@@ -124,8 +135,10 @@ def run_load_point(args: argparse.Namespace, external_tokens: int) -> dict[str, 
         str(args.resident_output_tokens),
         "--context-length",
         str(args.context_length),
+        "--churn-tokens",
+        str(point_churn_tokens(external_tokens)),
         "--max-total-tokens",
-        str(args.max_total_tokens),
+        str(point_max_total_tokens(external_tokens, args.resident_tokens)),
         "--request-rate",
         str(args.request_rate),
         "--seed",

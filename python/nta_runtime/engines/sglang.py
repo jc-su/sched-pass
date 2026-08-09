@@ -1623,8 +1623,18 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 or allocation is None
                 or allocation.plan.work_item_count != schedule.work_count
             ):
+                planned = sorted(
+                    self._wrapper_modules.get(wrapper_id, str(wrapper_id))
+                    for wrapper_id in batch.schedules
+                )
                 raise RuntimeError(
-                    "preacquired external attention has no validated CTA work plan"
+                    "preacquired external attention has no validated CTA work "
+                    f"plan: wrapper={module_name} schedule={schedule is not None} "
+                    f"allocation={allocation is not None} "
+                    f"work_count={getattr(schedule, 'work_count', None)} "
+                    f"plan_items="
+                    f"{getattr(getattr(allocation, 'plan', None), 'work_item_count', None)} "
+                    f"planned_wrappers={planned}"
                 )
         if "request_bound" in module_name:
             request_slots = tuple(binding.request_slot for binding in batch.bindings)
@@ -2611,6 +2621,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     (arrive, prefetched.ready_event, int(layer.layer_id))
                 )
             stream.wait_event(prefetched.ready_event)
+            # The preloaded form must not depend on a mixed/demand layer having
+            # populated the structural plan first: batch composition is
+            # timing-dependent, and a pure-preloaded batch is legal. The call
+            # is a signature-checked cache hit after the first layer.
+            self._upload_plan(wrapper, int(layer.layer_id), kv_cache)
             self._run_preacquired_attention(
                 wrapper, q, kv_cache, output, layer, run_options
             )
