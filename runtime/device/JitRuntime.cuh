@@ -395,8 +395,12 @@ nta_set_indexed_row_counts(nta::abi::RuntimeView *runtime,
   const std::uint64_t elementBytes = object.bytes / replica->dmaPageCount;
   const_cast<abi::ReplicaEntry *>(replica)->dmaPageCount = rowCount;
   object.bytes = elementBytes * rowCount;
+  // Issued is the state the bounded indexed copy consumes. The tiered loop
+  // owns these slots outside the intent/epoch protocol: finalize no-ops
+  // without a claimed intent, and correctness is carried by stream order
+  // plus the caller's verification, not by Ready publication.
   atomicExch(&object.state,
-             static_cast<std::uint32_t>(abi::ObjectState::New));
+             static_cast<std::uint32_t>(abi::ObjectState::Issued));
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t

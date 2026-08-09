@@ -346,6 +346,17 @@ class SglangHiCacheBridge:
             with self._lock:
                 self._pending.pop(pending.consumer_index, None)
 
+    def retire(self, pending: PendingHostLoad) -> None:
+        """Drop a claim whose completion happened outside the layer flow.
+
+        The tiered selected path completes producer events at claim time and
+        serves layers itself; the pending entry must still be released when
+        the claim ends so producer-slot reuse stays fail-closed for genuinely
+        live entries.
+        """
+        with self._lock:
+            self._pending.pop(pending.consumer_index, None)
+
     def handoff_prefetch(
         self, pending: PendingHostLoad, stream: torch.cuda.Stream
     ) -> None:

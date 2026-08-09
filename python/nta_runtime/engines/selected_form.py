@@ -55,6 +55,164 @@ class SelectedShadow:
             )
         return self._wrappers
 
+    def _prefill_wrappers(self) -> tuple[Any, Any]:
+        if getattr(self, "_prefill_pair", None) is None:
+            import flashinfer
+
+            self._prefill_pair = tuple(
+                flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    torch.empty(
+                        64 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+                    ),
+                    "NHD",
+                    backend="fa2",
+                )
+                for _ in range(2)
+            )
+        return self._prefill_pair
+
+    def evaluate_tiered(
+        self,
+        engine: Any,
+        claim: Any,
+        wrapper: Any,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        layer: Any,
+        stats: dict[str, Any],
+        serve_output: torch.Tensor,
+        prefill: bool,
+    ) -> bool:
+        """Serve one layer of a tiered batch: stage the chosen prefix rows
+        through the bounded indexed path, then run attention over chosen
+        prefix plus resident tail. Peer requests keep full tables."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("tiered serving inside graph capture is unsupported")
+        key_cache, value_cache = kv_cache
+        local_layer = int(layer.layer_id) - claim.start_layer
+        if not 0 <= local_layer < claim.layer_count:
+            raise RuntimeError("tiered layer is outside the claimed model")
+        group_size = q.shape[1] // key_cache.shape[1]
+        stream = torch.cuda.current_stream()
+
+        if prefill:
+            planned = int(getattr(wrapper, "_batch_size", 1) or 1)
+            if planned != 1:
+                raise RuntimeError(
+                    "tiered extend currently requires a single-request "
+                    f"forward; the wrapper planned {planned}"
+                )
+            batch_size = 1
+        else:
+            batch_size = q.shape[0]
+        indptr = wrapper._paged_kv_indptr_buf[: batch_size + 1]
+        total = int(indptr[-1])
+        indices = wrapper._paged_kv_indices_buf[:total]
+        indptr_cpu = indptr.to("cpu", torch.int64)
+
+        kept_per_request = []
+        staged_any = False
+        for request in range(batch_size):
+            begin = int(indptr_cpu[request])
+            end = int(indptr_cpu[request + 1])
+            tokens = indices[begin:end]
+            queries = q if prefill else q[request : request + 1]
+            tokens_long = tokens.to(torch.long)
+            prefix_mask = claim.slot_is_prefix[tokens_long]
+            prefix_count = int(prefix_mask.sum())
+            if prefix_count == 0:
+                kept_per_request.append(tokens)
+                continue
+            if prefix_count != claim.token_count:
+                raise RuntimeError(
+                    f"tiered request exposes {prefix_count} of "
+                    f"{claim.token_count} claimed prefix slots; partial "
+                    "prefix reuse is outside the current stage"
+                )
+            staged_any = True
+            chosen = claim.choose_pages(local_layer, queries, group_size)
+            claim.stage_layer(engine, local_layer, chosen, stream)
+            chosen_mask = torch.zeros(
+                claim.pages, dtype=torch.bool, device=tokens.device
+            )
+            chosen_mask[
+                torch.tensor(chosen, dtype=torch.int64, device=tokens.device)
+            ] = True
+            positions = claim.slot_to_position[tokens_long]
+            page_of_token = positions // claim.page_tokens
+            keep_mask = ~prefix_mask | chosen_mask[page_of_token]
+            kept_per_request.append(tokens[keep_mask])
+        if not staged_any:
+            raise RuntimeError(
+                "tiered forward matched the claim but no request carried its "
+                "prefix slots; refusing to serve unstaged rows"
+            )
+
+        compact_indices = torch.cat(kept_per_request).to(torch.int32)
+        counts = [0] + [int(k.numel()) for k in kept_per_request]
+        compact_indptr = torch.tensor(
+            counts, dtype=torch.int32, device=indices.device
+        ).cumsum(0, dtype=torch.int32)
+        last_page_len = torch.ones(
+            batch_size, dtype=torch.int32, device=indices.device
+        )
+
+        outputs = []
+        if prefill:
+            suffix = q.shape[0]
+            qo_indptr = torch.tensor(
+                [0, suffix], dtype=torch.int32, device=indices.device
+            )
+            for verifier in self._prefill_wrappers():
+                verifier.plan(
+                    qo_indptr,
+                    compact_indptr,
+                    compact_indices,
+                    last_page_len,
+                    q.shape[1],
+                    key_cache.shape[1],
+                    q.shape[2],
+                    1,
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    q_data_type=q.dtype,
+                    kv_data_type=key_cache.dtype,
+                )
+                outputs.append(verifier.run(q, (key_cache, value_cache)))
+        else:
+            for verifier in self._verification_wrappers():
+                verifier.plan(
+                    compact_indptr,
+                    compact_indices,
+                    last_page_len,
+                    q.shape[1],
+                    key_cache.shape[1],
+                    q.shape[2],
+                    1,
+                    q_data_type=q.dtype,
+                    kv_data_type=key_cache.dtype,
+                    sm_scale=layer.scaling,
+                    disable_split_kv=True,
+                )
+                outputs.append(verifier.run(q, (key_cache, value_cache)))
+        if not torch.equal(outputs[0], outputs[1]):
+            raise RuntimeError(
+                "tiered verification wrappers disagree over an identical "
+                "compact table"
+            )
+        serve_output.copy_(outputs[0])
+        stats["tiered_rows_copied"] = claim.rows_copied
+        stats["tiered_rows_rehit"] = claim.rows_rehit
+        kind = "tiered_prefill" if prefill else "tiered_decode"
+        stats[f"{kind}_layers"] = stats.get(f"{kind}_layers", 0) + 1
+        stats["tiered_tokens_total"] = (
+            stats.get("tiered_tokens_total", 0) + total
+        )
+        stats["tiered_tokens_kept"] = (
+            stats.get("tiered_tokens_kept", 0) + int(compact_indices.numel())
+        )
+        return True
+
     def _select_request(
         self, query: torch.Tensor, tokens: torch.Tensor, key_cache: torch.Tensor,
         group_size: int,

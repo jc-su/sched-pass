@@ -732,6 +732,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 selected_budget,
                 _positive_environment("NTA_SGLANG_SELECTED_PAGE_TOKENS", 16),
             )
+        # Stage 3b: tiered claims skip bulk promotion entirely; the selected
+        # form acquires only chosen pages per layer through the bounded
+        # indexed path into SGLang's preallocated prefix slots.
+        self._tiered_active = None
+        self._tiered_enabled = (
+            os.environ.get("NTA_SGLANG_SELECTED_TIERED") == "1"
+        )
+        if self._tiered_enabled and (
+            self._selected_shadow is None or not self._selected_serve
+        ):
+            raise RuntimeError(
+                "NTA_SGLANG_SELECTED_TIERED requires a selected budget and "
+                "NTA_SGLANG_SELECTED_SERVE=1"
+            )
         trace_file = os.environ.get("NTA_OPPORTUNITY_TRACE_FILE")
         self._opportunity_trace = pathlib.Path(trace_file) if trace_file else None
         self._opportunity_revision = os.environ.get("NTA_REVISION", "")
@@ -761,11 +775,47 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 raise ValueError(
                     "the SGLang HiCache tracer only observes host_staged data"
                 )
-        if self._pipeline_host:
+        if self._tiered_enabled:
+            self._hicache.set_prefetch_callback(self._prepare_tiered_claim)
+        elif self._pipeline_host:
             self._hicache.set_prefetch_callback(self._prepare_host_pipeline)
         elif self._cross_layer_frontier and self._model_layer_count > 1:
             self._hicache.set_prefetch_callback(self._publish_cross_layer_frontier)
         atexit.register(self._write_stats)
+
+    def _prepare_tiered_claim(self, pending: PendingHostLoad) -> None:
+        from nta_runtime.engines.selected_tiered import TieredClaim
+
+        if self._tiered_active is not None:
+            # Supersession: a new claim releases the previous one. The prior
+            # request has completed by the time its evicted prefix is
+            # re-promoted; if it somehow had not, the dispatch gate stops
+            # matching its pending and the run fails closed rather than
+            # serving stale claim state. Slot registrations are overwritten
+            # by the new claim at the same base, and the bridge entry retires
+            # so producer-slot reuse checks keep protecting live claims.
+            self._hicache.retire(self._tiered_active.pending)
+            self._tiered_active = None
+            self._stats["tiered_claims_released"] = (
+                self._stats.get("tiered_claims_released", 0) + 1
+            )
+        first_slot, _ = _pipeline_object_range(
+            self._object_capacity,
+            pending.consumer_index,
+            int(pending.controller.layer_num),
+        )
+        claim = TieredClaim(
+            pending,
+            self,
+            budget_pages=self._selected_shadow.budget_pages,
+            page_tokens=self._selected_shadow.page_tokens,
+            first_object_slot=first_slot,
+            verify=os.environ.get("NTA_SGLANG_SELECTED_TIERED_VERIFY") == "1",
+        )
+        for local_layer in range(claim.layer_count):
+            pending.producer_event.complete(local_layer)
+        self._tiered_active = claim
+        self._stats["tiered_claims"] = self._stats.get("tiered_claims", 0) + 1
 
     def cancel_requests(self, request_id_prefix: str, *, all: bool = False) -> int:
         cancelled = self._request_slots.cancel_matching(request_id_prefix, all=all)
@@ -1050,7 +1100,24 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._stats["batches"] += 1
                 self._stats["resident_transformed_batches"] += 1
                 return
-            self._init_external_metadata(forward_batch, pending, bindings=bindings)
+            if (
+                self._tiered_active is not None
+                and self._tiered_active.pending is pending
+            ):
+                # Tiered batches carry no demand plans or schedules: the
+                # selected form reads the wrapper tables directly and stages
+                # chosen rows itself.
+                self._active_batch = _ActiveBatch(
+                    bindings, {}, pending, {}, {}, {}, ()
+                )
+                self._stats["batches"] += 1
+                self._stats["tiered_batches"] = (
+                    self._stats.get("tiered_batches", 0) + 1
+                )
+            else:
+                self._init_external_metadata(
+                    forward_batch, pending, bindings=bindings
+                )
         except Exception as error:
             self._active_batch = None
             self._stats["hicache_fallback_batches"] += 1
@@ -2604,6 +2671,25 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("NTA attention ran without request metadata")
         pending = batch.pending_host_load
         stream = torch.cuda.current_stream()
+        tiered = self._tiered_active
+        if (
+            tiered is not None
+            and pending is not None
+            and tiered.pending is pending
+        ):
+            is_decode = any(
+                wrapper is candidate
+                for candidate in (
+                    getattr(self.forward_metadata, "decode_wrappers", ())
+                    or ()
+                )
+            )
+            self._selected_shadow.evaluate_tiered(
+                self, tiered, wrapper, q, kv_cache, layer, self._stats,
+                serve_output=output, prefill=not is_decode,
+            )
+            tiered.layers_served += 1
+            return output.view(-1, layer.tp_q_head_num * layer.head_dim)
         if (
             self._selected_shadow is not None
             and pending is None
