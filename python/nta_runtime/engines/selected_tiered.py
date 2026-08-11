@@ -632,37 +632,42 @@ class TieredClaim:
         request_position: int,
         prefix_mask: torch.Tensor | None = None,
     ) -> None:
-        """Bind the claim to the request generation that first consumes it."""
+        """Bind the claim to the lifetime identity of its first consumer.
+
+        Identity is (request id, req_pool_idx): the pool row is stable for
+        a request's whole life, unlike slot-tracker generations, which
+        count reuse of *batch positions* and legitimately change whenever
+        batch composition changes. A matching id on a different pool row
+        is a genuinely new request epoch touching a live claim's rows —
+        the cross-arrival case — and is refused.
+        """
         request_ids = getattr(engine, "_current_request_ids", ())
-        batch = getattr(engine, "_active_batch", None)
-        bindings = () if batch is None else batch.bindings
+        pool_indices = getattr(engine, "_current_req_pool_indices", ())
         if (
             request_position >= len(request_ids)
-            or request_position >= len(bindings)
+            or request_position >= len(pool_indices)
         ):
             raise RuntimeError("tiered forward omitted request identity")
         request_id = request_ids[request_position]
-        generation = bindings[request_position].generation
+        pool_index = pool_indices[request_position]
         if self.request_generation is None:
             if prefix_mask is None:
                 raise RuntimeError("first tiered binding omitted its prefix mask")
             if self.request_id is not None and self.request_id != request_id:
                 raise RuntimeError("external prefix reached the wrong request")
             self.request_id = request_id
-            self.request_generation = generation
+            self.request_generation = pool_index
             self.bound_prefix_mask = prefix_mask.clone()
-        elif self.request_id != request_id or self.request_generation != generation:
+        elif self.request_id != request_id or self.request_generation != pool_index:
             raise RuntimeError(
-                "tiered claim crossed a request generation: claim "
+                "tiered claim served outside its bound request: claim "
                 f"{self.claim_id} bound (request={self.request_id!r}, "
-                f"generation={self.request_generation}) but table position "
-                f"{request_position} now carries (request={request_id!r}, "
-                f"generation={generation}). A matching id with a different "
-                "generation means the radix cache shared this claim's "
-                "virtual rows into a later arrival's table — cross-request "
-                "reuse of a tiered prefix is unsupported; run such "
-                "workloads with the radix cache disabled or distinct "
-                "prompts until claim-time radix exclusion lands"
+                f"pool_row={self.request_generation}) but table position "
+                f"{request_position} carries (request={request_id!r}, "
+                f"pool_row={pool_index}). A matching id on a different pool "
+                "row means a later arrival's request is touching this live "
+                "claim's rows — cross-arrival reuse of a tiered prefix is "
+                "unsupported until claims can rebind"
             )
 
     def choose_free_pages(

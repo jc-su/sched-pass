@@ -184,26 +184,27 @@ passed to the physical allocator or FlashInfer. The adapter fails closed for
 page sizes other than one, SWA/Mamba components, unsupported calling
 conventions, staging exhaustion, or lost retirement ownership.
 
-Cross-arrival radix reuse of virtual rows is a recorded unsupported boundary
-with a named failure (2026-08-11): when identical prompts re-arrive with the
-radix cache enabled, the tree shares a live claim's virtual rows into the
-later arrival's table, and the claim's request-generation identity check
-raises rather than serving stale bindings (observed as the same request id
-with a regressed generation). SGLang cannot disable the radix tree under HiCache (the host tier is
-radix-structured), and re-sending a cached prefix is the load harness's
-core scenario, so this boundary blocks the very workload the harness
-measures. Empirically confirmed 2026-08-11: even at zero load-warmup
-iterations, the setup phase's host-cache probe forms a claim whose
-virtual rows reach the measured arrival's table (claim bound at one
-request generation, observed at another), meaning the documented
-cache-insertion interception does not keep virtual rows out of the
-radix tree as intended. The identity check fails closed every time —
-no stale bytes are ever served — but claim rebind across arrivals, or
-an interception fix proven by this exact gate, is the highest-priority
-lifecycle work item; the gate script is the reproducer.
-The virtual-token namespace is also monotonically consumed (~65K claims of
-16K prefixes exhaust int32); generation-tagged recycling is required before
-long-duration qualification.
+Claim identity is bound to (request id, req_pool_idx) — the pool row is
+stable for a request's lifetime. An earlier build bound claims to
+slot-tracker generations, which count reuse of *batch positions* and
+legitimately change with batch composition; that misuse made the identity
+check fire on any extend-to-mixed-decode transition and was initially
+misdiagnosed as radix sharing (2026-08-11, since corrected — whether
+virtual rows can reach the radix tree at all remains unproven either way,
+and the pool-row check now detects the true cross-arrival case: a same-id
+request on a different pool row touching a live claim's rows, refused
+until claims can rebind).
+
+Resolved 2026-08-11: with identity on pool rows, the full re-serving
+workload passes end to end — repeated same-prefix arrivals form fresh
+claims (eight in the gate run), every claim retires on request finish,
+and all 2,196 fast-path layers byte-verify against their pinned host
+sources. Re-arrival needs no claim rebind: retirement-on-finish means a
+new arrival never meets a live claim; the pool-row refusal remains as
+the guard for the case that should never occur. The virtual-token namespace is also
+monotonically consumed (~65K claims of 16K prefixes exhaust int32);
+generation-tagged recycling is required before long-duration
+qualification.
 
 Each claim also owns a per-layer page-to-slot table inside its bounded lease.
 The device phase validates the selected logical page set, protects pages in the

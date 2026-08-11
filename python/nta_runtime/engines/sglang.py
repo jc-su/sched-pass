@@ -1270,6 +1270,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._current_request_ids = tuple(
                     str(value) for value in forward_batch.rids
                 )
+                # Pool indices are the lifetime-stable request identity;
+                # slot-tracker generations are positional reuse counters and
+                # must never be treated as request epochs.
+                self._current_req_pool_indices = tuple(
+                    int(value)
+                    for value in forward_batch.req_pool_indices.tolist()
+                )
                 seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
                 if seq_lens_cpu is None:
                     raise RuntimeError(
