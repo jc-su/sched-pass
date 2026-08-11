@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--load-warmup-iterations", type=int, default=2)
     parser.add_argument("--arm-timeout-seconds", type=float, default=600.0)
     parser.add_argument(
+        "--cache-root",
+        type=pathlib.Path,
+        default=ROOT / "results" / "serving" / "sglang-hicache-load-cache",
+        help="base directory for per-backend JIT and engine reports",
+    )
+    parser.add_argument(
         "--include-dense-diagnostic",
         action="store_true",
         help=(
@@ -139,7 +145,7 @@ def git_value(*arguments: str) -> str:
 def run_arm(
     args: argparse.Namespace, name: str, backend: str, extra: dict[str, str]
 ) -> dict[str, Any]:
-    workspace = ROOT / "results" / "serving" / "sglang-hicache-load-cache" / backend
+    workspace = args.cache_root / backend
     command = [
         str(ROOT / "tools" / "jit" / "activate.py"),
         "--build-dir", args.build_dir,

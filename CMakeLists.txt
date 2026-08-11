@@ -339,6 +339,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/selected_serving_evidence.py
     )
     add_test(
+      NAME nta-selected-quality-harness
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/selected_quality_harness.py
+    )
+    add_test(
       NAME nta-selected-request-overlap
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/selected_request_overlap.py

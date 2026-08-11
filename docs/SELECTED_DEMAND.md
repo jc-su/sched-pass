@@ -91,6 +91,17 @@ deterministic smoke workloads the harness can additionally require selected
 output to match stock text, which is a strict local quality check but does not
 replace task-level evaluation.
 
+`benchmarks/serving/SglangSelectedQuality.py` adds the first scored end-to-end
+task-quality smoke for this path. It drives the same SGLang mechanism through
+exact-prefix host-cache requests whose retrieval question is part of the cached
+16K prefix, and it runs an async resident peer beside each external request so
+the selected sidecar is exercised in the heterogeneous batch shape the system
+targets. The harness rejects stock runs that do not hit host cache, rejects NTA
+runs that bypass external claims, bounded staging, device compaction,
+compiler-generated attention, or zero-fallback guards, and reports pass-rate
+deltas for each selected budget. This is a task-quality smoke gate, not a
+LongBench-level quality artifact.
+
 ABI v27 adds two optimizations to this path. First, immutable page summaries are
 cached by exact external-prefix identity, host row mapping, layer geometry, and
 page size; repeated claims wait on the original CUDA event instead of rescanning
@@ -107,15 +118,25 @@ budget-32 run used zero stock attention and zero HiCache fallback, reduced live
 staging to 512 rows versus 16,382 dense rows, executed 72 bounded-cache
 launches, 612 selected-row reuse layers, and 684 compiler attention launches.
 
-The same run also establishes the current boundary. Budget 64 preserves output
-but regresses to external P95 TTFT `1.434x` and resident P99 ITL `1.129x`.
-Budget 128 satisfies the recall diagnostic gate (`quest_mean_recall=0.813`,
-`oracle_mean_gap=0.048`) and preserves output, but regresses to external P95
-TTFT `6.323x` and resident P99 ITL `3.681x` because the current compact
-FlashInfer form moves and consumes too many selected rows. The mechanism has a
-winning low-budget point on this workload, but the high-recall point is not
-paper-ready; it needs a finer acquisition/quality unit or a lower-overhead
-selected attention form before it can carry an OSDI headline.
+The same run also establishes the current boundary. The one-task scored smoke
+in `results/serving/sglang-selected-quality-qwen25-3b-16k-smoke.jsonl` passed
+stock and budgets 32, 64, and 128, with active mechanisms at every selected
+budget. That result only says the easy retrieval task is not immediately broken
+by low selected budgets. It is not enough quality evidence for a paper.
+
+The profiled load runs show where the current implementation stops paying:
+budget 32 improved external P95 TTFT to `0.911x` stock but hurt resident P99
+ITL to `1.566x`; budget 64 regressed to external P95 TTFT `1.501x` and resident
+P99 ITL `1.255x`; budget 128 satisfied the recall diagnostic gate
+(`quest_mean_recall=0.813`, `oracle_mean_gap=0.048`) and preserved output, but
+regressed to external P95 TTFT `6.480x` and resident P99 ITL `5.286x`. The
+budget-128 engine profile attributes `881.5 ms` to 2,376 direct selected
+operator layer invocations (`0.371 ms` each) and `98.6 ms` to CPU enqueue work;
+the selected staging path does not yet export enough transfer-profile counters
+to fully split copy cost from operator cost. The mechanism has a winning
+low-budget point on this workload, but the high-recall point is not paper-ready;
+it needs a page-native or otherwise lower-overhead selected attention form and
+better selected-path profiling before it can carry an OSDI headline.
 
 ## Bounded HBM Contract
 

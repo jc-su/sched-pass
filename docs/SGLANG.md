@@ -436,6 +436,18 @@ text but regressed (`1.434x` and `6.323x` external P95 TTFT respectively), so
 the current implementation has a low-budget win and a high-quality/high-budget
 overhead cliff.
 
+`benchmarks/serving/SglangSelectedQuality.py` now provides a separate scored
+quality smoke. On one exact-prefix retrieval task, stock and selected budgets
+32, 64, and 128 all passed while the selected arms exercised external claims,
+bounded staging, device compaction, compiler-generated attention, zero stock
+attention, and zero HiCache fallback. That result is a sanity check, not
+paper-level quality evidence. The profiled budget-128 load run instead points
+at the next integration target: 2,376 selected direct-operator layer
+invocations consumed `881.5 ms` of GPU time and CPU enqueue consumed `98.6 ms`,
+while selected transfer timing is not yet separated. The selected path needs a
+page-native or lower-overhead operator form before the high-recall operating
+point can be a headline.
+
 Three arm-balanced repetitions of that graph workload produced an
 output-throughput geometric mean of `0.9447x` with bootstrap interval
 `[0.9337x, 0.9578x]`. External TTFT was `1.3386x` and resident P99 inter-token

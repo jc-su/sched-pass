@@ -276,10 +276,15 @@ paper claim. A stricter budget-32 smoke rerun with same-budget selector-quality
 metadata and required output parity measured external P95 TTFT `0.848x` and
 resident P99 ITL `0.804x`, but budget 64 and 128 regressed despite output
 parity. The high-recall budget-128 point meets the recall diagnostic and still
-loses badly, which makes the next implementation target precise: reduce the
-cost of high-quality selection, for example by using a finer quality unit or a
-lower-overhead selected attention form, before treating selected demand as a
-paper headline.
+loses badly. The separate task-quality smoke harness passed budgets 32, 64,
+and 128 on an easy exact-prefix retrieval task with every selected mechanism
+active, but that is only a sanity check. A budget-128 profile attributes the
+cliff mainly to the current selected direct-operator path (`881.5 ms` across
+2,376 layer invocations) plus CPU enqueue (`98.6 ms`), while selected transfer
+timing is still under-instrumented. The next implementation target is therefore
+precise: make selected execution page-native or otherwise lower-overhead at
+quality budgets, and expose selected staging copy time separately from selected
+attention time, before treating selected demand as a paper headline.
 
 ### 4.2 Runtime: schedule data and computation together
 

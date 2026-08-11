@@ -638,6 +638,34 @@ while satisfying the recall diagnostic (`quest_mean_recall=0.813`,
 `oracle_mean_gap=0.048`). This is now a bounded positive plus negative
 crossover, not a universal selected-attention win.
 
+The task-quality smoke harness is now separate from the load harness. In
+`results/serving/sglang-selected-quality-qwen25-3b-16k-smoke.jsonl`,
+`SglangSelectedQuality.py` ran one exact-prefix retrieval task through stock
+and selected budgets 32, 64, and 128. All four arms passed; selected arms
+reported active external claims, bounded staging, device compaction,
+compiler-generated attention, zero stock-attention launches, and zero HiCache
+fallback. Budget 32 copied 18,072 released rows with 512 staging high-water rows
+against 15,606 dense rows; budget 64 copied 36,504 rows with 1,024 staging
+rows; budget 128 copied 73,368 rows with 2,048 staging rows. This smoke only
+guards against an obvious quality failure; it is not a LongBench or
+needle-suite quality result.
+
+Profiling the same coalesced load shape with `NTA_SGLANG_PROFILE_CPU=1` and
+`NTA_SGLANG_PROFILE_GPU=1` gives the current cliff diagnosis. Budget 32
+(`results/serving/sglang-selected-abi27-qwen25-3b-16k-budget32-profile.jsonl`)
+improved external P95 TTFT to `0.911x` stock but worsened resident P99 ITL to
+`1.566x`. Budget 64
+(`results/serving/sglang-selected-abi27-qwen25-3b-16k-budget64-profile.jsonl`)
+regressed to `1.501x` external P95 TTFT and `1.255x` resident P99 ITL. Budget
+128
+(`results/serving/sglang-selected-abi27-qwen25-3b-16k-budget128-profile.jsonl`)
+regressed to `6.480x` external P95 TTFT and `5.286x` resident P99 ITL; the
+engine profile charged `881.5 ms` to 2,376 selected direct-operator layer
+invocations and `98.6 ms` to CPU enqueue. A later all-budget rerun was
+discarded because another GPU job started during the sweep. The selected-path
+transfer profiler is still incomplete, so the next profiling fix is to expose
+selected staging copy time separately from selected attention time.
+
 The coalesced load fixture now enables SGLang mixed-chunk batching and releases
 the host-hit request into the running resident batch through the acquisition
 admission hook. `NTA_SGLANG_REQUIRE_MIXED_ATTENTION=1` fails closed unless the
