@@ -34,6 +34,7 @@ class QualityTask:
     question: str
     answer: str
     needle_token_offset: int
+    kind: str = "needle"
 
     @property
     def prompt(self) -> str:
@@ -50,6 +51,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--external-tokens", type=int, default=16384)
     parser.add_argument("--task-count", type=int, default=3)
+    parser.add_argument(
+        "--task-kinds",
+        default="needle",
+        help=(
+            "comma list from {needle, multikey, count}; needle is single-"
+            "position retrieval, multikey requires six dispersed parts in "
+            "order, count requires tallying eight dispersed markers — the "
+            "aggregation kinds exist because low budgets can pass retrieval "
+            "while failing global-attention tasks"
+        ),
+    )
     parser.add_argument("--max-new-tokens", type=int, default=12)
     parser.add_argument("--resident-tokens", type=int, default=2048)
     parser.add_argument("--resident-output-tokens", type=int, default=64)
@@ -75,6 +87,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("token counts must be positive")
     if args.external_tokens + args.churn_tokens <= args.max_total_tokens:
         parser.error("external prefix and churn must exceed the device token pool")
+    args.task_kinds = tuple(
+        kind.strip() for kind in args.task_kinds.split(",") if kind.strip()
+    )
+    for kind in args.task_kinds:
+        if kind not in ("needle", "multikey", "count"):
+            parser.error(f"unknown task kind {kind!r}")
+    if not args.task_kinds:
+        parser.error("at least one task kind is required")
     return args
 
 
@@ -94,64 +114,135 @@ def repeated_ids(tokenizer: Any, label: str, minimum: int) -> list[int]:
     return ids[:minimum]
 
 
+def _assemble_prefix(
+    tokenizer: Any,
+    args: argparse.Namespace,
+    label: str,
+    segments: list[tuple[float, str]],
+    question: str,
+) -> tuple[str, int]:
+    """Build an exact-length prefix with texts at fractional offsets.
+
+    Returns the decoded prefix and the first segment's token offset.
+    """
+    question_ids = token_ids(tokenizer, question)
+    pieces = sorted(segments)
+    ids: list[int] = []
+    first_offset = -1
+    for position, (fraction, text) in enumerate(pieces):
+        target = int(args.external_tokens * fraction)
+        if target > len(ids):
+            ids += repeated_ids(
+                tokenizer, f"{label}-fill-{position}", target - len(ids)
+            )
+        segment_ids = token_ids(tokenizer, text)
+        if first_offset < 0:
+            first_offset = len(ids)
+        ids += segment_ids
+    tail = args.external_tokens - len(ids) - len(question_ids)
+    if tail < 64:
+        raise RuntimeError("quality prefix has no room for its question")
+    ids += repeated_ids(tokenizer, f"{label}-fill-tail", tail)
+    ids += question_ids
+    if len(ids) != args.external_tokens:
+        raise RuntimeError("quality prefix token construction drifted")
+    return tokenizer.decode(ids, skip_special_tokens=True), first_offset
+
+
 def build_tasks(tokenizer: Any, args: argparse.Namespace) -> list[QualityTask]:
     rng = random.Random(args.seed)
-    # Keep needles away from the sink and recent pages retained by the selector.
+    # Keep planted content away from the sink and recent pages the
+    # selector always retains, or the task measures retention, not
+    # selection.
     fractions = [0.18, 0.43, 0.68, 0.82, 0.31, 0.57]
     tasks: list[QualityTask] = []
-    for index in range(args.task_count):
-        answer = f"NTAKEY{index:02d}{rng.randrange(1000, 9999)}"
-        needle = (
-            f"\nThe exact retrieval key for quality task {index} is {answer}. "
-            f"When asked about quality task {index}, answer only {answer}.\n"
-        )
-        question = (
-            f"\nQuestion: What is the exact retrieval key for quality task {index}? "
-            "Answer with only the key.\nAnswer:"
-        )
-        needle_ids = token_ids(tokenizer, needle)
-        question_ids = token_ids(tokenizer, question)
-        if len(needle_ids) >= args.external_tokens // 4:
-            raise RuntimeError("needle text unexpectedly consumed the prefix")
-        offset = int(args.external_tokens * fractions[index % len(fractions)])
-        offset = max(
-            32,
-            min(
-                offset,
-                args.external_tokens - len(needle_ids) - len(question_ids) - 64,
-            ),
-        )
-        before = repeated_ids(tokenizer, f"quality-before-{index}", offset)
-        after_count = (
-            args.external_tokens
-            - len(before)
-            - len(needle_ids)
-            - len(question_ids)
-        )
-        after = repeated_ids(tokenizer, f"quality-after-{index}", after_count)
-        prefix_ids = before + needle_ids + after + question_ids
-        if len(prefix_ids) != args.external_tokens:
-            raise RuntimeError("quality prefix token construction drifted")
-        prefix = tokenizer.decode(prefix_ids, skip_special_tokens=True)
-        question = (
-            f"\nQuestion: What is the exact retrieval key for quality task {index}? "
-            "Answer with only the key.\nAnswer:"
-        )
-        tasks.append(
-            QualityTask(
-                name=f"needle-{index}",
-                prefix=prefix,
-                question="",
-                answer=answer,
-                needle_token_offset=len(before),
+    for kind in args.task_kinds:
+        for index in range(args.task_count):
+            label = f"{kind}-{index}"
+            if kind == "needle":
+                answer = f"NTAKEY{index:02d}{rng.randrange(1000, 9999)}"
+                needle = (
+                    f"\nThe exact retrieval key for quality task {index} is "
+                    f"{answer}. When asked about quality task {index}, answer "
+                    f"only {answer}.\n"
+                )
+                question = (
+                    f"\nQuestion: What is the exact retrieval key for quality "
+                    f"task {index}? Answer with only the key.\nAnswer:"
+                )
+                prefix, offset = _assemble_prefix(
+                    tokenizer, args, label,
+                    [(fractions[index % len(fractions)], needle)], question,
+                )
+            elif kind == "multikey":
+                parts = [
+                    f"P{part}X{rng.randrange(100, 999)}" for part in range(6)
+                ]
+                segments = [
+                    (
+                        [0.15, 0.28, 0.41, 0.54, 0.67, 0.80][part],
+                        f"\nPart {part + 1} of the master passcode for vault "
+                        f"{index} is {parts[part]}. Remember part {part + 1}: "
+                        f"{parts[part]}.\n",
+                    )
+                    for part in range(6)
+                ]
+                question = (
+                    f"\nQuestion: State every part of the master passcode for "
+                    f"vault {index} in order, separated by spaces.\nAnswer:"
+                )
+                answer = " ".join(parts)
+                prefix, offset = _assemble_prefix(
+                    tokenizer, args, label, segments, question
+                )
+            elif kind == "count":
+                marker = f"AUDITCODE{index:02d}"
+                segments = [
+                    (
+                        [0.12, 0.22, 0.34, 0.46, 0.58, 0.66, 0.74, 0.84][hit],
+                        f"\nThe audit marker {marker} appears at this "
+                        f"checkpoint.\n",
+                    )
+                    for hit in range(8)
+                ]
+                question = (
+                    f"\nQuestion: How many times does the audit marker "
+                    f"{marker} appear in this document? Answer with the "
+                    f"number only.\nAnswer:"
+                )
+                answer = "8"
+                prefix, offset = _assemble_prefix(
+                    tokenizer, args, label, segments, question
+                )
+            else:
+                raise RuntimeError(f"unknown quality task kind {kind!r}")
+            tasks.append(
+                QualityTask(
+                    name=label,
+                    prefix=prefix,
+                    question="",
+                    answer=answer,
+                    needle_token_offset=offset,
+                    kind=kind,
+                )
             )
-        )
     return tasks
 
 
-def score_output(text: str, answer: str) -> bool:
+def score_output(text: str, task: QualityTask) -> bool:
     compact = "".join(text.upper().split())
-    return answer.upper() in compact
+    if task.kind == "multikey":
+        cursor = 0
+        for part in task.answer.upper().split():
+            found = compact.find(part, cursor)
+            if found < 0:
+                return False
+            cursor = found + len(part)
+        return True
+    if task.kind == "count":
+        head = compact.lstrip(".,:;")[:8]
+        return head.startswith(task.answer) or head.startswith("EIGHT")
+    return task.answer.upper() in compact
 
 
 async def stream_request(
@@ -284,10 +375,11 @@ def main() -> int:
             digest.update(b"\0")
             host_tokens = host_cached_tokens(result)
             device_tokens = device_cached_tokens(result)
-            passed = score_output(text, task.answer)
+            passed = score_output(text, task)
             records.append(
                 {
                     "name": task.name,
+                    "kind": task.kind,
                     "answer": task.answer,
                     "needle_token_offset": task.needle_token_offset,
                     "host_cached_tokens": host_tokens,
@@ -324,6 +416,13 @@ def main() -> int:
         "task_count": len(records),
         "passed": passed,
         "pass_rate": passed / max(1, len(records)),
+        "pass_rate_by_kind": {
+            kind: (
+                sum(r["passed"] for r in records if r["kind"] == kind)
+                / max(1, sum(1 for r in records if r["kind"] == kind))
+            )
+            for kind in sorted({r["kind"] for r in records})
+        },
         "all_tasks_host_served": all(record["served_from_host"] for record in records),
         "load_seconds": load_seconds,
         "generated_text_sha256": digest.hexdigest(),

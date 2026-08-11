@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-dir", default="build")
     parser.add_argument("--external-tokens", type=int, default=16384)
     parser.add_argument("--task-count", type=int, default=3)
+    parser.add_argument("--task-kinds", default="needle")
+    parser.add_argument("--max-new-tokens", type=int, default=96)
     parser.add_argument("--max-new-tokens", type=int, default=12)
     parser.add_argument("--resident-tokens", type=int, default=2048)
     parser.add_argument("--resident-output-tokens", type=int, default=64)
@@ -109,6 +111,10 @@ def run_arm(
         str(args.external_tokens),
         "--task-count",
         str(args.task_count),
+        "--task-kinds",
+        args.task_kinds,
+        "--max-new-tokens",
+        str(args.max_new_tokens),
         "--max-new-tokens",
         str(args.max_new_tokens),
         "--resident-tokens",
@@ -214,6 +220,7 @@ def main() -> int:
         quality_delta = stock_pass_rate - pass_rate
         budget_reports[str(budget)] = {
             "pass_rate": pass_rate,
+            "pass_rate_by_kind": report.get("pass_rate_by_kind", {}),
             "quality_delta": quality_delta,
             "quality_parity": quality_delta <= args.max_quality_delta,
             "all_tasks_host_served": bool(report["all_tasks_host_served"]),
@@ -234,6 +241,7 @@ def main() -> int:
         "selection_refresh_interval": args.selection_refresh_interval,
         "stock": {
             "pass_rate": stock_pass_rate,
+            "pass_rate_by_kind": stock.get("pass_rate_by_kind", {}),
             "all_tasks_host_served": bool(stock["all_tasks_host_served"]),
             "generated_text_sha256": stock["generated_text_sha256"],
             "records": stock["records"],
