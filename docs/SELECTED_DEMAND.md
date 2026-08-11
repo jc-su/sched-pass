@@ -142,7 +142,18 @@ FlashInfer attention, and planning are all healthy. The 64-to-128
 superlinearity is that kernel's internal scan scaling with budget; the
 cliff fix is a kernel restructure (parallelize or index the slot
 assignment), not a representation change, and its target is under 100
-microseconds per launch. The mechanism has a winning
+microseconds per launch. The restructure landed (7c55538: shared-memory
+tables, parallel validation/hit/emission, first-fit eviction reproduced
+exactly, byte gate green on all 2,196 layers) and erased the cliff in the
+timed ladder (`selected-load-postfix-b{32,64,128}.json`, single trials,
+tiered vs stock): budget 128 went from `6.32x` external P95 TTFT to
+`0.953x` with resident P99 ITL `0.926x` — the quality-defensible recall
+point now wins outright — and budget 64 measures `0.881x` TTFT, `0.928x`
+P99, `1.021x` TPOT. Remaining before any OSDI claim: the quality matrix
+(budget x refresh with aggregation tasks), the capacity/goodput
+experiment at the regime map's (32K, batch-32) point with pre-registered
+bars and n=10, and concurrent live claims exercised beyond
+`tiered_concurrent_claims_max = 1`, which every run so far has had. The mechanism has a winning
 low-budget point on this workload, but the high-recall point is not paper-ready;
 it needs a page-native or otherwise lower-overhead selected attention form and
 better selected-path profiling before it can carry an OSDI headline.
