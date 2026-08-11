@@ -678,6 +678,14 @@ class TieredClaim:
             self.request_id = request_id
             self.request_generation = pool_index
             self.bound_prefix_mask = prefix_mask.clone()
+            # One synchronization at bind time buys sync-free remainders on
+            # every later forward: prefix positions are frozen once bound,
+            # and everything the table appends after this length is
+            # non-prefix by construction.
+            self.bound_nonprefix_index = (
+                (~self.bound_prefix_mask).nonzero().squeeze(1)
+            )
+            self.bound_length = int(self.bound_prefix_mask.numel())
         elif self.request_id != request_id or self.request_generation != pool_index:
             raise RuntimeError(
                 "tiered claim served outside its bound request: claim "

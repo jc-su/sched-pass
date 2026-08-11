@@ -649,6 +649,37 @@ class SelectedAttentionExecutor:
                     and claim.request_id != request_ids[request]
                 ):
                     continue
+                if claim.request_id is not None and getattr(
+                    claim, "bound_nonprefix_index", None
+                ) is not None:
+                    # Bound claim: remainder sizes are known analytically —
+                    # frozen non-prefix positions plus everything appended
+                    # past the bound length. No masked_select, no host
+                    # synchronization on the per-forward path.
+                    if tokens.numel() < claim.bound_length:
+                        raise RuntimeError(
+                            "tiered request table shrank below its bound prefix"
+                        )
+                    if matched is not None:
+                        raise RuntimeError(
+                            "one request matched two live tiered claims"
+                        )
+                    if claim.claim_id in matched_claims:
+                        raise RuntimeError(
+                            "one tiered claim matched two requests"
+                        )
+                    matched = claim
+                    matched_claims.add(claim.claim_id)
+                    remainder = torch.cat(
+                        [
+                            tokens[: claim.bound_length].index_select(
+                                0, claim.bound_nonprefix_index
+                            ),
+                            tokens[claim.bound_length :],
+                        ]
+                    )
+                    claim.note_serving(engine, request)
+                    continue
                 prefix_mask = claim.table_prefix_mask(tokens)
                 if claim.request_id is None:
                     prefix_count = int(prefix_mask.sum())
