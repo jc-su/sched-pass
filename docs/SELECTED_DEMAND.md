@@ -133,7 +133,16 @@ regressed to external P95 TTFT `6.480x` and resident P99 ITL `5.286x`. The
 budget-128 engine profile attributes `881.5 ms` to 2,376 direct selected
 operator layer invocations (`0.371 ms` each) and `98.6 ms` to CPU enqueue work;
 the selected staging path does not yet export enough transfer-profile counters
-to fully split copy cost from operator cost. The mechanism has a winning
+to fully split copy cost from operator cost. The nsys autopsy (2026-08-11,
+`results/analysis/cliff-b128.nsys-rep`) resolves that attribution: the
+device compaction kernel `nta_prepare_bounded_selected_indexed_rows` alone
+is 52.6% of all GPU time — 907 launches averaging 6.1ms (max 15ms) for
+work that should cost tens of microseconds — while staging copies,
+FlashInfer attention, and planning are all healthy. The 64-to-128
+superlinearity is that kernel's internal scan scaling with budget; the
+cliff fix is a kernel restructure (parallelize or index the slot
+assignment), not a representation change, and its target is under 100
+microseconds per launch. The mechanism has a winning
 low-budget point on this workload, but the high-recall point is not paper-ready;
 it needs a page-native or otherwise lower-overhead selected attention form and
 better selected-path profiling before it can carry an OSDI headline.
