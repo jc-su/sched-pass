@@ -95,6 +95,18 @@ degrading resident-request tails.
   operator build's scope is therefore the captured multi-claim decode
   step, batched tiered extends through the existing multi-request
   prefill machinery, and throughput-aware admission.
+- **Amendment 2 (2026-08-11, adds operating point P3; derived before
+  any P3 run):** the P2 probes show both arms extend-rate-limited at
+  burst arrivals (~1.5 requests/s serialized prefill ceiling), which no
+  memory mechanism can beat — the same regime-arithmetic lesson at the
+  service level. The separating shape must satisfy stock service rate <
+  arrival rate < tiered service rate. **P3:** 24 externals x 16,384
+  prefix x 768 output tokens, Poisson arrivals at 0.9/s, pool 110,000
+  (stock concurrency ~6, service ~6/(0.65s extend + 7.4s hold) ~= 0.75/s
+  < 0.9/s -> unbounded queue; tiered extend-limited ~1.5/s > 0.9/s ->
+  stable, with 24-claim decode ITL well inside the 100ms SLO). Same SLO
+  definitions and bars; qualifying seeds unchanged. P1/P2 remain
+  recorded shapes whose ceilings are now understood.
 - **Amendment 1 (2026-08-11):** the quality matrix (needle + multikey
   kinds, count demoted diagnostic-only by stock validation; budgets
   {32, 64, 128} x refresh {1, 1024}) passed every cell at 1.0, equal to
