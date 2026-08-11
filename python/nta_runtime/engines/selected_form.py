@@ -450,6 +450,7 @@ class SelectedAttentionExecutor:
         verify_targets: list[tuple[Any, torch.Tensor, torch.Tensor]] = []
         if ctx.get("request_overlap", False):
             copy_events = []
+            layer_rows: list[torch.Tensor] = []
             for entry in ctx["claim_entries"]:
                 claim = entry["claim"]
                 request = entry["request"]
@@ -472,10 +473,9 @@ class SelectedAttentionExecutor:
                     stats["tiered_selection_reuse_layers"] = (
                         stats.get("tiered_selection_reuse_layers", 0) + 1
                     )
-                ctx["plan_indices"][entry["begin"] : entry["end"]].copy_(
-                    selected_rows
-                )
+                layer_rows.append(selected_rows)
                 claim.layers_served += 1
+            self._write_claim_segments(ctx, layer_rows)
             self._run_paged(
                 engine,
                 ctx["peer_wrapper"],
@@ -506,6 +506,7 @@ class SelectedAttentionExecutor:
                 + len(ctx["peer_positions"])
             )
         else:
+            layer_rows: list[torch.Tensor] = []
             for entry in ctx["claim_entries"]:
                 claim = entry["claim"]
                 request = entry["request"]
@@ -529,10 +530,9 @@ class SelectedAttentionExecutor:
                     stats["tiered_selection_reuse_layers"] = (
                         stats.get("tiered_selection_reuse_layers", 0) + 1
                     )
-                ctx["plan_indices"][entry["begin"] : entry["end"]].copy_(
-                    selected_rows
-                )
+                layer_rows.append(selected_rows)
                 claim.layers_served += 1
+            self._write_claim_segments(ctx, layer_rows)
             self._run_paged(
                 engine, ctx["verifier"], q, kv_cache, layer, out=serve_output
             )
@@ -574,6 +574,27 @@ class SelectedAttentionExecutor:
             stats.get("tiered_tokens_kept", 0) + ctx["kept_total"]
         )
         return True
+
+    def _write_claim_segments(
+        self, ctx: dict[str, Any], layer_rows: list[torch.Tensor]
+    ) -> None:
+        """Write every claim's selected rows for one layer.
+
+        At high claim concurrency, per-claim slice copies dominated decode
+        (~540 launches per step at fifteen claims); one concatenation and
+        one index_copy through the per-forward destination map replace
+        them with two launches per layer.
+        """
+        entries = ctx["claim_entries"]
+        if not entries:
+            return
+        if len(entries) == 1 or ctx.get("claim_row_positions") is None:
+            for entry, rows in zip(entries, layer_rows, strict=True):
+                ctx["plan_indices"][entry["begin"] : entry["end"]].copy_(rows)
+            return
+        ctx["plan_indices"].index_copy_(
+            0, ctx["claim_row_positions"], torch.cat(layer_rows)
+        )
 
     def _build_multi_claim_ctx(
         self,
@@ -741,11 +762,25 @@ class SelectedAttentionExecutor:
             )
         if verifier._paged_kv_indices_buf.data_ptr() != plan_indices.data_ptr():
             raise RuntimeError("FlashInfer did not retain the compact indices buffer")
+        claim_row_positions = (
+            torch.cat(
+                [
+                    torch.arange(
+                        entry["begin"], entry["end"],
+                        dtype=torch.int64, device=q.device,
+                    )
+                    for entry in claim_entries
+                ]
+            )
+            if len(claim_entries) > 1
+            else None
+        )
         return {
             "wrapper": wrapper,
             "verifier": verifier,
             "claim_ids": tuple(claim.claim_id for claim in claims),
             "claim_entries": claim_entries,
+            "claim_row_positions": claim_row_positions,
             "query_ranges": query_ranges,
             "plan_indices": plan_indices,
             "total": total,
