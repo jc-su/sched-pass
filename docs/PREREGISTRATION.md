@@ -89,7 +89,12 @@ degrading resident-request tails.
   a binding constraint; admitting to memory capacity rather than to
   serving throughput is counterproductive under TTFT SLOs, which
   elevates feasibility-based admission from robustness work to required
-  system behavior.
+  system behavior. A coalesced mixed-chunk follow-up probe changed
+  neither arm (stock 1.005, tiered 0.713 req/s; TTFT distributions
+  unmoved), so extend throughput is engine work, not configuration: the
+  operator build's scope is therefore the captured multi-claim decode
+  step, batched tiered extends through the existing multi-request
+  prefill machinery, and throughput-aware admission.
 - **Amendment 1 (2026-08-11):** the quality matrix (needle + multikey
   kinds, count demoted diagnostic-only by stock validation; budgets
   {32, 64, 128} x refresh {1, 1024}) passed every cell at 1.0, equal to
