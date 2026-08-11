@@ -100,7 +100,14 @@ targets. The harness rejects stock runs that do not hit host cache, rejects NTA
 runs that bypass external claims, bounded staging, device compaction,
 compiler-generated attention, or zero-fallback guards, and reports pass-rate
 deltas for each selected budget. This is a task-quality smoke gate, not a
-LongBench-level quality artifact.
+LongBench-level quality artifact. The harness now also carries two
+aggregation kinds: multikey (six dispersed passcode parts required in
+order) and count (eight dispersed markers to tally). Stock validation on
+Qwen2.5-3B passes needle and multikey at 3/3 each and fails count at 0/3
+with a consistent wrong tally — dense attention sees the markers but the
+model cannot count them — so count is diagnostic-only on this model and
+excluded from parity gates, per the pre-declared rule that a kind the
+dense baseline cannot pass measures the model, not the selection.
 
 ABI v27 adds two optimizations to this path. First, immutable page summaries are
 cached by exact external-prefix identity, host row mapping, layer geometry, and

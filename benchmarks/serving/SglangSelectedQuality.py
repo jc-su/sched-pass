@@ -27,7 +27,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-count", type=int, default=3)
     parser.add_argument("--task-kinds", default="needle")
     parser.add_argument("--max-new-tokens", type=int, default=96)
-    parser.add_argument("--max-new-tokens", type=int, default=12)
     parser.add_argument("--resident-tokens", type=int, default=2048)
     parser.add_argument("--resident-output-tokens", type=int, default=64)
     parser.add_argument("--churn-tokens", type=int, default=17000)
@@ -113,8 +112,6 @@ def run_arm(
         str(args.task_count),
         "--task-kinds",
         args.task_kinds,
-        "--max-new-tokens",
-        str(args.max_new_tokens),
         "--max-new-tokens",
         str(args.max_new_tokens),
         "--resident-tokens",

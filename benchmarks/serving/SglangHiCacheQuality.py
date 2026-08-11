@@ -321,12 +321,12 @@ def main() -> int:
     }
     churn_prompts = [
         make_prompt(tokenizer, f"quality-churn-{index}", args.churn_tokens)
-        for index in range(args.task_count)
+        for index in range(len(tasks))
     ]
     shape_prompt = make_prompt(tokenizer, "quality-shape", args.external_tokens)
     resident_prompts = [
         make_prompt(tokenizer, f"quality-resident-{index}", args.resident_tokens)
-        for index in range(args.task_count)
+        for index in range(len(tasks))
     ]
     load_started = time.perf_counter()
     records = []
