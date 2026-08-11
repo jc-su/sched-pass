@@ -146,18 +146,27 @@ class BoundedStagingPool:
             self._retired.append((lease, completion))
 
     def reclaim(self, *, wait: bool = False) -> int:
-        """Return completed retired ranges to the allocator."""
-        reclaimed: list[StagingLease] = []
+        """Return completed retired ranges to the allocator.
+
+        Fence waits happen outside the lock: a blocking CUDA synchronize
+        under the pool mutex would stall every acquire and view for the
+        duration of a device drain.
+        """
         with self._lock:
-            pending: list[tuple[StagingLease, Any]] = []
-            for lease, completion in self._retired:
-                if wait:
-                    completion.synchronize()
-                elif not completion.query():
-                    pending.append((lease, completion))
-                    continue
-                reclaimed.append(lease)
-            self._retired = pending
+            retired = self._retired
+            self._retired = []
+        reclaimed: list[StagingLease] = []
+        pending: list[tuple[StagingLease, Any]] = []
+        for lease, completion in retired:
+            if wait:
+                completion.synchronize()
+            elif not completion.query():
+                pending.append((lease, completion))
+                continue
+            reclaimed.append(lease)
+        if pending:
+            with self._lock:
+                self._retired.extend(pending)
         for lease in reclaimed:
             self._ranges.release(lease.range)
         return len(reclaimed)

@@ -45,11 +45,15 @@ MECHANISM_LAUNCHES_PER_LAYER = 3
 LAUNCH_SECONDS = 8e-6
 
 MODELS = {
-    # name: (layers, kv_heads, head_dim, params_billions)  [config.json]
-    "qwen2.5-3b": (36, 2, 128, 3.09),
-    "qwen3-4b": (36, 8, 128, 4.02),
-    "qwen3-8b": (36, 8, 128, 8.19),
-    "qwen3-30b-a3b": (48, 4, 128, 30.5),
+    # name: (layers, kv_heads, head_dim, total_params_B, active_params_B)
+    # [config.json]. Decode weight traffic follows ACTIVE parameters: an
+    # MoE step reads only the routed experts, so charging total parameters
+    # would overestimate the base step ~10x for qwen3-30b-a3b and deflate
+    # attention share exactly where selection wins are largest.
+    "qwen2.5-3b": (36, 2, 128, 3.09, 3.09),
+    "qwen3-4b": (36, 8, 128, 4.02, 4.02),
+    "qwen3-8b": (36, 8, 128, 8.19, 8.19),
+    "qwen3-30b-a3b": (48, 4, 128, 30.5, 3.3),
 }
 
 GPU_MEMORY_BYTES = 96.0e9 * 0.85  # RTX PRO 6000 Blackwell, SGLang default
@@ -66,13 +70,13 @@ def kv_bytes_per_token(layers: int, kv_heads: int, head_dim: int) -> int:
 def base_step_seconds(name: str) -> tuple[float, bool]:
     """Anchored where measured; weight-read floor plus the anchor's fixed
     overhead where not. Estimated entries must be re-anchored by P1."""
-    layers, kv_heads, head_dim, params = MODELS[name]
-    weight_read = params * 1e9 * 2 / HBM_BYTES_PER_SECOND
+    _, _, _, _, active_params = MODELS[name]
+    weight_read = active_params * 1e9 * 2 / HBM_BYTES_PER_SECOND
     if name in ANCHOR_TPOT_SECONDS:
         return ANCHOR_TPOT_SECONDS[name], True
-    anchor_layers, _, _, anchor_params = MODELS["qwen2.5-3b"]
+    _, _, _, _, anchor_active = MODELS["qwen2.5-3b"]
     anchor_overhead = ANCHOR_TPOT_SECONDS["qwen2.5-3b"] - (
-        anchor_params * 1e9 * 2 / HBM_BYTES_PER_SECOND
+        anchor_active * 1e9 * 2 / HBM_BYTES_PER_SECOND
     )
     return weight_read + anchor_overhead, False
 
@@ -80,7 +84,7 @@ def base_step_seconds(name: str) -> tuple[float, bool]:
 def evaluate_point(
     name: str, context: int, batch: int, budget_pages: int
 ) -> dict:
-    layers, kv_heads, head_dim, params = MODELS[name]
+    layers, kv_heads, head_dim, params, _ = MODELS[name]
     per_token = kv_bytes_per_token(layers, kv_heads, head_dim)
     base, anchored = base_step_seconds(name)
 
@@ -185,9 +189,18 @@ def main() -> int:
             f"admission x{p['admission_ratio']:.1f}"
         )
 
+    gpu_name = "unavailable"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+    except Exception:
+        pass
     report = {
         "classification": "selected-serving-regime-map",
         "schema": 1,
+        "gpu": gpu_name,
         "constants": {
             "hbm_bytes_per_second": HBM_BYTES_PER_SECOND,
             "gpu_pool_bytes": GPU_MEMORY_BYTES,

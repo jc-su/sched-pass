@@ -39,6 +39,7 @@ class SelectedAttentionExecutor:
         decode_jit_args: list[Any] | None = None,
         prefill_jit_args: list[Any] | None = None,
         register_wrapper: Any = None,
+        use_tensor_cores: bool = False,
     ) -> None:
         if budget_pages <= 0 or page_tokens <= 0:
             raise ValueError("selected-form budget and page tokens must be positive")
@@ -47,6 +48,7 @@ class SelectedAttentionExecutor:
         self._decode_jit_args = decode_jit_args
         self._prefill_jit_args = prefill_jit_args
         self._register_wrapper = register_wrapper
+        self._use_tensor_cores = use_tensor_cores
         configured = (
             decode_jit_args is not None,
             prefill_jit_args is not None,
@@ -76,6 +78,7 @@ class SelectedAttentionExecutor:
                     ),
                     "NHD",
                     backend="fa2",
+                    use_tensor_cores=self._use_tensor_cores,
                     **(
                         {"jit_args": self._decode_jit_args}
                         if self._decode_jit_args is not None
@@ -410,7 +413,9 @@ class SelectedAttentionExecutor:
                     prefill,
                 )
             raise RuntimeError(
-                "concurrent tiered claims require the fixed-shape selected form"
+                "verification modes and non-fixed-shape claims are "
+                "unsupported with concurrent tiered claims; run the gate "
+                "workload with a single external prefix"
             )
 
         local_layer = int(layer.layer_id) - claims[0].start_layer
@@ -442,6 +447,7 @@ class SelectedAttentionExecutor:
         key_cache, _ = kv_cache
         group_size = q.shape[1] // key_cache.shape[1]
         stream = torch.cuda.current_stream()
+        verify_targets: list[tuple[Any, torch.Tensor, torch.Tensor]] = []
         if ctx.get("request_overlap", False):
             copy_events = []
             for entry in ctx["claim_entries"]:
@@ -460,6 +466,8 @@ class SelectedAttentionExecutor:
                     )
                     claim.remember_selected_rows(local_layer, selected_rows)
                     copy_events.append(copied)
+                    if claim.verify_fast:
+                        verify_targets.append((claim, free, selected_rows))
                 else:
                     stats["tiered_selection_reuse_layers"] = (
                         stats.get("tiered_selection_reuse_layers", 0) + 1
@@ -515,6 +523,8 @@ class SelectedAttentionExecutor:
                         engine, local_layer, free, stream
                     )
                     claim.remember_selected_rows(local_layer, selected_rows)
+                    if claim.verify_fast:
+                        verify_targets.append((claim, free, selected_rows))
                 else:
                     stats["tiered_selection_reuse_layers"] = (
                         stats.get("tiered_selection_reuse_layers", 0) + 1
@@ -527,6 +537,23 @@ class SelectedAttentionExecutor:
                 engine, ctx["verifier"], q, kv_cache, layer, out=serve_output
             )
 
+        if verify_targets:
+            # VERIFY=fast on the live path: every freshly staged layer is
+            # byte-verified against its pinned host source after all copy
+            # waits have been enqueued. Reuse layers were verified when
+            # first staged; the bounded cache owns their slots until
+            # eviction, so their bytes cannot change underneath.
+            for verified_claim, free, physical_rows in verify_targets:
+                positions = verified_claim.kept_prefix_positions(free)
+                verified_claim._verify_layer(
+                    local_layer,
+                    positions,
+                    int(positions.numel()),
+                    physical_rows=physical_rows,
+                )
+                stats["tiered_fast_checked_layers"] = (
+                    stats.get("tiered_fast_checked_layers", 0) + 1
+                )
         stats["tiered_rows_copied"] = stats.get(
             "tiered_rows_copied_released", 0
         ) + sum(claim.rows_copied for claim in claims)

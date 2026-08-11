@@ -737,6 +737,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 register_wrapper=lambda wrapper, name: self._wrapper_modules.__setitem__(
                     id(wrapper), name
                 ),
+                use_tensor_cores=bool(self.decode_use_tensor_cores),
             )
         # Stage 3b: tiered claims skip bulk promotion entirely; the selected
         # form acquires only chosen pages per layer through the bounded

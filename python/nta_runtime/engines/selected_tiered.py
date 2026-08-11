@@ -226,8 +226,20 @@ class TieredClaim:
             key_cache = device_pool._get_key_buffer(layer_id)
             value_cache = device_pool._get_value_buffer(layer_id)
             element = key_cache[0].numel() * key_cache.element_size()
-            if host_value[0].numel() * host_value.element_size() != element:
-                raise RuntimeError("tiered K/V row geometry disagrees")
+            # Every source and destination must agree on the per-row byte
+            # count the indexed copy uses; checking only one pairing lets an
+            # asymmetric host layout stage silently corrupted KV.
+            for label, tensor in (
+                ("host key", host_key),
+                ("host value", host_value),
+                ("device value", value_cache),
+            ):
+                if tensor[0].numel() * tensor.element_size() != element:
+                    raise RuntimeError(
+                        f"tiered K/V row geometry disagrees: {label} rows "
+                        f"are {tensor[0].numel() * tensor.element_size()} "
+                        f"bytes, device key rows are {element}"
+                    )
             for source, staging in (
                 (host_key, key_cache),
                 (host_value, value_cache),
@@ -591,12 +603,22 @@ class TieredClaim:
             )
 
     def table_prefix_mask(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Return the immutable external-prefix positions for this request."""
+        """Return the external-prefix positions for this request's table.
+
+        Sidecar claims recompute by identity on every forward: virtual
+        token ids are never valid physical rows, so the range test is
+        exact under any table rebuild or reorder — whereas replaying a
+        positional snapshot after a retract/resume would mark the wrong
+        positions and feed virtual ids into the planned physical indices.
+        The positional snapshot is kept only for the legacy dense-slot
+        mode, where recycled physical slot ids can alias between requests
+        and the first observation is the authoritative one.
+        """
+        if getattr(self, "external_sidecar", False):
+            return (tokens >= self.virtual_begin) & (
+                tokens < self.virtual_begin + self.token_count
+            )
         if self.bound_prefix_mask is None:
-            if getattr(self, "external_sidecar", False):
-                return (tokens >= self.virtual_begin) & (
-                    tokens < self.virtual_begin + self.token_count
-                )
             return self.slot_is_prefix[tokens.to(torch.long)]
         if tokens.numel() < self.bound_prefix_mask.numel():
             raise RuntimeError("tiered request table shrank below its bound prefix")
@@ -630,7 +652,18 @@ class TieredClaim:
             self.request_generation = generation
             self.bound_prefix_mask = prefix_mask.clone()
         elif self.request_id != request_id or self.request_generation != generation:
-            raise RuntimeError("tiered claim crossed a request generation")
+            raise RuntimeError(
+                "tiered claim crossed a request generation: claim "
+                f"{self.claim_id} bound (request={self.request_id!r}, "
+                f"generation={self.request_generation}) but table position "
+                f"{request_position} now carries (request={request_id!r}, "
+                f"generation={generation}). A matching id with a different "
+                "generation means the radix cache shared this claim's "
+                "virtual rows into a later arrival's table — cross-request "
+                "reuse of a tiered prefix is unsupported; run such "
+                "workloads with the radix cache disabled or distinct "
+                "prompts until claim-time radix exclusion lands"
+            )
 
     def choose_free_pages(
         self, local_layer: int, query: torch.Tensor, group_size: int

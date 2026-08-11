@@ -90,7 +90,11 @@ def measure_point(
             ("short", args.short_output_tokens),
             ("long", args.long_output_tokens),
         ):
-            sampling = {"temperature": 0, "max_new_tokens": new_tokens}
+            sampling = {
+                "temperature": 0,
+                "max_new_tokens": new_tokens,
+                "ignore_eos": True,
+            }
             started = time.perf_counter()
             results = engine.generate(input_ids=input_ids, sampling_params=sampling)
             elapsed = time.perf_counter() - started
@@ -124,11 +128,38 @@ def measure_point(
     }
 
 
-def predicted(batch: int, context: int) -> dict[str, float]:
-    sys.path.insert(0, str(ROOT / "benchmarks" / "serving"))
+def regime_model_for(model_dir: pathlib.Path) -> str:
+    """Resolve the regime-map entry by measured geometry, never by name.
+
+    A silent wrong-model comparison would invalidate every prediction
+    column, so an unmapped geometry is an error, not a fallback.
+    """
+    from RegimeMap import MODELS
+
+    config = json.loads((model_dir / "config.json").read_text())
+    geometry = (
+        int(config["num_hidden_layers"]),
+        int(config["num_key_value_heads"]),
+        int(
+            config.get(
+                "head_dim",
+                config["hidden_size"] // config["num_attention_heads"],
+            )
+        ),
+    )
+    for name, (layers, kv_heads, head_dim, *_) in MODELS.items():
+        if geometry == (layers, kv_heads, head_dim):
+            return name
+    raise RuntimeError(
+        f"model geometry {geometry} has no regime-map entry; add it to "
+        "RegimeMap.MODELS before sweeping"
+    )
+
+
+def predicted(model_name: str, batch: int, context: int) -> dict[str, float]:
     from RegimeMap import evaluate_point
 
-    point = evaluate_point("qwen2.5-3b", context, batch, 128)
+    point = evaluate_point(model_name, context, batch, 128)
     return {
         "dense_step_ms": point["dense_step_ms"],
         "attention_share_pct": point["attention_share_pct"],
@@ -143,10 +174,11 @@ def main() -> int:
     from SglangSmoke import configure_jit_environment
 
     configure_jit_environment(args)
+    regime_model = regime_model_for(args.model)
     measured = []
     for batch, context in args.points:
         result = measure_point(args, batch, context)
-        model = predicted(batch, context)
+        model = predicted(regime_model, batch, context)
         result["predicted_dense_step_ms"] = model["dense_step_ms"]
         result["predicted_attention_share_pct"] = model["attention_share_pct"]
         result["measured_over_predicted"] = (

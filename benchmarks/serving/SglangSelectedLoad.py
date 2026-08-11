@@ -114,6 +114,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("selected budget and page tokens must be positive")
     if args.selection_refresh_interval <= 0:
         parser.error("selection refresh interval must be positive")
+    if args.require_request_overlap and args.selection_refresh_interval > 1:
+        parser.error(
+            "--require-request-overlap is incompatible with "
+            "--selection-refresh-interval > 1: selection reuse keeps the "
+            "batch in the no-split form, so the overlap requirement would "
+            "fail only after every arm has burned its GPU time"
+        )
     for name in (
         "min_selector_mean_recall",
         "min_selector_min_layer_recall",
@@ -263,8 +270,17 @@ def validate_tiered_activation(
         "compiler_attention_launches": int(
             counters.get("selected_compiler_launches", 0)
         ),
-        "rows_copied": int(counters.get("tiered_rows_copied", 0)),
-        "rows_reused": int(counters.get("tiered_rows_rehit", 0)),
+        # The serve-time snapshot misses the final claim's async-drained
+        # copies, and the released totals miss any claim still live at the
+        # dump; each is a lower bound, so take the larger.
+        "rows_copied": max(
+            int(counters.get("tiered_rows_copied", 0)),
+            int(counters.get("tiered_rows_copied_released", 0)),
+        ),
+        "rows_reused": max(
+            int(counters.get("tiered_rows_rehit", 0)),
+            int(counters.get("tiered_rows_rehit_released", 0)),
+        ),
         "selection_reuse_layers": int(
             counters.get("tiered_selection_reuse_layers", 0)
         ),
@@ -449,8 +465,14 @@ def main() -> int:
     )
     kept = int(counters.get("tiered_tokens_kept", 0))
     total = int(counters.get("tiered_tokens_total", 0))
-    rows_copied = int(counters.get("tiered_rows_copied", 0))
-    rows_reused = int(counters.get("tiered_rows_rehit", 0))
+    rows_copied = max(
+        int(counters.get("tiered_rows_copied", 0)),
+        int(counters.get("tiered_rows_copied_released", 0)),
+    )
+    rows_reused = max(
+        int(counters.get("tiered_rows_rehit", 0)),
+        int(counters.get("tiered_rows_rehit_released", 0)),
+    )
     rows_requested = rows_copied + rows_reused
 
     def ratios(base: dict[str, Any], subject: dict[str, Any]) -> dict[str, float]:

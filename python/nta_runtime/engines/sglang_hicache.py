@@ -169,12 +169,23 @@ class SglangHiCacheBridge:
         if namespace_exhausted:
             allocator.free(staging_rows)
             raise RuntimeError("external virtual-token namespace is exhausted")
-        virtual = torch.arange(
-            virtual_begin,
-            virtual_end,
-            dtype=torch.int64,
-            device=controller.device,
-        )
+        try:
+            virtual = torch.arange(
+                virtual_begin,
+                virtual_end,
+                dtype=torch.int64,
+                device=controller.device,
+            )
+        except Exception:
+            # Nothing downstream owns these resources yet; a failure here
+            # must not leak bounded staging rows or burn namespace. The
+            # rollback is best-effort: it only rewinds if no later claim
+            # advanced the cursor past ours.
+            allocator.free(staging_rows)
+            with self._lock:
+                if self._next_virtual_token == virtual_end:
+                    self._next_virtual_token = virtual_begin
+            raise
         def registry_release(handle: Any) -> None:
             with self._lock:
                 current = self._external_prefixes.get(handle.request_id)
@@ -307,6 +318,10 @@ class SglangHiCacheBridge:
                 # SGLang's own transfer is an explicit, counted opt-in for
                 # resilience deployments only.
                 if os.environ.get("NTA_SGLANG_ALLOW_PREFETCH_FALLBACK", "0") != "1":
+                    # Fail closed, but not dirty: the dead claim must not
+                    # keep the producer slot occupied or the host nodes
+                    # pinned for whoever survives this exception.
+                    self._drop_ownership(pending)
                     raise RuntimeError(
                         "NTA early HiCache prefetch failed for a claimed load; "
                         "set NTA_SGLANG_ALLOW_PREFETCH_FALLBACK=1 to restore "
@@ -319,8 +334,9 @@ class SglangHiCacheBridge:
                     self._admission_stats["prefetch_fallback_loads"] = (
                         self._admission_stats.get("prefetch_fallback_loads", 0) + 1
                     )
-                pending.held_ack = None
-                controller.ack_load_queue.append(ack)
+                # fallback() replays the transfer and its tail drops
+                # ownership, which now delivers the held acknowledgement
+                # with the producer-finish semantics a real transfer has.
                 self.fallback(pending)
                 return producer_id
         return producer_id
@@ -472,30 +488,46 @@ class SglangHiCacheBridge:
         incomplete: list[_ProgressPublication] = []
         completed: list[tuple[RequestWork, ServiceModel]] = []
         stale = 0
-        for publication in publications:
-            progress = publication.snapshot.query()
-            if progress is None:
-                incomplete.append(publication)
-                continue
-            if len(progress) != len(publication.bindings):
-                raise RuntimeError("request-progress snapshot changed row count")
-            for binding, item in zip(publication.bindings, progress):
-                if (
-                    item.request_id != binding.request_id
-                    or item.generation != binding.generation
-                ):
-                    stale += 1
+        position = 0
+        try:
+            for position, publication in enumerate(publications):
+                progress = publication.snapshot.query()
+                if progress is None:
+                    incomplete.append(publication)
                     continue
-                completed.append(
-                    (
-                        RequestWork.from_progress(
-                            item,
-                            priority=binding.priority,
-                            deadline_ns=0,
-                        ),
-                        publication.model,
+                if len(progress) != len(publication.bindings):
+                    raise RuntimeError(
+                        "request-progress snapshot changed row count"
                     )
-                )
+                for binding, item in zip(publication.bindings, progress):
+                    if (
+                        item.request_id != binding.request_id
+                        or item.generation != binding.generation
+                    ):
+                        stale += 1
+                        continue
+                    completed.append(
+                        (
+                            RequestWork.from_progress(
+                                item,
+                                priority=binding.priority,
+                                deadline_ns=0,
+                            ),
+                            publication.model,
+                        )
+                    )
+        except Exception:
+            # Publications own pinned host storage until their stream
+            # events complete; dropping the untraversed tail on an
+            # exception would free buffers under in-flight D2H copies.
+            # Requeue the failing entry, the tail, and the incomplete
+            # snapshots, then let the failure propagate. Work already in
+            # ``completed`` is lost with the raise, which only costs
+            # feedback freshness — its buffers are already quiesced.
+            with self._lock:
+                self._progress_publications.extend(publications[position:])
+                self._progress_publications.extend(incomplete)
+            raise
         with self._lock:
             self._progress_publications.extend(incomplete)
             for work, model in completed:
@@ -533,7 +565,15 @@ class SglangHiCacheBridge:
             self._owned.pop(pending.claim_id)
             if self._pending.get(pending.consumer_index) is pending:
                 self._pending.pop(pending.consumer_index)
-            return True
+        # Ownership ends exactly once, and every ending path must deliver
+        # the held acknowledgement or SGLang never unlocks the host radix
+        # nodes — a silent one-pinned-prefix-per-load leak. Callers needing
+        # a stream-fenced finish event replace ``held_ack`` before dropping.
+        ack = pending.held_ack
+        if ack is not None:
+            pending.held_ack = None
+            pending.controller.ack_load_queue.append(ack)
+        return True
 
     def retire(
         self,
@@ -552,21 +592,18 @@ class SglangHiCacheBridge:
         reclamation asynchronous while preventing completion DMA from racing
         host-row reuse.
         """
-        if not self._drop_ownership(pending):
-            return False
         ack = pending.held_ack
-        if ack is not None:
-            if stream is not None:
-                finish_event = torch.cuda.Event()
-                finish_event.record(stream)
-                ack = type(ack)(ack.start_event, finish_event, ack.node_ids)
-                if pending.host_indices.is_cuda:
-                    pending.host_indices.record_stream(stream)
-                if pending.device_indices.is_cuda:
-                    pending.device_indices.record_stream(stream)
-            pending.controller.ack_load_queue.append(ack)
-            pending.held_ack = None
-        return True
+        if ack is not None and stream is not None:
+            finish_event = torch.cuda.Event()
+            finish_event.record(stream)
+            pending.held_ack = type(ack)(
+                ack.start_event, finish_event, ack.node_ids
+            )
+            if pending.host_indices.is_cuda:
+                pending.host_indices.record_stream(stream)
+            if pending.device_indices.is_cuda:
+                pending.device_indices.record_stream(stream)
+        return self._drop_ownership(pending)
 
     def handoff_prefetch(
         self, pending: PendingHostLoad, stream: torch.cuda.Stream

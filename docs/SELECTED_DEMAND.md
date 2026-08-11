@@ -184,6 +184,27 @@ passed to the physical allocator or FlashInfer. The adapter fails closed for
 page sizes other than one, SWA/Mamba components, unsupported calling
 conventions, staging exhaustion, or lost retirement ownership.
 
+Cross-arrival radix reuse of virtual rows is a recorded unsupported boundary
+with a named failure (2026-08-11): when identical prompts re-arrive with the
+radix cache enabled, the tree shares a live claim's virtual rows into the
+later arrival's table, and the claim's request-generation identity check
+raises rather than serving stale bindings (observed as the same request id
+with a regressed generation). SGLang cannot disable the radix tree under HiCache (the host tier is
+radix-structured), and re-sending a cached prefix is the load harness's
+core scenario, so this boundary blocks the very workload the harness
+measures. Empirically confirmed 2026-08-11: even at zero load-warmup
+iterations, the setup phase's host-cache probe forms a claim whose
+virtual rows reach the measured arrival's table (claim bound at one
+request generation, observed at another), meaning the documented
+cache-insertion interception does not keep virtual rows out of the
+radix tree as intended. The identity check fails closed every time —
+no stale bytes are ever served — but claim rebind across arrivals, or
+an interception fix proven by this exact gate, is the highest-priority
+lifecycle work item; the gate script is the reproducer.
+The virtual-token namespace is also monotonically consumed (~65K claims of
+16K prefixes exhaust int32); generation-tagged recycling is required before
+long-duration qualification.
+
 Each claim also owns a per-layer page-to-slot table inside its bounded lease.
 The device phase validates the selected logical page set, protects pages in the
 current set from replacement, assigns misses to deterministic physical slots,
