@@ -77,6 +77,19 @@ degrading resident-request tails.
   ways), makespan 1.65x. The graph-capturable multi-claim operator
   (design of record, its own exit gate: TPOT <= 1.2x stock, GPU busy
   > 85%) must land before qualifying trials begin.
+- **P2 scaling probe (2026-08-11, non-qualifying seed, recorded
+  negative):** at 32 externals, stock queues (13 of 32 externals exceed
+  the 8s TTFT; goodput 1.104 req/s) but tiered measures **worse** —
+  0.704 req/s with median external TTFT 12.2s — because admission
+  without serving throughput inverts the benefit: serialized extends
+  (~22s of aggregate prefill wall) plus 32-wide decode at 1.9x TPOT
+  starve every admitted request together, while stock's waves each
+  complete quickly once admitted. The operator-build prerequisite is
+  therefore confirmed by measurement, and extend throughput joins it as
+  a binding constraint; admitting to memory capacity rather than to
+  serving throughput is counterproductive under TTFT SLOs, which
+  elevates feasibility-based admission from robustness work to required
+  system behavior.
 - **Amendment 1 (2026-08-11):** the quality matrix (needle + multikey
   kinds, count demoted diagnostic-only by stock validation; budgets
   {32, 64, 128} x refresh {1, 1024}) passed every cell at 1.0, equal to
