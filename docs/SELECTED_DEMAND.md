@@ -265,7 +265,12 @@ re-profile. **Confirmed 2026-08-11:** median external TPOT
 measured 17.7ms at eight claims and 27.7ms at sixteen — 1.25ms per claim,
 exactly linear, extrapolating to stock's ~10-11ms at one claim. The
 host-orchestration diagnosis holds from three independent directions
-(profile, fix-insensitivity, scaling), and the build proceeds.
+(profile, fix-insensitivity, scaling), and the build proceeds. Five-trial
+repetitions of the pressure shape (both arms, all clean; artifact
+`results/serving/pressure-prebuild-n5.json`) replicate both won axes as
+ratios of medians: external P95 TTFT **0.861x** stock and resident P99
+ITL **0.506x** — pre-build evidence, explicitly distinct from the
+pre-registered qualifying trials that run after the operator build.
 
 Phases, smallest-first:
 
