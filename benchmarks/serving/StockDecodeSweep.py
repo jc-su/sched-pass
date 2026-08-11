@@ -57,6 +57,15 @@ def parse_args() -> argparse.Namespace:
         if batch <= 0 or context <= 0:
             parser.error(f"invalid point {raw!r}")
         args.points.append((batch, context))
+    model_config = json.loads((args.model / "config.json").read_text())
+    position_limit = int(model_config.get("max_position_embeddings", 1 << 30))
+    for batch, context in args.points:
+        needed = context + args.long_output_tokens + 64
+        if needed > position_limit:
+            parser.error(
+                f"point ({batch},{context}) needs {needed} positions but the "
+                f"model supports {position_limit}; reduce the context"
+            )
     return args
 
 
@@ -144,6 +153,13 @@ def main() -> int:
             result["decode_tpot_seconds"] * 1e3 / model["dense_step_ms"]
         )
         measured.append(result)
+        if args.output:
+            # Persist after every point: a later point's failure must not
+            # discard completed measurements.
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(
+                json.dumps({"partial": True, "points": measured}) + "\n"
+            )
         print(
             f"bs={batch} ctx={context}: measured TPOT "
             f"{result['decode_tpot_seconds'] * 1e3:.2f}ms, predicted "

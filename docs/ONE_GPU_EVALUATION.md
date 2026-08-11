@@ -232,6 +232,22 @@ Qwen3-4B/8B (144KB/token) reach the frontier at batch 4-8 (T_base
 estimated, pending anchor). `StockDecodeSweep.py` validates the map's
 physics empirically before any derived point is used.
 
+**Sweep validation (2026-08-11, `stock-decode-sweep*.json`):** measured
+pure-decode TPOT vs prediction — (1, 2K): 5.45ms vs 10.15 (the clean
+engine's base cost is ~half the serving anchor, so the map's shares are
+conservative); (16, 16K): 18.24ms vs 16.14 (x1.13); (32, 32K): 47.81ms
+vs 34.09 (x1.40, implying effective attention bandwidth ~0.9TB/s at
+GQA-2 and a measured attention share of ~80-87% at this point — *more*
+win available than mapped). One outlier: (32, 16K) measured 60.85ms,
+slower than the same batch at double the context — physically inverted
+for attention-bound decode and consistent with the project's documented
+episodic SGLang stall pathology landing inside a single-sample
+difference; re-measure with repetitions during the qualified campaign
+before using that point. Verdict: the map's physics holds where it
+matters, and the frozen operating points are (32K, batch 32) for the
+capacity/goodput headline and (64K, batch 16) as the long-context
+latency point.
+
 Consequences, in order: (1) concurrent per-request claims are the
 critical-path engineering — every winning point has batch >> 1; (2) all
 future selected-serving evaluation runs only at map-positive points, with
