@@ -106,7 +106,17 @@ degrading resident-request tails.
   < 0.9/s -> unbounded queue; tiered extend-limited ~1.5/s > 0.9/s ->
   stable, with 24-claim decode ITL well inside the 100ms SLO). Same SLO
   definitions and bars; qualifying seeds unchanged. P1/P2 remain
-  recorded shapes whose ceilings are now understood.
+  recorded shapes whose ceilings are now understood. **P3 probe result
+  (non-qualifying seed):** the arrival-side prediction held on both arms
+  — tiered external TTFT p50 0.79s versus stock 5.51s with 23 of 24
+  under the SLO while stock's queue pushed six past it — but tiered
+  qualified only 11 of 24 overall (goodput 0.296 vs 0.528) because P99
+  ITL crosses 100ms at ~24 concurrent claims over long decodes. The
+  host-bound decode loop is therefore a direct SLO failure at scale, not
+  a throughput optic: the operator build gates qualifying trials with an
+  added criterion — P3 external P99 ITL within the 100ms SLO for at
+  least the stock arm's qualified fraction — and with ITL qualified the
+  goodput bar follows from queue divergence under sustained arrivals.
 - **Amendment 1 (2026-08-11):** the quality matrix (needle + multikey
   kinds, count demoted diagnostic-only by stock validation; budgets
   {32, 64, 128} x refresh {1, 1024}) passed every cell at 1.0, equal to
