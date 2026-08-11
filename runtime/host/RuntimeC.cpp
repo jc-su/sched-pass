@@ -728,7 +728,8 @@ nta_status nta_runtime_copy_request_progress_async(
     runtime->value->copyRequestProgressAsync(
         firstRequestSlot,
         std::span<nta::abi::RequestProgress>(destination, requestCount),
-        reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(cudaStream)));
+        reinterpret_cast<cudaStream_t>(
+            static_cast<std::uintptr_t>(cudaStream)));
   });
 }
 
@@ -1183,6 +1184,75 @@ nta_status nta_jit_phase_set_indexed_row_counts(
     program->value->setIndexedRowCounts(stream(cudaStream),
                                         runtime->value->deviceView(),
                                         firstObject, objectCount, rowCount);
+  });
+}
+
+nta_status nta_jit_phase_prepare_selected_indexed_rows(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint64_t selectedPages, std::uint32_t selectedPageCount,
+    std::uint32_t pageTokens, std::uint32_t tokenCount, std::uint64_t hostRows,
+    std::uint64_t deviceRows, std::uint64_t stagedPages,
+    std::uint64_t sourceIndices, std::uint64_t stagingIndices,
+    std::uint32_t capacity, std::uint64_t copiedRows,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->prepareSelectedIndexedRows(
+        stream(cudaStream), runtime->value->deviceView(), firstObject,
+        objectCount, reinterpret_cast<const std::int64_t *>(selectedPages),
+        selectedPageCount, pageTokens, tokenCount,
+        reinterpret_cast<const std::uint32_t *>(hostRows),
+        reinterpret_cast<const std::uint32_t *>(deviceRows),
+        reinterpret_cast<std::uint32_t *>(stagedPages),
+        reinterpret_cast<std::uint32_t *>(sourceIndices),
+        reinterpret_cast<std::uint32_t *>(stagingIndices), capacity,
+        reinterpret_cast<std::uint64_t *>(copiedRows));
+  });
+}
+
+nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint64_t selectedPages, std::uint32_t selectedPageCount,
+    std::uint32_t pageTokens, std::uint32_t tokenCount, std::uint64_t hostRows,
+    std::uint64_t deviceRows, std::uint64_t cachedPages,
+    std::uint32_t cacheSlotCount, std::uint64_t selectedRows,
+    std::uint64_t sourceIndices, std::uint64_t stagingIndices,
+    std::uint32_t capacity, std::uint64_t copiedRows,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->prepareBoundedSelectedIndexedRows(
+        stream(cudaStream), runtime->value->deviceView(), firstObject,
+        objectCount, reinterpret_cast<const std::int64_t *>(selectedPages),
+        selectedPageCount, pageTokens, tokenCount,
+        reinterpret_cast<const std::uint32_t *>(hostRows),
+        reinterpret_cast<const std::uint32_t *>(deviceRows),
+        reinterpret_cast<std::int64_t *>(cachedPages), cacheSlotCount,
+        reinterpret_cast<std::uint32_t *>(selectedRows),
+        reinterpret_cast<std::uint32_t *>(sourceIndices),
+        reinterpret_cast<std::uint32_t *>(stagingIndices), capacity,
+        reinterpret_cast<std::uint64_t *>(copiedRows));
+  });
+}
+
+nta_status nta_jit_phase_reduce_mapped_key_pages(
+    const nta_jit_phase_program *program, std::uint64_t source,
+    std::uint32_t sourceRows, std::uint64_t sourceStrideBytes,
+    std::uint32_t firstRow, std::uint32_t tokenCount, std::uint32_t pageTokens,
+    std::uint32_t kvHeads, std::uint32_t headDim, std::uint32_t elementType,
+    std::uint64_t outputMin, std::uint64_t outputMax,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    program->value->reduceMappedKeyPages(
+        stream(cudaStream), reinterpret_cast<const void *>(source), sourceRows,
+        sourceStrideBytes, firstRow, tokenCount, pageTokens, kvHeads, headDim,
+        elementType, reinterpret_cast<float *>(outputMin),
+        reinterpret_cast<float *>(outputMax));
   });
 }
 

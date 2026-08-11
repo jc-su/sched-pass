@@ -54,6 +54,8 @@ _EXPORTS = {
     "plan_critical_work": ("critical_work", "plan_critical_work"),
     "BoundedEpoch": ("epoch", "BoundedEpoch"),
     "EpochResult": ("epoch", "EpochResult"),
+    "BoundedStagingPool": ("bounded_staging", "BoundedStagingPool"),
+    "StagingLease": ("bounded_staging", "StagingLease"),
     "FlashInferLayerEpoch": ("flashinfer", "FlashInferLayerEpoch"),
     "FlashInferHostWave": (
         "flashinfer_tier_streaming",

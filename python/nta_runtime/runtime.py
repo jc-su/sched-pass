@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 23
+API_VERSION = 26
 
 
 class RuntimeError(Exception):
@@ -1055,6 +1055,65 @@ _phase_set_indexed_row_counts = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_phase_prepare_selected_indexed_rows = _function(
+    "nta_jit_phase_prepare_selected_indexed_rows",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
+_phase_prepare_bounded_selected_indexed_rows = _function(
+    "nta_jit_phase_prepare_bounded_selected_indexed_rows",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
+_phase_reduce_mapped_key_pages = _function(
+    "nta_jit_phase_reduce_mapped_key_pages",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
 _phase_nvme = _function(
     "nta_jit_phase_progress_nvme",
     ctypes.c_int,
@@ -1923,6 +1982,231 @@ class JitPhaseProgram(_Owner):
                 first_object,
                 object_count,
                 row_count,
+                _stream_address(stream),
+            )
+        )
+
+    def prepare_selected_indexed_rows(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        selected_pages: Any,
+        page_tokens: int,
+        token_count: int,
+        host_rows: Any,
+        device_rows: Any,
+        staged_pages: Any,
+        source_indices: Any,
+        staging_indices: Any,
+        copied_rows: Any,
+        stream: Any = None,
+    ) -> None:
+        """Compact and validate device-selected misses in stream order."""
+        import torch
+
+        arrays = (
+            selected_pages,
+            host_rows,
+            device_rows,
+            staged_pages,
+            source_indices,
+            staging_indices,
+            copied_rows,
+        )
+        if any(not tensor.is_cuda for tensor in arrays):
+            raise ValueError("selected indexed-row arrays must reside on CUDA")
+        if selected_pages.dtype != torch.int64 or selected_pages.numel() == 0:
+            raise ValueError("selected pages must be a non-empty int64 tensor")
+        if any(
+            tensor.dtype != torch.int32
+            for tensor in (
+                host_rows,
+                device_rows,
+                staged_pages,
+                source_indices,
+                staging_indices,
+            )
+        ):
+            raise ValueError("selected indexed-row mappings must use int32")
+        if copied_rows.dtype != torch.int64 or copied_rows.numel() != 1:
+            raise ValueError("copied-row accounting must be one int64 value")
+        if host_rows.numel() != token_count or device_rows.numel() != token_count:
+            raise ValueError("selected row maps disagree with the token count")
+        capacity = int(source_indices.numel())
+        if staging_indices.numel() != capacity or min(
+            object_count, page_tokens, token_count, capacity
+        ) <= 0:
+            raise ValueError("selected indexed-row geometry is invalid")
+        _check(
+            _phase_prepare_selected_indexed_rows(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
+                selected_pages.data_ptr(),
+                selected_pages.numel(),
+                page_tokens,
+                token_count,
+                host_rows.data_ptr(),
+                device_rows.data_ptr(),
+                staged_pages.data_ptr(),
+                source_indices.data_ptr(),
+                staging_indices.data_ptr(),
+                capacity,
+                copied_rows.data_ptr(),
+                _stream_address(stream),
+            )
+        )
+
+    def prepare_bounded_selected_indexed_rows(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        selected_pages: Any,
+        page_tokens: int,
+        token_count: int,
+        host_rows: Any,
+        device_rows: Any,
+        cached_pages: Any,
+        selected_rows: Any,
+        source_indices: Any,
+        staging_indices: Any,
+        copied_rows: Any,
+        stream: Any = None,
+    ) -> None:
+        """Emit a physical selected table and compact only staging misses."""
+        import torch
+
+        arrays = (
+            selected_pages,
+            host_rows,
+            device_rows,
+            cached_pages,
+            selected_rows,
+            source_indices,
+            staging_indices,
+            copied_rows,
+        )
+        if any(
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device.type != "cuda"
+            or not tensor.is_contiguous()
+            for tensor in arrays
+        ):
+            raise ValueError(
+                "bounded selected indexed-row arrays must be contiguous CUDA tensors"
+            )
+        if any(tensor.device != selected_pages.device for tensor in arrays):
+            raise ValueError("bounded selected indexed-row arrays must share a device")
+        if selected_pages.dtype != torch.int64 or selected_pages.numel() == 0:
+            raise ValueError("selected pages must be a non-empty int64 tensor")
+        if cached_pages.dtype != torch.int64 or cached_pages.numel() == 0:
+            raise ValueError("cached pages must be a non-empty int64 tensor")
+        if any(
+            tensor.dtype != torch.int32
+            for tensor in (
+                host_rows,
+                device_rows,
+                selected_rows,
+                source_indices,
+                staging_indices,
+            )
+        ):
+            raise ValueError("bounded selected row mappings must use int32")
+        if copied_rows.dtype != torch.int64 or copied_rows.numel() != 1:
+            raise ValueError("copied-row accounting must be one int64 value")
+        capacity = int(source_indices.numel())
+        if (
+            min(object_count, page_tokens, token_count, capacity) <= 0
+            or host_rows.numel() != token_count
+            or device_rows.numel() != capacity
+            or selected_rows.numel() != capacity
+            or staging_indices.numel() != capacity
+            or capacity % page_tokens != 0
+            or cached_pages.numel() != capacity // page_tokens
+            or selected_pages.numel() > cached_pages.numel()
+        ):
+            raise ValueError("bounded selected indexed-row geometry is invalid")
+        _check(
+            _phase_prepare_bounded_selected_indexed_rows(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
+                selected_pages.data_ptr(),
+                selected_pages.numel(),
+                page_tokens,
+                token_count,
+                host_rows.data_ptr(),
+                device_rows.data_ptr(),
+                cached_pages.data_ptr(),
+                cached_pages.numel(),
+                selected_rows.data_ptr(),
+                source_indices.data_ptr(),
+                staging_indices.data_ptr(),
+                capacity,
+                copied_rows.data_ptr(),
+                _stream_address(stream),
+            )
+        )
+
+    def reduce_mapped_key_pages(
+        self,
+        source: Any,
+        first_row: int,
+        token_count: int,
+        page_tokens: int,
+        output_min: Any,
+        output_max: Any,
+        stream: Any = None,
+    ) -> None:
+        """Reduce pinned host K rows directly into CUDA page envelopes."""
+        import torch
+
+        if (
+            not isinstance(source, torch.Tensor)
+            or source.device.type != "cpu"
+            or not source.is_pinned()
+            or source.ndim != 3
+            or source.dtype not in (torch.float16, torch.bfloat16)
+            or not source.is_contiguous()
+        ):
+            raise ValueError(
+                "mapped key reduction requires contiguous pinned fp16/bf16 rows"
+            )
+        pages = (token_count + page_tokens - 1) // page_tokens
+        expected = (pages, int(source.shape[1]), int(source.shape[2]))
+        if (
+            min(first_row, token_count, page_tokens) < 0
+            or token_count == 0
+            or page_tokens == 0
+            or first_row + token_count > int(source.shape[0])
+            or any(
+                not isinstance(output, torch.Tensor)
+                or output.device.type != "cuda"
+                or output.dtype != torch.float32
+                or tuple(output.shape) != expected
+                or not output.is_contiguous()
+                for output in (output_min, output_max)
+            )
+        ):
+            raise ValueError("mapped key reduction geometry is invalid")
+        _check(
+            _phase_reduce_mapped_key_pages(
+                self._handle,
+                source.data_ptr(),
+                source.shape[0],
+                source.stride(0) * source.element_size(),
+                first_row,
+                token_count,
+                page_tokens,
+                source.shape[1],
+                source.shape[2],
+                0 if source.dtype == torch.float16 else 1,
+                output_min.data_ptr(),
+                output_max.data_ptr(),
                 _stream_address(stream),
             )
         )

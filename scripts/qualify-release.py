@@ -237,6 +237,25 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
     incremental = evidence.get("incremental_execution", {})
     scheduler = evidence.get("scheduler", {})
     sparse = evidence.get("sparse_flashinfer", {})
+    selector_quality = sparse.get("selector_quality", {})
+    selector_recall_valid = (
+        isinstance(selector_quality, dict)
+        and selector_quality.get("budget_matches_serving") is True
+        and isinstance(selector_quality.get("quest_mean_recall"), (int, float))
+        and selector_quality["quest_mean_recall"] >= 0.80
+        and isinstance(selector_quality.get("quest_min_layer_recall"), (int, float))
+        and selector_quality["quest_min_layer_recall"] >= 0.40
+        and isinstance(selector_quality.get("oracle_mean_gap"), (int, float))
+        and selector_quality["oracle_mean_gap"] <= 0.06
+    )
+    selector_task_quality_valid = (
+        isinstance(selector_quality, dict)
+        and selector_quality.get("budget_matches_serving") is True
+        and selector_quality.get("task_quality_parity") is True
+        and selector_quality.get("quality_metric_count", 0) > 0
+        and isinstance(selector_quality.get("max_task_quality_delta"), (int, float))
+        and selector_quality["max_task_quality_delta"] <= 0.01
+    )
     performance = evidence.get("performance", {})
     workload = evidence.get("workload", {})
     return [
@@ -367,6 +386,7 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
             and sparse.get("policy_regret_definition")
             == "same_trial_chosen_over_best"
             and sparse.get("candidate_retained_baseline") is True
+            and (selector_recall_valid or selector_task_quality_valid)
             and isinstance(
                 sparse.get(
                     "minimum_cold_indexed_latency_ratio_to_candidate_retained"
@@ -387,7 +407,8 @@ def osdi_checks(evidence_dir: pathlib.Path, revision: str) -> list[dict[str, Any
             and sparse["maximum_regret_to_offline_oracle"] <= 2.0,
             "requires paired transformed FlashInfer forms, a five-point crossover, "
             "a confidence-bounded overfetch win, same-trial policy regret, "
-            "explicit forced-indexed and resident-candidate costs, and bounded oracle regret",
+            "explicit forced-indexed and resident-candidate costs, same-budget "
+            "task-quality parity or selector-recall evidence, and bounded oracle regret",
         ),
         check(
             "mechanism performance bounds",

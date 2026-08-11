@@ -67,16 +67,38 @@ public:
                                          std::uint32_t firstObject,
                                          std::uint32_t objectCount) const;
   void progressValidatedIndexedHostRangeParallel(
-      cudaStream_t stream, abi::RuntimeView *runtime,
-      std::uint32_t firstObject, std::uint32_t objectCount,
-      std::uint32_t copyBlocksPerGroup) const;
+      cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+      std::uint32_t objectCount, std::uint32_t copyBlocksPerGroup) const;
   // Bound the next validated indexed copy of each listed object to the
   // in-place-rewritten prefix of its registered index arrays. The per-step
   // selection loop uses this to acquire only the current step's misses.
   void setIndexedRowCounts(cudaStream_t stream, abi::RuntimeView *runtime,
-                           std::uint32_t firstObject,
-                           std::uint32_t objectCount,
+                           std::uint32_t firstObject, std::uint32_t objectCount,
                            std::uint32_t rowCount) const;
+  void prepareSelectedIndexedRows(
+      cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+      std::uint32_t objectCount, const std::int64_t *selectedPages,
+      std::uint32_t selectedPageCount, std::uint32_t pageTokens,
+      std::uint32_t tokenCount, const std::uint32_t *hostRows,
+      const std::uint32_t *deviceRows, std::uint32_t *stagedPages,
+      std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+      std::uint32_t capacity, std::uint64_t *copiedRows) const;
+  void prepareBoundedSelectedIndexedRows(
+      cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+      std::uint32_t objectCount, const std::int64_t *selectedPages,
+      std::uint32_t selectedPageCount, std::uint32_t pageTokens,
+      std::uint32_t tokenCount, const std::uint32_t *hostRows,
+      const std::uint32_t *deviceRows, std::int64_t *cachedPages,
+      std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
+      std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+      std::uint32_t capacity, std::uint64_t *copiedRows) const;
+  void reduceMappedKeyPages(cudaStream_t stream, const void *source,
+                            std::uint32_t sourceRows,
+                            std::uint64_t sourceStrideBytes,
+                            std::uint32_t firstRow, std::uint32_t tokenCount,
+                            std::uint32_t pageTokens, std::uint32_t kvHeads,
+                            std::uint32_t headDim, std::uint32_t elementType,
+                            float *outputMin, float *outputMax) const;
   void progressNvme(cudaStream_t stream, abi::RuntimeView *runtime,
                     std::uint32_t issueBudget,
                     std::uint32_t completionBudget) const;

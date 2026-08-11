@@ -211,6 +211,31 @@ def main() -> None:
             "no_selectivity_speedup": 0.99,
             "no_selectivity_forced_indexed_throughput_ratio": 0.61,
             "maximum_regret_to_offline_oracle": 2.0,
+            "selector_quality": {
+                "budget_matches_serving": True,
+                "quest_mean_recall": 0.8134,
+                "quest_min_layer_recall": 0.4394,
+                "oracle_mean_gap": 0.0478,
+            },
+        }
+        (evidence / "osdi-evidence.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        osdi = qualifier.osdi_checks(evidence, "revision")
+        sparse = next(
+            item
+            for item in osdi
+            if item["name"] == "real GPU-selected FlashInfer acquisition"
+        )
+        assert sparse["passed"] is True
+        current["sparse_flashinfer"]["selector_quality"] = {
+            "budget_matches_serving": True,
+            "quest_mean_recall": 0.70,
+            "quest_min_layer_recall": 0.20,
+            "oracle_mean_gap": 0.10,
+            "task_quality_parity": True,
+            "quality_metric_count": 3,
+            "max_task_quality_delta": 0.0,
         }
         (evidence / "osdi-evidence.json").write_text(
             json.dumps(current), encoding="utf-8"
@@ -234,6 +259,23 @@ def main() -> None:
             if item["name"] == "real GPU-selected FlashInfer acquisition"
         )
         assert sparse["passed"] is False
+        current["sparse_flashinfer"]["maximum_regret_to_offline_oracle"] = 2.0
+        current["sparse_flashinfer"]["selector_quality"][
+            "budget_matches_serving"
+        ] = False
+        (evidence / "osdi-evidence.json").write_text(
+            json.dumps(current), encoding="utf-8"
+        )
+        osdi = qualifier.osdi_checks(evidence, "revision")
+        sparse = next(
+            item
+            for item in osdi
+            if item["name"] == "real GPU-selected FlashInfer acquisition"
+        )
+        assert sparse["passed"] is False
+        current["sparse_flashinfer"]["selector_quality"][
+            "budget_matches_serving"
+        ] = True
 
         current["dirty"] = True
         (evidence / "osdi-evidence.json").write_text(

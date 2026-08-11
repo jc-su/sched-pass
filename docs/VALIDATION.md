@@ -1,6 +1,6 @@
 # Validation Record
 
-Date: 2026-08-09
+Date: 2026-08-10
 
 This record supports a locally validated mechanism prototype. It does not
 establish production readiness, an end-to-end serving result, or an OSDI-level
@@ -11,20 +11,16 @@ Tables and command output retain ABI state `Ready` and legacy CLI policy
 runnable work, and device-generated demand; results are not renamed after
 collection.
 
-The source ABI is v25 and the public C API is v23 (v23 adds the per-step
-indexed row-count bound the selected-demand loop uses to acquire only each
-step's misses). ABI v25 makes rejected
-same-generation epoch attribution observable, uses checked request-progress
-subtraction, and keeps stale generations isolated from reused slots. ABI v24
-added exact pending and expected compiler-attributed compute to the contract;
-ABI v23 added a monotonic
-runtime-lifetime failure counter and GPU-side indexed-directory rebinding used
-by asynchronous layer execution. C API v22 adds a reusable, stream-ordered
-pinned-host request-progress snapshot; the typed JIT operator-plan
-query; v17 added the operator-contract query and capture-safe host-to-device
-copy entry point. Focused compiler, C API, Python, and real FlashInfer JIT tests
-plus the complete 46-test CTest suite have been rerun for v25. All executable
-tests passed; the physical multi-GPU test was skipped on the one-GPU host.
+The source ABI is v27 and the public C API is v26. C API v26 adds the bounded
+selected-page cache phase: it validates device-selected identities, assigns
+physical staging slots, emits the consumer row table, and compacts cache misses
+without a host control edge. ABI v27 makes that phase a required JIT-module
+contract, so an older cached module is rejected at load. ABI v27 also added bounded
+dependency sets and compiler-attributed critical-work metadata; earlier ABI
+history remains in the repository log. Focused compiler, C API, Python, and
+real FlashInfer JIT tests plus the complete 53-test CTest suite were rerun for
+v27. Fifty-two tests executed and passed; the physical multi-GPU test reported
+the configured skip on this one-GPU host.
 Current-ABI VFIO correctness and bandwidth were rerun below; a clean-revision
 repeat and multi-platform reliability campaign remain open.
 
@@ -110,9 +106,10 @@ OSDI qualification evidence.
 
 ## Correctness Gates
 
-`ctest --test-dir build --output-on-failure` discovers 47 tests. On this
-single-GPU host, 45 pass and `nta-multi-gpu` reports the configured skip code
-77 because a second physical CUDA device is unavailable. The gates cover:
+`ctest --test-dir build --output-on-failure -j2` discovers 53 tests. On this
+single-GPU host, 52 execute and pass and `nta-multi-gpu` reports the configured
+skip code 77 because a second physical CUDA device is unavailable. The gates
+cover:
 
 1. FlashInfer CSR-to-common-plan validation, including grouped pages and bad
    metadata;
@@ -121,7 +118,7 @@ single-GPU host, 45 pass and `nta-multi-gpu` reports the configured skip code
    rejection of live-state, token, missing-binding, non-inlined-helper,
    lane-divergent control, non-dominating divergent control, and divergent PHI
    operand cases;
-4. host/device ABI v25 layout, including operation epochs, checked progress
+4. host/device ABI v27 layout, including operation epochs, checked progress
    conservation, dropped-attribution telemetry, terminal counters,
    multi-CTA completion state, and the NVMe control-page mirror;
 5. Clang nvcc-shim compilation of a foreign source kernel, including automatic
@@ -187,7 +184,7 @@ calls. Control dependence is computed from the post-dominator tree, including
 branches that do not dominate the marker; uniform PHIs require every incoming
 control dependence to be CTA-uniform. A positive late-bound fixture selects an
 object catalog entry from CTA-uniform GPU state. Lowered modules contain no
-bind/acquire/defer markers and carry ABI-v25 `!nta.acquire` metadata tagged
+bind/acquire/defer markers and carry ABI-v27 `!nta.acquire` metadata tagged
 `split-phase-cta`.
 
 Incremental kernels additionally delimit one numerical region with convergent
@@ -257,6 +254,12 @@ memcheck:  ERROR SUMMARY: 0 errors
 racecheck: 0 hazards displayed (0 errors, 0 warnings)
 synccheck: ERROR SUMMARY: 0 errors
 ```
+
+ABI v27 also ran the real JIT-exported bounded selected-page phase through
+Compute Sanitizer after initial placement, replacement, all-hit replay,
+tail-page handling, and malformed-selection rejection. Memcheck reported zero
+errors, racecheck reported zero hazards and warnings, and synccheck reported
+zero errors.
 
 PTXAS reports no spills. Current key resources are:
 
@@ -477,7 +480,7 @@ exact design and command are in `docs/DEVICE_ROUTED_MOE.md`.
 
 ## GPU-Initiated NVMe
 
-The ABI-v25 controller-free test runs the same compiler-lowered finite CTA and
+The ABI-v27 controller-free test runs the same compiler-lowered finite CTA and
 device transport code against an NVMe queue/control image in CUDA memory. It
 checks that the CTA leader constructs a READ SQE and command context, rings the
 SQ doorbell, leaves its work ticket `Pending`, and exits with no intent. The
@@ -598,6 +601,42 @@ is transformed. The mechanism is therefore active and correct, but it remains
 and lightweight publication reduce the newest 16K cost to 7.0%, but do not
 produce a win. The next gate is a repeated measured arrival-skew crossover
 against layer wait and skip/rebatch, not another forced dense point.
+
+ABI v27 selected-demand serving adds prefix-summary reuse and selected-row
+refresh reuse. The strict `SglangSelectedLoad.py` harness now runs stock and the
+tiered selected NTA arm by default; the legacy dense NTA diagnostic remains
+available with `--include-dense-diagnostic` because its default path can
+dominate the selected experiment without exercising selected demand. On
+Qwen2.5-3B with a 16K host prefix, 2K resident peer, budget 32 pages, refresh
+interval 1024, and no warmup, three dirty-tree seeds produced these
+geometric-mean ratios versus stock:
+
+| Metric | Ratio | Range | Mechanism |
+| --- | ---: | ---: | --- |
+| External P95 TTFT | 0.831x | 0.802x-0.870x | 72 bounded-cache launches, 612 selected-row reuse layers |
+| Resident P99 ITL | 0.891x | 0.726x-1.054x | 684 compiler attention launches, zero stock/fallback |
+| Resident P95 TPOT | 1.085x | 1.055x-1.117x | 512 staging rows versus 16,382 dense rows |
+
+The run is the first repeated mechanism-qualified SGLang signal with external
+TTFT and resident-tail benefit. It is still not a paper-level claim: the tree
+was dirty, clocks were uncontrolled, the quality gate for approximate selected
+attention had not yet been tied to the harness, and resident TPOT remains
+slower than stock.
+
+The stricter same-workload smoke gate now exists. With the same model and
+load shape, budget 32, refresh interval 1024, no load warmup, an attached
+same-budget `QuestRecall.py` report, and `--require-tiered-output-match`, the
+tiered arm preserved generated text exactly while reporting external P95 TTFT
+`0.848x`, resident P99 ITL `0.804x`, and resident P95 TPOT `1.113x` stock.
+Mechanism counters stayed active: 72 bounded-cache launches, 612 selected-row
+reuse layers, 684 compiler attention launches, zero stock attention, zero
+HiCache fallback, and 512 staging rows versus 16,382 dense rows. Budget 64 and
+128 runs with the same output-match gate also preserved text but regressed:
+budget 64 measured external P95 TTFT `1.434x` and resident P99 ITL `1.129x`;
+budget 128 measured external P95 TTFT `6.323x` and resident P99 ITL `3.681x`
+while satisfying the recall diagnostic (`quest_mean_recall=0.813`,
+`oracle_mean_gap=0.048`). This is now a bounded positive plus negative
+crossover, not a universal selected-attention win.
 
 The coalesced load fixture now enables SGLang mixed-chunk batching and releases
 the host-hit request into the running resident batch through the acquisition

@@ -876,15 +876,6 @@ def main() -> None:
     torch.cuda.synchronize()
     if invalid_indexed.native_runtime.sticky_failed_count != sticky_failures:
         raise RuntimeError("epoch reset erased a sticky acquisition failure")
-    if options.sanitizer:
-        print(
-            f"flashinfer_version={flashinfer.__version__} sanitizer_path=pass "
-            f"shared_kv_head_ctas=2 indexed_host=pass indexed_bounds=pass "
-            f"indexed_preload=pass paired_preload=pass ready_wave=pass "
-            f"max_abs_error={maximum:.6g}"
-        )
-        return
-
     split_pages = 256
     split_shape = (split_pages, 2, 16, 2, 128)
     split_host_kv = torch.randn(split_shape, dtype=torch.float16, pin_memory=True)
@@ -1261,11 +1252,19 @@ def main() -> None:
     tiny_hooked_samples = []
     for sample in range(5):
         if sample % 2 == 0:
-            tiny_baseline_samples.append(benchmark(tiny_prefill_baseline_call))
-            tiny_hooked_samples.append(benchmark(tiny_prefill_hooked_call))
+            tiny_baseline_samples.append(
+                benchmark(tiny_prefill_baseline_call, 2 if options.sanitizer else 2_000)
+            )
+            tiny_hooked_samples.append(
+                benchmark(tiny_prefill_hooked_call, 2 if options.sanitizer else 2_000)
+            )
         else:
-            tiny_hooked_samples.append(benchmark(tiny_prefill_hooked_call))
-            tiny_baseline_samples.append(benchmark(tiny_prefill_baseline_call))
+            tiny_hooked_samples.append(
+                benchmark(tiny_prefill_hooked_call, 2 if options.sanitizer else 2_000)
+            )
+            tiny_baseline_samples.append(
+                benchmark(tiny_prefill_baseline_call, 2 if options.sanitizer else 2_000)
+            )
     tiny_baseline_us = statistics.median(tiny_baseline_samples)
     tiny_hooked_us = statistics.median(tiny_hooked_samples)
     tiny_overhead = (tiny_hooked_us / tiny_baseline_us - 1.0) * 100.0
@@ -1354,13 +1353,25 @@ def main() -> None:
     hooked_samples = []
     for sample in range(5):
         if sample % 2 == 0:
-            baseline_samples.append(benchmark(baseline_call))
-            direct_samples.append(benchmark(direct_call))
-            hooked_samples.append(benchmark(hooked_call))
+            baseline_samples.append(
+                benchmark(baseline_call, 2 if options.sanitizer else 2_000)
+            )
+            direct_samples.append(
+                benchmark(direct_call, 2 if options.sanitizer else 2_000)
+            )
+            hooked_samples.append(
+                benchmark(hooked_call, 2 if options.sanitizer else 2_000)
+            )
         else:
-            hooked_samples.append(benchmark(hooked_call))
-            direct_samples.append(benchmark(direct_call))
-            baseline_samples.append(benchmark(baseline_call))
+            hooked_samples.append(
+                benchmark(hooked_call, 2 if options.sanitizer else 2_000)
+            )
+            direct_samples.append(
+                benchmark(direct_call, 2 if options.sanitizer else 2_000)
+            )
+            baseline_samples.append(
+                benchmark(baseline_call, 2 if options.sanitizer else 2_000)
+            )
     baseline_us = statistics.median(baseline_samples)
     direct_us = statistics.median(direct_samples)
     hooked_us = statistics.median(hooked_samples)
@@ -1368,7 +1379,7 @@ def main() -> None:
     torch.testing.assert_close(hooked_output, baseline_output, rtol=2e-3, atol=2e-3)
     direct_overhead = (direct_us / baseline_us - 1.0) * 100.0
     incremental_overhead = (hooked_us / baseline_us - 1.0) * 100.0
-    if direct_overhead > 5.0:
+    if not options.sanitizer and direct_overhead > 5.0:
         raise RuntimeError(
             f"resident direct-form overhead {direct_overhead:.2f}% exceeds 5%"
         )

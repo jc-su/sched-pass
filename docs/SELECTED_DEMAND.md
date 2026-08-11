@@ -1,81 +1,234 @@
-# Selected-Demand Serving (1D) Implementation Plan
+# Device-Selected External Data
 
-Status: declared plan; implementation not started. This is the campaign
-centerpiece defined in `ONE_GPU_EVALUATION.md` (RQ1/1D). Measured inputs it
-builds on: near-oracle envelope selection quality with sink/recent retention
-(`results/serving/quest-recall-*.json`), the 8.17x/2.14x selected-page
-acquisition crossovers with exact parity, and the finding that selection
-economics require 16K+ contexts (short-context attention is inherently
-diffuse). Every stage below lands behind a health check before any timed run.
+Status: bounded-allocation SGLang vertical slice mechanism-qualified on one
+GPU; exact contributors and paper-level performance evidence open.
 
-## Goal
+This document is the implementation boundary for the model-generated-demand
+workload in `ONE_GPU_EVALUATION.md` (RQ1/1D). It deliberately separates three
+facts that earlier prototypes conflated:
 
-One end-to-end serving experiment: SGLang decode where each step's attention
-reads only device-selected KV pages, the unselected pool stays in host tiers,
-selected pages move through the existing indexed acquisition path, and output
-quality is evaluated against dense attention. Gate: `>=1.5x` goodput at
-quality parity against the strongest baseline, n=10, clean revision.
+1. selecting and acquiring external pages without returning their identities to
+   the host;
+2. consuming those pages through compiler-generated operator code; and
+3. avoiding dense HBM allocation for the external prefix.
 
-## Design
+The SGLang adapter now establishes all three through an explicit external
+prefix sidecar created at `init_load_back`, before SGLang allocates KV for the
+request. Virtual token identities preserve sequence position in the request
+table; only a bounded physical staging lease reaches FlashInfer.
 
-1. **Page-summary maintenance.** Per (layer, kv-head, page): key min/max
-   envelopes in HBM, updated incrementally when pages are appended or
-   promoted; invalidated with page eviction through the existing generation
-   machinery. Envelope updates are pure elementwise min/max over the new
-   tokens: no rescan of resident pages.
-2. **Per-step selection.** At each decode step and layer, score envelopes
-   against the live query (`quest_selector.quest_page_scores`, aggregated
-   across the head group because the acquisition unit is a whole page), always
-   retain sink and recent pages, take top-k under the per-request page budget.
-   Selection output is the device-resident selected-index tensor the existing
-   `register_selected_host_pages`/`build_selected_page_work_plan` machinery
-   already consumes.
-3. **Acquisition and caching.** Selected pages resolve through the tier
-   directory: HBM-resident pages consume directly; host/CXL/NVMe pages
-   acquire through the indexed gather path into a staging cache keyed by
-   (page, version) with reuse across steps (temporal locality of selection is
-   the expected hit source; report the measured hit rate).
-4. **Quality evaluation.** Same checkpoint, dense versus selected, on
-   LongBench-style long-context tasks at 16K+; report task metrics and the
-   per-layer attention-mass recall of the deployed selector at the chosen
-   budget. Quality parity is a gate, not an assumption.
+## Problem
 
-## File-by-file
+Sparse attention, fused device routing, and embedding lookup can discover data
+identities only after GPU execution starts. A host scheduler can predict or
+overfetch those identities, but it cannot know the exact current selection
+without a device-to-host control edge. GPU-initiated transfer alone is also not
+enough: the consumer must retain request generation, logical object identity,
+and the numerical rule for combining completed work.
 
-- `python/nta_runtime/quest_selector.py`: add incremental envelope update
-  (`update_page_envelopes(envelopes, appended_tokens)`) and a budgeted
-  selection helper with sink/recent retention; property tests extend
-  `tests/runtime/quest_selector.py` (update equivalence against full
-  recompute; retention invariants).
-- `python/nta_runtime/engines/sglang.py`: a `selected` attention form beside
-  `preloaded`/`incremental`: per-step selection on the compute stream, staging
-  cache lookup, indexed acquisition for misses, compact-table FlashInfer run.
-  Envelope maintenance hooks where HiCache writes device pages (the same
-  mutation points the bridge already observes).
-- `python/nta_runtime/engines/sglang_hicache.py`: expose page-write events to
-  the envelope maintainer; no transfer-path changes.
-- `benchmarks/serving/SglangSelectedLoad.py`: the 1D load harness (long-prompt
-  requests over a host-tiered pool, measured promotions, budgets swept), plus
-  the baseline arms: dense full-promotion, overfetch-candidates, host-side
-  selection with the identity round trip, prediction-based prefetch.
-- `benchmarks/serving/QuestRecall.py`: long-context mode using the verified
-  logit-reconstruction path (no materialized attention) for 16K-32K recall.
+The system therefore needs one path:
 
-## Health-check sequence (each stage gates the next)
+```text
+request generation and external object catalog
+  -> model-generated device selection
+  -> validated device miss compaction
+  -> tier-specific acquisition into bounded HBM
+  -> compiler-generated consumer or exact contributor
+  -> generation-safe publication and engine progress
+```
 
-1. Envelope update equivalence tests (CPU+CUDA, no engine).
-2. Selected form on a resident-only batch: selection runs, output exactly
-   matches dense attention over the same selected set, zero acquisition.
-3. Selected form with host-tiered pages at one budget: exact output versus a
-   reference computed on the same selection; staging-cache hit accounting
-   conserved.
-4. Short timed smoke with mechanism counters asserted (selected launches,
-   bytes avoided, zero fallback) before any qualified series.
+The research claim is not that sparse KV is universal. It is the strongest
+case where the semantic gap is unavoidable: demand is generated by model
+execution, and useful work must be tied back to a live request without asking
+the host which bytes were selected. Dense tier streaming and device-routed MoE
+exercise the same request/object/contributor contract under different data
+geometry.
 
-## Boundaries
+## Implemented Vertical Slice
 
-Per-KV-head selection (finer acquisition unit), CXL as a distinct credited
-tier, and NVMe-backed candidate pools compose later through the same
-directory; none blocks the first 1D result. Speculative or learned selectors
-are out of scope: the claim is about serving device-generated demand, not
-about inventing selectors.
+The installed SGLang 0.5.14 adapter currently implements:
+
+- concurrent generation-tagged claims for external HiCache prefixes;
+- host-source pinning until every asynchronous completion copy has retired;
+- immutable request-table position binding, so allocator slot reuse cannot
+  change prefix identity;
+- live-query Quest-style page scoring and fixed-shape device top-k selection;
+- a CUDA kernel that validates selected logical page IDs, rejects duplicates,
+  compacts only unstaged rows, validates source and destination indices, and
+  publishes the current indexed-object row count without a host identity or
+  count round trip;
+- acquisition through the runtime's validated indexed host path;
+- one compact FlashInfer plan containing every claimed and resident request in
+  the batch; and
+- request-bound compiler-generated FlashInfer decode and paged-prefill
+  wrappers, with explicit activation counters and fail-closed benchmark gates.
+- pre-allocation admission credit for host-only prefix rows, allocator-backed
+  bounded staging, finish-edge reclamation, and live/high-water capacity
+  conservation counters.
+
+The selected path is approximate attention. It runs one compact
+FlashInfer operation over selected external rows plus the resident suffix. It
+does not yet use the exact `(V, LSE)` contributor form in the SGLang selected
+path. Resident requests may use SGLang CUDA graph replay; a batch containing an
+external sidecar is routed to the same NTA selected eager operator and is
+guarded against entering a dense captured graph. Capturing the external
+selected operator itself remains open.
+
+The benchmark `benchmarks/serving/SglangSelectedLoad.py` rejects a tiered run
+unless all of the following are active: external claims and admission credits,
+dense rows avoided, physical staging and its high-water mark, device
+compaction, bounded-cache preparation, compiler-generated attention, copied
+rows, and either bounded-cache row hits or selected-row-table reuse. The
+dense-equivalent high-water mark must exceed physical staging high-water. The
+gate also requires a genuinely selective table, zero HiCache fallback, and zero
+stock-attention launches. A speedup produced by bypassing the mechanism is
+therefore not accepted as NTA evidence. For approximate selected attention, the
+same harness can attach a `QuestRecall.py` selector-quality report and fail
+closed when the report's model, context length, page size, or selected budget
+does not match the serving run. Paper runs must use that gate; output hashes
+alone are not correctness evidence for the approximate operator. For
+deterministic smoke workloads the harness can additionally require selected
+output to match stock text, which is a strict local quality check but does not
+replace task-level evaluation.
+
+ABI v27 adds two optimizations to this path. First, immutable page summaries are
+cached by exact external-prefix identity, host row mapping, layer geometry, and
+page size; repeated claims wait on the original CUDA event instead of rescanning
+host K rows. Second, `NTA_SGLANG_SELECTED_REFRESH_INTERVAL` can reuse the
+staged selected-row table across decode steps while still running compact
+compiler-generated FlashInfer attention. With Qwen2.5-3B, a 16K host prefix,
+a 2K resident peer, budget 32 pages, and refresh interval 1024, three
+dirty-tree runs produced external P95 TTFT geomean `0.831x` stock and resident
+P99 ITL geomean `0.891x`; resident P95 TPOT remained `1.085x` stock. A fourth
+run with the stricter output-match smoke gate and attached same-budget
+`QuestRecall.py` report measured external P95 TTFT `0.848x`, resident P99 ITL
+`0.804x`, resident P95 TPOT `1.113x`, and exact generated-text parity. Every
+budget-32 run used zero stock attention and zero HiCache fallback, reduced live
+staging to 512 rows versus 16,382 dense rows, executed 72 bounded-cache
+launches, 612 selected-row reuse layers, and 684 compiler attention launches.
+
+The same run also establishes the current boundary. Budget 64 preserves output
+but regresses to external P95 TTFT `1.434x` and resident P99 ITL `1.129x`.
+Budget 128 satisfies the recall diagnostic gate (`quest_mean_recall=0.813`,
+`oracle_mean_gap=0.048`) and preserves output, but regresses to external P95
+TTFT `6.323x` and resident P99 ITL `3.681x` because the current compact
+FlashInfer form moves and consumes too many selected rows. The mechanism has a
+winning low-budget point on this workload, but the high-recall point is not
+paper-ready; it needs a finer acquisition/quality unit or a lower-overhead
+selected attention form before it can carry an OSDI headline.
+
+## Bounded HBM Contract
+
+`BoundedStagingPool` owns one preallocated layered CUDA K/V allocation. It
+leases fixed row ranges with a monotonically changing generation and does not
+return a retired range until its completion fence has passed. Capacity,
+current ownership, and high-water bytes derive from the real CUDA allocation.
+The canonical exact-partial FlashInfer tier-streaming operator now uses this
+pool, so its bounded-HBM result and graph-stable addresses come from shared
+runtime code rather than benchmark-local tensor lists.
+
+ABI v27 also provides a fused mapped-host summary phase. It reads pinned FP16
+or BF16 K rows directly from GPU code and writes only FP32 min/max envelopes to
+HBM. On this host, a paired 16K-row diagnostic measured 0.185 ms for mapped
+reduction and 0.174 ms for optimized copy-and-reduce while another SGLang
+process held the GPU. The result is diagnostic, not qualification evidence;
+copy-and-reduce remains the default and `NTA_SGLANG_SUMMARY_PATH=mapped`
+selects the no-scratch path for a controlled transport-geometry sweep.
+
+The SGLang adapter represents an external prefix without allocating dense
+device-token slots through this contract:
+
+```text
+ExternalPrefix {
+  request_id, generation
+  logical token/page count
+  source object IDs and versions
+  resident suffix table
+  bounded staging lease
+  cancellation and completion fence
+}
+```
+
+The attention adapter then executes either:
+
+- selected mode: selected external pages in the staging lease plus the
+  resident suffix; or
+- exact mode: request-local partials over resident and external ranges,
+  followed by an ordered exact merge after every current-generation
+  contributor completes.
+
+The sidecar uses a disjoint int32 virtual namespace and intercepts cache
+insertion, request-table release, and allocator free. Virtual values are never
+passed to the physical allocator or FlashInfer. The adapter fails closed for
+page sizes other than one, SWA/Mamba components, unsupported calling
+conventions, staging exhaustion, or lost retirement ownership.
+
+Each claim also owns a per-layer page-to-slot table inside its bounded lease.
+The device phase validates the selected logical page set, protects pages in the
+current set from replacement, assigns misses to deterministic physical slots,
+emits FlashInfer's physical row table in selected order, and rewrites the
+indexed transfer list with misses only. Repeated pages therefore reuse staged
+K/V without a host identity or miss-count readback. The cache dies with the
+generation-tagged claim and its rows cannot be recycled before the completion
+fence.
+
+For a coalesced decode batch, selected-list preparation records a CUDA event
+and the miss-only indexed copies run on the claim transfer stream. Resident
+peer requests execute first through a request-bound compiler-generated
+FlashInfer wrapper. Only the external request group waits for the copy event,
+then it executes through the same compiler-generated family. Request-slot
+offsets are checked for each contiguous subgroup; an interleaved group takes
+the unsplit NTA form rather than using stock attention. The registered
+selected-load experiment uses coalesced batching and rejects a run with zero
+overlap layers.
+
+## Compiler and Runtime Roles
+
+The typed FlashInfer frontend retains request and tile coordinates before they
+are erased by pointer arithmetic. The LLVM pass remains the backend legality
+checker and lowering stage. It proves CTA-uniform acquisition control,
+generation continuity, a legal finite exit, and exactly-once partial
+publication. It does not infer sparse selection semantics from arbitrary NVVM
+address expressions.
+
+The runtime owns fixed-capacity request, object, dependency, runnable-work, and
+staging structures. Selected identities stay on the device. CPU DRAM uses the
+validated indexed gather. NVMe uses the same object/version dependency but a
+different queue and completion implementation. NVMe completion must still be
+consumed in CQ ring order by bounded progress work; a consumer CTA cannot poll
+the completion slot associated with its own submission because NVMe may
+complete commands out of submission order.
+
+## Remaining Vertical Work
+
+1. Feed writeback-time page summaries into the selector. ABI v27 caches
+   summaries across repeated claims, but the first claim still scans every key
+   once before selection.
+2. Execute selected external and resident ranges through the compiler-generated
+   exact contributor form where exact attention is required; retain compact
+   approximate mode as a quality-gated policy option.
+3. Capture the fixed-shape selection, miss compaction, finite acquisition, and
+   consumer sequence with graph-stable staging leases.
+4. Connect selected NVMe objects to the same claim lifecycle after CPU-DRAM
+   behavior passes; do not infer NVMe benefit from DRAM measurements.
+5. Add a second real operator family. Device-routed MoE is valid only if expert
+   identity remains device-side through acquisition and consumption.
+
+## Evaluation Gates
+
+Correctness precedes performance:
+
+- exact output parity for exact forms and task-quality parity for selected
+  approximate forms;
+- invalid page IDs, duplicate IDs, cancellation, request-slot reuse, and stale
+  completion all fail closed;
+- physical bytes, dense-equivalent bytes, staging capacity, and staging
+  high-water bytes are first-class metrics;
+- every measured NTA arm proves compiler, acquisition, and engine-lifecycle
+  activation and reports zero fallback; and
+- resident P99 inter-token latency stays within `1.05x` of stock.
+
+The headline gate remains an end-to-end goodput improvement at matched quality
+and a capacity point that dense promotion cannot admit. Existing operator
+speedups and the current SGLang diagnostic do not satisfy that gate by
+themselves.

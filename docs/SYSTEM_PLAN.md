@@ -1,8 +1,8 @@
 # Request-Aware Incremental GPU Operators
 
-Status: canonical research and implementation roadmap; compiler/runtime
-mechanism implemented, completion-driven FlashInfer serving and OSDI evidence
-open
+Status: canonical research and implementation roadmap; compiler/runtime plus
+bounded external-prefix SGLang slice implemented, exact contributor serving
+and OSDI evidence open
 
 This document defines the revised problem, co-design, implementation order, and
 claim boundary. `ARCHITECTURE.md` remains the mechanism contract. Historical
@@ -262,6 +262,25 @@ FlashInfer partials overlap transfer, followed by an engine decision that uses
 the exported progress. Transfer tuning on early-known dense demand is not
 sufficient evidence for the paper thesis.
 
+The ABI v27 selected-demand path provides the first positive SGLang signal after
+that reset. Prefix-summary reuse avoids rescanning host K rows on repeated
+claims, selected-row refresh reuse cuts bounded-cache preparation from 684 to 72
+launches on the 16K diagnostic, and adaptive no-split execution keeps the mixed
+batch in one compiler-generated compact FlashInfer launch after selected rows
+are staged. Three dirty-tree Qwen2.5-3B seeds at 16K host + 2K resident, budget
+32 pages, refresh interval 1024, reported external P95 TTFT `0.831x` stock and
+resident P99 ITL `0.891x`, with zero fallback/stock and 512 staging rows versus
+16,382 dense rows. Resident P95 TPOT is still `1.085x` stock, so the current
+next gate is quality-controlled goodput and resident-throughput recovery, not a
+paper claim. A stricter budget-32 smoke rerun with same-budget selector-quality
+metadata and required output parity measured external P95 TTFT `0.848x` and
+resident P99 ITL `0.804x`, but budget 64 and 128 regressed despite output
+parity. The high-recall budget-128 point meets the recall diagnostic and still
+loses badly, which makes the next implementation target precise: reduce the
+cost of high-quality selection, for example by using a finer quality unit or a
+lower-overhead selected attention form, before treating selected demand as a
+paper headline.
+
 ### 4.2 Runtime: schedule data and computation together
 
 The runtime maintains four bounded structures:
@@ -340,7 +359,7 @@ Implemented today are:
 - direct HBM and mapped-DRAM consumption, staged DRAM, a retained
   `(object_id, version)` HBM staging entry, a hard byte budget for staging
   allocations owned by the runtime, and one-queue VFIO NVMe;
-- ABI-v25 work metadata carrying request reduction groups, contributor counts,
+- ABI-v27 work metadata carrying request reduction groups, contributor counts,
   unavailable bytes, and estimated compute cost;
 - per-request pending/runnable/completed/expected compute, blocked-byte, and
   complete-contributor summaries with generation-stamped identities;
@@ -361,7 +380,16 @@ Implemented today are:
   have predicted value;
 - a real FlashInfer GPU-selected page path with a stable device-only index
   table, bounded source/destination validation, cold and retained staging, and
-  a no-oracle bulk-versus-indexed cost decision; and
+  a no-oracle bulk-versus-indexed cost decision;
+- a shared bounded CUDA K/V staging owner with generation-changing leases,
+  completion-fenced reuse, allocation-derived HBM accounting, and a production
+  caller in the exact-partial FlashInfer operator;
+- an SGLang selected-demand path with pre-allocation external-prefix
+  interception, bounded physical staging, per-layer device page-to-slot
+  retention, live-query selection, device-only miss compaction and validation,
+  concurrent generation-tagged claims, pinned source lifetime, and
+  compiler-generated request-bound FlashInfer consumption, including
+  coalesced-batch peer execution overlapped with external miss transfer; and
 - an SGLang HiCache adapter that publishes request generations and priorities,
   preserves exact page-map identity, exposes the complete demand path and the
   transformed direct path, consumes generation-checked compiler progress in
@@ -374,8 +402,9 @@ complete-data and incremental launch forms from one typed operator, a second
 Triton/MLIR or TileLang frontend, a measured elastic
 range-coalescing objective, runtime-generic HBM eviction/refcounts, graph replay
 inside SGLang's full model graph, deadline/slack propagation into the admission
-consumer, end-to-end serving use of the GPU-selected path, multiple NVMe queue
-pairs, a vLLM adapter, or RNIC/RDMA. Current-ABI VFIO NVMe has one
+consumer, an external-prefix engine allocation state, exact contributors and
+graph replay in the selected SGLang path, multiple NVMe queue pairs, a vLLM
+adapter, or RNIC/RDMA. Current-ABI VFIO NVMe has one
 single-controller local
 qualification point, not the multi-platform reliability evidence required for
 production. Local dense CPU-DRAM traces have not established the P0 opportunity;
@@ -623,7 +652,7 @@ before the last page arrives and matches stock output.
 - Replace capacity scans with changed-object propagation, urgency buckets, and
   compact runnable queues. Changed-object propagation and transport urgency are
   implemented; exact compact launch sizing remains open.
-- Export per-request progress and blocked-data summaries. ABI v25 exports
+- Export per-request progress and blocked-data summaries. ABI v27 exports
   pending, runnable, completed, and expected compute plus unavailable bytes,
   checked conservation, and dropped-attribution telemetry.
 - Rank data and executable contributors from current request critical work.
@@ -664,7 +693,7 @@ admission state.
 ### P5: NVMe scale and reliability
 
 - Preserve the historical ABI-v18 single-controller qualification as a
-  regression, rerun it on ABI v25, and repeat it across platforms.
+  regression, rerun it on ABI v27, and repeat it across platforms.
 - Add multiple queue pairs and depth/transfer sizing from Little's law.
 - Separate buffer lifetime from transport lifetime and validate backpressure,
   timeout, reset, cancellation, and stale completion behavior.
@@ -696,8 +725,9 @@ demand.
 - Validate multi-GPU ownership and isolation on physical hardware.
 - Run long-context datasets with randomized variant order and controlled clocks.
 - Compare against direct access, Strata-style coalesced scheduling, ECHO-style
-  sparse prefetch, Syncopate-style chunk overlap, CPU completion, and persistent
-  GPU progress where artifacts permit.
+  sparse prefetch, SparseServe/SPIN-style hierarchical sparse serving,
+  Syncopate-style chunk overlap, CPU completion, and persistent GPU progress
+  where artifacts permit.
 
 Gate: every claim maps to a clean revision, real workload, matched baseline,
 confidence interval, and published raw artifact.
@@ -737,7 +767,7 @@ The following are established techniques and remain necessary system parts:
 
 The candidate contribution is:
 
-> A compiler-verified arrival-driven contributor form for finite batched GPU
+> A compiler-checked arrival-driven contributor form for finite batched GPU
 > operators: request-owned CTAs may exit before acquiring external data, later
 > execute a zero-frame numerical region, publish exactly one reduction
 > contributor, and expose exact remaining data and compute to one SLO policy
@@ -764,11 +794,20 @@ batch decisions.
 ECHO is the required sparse comparison. Sparse offload, graph-friendly recall,
 and indexer/recall overlap are not independent contributions.
 
+SparseServe and SPIN further remove selective transfer, layer-bounded staging,
+per-request sparse working sets, and a common hierarchical page abstraction
+from the novelty claim. They are required capacity/goodput and quality controls.
+The remaining distinction must come from mechanically checked contributor
+execution across finite invocations and its request-lifecycle feedback, not a
+new cache policy.
+
 Primary sources:
 
 - [Syncopate](https://www.usenix.org/conference/osdi26/presentation/qiang)
 - [Strata](https://www.usenix.org/conference/osdi26/presentation/xie-zhiqiang)
 - [ECHO](https://www.usenix.org/conference/osdi26/presentation/liu-guangda)
+- [SparseServe](https://arxiv.org/abs/2509.24626)
+- [SPIN](https://arxiv.org/abs/2604.26837)
 - [FlashInfer top-k](https://docs.flashinfer.ai/api/topk.html)
 - [FlashInfer sparse attention](https://docs.flashinfer.ai/api/sparse.html)
 
@@ -787,7 +826,8 @@ Not allowed:
 - fine-grained acquisition always beats bulk transfer;
 - GPU I/O, a descriptor, worklists, or the LLVM pass is novel by itself;
 - custom CUDA fixtures establish production performance;
-- NTA beats Strata, Syncopate, or ECHO without matched artifacts; or
+- NTA beats Strata, Syncopate, ECHO, SparseServe, or SPIN without matched
+  artifacts; or
 - local qualification establishes production or OSDI readiness.
 
 Stop or narrow the project if:
@@ -833,7 +873,7 @@ and a bounded-HBM crossover. The next order is therefore fixed:
    generation-identity, and exactly-once publication proofs.
 4. Consume that generated plan in SGLang paged prefill and decode, including
    CUDA graph replay, cancellation, and slot reuse with zero stock fallback.
-5. Consume ABI-v25 critical-work snapshots in SGLang admission and acquisition
+5. Consume ABI-v27 critical-work snapshots in SGLang admission and acquisition
    grouping, then compare atomic promotion, layer wait, and skip/rebatch from
    identical request/cache states. The policy may use only current progress and
    online service calibration, never a future-arrival trace.

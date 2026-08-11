@@ -36,7 +36,7 @@ shape). CPU-DRAM performance claims therefore use the copy engine. NVMe must be
 measured separately because its queue, latency, and P2P path are physically
 different.
 
-## Research Questions And Execution Plan (2026-08-09)
+## Research Questions And Execution Plan (2026-08-10)
 
 This section is the authoritative campaign plan. The E0-E5 matrix below remains
 the detailed sweep inventory; each sweep now serves exactly one of four
@@ -50,7 +50,7 @@ one or two RQs:
 2. Execution should advance only at exact, independently committable
    contributor boundaries; byte arrival and CTA completion are not progress.
    The dense negative series is this insight's boundary evidence (RQ2, RQ3).
-3. The contributor commit and suspension contract is compiler-verifiable, and
+3. The contributor commit and suspension contract is compiler-checkable, and
    must be: the post-dominance control-dependence defect was invisible to
    review and caught only by mechanical checking (RQ3).
 
@@ -194,6 +194,10 @@ recorded lever if task quality demands it. Operating decision for 1D: enter
 the engine stage at budgets 128 and 256 (87.5% and 75% byte avoidance,
 whose acquisition speedups are already measured at 4.12x and 2.13x), and
 let the task-quality gate — not recall — select the shipping point.
+`SglangSelectedLoad.py` now accepts a same-budget `QuestRecall.py` report and
+turns those recall numbers into a hard gate, so a selected-serving speedup is
+not publishable unless the quality artifact matches the serving model, context
+length, page size, and selected-page budget.
 
 Qwen3-30B-A3B was smoke-verified on this host on 2026-08-09 through stock
 SGLang 0.5.14 with full decode CUDA graphs (4 requests, 255.9 output
@@ -244,6 +248,71 @@ reference path (dual wrappers, byte verification, device-vs-reference
 selection cross-check); `=fast` runs the timed fast path plus per-layer
 independent recomputation. The n=10 campaign starts only after the rerun
 shows tiered at parity or better against dense promotion.
+
+**Optimization ladder, measured (single trials, tiered vs dense; artifacts
+`results/serving/selected-load-16k-b128-{first,decodefast,extendfast,scan,
+misspath}.json`):** external TTFT p95 7.50x → 5.52x (decode fast path) →
+5.83x (extend fast path — which proved the residual was not extend
+orchestration) → 2.18x (streamed envelope scan) → 1.96x (device-side miss
+staging, fp16 reductions); resident P99 ITL 8.04x → ~1.0x (parity from the
+decode round on); resident TPOT p95 7.74x → 1.01x. The extend round's flat
+TTFT localized the true cost: the claim-time envelope build was a 36-layer
+CPU gather over 16K rows (~0.4s). The streamed scan moves key bytes once
+through an 8MB GPU scratch (~295MB, no HBM capacity held) and is verified
+bit-exact against the CPU reference — min/max are order-invariant, so
+unlike the attention cross-check this equality is exact by construction.
+
+**Serving-integrity finding (claim supersession):** arrivals outpace
+decode (83ms spacing vs ~400ms of decode), so the original single-claim
+implementation superseded live requests. Those requests then fell through to
+dense attention over a prefix that was ~84% unstaged, silently reading stale
+pool rows. A deferred-completion repair was also unsound because SGLang could
+recycle the released host rows before the deferred copy. The implementation
+now owns concurrent claims by monotonically increasing claim ID, assigns each
+claim a generation-tagged fixed object-directory range, and scans the whole
+batch so every live external request is compacted in the same FlashInfer plan.
+Partial slot-number collisions cannot bind an unowned claim; after first use,
+request identity is authoritative. A claim retires only at request finish,
+cancellation, or backend shutdown.
+
+The same gate then exposed the deeper invariant: SGLang's host-node
+protection is keyed to load completion, and a claim that fakes producer
+completion forfeits it at birth — `loading_check` unlocks the host radix
+nodes as soon as the finish event fires, and churn write-back recycles
+the claim's host rows while it is still staging from them (observed as
+staged-vs-host divergence whose staged side held the scan-era bytes).
+Stage-time byte verification cannot catch this class — it compares the
+copy against the same recycled source — which is why the mechanism, not
+a check, had to change: a claimed load now holds its `HiCacheAck` until
+`retire()`, keeping the host source lock-pinned for the claim's entire
+lifetime. Tiered serving's correctness contract is therefore explicit:
+**the claim pins its host source; release and completion are one
+atomic scheduler-thread event.** Retirement replaces SGLang's already-fired
+producer completion with an event recorded after the final copy or attention
+consumer on the actual CUDA stream, so host-row recycling cannot race DMA.
+
+The SGLang adapter now establishes the mechanism needed for an HBM-capacity
+result: it intercepts load-back before dense allocation, represents the host
+prefix with virtual request-table IDs, and leases only the selected-row budget
+from the physical allocator. Request finish retires the claim and returns the
+lease after its CUDA completion fence. One 1,022-token Qwen2.5-3B smoke used
+256 physical rows and avoided 766 dense slots with allocator conservation.
+That single point is a correctness/capacity checkpoint, not an admission,
+goodput, latency, or OSDI-level result.
+
+ABI v27 removes two additional bypasses from this prototype. Selected page
+identities and the miss count now remain on the GPU through validation,
+hit filtering, indexed-list construction, and acquisition; the compact table
+is consumed by request-bound compiler-generated FlashInfer wrappers. ABI v27
+adds bounded physical page placement: repeated selected pages remain in their
+per-layer staging slots and only misses are copied. The 1D harness rejects zero
+compiler launches, zero device compaction, zero cache launches or hits, zero
+copied rows, a nonselective table, or any fallback. A fused mapped-host summary phase
+also eliminates the temporary K staging buffer. A paired 16K-row local
+diagnostic measured that phase at 0.185 ms versus 0.174 ms for optimized
+copy-and-reduce, so copy-and-reduce remains the default until an uncontended
+shape sweep finds a crossover. These are implementation facts, not a new
+serving result; the three-arm workload must be rerun on ABI v27.
 
 Go/no-go: if the integrated streaming operator cannot beat the layer-wise arm
 at real opportunity points by `>=1.10x` with the direct path within `3%`, and
@@ -540,7 +609,7 @@ For each geometry, replay at least four arrival orders: homogeneous, one delayed
 request, interleaved tiers within every request, and an adversarial order that
 delays the lowest-index contributor. Deterministic output must be independent of
 arrival order. Compare three online scores from the same current state: CTA
-count only, bytes plus transport time, and ABI-v25 critical work (data service
+count only, bytes plus transport time, and ABI-v27 critical work (data service
 plus pending/runnable compute). This isolates whether compiler-attributed cost
 and the request bridge improve decisions beyond trivial ordering.
 
@@ -675,6 +744,13 @@ Runnable now:
 - real FlashInfer GPU top-k page selection feeding a stable device index table,
   bounded pinned-host gather, compact paged decode, matched candidate
   overfetch, and a precomputed selected-copy oracle;
+- an SGLang external-prefix sidecar that avoids dense KV allocation, retains
+  selected pages in bounded per-layer physical slots, copies only misses, and
+  consumes physical tables through compiler-generated FlashInfer wrappers;
+- a coalesced decode form that executes resident request subgroups while
+  external miss-only transfers run on separate CUDA streams, with evidence
+  gates requiring positive overlap, cache reuse, zero fallback, and zero stock
+  attention;
 - GPU-initiated VFIO NVMe mechanism and preliminary hardware trials; and
 - GPU-hidden-state top-k MoE routing with device-built dependencies plus
   matched `late-bound` (legacy CLI name), `cpu-sync`, and `overfetch` controls;
@@ -726,7 +802,7 @@ throughput, 1.048x resident P99 inter-token latency, and 1.295x external TTFT;
 it was removed. Dense admission shifting is therefore a rejected ablation, not
 the primary result.
 
-ABI v25 exports blocked-byte, pending-compute, executable-compute,
+ABI v27 exports blocked-byte, pending-compute, executable-compute,
 completed-compute, and expected-compute summaries plus observable dropped
 attribution. The device
 transport queue recomputes deadline urgency from live queue delay, transfer

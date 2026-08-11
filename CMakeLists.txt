@@ -334,6 +334,21 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_plugin.py
     )
     add_test(
+      NAME nta-selected-serving-evidence
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/selected_serving_evidence.py
+    )
+    add_test(
+      NAME nta-selected-request-overlap
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/selected_request_overlap.py
+    )
+    add_test(
+      NAME nta-bounded-staging
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/bounded_staging.py
+    )
+    add_test(
       NAME nta-python-runtime
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/python_runtime.py
@@ -369,7 +384,10 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity_study.py
     )
     set_tests_properties(
-      nta-request-slots nta-sglang-plugin nta-qualification-runner
+      nta-request-slots nta-sglang-plugin nta-selected-serving-evidence
+      nta-selected-request-overlap
+      nta-bounded-staging
+      nta-qualification-runner
       nta-qualification-evidence nta-serving-evidence nta-jit-operator-family
       nta-opportunity-analysis
       nta-opportunity-study
@@ -381,6 +399,12 @@ if(NTA_ENABLE_CUDA)
       TIMEOUT 60
     )
     set_tests_properties(nta-request-slots PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    )
+    set_tests_properties(nta-selected-request-overlap PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    )
+    set_tests_properties(nta-bounded-staging PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
     )
     set_tests_properties(nta-opportunity-analysis PROPERTIES
@@ -522,6 +546,10 @@ if(NTA_ENABLE_CUDA)
     set_tests_properties(
       nta-flashinfer-jit-compile nta-flashinfer-hooked-decode
       PROPERTIES RUN_SERIAL TRUE TIMEOUT 300
+    )
+    set_tests_properties(
+      nta-indexed-row-count-seam
+      PROPERTIES DEPENDS nta-flashinfer-jit-compile
     )
   endif()
 

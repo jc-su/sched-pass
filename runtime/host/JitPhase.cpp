@@ -33,8 +33,26 @@ using AliasPreloadedObjects = cudaError_t (*)(void *, std::uint32_t,
 using ProgressHost = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using ProgressIndexedHostRange = cudaError_t (*)(void *, std::uint32_t,
                                                  std::uint32_t, cudaStream_t);
-using ProgressIndexedHostRangeParallel = cudaError_t (*)(
-    void *, std::uint32_t, std::uint32_t, std::uint32_t, cudaStream_t);
+using ProgressIndexedHostRangeParallel = cudaError_t (*)(void *, std::uint32_t,
+                                                         std::uint32_t,
+                                                         std::uint32_t,
+                                                         cudaStream_t);
+using PrepareSelectedIndexedRows = cudaError_t (*)(
+    void *, std::uint32_t, std::uint32_t, const std::int64_t *, std::uint32_t,
+    std::uint32_t, std::uint32_t, const std::uint32_t *, const std::uint32_t *,
+    std::uint32_t *, std::uint32_t *, std::uint32_t *, std::uint32_t,
+    std::uint64_t *, cudaStream_t);
+using PrepareBoundedSelectedIndexedRows = cudaError_t (*)(
+    void *, std::uint32_t, std::uint32_t, const std::int64_t *, std::uint32_t,
+    std::uint32_t, std::uint32_t, const std::uint32_t *, const std::uint32_t *,
+    std::int64_t *, std::uint32_t, std::uint32_t *, std::uint32_t *,
+    std::uint32_t *, std::uint32_t, std::uint64_t *, cudaStream_t);
+using ReduceMappedKeyPages = cudaError_t (*)(const void *, std::uint32_t,
+                                             std::uint64_t, std::uint32_t,
+                                             std::uint32_t, std::uint32_t,
+                                             std::uint32_t, std::uint32_t,
+                                             std::uint32_t, float *, float *,
+                                             cudaStream_t);
 using ProgressNvme = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                                      cudaStream_t);
 using Publish = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
@@ -121,6 +139,13 @@ struct JitPhaseProgram::Impl {
               "nta_jit_progress_validated_indexed_host_range_parallel");
       setIndexedRowCounts = load<ProgressIndexedHostRangeParallel>(
           library, "nta_jit_set_indexed_row_counts");
+      prepareSelectedIndexedRows = load<PrepareSelectedIndexedRows>(
+          library, "nta_jit_prepare_selected_indexed_rows");
+      prepareBoundedSelectedIndexedRows =
+          load<PrepareBoundedSelectedIndexedRows>(
+              library, "nta_jit_prepare_bounded_selected_indexed_rows");
+      reduceMappedKeyPages = load<ReduceMappedKeyPages>(
+          library, "nta_jit_reduce_mapped_key_pages");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
       publish = load<Publish>(library, "nta_jit_publish_ready");
       complete = load<Complete>(library, "nta_jit_complete_launched");
@@ -154,6 +179,9 @@ struct JitPhaseProgram::Impl {
   ProgressIndexedHostRangeParallel progressValidatedIndexedHostRangeParallel =
       nullptr;
   ProgressIndexedHostRangeParallel setIndexedRowCounts = nullptr;
+  PrepareSelectedIndexedRows prepareSelectedIndexedRows = nullptr;
+  PrepareBoundedSelectedIndexedRows prepareBoundedSelectedIndexedRows = nullptr;
+  ReduceMappedKeyPages reduceMappedKeyPages = nullptr;
   ProgressNvme progressNvme = nullptr;
   Publish publish = nullptr;
   Complete complete = nullptr;
@@ -325,9 +353,77 @@ void JitPhaseProgram::setIndexedRowCounts(cudaStream_t stream,
     throw std::invalid_argument(
         "JIT indexed row-count update needs a runtime, objects, and rows");
   }
-  check(impl_->setIndexedRowCounts(runtime, firstObject, objectCount,
-                                   rowCount, stream),
+  check(impl_->setIndexedRowCounts(runtime, firstObject, objectCount, rowCount,
+                                   stream),
         "nta_jit_set_indexed_row_counts");
+}
+
+void JitPhaseProgram::prepareSelectedIndexedRows(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount, const std::int64_t *selectedPages,
+    std::uint32_t selectedPageCount, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, const std::uint32_t *hostRows,
+    const std::uint32_t *deviceRows, std::uint32_t *stagedPages,
+    std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+    std::uint32_t capacity, std::uint64_t *copiedRows) const {
+  if (runtime == nullptr || selectedPages == nullptr || hostRows == nullptr ||
+      deviceRows == nullptr || stagedPages == nullptr ||
+      sourceIndices == nullptr || stagingIndices == nullptr ||
+      copiedRows == nullptr || objectCount == 0 || selectedPageCount == 0 ||
+      pageTokens == 0 || tokenCount == 0 || capacity == 0) {
+    throw std::invalid_argument(
+        "JIT selected-row preparation needs bounded device arrays");
+  }
+  check(impl_->prepareSelectedIndexedRows(
+            runtime, firstObject, objectCount, selectedPages, selectedPageCount,
+            pageTokens, tokenCount, hostRows, deviceRows, stagedPages,
+            sourceIndices, stagingIndices, capacity, copiedRows, stream),
+        "nta_jit_prepare_selected_indexed_rows");
+}
+
+void JitPhaseProgram::prepareBoundedSelectedIndexedRows(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount, const std::int64_t *selectedPages,
+    std::uint32_t selectedPageCount, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, const std::uint32_t *hostRows,
+    const std::uint32_t *deviceRows, std::int64_t *cachedPages,
+    std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
+    std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+    std::uint32_t capacity, std::uint64_t *copiedRows) const {
+  if (runtime == nullptr || selectedPages == nullptr || hostRows == nullptr ||
+      deviceRows == nullptr || cachedPages == nullptr ||
+      selectedRows == nullptr || sourceIndices == nullptr ||
+      stagingIndices == nullptr || copiedRows == nullptr || objectCount == 0 ||
+      selectedPageCount == 0 || pageTokens == 0 || tokenCount == 0 ||
+      cacheSlotCount == 0 || capacity == 0) {
+    throw std::invalid_argument(
+        "JIT bounded selected-row preparation needs bounded device arrays");
+  }
+  check(impl_->prepareBoundedSelectedIndexedRows(
+            runtime, firstObject, objectCount, selectedPages, selectedPageCount,
+            pageTokens, tokenCount, hostRows, deviceRows, cachedPages,
+            cacheSlotCount, selectedRows, sourceIndices, stagingIndices,
+            capacity, copiedRows, stream),
+        "nta_jit_prepare_bounded_selected_indexed_rows");
+}
+
+void JitPhaseProgram::reduceMappedKeyPages(
+    cudaStream_t stream, const void *source, std::uint32_t sourceRows,
+    std::uint64_t sourceStrideBytes, std::uint32_t firstRow,
+    std::uint32_t tokenCount, std::uint32_t pageTokens, std::uint32_t kvHeads,
+    std::uint32_t headDim, std::uint32_t elementType, float *outputMin,
+    float *outputMax) const {
+  if (source == nullptr || outputMin == nullptr || outputMax == nullptr ||
+      sourceRows == 0 || sourceStrideBytes == 0 || tokenCount == 0 ||
+      pageTokens == 0 || kvHeads == 0 || headDim == 0 || elementType > 1) {
+    throw std::invalid_argument(
+        "JIT mapped key reduction needs bounded source and output geometry");
+  }
+  check(impl_->reduceMappedKeyPages(source, sourceRows, sourceStrideBytes,
+                                    firstRow, tokenCount, pageTokens, kvHeads,
+                                    headDim, elementType, outputMin, outputMax,
+                                    stream),
+        "nta_jit_reduce_mapped_key_pages");
 }
 
 void JitPhaseProgram::progressValidatedIndexedHostRangeParallel(
@@ -374,9 +470,10 @@ void JitPhaseProgram::complete(cudaStream_t stream, abi::RuntimeView *runtime,
         "nta_jit_complete_launched");
 }
 
-void JitPhaseProgram::completeStreamOrdered(
-    cudaStream_t stream, abi::RuntimeView *runtime,
-    const abi::WorkItem *workItems, std::uint32_t workItemCount) const {
+void JitPhaseProgram::completeStreamOrdered(cudaStream_t stream,
+                                            abi::RuntimeView *runtime,
+                                            const abi::WorkItem *workItems,
+                                            std::uint32_t workItemCount) const {
   if (runtime == nullptr || workItems == nullptr || workItemCount == 0) {
     throw std::invalid_argument(
         "stream-ordered completion needs a runtime and exact work plan");

@@ -331,7 +331,19 @@ template <typename Params>
 [[nodiscard]] __device__ __forceinline__ bool
 shouldRun(const Params &params, abi::RuntimeView *runtime,
           const kernel::WorkContext &work) {
-  return !tracksCompletion(params) || shouldRun(runtime, work);
+  if (!tracksCompletion(params)) {
+    return true;
+  }
+  // Ticket state is mutated by sibling CTAs. Independent global loads can
+  // therefore split one CTA around the early return and leave only part of it
+  // entering FlashInfer's barrier-bearing numerical body. Snapshot once and
+  // broadcast the decision collectively.
+  __shared__ std::uint32_t runDecision;
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    runDecision = shouldRun(runtime, work) ? 1U : 0U;
+  }
+  __syncthreads();
+  return runDecision != 0;
 }
 
 // FlashInfer maps one canonical x-coordinate to one or more y/z head CTAs.

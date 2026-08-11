@@ -54,11 +54,11 @@ The branch contains a working LLVM 22 new-PM pass and real Blackwell CUDA
 workloads:
 
 - per-CTA request/generation binding in batched kernels;
-- compiler proof of a canonical finite-kernel deferral boundary;
-- compiler-verified convergent numerical regions whose publication
+- compiler checks for a canonical finite-kernel deferral boundary;
+- compiler-checked convergent numerical regions whose publication
   post-dominates acquired execution, with request/reduction operands lowered to
   `!nta.partial` and `!nta.operator` contracts;
-- an engine-neutral `WorkPlan` model and ABI-v25 bounded dependency sets, so one
+- an engine-neutral `WorkPlan` model and ABI-v27 bounded dependency sets, so one
   work ticket can wait for several pages, experts, or object shards;
 - one reusable device-plan allocation with two pinned, asynchronous upload
   slots and no unconditional hot-path event synchronization;
@@ -182,7 +182,7 @@ driven; GPU initiation is retained for device-discovered demand and transports
 whose queue semantics justify it, rather than being claimed as universally
 faster.
 The existing code implements the unavailable-data work-ticket mechanism,
-compiler-verified request-local partial reduction, real FlashInfer hooks, and
+compiler-checked request-local partial reduction, real FlashInfer hooks, and
 SGLang decode graph replay. Demand mode reuses one structural plan, rebinds
 layer K/V directories on the GPU, and stages one next-layer contributor wave
 during post-attention compute before progressing the remaining waves. A
@@ -446,7 +446,7 @@ completed all 32,000 measured commands with matching data at 1,624.42 MiB/s
 physical throughput and zero failure. The benchmark invalidates its staging entries at
 the start of every measured graph; cache-hit replay is therefore not counted as
 SSD bandwidth. This is a single-machine mechanism result, not production
-serving or paper-level evaluation. The ABI-v25 harness now completes exact
+serving or paper-level evaluation. The ABI-v27 harness now completes exact
 2-MiB reads at 58.16% of a matched `fio` baseline on this host from clean
 revision `5c26f8b8aa6c`. This is one-controller local scaling evidence, not
 serving or portability evidence.

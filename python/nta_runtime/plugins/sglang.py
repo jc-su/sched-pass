@@ -12,11 +12,38 @@ _HICACHE_LOAD_TARGET = (
     "sglang.srt.managers.cache_controller.HiCacheController.start_loading"
 )
 _ABORT_TARGET = "sglang.srt.managers.scheduler.Scheduler.abort_request"
+_REQUEST_FINISH_TARGET = (
+    "sglang.srt.managers.scheduler_components.batch_result_processor."
+    "SchedulerBatchResultProcessor._handle_finish_state_updated_req"
+)
 _FORWARD_BATCH_TARGET = (
     "sglang.srt.model_executor.forward_batch_info.ForwardBatch.init_new"
 )
 _PREFILL_ADMISSION_TARGET = (
     "sglang.srt.managers.scheduler.Scheduler._get_new_batch_prefill_raw"
+)
+_EXTERNAL_ADMISSION_TARGET = (
+    "sglang.srt.managers.schedule_policy.PrefillAdder.add_one_req"
+)
+_CUDA_GRAPH_ELIGIBILITY_TARGET = (
+    "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+    "DecodeCudaGraphRunner.can_run_graph"
+)
+_EXTERNAL_PREFIX_TARGETS = (
+    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.init_load_back",
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.init_load_back",
+)
+_CACHE_UNFINISHED_TARGETS = (
+    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.cache_unfinished_req",
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.cache_unfinished_req",
+)
+_CACHE_FINISHED_TARGETS = (
+    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.cache_finished_req",
+    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.cache_finished_req",
+)
+_ALLOCATOR_FREE_TARGETS = (
+    "sglang.srt.mem_cache.allocator.token.TokenToKVPoolAllocator.free",
+    "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.free",
 )
 
 
@@ -56,6 +83,8 @@ def _preserve_graph_request_metadata() -> None:
 
 def _walk_attention_backends(scheduler):
     worker = getattr(scheduler, "tp_worker", None)
+    if worker is None:
+        worker = getattr(scheduler, "model_worker", None)
     runner = getattr(worker, "model_runner", None)
     pending = [getattr(runner, "attn_backend", None)]
     visited: set[int] = set()
@@ -74,6 +103,9 @@ def _walk_attention_backends(scheduler):
 def _flush_backend_stats(scheduler, *args, **kwargs) -> None:
     del args, kwargs
     for backend in _walk_attention_backends(scheduler):
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
         writer = getattr(backend, "_write_stats", None)
         if callable(writer):
             writer()
@@ -90,6 +122,24 @@ def _cancel_backend_requests(scheduler, recv_req, *args, **kwargs) -> None:
         cancel = getattr(backend, "cancel_requests", None)
         if callable(cancel):
             cancel(request_id, all=abort_all)
+
+
+def _retire_finished_request(processor, req, *args, **kwargs) -> None:
+    del args, kwargs
+    if not req.finished():
+        return
+    request_id = getattr(req, "rid", "") or ""
+    if not request_id:
+        raise RuntimeError("finished SGLang request omitted its request ID")
+    handle = getattr(req, "_nta_external_prefix", None)
+    if handle is not None:
+        if not handle._released and not handle.retire("finished"):
+            raise RuntimeError("finished external prefix lost its runtime claim")
+        return
+    for backend in _walk_attention_backends(processor):
+        finish = getattr(backend, "finish_requests", None)
+        if callable(finish):
+            finish((request_id,))
 
 
 def _attach_request_priorities(forward_batch, cls, batch, model_runner):
@@ -115,6 +165,24 @@ def _attach_request_priorities(forward_batch, cls, batch, model_runner):
     forward_batch._nta_request_priorities = priorities
 
 
+def _route_cuda_graph_eligibility(original, runner, forward_batch):
+    request_ids = tuple(str(value) for value in getattr(forward_batch, "rids", ()))
+    pending = [getattr(runner, "attn_backend", None)]
+    pending.extend(getattr(runner.model_runner, "decode_attn_backend_group", ()) or ())
+    visited: set[int] = set()
+    for backend in pending:
+        if backend is None or id(backend) in visited:
+            continue
+        visited.add(id(backend))
+        requires_eager = getattr(backend, "requires_eager_requests", None)
+        if callable(requires_eager) and requires_eager(request_ids):
+            backend._stats["tiered_graph_eager_batches"] = (
+                backend._stats.get("tiered_graph_eager_batches", 0) + 1
+            )
+            return False
+    return original(runner, forward_batch)
+
+
 def register() -> None:
     version = importlib.metadata.version("sglang")
     if version != SUPPORTED_SGLANG_VERSION:
@@ -132,6 +200,13 @@ def register() -> None:
     )
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
     from nta_runtime.engines.sglang_hicache import route_start_loading
+    from nta_runtime.engines.sglang_external import (
+        route_allocator_free,
+        route_cache_finished,
+        route_cache_unfinished,
+        route_external_admission_credit,
+        route_init_load_back,
+    )
     from nta_runtime.engines.sglang_admission import route_prefill_admission
 
     _preserve_graph_request_metadata()
@@ -149,6 +224,11 @@ def register() -> None:
     abort_hooks = HookRegistry._hooks[_ABORT_TARGET]
     if not any(hook is _cancel_backend_requests for _, hook, _ in abort_hooks):
         HookRegistry.register(_ABORT_TARGET, _cancel_backend_requests, HookType.BEFORE)
+    finish_hooks = HookRegistry._hooks[_REQUEST_FINISH_TARGET]
+    if not any(hook is _retire_finished_request for _, hook, _ in finish_hooks):
+        HookRegistry.register(
+            _REQUEST_FINISH_TARGET, _retire_finished_request, HookType.BEFORE
+        )
     forward_hooks = HookRegistry._hooks[_FORWARD_BATCH_TARGET]
     if not any(hook is _attach_request_priorities for _, hook, _ in forward_hooks):
         HookRegistry.register(
@@ -161,6 +241,47 @@ def register() -> None:
             route_prefill_admission,
             HookType.AROUND,
         )
+    graph_hooks = HookRegistry._hooks[_CUDA_GRAPH_ELIGIBILITY_TARGET]
+    if not any(hook is _route_cuda_graph_eligibility for _, hook, _ in graph_hooks):
+        HookRegistry.register(
+            _CUDA_GRAPH_ELIGIBILITY_TARGET,
+            _route_cuda_graph_eligibility,
+            HookType.AROUND,
+        )
+    external_admission_hooks = HookRegistry._hooks[_EXTERNAL_ADMISSION_TARGET]
+    if not any(
+        hook is route_external_admission_credit
+        for _, hook, _ in external_admission_hooks
+    ):
+        HookRegistry.register(
+            _EXTERNAL_ADMISSION_TARGET,
+            route_external_admission_credit,
+            HookType.AROUND,
+        )
+    for target in _EXTERNAL_PREFIX_TARGETS:
+        hooks = HookRegistry._hooks[target]
+        if not any(hook is route_init_load_back for _, hook, _ in hooks):
+            HookRegistry.register(
+                target, route_init_load_back, HookType.AROUND
+            )
+    for target in _CACHE_UNFINISHED_TARGETS:
+        hooks = HookRegistry._hooks[target]
+        if not any(hook is route_cache_unfinished for _, hook, _ in hooks):
+            HookRegistry.register(
+                target, route_cache_unfinished, HookType.AROUND
+            )
+    for target in _CACHE_FINISHED_TARGETS:
+        hooks = HookRegistry._hooks[target]
+        if not any(hook is route_cache_finished for _, hook, _ in hooks):
+            HookRegistry.register(
+                target, route_cache_finished, HookType.AROUND
+            )
+    for target in _ALLOCATOR_FREE_TARGETS:
+        hooks = HookRegistry._hooks[target]
+        if not any(hook is route_allocator_free for _, hook, _ in hooks):
+            HookRegistry.register(
+                target, route_allocator_free, HookType.AROUND
+            )
     if BACKEND_NAME in ATTENTION_BACKENDS:
         return
 

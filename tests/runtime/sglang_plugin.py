@@ -5,10 +5,14 @@ from __future__ import annotations
 
 import inspect
 import multiprocessing as mp
+import os
 import types
+from collections import namedtuple
 from contextlib import nullcontext
 from dataclasses import replace
 from unittest.mock import patch
+
+import torch
 
 
 def load_in_spawn(result) -> None:
@@ -46,7 +50,11 @@ def main() -> None:
     from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
     from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
 
-    from nta_runtime.plugins.sglang import BACKEND_NAME, register
+    from nta_runtime.plugins.sglang import (
+        BACKEND_NAME,
+        _retire_finished_request,
+        register,
+    )
 
     register()
     register()
@@ -65,7 +73,10 @@ def main() -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
     from nta_runtime.plugins.sglang import (
         _ABORT_TARGET,
+        _CUDA_GRAPH_ELIGIBILITY_TARGET,
+        _EXTERNAL_ADMISSION_TARGET,
         _HICACHE_LOAD_TARGET,
+        _REQUEST_FINISH_TARGET,
         _RELEASE_TARGET,
         _FORWARD_BATCH_TARGET,
         _PREFILL_ADMISSION_TARGET,
@@ -82,12 +93,47 @@ def main() -> None:
         kind == HookType.BEFORE for kind, _, _ in HookRegistry._hooks[_RELEASE_TARGET]
     )
     assert any(
+        kind == HookType.BEFORE
+        for kind, _, _ in HookRegistry._hooks[_REQUEST_FINISH_TARGET]
+    )
+    assert any(
         kind == HookType.AFTER
         for kind, _, _ in HookRegistry._hooks[_FORWARD_BATCH_TARGET]
     )
     assert any(
         kind == HookType.AROUND
         for kind, _, _ in HookRegistry._hooks[_PREFILL_ADMISSION_TARGET]
+    )
+    assert any(
+        kind == HookType.AROUND
+        for kind, _, _ in HookRegistry._hooks[_EXTERNAL_ADMISSION_TARGET]
+    )
+    assert any(
+        kind == HookType.AROUND
+        for kind, _, _ in HookRegistry._hooks[_CUDA_GRAPH_ELIGIBILITY_TARGET]
+    )
+
+    from nta_runtime.plugins.sglang import _route_cuda_graph_eligibility
+
+    graph_stats = {}
+    graph_backend = types.SimpleNamespace(
+        _stats=graph_stats,
+        requires_eager_requests=lambda ids: "external-request" in ids,
+    )
+    graph_runner = types.SimpleNamespace(
+        attn_backend=graph_backend,
+        model_runner=types.SimpleNamespace(decode_attn_backend_group=()),
+    )
+    assert not _route_cuda_graph_eligibility(
+        lambda *_args: True,
+        graph_runner,
+        types.SimpleNamespace(rids=("external-request",)),
+    )
+    assert graph_stats["tiered_graph_eager_batches"] == 1
+    assert _route_cuda_graph_eligibility(
+        lambda *_args: True,
+        graph_runner,
+        types.SimpleNamespace(rids=("resident-request",)),
     )
 
     from nta_runtime.engines.sglang_admission import (
@@ -100,6 +146,27 @@ def main() -> None:
     )
     from nta_runtime.requests import RequestBinding, stable_request_id
     from nta_runtime.runtime import RequestProgress
+    from nta_runtime.fixed_range_pool import FixedRangePool
+
+    ranges = FixedRangePool(128, 24, reserved_low=2)
+    first = ranges.acquire(11)
+    second = ranges.acquire(12)
+    assert first.begin >= 2 and first.end <= 128
+    assert second.begin >= 2 and second.end <= 128
+    assert first.end <= second.begin or second.end <= first.begin
+    assert ranges.in_use == 2 and ranges.high_watermark == 2
+    ranges.release(first)
+    reused = ranges.acquire(13)
+    assert reused.slot == first.slot
+    assert reused.generation != first.generation
+    try:
+        ranges.release(first)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("range pool accepted a stale lease")
+    ranges.release(second)
+    ranges.release(reused)
 
     class Request:
         def __init__(self, rid: str) -> None:
@@ -217,6 +284,38 @@ def main() -> None:
 
     device_pool = DevicePool()
     progress_bridge = SglangHiCacheBridge(device_pool)
+
+    class FakeEvent:
+        def __init__(self) -> None:
+            self.stream = None
+
+        def record(self, stream) -> None:
+            self.stream = stream
+
+    class FakeTensor:
+        is_cuda = False
+
+    fake_stream = object()
+    old_finish = object()
+    Ack = namedtuple("Ack", ("start_event", "finish_event", "node_ids"))
+    controller = types.SimpleNamespace(ack_load_queue=[])
+    pending = types.SimpleNamespace(
+        claim_id=91,
+        consumer_index=7,
+        held_ack=Ack(object(), old_finish, (11,)),
+        controller=controller,
+        host_indices=FakeTensor(),
+        device_indices=FakeTensor(),
+    )
+    progress_bridge._pending[7] = pending
+    progress_bridge._owned[91] = pending
+    with patch("torch.cuda.Event", FakeEvent):
+        assert progress_bridge.retire(pending, stream=fake_stream)
+    assert not progress_bridge.retire(pending, stream=fake_stream)
+    assert len(controller.ack_load_queue) == 1
+    retired_ack = controller.ack_load_queue[0]
+    assert retired_ack.finish_event is not old_finish
+    assert retired_ack.finish_event.stream is fake_stream
     resident_id = stable_request_id("resident")
     binding = RequestBinding(0, 0, 4, resident_id, priority=3)
     blocked = RequestProgress(
@@ -260,6 +359,202 @@ def main() -> None:
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
+
+    class FakeFence:
+        def __init__(self, done: bool) -> None:
+            self.done = done
+
+        def query(self) -> bool:
+            return self.done
+
+        def synchronize(self) -> None:
+            self.done = True
+
+    class FakeRanges:
+        def __init__(self) -> None:
+            self.released = []
+
+        def release(self, lease) -> None:
+            self.released.append(lease)
+
+    reclaimed = []
+    range_pool = FakeRanges()
+    resource_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
+    resource_backend._tiered_object_ranges = range_pool
+    resource_backend._stats = {}
+    resource_backend._retired_tiered_resources = [
+        (
+            FakeFence(False),
+            "lease-a",
+            types.SimpleNamespace(
+                release_resources=lambda: reclaimed.append("claim-a")
+            ),
+        )
+    ]
+    resource_backend._drain_tiered_resources(wait=False)
+    assert range_pool.released == [] and reclaimed == []
+    resource_backend._drain_tiered_resources(wait=True)
+    assert range_pool.released == ["lease-a"]
+    assert reclaimed == ["claim-a"]
+
+    from nta_runtime.engines.sglang_external import (
+        VIRTUAL_TOKEN_BASE,
+        route_allocator_free,
+        route_cache_finished,
+        route_external_admission_credit,
+        route_init_load_back,
+    )
+
+    class ExternalDevicePool:
+        pass
+
+    class ExternalAllocator:
+        def __init__(self, device_pool) -> None:
+            self._kvcache = device_pool
+            self.allocations = []
+            self.frees = []
+            self.attempts = 0
+
+        def alloc(self, count):
+            self.attempts += 1
+            if self.attempts == 1:
+                return None
+            rows = torch.arange(100, 100 + count, dtype=torch.int64)
+            self.allocations.append(rows.clone())
+            return rows
+
+        def available_size(self):
+            return 0
+
+        def free(self, rows):
+            self.frees.append(rows.clone())
+
+    class ExternalNode:
+        def __init__(self, node_id, host_value, parent, evicted=True) -> None:
+            self.id = node_id
+            self.host_value = host_value
+            self.parent = parent
+            self.evicted = evicted
+            self.protected = 0
+
+        def protect_host(self):
+            self.protected += 1
+
+        def release_host(self):
+            self.protected -= 1
+
+    external_pool = ExternalDevicePool()
+    external_allocator = ExternalAllocator(external_pool)
+    external_controller = types.SimpleNamespace(
+        mem_pool_device=external_pool,
+        mem_pool_device_allocator=external_allocator,
+        device="cpu",
+    )
+    external_bridge = SglangHiCacheBridge(external_pool)
+    captured_handles = []
+    external_bridge.enable_external_prefixes(4, captured_handles.append)
+    resident_node = ExternalNode(1, None, None, evicted=False)
+    host_node = ExternalNode(
+        2, torch.arange(9, 15, dtype=torch.int64), resident_node
+    )
+    external_request = types.SimpleNamespace(
+        rid="external-request",
+        prefix_indices=torch.tensor((1, 2), dtype=torch.int64),
+        last_node=resident_node,
+        needs_host_load_back=lambda: True,
+        swa_host_hit_length=0,
+        mamba_host_hit_length=0,
+        host_hit_length=6,
+    )
+    external_evictions = []
+
+    def evict_external(params):
+        external_evictions.append(params.num_tokens)
+        return types.SimpleNamespace(num_tokens_evicted=params.num_tokens)
+
+    external_cache = types.SimpleNamespace(
+        cache_controller=external_controller,
+        page_size=1,
+        evict=evict_external,
+    )
+    external_params = types.SimpleNamespace(
+        req=external_request,
+        best_match_node=host_node,
+        host_hit_length=6,
+    )
+    virtual, last_node = route_init_load_back(
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("dense load-back executed")
+        ),
+        external_cache,
+        external_params,
+    )
+    assert last_node is resident_node
+    assert virtual.tolist() == list(range(VIRTUAL_TOKEN_BASE, VIRTUAL_TOKEN_BASE + 6))
+    assert external_evictions == [4]
+    assert external_allocator.allocations[0].numel() == 4
+    assert host_node.protected == 1 and len(captured_handles) == 1
+    external_stats = external_bridge.admission_stats()
+    assert external_stats["external_live_dense_rows"] == 6
+    assert external_stats["external_live_staging_rows"] == 4
+    assert external_stats["external_dense_high_water_rows"] == 6
+    assert external_stats["external_staging_high_water_rows"] == 4
+    finish_reasons = []
+    captured_handles[0].retire_callback = (
+        lambda reason: finish_reasons.append(reason) is None
+    )
+    _retire_finished_request(
+        types.SimpleNamespace(),
+        types.SimpleNamespace(
+            rid="external-request",
+            finished=lambda: True,
+            _nta_external_prefix=captured_handles[0],
+        ),
+    )
+    assert finish_reasons == ["finished"]
+    # The cache-release hook is the authoritative retirement edge. It is
+    # idempotent when an earlier result hook already completed the claim.
+    captured_handles[0]._released = True
+    request_finish_calls = []
+    external_request.cache_protected_len = 6
+    route_cache_finished(
+        lambda _cache, _request, is_insert=True: request_finish_calls.append(
+            (_request.cache_protected_len, is_insert)
+        ),
+        external_cache,
+        external_request,
+    )
+    assert request_finish_calls == [(2, False)]
+    captured_handles[0]._released = False
+    admission_offsets = []
+    adder = types.SimpleNamespace(
+        tree_cache=external_cache, rem_total_token_offset=50
+    )
+
+    def admit(fake_adder, _request):
+        admission_offsets.append(fake_adder.rem_total_token_offset)
+        fake_adder.rem_total_token_offset += 3
+        return "admitted"
+
+    assert (
+        route_external_admission_credit(admit, adder, external_request)
+        == "admitted"
+    )
+    assert admission_offsets == [44]
+    assert adder.rem_total_token_offset == 53
+    physical_frees = []
+    route_allocator_free(
+        lambda _allocator, rows: physical_frees.append(rows.clone()),
+        external_allocator,
+        torch.tensor((7, VIRTUAL_TOKEN_BASE, 8), dtype=torch.int64),
+    )
+    assert physical_frees[0].tolist() == [7, 8]
+    captured_handles[0].release_resources()
+    assert external_allocator.frees[-1].tolist() == [100, 101, 102, 103]
+    assert host_node.protected == 0
+    external_stats = external_bridge.admission_stats()
+    assert external_stats["external_live_dense_rows"] == 0
+    assert external_stats["external_live_staging_rows"] == 0
     assert _pipeline_object_range(128, 0, 12) == (104, 128)
     assert _pipeline_object_range(128, 1, 12) == (80, 104)
     for invalid in ((0, 0, 12), (128, -1, 12), (48, 1, 12)):
@@ -285,7 +580,138 @@ def main() -> None:
     assert signature == rebound, "request generation invalidated a structural plan"
     assert signature != reslotted, "plan cache aliased a different request slot"
 
-    import torch
+    from nta_runtime.engines.selected_form import SelectedAttentionExecutor
+    from nta_runtime.engines.selected_tiered import TieredClaim
+
+    class PlannedWrapper:
+        def __init__(self, indptr=None, indices=None) -> None:
+            self._paged_kv_indptr_buf = indptr
+            self._paged_kv_indices_buf = indices
+
+        def plan(self, indptr, indices, *args, **kwargs) -> None:
+            del args, kwargs
+            self._paged_kv_indptr_buf = indptr
+            self._paged_kv_indices_buf = indices
+
+    source_wrapper = PlannedWrapper(
+        torch.tensor([0, 4, 8], dtype=torch.int32),
+        torch.tensor([10, 11, 1, 2, 20, 21, 3, 4], dtype=torch.int32),
+    )
+    selected = SelectedAttentionExecutor(4, 1)
+
+    def fake_claim(claim_id, slots):
+        mask = torch.zeros(32, dtype=torch.bool)
+        mask[torch.tensor(slots)] = True
+        claim = types.SimpleNamespace(
+            claim_id=claim_id,
+            slot_is_prefix=mask,
+            token_count=len(slots),
+            kept_prefix_rows=1,
+            request=None,
+            request_id=None,
+        )
+
+        def table_prefix_mask(tokens):
+            return mask[tokens.to(torch.long)]
+
+        def note_serving(engine, request, prefix_mask=None):
+            assert prefix_mask is not None
+            claim.request = request
+            claim.request_id = engine._current_request_ids[request]
+
+        claim.table_prefix_mask = table_prefix_mask
+        claim.note_serving = note_serving
+        return claim
+
+    first_claim = fake_claim(1, (10, 11))
+    second_claim = fake_claim(2, (20, 21))
+    recycled_claim = fake_claim(3, (1, 30))
+    multi_ctx = selected._build_multi_claim_ctx(
+        types.SimpleNamespace(
+            _current_request_ids=("req-a", "req-b"),
+            _current_kv_lengths=(4, 4),
+            _current_query_lengths=(1, 1),
+        ),
+        (first_claim, second_claim, recycled_claim),
+        source_wrapper,
+        torch.empty((2, 2, 4)),
+        (torch.empty((32, 1, 4)), torch.empty((32, 1, 4))),
+        types.SimpleNamespace(scaling=0.5),
+        False,
+    )
+    assert multi_ctx is not None
+    assert len(multi_ctx["claim_entries"]) == 2
+    assert first_claim.request == 0 and second_claim.request == 1
+    assert first_claim.request_id == "req-a" and second_claim.request_id == "req-b"
+    assert recycled_claim.request is None
+    assert multi_ctx["plan_indices"][[1, 2, 4, 5]].tolist() == [1, 2, 3, 4]
+    assert source_wrapper._paged_kv_indices_buf is multi_ctx["plan_indices"]
+    assert multi_ctx["verifier"] is source_wrapper
+
+    # Once bound, prefix identity follows immutable request-table positions,
+    # not allocator slot numbers that can be recycled into an appended suffix.
+    positional_claim = TieredClaim.__new__(TieredClaim)
+    positional_claim.slot_is_prefix = torch.zeros(32, dtype=torch.bool)
+    positional_claim.slot_is_prefix[torch.tensor((10, 11, 30))] = True
+    positional_claim.bound_prefix_mask = None
+    positional_claim.request_id = None
+    positional_claim.request_generation = None
+    initial_tokens = torch.tensor((10, 11, 1, 2), dtype=torch.int32)
+    initial_mask = positional_claim.table_prefix_mask(initial_tokens)
+    positional_engine = types.SimpleNamespace(
+        _current_request_ids=("req-a",),
+        _active_batch=types.SimpleNamespace(
+            bindings=(types.SimpleNamespace(generation=7),)
+        ),
+    )
+    positional_claim.note_serving(positional_engine, 0, initial_mask)
+    appended_tokens = torch.tensor((10, 11, 1, 2, 30), dtype=torch.int32)
+    assert positional_claim.table_prefix_mask(appended_tokens).tolist() == [
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+
+    # A long external prefix must not become a full-prefix HBM scratch
+    # allocation while its summaries are built.
+    if torch.cuda.is_available():
+        summary_claim = TieredClaim.__new__(TieredClaim)
+        summary_claim.layer_count = 2
+        summary_claim.token_count = 67
+        summary_claim.page_tokens = 8
+        summary_claim.host_rows_cpu = torch.arange(11, 78, dtype=torch.int64)
+        generator = torch.Generator().manual_seed(20260810)
+        summary_layers = [
+            torch.randn(
+                (96, 2, 16), dtype=torch.float16, generator=generator
+            ).pin_memory()
+            for _ in range(summary_claim.layer_count)
+        ]
+        summary_pool = types.SimpleNamespace(k_data_refs=summary_layers)
+        previous_chunk = os.environ.get("NTA_SGLANG_SUMMARY_CHUNK_ROWS")
+        os.environ["NTA_SGLANG_SUMMARY_CHUNK_ROWS"] = "19"
+        try:
+            streamed_min, streamed_max = summary_claim._streamed_envelopes(
+                summary_pool, torch.device("cuda")
+            )
+        finally:
+            if previous_chunk is None:
+                os.environ.pop("NTA_SGLANG_SUMMARY_CHUNK_ROWS", None)
+            else:
+                os.environ["NTA_SGLANG_SUMMARY_CHUNK_ROWS"] = previous_chunk
+        gathered_min, gathered_max = summary_claim._gathered_envelopes(
+            summary_pool, torch.device("cuda")
+        )
+        assert torch.equal(streamed_min, gathered_min)
+        assert torch.equal(streamed_max, gathered_max)
+        expected_rows = 16
+        assert summary_claim.summary_scratch_bytes == (
+            expected_rows
+            * summary_layers[0][0].numel()
+            * summary_layers[0].element_size()
+        )
 
     query = torch.empty((2, 4, 8), dtype=torch.float16)
     key_cache = torch.empty((16, 1), dtype=torch.float16)

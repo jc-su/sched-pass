@@ -8,10 +8,15 @@
 #include "nta/OperatorContract.h"
 #include "runtime/device/Acquire.cuh"
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace nta::jit {
 
@@ -371,10 +376,10 @@ nta_jit_progress_indexed_host_range(void *runtime, std::uint32_t firstObject,
 // from a previous step, and any violation fails the object closed.
 extern "C" __global__ void
 nta_set_indexed_row_counts(nta::abi::RuntimeView *runtime,
-                           std::uint32_t firstObject,
-                           std::uint32_t objectCount, std::uint32_t rowCount) {
+                           std::uint32_t firstObject, std::uint32_t objectCount,
+                           std::uint32_t rowCount) {
   using namespace nta;
-  const std::uint32_t relative = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t relative = blockIdx.x;
   if (runtime == nullptr || relative >= objectCount) {
     return;
   }
@@ -384,25 +389,48 @@ nta_set_indexed_row_counts(nta::abi::RuntimeView *runtime,
     return;
   }
   abi::ObjectEntry &object = runtime->objects[slot64];
-  const abi::ReplicaEntry *replica = device::replica(runtime, object, 0);
-  if (replica == nullptr || (replica->flags & abi::ReplicaIndexed) == 0 ||
-      rowCount == 0 || object.flags == 0 || rowCount > object.flags ||
-      replica->dmaPageCount == 0) {
-    atomicExch(&object.state,
-               static_cast<std::uint32_t>(abi::ObjectState::Failed));
+  abi::ReplicaEntry *replica =
+      const_cast<abi::ReplicaEntry *>(device::replica(runtime, object, 0));
+  __shared__ std::uint32_t validGeometry;
+  __shared__ std::uint32_t invalidIndex;
+  if (threadIdx.x == 0) {
+    validGeometry =
+        replica != nullptr && (replica->flags & abi::ReplicaIndexed) != 0 &&
+                rowCount != 0 && object.flags != 0 &&
+                rowCount <= object.flags && replica->dmaPageCount != 0
+            ? 1U
+            : 0U;
+    invalidIndex = 0;
+    if (validGeometry == 0) {
+      atomicExch(&object.state,
+                 static_cast<std::uint32_t>(abi::ObjectState::Failed));
+      device::recordFailure(runtime);
+    } else {
+      const std::uint64_t elementBytes = object.bytes / replica->dmaPageCount;
+      replica->dmaPageCount = rowCount;
+      object.bytes = elementBytes * rowCount;
+      object.selectedReplica = 0;
+      atomicAnd(&replica->flags, ~abi::ReplicaIndicesValidated);
+    }
+  }
+  __syncthreads();
+  if (validGeometry == 0) {
     return;
   }
-  const std::uint64_t elementBytes = object.bytes / replica->dmaPageCount;
-  const_cast<abi::ReplicaEntry *>(replica)->dmaPageCount = rowCount;
-  object.bytes = elementBytes * rowCount;
-  // Registration leaves selectedReplica invalid until a protocol selects
-  // one; the copy kernel resolves through it and silently skips otherwise.
-  // The bounded direct path always uses the single indexed replica.
-  object.selectedReplica = 0;
-  // Issued is the state the bounded indexed copy consumes. The tiered loop
-  // owns these slots outside the intent/epoch protocol: finalize no-ops
-  // without a claimed intent, and correctness is carried by stream order
-  // plus the caller's verification, not by Ready publication.
+  device::validateIndexedTransferIndices(object, *replica, &invalidIndex);
+  __syncthreads();
+  if (threadIdx.x != 0) {
+    return;
+  }
+  if (invalidIndex != 0) {
+    atomicExch(&object.state,
+               static_cast<std::uint32_t>(abi::ObjectState::Failed));
+    device::recordFailure(runtime);
+    return;
+  }
+  atomicOr(&replica->flags, abi::ReplicaIndicesValidated);
+  // Issued is published only after the selector's current prefix has passed
+  // the same source/destination bounds used by the generic indexed path.
   atomicExch(&object.state,
              static_cast<std::uint32_t>(abi::ObjectState::Issued));
 }
@@ -415,10 +443,443 @@ nta_jit_set_indexed_row_counts(void *runtime, std::uint32_t firstObject,
   if (runtime == nullptr || objectCount == 0) {
     return cudaErrorInvalidValue;
   }
-  nta_set_indexed_row_counts<<<(objectCount + threads - 1U) / threads, threads,
-                               0, stream>>>(
+  nta_set_indexed_row_counts<<<objectCount, threads, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime), firstObject, objectCount,
       rowCount);
+  return nta::jit::launchStatus();
+}
+
+// Convert device-selected logical pages into the bounded indexed transfer
+// prefix without returning either the selection or the miss count to the host.
+// One CTA is intentional: selection budgets are small, deterministic ordering
+// makes the resulting transfer list reproducible, and K/V objects share it.
+extern "C" __global__ void nta_prepare_selected_indexed_rows(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount, const std::int64_t *selectedPages,
+    std::uint32_t selectedPageCount, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, const std::uint32_t *hostRows,
+    const std::uint32_t *deviceRows, std::uint32_t *stagedPages,
+    std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+    std::uint32_t capacity, std::uint64_t *copiedRows) {
+  using namespace nta;
+  __shared__ std::uint32_t rowCount;
+  __shared__ std::uint32_t invalid;
+  __shared__ std::uint32_t invalidIndex;
+  if (threadIdx.x == 0) {
+    rowCount = 0;
+    invalid = 0;
+    const std::uint32_t pageCount =
+        pageTokens == 0 ? 0 : (tokenCount + pageTokens - 1U) / pageTokens;
+    if (runtime == nullptr || selectedPages == nullptr || hostRows == nullptr ||
+        deviceRows == nullptr || stagedPages == nullptr ||
+        sourceIndices == nullptr || stagingIndices == nullptr ||
+        copiedRows == nullptr || objectCount == 0 || selectedPageCount == 0 ||
+        pageCount == 0 || capacity == 0 || selectedPageCount > pageCount ||
+        firstObject > runtime->objectCapacity ||
+        objectCount > runtime->objectCapacity - firstObject) {
+      invalid = 1;
+    }
+    for (std::uint32_t index = 0; invalid == 0 && index < selectedPageCount;
+         ++index) {
+      const std::int64_t page = selectedPages[index];
+      if (page < 0 || static_cast<std::uint64_t>(page) >= pageCount) {
+        invalid = 1;
+        break;
+      }
+      for (std::uint32_t prior = 0; prior < index; ++prior) {
+        if (selectedPages[prior] == page) {
+          invalid = 1;
+          break;
+        }
+      }
+    }
+    for (std::uint32_t index = 0; invalid == 0 && index < selectedPageCount;
+         ++index) {
+      const std::uint32_t page =
+          static_cast<std::uint32_t>(selectedPages[index]);
+      if (stagedPages[page] != 0) {
+        continue;
+      }
+      const std::uint32_t begin = page * pageTokens;
+      const std::uint32_t end = min(tokenCount, begin + pageTokens);
+      if (end < begin || end - begin > capacity - rowCount) {
+        invalid = 1;
+        break;
+      }
+      for (std::uint32_t position = begin; position < end; ++position) {
+        sourceIndices[rowCount] = hostRows[position];
+        stagingIndices[rowCount] = deviceRows[position];
+        ++rowCount;
+      }
+      stagedPages[page] = 1;
+    }
+  }
+  __syncthreads();
+
+  for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
+    abi::ObjectEntry &object = runtime->objects[firstObject + relative];
+    abi::ReplicaEntry *replica =
+        const_cast<abi::ReplicaEntry *>(device::replica(runtime, object, 0));
+    if (threadIdx.x == 0) {
+      invalidIndex = 0;
+      const bool geometry =
+          invalid == 0 && replica != nullptr &&
+          (replica->flags & abi::ReplicaIndexed) != 0 &&
+          replica->dmaPageCount != 0 && object.bytes != 0 &&
+          object.bytes % replica->dmaPageCount == 0 &&
+          object.flags >= capacity &&
+          replica->dmaPageListAddress ==
+              reinterpret_cast<std::uint64_t>(sourceIndices) &&
+          object.stagingTensorMapAddress ==
+              reinterpret_cast<std::uint64_t>(stagingIndices);
+      if (!geometry) {
+        invalidIndex = 1;
+      } else if (rowCount != 0) {
+        const std::uint64_t elementBytes = object.bytes / replica->dmaPageCount;
+        replica->dmaPageCount = rowCount;
+        object.bytes = elementBytes * rowCount;
+        object.selectedReplica = 0;
+        atomicAnd(&replica->flags, ~abi::ReplicaIndicesValidated);
+      }
+    }
+    __syncthreads();
+    if (invalidIndex == 0 && rowCount != 0) {
+      device::validateIndexedTransferIndices(object, *replica, &invalidIndex);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && invalidIndex != 0) {
+      invalid = 1;
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x != 0) {
+    return;
+  }
+  if (invalid != 0) {
+    for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
+      atomicExch(&runtime->objects[firstObject + relative].state,
+                 static_cast<std::uint32_t>(abi::ObjectState::Failed));
+    }
+    device::recordFailure(runtime);
+    return;
+  }
+  for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
+    abi::ObjectEntry &object = runtime->objects[firstObject + relative];
+    abi::ReplicaEntry *replica =
+        const_cast<abi::ReplicaEntry *>(device::replica(runtime, object, 0));
+    if (rowCount != 0) {
+      atomicOr(&replica->flags, abi::ReplicaIndicesValidated);
+    }
+    __threadfence();
+    atomicExch(&object.state, static_cast<std::uint32_t>(
+                                  rowCount == 0 ? abi::ObjectState::Ready
+                                                : abi::ObjectState::Issued));
+  }
+  if (rowCount != 0) {
+    atomicAdd(reinterpret_cast<unsigned long long *>(copiedRows),
+              static_cast<unsigned long long>(rowCount));
+  }
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_prepare_selected_indexed_rows(
+    void *runtime, std::uint32_t firstObject, std::uint32_t objectCount,
+    const std::int64_t *selectedPages, std::uint32_t selectedPageCount,
+    std::uint32_t pageTokens, std::uint32_t tokenCount,
+    const std::uint32_t *hostRows, const std::uint32_t *deviceRows,
+    std::uint32_t *stagedPages, std::uint32_t *sourceIndices,
+    std::uint32_t *stagingIndices, std::uint32_t capacity,
+    std::uint64_t *copiedRows, cudaStream_t stream) {
+  if (runtime == nullptr || selectedPages == nullptr || hostRows == nullptr ||
+      deviceRows == nullptr || stagedPages == nullptr ||
+      sourceIndices == nullptr || stagingIndices == nullptr ||
+      copiedRows == nullptr || objectCount == 0 || selectedPageCount == 0 ||
+      pageTokens == 0 || tokenCount == 0 || capacity == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_prepare_selected_indexed_rows<<<1, 256, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), firstObject, objectCount,
+      selectedPages, selectedPageCount, pageTokens, tokenCount, hostRows,
+      deviceRows, stagedPages, sourceIndices, stagingIndices, capacity,
+      copiedRows);
+  return nta::jit::launchStatus();
+}
+
+// Map a device-selected logical page set into a bounded physical staging
+// cache. The selected table is emitted in caller order, while only cache
+// misses enter the validated indexed-copy prefix. One CTA serializes slot
+// replacement so a page selected by this invocation cannot be evicted by a
+// later miss from the same set.
+extern "C" __global__ void nta_prepare_bounded_selected_indexed_rows(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount, const std::int64_t *selectedPages,
+    std::uint32_t selectedPageCount, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, const std::uint32_t *hostRows,
+    const std::uint32_t *deviceRows, std::int64_t *cachedPages,
+    std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
+    std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+    std::uint32_t capacity, std::uint64_t *copiedRows) {
+  using namespace nta;
+  __shared__ std::uint32_t missRowCount;
+  __shared__ std::uint32_t selectedRowCount;
+  __shared__ std::uint32_t invalid;
+  __shared__ std::uint32_t invalidIndex;
+  if (threadIdx.x == 0) {
+    missRowCount = 0;
+    selectedRowCount = 0;
+    invalid = 0;
+    const std::uint32_t pageCount =
+        pageTokens == 0 ? 0 : (tokenCount + pageTokens - 1U) / pageTokens;
+    if (runtime == nullptr || selectedPages == nullptr || hostRows == nullptr ||
+        deviceRows == nullptr || cachedPages == nullptr ||
+        selectedRows == nullptr || sourceIndices == nullptr ||
+        stagingIndices == nullptr || copiedRows == nullptr ||
+        objectCount == 0 || selectedPageCount == 0 || pageCount == 0 ||
+        capacity == 0 || capacity % pageTokens != 0 ||
+        cacheSlotCount != capacity / pageTokens ||
+        selectedPageCount > cacheSlotCount || selectedPageCount > pageCount ||
+        firstObject > runtime->objectCapacity ||
+        objectCount > runtime->objectCapacity - firstObject) {
+      invalid = 1;
+    }
+    for (std::uint32_t index = 0; invalid == 0 && index < selectedPageCount;
+         ++index) {
+      const std::int64_t page = selectedPages[index];
+      if (page < 0 || static_cast<std::uint64_t>(page) >= pageCount) {
+        invalid = 1;
+        break;
+      }
+      for (std::uint32_t prior = 0; prior < index; ++prior) {
+        if (selectedPages[prior] == page) {
+          invalid = 1;
+          break;
+        }
+      }
+    }
+
+    for (std::uint32_t index = 0; invalid == 0 && index < selectedPageCount;
+         ++index) {
+      const std::int64_t selectedPage = selectedPages[index];
+      std::uint32_t slot = cacheSlotCount;
+      bool hit = false;
+      for (std::uint32_t candidate = 0; candidate < cacheSlotCount;
+           ++candidate) {
+        if (cachedPages[candidate] == selectedPage) {
+          slot = candidate;
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) {
+        for (std::uint32_t candidate = 0; candidate < cacheSlotCount;
+             ++candidate) {
+          bool protectedBySelection = false;
+          for (std::uint32_t selected = 0; selected < selectedPageCount;
+               ++selected) {
+            if (cachedPages[candidate] == selectedPages[selected]) {
+              protectedBySelection = true;
+              break;
+            }
+          }
+          if (!protectedBySelection) {
+            slot = candidate;
+            break;
+          }
+        }
+      }
+      if (slot == cacheSlotCount) {
+        invalid = 1;
+        break;
+      }
+
+      const std::uint32_t page = static_cast<std::uint32_t>(selectedPage);
+      const std::uint32_t begin = page * pageTokens;
+      const std::uint32_t end = min(tokenCount, begin + pageTokens);
+      const std::uint32_t rows = end - begin;
+      const std::uint32_t physicalBegin = slot * pageTokens;
+      if (end < begin || rows > capacity - selectedRowCount ||
+          rows > capacity - physicalBegin ||
+          (!hit && rows > capacity - missRowCount)) {
+        invalid = 1;
+        break;
+      }
+      for (std::uint32_t row = 0; row < rows; ++row) {
+        const std::uint32_t physical = physicalBegin + row;
+        selectedRows[selectedRowCount++] = deviceRows[physical];
+        if (!hit) {
+          sourceIndices[missRowCount] = hostRows[begin + row];
+          stagingIndices[missRowCount] = deviceRows[physical];
+          ++missRowCount;
+        }
+      }
+      if (!hit) {
+        cachedPages[slot] = selectedPage;
+      }
+    }
+  }
+  __syncthreads();
+
+  for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
+    abi::ObjectEntry &object = runtime->objects[firstObject + relative];
+    abi::ReplicaEntry *replica =
+        const_cast<abi::ReplicaEntry *>(device::replica(runtime, object, 0));
+    if (threadIdx.x == 0) {
+      invalidIndex = 0;
+      const bool geometry =
+          invalid == 0 && replica != nullptr &&
+          (replica->flags & abi::ReplicaIndexed) != 0 &&
+          replica->dmaPageCount != 0 && object.bytes != 0 &&
+          object.bytes % replica->dmaPageCount == 0 &&
+          object.flags >= capacity &&
+          replica->dmaPageListAddress ==
+              reinterpret_cast<std::uint64_t>(sourceIndices) &&
+          object.stagingTensorMapAddress ==
+              reinterpret_cast<std::uint64_t>(stagingIndices);
+      if (!geometry) {
+        invalidIndex = 1;
+      } else if (missRowCount != 0) {
+        const std::uint64_t elementBytes = object.bytes / replica->dmaPageCount;
+        replica->dmaPageCount = missRowCount;
+        object.bytes = elementBytes * missRowCount;
+        object.selectedReplica = 0;
+        atomicAnd(&replica->flags, ~abi::ReplicaIndicesValidated);
+      }
+    }
+    __syncthreads();
+    if (invalidIndex == 0 && missRowCount != 0) {
+      device::validateIndexedTransferIndices(object, *replica, &invalidIndex);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && invalidIndex != 0) {
+      invalid = 1;
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x != 0) {
+    return;
+  }
+  if (invalid != 0) {
+    for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
+      atomicExch(&runtime->objects[firstObject + relative].state,
+                 static_cast<std::uint32_t>(abi::ObjectState::Failed));
+    }
+    device::recordFailure(runtime);
+    return;
+  }
+  for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
+    abi::ObjectEntry &object = runtime->objects[firstObject + relative];
+    abi::ReplicaEntry *replica =
+        const_cast<abi::ReplicaEntry *>(device::replica(runtime, object, 0));
+    if (missRowCount != 0) {
+      atomicOr(&replica->flags, abi::ReplicaIndicesValidated);
+    }
+    __threadfence();
+    atomicExch(&object.state,
+               static_cast<std::uint32_t>(missRowCount == 0
+                                              ? abi::ObjectState::Ready
+                                              : abi::ObjectState::Issued));
+  }
+  if (missRowCount != 0) {
+    atomicAdd(reinterpret_cast<unsigned long long *>(copiedRows),
+              static_cast<unsigned long long>(missRowCount));
+  }
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_prepare_bounded_selected_indexed_rows(
+    void *runtime, std::uint32_t firstObject, std::uint32_t objectCount,
+    const std::int64_t *selectedPages, std::uint32_t selectedPageCount,
+    std::uint32_t pageTokens, std::uint32_t tokenCount,
+    const std::uint32_t *hostRows, const std::uint32_t *deviceRows,
+    std::int64_t *cachedPages, std::uint32_t cacheSlotCount,
+    std::uint32_t *selectedRows, std::uint32_t *sourceIndices,
+    std::uint32_t *stagingIndices, std::uint32_t capacity,
+    std::uint64_t *copiedRows, cudaStream_t stream) {
+  if (runtime == nullptr || selectedPages == nullptr || hostRows == nullptr ||
+      deviceRows == nullptr || cachedPages == nullptr ||
+      selectedRows == nullptr || sourceIndices == nullptr ||
+      stagingIndices == nullptr || copiedRows == nullptr || objectCount == 0 ||
+      selectedPageCount == 0 || pageTokens == 0 || tokenCount == 0 ||
+      cacheSlotCount == 0 || capacity == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_prepare_bounded_selected_indexed_rows<<<1, 256, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), firstObject, objectCount,
+      selectedPages, selectedPageCount, pageTokens, tokenCount, hostRows,
+      deviceRows, cachedPages, cacheSlotCount, selectedRows, sourceIndices,
+      stagingIndices, capacity, copiedRows);
+  return nta::jit::launchStatus();
+}
+
+extern "C" __global__ void nta_reduce_mapped_key_pages(
+    const std::byte *source, std::uint32_t sourceRows,
+    std::uint64_t sourceStrideBytes, std::uint32_t firstRow,
+    std::uint32_t tokenCount, std::uint32_t pageTokens,
+    std::uint32_t elementCount, std::uint32_t elementType, float *outputMin,
+    float *outputMax) {
+  const std::uint32_t pageCount = (tokenCount + pageTokens - 1U) / pageTokens;
+  const std::uint64_t outputCount =
+      static_cast<std::uint64_t>(pageCount) * elementCount;
+  for (std::uint64_t output =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       output < outputCount;
+       output += static_cast<std::uint64_t>(blockDim.x) * gridDim.x) {
+    const std::uint32_t page = output / elementCount;
+    const std::uint32_t element = output % elementCount;
+    const std::uint32_t begin = page * pageTokens;
+    const std::uint32_t end = min(tokenCount, begin + pageTokens);
+    float minimum = CUDART_INF_F;
+    float maximum = -CUDART_INF_F;
+    for (std::uint32_t token = begin; token < end; ++token) {
+      const std::uint64_t row = static_cast<std::uint64_t>(firstRow) + token;
+      if (row >= sourceRows) {
+        continue;
+      }
+      const std::byte *address = source + row * sourceStrideBytes +
+                                 static_cast<std::uint64_t>(element) * 2U;
+      const float value =
+          elementType == 0
+              ? __half2float(*reinterpret_cast<const __half *>(address))
+              : __bfloat162float(
+                    *reinterpret_cast<const __nv_bfloat16 *>(address));
+      minimum = fminf(minimum, value);
+      maximum = fmaxf(maximum, value);
+    }
+    outputMin[output] = minimum;
+    outputMax[output] = maximum;
+  }
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_reduce_mapped_key_pages(const void *source, std::uint32_t sourceRows,
+                                std::uint64_t sourceStrideBytes,
+                                std::uint32_t firstRow,
+                                std::uint32_t tokenCount,
+                                std::uint32_t pageTokens, std::uint32_t kvHeads,
+                                std::uint32_t headDim,
+                                std::uint32_t elementType, float *outputMin,
+                                float *outputMax, cudaStream_t stream) {
+  constexpr std::uint32_t threads = 256;
+  if (source == nullptr || outputMin == nullptr || outputMax == nullptr ||
+      sourceRows == 0 || tokenCount == 0 || pageTokens == 0 || kvHeads == 0 ||
+      headDim == 0 || elementType > 1 || firstRow >= sourceRows ||
+      tokenCount > sourceRows - firstRow ||
+      headDim > std::numeric_limits<std::uint32_t>::max() / kvHeads ||
+      sourceStrideBytes < static_cast<std::uint64_t>(kvHeads) * headDim * 2U) {
+    return cudaErrorInvalidValue;
+  }
+  const std::uint64_t pageCount =
+      (static_cast<std::uint64_t>(tokenCount) + pageTokens - 1U) / pageTokens;
+  const std::uint64_t outputCount = pageCount * kvHeads * headDim;
+  const std::uint64_t blocks64 = (outputCount + threads - 1U) / threads;
+  const std::uint32_t blocks =
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(blocks64, 65535U));
+  nta_reduce_mapped_key_pages<<<blocks, threads, 0, stream>>>(
+      static_cast<const std::byte *>(source), sourceRows, sourceStrideBytes,
+      firstRow, tokenCount, pageTokens, kvHeads * headDim, elementType,
+      outputMin, outputMax);
   return nta::jit::launchStatus();
 }
 

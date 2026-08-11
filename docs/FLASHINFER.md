@@ -274,13 +274,13 @@ does not.
 
 ## Validation
 
-Correctness gates below run on ABI v25. Any quoted sanitizer and performance
+Correctness gates below run on ABI v27. Any quoted sanitizer and performance
 numbers that predate v22 must be regenerated before use as current evidence.
 
 The local CTest gate covers:
 
 - real multi-source decode and paged-prefill JIT compilation with NTA Params;
-- C and C++ loading of the exported ABI-25 phase functions;
+- C and C++ loading of the exported ABI-27 phase functions;
 - resident and pinned-host deferred decode;
 - heterogeneous request remapping where only the nonzero scheduler ticket is
   ready and physical CTA zero must execute it;
@@ -332,8 +332,10 @@ single-machine measurements.
 
 - best-fixed trace comparison and resettable decision-regret evaluation for the
   SGLang consumer of compiler-generated progress;
-- end-to-end SGLang or vLLM use of the GPU-selected page path, including real
-  model-generated scores rather than controlled random scores;
+- paper-level capacity/goodput evaluation of the SGLang GPU-selected page path;
+  the adapter now creates an external sidecar before dense load-back and a
+  one-request smoke proves bounded physical staging, but the registered
+  multi-load campaign and confidence intervals remain open;
 - a vLLM request-generation/KV-offload adapter and integration of demand phases
   into SGLang's full model graph (the separately keyed finite operator graph is
   implemented for decode and paged prefill);

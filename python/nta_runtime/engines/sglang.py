@@ -48,6 +48,7 @@ from nta_runtime.execution_policy import (
 from nta_runtime.opportunity import OperatorArrival, TileArrival, append_json_line
 from nta_runtime.requests import RequestBinding, RequestSlotTracker
 from nta_runtime.engines.sglang_hicache import PendingHostLoad, SglangHiCacheBridge
+from nta_runtime.fixed_range_pool import FixedRangePool
 from nta_runtime.runtime import (
     AcquireRequirement,
     DeviceWorkPlan,
@@ -718,7 +719,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         selected_budget = int(
             os.environ.get("NTA_SGLANG_SELECTED_BUDGET", "0") or 0
         )
-        self._selected_shadow = None
+        self._selected_executor = None
         # Stage 3a: serve the verified selected-attention result instead of
         # only shadowing it. Output is approximate by design; the quality
         # harness, not exactness against dense, is that stage's judge.
@@ -726,26 +727,48 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             os.environ.get("NTA_SGLANG_SELECTED_SERVE") == "1"
         )
         if selected_budget > 0:
-            from nta_runtime.engines.selected_form import SelectedShadow
+            from nta_runtime.engines.selected_form import SelectedAttentionExecutor
 
-            self._selected_shadow = SelectedShadow(
+            self._selected_executor = SelectedAttentionExecutor(
                 selected_budget,
                 _positive_environment("NTA_SGLANG_SELECTED_PAGE_TOKENS", 16),
+                decode_jit_args=self._decode_jit_args,
+                prefill_jit_args=self._prefill_jit_args,
+                register_wrapper=lambda wrapper, name: self._wrapper_modules.__setitem__(
+                    id(wrapper), name
+                ),
             )
         # Stage 3b: tiered claims skip bulk promotion entirely; the selected
         # form acquires only chosen pages per layer through the bounded
         # indexed path into SGLang's preallocated prefix slots.
-        self._tiered_active = None
+        self._tiered_claims: dict[int, Any] = {}
+        self._current_tiered_claims: tuple[Any, ...] = ()
+        self._retired_tiered_accounting: list[tuple[Any, ...]] = []
+        self._retired_tiered_resources: list[tuple[Any, Any, Any]] = []
+        self._tiered_summary_cache: dict[tuple[Any, ...], tuple[Any, Any, Any, int]] = {}
+        self._tiered_summary_cache_order: list[tuple[Any, ...]] = []
+        self._tiered_summary_cache_capacity = _nonnegative_environment(
+            "NTA_SGLANG_SUMMARY_CACHE_CAPACITY", 8
+        )
         self._tiered_enabled = (
             os.environ.get("NTA_SGLANG_SELECTED_TIERED") == "1"
         )
         if self._tiered_enabled and (
-            self._selected_shadow is None or not self._selected_serve
+            self._selected_executor is None or not self._selected_serve
         ):
             raise RuntimeError(
                 "NTA_SGLANG_SELECTED_TIERED requires a selected budget and "
                 "NTA_SGLANG_SELECTED_SERVE=1"
             )
+        self._tiered_object_ranges = (
+            FixedRangePool(
+                self._object_capacity,
+                2 * self._model_layer_count,
+                reserved_low=2,
+            )
+            if self._tiered_enabled
+            else None
+        )
         trace_file = os.environ.get("NTA_OPPORTUNITY_TRACE_FILE")
         self._opportunity_trace = pathlib.Path(trace_file) if trace_file else None
         self._opportunity_revision = os.environ.get("NTA_REVISION", "")
@@ -776,68 +799,187 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     "the SGLang HiCache tracer only observes host_staged data"
                 )
         if self._tiered_enabled:
-            self._hicache.set_prefetch_callback(self._prepare_tiered_claim)
+            self._hicache.enable_external_prefixes(
+                self._selected_executor.budget_pages
+                * self._selected_executor.page_tokens,
+                self._prepare_tiered_claim,
+            )
         elif self._pipeline_host:
             self._hicache.set_prefetch_callback(self._prepare_host_pipeline)
         elif self._cross_layer_frontier and self._model_layer_count > 1:
             self._hicache.set_prefetch_callback(self._publish_cross_layer_frontier)
         atexit.register(self._write_stats)
+        atexit.register(self.close)
 
-    def _prepare_tiered_claim(self, pending: PendingHostLoad) -> None:
-        from nta_runtime.engines.selected_tiered import TieredClaim
-
-        if self._tiered_active is not None:
-            # Supersession: a new claim releases the previous one. The prior
-            # request has completed by the time its evicted prefix is
-            # re-promoted; if it somehow had not, the dispatch gate stops
-            # matching its pending and the run fails closed rather than
-            # serving stale claim state. Slot registrations are overwritten
-            # by the new claim at the same base, and the bridge entry retires
-            # so producer-slot reuse checks keep protecting live claims.
-            self._hicache.retire(self._tiered_active.pending)
-            # Fold the released claim's transfer counters into the running
-            # totals; the serving layer reports totals + the live claim, so
-            # supersession must not discard history.
+    def _retire_tiered_claim(
+        self,
+        claim: Any,
+        *,
+        reason: str,
+    ) -> bool:
+        if self._tiered_claims.get(claim.claim_id) is not claim:
+            return False
+        stream = torch.cuda.current_stream()
+        accounting = claim.enqueue_accounting_snapshot(stream)
+        if accounting:
+            self._retired_tiered_accounting.append(accounting)
+        else:
             self._stats["tiered_rows_copied_released"] = (
                 self._stats.get("tiered_rows_copied_released", 0)
-                + self._tiered_active.rows_copied
+                + claim.rows_copied
             )
             self._stats["tiered_rows_rehit_released"] = (
                 self._stats.get("tiered_rows_rehit_released", 0)
-                + self._tiered_active.rows_rehit
+                + claim.rows_rehit
             )
-            self._tiered_active = None
-            self._stats["tiered_claims_released"] = (
-                self._stats.get("tiered_claims_released", 0) + 1
+        if not claim.external_sidecar and not self._hicache.retire(
+            claim.pending, stream=stream
+        ):
+            raise RuntimeError("tiered claim lost its HiCache ownership before retire")
+        self._tiered_claims.pop(claim.claim_id)
+        if self._tiered_object_ranges is None:
+            raise RuntimeError("tiered claim retired without its object-range pool")
+        completion = torch.cuda.Event()
+        completion.record(stream)
+        self._retired_tiered_resources.append(
+            (completion, claim.object_lease, claim)
+        )
+        self._stats["tiered_claims_released"] = (
+            self._stats.get("tiered_claims_released", 0) + 1
+        )
+        counter = f"tiered_claims_released_{reason}"
+        self._stats[counter] = self._stats.get(counter, 0) + 1
+        self._drain_tiered_accounting(wait=False)
+        self._drain_tiered_resources(wait=False)
+        return True
+
+    def _drain_tiered_resources(self, *, wait: bool) -> None:
+        ranges = self._tiered_object_ranges
+        if ranges is None:
+            if self._retired_tiered_resources:
+                raise RuntimeError("retired tiered resources lost their range pool")
+            return
+        pending: list[tuple[Any, Any, Any]] = []
+        for event, lease, claim in self._retired_tiered_resources:
+            if wait:
+                event.synchronize()
+            elif not event.query():
+                pending.append((event, lease, claim))
+                continue
+            ranges.release(lease)
+            release = getattr(claim, "release_resources", None)
+            if callable(release):
+                release()
+            self._stats["tiered_resource_ranges_reclaimed"] = (
+                self._stats.get("tiered_resource_ranges_reclaimed", 0) + 1
             )
-        first_slot, _ = _pipeline_object_range(
-            self._object_capacity,
-            pending.consumer_index,
-            int(pending.controller.layer_num),
-        )
-        claim = TieredClaim(
-            pending,
-            self,
-            budget_pages=self._selected_shadow.budget_pages,
-            page_tokens=self._selected_shadow.page_tokens,
-            first_object_slot=first_slot,
-            verify=os.environ.get("NTA_SGLANG_SELECTED_TIERED_VERIFY") == "1",
-            verify_fast=(
-                os.environ.get("NTA_SGLANG_SELECTED_TIERED_VERIFY") == "fast"
-            ),
-        )
-        for local_layer in range(claim.layer_count):
-            pending.producer_event.complete(local_layer)
-        self._tiered_active = claim
+        self._retired_tiered_resources = pending
+
+    def _drain_tiered_accounting(self, *, wait: bool) -> None:
+        pending: list[tuple[Any, ...]] = []
+        for event, host_counter, device_counter, requested in (
+            self._retired_tiered_accounting
+        ):
+            if wait:
+                event.synchronize()
+            elif not event.query():
+                pending.append((event, host_counter, device_counter, requested))
+                continue
+            copied = int(host_counter[0])
+            if copied < 0 or copied > requested:
+                raise RuntimeError("tiered device accounting violated conservation")
+            self._stats["tiered_rows_copied_released"] = (
+                self._stats.get("tiered_rows_copied_released", 0) + copied
+            )
+            self._stats["tiered_rows_rehit_released"] = (
+                self._stats.get("tiered_rows_rehit_released", 0)
+                + requested
+                - copied
+            )
+        self._retired_tiered_accounting = pending
+
+    def _prepare_tiered_claim(self, pending: Any) -> None:
+        from nta_runtime.engines.selected_tiered import TieredClaim
+
+        ranges = self._tiered_object_ranges
+        if ranges is None:
+            raise RuntimeError("tiered claim has no object-range pool")
+        self._drain_tiered_resources(wait=False)
+        lease = ranges.acquire(pending.claim_id)
+        try:
+            claim = TieredClaim(
+                pending,
+                self,
+                budget_pages=self._selected_executor.budget_pages,
+                page_tokens=self._selected_executor.page_tokens,
+                first_object_slot=lease.begin,
+                claim_id=pending.claim_id,
+                verify=os.environ.get("NTA_SGLANG_SELECTED_TIERED_VERIFY") == "1",
+                verify_fast=(
+                    os.environ.get("NTA_SGLANG_SELECTED_TIERED_VERIFY") == "fast"
+                ),
+            )
+        except Exception:
+            ranges.release(lease)
+            raise
+        claim.object_lease = lease
+        if not claim.external_sidecar:
+            for local_layer in range(claim.layer_count):
+                pending.producer_event.complete(local_layer)
+        self._tiered_claims[claim.claim_id] = claim
+        if claim.external_sidecar:
+            def retire_external(reason: str) -> bool:
+                retired = self._retire_tiered_claim(claim, reason=reason)
+                if retired and reason == "finished":
+                    # SGLang checks allocator conservation immediately after
+                    # request release. At that point generation output is
+                    # already available, so the completion event should be
+                    # satisfied; synchronizing makes ownership explicit.
+                    self._drain_tiered_resources(wait=True)
+                return retired
+
+            pending.retire_callback = retire_external
         self._stats["tiered_claims"] = self._stats.get("tiered_claims", 0) + 1
+        self._stats["tiered_claims_live_max"] = max(
+            self._stats.get("tiered_claims_live_max", 0),
+            len(self._tiered_claims),
+        )
+        self._stats["tiered_object_ranges_high_watermark"] = ranges.high_watermark
         self._stats["tiered_claim_tokens"] = (
             self._stats.get("tiered_claim_tokens", 0) + claim.token_count
         )
 
     def cancel_requests(self, request_id_prefix: str, *, all: bool = False) -> int:
         cancelled = self._request_slots.cancel_matching(request_id_prefix, all=all)
+        for claim in tuple(self._tiered_claims.values()):
+            if all or (
+                claim.request_id is not None
+                and claim.request_id.startswith(request_id_prefix)
+            ):
+                self._retire_tiered_claim(claim, reason="cancelled")
         self._stats["request_cancellations"] += cancelled
         return cancelled
+
+    def finish_requests(self, request_ids: tuple[str, ...]) -> int:
+        """Retire claims before SGLang releases a finished request's KV rows."""
+        retired = 0
+        for claim in tuple(self._tiered_claims.values()):
+            if claim.request_id in request_ids:
+                retired += int(
+                    self._retire_tiered_claim(
+                        claim, reason="finished"
+                    )
+                )
+        if retired:
+            self._drain_tiered_resources(wait=True)
+        return retired
+
+    def close(self) -> None:
+        """Release serving-owned HiCache state before worker teardown."""
+        for claim in tuple(self._tiered_claims.values()):
+            self._retire_tiered_claim(claim, reason="shutdown")
+        self._drain_tiered_resources(wait=True)
+        self._drain_tiered_accounting(wait=True)
 
     def _install_instrumented_wrappers(
         self, model_runner: Any, skip_prefill: bool
@@ -1041,6 +1183,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self, forward_batch: Any, in_capture: bool = False
     ) -> None:
         self._cuda_graph_mode = True
+        request_ids = tuple(str(value) for value in getattr(forward_batch, "rids", ()))
+        if self.requires_eager_requests(request_ids):
+            raise RuntimeError(
+                "external-prefix requests reached dense CUDA graph replay"
+            )
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         bindings = self._bind_forward_requests(
             forward_batch, allow_capture_ids=in_capture
@@ -1077,6 +1224,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._stats["graph_replays"] += 1
             self._stats["batches"] += 1
 
+    def requires_eager_requests(self, request_ids: tuple[str, ...]) -> bool:
+        """Return whether live external identities require selected execution."""
+        if not self._tiered_enabled or not self._tiered_claims:
+            return False
+        if not request_ids:
+            return True
+        live = set(request_ids)
+        return any(claim.request_id in live for claim in self._tiered_claims.values())
+
     def init_forward_metadata_in_graph(self, forward_batch: Any) -> None:
         super().init_forward_metadata_in_graph(forward_batch)
 
@@ -1108,22 +1264,63 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             bindings = self._bind_forward_requests(
                 forward_batch, allow_capture_ids=False
             )
+            if self._tiered_enabled:
+                self._selected_executor.begin_tiered_forward()
+                self._current_request_ids = tuple(
+                    str(value) for value in forward_batch.rids
+                )
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is None:
+                    raise RuntimeError(
+                        "tiered attention requires SGLang's CPU sequence lengths"
+                    )
+                self._current_kv_lengths = tuple(
+                    int(value) for value in seq_lens_cpu[: forward_batch.batch_size]
+                )
+                extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+                self._current_query_lengths = (
+                    tuple(int(value) for value in extend_lens)
+                    if extend_lens is not None
+                    else (1,) * int(forward_batch.batch_size)
+                )
+                if len(self._current_query_lengths) != int(
+                    forward_batch.batch_size
+                ):
+                    raise RuntimeError(
+                        "tiered attention query lengths disagree with the batch"
+                    )
+                self._current_tiered_claims = tuple(self._tiered_claims.values())
             if self._profile_cpu:
                 self._stats["request_bind_cpu_ns"] = self._stats.get(
                     "request_bind_cpu_ns", 0
                 ) + (time.perf_counter_ns() - bind_started)
             if pending is None:
-                self._active_batch = _ActiveBatch(bindings, {}, None, {}, {}, {}, ())
+                sidecar_active = self._tiered_enabled and any(
+                    claim.request_id in self._current_request_ids
+                    for claim in self._current_tiered_claims
+                )
+                self._active_batch = _ActiveBatch(
+                    bindings, {}, None, {}, {}, {}, ()
+                )
                 self._stats["batches"] += 1
-                self._stats["resident_transformed_batches"] += 1
+                if sidecar_active:
+                    self._stats["tiered_batches"] = (
+                        self._stats.get("tiered_batches", 0) + 1
+                    )
+                    self._stats["tiered_external_prefix_batches"] = (
+                        self._stats.get("tiered_external_prefix_batches", 0) + 1
+                    )
+                else:
+                    self._stats["resident_transformed_batches"] += 1
                 return
             if (
-                self._tiered_active is not None
-                and self._tiered_active.pending is pending
+                self._tiered_enabled
+                and pending.claim_id in self._tiered_claims
             ):
                 # Tiered batches carry no demand plans or schedules: the
                 # selected form reads the wrapper tables directly and stages
-                # chosen rows itself.
+                # chosen rows itself. The request rows are recorded so the
+                # claim can prove slot ownership at completion time.
                 self._active_batch = _ActiveBatch(
                     bindings, {}, pending, {}, {}, {}, ()
                 )
@@ -2688,12 +2885,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("NTA attention ran without request metadata")
         pending = batch.pending_host_load
         stream = torch.cuda.current_stream()
-        tiered = self._tiered_active
-        if (
-            tiered is not None
-            and pending is not None
-            and tiered.pending is pending
-        ):
+        tiered = self._current_tiered_claims
+        if tiered:
             is_decode = any(
                 wrapper is candidate
                 for candidate in (
@@ -2701,17 +2894,23 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     or ()
                 )
             )
-            self._selected_shadow.evaluate_tiered(
+            served = self._selected_executor.evaluate_tiered_claims(
                 self, tiered, wrapper, q, kv_cache, layer, self._stats,
                 serve_output=output, prefill=not is_decode,
             )
-            tiered.layers_served += 1
-            return output.view(-1, layer.tp_q_head_num * layer.head_dim)
+            if served:
+                return output.view(-1, layer.tp_q_head_num * layer.head_dim)
+            if (
+                pending is not None
+                and pending.claim_id in self._tiered_claims
+            ):
+                raise RuntimeError(
+                    "the current HiCache load did not match its tiered request"
+                )
         if (
-            self._selected_shadow is not None
+            self._selected_executor is not None
             # Tiered mode confines selection to the claimed external prefix;
-            # claim-free batches take the stock dense path so the resident
-            # tail measures the mechanism, not stage-3a's verification pair.
+            # claim-free batches keep the transformed request-bound dense form.
             and not self._tiered_enabled
             and pending is None
             and any(
@@ -2722,8 +2921,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 )
             )
         ):
-            served = self._selected_shadow.evaluate(
-                wrapper, q, kv_cache, layer, self._stats,
+            served = self._selected_executor.evaluate(
+                self, wrapper, q, kv_cache, layer, self._stats,
                 serve_output=output if self._selected_serve else None,
             )
             if served:
@@ -3652,10 +3851,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         return report
 
     def _publish_stats(self) -> None:
+        self._drain_tiered_accounting(wait=False)
         if self._stats_publisher is None:
             return
         self._stats_publisher.publish(self._stats_report())
 
     def _write_stats(self) -> None:
+        self._drain_tiered_accounting(wait=False)
         if self._stats_publisher is not None:
             self._stats_publisher.publish(self._stats_report(), wait=True)

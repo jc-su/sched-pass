@@ -177,14 +177,38 @@ def _acquisition_ns(request: RequestWork, model: ServiceModel) -> int:
 
 
 def _urgency(priority: int, critical_path_ns: int, slack_ns: int | None) -> int:
+    """Mirror ``device::urgencyBucket`` for one request snapshot.
+
+    ``slack_ns`` excludes the predicted critical path. Reconstructing the
+    remaining deadline budget keeps host admission and device transport on
+    the same quantized policy without publishing a second policy field.
+    """
     if slack_ns is None:
-        return priority
-    if slack_ns <= 0:
-        return 7
-    if critical_path_ns == 0:
-        return priority
-    ratio = slack_ns / critical_path_ns
-    deadline_urgency = 6 if ratio <= 1 else 5 if ratio <= 2 else 4 if ratio <= 4 else 0
+        service_urgency = (
+            0
+            if critical_path_ns == 0
+            else 3
+            if critical_path_ns <= 100_000
+            else 2
+            if critical_path_ns <= 500_000
+            else 1
+            if critical_path_ns <= 2_000_000
+            else 0
+        )
+        return max(priority, service_urgency)
+    remaining_ns = max(0, slack_ns + critical_path_ns)
+    deadline_urgency = (
+        7
+        if remaining_ns == 0
+        or (critical_path_ns != 0 and remaining_ns <= critical_path_ns)
+        else 6
+        if critical_path_ns != 0 and remaining_ns <= 2 * critical_path_ns
+        else 5
+        if critical_path_ns != 0 and remaining_ns <= 4 * critical_path_ns
+        else 4
+        if remaining_ns <= 5_000_000
+        else 0
+    )
     return max(priority, deadline_urgency)
 
 

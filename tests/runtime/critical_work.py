@@ -11,6 +11,7 @@ from nta_runtime.critical_work import (
     estimate_critical_work,
     plan_critical_work,
 )
+from nta_runtime.critical_work import _urgency
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,17 @@ def work(
 
 
 def main() -> None:
+    assert _urgency(0, 0, None) == 0
+    assert _urgency(0, 100_000, None) == 3
+    assert _urgency(0, 500_000, None) == 2
+    assert _urgency(0, 2_000_000, None) == 1
+    assert _urgency(4, 10_000_000, None) == 4
+    assert _urgency(0, 200, -1) == 7
+    assert _urgency(0, 200, 0) == 7
+    assert _urgency(0, 200, 200) == 6
+    assert _urgency(0, 200, 600) == 5
+    assert _urgency(0, 200, 4_999_800) == 4
+    assert _urgency(0, 200, 5_000_000) == 0
     model = ServiceModel(
         bandwidth_bytes_per_second=10_000_000_000,
         fixed_latency_ns=20_000,

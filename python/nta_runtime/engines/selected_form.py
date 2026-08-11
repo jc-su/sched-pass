@@ -1,19 +1,18 @@
-"""Shadow evaluation of the selected attention form (1D health-check 2).
+"""Selected FlashInfer execution for resident and host-tiered KV tables.
 
-On resident decode batches, this runs the complete selection plumbing the
-selected form will use — logical-page envelopes over the live device pool,
-Quest scoring against the step's real queries, budgeted retention selection,
-compact per-token table construction — and verifies it end to end without
-touching the batch's served output: two independently planned stock wrappers
-execute over the identical compact table and must agree exactly, and every
-structural invariant of the table (subset, retention, ordering) is asserted.
-Zero acquisition occurs; serving semantics are unchanged. Routing real output
-through the form is the next stage and requires this one green.
+The resident verification mode builds compact per-token tables and compares two
+independent wrappers. The tiered mode combines device-side Quest selection,
+validated miss compaction, indexed host acquisition, and request-bound
+compiler-generated FlashInfer wrappers. It preserves request generation and
+supports multiple claimed requests in one batch.
 
 SGLang's HiCache profile stores KV at page size one, so a "page" here is a
 logical run of ``page_tokens`` consecutive sequence positions; a selected
 table is simply the subset of token-slot indices belonging to selected
 logical pages, which FlashInfer consumes without kernel changes.
+
+External prefixes use virtual request-table identities and bounded physical
+staging rows. FlashInfer receives only compact physical tables.
 """
 
 from __future__ import annotations
@@ -29,15 +28,42 @@ from nta_runtime.quest_selector import (
 )
 
 
-class SelectedShadow:
-    """Owns the verification wrapper pair and the per-step evaluation."""
+class SelectedAttentionExecutor:
+    """Own selected-table planning and compiler-generated FlashInfer launches."""
 
-    def __init__(self, budget_pages: int, page_tokens: int) -> None:
+    def __init__(
+        self,
+        budget_pages: int,
+        page_tokens: int,
+        *,
+        decode_jit_args: list[Any] | None = None,
+        prefill_jit_args: list[Any] | None = None,
+        register_wrapper: Any = None,
+    ) -> None:
         if budget_pages <= 0 or page_tokens <= 0:
             raise ValueError("selected-form budget and page tokens must be positive")
         self.budget_pages = budget_pages
         self.page_tokens = page_tokens
+        self._decode_jit_args = decode_jit_args
+        self._prefill_jit_args = prefill_jit_args
+        self._register_wrapper = register_wrapper
+        configured = (
+            decode_jit_args is not None,
+            prefill_jit_args is not None,
+            register_wrapper is not None,
+        )
+        if any(configured) and not all(configured):
+            raise ValueError(
+                "selected compiler execution requires both JIT forms and registration"
+            )
+        self.compiler_transformed = all(configured)
         self._wrappers: tuple[Any, Any] | None = None
+        self._overlap_decode_wrappers: dict[int, tuple[Any, torch.Tensor]] = {}
+        self._tiered_batch_contexts: dict[int, dict[str, Any]] = {}
+
+    def begin_tiered_forward(self) -> None:
+        """Invalidate wrapper plans at the engine's forward boundary."""
+        self._tiered_batch_contexts.clear()
 
     def _verification_wrappers(self) -> tuple[Any, Any]:
         if self._wrappers is None:
@@ -50,9 +76,17 @@ class SelectedShadow:
                     ),
                     "NHD",
                     backend="fa2",
+                    **(
+                        {"jit_args": self._decode_jit_args}
+                        if self._decode_jit_args is not None
+                        else {}
+                    ),
                 )
                 for _ in range(2)
             )
+            if self._register_wrapper is not None and self._decode_jit_args is not None:
+                for wrapper in self._wrappers:
+                    self._register_wrapper(wrapper, self._decode_jit_args[0])
         return self._wrappers
 
     def _prefill_wrappers(self) -> tuple[Any, Any]:
@@ -66,10 +100,88 @@ class SelectedShadow:
                     ),
                     "NHD",
                     backend="fa2",
+                    **(
+                        {"jit_args": self._prefill_jit_args}
+                        if self._prefill_jit_args is not None
+                        else {}
+                    ),
                 )
                 for _ in range(2)
             )
+            if self._register_wrapper is not None and self._prefill_jit_args is not None:
+                for wrapper in self._prefill_pair:
+                    self._register_wrapper(wrapper, self._prefill_jit_args[0])
         return self._prefill_pair
+
+    def _overlap_decode_wrapper(self, owner: Any) -> Any:
+        """Return a compiler-generated peer-group wrapper for one owner."""
+        key = id(owner)
+        cached = self._overlap_decode_wrappers.get(key)
+        if cached is not None:
+            return cached[0]
+        import flashinfer
+
+        workspace = torch.empty(
+            32 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+        )
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace,
+            "NHD",
+            backend="fa2",
+            use_tensor_cores=bool(owner.use_tensor_cores),
+            **(
+                {"jit_args": self._decode_jit_args}
+                if self._decode_jit_args is not None
+                else {}
+            ),
+        )
+        if self._register_wrapper is not None and self._decode_jit_args is not None:
+            self._register_wrapper(wrapper, self._decode_jit_args[0])
+        self._overlap_decode_wrappers[key] = (wrapper, workspace)
+        return wrapper
+
+    def _run_paged(
+        self,
+        engine: Any,
+        wrapper: Any,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        layer: Any,
+        *,
+        out: torch.Tensor | None = None,
+        request_positions: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        if not self.compiler_transformed:
+            return wrapper.run(q, kv_cache, out=out)
+        batch = getattr(engine, "_active_batch", None)
+        bindings = () if batch is None else batch.bindings
+        request_slots = tuple(
+            bindings[position].request_slot
+            for position in (
+                range(len(bindings))
+                if request_positions is None
+                else request_positions
+            )
+        )
+        if not request_slots or request_slots != tuple(
+            range(request_slots[0], request_slots[0] + len(request_slots))
+        ):
+            raise RuntimeError(
+                "selected attention requires contiguous request bindings"
+            )
+        engine._phase_program(wrapper)
+        result = wrapper.run(
+            q,
+            kv_cache,
+            engine._runtime.device_view_tensor,
+            layer.scaling,
+            request_slots[0],
+            out=out,
+        )
+        engine._stats["selected_compiler_launches"] = (
+            engine._stats.get("selected_compiler_launches", 0) + 1
+        )
+        return result
 
     def evaluate_tiered(
         self,
@@ -99,10 +211,10 @@ class SelectedShadow:
         group_size = q.shape[1] // key_cache.shape[1]
         stream = torch.cuda.current_stream()
 
-        if not prefill and claim.fast_ok and not claim.verify:
-            return self._tiered_decode_fast(
+        if claim.fast_ok and not claim.verify:
+            return self._tiered_fast(
                 engine, claim, wrapper, q, kv_cache, layer, local_layer,
-                group_size, stats, serve_output, stream,
+                group_size, stats, serve_output, stream, prefill,
             )
 
         if prefill:
@@ -128,7 +240,7 @@ class SelectedShadow:
             tokens = indices[begin:end]
             queries = q if prefill else q[request : request + 1]
             tokens_long = tokens.to(torch.long)
-            prefix_mask = claim.slot_is_prefix[tokens_long]
+            prefix_mask = claim.table_prefix_mask(tokens)
             prefix_count = int(prefix_mask.sum())
             if prefix_count == 0:
                 kept_per_request.append(tokens)
@@ -140,6 +252,7 @@ class SelectedShadow:
                     "prefix reuse is outside the current stage"
                 )
             staged_any = True
+            claim.note_serving(engine, request, prefix_mask)
             chosen = claim.choose_pages(local_layer, queries, group_size)
             if claim.verify and claim.fast_ok and not prefill:
                 free = claim.choose_free_pages(
@@ -154,6 +267,17 @@ class SelectedShadow:
                         "reference selection"
                     )
             claim.stage_layer(engine, local_layer, chosen, stream)
+            if claim.external_sidecar:
+                selected_rows = claim.page_row_count(chosen)
+                kept_per_request.append(
+                    torch.cat(
+                        [
+                            claim.device_rows[:selected_rows],
+                            tokens[~prefix_mask],
+                        ]
+                    )
+                )
+                continue
             chosen_mask = torch.zeros(
                 claim.pages, dtype=torch.bool, device=tokens.device
             )
@@ -201,7 +325,11 @@ class SelectedShadow:
                     q_data_type=q.dtype,
                     kv_data_type=key_cache.dtype,
                 )
-                outputs.append(verifier.run(q, (key_cache, value_cache)))
+                outputs.append(
+                    self._run_paged(
+                        engine, verifier, q, (key_cache, value_cache), layer
+                    )
+                )
         else:
             verifiers = self._verification_wrappers()
             for verifier in verifiers if claim.verify else verifiers[:1]:
@@ -218,7 +346,11 @@ class SelectedShadow:
                     sm_scale=layer.scaling,
                     disable_split_kv=True,
                 )
-                outputs.append(verifier.run(q, (key_cache, value_cache)))
+                outputs.append(
+                    self._run_paged(
+                        engine, verifier, q, (key_cache, value_cache), layer
+                    )
+                )
         if len(outputs) == 2 and not torch.equal(outputs[0], outputs[1]):
             raise RuntimeError(
                 "tiered verification wrappers disagree over an identical "
@@ -241,7 +373,483 @@ class SelectedShadow:
         )
         return True
 
-    def _tiered_decode_fast(
+    def evaluate_tiered_claims(
+        self,
+        engine: Any,
+        claims: tuple[Any, ...],
+        wrapper: Any,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        layer: Any,
+        stats: dict[str, Any],
+        serve_output: torch.Tensor,
+        prefill: bool,
+    ) -> bool:
+        """Serve every external-prefix request through one compact plan.
+
+        A dense peer table is unsafe when that peer belongs to another live
+        claim, so matching and compaction are batch-wide.  The plan is built
+        once at layer zero; every later layer only updates fixed-size claim
+        segments and stages newly selected rows.
+        """
+        if not claims:
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("tiered serving inside graph capture is unsupported")
+        if any(not claim.fast_ok or claim.verify for claim in claims):
+            if len(claims) == 1:
+                return self.evaluate_tiered(
+                    engine,
+                    claims[0],
+                    wrapper,
+                    q,
+                    kv_cache,
+                    layer,
+                    stats,
+                    serve_output,
+                    prefill,
+                )
+            raise RuntimeError(
+                "concurrent tiered claims require the fixed-shape selected form"
+            )
+
+        local_layer = int(layer.layer_id) - claims[0].start_layer
+        if any(
+            claim.start_layer != claims[0].start_layer
+            or claim.layer_count != claims[0].layer_count
+            for claim in claims
+        ):
+            raise RuntimeError("concurrent tiered claims disagree on model geometry")
+        if not 0 <= local_layer < claims[0].layer_count:
+            raise RuntimeError("tiered layer is outside the claimed model")
+
+        claim_ids = tuple(claim.claim_id for claim in claims)
+        context_key = id(wrapper)
+        ctx = self._tiered_batch_contexts.get(context_key)
+        if (
+            ctx is None
+            or ctx["wrapper"] is not wrapper
+            or ctx["prefill"] is not prefill
+            or ctx["claim_ids"] != claim_ids
+        ):
+            ctx = self._build_multi_claim_ctx(
+                engine, claims, wrapper, q, kv_cache, layer, prefill
+            )
+            if ctx is None:
+                return False
+            self._tiered_batch_contexts[context_key] = ctx
+
+        key_cache, _ = kv_cache
+        group_size = q.shape[1] // key_cache.shape[1]
+        stream = torch.cuda.current_stream()
+        if ctx.get("request_overlap", False):
+            copy_events = []
+            for entry in ctx["claim_entries"]:
+                claim = entry["claim"]
+                request = entry["request"]
+                selected_rows = None if prefill else claim.cached_selected_rows(
+                    local_layer
+                )
+                if selected_rows is None:
+                    queries = q[request : request + 1]
+                    free = claim.choose_free_pages(
+                        local_layer, queries, group_size
+                    )
+                    selected_rows, copied = claim.stage_missing_async(
+                        engine, local_layer, free, stream
+                    )
+                    claim.remember_selected_rows(local_layer, selected_rows)
+                    copy_events.append(copied)
+                else:
+                    stats["tiered_selection_reuse_layers"] = (
+                        stats.get("tiered_selection_reuse_layers", 0) + 1
+                    )
+                ctx["plan_indices"][entry["begin"] : entry["end"]].copy_(
+                    selected_rows
+                )
+                claim.layers_served += 1
+            self._run_paged(
+                engine,
+                ctx["peer_wrapper"],
+                q[ctx["peer_slice"]],
+                kv_cache,
+                layer,
+                out=ctx["peer_output"],
+                request_positions=ctx["peer_positions"],
+            )
+            serve_output[ctx["peer_slice"]].copy_(ctx["peer_output"])
+            for copied in copy_events:
+                stream.wait_event(copied)
+            self._run_paged(
+                engine,
+                ctx["verifier"],
+                q[ctx["claim_slice"]],
+                kv_cache,
+                layer,
+                out=ctx["external_output"],
+                request_positions=ctx["claim_positions"],
+            )
+            serve_output[ctx["claim_slice"]].copy_(ctx["external_output"])
+            stats["tiered_request_overlap_layers"] = (
+                stats.get("tiered_request_overlap_layers", 0) + 1
+            )
+            stats["tiered_request_overlap_peer_requests"] = (
+                stats.get("tiered_request_overlap_peer_requests", 0)
+                + len(ctx["peer_positions"])
+            )
+        else:
+            for entry in ctx["claim_entries"]:
+                claim = entry["claim"]
+                request = entry["request"]
+                if prefill:
+                    query_begin, query_end = ctx["query_ranges"][request]
+                    queries = q[query_begin:query_end]
+                else:
+                    queries = q[request : request + 1]
+                selected_rows = None if prefill else claim.cached_selected_rows(
+                    local_layer
+                )
+                if selected_rows is None:
+                    free = claim.choose_free_pages(local_layer, queries, group_size)
+                    selected_rows = claim.stage_missing(
+                        engine, local_layer, free, stream
+                    )
+                    claim.remember_selected_rows(local_layer, selected_rows)
+                else:
+                    stats["tiered_selection_reuse_layers"] = (
+                        stats.get("tiered_selection_reuse_layers", 0) + 1
+                    )
+                ctx["plan_indices"][entry["begin"] : entry["end"]].copy_(
+                    selected_rows
+                )
+                claim.layers_served += 1
+            self._run_paged(
+                engine, ctx["verifier"], q, kv_cache, layer, out=serve_output
+            )
+
+        stats["tiered_rows_copied"] = stats.get(
+            "tiered_rows_copied_released", 0
+        ) + sum(claim.rows_copied for claim in claims)
+        stats["tiered_rows_rehit"] = stats.get(
+            "tiered_rows_rehit_released", 0
+        ) + sum(claim.rows_rehit for claim in claims)
+        kind = "tiered_prefill" if prefill else "tiered_decode"
+        stats[f"{kind}_layers"] = stats.get(f"{kind}_layers", 0) + 1
+        stats["tiered_fast_layers"] = stats.get("tiered_fast_layers", 0) + 1
+        stats["tiered_concurrent_claims_max"] = max(
+            stats.get("tiered_concurrent_claims_max", 0),
+            len(ctx["claim_entries"]),
+        )
+        stats["tiered_tokens_total"] = (
+            stats.get("tiered_tokens_total", 0) + ctx["total"]
+        )
+        stats["tiered_tokens_kept"] = (
+            stats.get("tiered_tokens_kept", 0) + ctx["kept_total"]
+        )
+        return True
+
+    def _build_multi_claim_ctx(
+        self,
+        engine: Any,
+        claims: tuple[Any, ...],
+        wrapper: Any,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        layer: Any,
+        prefill: bool,
+    ) -> dict[str, Any] | None:
+        key_cache, _ = kv_cache
+        kv_lengths = tuple(getattr(engine, "_current_kv_lengths", ()))
+        query_lengths = tuple(getattr(engine, "_current_query_lengths", ()))
+        if prefill:
+            batch_size = int(getattr(wrapper, "_batch_size", 1) or 1)
+            qo_indptr = wrapper._qo_indptr_buf[: batch_size + 1]
+            if len(query_lengths) != batch_size or sum(query_lengths) != q.shape[0]:
+                raise RuntimeError("tiered extend query offsets disagree with Q")
+            query_boundaries = [0]
+            for length in query_lengths:
+                query_boundaries.append(query_boundaries[-1] + length)
+            query_ranges = tuple(
+                (query_boundaries[index], query_boundaries[index + 1])
+                for index in range(batch_size)
+            )
+        else:
+            batch_size = q.shape[0]
+            qo_indptr = None
+            query_ranges = tuple((index, index + 1) for index in range(batch_size))
+        if len(kv_lengths) != batch_size:
+            raise RuntimeError("tiered batch omitted CPU KV lengths")
+        boundaries = [0]
+        for length in kv_lengths:
+            boundaries.append(boundaries[-1] + length)
+        total = boundaries[-1]
+        indices = wrapper._paged_kv_indices_buf[:total]
+        segments: list[tuple[Any | None, torch.Tensor, int]] = []
+        matched_claims: set[int] = set()
+        request_ids = getattr(engine, "_current_request_ids", ())
+        if len(request_ids) != batch_size:
+            raise RuntimeError("tiered batch omitted request identities")
+        for request in range(batch_size):
+            begin = boundaries[request]
+            end = boundaries[request + 1]
+            tokens = indices[begin:end]
+            matched = None
+            remainder = tokens
+            for claim in claims:
+                if (
+                    claim.request_id is not None
+                    and claim.request_id != request_ids[request]
+                ):
+                    continue
+                prefix_mask = claim.table_prefix_mask(tokens)
+                if claim.request_id is None:
+                    prefix_count = int(prefix_mask.sum())
+                    if prefix_count == 0:
+                        continue
+                    if prefix_count != claim.token_count:
+                        # Before first use, unrelated requests can contain a
+                        # few recycled slot numbers from this claim. Identity
+                        # becomes authoritative after the complete match.
+                        continue
+                if matched is not None:
+                    raise RuntimeError("one request matched two live tiered claims")
+                if claim.claim_id in matched_claims:
+                    raise RuntimeError("one tiered claim matched two requests")
+                matched = claim
+                matched_claims.add(claim.claim_id)
+                remainder = tokens[~prefix_mask]
+                claim.note_serving(engine, request, prefix_mask)
+            segments.append((matched, remainder, request))
+        if not matched_claims:
+            return None
+
+        claim_positions = tuple(
+            request for claim, _, request in segments if claim is not None
+        )
+        peer_positions = tuple(
+            request for claim, _, request in segments if claim is None
+        )
+        contiguous_claims = bool(claim_positions) and claim_positions == tuple(
+            range(claim_positions[0], claim_positions[-1] + 1)
+        )
+        contiguous_peers = bool(peer_positions) and peer_positions == tuple(
+            range(peer_positions[0], peer_positions[-1] + 1)
+        )
+        split_overlap = not any(
+            int(getattr(claim, "selection_refresh_interval", 1)) > 1
+            for claim in claims
+        )
+        if not prefill and contiguous_claims and contiguous_peers and split_overlap:
+            return self._build_request_overlap_ctx(
+                claims,
+                wrapper,
+                q,
+                key_cache,
+                layer,
+                segments,
+                claim_positions,
+                peer_positions,
+                total,
+            )
+
+        kept_counts = [
+            int(tokens.numel())
+            + (0 if claim is None else claim.kept_prefix_rows)
+            for claim, tokens, _ in segments
+        ]
+        kept_total = sum(kept_counts)
+        plan_indices = torch.empty(kept_total, dtype=torch.int32, device=q.device)
+        claim_entries = []
+        offset = 0
+        for (claim, tokens, request), count in zip(segments, kept_counts, strict=True):
+            if claim is None:
+                plan_indices[offset : offset + count].copy_(tokens)
+            else:
+                claim_end = offset + claim.kept_prefix_rows
+                plan_indices[claim_end : offset + count].copy_(tokens)
+                claim_entries.append(
+                    {
+                        "claim": claim,
+                        "request": request,
+                        "begin": offset,
+                        "end": claim_end,
+                    }
+                )
+            offset += count
+
+        boundaries = [0]
+        for count in kept_counts:
+            boundaries.append(boundaries[-1] + count)
+        indptr = torch.tensor(boundaries, dtype=torch.int32)
+        last_page_len = torch.ones(batch_size, dtype=torch.int32)
+        verifier = wrapper
+        if prefill:
+            verifier.plan(
+                qo_indptr,
+                indptr,
+                plan_indices,
+                last_page_len,
+                q.shape[1],
+                key_cache.shape[1],
+                q.shape[2],
+                1,
+                causal=True,
+                sm_scale=layer.scaling,
+                q_data_type=q.dtype,
+                kv_data_type=key_cache.dtype,
+            )
+        else:
+            verifier.plan(
+                indptr,
+                plan_indices,
+                last_page_len,
+                q.shape[1],
+                key_cache.shape[1],
+                q.shape[2],
+                1,
+                q_data_type=q.dtype,
+                kv_data_type=key_cache.dtype,
+                sm_scale=layer.scaling,
+                disable_split_kv=True,
+            )
+        if verifier._paged_kv_indices_buf.data_ptr() != plan_indices.data_ptr():
+            raise RuntimeError("FlashInfer did not retain the compact indices buffer")
+        return {
+            "wrapper": wrapper,
+            "verifier": verifier,
+            "claim_ids": tuple(claim.claim_id for claim in claims),
+            "claim_entries": claim_entries,
+            "query_ranges": query_ranges,
+            "plan_indices": plan_indices,
+            "total": total,
+            "kept_total": kept_total,
+            "prefill": prefill,
+        }
+
+    def _build_request_overlap_ctx(
+        self,
+        claims: tuple[Any, ...],
+        wrapper: Any,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        layer: Any,
+        segments: list[tuple[Any | None, torch.Tensor, int]],
+        claim_positions: tuple[int, ...],
+        peer_positions: tuple[int, ...],
+        total: int,
+    ) -> dict[str, Any]:
+        """Plan compiler-generated peer and external request groups."""
+        claim_segments = [
+            (claim, tokens, request)
+            for claim, tokens, request in segments
+            if claim is not None
+        ]
+        peer_segments = [
+            (tokens, request)
+            for claim, tokens, request in segments
+            if claim is None
+        ]
+        external_counts = [
+            claim.kept_prefix_rows + int(tokens.numel())
+            for claim, tokens, _ in claim_segments
+        ]
+        peer_counts = [int(tokens.numel()) for tokens, _ in peer_segments]
+        if min(external_counts + peer_counts) <= 0:
+            raise RuntimeError(
+                "request overlap requires non-empty peer and external tables"
+            )
+
+        external_total = sum(external_counts)
+        external_indices = torch.empty(
+            external_total, dtype=torch.int32, device=q.device
+        )
+        claim_entries = []
+        offset = 0
+        for (claim, tokens, request), count in zip(
+            claim_segments, external_counts, strict=True
+        ):
+            selected_end = offset + claim.kept_prefix_rows
+            external_indices[selected_end : offset + count].copy_(tokens)
+            claim_entries.append(
+                {
+                    "claim": claim,
+                    "request": request,
+                    "begin": offset,
+                    "end": selected_end,
+                }
+            )
+            offset += count
+        external_boundaries = [0]
+        for count in external_counts:
+            external_boundaries.append(external_boundaries[-1] + count)
+        wrapper.plan(
+            torch.tensor(external_boundaries, dtype=torch.int32),
+            external_indices,
+            torch.ones(len(claim_segments), dtype=torch.int32),
+            q.shape[1],
+            key_cache.shape[1],
+            q.shape[2],
+            1,
+            q_data_type=q.dtype,
+            kv_data_type=key_cache.dtype,
+            sm_scale=layer.scaling,
+            disable_split_kv=True,
+        )
+        if wrapper._paged_kv_indices_buf.data_ptr() != external_indices.data_ptr():
+            raise RuntimeError(
+                "FlashInfer did not retain the external-group indices buffer"
+            )
+
+        peer_indices = torch.cat([tokens for tokens, _ in peer_segments]).to(
+            torch.int32
+        )
+        peer_boundaries = [0]
+        for count in peer_counts:
+            peer_boundaries.append(peer_boundaries[-1] + count)
+        peer_wrapper = self._overlap_decode_wrapper(wrapper)
+        peer_wrapper.plan(
+            torch.tensor(peer_boundaries, dtype=torch.int32),
+            peer_indices,
+            torch.ones(len(peer_segments), dtype=torch.int32),
+            q.shape[1],
+            key_cache.shape[1],
+            q.shape[2],
+            1,
+            q_data_type=q.dtype,
+            kv_data_type=key_cache.dtype,
+            sm_scale=layer.scaling,
+            disable_split_kv=True,
+        )
+        if peer_wrapper._paged_kv_indices_buf.data_ptr() != peer_indices.data_ptr():
+            raise RuntimeError(
+                "FlashInfer did not retain the peer-group indices buffer"
+            )
+
+        return {
+            "wrapper": wrapper,
+            "verifier": wrapper,
+            "peer_wrapper": peer_wrapper,
+            "claim_ids": tuple(claim.claim_id for claim in claims),
+            "claim_entries": claim_entries,
+            "claim_positions": claim_positions,
+            "peer_positions": peer_positions,
+            "claim_slice": slice(claim_positions[0], claim_positions[-1] + 1),
+            "peer_slice": slice(peer_positions[0], peer_positions[-1] + 1),
+            "plan_indices": external_indices,
+            "peer_indices": peer_indices,
+            "external_output": torch.empty_like(
+                q[claim_positions[0] : claim_positions[-1] + 1]
+            ),
+            "peer_output": torch.empty_like(
+                q[peer_positions[0] : peer_positions[-1] + 1]
+            ),
+            "total": total,
+            "kept_total": external_total + sum(peer_counts),
+            "prefill": False,
+            "request_overlap": True,
+        }
+
+    def _tiered_fast(
         self,
         engine: Any,
         claim: Any,
@@ -254,23 +862,28 @@ class SelectedShadow:
         stats: dict[str, Any],
         serve_output: torch.Tensor,
         stream: Any,
+        prefill: bool,
     ) -> bool:
-        """Plan-once decode serving.
+        """Plan-once serving for both extend and decode.
 
         The kept row count is layer-invariant (retention always keeps the
-        tail page), so the verification wrapper is planned exactly once per
+        tail page), so the serving wrapper is planned exactly once per
         forward against an indices buffer this class owns; each layer
-        rewrites only the claim request's prefix segment of that buffer from
-        the device-side selection and runs attention. FlashInfer's decode
-        planner consumes indptr lengths only — indices are read from the
-        device buffer at run time — which is what makes the in-place rewrite
-        sound.
+        rewrites only the claim's segment of that buffer from the
+        device-side selection and runs attention. FlashInfer's planners
+        consume indptr lengths only — indices are read from the device
+        buffer at run time — which is what makes the in-place rewrite
+        sound. The claim segment leads each request's table: extend is
+        causal and only the trailing ``qo_len`` kv positions are
+        progressively masked, so every prefix row must precede the suffix,
+        while decode attention is order-free either way.
         """
         ctx = claim.ctx
         if (
             ctx is None
             or local_layer == 0
             or ctx["wrapper"] is not wrapper
+            or ctx["prefill"] is not prefill
             or ctx["next"] != local_layer
         ):
             if local_layer != 0:
@@ -278,23 +891,25 @@ class SelectedShadow:
                     "tiered fast path entered mid-forward at layer "
                     f"{local_layer} without a forward context"
                 )
-            ctx = self._build_decode_ctx(claim, wrapper, q, kv_cache, layer)
+            ctx = self._build_fast_ctx(
+                engine, claim, wrapper, q, kv_cache, layer, prefill
+            )
             claim.ctx = ctx
         ctx["next"] = local_layer + 1
 
         request = ctx["claim_request"]
-        free = claim.choose_free_pages(
-            local_layer, q[request : request + 1], group_size
-        )
-        positions = claim.kept_prefix_positions(free)
+        queries = q if prefill else q[request : request + 1]
+        free = claim.choose_free_pages(local_layer, queries, group_size)
+        selected_rows = claim.stage_missing(engine, local_layer, free, stream)
         ctx["plan_indices"][ctx["seg_begin"] : ctx["seg_end"]].copy_(
-            claim.device_rows[positions]
+            selected_rows
         )
-        claim.stage_missing(engine, local_layer, free, stream)
-        ctx["verifier"].run(q, kv_cache, out=serve_output)
+        self._run_paged(
+            engine, ctx["verifier"], q, kv_cache, layer, out=serve_output
+        )
         if claim.verify_fast:
             self._fast_crosscheck(
-                claim, q, kv_cache, layer, local_layer, group_size,
+                engine, claim, q, kv_cache, layer, local_layer, group_size,
                 serve_output, ctx,
             )
             stats["tiered_fast_checked_layers"] = (
@@ -307,9 +922,8 @@ class SelectedShadow:
         stats["tiered_rows_rehit"] = (
             stats.get("tiered_rows_rehit_released", 0) + claim.rows_rehit
         )
-        stats["tiered_decode_layers"] = (
-            stats.get("tiered_decode_layers", 0) + 1
-        )
+        kind = "tiered_prefill" if prefill else "tiered_decode"
+        stats[f"{kind}_layers"] = stats.get(f"{kind}_layers", 0) + 1
         stats["tiered_fast_layers"] = stats.get("tiered_fast_layers", 0) + 1
         stats["tiered_tokens_total"] = (
             stats.get("tiered_tokens_total", 0) + ctx["total"]
@@ -319,19 +933,30 @@ class SelectedShadow:
         )
         return True
 
-    def _build_decode_ctx(
+    def _build_fast_ctx(
         self,
+        engine: Any,
         claim: Any,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         layer: Any,
+        prefill: bool,
     ) -> dict[str, Any]:
-        """Once per decode forward: identify the claim request, lay out the
-        compact indices buffer (peer tables and the resident tail are
-        layer-invariant), and plan the single serving wrapper against it."""
+        """Once per forward: identify the claim request, lay out the compact
+        indices buffer (peer tables and non-claim tokens are layer-invariant),
+        and plan the single serving wrapper against it."""
         key_cache, _ = kv_cache
-        batch_size = q.shape[0]
+        if prefill:
+            planned = int(getattr(wrapper, "_batch_size", 1) or 1)
+            if planned != 1:
+                raise RuntimeError(
+                    "tiered extend currently requires a single-request "
+                    f"forward; the wrapper planned {planned}"
+                )
+            batch_size = 1
+        else:
+            batch_size = q.shape[0]
         indptr_cpu = wrapper._paged_kv_indptr_buf[: batch_size + 1].to(
             "cpu", torch.int64
         )
@@ -344,7 +969,7 @@ class SelectedShadow:
             begin = int(indptr_cpu[request])
             end = int(indptr_cpu[request + 1])
             tokens = indices[begin:end]
-            prefix_mask = claim.slot_is_prefix[tokens.to(torch.long)]
+            prefix_mask = claim.table_prefix_mask(tokens)
             prefix_count = int(prefix_mask.sum())
             if prefix_count == 0:
                 segments.append(("peer", tokens))
@@ -361,9 +986,11 @@ class SelectedShadow:
                 )
             # The claim's slots need not be the leading table entries nor in
             # sequence order (radix hits can leave the claimed segment
-            # mid-table); decode attention is order-free, so the layout is
-            # simply [non-claim tokens, rewritable prefix segment].
+            # mid-table). The non-claim remainder keeps its original order,
+            # which for extend leaves the causal suffix trailing as
+            # causality requires.
             claim_request = request
+            claim.note_serving(engine, request, prefix_mask)
             segments.append(("claim", tokens[~prefix_mask]))
         if claim_request is None:
             raise RuntimeError(
@@ -386,9 +1013,9 @@ class SelectedShadow:
             if kind == "peer":
                 plan_indices[offset : offset + count].copy_(tokens)
             else:
-                seg_begin = offset + count - claim.kept_prefix_rows
-                seg_end = offset + count
-                plan_indices[offset : seg_begin].copy_(tokens)
+                seg_begin = offset
+                seg_end = offset + claim.kept_prefix_rows
+                plan_indices[seg_end : offset + count].copy_(tokens)
             offset += count
 
         boundaries = [0]
@@ -396,20 +1023,40 @@ class SelectedShadow:
             boundaries.append(boundaries[-1] + count)
         indptr_host = torch.tensor(boundaries, dtype=torch.int32)
         last_page_len_host = torch.ones(batch_size, dtype=torch.int32)
-        verifier = self._verification_wrappers()[0]
-        verifier.plan(
-            indptr_host,
-            plan_indices,
-            last_page_len_host,
-            q.shape[1],
-            key_cache.shape[1],
-            q.shape[2],
-            1,
-            q_data_type=q.dtype,
-            kv_data_type=key_cache.dtype,
-            sm_scale=layer.scaling,
-            disable_split_kv=True,
-        )
+        if prefill:
+            verifier = self._prefill_wrappers()[0]
+            qo_indptr_host = torch.tensor(
+                [0, q.shape[0]], dtype=torch.int32
+            )
+            verifier.plan(
+                qo_indptr_host,
+                indptr_host,
+                plan_indices,
+                last_page_len_host,
+                q.shape[1],
+                key_cache.shape[1],
+                q.shape[2],
+                1,
+                causal=True,
+                sm_scale=layer.scaling,
+                q_data_type=q.dtype,
+                kv_data_type=key_cache.dtype,
+            )
+        else:
+            verifier = self._verification_wrappers()[0]
+            verifier.plan(
+                indptr_host,
+                plan_indices,
+                last_page_len_host,
+                q.shape[1],
+                key_cache.shape[1],
+                q.shape[2],
+                1,
+                q_data_type=q.dtype,
+                kv_data_type=key_cache.dtype,
+                sm_scale=layer.scaling,
+                disable_split_kv=True,
+            )
         if verifier._paged_kv_indices_buf.data_ptr() != plan_indices.data_ptr():
             raise RuntimeError(
                 "the planned wrapper copied the indices buffer; in-place "
@@ -425,11 +1072,13 @@ class SelectedShadow:
             "total": total,
             "kept_total": kept_total,
             "segments": segments,
+            "prefill": prefill,
             "next": 0,
         }
 
     def _fast_crosscheck(
         self,
+        engine: Any,
         claim: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -443,14 +1092,15 @@ class SelectedShadow:
 
         Three checks: the device selection equals the reference selection;
         the staged rows byte-match their host sources; and an independently
-        planned wrapper over the reference-ordered compact table reproduces
+        planned wrapper over a differently-ordered compact table reproduces
         the served output. The kv orderings differ, so the attention check
         is a tolerance compare — tight enough that any wrong page, stale
         row, or misplaced segment write fails it by orders of magnitude.
         """
         key_cache, value_cache = kv_cache
+        prefill = ctx["prefill"]
         request = ctx["claim_request"]
-        queries = q[request : request + 1]
+        queries = q if prefill else q[request : request + 1]
         chosen = claim.choose_pages(local_layer, queries, group_size)
         fast_chosen = sorted(
             torch.cat(
@@ -465,8 +1115,12 @@ class SelectedShadow:
                 "fast-path selection diverged from the reference selection"
             )
         all_positions = claim._positions_of(chosen)
+        physical_rows = claim.physical_rows_for_pages(local_layer, chosen)
         claim._verify_layer(
-            local_layer, all_positions, int(all_positions.numel())
+            local_layer,
+            all_positions,
+            int(all_positions.numel()),
+            physical_rows,
         )
 
         kept_per_request = []
@@ -477,7 +1131,7 @@ class SelectedShadow:
                 kept_per_request.append(
                     torch.cat(
                         [
-                            claim.device_rows[all_positions],
+                            physical_rows,
                             tokens,
                         ]
                     )
@@ -487,26 +1141,55 @@ class SelectedShadow:
         compact_indptr = torch.tensor(
             counts, dtype=torch.int32, device=compact_indices.device
         ).cumsum(0, dtype=torch.int32)
+        batch_size = 1 if prefill else q.shape[0]
         last_page_len = torch.ones(
-            q.shape[0], dtype=torch.int32, device=compact_indices.device
+            batch_size, dtype=torch.int32, device=compact_indices.device
         )
-        reference = self._verification_wrappers()[1]
-        reference.plan(
-            compact_indptr,
-            compact_indices,
-            last_page_len,
-            q.shape[1],
-            key_cache.shape[1],
-            q.shape[2],
-            1,
-            q_data_type=q.dtype,
-            kv_data_type=key_cache.dtype,
-            sm_scale=layer.scaling,
-            disable_split_kv=True,
+        if prefill:
+            reference = self._prefill_wrappers()[1]
+            qo_indptr = torch.tensor(
+                [0, q.shape[0]], dtype=torch.int32,
+                device=compact_indices.device,
+            )
+            reference.plan(
+                qo_indptr,
+                compact_indptr,
+                compact_indices,
+                last_page_len,
+                q.shape[1],
+                key_cache.shape[1],
+                q.shape[2],
+                1,
+                causal=True,
+                sm_scale=layer.scaling,
+                q_data_type=q.dtype,
+                kv_data_type=key_cache.dtype,
+            )
+        else:
+            reference = self._verification_wrappers()[1]
+            reference.plan(
+                compact_indptr,
+                compact_indices,
+                last_page_len,
+                q.shape[1],
+                key_cache.shape[1],
+                q.shape[2],
+                1,
+                q_data_type=q.dtype,
+                kv_data_type=key_cache.dtype,
+                sm_scale=layer.scaling,
+                disable_split_kv=True,
+            )
+        expected = self._run_paged(
+            engine, reference, q, (key_cache, value_cache), layer
         )
-        expected = reference.run(q, (key_cache, value_cache))
+        # Tolerance is calibrated to fp16 reduction reordering, which the
+        # differing kv orders legitimately produce: a 16K-term extend was
+        # observed to differ by exactly one ulp at the output magnitude
+        # (3.9e-3 at 6.7). Real staging or selection errors diverge at the
+        # output's own scale, orders of magnitude above this bound.
         if not torch.allclose(
-            serve_output.float(), expected.float(), rtol=1e-2, atol=1e-3
+            serve_output.float(), expected.float(), rtol=2e-2, atol=8e-3
         ):
             difference = (serve_output.float() - expected.float()).abs()
             raise RuntimeError(
@@ -563,6 +1246,7 @@ class SelectedShadow:
 
     def evaluate(
         self,
+        engine: Any,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -624,7 +1308,11 @@ class SelectedShadow:
                 sm_scale=layer.scaling,
                 disable_split_kv=True,
             )
-            outputs.append(verifier.run(q, (key_cache, value_cache)))
+            outputs.append(
+                self._run_paged(
+                    engine, verifier, q, (key_cache, value_cache), layer
+                )
+            )
         if not torch.equal(outputs[0], outputs[1]):
             raise RuntimeError(
                 "selected form verification wrappers disagree over an "

@@ -73,7 +73,7 @@ int main() {
                 23);
   static_assert(
       destinationTransferIndexLimit(packTransferIndexLimits(23, 47)) == 47);
-  if (Version != 25 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
+  if (Version != 27 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

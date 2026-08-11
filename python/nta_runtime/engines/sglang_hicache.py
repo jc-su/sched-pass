@@ -22,12 +22,14 @@ from nta_runtime.critical_work import (
 
 @dataclass
 class PendingHostLoad:
+    claim_id: int
     consumer_index: int
     host_indices: torch.Tensor
     device_indices: torch.Tensor
     producer_event: Any
     controller: Any
     node_ids: tuple[int, ...]
+    held_ack: Any = None
     host_by_device: dict[int, int] = field(default_factory=dict)
     completed_layers: int = 0
     prefetched_layers: dict[int, Any] = field(default_factory=dict)
@@ -71,6 +73,15 @@ class SglangHiCacheBridge:
     def __init__(self, device_pool: Any) -> None:
         self.device_pool = device_pool
         self._pending: dict[int, PendingHostLoad] = {}
+        self._owned: dict[int, PendingHostLoad] = {}
+        self._next_claim_id = 1
+        self._next_virtual_token = 1 << 30
+        self._external_prefix_capacity_rows = 0
+        self._external_prefixes: dict[str, Any] = {}
+        self._external_live_dense_rows = 0
+        self._external_live_staging_rows = 0
+        self._external_dense_high_water_rows = 0
+        self._external_staging_high_water_rows = 0
         self._lock = threading.Lock()
         self._prefetch_callback: Any = None
         self._admission_stats: dict[str, int] = {}
@@ -82,6 +93,152 @@ class SglangHiCacheBridge:
 
     def set_prefetch_callback(self, callback: Any) -> None:
         self._prefetch_callback = callback
+
+    @property
+    def external_prefix_enabled(self) -> bool:
+        return self._external_prefix_capacity_rows > 0
+
+    def enable_external_prefixes(self, capacity_rows: int, callback: Any) -> None:
+        if capacity_rows <= 0 or not callable(callback):
+            raise ValueError("external-prefix ownership requires capacity and callback")
+        self._external_prefix_capacity_rows = capacity_rows
+        self._prefetch_callback = callback
+
+    def claim_external_prefix(
+        self,
+        request: Any,
+        host_indices: torch.Tensor,
+        source_release: Any,
+        controller: Any,
+        cache: Any,
+        *,
+        node_ids: tuple[int, ...],
+    ) -> Any:
+        """Allocate virtual identity plus bounded physical staging rows."""
+        from nta_runtime.engines.sglang_external import (
+            ExternalPrefixHandle,
+            VIRTUAL_TOKEN_BASE,
+            VIRTUAL_TOKEN_LIMIT,
+        )
+
+        if not self.external_prefix_enabled:
+            raise RuntimeError("external-prefix ownership is disabled")
+        request_id = str(getattr(request, "rid", "") or "")
+        if not request_id:
+            raise RuntimeError("external-prefix request omitted its ID")
+        with self._lock:
+            if request_id in self._external_prefixes:
+                raise RuntimeError("request already has a live external prefix")
+        token_count = int(host_indices.numel())
+        if token_count <= 0:
+            raise RuntimeError("external-prefix request has no host rows")
+        if controller is None or controller.mem_pool_device is not self.device_pool:
+            raise RuntimeError("external-prefix request omitted its cache controller")
+        allocator = getattr(
+            controller.mem_pool_device_allocator,
+            "full_attn_allocator",
+            controller.mem_pool_device_allocator,
+        )
+        physical_capacity = min(self._external_prefix_capacity_rows, token_count)
+        staging_rows = allocator.alloc(physical_capacity)
+        evicted_rows = 0
+        if staging_rows is None:
+            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+            available = int(allocator.available_size())
+            needed = max(1, physical_capacity - available)
+            eviction = cache.evict(EvictParams(num_tokens=needed))
+            evicted_rows = int(eviction.num_tokens_evicted)
+            staging_rows = allocator.alloc(physical_capacity)
+        if staging_rows is None:
+            raise RuntimeError("bounded external-prefix staging pool is exhausted")
+        if int(staging_rows.numel()) != physical_capacity:
+            allocator.free(staging_rows)
+            raise RuntimeError("bounded staging allocator returned malformed rows")
+        with self._lock:
+            virtual_begin = self._next_virtual_token
+            virtual_end = virtual_begin + token_count
+            namespace_exhausted = (
+                virtual_begin < VIRTUAL_TOKEN_BASE
+                or virtual_end > VIRTUAL_TOKEN_LIMIT + 1
+            )
+            if not namespace_exhausted:
+                self._next_virtual_token = virtual_end
+                claim_id = self._next_claim_id
+                self._next_claim_id += 1
+        if namespace_exhausted:
+            allocator.free(staging_rows)
+            raise RuntimeError("external virtual-token namespace is exhausted")
+        virtual = torch.arange(
+            virtual_begin,
+            virtual_end,
+            dtype=torch.int64,
+            device=controller.device,
+        )
+        def registry_release(handle: Any) -> None:
+            with self._lock:
+                current = self._external_prefixes.get(handle.request_id)
+                if current is not handle:
+                    raise RuntimeError("external-prefix registry lost ownership")
+                self._external_prefixes.pop(handle.request_id)
+                self._external_live_dense_rows -= token_count
+                self._external_live_staging_rows -= physical_capacity
+                if (
+                    self._external_live_dense_rows < 0
+                    or self._external_live_staging_rows < 0
+                ):
+                    raise RuntimeError("external-prefix capacity accounting underflow")
+
+        handle = ExternalPrefixHandle(
+            claim_id=claim_id,
+            request_id=request_id,
+            consumer_index=-1,
+            host_indices=host_indices,
+            device_indices=virtual,
+            staging_rows=staging_rows,
+            controller=controller,
+            node_ids=node_ids,
+            resident_prefix_len=int(request.prefix_indices.numel()),
+            source_release=source_release,
+            registry_release=registry_release,
+        )
+        with self._lock:
+            duplicate = request_id in self._external_prefixes
+            if not duplicate:
+                self._external_prefixes[request_id] = handle
+                self._external_live_dense_rows += token_count
+                self._external_live_staging_rows += physical_capacity
+                self._external_dense_high_water_rows = max(
+                    self._external_dense_high_water_rows,
+                    self._external_live_dense_rows,
+                )
+                self._external_staging_high_water_rows = max(
+                    self._external_staging_high_water_rows,
+                    self._external_live_staging_rows,
+                )
+        if duplicate:
+            allocator.free(staging_rows)
+            raise RuntimeError("request acquired two external-prefix claims")
+        try:
+            self._prefetch_callback(handle)
+        except Exception:
+            with self._lock:
+                self._external_prefixes.pop(request_id, None)
+                self._external_live_dense_rows -= token_count
+                self._external_live_staging_rows -= physical_capacity
+            allocator.free(staging_rows)
+            raise
+        self.record_admission(
+            external_prefix_claims=1,
+            external_dense_slots_avoided=token_count - physical_capacity,
+            external_staging_slots=physical_capacity,
+            external_staging_evicted_rows=evicted_rows,
+        )
+        return handle
+
+    def external_prefix(self, request_id: str) -> Any | None:
+        with self._lock:
+            return self._external_prefixes.get(request_id)
 
     @staticmethod
     def supports(controller: Any) -> bool:
@@ -113,17 +270,33 @@ class SglangHiCacheBridge:
         op = CacheOperation.merge_ops(controller.load_queue)
         controller.load_queue.clear()
         event = controller.layer_done_counter.events[producer_id]
+        with self._lock:
+            claim_id = self._next_claim_id
+            self._next_claim_id += 1
         pending = PendingHostLoad(
-            producer_id,
-            op.host_indices,
-            op.device_indices,
-            event,
-            controller,
-            tuple(op.node_ids),
+            claim_id=claim_id,
+            consumer_index=producer_id,
+            host_indices=op.host_indices,
+            device_indices=op.device_indices,
+            producer_event=event,
+            controller=controller,
+            node_ids=tuple(op.node_ids),
         )
-        controller.ack_load_queue.append(
-            HiCacheAck(event.start_event, event.finish_event, op.node_ids)
-        )
+        ack = HiCacheAck(event.start_event, event.finish_event, op.node_ids)
+        if self._prefetch_callback is None:
+            controller.ack_load_queue.append(ack)
+        else:
+            # A claimed load completes its producer events immediately, which
+            # would fire the ack and let loading_check unlock the host radix
+            # nodes while the claim still stages from them — churn write-back
+            # then recycles the host rows out from under the claim. Holding
+            # the ack until retire() pins the host source for the claim's
+            # whole lifetime. Retirement records a new finish event after the
+            # final copy or attention consumer on the actual CUDA stream.
+            pending.held_ack = ack
+        with self._lock:
+            self._pending[producer_id] = pending
+            self._owned[claim_id] = pending
         if self._prefetch_callback is not None:
             try:
                 self._prefetch_callback(pending)
@@ -146,12 +319,10 @@ class SglangHiCacheBridge:
                     self._admission_stats["prefetch_fallback_loads"] = (
                         self._admission_stats.get("prefetch_fallback_loads", 0) + 1
                     )
+                pending.held_ack = None
+                controller.ack_load_queue.append(ack)
                 self.fallback(pending)
                 return producer_id
-        with self._lock:
-            if producer_id in self._pending:
-                raise RuntimeError("SGLang reused a live HiCache producer slot")
-            self._pending[producer_id] = pending
         return producer_id
 
     def get(self, consumer_index: int) -> PendingHostLoad | None:
@@ -215,7 +386,16 @@ class SglangHiCacheBridge:
 
     def admission_stats(self) -> dict[str, int]:
         with self._lock:
-            return dict(self._admission_stats)
+            result = dict(self._admission_stats)
+            result.update(
+                external_live_dense_rows=self._external_live_dense_rows,
+                external_live_staging_rows=self._external_live_staging_rows,
+                external_dense_high_water_rows=self._external_dense_high_water_rows,
+                external_staging_high_water_rows=(
+                    self._external_staging_high_water_rows
+                ),
+            )
+            return result
 
     def progress_publication_available(self) -> bool:
         """Return whether another nonblocking compiler snapshot can be retained."""
@@ -343,19 +523,50 @@ class SglangHiCacheBridge:
                 pending.host_indices.record_stream(stream)
             if pending.device_indices.is_cuda:
                 pending.device_indices.record_stream(stream)
-            with self._lock:
-                self._pending.pop(pending.consumer_index, None)
+            self._drop_ownership(pending)
 
-    def retire(self, pending: PendingHostLoad) -> None:
+    def _drop_ownership(self, pending: PendingHostLoad) -> bool:
+        with self._lock:
+            current = self._owned.get(pending.claim_id)
+            if current is not pending:
+                return False
+            self._owned.pop(pending.claim_id)
+            if self._pending.get(pending.consumer_index) is pending:
+                self._pending.pop(pending.consumer_index)
+            return True
+
+    def retire(
+        self,
+        pending: PendingHostLoad,
+        *,
+        stream: torch.cuda.Stream | None = None,
+    ) -> bool:
         """Drop a claim whose completion happened outside the layer flow.
 
         The tiered selected path completes producer events at claim time and
         serves layers itself; the pending entry must still be released when
         the claim ends so producer-slot reuse stays fail-closed for genuinely
-        live entries.
+        live entries.  A held acknowledgement must describe NTA's last use of
+        the pinned host rows, not SGLang's already-completed producer event.
+        Recording a replacement finish event on the consuming stream keeps
+        reclamation asynchronous while preventing completion DMA from racing
+        host-row reuse.
         """
-        with self._lock:
-            self._pending.pop(pending.consumer_index, None)
+        if not self._drop_ownership(pending):
+            return False
+        ack = pending.held_ack
+        if ack is not None:
+            if stream is not None:
+                finish_event = torch.cuda.Event()
+                finish_event.record(stream)
+                ack = type(ack)(ack.start_event, finish_event, ack.node_ids)
+                if pending.host_indices.is_cuda:
+                    pending.host_indices.record_stream(stream)
+                if pending.device_indices.is_cuda:
+                    pending.device_indices.record_stream(stream)
+            pending.controller.ack_load_queue.append(ack)
+            pending.held_ack = None
+        return True
 
     def handoff_prefetch(
         self, pending: PendingHostLoad, stream: torch.cuda.Stream
@@ -371,11 +582,8 @@ class SglangHiCacheBridge:
             if pending.device_indices.is_cuda:
                 pending.device_indices.record_stream(stream)
         pending.completed_layers = int(pending.controller.layer_num)
-        with self._lock:
-            current = self._pending.get(pending.consumer_index)
-            if current is not pending:
-                raise RuntimeError("HiCache producer slot changed before graph handoff")
-            self._pending.pop(pending.consumer_index)
+        if not self._drop_ownership(pending):
+            raise RuntimeError("HiCache claim changed before graph handoff")
 
     def fallback(self, pending: PendingHostLoad) -> None:
         """Resume SGLang's original layer-wise transfer after a planning miss."""
@@ -402,8 +610,7 @@ class SglangHiCacheBridge:
                 host_indices.record_stream(controller.load_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(controller.load_stream)
-        with self._lock:
-            self._pending.pop(pending.consumer_index, None)
+        self._drop_ownership(pending)
 
 
 _BRIDGES: dict[int, tuple[weakref.ReferenceType[Any], weakref.ReferenceType[Any]]] = {}

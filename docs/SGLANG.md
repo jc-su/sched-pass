@@ -63,7 +63,7 @@ SGLang request and HiCache page map
 
 Unresolved demand
   -> compact request slot/generation binding
-  -> ABI-24 guarded incremental CTAs
+  -> ABI-27 guarded incremental CTAs
 ```
 
 The resident-only preacquired direct path allocates no per-batch `WorkItem`
@@ -123,6 +123,33 @@ structural plan is reused across transformer layers; each layer republishes its
 K/V addresses through the stream-ordered object directory. Shape equality
 alone is not a cache hit: a different page map or generation advances the
 object version and uploads a new plan.
+
+## Selected-Demand Diagnostic
+
+`NTA_SGLANG_SELECTED_SERVE=1` and
+`NTA_SGLANG_SELECTED_TIERED=1` enable the device-selected integration. Live
+queries select logical external-prefix pages; ABI v27 validates and compacts
+misses on the GPU, the indexed path acquires their K/V rows, and
+compiler-generated request-bound FlashInfer wrappers consume one compact table
+for every claimed and resident request. Claims pin host sources until the last
+stream-ordered use and bind prefix identity to immutable request-table
+positions, not recyclable allocator slot numbers.
+
+The adapter intercepts host load-back before dense device allocation, publishes
+virtual request-table identities, and leases only the configured selected-row
+budget from SGLang's physical allocator. Cache finish retires the compiler
+claim, waits for its completion fence, releases staging, and then lets SGLang
+free the physical suffix; allocator conservation is checked by SGLang itself.
+Resident batches retain CUDA graph replay. External-prefix batches run the NTA
+selected eager form and fail if they reach a dense captured graph. The
+selected eager form and fail if they reach a dense captured graph. A per-layer
+device page-to-slot table retains selected K/V inside the lease; the phase
+emits the physical FlashInfer table and copies misses only. The selected-load
+harness uses coalesced batching. Resident peer requests run through a
+compiler-generated request subgroup while external misses progress on a
+transfer stream; only the external subgroup waits at its consumer edge. The
+harness requires positive overlap, cache execution and reuse, activation and
+high-water capacity evidence, zero fallback, and zero stock attention.
 
 ## Running
 
@@ -222,7 +249,7 @@ PARALLEL_SLOTS="$(python3 -c \
   --require-proceed
 ```
 
-ABI v25 stores one relative `%globaltimer` timestamp per bounded work ticket.
+ABI v27 stores one relative `%globaltimer` timestamp per bounded work ticket.
 Zero means the tile was resident or already staged at epoch start; a positive
 value is written exactly once when the ticket enters the runnable tile set.
 With `NTA_OPPORTUNITY_MEASURE_COMPUTE=1`, `compute_ns` is calibrated by a
@@ -388,6 +415,26 @@ guard is not the dominant external-serving regression. One-, eight-, and
 default-width GPU mover diagnostics remained negative; the dense loss is
 instead concentrated in ticketed first-layer setup and transfer interference
 with resident decode.
+
+ABI v27 selected-demand mode moves the positive path away from dense early-known
+promotion. The SGLang selected harness now runs stock plus tiered selected NTA by
+default and keeps the dense NTA arm as an opt-in diagnostic. With Qwen2.5-3B,
+16K host prefix, 2K resident peer, budget 32 pages, and selected refresh interval
+1024, three dirty-tree seeds produced external P95 TTFT geomean `0.831x` stock
+and resident P99 ITL geomean `0.891x`. Resident P95 TPOT remained `1.085x`
+stock. Every run used bounded external staging, prefix-summary reuse,
+selected-row-table reuse, compiler-generated attention, zero stock attention,
+and zero HiCache fallback. This is the current best SGLang signal, not a
+production or OSDI-level claim.
+
+The stricter output-match smoke rerun keeps that point alive: budget 32 with
+same-budget `QuestRecall.py` metadata and `--require-tiered-output-match`
+measured external P95 TTFT `0.848x` stock and resident P99 ITL `0.804x`, with
+resident P95 TPOT still `1.113x`. The generated text matched stock and every
+mechanism counter remained active. Budget 64 and 128 also preserved generated
+text but regressed (`1.434x` and `6.323x` external P95 TTFT respectively), so
+the current implementation has a low-budget win and a high-quality/high-budget
+overhead cliff.
 
 Three arm-balanced repetitions of that graph workload produced an
 output-throughput geometric mean of `0.9447x` with bootstrap interval

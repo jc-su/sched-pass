@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 23U
+#define NTA_RUNTIME_C_API_VERSION 26U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -304,9 +304,11 @@ nta_status nta_runtime_read_request_progress_range(
     uint32_t request_count, nta_request_progress *progress);
 // host_destination must point to request_count entries in CUDA page-locked
 // host memory and remain live until cuda_stream reaches the copy.
-nta_status nta_runtime_copy_request_progress_async(
-    const nta_runtime *runtime, uint32_t first_request_slot,
-    uint32_t request_count, uint64_t host_destination, uint64_t cuda_stream);
+nta_status nta_runtime_copy_request_progress_async(const nta_runtime *runtime,
+                                                   uint32_t first_request_slot,
+                                                   uint32_t request_count,
+                                                   uint64_t host_destination,
+                                                   uint64_t cuda_stream);
 nta_status nta_runtime_read_work_ticket_state(const nta_runtime *runtime,
                                               uint32_t work_ticket,
                                               uint32_t *state);
@@ -402,11 +404,39 @@ nta_status nta_jit_phase_progress_validated_indexed_host_range_parallel(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t object_count,
     uint32_t copy_blocks_per_group, uint64_t cuda_stream);
-/* C API v23: bound the next validated indexed copies to the in-place
+/* Bound the next validated indexed copies to the in-place
  * rewritten prefix of each object's registered index arrays. */
 nta_status nta_jit_phase_set_indexed_row_counts(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t object_count, uint32_t row_count,
+    uint64_t cuda_stream);
+/* C API v24: turn device-selected logical pages into a validated miss-only
+ * indexed transfer without a device-to-host control round trip. */
+nta_status nta_jit_phase_prepare_selected_indexed_rows(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count, uint64_t selected_pages,
+    uint32_t selected_page_count, uint32_t page_tokens, uint32_t token_count,
+    uint64_t host_rows, uint64_t device_rows, uint64_t staged_pages,
+    uint64_t source_indices, uint64_t staging_indices, uint32_t capacity,
+    uint64_t copied_rows, uint64_t cuda_stream);
+/* C API v26: map selected pages into a bounded physical cache, emit the
+ * consumer table, and validate/compact only cache misses. */
+nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count, uint64_t selected_pages,
+    uint32_t selected_page_count, uint32_t page_tokens, uint32_t token_count,
+    uint64_t host_rows, uint64_t device_rows, uint64_t cached_pages,
+    uint32_t cache_slot_count, uint64_t selected_rows, uint64_t source_indices,
+    uint64_t staging_indices, uint32_t capacity, uint64_t copied_rows,
+    uint64_t cuda_stream);
+/* C API v25: reduce pinned mapped host key rows directly into device page
+ * envelopes without allocating a temporary HBM copy. element_type is 0 for
+ * fp16 and 1 for bf16. */
+nta_status nta_jit_phase_reduce_mapped_key_pages(
+    const nta_jit_phase_program *program, uint64_t source, uint32_t source_rows,
+    uint64_t source_stride_bytes, uint32_t first_row, uint32_t token_count,
+    uint32_t page_tokens, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t element_type, uint64_t output_min, uint64_t output_max,
     uint64_t cuda_stream);
 nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        nta_runtime *runtime,

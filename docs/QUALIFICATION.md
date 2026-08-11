@@ -34,7 +34,7 @@ This rejects the dense
 early-known-demand performance hypothesis; it is not folded into the positive
 device-selected acquisition claim.
 
-The ABI-v25 finite demand graph closes the earlier eager-control gap but does
+The ABI-v27 finite demand graph closes the earlier eager-control gap but does
 not reverse that dense boundary. On clean revision `ae7c56a`, one
 performance-excluded-warmup 2K host/2K resident run replayed the demand graph,
 used both compiler forms, compacted the combined physical CTA bound to 50%, and
@@ -43,11 +43,14 @@ output throughput, `1.1014x` external TTFT, `1.8843x` resident P99 ITL, and
 `0.4584x` stock-derived SLO goodput. This is one diagnostic process trial, not
 paper evidence; it proves graph activation and preserves the negative result.
 
-The latest `local` qualifier returned `READY` after 47 CTests (one multi-GPU
-case skipped on the one-GPU host), CUDA sanitizer coverage, a 10,000-epoch
-lifecycle stress, CPU-only tests, Clang static analysis, Python package checks,
-ShellCheck, and patch hygiene. This is an implementation-quality result, not a
-production or paper-evidence verdict.
+The latest archived `local` qualifier returned `READY` after 47 CTests (one
+multi-GPU case skipped on the one-GPU host), CUDA sanitizer coverage, a
+10,000-epoch lifecycle stress, CPU-only tests, Clang static analysis, Python
+package checks, ShellCheck, and patch hygiene. The current ABI-v27 developer
+suite discovers 53 tests: 52 pass and the physical multi-GPU case is skipped on
+this one-GPU host. It must be rerun by the release qualifier on a clean revision
+before replacing that archived result.
+Neither result is a production or paper-evidence verdict.
 
 Validate the local performance-mechanism artifact independently with:
 
@@ -197,7 +200,7 @@ The executable gate now matches `SYSTEM_PLAN.md` and requires:
   reuse;
 - one elastic online policy with engine admission feedback and identical-state
   decision regret no worse than 1.05 median and 1.10 p95;
-- ABI-v25 request accounting in every mechanism-active run, with pending,
+- ABI-v27 request accounting in every mechanism-active run, with pending,
   executable, completed, and expected compiler-attributed compute conserved;
   dropped attribution must remain zero, and the device critical-work policy
   must beat or match CTA-count-only and byte-only ablations without using
@@ -207,8 +210,12 @@ The executable gate now matches `SYSTEM_PLAN.md` and requires:
   round trip, at least five selectivity points, a measured crossover, a peak
   confidence interval above one, at least 2x peak speedup over forced
   overfetch, an explicit forced-indexed zero-avoidance result, an
-  all-candidate-resident baseline, at most 1.05x same-trial online-policy
-  regret, and at most 2x regret to a precomputed selected-copy oracle;
+  all-candidate-resident baseline, a same-budget task-quality gate
+  (`task_quality_parity=true`, `max_task_quality_delta <= 0.01`) or a
+  selector-recall diagnostic gate (`quest_mean_recall >= 0.80`,
+  `quest_min_layer_recall >= 0.40`, `oracle_mean_gap <= 0.06`), at most
+  1.05x same-trial online-policy regret, and at most 2x regret to a
+  precomputed selected-copy oracle;
 - no more than 5% p50 resident overhead, at least 90% of dense bulk throughput,
   and an end-to-end gain over equal-state request skip/rebatch;
 - at least ten controlled independent trials with confidence intervals; and

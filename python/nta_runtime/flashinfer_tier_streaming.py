@@ -11,6 +11,7 @@ from typing import Any
 import flashinfer
 import torch
 
+from .bounded_staging import BoundedStagingPool
 from .flashinfer import (
     BIND_CURRENT_GENERATION,
     attention_jit_args,
@@ -154,12 +155,22 @@ class FlashInferTierStreamingExecutor:
         self.compute_stream = compute_stream or torch.cuda.current_stream(target)
         self.copy_stream = copy_stream or torch.cuda.Stream(device=target, priority=0)
         self.transfer_wave = transfer_wave
-        shape = (schedule.maximum_wave_tokens, *first.key.shape[1:])
-        self.staging_key = [
-            torch.empty(shape, dtype=first.key.dtype, device=target)
-            for _ in range(slot_count)
-        ]
-        self.staging_value = [torch.empty_like(key) for key in self.staging_key]
+        self._staging_pool = BoundedStagingPool.allocate(
+            1,
+            slot_count * schedule.maximum_wave_tokens,
+            schedule.maximum_wave_tokens,
+            tuple(first.key.shape[1:]),
+            dtype=first.key.dtype,
+            device=target,
+        )
+        self._staging_leases = tuple(
+            self._staging_pool.acquire(slot + 1) for slot in range(slot_count)
+        )
+        staging = tuple(
+            self._staging_pool.view(lease, 0) for lease in self._staging_leases
+        )
+        self.staging_key = [pair[0] for pair in staging]
+        self.staging_value = [pair[1] for pair in staging]
         self._event_sets = tuple(
             _ExecutorEvents(
                 torch.cuda.Event(),
@@ -200,6 +211,10 @@ class FlashInferTierStreamingExecutor:
     @property
     def staging_tokens(self) -> int:
         return self.slot_count * self.schedule.maximum_wave_tokens
+
+    @property
+    def staging_bytes(self) -> int:
+        return self._staging_pool.capacity_bytes
 
     def _enqueue_copy(self, wave_index: int) -> None:
         slot = wave_index % self.slot_count

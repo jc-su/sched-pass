@@ -42,7 +42,7 @@ and graph consumers validate before launch. Paired ragged-prefill direct and
 incremental forms are implemented; arbitrary-kernel recognition and the paged
 SGLang operator remain open.
 
-ABI v25 defines one engine-neutral device work item, fixed-capacity dependency
+ABI v27 defines one engine-neutral device work item, fixed-capacity dependency
 segments, completion-driven reverse dependency edges, and a compact runnable
 work queue. The completion CTA that satisfies the final dependency performs the
 single `Pending -> Ready` transition and appends the ticket; a bounded
@@ -206,7 +206,7 @@ not independent production policies.
 : An immutable, versioned byte or tensor object with one or more physical
   replicas.
 
-ABI v25 registers each staged directory entry as one acquisition tile. Direct
+ABI v27 registers each staged directory entry as one acquisition tile. Direct
 sources may serve subranges, but a staged miss transfers the complete entry;
 this makes duplicate suppression exact without a range-availability bitmap.
 
@@ -436,7 +436,7 @@ external miss
 The queue lease protects only command construction and publication. It is
 released before the CTA returns and is never held across device I/O. The CTA
 does not inspect completion state. A separate finite progress invocation drains
-the CQ, releases credits, and publishes data availability. ABI v25 implements this for
+the CQ, releases credits, and publishes data availability. ABI v27 implements this for
 NVMe; RDMA remains inactive until a real backend and RNIC testbed exist.
 
 The fast path is intentionally opportunistic. Backend demand is atomically
@@ -558,7 +558,7 @@ thread-derived operands, but LLVM IR alone cannot prove that an unrelated CTA
 never writes a plain global address; unsupported frontends must not assert this
 contract without equivalent ownership.
 
-The ABI-v25 IR suite includes a positive device-selected-object case whose slot,
+The ABI-v27 IR suite includes a positive device-selected-object case whose slot,
 identity, version, range, and direct pointer are loaded from a catalog selected
 by CTA identity. The pass lowers that case and tags it `split-phase-cta` while
 the existing thread/lane-derived fixtures remain rejected. This establishes
@@ -653,7 +653,7 @@ graph must choose a compatible control strategy; it cannot combine those two
 features as if they were independently composable. See the
 [CUDA Graphs programming guide](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html).
 
-ABI v25 also allows the missing application CTA to attempt one NVMe submission.
+ABI v27 also allows the missing application CTA to attempt one NVMe submission.
 A backend-local queue lease serializes it with the finite progress kernel. The
 CTA rings at most one doorbell, never waits for the lease or completion, and
 publishes an intent on any recoverable failure. This is a latency path, not a
@@ -688,7 +688,7 @@ conditions.
 
 The current implementation carries request generation, tenant, priority, and
 deadline into every intent. Request, tenant, and backend byte credits are
-reserved without waiting and rolled back on admission failure. ABI v25 accounts
+reserved without waiting and rolled back on admission failure. ABI v27 accounts
 pending, executable, completed, and expected compiler-attributed compute plus
 unavailable bytes for each request generation. Checked subtraction makes
 counter underflow fail closed; rejected same-generation epoch attribution is
@@ -1147,7 +1147,7 @@ consumes direct pages or exits for finite staged acquisition. Runnable work is
 mapped back through the ticket rather than assuming request index equals slot.
 This is not yet a FlashInfer or SGLang sparse-attention integration.
 
-The ABI-v25 dependency-set workload separately acquires up to 32 mixed-tier
+The ABI-v27 dependency-set workload separately acquires up to 32 mixed-tier
 objects per CTA, supports cancellation, stale generations, stale object
 versions, and duplicate coalescing, and resumes only after the complete set is
 ready. Global-load and TMA attention now consume the same common work and

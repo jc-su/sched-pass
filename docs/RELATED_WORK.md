@@ -1,6 +1,6 @@
 # Related-Work And Novelty Audit
 
-Audit date: 2026-08-04
+Audit date: 2026-08-10
 
 This is a live design constraint, not a claim of novelty. The project must not
 claim "first", "production-ready", or "OSDI-level" until the implementation and
@@ -174,6 +174,20 @@ sensitivity, and equal-quality baselines. Sparse attention remains a stress
 case for device-discovered demand, not the only workload or a substitute for
 the dense fragmented-arrival result.
 
+[SparseServe](https://arxiv.org/abs/2509.24626) combines dynamic sparse
+attention with hierarchical HBM/DRAM management, fragmented-transfer paths,
+working-set-aware batch sizing, and layer-segmented prefill. NTA cannot claim
+novelty from selective KV transfer, bounded layer staging, or converting sparse
+working-set reduction into higher admission capacity.
+
+[SPIN](https://arxiv.org/abs/2604.26837) co-designs sparse attention with
+hierarchical KV storage through a common partition abstraction, per-request HBM
+budgets, GPU-oriented replacement, and active-working-set metadata. A common
+page/partition abstraction and request-sized staging policy are therefore not
+independent NTA contributions. Both systems are required sparse-serving
+controls; NTA must distinguish itself through the compiler-checked contributor
+and request-lifecycle contract and must still match their quality constraints.
+
 ### GPU-Owned Remote I/O And Communication
 
 [GORIO](https://arxiv.org/abs/2607.04415) keeps ANNS query evolution, page-miss
@@ -245,9 +259,10 @@ must not be presented as independent contributions.
 2. Automatic or repeatable compiler recognition on more than one production
    kernel family; explicit markers alone are insufficient.
 3. Baselines for Strata-style userspace scheduling, ECHO-style lossless
-   prefetch, DirectKV-style direct access, Syncopate-style chunk overlap,
-   Tutti-style GPU-native storage, CoPilotIO-style CPU completion, and a
-   persistent GPU service.
+   prefetch, SparseServe/SPIN-style hierarchical sparse serving,
+   DirectKV-style direct access, Syncopate-style chunk overlap, Tutti-style
+   GPU-native storage, CoPilotIO-style CPU completion, and a persistent GPU
+   service.
 4. Real NVMe experiments with CPU usage, SM tax, TTFT, TPOT, p50/p99, goodput,
    fairness, and failure recovery. Real RNIC experiments are additionally
    required only for an RDMA or network-I/O claim.
