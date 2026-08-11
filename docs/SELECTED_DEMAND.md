@@ -107,7 +107,14 @@ Qwen2.5-3B passes needle and multikey at 3/3 each and fails count at 0/3
 with a consistent wrong tally — dense attention sees the markers but the
 model cannot count them — so count is diagnostic-only on this model and
 excluded from parity gates, per the pre-declared rule that a kind the
-dense baseline cannot pass measures the model, not the selection.
+dense baseline cannot pass measures the model, not the selection. With
+the claim floor in place the full matrix is green in every cell: budgets
+32, 64, and 128 each pass needle and multikey at 1.0 under refresh 1 and
+refresh 1024 alike, equal to stock — six dispersed positions retrieved
+in order even at a 3 percent keep rate with frozen selection. Quality
+parity therefore does not constrain the operating point on this battery,
+and the qualifying configuration is budget 64 at refresh 1024 by
+performance, recorded as pre-registration amendment 1.
 
 ABI v27 adds two optimizations to this path. First, immutable page summaries are
 cached by exact external-prefix identity, host row mapping, layer geometry, and

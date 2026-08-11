@@ -77,4 +77,13 @@ degrading resident-request tails.
   ways), makespan 1.65x. The graph-capturable multi-claim operator
   (design of record, its own exit gate: TPOT <= 1.2x stock, GPU busy
   > 85%) must land before qualifying trials begin.
-- Amendments: none yet.
+- **Amendment 1 (2026-08-11):** the quality matrix (needle + multikey
+  kinds, count demoted diagnostic-only by stock validation; budgets
+  {32, 64, 128} x refresh {1, 1024}) passed every cell at 1.0, equal to
+  stock, on the synthetic retrieval-plus-aggregation battery
+  (`results/serving/quality-matrix/`). The tiered arm's qualifying
+  configuration is therefore fixed at **budget 64, refresh interval
+  1024** — chosen by performance among quality-parity points, per
+  protocol. The matrix also exposed and fixed a sidecar defect (sub-page
+  host hits claimed as external prefixes, suppressing radix insertion
+  workload-wide; claims now floor at page size, commit 16a32b1).
