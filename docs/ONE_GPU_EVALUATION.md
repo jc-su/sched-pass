@@ -208,6 +208,39 @@ model JITs Triton kernels, while FlashInfer's ninja simultaneously requires a
 CUDA-compatible `-ccbin` from the same variable; both are satisfied by the
 CUDA-matched C driver (`gcc-14`).
 
+### Regime map: where the mechanism can win at all (2026-08-11)
+
+`benchmarks/serving/RegimeMap.py` (artifact
+`results/analysis/regime-map.json`) computes the two quantities that bound
+any KV-selection mechanism's payoff — attention-byte share of the decode
+step and KV pressure against the pool — from measured constants (HBM
+~1.6TB/s ladder, anchored stock TPOT) and the actual model geometries.
+The verdict on our own history: the operating point every selected-serving
+experiment ran at (Qwen2.5-3B, 2 KV heads = 36KB/token, 16K context,
+batch <= 2, 96GB pool) has attention share **3.6%** and available win
+**-5.1%** — the mechanism floor exceeds the entire prize, so no
+implementation quality could have won there. The recorded losses were the
+benchmark's geometry, not the mechanism's verdict; conversely nothing won
+there is worth claiming.
+
+The win region is reachable *with the already-integrated model*: at
+(64K, batch 16), (32K, batch 32), or (131K, batch 8) the same Qwen2.5-3B
+reaches ~70% attention share and ~65% available step win; at (32K,
+batch 64) and beyond, dense becomes infeasible outright while selected
+serving admits 7-48x more requests — the capacity axis finally exists.
+Qwen3-4B/8B (144KB/token) reach the frontier at batch 4-8 (T_base
+estimated, pending anchor). `StockDecodeSweep.py` validates the map's
+physics empirically before any derived point is used.
+
+Consequences, in order: (1) concurrent per-request claims are the
+critical-path engineering — every winning point has batch >> 1; (2) all
+future selected-serving evaluation runs only at map-positive points, with
+the map's negative region published as the applicability boundary
+(small-KV models at small batch are *architecturally* outside the
+mechanism's scope, and our measured negatives there document it); (3) the
+quality gate re-couples at the map-chosen budget and context, since
+keep-rate at 32K/budget-128 is 6.25%.
+
 ### Execution order and go/no-go
 
 1. Mover-priority interference rerun (1C metric only) — already unblocked.
