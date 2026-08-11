@@ -239,6 +239,20 @@ serves multi-claim batches — is the last structural item before the
 capacity separation can appear; admission itself is no longer the
 limit.
 
+Successive gated fixes then won two of the three pressure axes
+(commits 01b8da4, b4d9d8f): collapsing per-claim segment writes took
+external P95 TTFT to 0.76x stock, and removing the per-forward
+masked_select syncs took resident P99 to 0.47x — both byte-verified on
+all 972 layers. External TPOT stayed near 27ms against stock's 11ms
+through both fixes, and the decode-window profile
+(`results/analysis/pressure-decode.nsys-rep`) explains why: GPU busy is
+55 percent — the step is bound by host-side serve-loop work across
+sixteen claims, not by any kernel (the restructured compaction kernel no
+longer even registers). Graph capture or a device-resident claim loop is
+therefore the measured requirement for the final axis, not a preference;
+until it lands, the pressure story is TTFT and resident tails won,
+throughput at parity, makespan behind.
+
 Each claim also owns a per-layer page-to-slot table inside its bounded lease.
 The device phase validates the selected logical page set, protects pages in the
 current set from replacement, assigns misses to deterministic physical slots,
