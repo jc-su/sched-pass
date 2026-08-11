@@ -261,7 +261,11 @@ GPU busy above 85 percent, and `VERIFY=fast` still green (verification
 runs eager; capture never weakens it). Confirmation protocol for the
 host-bound diagnosis: TPOT versus claim count (4/8/16) — near-linear
 growth confirms host orchestration; sub-linear stops the build for a
-re-profile.
+re-profile. **Confirmed 2026-08-11:** median external TPOT
+measured 17.7ms at eight claims and 27.7ms at sixteen — 1.25ms per claim,
+exactly linear, extrapolating to stock's ~10-11ms at one claim. The
+host-orchestration diagnosis holds from three independent directions
+(profile, fix-insensitivity, scaling), and the build proceeds.
 
 Phases, smallest-first:
 
