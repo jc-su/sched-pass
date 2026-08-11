@@ -226,6 +226,19 @@ monotonically consumed (~65K claims of 16K prefixes exhaust int32);
 generation-tagged recycling is required before long-duration
 qualification.
 
+The first held-occupancy pressure comparison (16 externals x 16K x
+256-token outputs against a 110K-token pool, single trials) measured the
+next boundary: fifteen concurrent claims served with all 972 checked
+layers byte-verified, and the resident P99 ITL under pressure came in at
+half of stock's (27.5ms vs 54.1ms — compact attention reduces
+interference), but external TTFT tied (6.36s vs 5.85s p95) and makespan
+doubled (17.7s vs 9.4s) because tiered extends still run as serialized
+single-request eager forwards while stock pipelines its prefill waves.
+Lifting the single-request extend boundary — the decode side already
+serves multi-claim batches — is the last structural item before the
+capacity separation can appear; admission itself is no longer the
+limit.
+
 Each claim also owns a per-layer page-to-slot table inside its bounded lease.
 The device phase validates the selected logical page set, protects pages in the
 current set from replacement, assigns misses to deterministic physical slots,
