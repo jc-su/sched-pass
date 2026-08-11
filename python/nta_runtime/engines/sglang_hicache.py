@@ -98,10 +98,17 @@ class SglangHiCacheBridge:
     def external_prefix_enabled(self) -> bool:
         return self._external_prefix_capacity_rows > 0
 
-    def enable_external_prefixes(self, capacity_rows: int, callback: Any) -> None:
+    def enable_external_prefixes(
+        self, capacity_rows: int, callback: Any, *, page_tokens: int = 1
+    ) -> None:
         if capacity_rows <= 0 or not callable(callback):
             raise ValueError("external-prefix ownership requires capacity and callback")
+        if page_tokens <= 0 or capacity_rows % page_tokens != 0:
+            raise ValueError(
+                "external-prefix capacity must be page-aligned"
+            )
         self._external_prefix_capacity_rows = capacity_rows
+        self._external_prefix_page_tokens = page_tokens
         self._prefetch_callback = callback
 
     def claim_external_prefix(
@@ -139,7 +146,14 @@ class SglangHiCacheBridge:
             "full_attn_allocator",
             controller.mem_pool_device_allocator,
         )
-        physical_capacity = min(self._external_prefix_capacity_rows, token_count)
+        # Staging is leased in whole pages: the device cache and the
+        # compaction kernel both require page-aligned capacity, and a
+        # sub-page claim still owns one full slot.
+        page_tokens = getattr(self, "_external_prefix_page_tokens", 1)
+        claim_pages = (token_count + page_tokens - 1) // page_tokens
+        physical_capacity = min(
+            self._external_prefix_capacity_rows, claim_pages * page_tokens
+        )
         staging_rows = allocator.alloc(physical_capacity)
         evicted_rows = 0
         if staging_rows is None:
@@ -241,7 +255,11 @@ class SglangHiCacheBridge:
             raise
         self.record_admission(
             external_prefix_claims=1,
-            external_dense_slots_avoided=token_count - physical_capacity,
+            # A sub-page claim stages a whole slot and avoids nothing; the
+            # honest floor is zero, never a negative avoidance.
+            external_dense_slots_avoided=max(
+                0, token_count - physical_capacity
+            ),
             external_staging_slots=physical_capacity,
             external_staging_evicted_rows=evicted_rows,
         )

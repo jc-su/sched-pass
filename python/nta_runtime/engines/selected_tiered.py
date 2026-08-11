@@ -184,8 +184,14 @@ class TieredClaim:
         # Shared per-step index arrays: every layer's objects point at the
         # same device tensors; layers rewrite the prefix sequentially on the
         # compute stream, so the copy consumes each layer's own contents.
-        capacity = budget_pages * page_tokens
-        self.capacity_rows = min(capacity, self.token_count)
+        # Capacity is page-aligned: the device cache and compaction kernel
+        # require whole slots, and the bridge leases staging identically, so
+        # a sub-page claim still owns one full page of rows.
+        self.capacity_rows = (
+            min(budget_pages, self.pages) * page_tokens
+            if self.external_sidecar
+            else min(budget_pages * page_tokens, self.token_count)
+        )
         self.source_index = torch.zeros(
             self.capacity_rows, dtype=torch.int32, device=device
         )
@@ -316,20 +322,34 @@ class TieredClaim:
         # and the free budget is constant — so every per-layer tensor has a
         # data-independent shape and the kept row count never changes.
         self.free_budget = budget_pages - 3
-        self.fast_ok = self.pages > budget_pages and self.free_budget > 0
-        if self.fast_ok:
+        self.select_all = not (
+            self.pages > budget_pages and self.free_budget > 0
+        )
+        # A claim smaller than the budget needs no selection: keeping every
+        # page is itself a fixed shape (empty free set, kept rows equal to
+        # the token count), so small re-promotion claims under churn serve
+        # through the same concurrent path instead of refusing the batch.
+        self.fast_ok = True
+        self.page_arange = torch.arange(
+            page_tokens, dtype=torch.int64, device=device
+        )
+        self.tail_positions = torch.arange(
+            (self.pages - 1) * page_tokens, self.token_count,
+            dtype=torch.int64, device=device,
+        )
+        if self.select_all:
+            self.free_budget = 0
+            self.forced_pages = torch.arange(
+                self.pages, dtype=torch.int64, device=device
+            )
+            self.full_forced_pages = self.forced_pages[: self.pages - 1]
+            self.kept_prefix_rows = self.token_count
+        else:
             self.forced_pages = torch.tensor(
                 [0, self.pages - 2, self.pages - 1],
                 dtype=torch.int64, device=device,
             )
             self.full_forced_pages = self.forced_pages[:2]
-            self.tail_positions = torch.arange(
-                (self.pages - 1) * page_tokens, self.token_count,
-                dtype=torch.int64, device=device,
-            )
-            self.page_arange = torch.arange(
-                page_tokens, dtype=torch.int64, device=device
-            )
             self.kept_prefix_rows = (
                 (self.free_budget + 2) * page_tokens
                 + int(self.tail_positions.numel())
@@ -675,6 +695,9 @@ class TieredClaim:
     ) -> torch.Tensor:
         """Device-side selection with data-independent shapes.
 
+        Select-all claims skip scoring entirely: every page is forced, the
+        free set is empty, and the shape is as fixed as any budgeted one.
+
         Masking the forced pages to -inf and taking the first ``free_budget``
         entries of a stable descending argsort ranks the non-forced pages
         exactly as the reference selection does (stable order among unmasked
@@ -682,6 +705,10 @@ class TieredClaim:
         the forced set equals ``budgeted_page_selection`` — asserted by the
         verify path. No host synchronization occurs.
         """
+        if self.select_all:
+            return torch.empty(
+                0, dtype=torch.int64, device=self.forced_pages.device
+            )
         scores = quest_page_scores(
             query.to(torch.float32),
             self.kmin[local_layer],

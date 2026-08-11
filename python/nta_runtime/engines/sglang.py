@@ -804,6 +804,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._selected_executor.budget_pages
                 * self._selected_executor.page_tokens,
                 self._prepare_tiered_claim,
+                page_tokens=self._selected_executor.page_tokens,
             )
         elif self._pipeline_host:
             self._hicache.set_prefetch_callback(self._prepare_host_pipeline)

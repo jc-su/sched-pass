@@ -68,6 +68,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=20260802)
+    parser.add_argument(
+        "--allow-oversubscribed-pool",
+        action="store_true",
+        help=(
+            "admit timed contexts whose dense KV exceeds the device pool; "
+            "this is the capacity experiment's operating condition — the "
+            "dense arm honestly queues and retracts under pressure while "
+            "the sidecar arm holds only bounded staging"
+        ),
+    )
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument(
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
@@ -108,8 +118,14 @@ def parse_args() -> argparse.Namespace:
         + args.external_requests
         * (args.external_tokens + args.external_suffix_tokens)
     )
-    if active_tokens >= args.max_total_tokens:
-        parser.error("all timed resident and external contexts must fit together")
+    if (
+        active_tokens >= args.max_total_tokens
+        and not args.allow_oversubscribed_pool
+    ):
+        parser.error(
+            "all timed resident and external contexts must fit together "
+            "(pass --allow-oversubscribed-pool for capacity-pressure runs)"
+        )
     if (
         args.external_requests * args.external_tokens + args.churn_tokens
         <= args.max_total_tokens
