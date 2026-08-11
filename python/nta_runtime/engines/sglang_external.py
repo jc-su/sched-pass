@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -169,6 +171,22 @@ def route_init_load_back(
     else:
         host_indices, source_release = _legacy_host_rows(cache, best_match_node)
     expected = int(params.host_hit_length)
+    configured = os.environ.get("NTA_SGLANG_EXTERNAL_MIN_TOKENS")
+    minimum = (
+        int(configured)
+        if configured
+        else int(getattr(bridge, "_external_prefix_page_tokens", 1) or 1)
+    )
+    if expected < max(1, minimum):
+        # Claims exist to avoid promoting large prefixes; a sub-page host
+        # hit costs nothing to serve densely, and claiming it attaches
+        # external-prefix semantics — including suppressed radix
+        # insertion — to requests that are not external at all. Observed
+        # failure: churn evicts the tree, every later request gets a
+        # trivial one-token host hit, the sidecar claims it, and radix
+        # caching silently dies for the whole workload.
+        source_release()
+        return original(cache, params)
     if expected <= 0 or int(host_indices.numel()) != expected:
         source_release()
         raise RuntimeError(
@@ -251,6 +269,12 @@ def route_cache_unfinished(
 ) -> Any:
     """Keep an external request private instead of inserting virtual IDs."""
     handle = getattr(request, "_nta_external_prefix", None)
+    if os.environ.get("NTA_DEBUG_CACHE_ROUTES") == "1":
+        print(
+            f"[nta-cache] unfinished rid={getattr(request, 'rid', '?')} "
+            f"handle={handle is not None}",
+            flush=True,
+        )
     if handle is None:
         return original(cache, request, *args, **kwargs)
     token_count = len(request.get_fill_ids())
@@ -267,6 +291,12 @@ def route_cache_finished(
 ) -> Any:
     """Free only physical suffix rows; preserve the pre-existing host prefix."""
     handle = getattr(request, "_nta_external_prefix", None)
+    if os.environ.get("NTA_DEBUG_CACHE_ROUTES") == "1":
+        print(
+            f"[nta-cache] finished rid={getattr(request, 'rid', '?')} "
+            f"handle={handle is not None} args={args} kwargs={kwargs}",
+            flush=True,
+        )
     if handle is None:
         return original(cache, request, *args, **kwargs)
     if not handle._released and not handle.retire("finished"):

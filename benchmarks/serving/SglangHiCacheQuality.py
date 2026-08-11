@@ -359,7 +359,21 @@ def main() -> int:
             generated_text(engine.generate(resident_prompt, setup_sampling))
             resident_probe = engine.generate(resident_prompt, setup_sampling)
             if device_cached_tokens(resident_probe) <= 0:
-                raise RuntimeError("quality resident request did not stay on device")
+                # Radix insertion of a just-finished request is
+                # asynchronous to the next call under write-through; one
+                # observed race leaves the probe seeing a bare 1-token
+                # match. A single regenerate-and-reprobe keeps the
+                # residency invariant while tolerating that timing; a
+                # second miss is a real failure.
+                generated_text(engine.generate(resident_prompt, setup_sampling))
+                resident_probe = engine.generate(resident_prompt, setup_sampling)
+            if device_cached_tokens(resident_probe) <= 0:
+                raise RuntimeError(
+                    "quality resident request did not stay on device after "
+                    f"retry: task index {len(records)} ({task.name}), probe "
+                    f"device={device_cached_tokens(resident_probe)} host="
+                    f"{host_cached_tokens(resident_probe)}"
+                )
             (resident_result, _), (result, elapsed) = engine.loop.run_until_complete(
                 run_quality_pair(
                     engine,

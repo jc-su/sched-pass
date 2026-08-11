@@ -11,7 +11,7 @@ for REFRESH in 1024 1; do
   if [ -s "$ARTIFACT" ]; then echo "skip existing $ARTIFACT"; continue; fi
   python3 benchmarks/serving/SglangSelectedQuality.py \
     --model "$MODEL" --task-kinds needle,multikey --task-count 3 \
-    --selected-budgets 32,64,128 --selection-refresh-interval "$REFRESH" \
+    --selected-budgets 32,64,128 --selection-refresh-interval "$REFRESH" --max-total-tokens 24000 \
     --max-new-tokens 96 \
     --output "$ARTIFACT" > "$OUT/matrix-refresh$REFRESH.log" 2>&1
   echo "refresh=$REFRESH exit=$?"
