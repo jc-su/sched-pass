@@ -253,6 +253,51 @@ therefore the measured requirement for the final axis, not a preference;
 until it lands, the pressure story is TTFT and resident tails won,
 throughput at parity, makespan behind.
 
+## Graph-Capturable Multi-Claim Operator (next build, design of record)
+
+The final implementation before the RQ campaign, with its exit gate
+declared first: pressure-shape external TPOT within ~1.2x stock, decode
+GPU busy above 85 percent, and `VERIFY=fast` still green (verification
+runs eager; capture never weakens it). Confirmation protocol for the
+host-bound diagnosis: TPOT versus claim count (4/8/16) — near-linear
+growth confirms host orchestration; sub-linear stops the build for a
+re-profile.
+
+Phases, smallest-first:
+
+1. **Fixed-shape claim table.** One static metadata layout with
+   fixed-capacity per-claim slots, stable device pointers, and
+   device-side active counts — the precondition for capture, and the
+   ABI the compiler-generated operator consumes: request/claim entries,
+   selected page table, staging slot table, resident suffix table,
+   generation and validity words.
+2. **One multi-claim prep launch.** The parallel compaction kernel
+   already validates, dedupes, compacts misses, and publishes row
+   counts for one claim from device tensors; generalize across claims
+   with a grid dimension so N claims cost one launch, with per-claim
+   attribution counters (selected pages, copied rows, reused rows,
+   rejections) written on device.
+3. **Capture the reuse path only.** The refresh boundary splits the
+   step: reuse steps (1023 of 1024 at the shipping interval) replay a
+   captured graph over stable buffers with padded lengths and
+   replay-updated metadata — the same pattern the dense NTA path
+   already uses for CUDA graphs — while refresh steps stay eager
+   Python. Only the steady-state loop needs capture.
+4. **Legality and attribution.** The pass contract gains the clause
+   that generated operators dereference staged rows only through the
+   claim entry bound to their request identity (statically checkable on
+   generated code), alongside the existing control-dependence,
+   exactly-once-commit, and generation checks. Deprioritized
+   explicitly: CTA ordering heuristics, L2 hints, grouped-LPT, and
+   LLVM-side NVMe issue.
+
+The co-design statement this implements: the engine knows request SLO
+and admission pressure; the runtime owns claims, bounded staging, and
+cancellation; the compiler turns request-level external-data
+dependencies into graph-capturable GPU work units that consume runtime
+tables without host rebuilding; kernels publish progress the scheduler
+can trust.
+
 Each claim also owns a per-layer page-to-slot table inside its bounded lease.
 The device phase validates the selected logical page set, protects pages in the
 current set from replacement, assigns misses to deterministic physical slots,
