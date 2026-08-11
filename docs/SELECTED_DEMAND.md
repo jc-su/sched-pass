@@ -272,6 +272,21 @@ ratios of medians: external P95 TTFT **0.861x** stock and resident P99
 ITL **0.506x** — pre-build evidence, explicitly distinct from the
 pre-registered qualifying trials that run after the operator build.
 
+RQ2 mechanism trials are complete at n=10 per budget on the committed
+revision (seeds 20260901-10; artifacts `results/serving/rq2-ladder/`;
+one budget-128 trial failed on transient host-memory exhaustion from a
+concurrent campaign, recorded and rerun per protocol, no metric-based
+exclusions). Tiered versus stock geomeans at the single-claim 16K shape:
+budget 64 — external P95 TTFT **0.893** [0.547, 1.415], resident P99 ITL
+**1.013** [0.785, 1.238], resident P95 TPOT **1.072** [0.727, 1.274];
+budget 128 — TTFT **0.927** [0.782, 1.011], P99 **1.067** [0.691,
+1.372], TPOT **1.089** [0.960, 1.162]. Read against the regime map,
+which assigns this operating point a negative available decode win, the
+result is the mechanism-health claim in its strongest honest form:
+fully-attested selected serving with byte-verifiable staging is at or
+slightly better than stock where it has nothing to gain, while avoiding
+84 percent of attention bytes and holding an eighth of the KV.
+
 Phases, smallest-first:
 
 1. **Fixed-shape claim table.** One static metadata layout with
