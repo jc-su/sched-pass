@@ -33,6 +33,7 @@ of one claim is unsupported.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import Any
 
@@ -125,9 +126,25 @@ class TieredClaim:
         cache_entry = None if (verify or verify_fast or cache is None) else cache.get(
             cache_key
         )
+        summary_stream = (
+            None
+            if (
+                verify
+                or verify_fast
+                or os.environ.get("NTA_SGLANG_SUMMARY_ASYNC", "0") != "1"
+            )
+            else getattr(engine, "_summary_stream", None)
+        )
+        self.summaries_ready: Any = None
         if cache_entry is not None:
             self.kmin, self.kmax, ready, cached_bytes = cache_entry
-            torch.cuda.current_stream(device).wait_event(ready)
+            if summary_stream is not None:
+                # Defer the readiness wait to first selection: waiting
+                # here would stall the compute stream behind a scan that
+                # may still be in flight on the summary stream.
+                self.summaries_ready = ready
+            else:
+                torch.cuda.current_stream(device).wait_event(ready)
             engine._stats["tiered_summary_cache_hits"] = (
                 engine._stats.get("tiered_summary_cache_hits", 0) + 1
             )
@@ -140,9 +157,21 @@ class TieredClaim:
                 + int(cached_bytes)
             )
         else:
-            self.kmin, self.kmax = self._build_envelopes(
-                engine, host_pool, device, verify, verify_fast
+            # The envelope scan is ~13.5GB of pinned-host reads for a 16K
+            # prefix; on the compute stream it queues half a second of
+            # work ahead of every live decode. Non-verify claims scan on
+            # the engine's summary stream and publish a readiness event;
+            # admission holds the claim's batch until it fires and the
+            # first selection waits on it as the fail-safe.
+            scan_context = (
+                torch.cuda.stream(summary_stream)
+                if summary_stream is not None
+                else contextlib.nullcontext()
             )
+            with scan_context:
+                self.kmin, self.kmax = self._build_envelopes(
+                    engine, host_pool, device, verify, verify_fast
+                )
             counter = f"tiered_summary_{summary_path}_claims"
             engine._stats[counter] = engine._stats.get(counter, 0) + 1
             engine._stats["tiered_summary_source_bytes"] = (
@@ -152,9 +181,14 @@ class TieredClaim:
                 engine._stats.get("tiered_summary_scratch_high_water_bytes", 0),
                 self.summary_scratch_bytes,
             )
+            if summary_stream is not None:
+                done = torch.cuda.Event()
+                done.record(summary_stream)
+                self.summaries_ready = done
             if cache is not None and not (verify or verify_fast):
-                ready = torch.cuda.Event()
-                ready.record(torch.cuda.current_stream(device))
+                ready = self.summaries_ready or torch.cuda.Event()
+                if self.summaries_ready is None:
+                    ready.record(torch.cuda.current_stream(device))
                 entry_bytes = (
                     self.kmin.numel() * self.kmin.element_size()
                     + self.kmax.numel() * self.kmax.element_size()
@@ -752,6 +786,12 @@ class TieredClaim:
             return torch.empty(
                 0, dtype=torch.int64, device=self.forced_pages.device
             )
+        if self.summaries_ready is not None:
+            # One-shot ordering between the summary stream's scan and the
+            # first live selection; a no-op when admission already held
+            # the batch until the event fired.
+            torch.cuda.current_stream().wait_event(self.summaries_ready)
+            self.summaries_ready = None
         scores = quest_page_scores(
             query.to(torch.float32),
             self.kmin[local_layer],

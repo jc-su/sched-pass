@@ -919,6 +919,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if ranges is None:
             raise RuntimeError("tiered claim has no object-range pool")
         self._drain_tiered_resources(wait=False)
+        if getattr(self, "_summary_stream", None) is None:
+            self._summary_stream = torch.cuda.Stream()
         if self._claim_table is None:
             from nta_runtime.claim_table import ClaimTable
 
@@ -999,6 +1001,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 return retired
 
             pending.retire_callback = retire_external
+        if claim.summaries_ready is not None:
+            self._hicache.note_summary_event(
+                pending.request_id, claim.summaries_ready
+            )
+            self._stats["tiered_summary_async_claims"] = (
+                self._stats.get("tiered_summary_async_claims", 0) + 1
+            )
         self._stats["tiered_claims"] = self._stats.get("tiered_claims", 0) + 1
         self._stats["tiered_claims_live_max"] = max(
             self._stats.get("tiered_claims_live_max", 0),

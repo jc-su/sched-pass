@@ -202,7 +202,7 @@ def main() -> None:
             return result
 
     clock = [1_000]
-    config = AdmissionConfig(True, 4, 100, 1)
+    config = AdmissionConfig(True, 4, 100, 1, 2_000_000_000)
     resident = Request("resident")
     scheduler = types.SimpleNamespace(
         running_batch=types.SimpleNamespace(reqs=[resident])

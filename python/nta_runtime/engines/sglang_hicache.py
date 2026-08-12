@@ -83,6 +83,7 @@ class SglangHiCacheBridge:
         self._external_dense_high_water_rows = 0
         self._external_staging_high_water_rows = 0
         self._lock = threading.Lock()
+        self._summary_events: dict[str, Any] = {}
         self._prefetch_callback: Any = None
         self._admission_stats: dict[str, int] = {}
         self._progress_publications: list[_ProgressPublication] = []
@@ -97,6 +98,25 @@ class SglangHiCacheBridge:
     @property
     def external_prefix_enabled(self) -> bool:
         return self._external_prefix_capacity_rows > 0
+
+    def note_summary_event(self, request_id: str, event: Any) -> None:
+        """Record a claim's summary-scan readiness for admission gating."""
+        with self._lock:
+            self._summary_events[str(request_id)] = event
+
+    def summaries_pending(self, request_ids: tuple[str, ...]) -> bool:
+        """Whether any request still waits on its summary scan."""
+        with self._lock:
+            pending = False
+            for request_id in request_ids:
+                event = self._summary_events.get(request_id)
+                if event is None:
+                    continue
+                if event.query():
+                    self._summary_events.pop(request_id, None)
+                else:
+                    pending = True
+            return pending
 
     def enable_external_prefixes(
         self, capacity_rows: int, callback: Any, *, page_tokens: int = 1
