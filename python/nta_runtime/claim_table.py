@@ -89,11 +89,16 @@ class ClaimTable:
         self.selected_rows = zeros(
             max_claims, self.capacity_rows, dtype=torch.int32
         )
+        # Transfer index words are per (claim, layer): the object ranges
+        # register these pointers once, and a pipelined extend keeps all
+        # thirty-six layers' transfers in flight at once — a shared row
+        # would let a later layer's prep overwrite indices a transfer is
+        # still reading.
         self.source_indices = zeros(
-            max_claims, self.capacity_rows, dtype=torch.int32
+            max_claims, layer_count, self.capacity_rows, dtype=torch.int32
         )
         self.staging_indices = zeros(
-            max_claims, self.capacity_rows, dtype=torch.int32
+            max_claims, layer_count, self.capacity_rows, dtype=torch.int32
         )
         self.copied_rows = zeros(max_claims, dtype=torch.int64)
         # Geometry and dispatch words the table-driven prep kernel reads

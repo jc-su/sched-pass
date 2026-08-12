@@ -230,19 +230,23 @@ class TieredClaim:
         self.table_backed = table_views is not None
         if table_views is not None:
             # Claim-table rows: pointer-stable slices of one allocation
-            # per field, sliced to this claim's page-aligned capacity.
+            # per field. Transfer index words are per (claim, layer) so a
+            # pipelined extend's in-flight transfers never share a row
+            # with a later layer's prep.
             self.source_index = table_views["source_indices"][
-                : self.capacity_rows
+                :, : self.capacity_rows
             ]
             self.staging_index = table_views["staging_indices"][
-                : self.capacity_rows
+                :, : self.capacity_rows
             ]
         else:
             self.source_index = torch.zeros(
-                self.capacity_rows, dtype=torch.int32, device=device
+                (self.layer_count, self.capacity_rows),
+                dtype=torch.int32, device=device,
             )
             self.staging_index = torch.zeros(
-                self.capacity_rows, dtype=torch.int32, device=device
+                (self.layer_count, self.capacity_rows),
+                dtype=torch.int32, device=device,
             )
         self.cached_pages: torch.Tensor | None = None
         self.selected_rows: torch.Tensor | None = None
@@ -313,8 +317,8 @@ class TieredClaim:
                         1,
                         source.data_ptr(),
                         staging.data_ptr(),
-                        self.source_index.data_ptr(),
-                        self.staging_index.data_ptr(),
+                        self.source_index[local_layer].data_ptr(),
+                        self.staging_index[local_layer].data_ptr(),
                         self.capacity_rows,
                         element,
                         source.stride(0) * source.element_size(),
@@ -633,11 +637,13 @@ class TieredClaim:
                 f"tiered staging asked for {count} rows outside capacity "
                 f"{self.capacity_rows}"
             )
-        self.source_index[:count] = self.host_rows[positions]
+        self.source_index[local_layer, :count] = self.host_rows[positions]
         if self.external_sidecar:
-            self.staging_index[:count] = self.device_rows[:count]
+            self.staging_index[local_layer, :count] = self.device_rows[:count]
         else:
-            self.staging_index[:count] = self.device_rows[positions]
+            self.staging_index[local_layer, :count] = self.device_rows[
+                positions
+            ]
         phases = engine._phase_program(engine._nta_demand_decode_wrappers[0])
         base = self.first_object_slot + 2 * local_layer
         phases.set_indexed_row_counts(
@@ -843,8 +849,8 @@ class TieredClaim:
             self.host_rows,
             self.device_rows,
             self.staged[local_layer],
-            self.source_index,
-            self.staging_index,
+            self.source_index[local_layer],
+            self.staging_index[local_layer],
             self.copied_rows_device,
             stream=stream,
         )
@@ -900,8 +906,8 @@ class TieredClaim:
             self.device_rows,
             self.cached_pages[local_layer],
             self.selected_rows,
-            self.source_index,
-            self.staging_index,
+            self.source_index[local_layer],
+            self.staging_index[local_layer],
             self.copied_rows_device,
             stream=stream,
         )
@@ -939,6 +945,89 @@ class TieredClaim:
             self._decode_step - self._earliest_stage_step
             >= self.selection_refresh_interval
         )
+
+    def stage_all_layers_async(
+        self,
+        engine: Any,
+        frees: list[torch.Tensor],
+        stream: torch.cuda.Stream,
+    ) -> list[torch.cuda.Event]:
+        """Issue every layer's selection, staging, and transfer up front.
+
+        A tiered extend's queries are fixed for the whole forward, so all
+        selections are known at layer zero. The serialized path paid one
+        synchronous copy-wait per layer (~36 round trips per extend — the
+        measured ~1.5/s extend ceiling); here every prep launch lands on
+        the compute stream back to back, transfers follow on the claim's
+        copy stream gated per layer, and each layer's attention waits
+        just-in-time. Transfer index words live in per-layer arrays so a
+        later layer's prep can never overwrite indices a transfer still
+        reads; the shared selected-row table is cloned into the per-layer
+        cache between preps, stream-ordered.
+        """
+        if (
+            not self.external_sidecar
+            or self.cached_pages is None
+            or self.selected_rows is None
+            or self.copy_stream is None
+            or not self.selection_ready
+            or not self.copy_ready
+        ):
+            raise RuntimeError("external claim has no bounded staging cache")
+        if len(frees) != self.layer_count:
+            raise RuntimeError("pipelined staging requires one page set per layer")
+        phases = engine._phase_program(engine._nta_demand_decode_wrappers[0])
+        events: list[torch.cuda.Event] = []
+        for local_layer, free_pages in enumerate(frees):
+            ordered_pages = torch.cat(
+                [self.full_forced_pages, free_pages, self.forced_pages[-1:]]
+            )
+            base = self.first_object_slot + 2 * local_layer
+            phases.prepare_bounded_selected_indexed_rows(
+                engine._runtime,
+                base,
+                2,
+                ordered_pages,
+                self.page_tokens,
+                self.token_count,
+                self.host_rows,
+                self.device_rows,
+                self.cached_pages[local_layer],
+                self.selected_rows,
+                self.source_index[local_layer],
+                self.staging_index[local_layer],
+                self.copied_rows_device,
+                stream=stream,
+            )
+            # Clone before the next layer's prep rewrites the shared
+            # selected-row table; the cache buffer is this layer's stable
+            # source for the segment write.
+            self.remember_selected_rows(
+                local_layer, self.selected_rows[: self.kept_prefix_rows]
+            )
+            selected = self.selection_ready[local_layer]
+            selected.record(stream)
+            self.copy_stream.wait_event(selected)
+            phases.progress_validated_indexed_host_range(
+                engine._runtime, base, 2, stream=self.copy_stream
+            )
+            copied = self.copy_ready[local_layer]
+            copied.record(self.copy_stream)
+            events.append(copied)
+        engine._stats["tiered_pipelined_extends"] = (
+            engine._stats.get("tiered_pipelined_extends", 0) + 1
+        )
+        engine._stats["tiered_device_compaction_launches"] = (
+            engine._stats.get("tiered_device_compaction_launches", 0)
+            + self.layer_count
+        )
+        engine._stats["tiered_bounded_cache_launches"] = (
+            engine._stats.get("tiered_bounded_cache_launches", 0)
+            + self.layer_count
+        )
+        self.device_accounting = True
+        self.requested_rows += self.kept_prefix_rows * self.layer_count
+        return events
 
     def cached_selected_rows(self, local_layer: int) -> torch.Tensor | None:
         """Return a reusable selected table for this decode layer, if legal."""

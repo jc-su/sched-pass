@@ -913,8 +913,12 @@ extern "C" __global__ void nta_prepare_claim_table_selected_rows(
               maxBudgetPages,
       capacity / pageTokens,
       selectedRowsBase + static_cast<std::uint64_t>(claim) * rowStride,
-      sourceIndicesBase + static_cast<std::uint64_t>(claim) * rowStride,
-      stagingIndicesBase + static_cast<std::uint64_t>(claim) * rowStride,
+      sourceIndicesBase +
+          (static_cast<std::uint64_t>(claim) * layerCount + localLayer) *
+              rowStride,
+      stagingIndicesBase +
+          (static_cast<std::uint64_t>(claim) * layerCount + localLayer) *
+              rowStride,
       capacity, copiedRowsBase + claim);
 }
 

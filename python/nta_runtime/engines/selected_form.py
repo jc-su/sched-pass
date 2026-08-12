@@ -599,7 +599,44 @@ class SelectedAttentionExecutor:
                 selected_rows = None if prefill else claim.cached_selected_rows(
                     local_layer
                 )
-                if selected_rows is None:
+                if selected_rows is None and (
+                    prefill
+                    and claim.external_sidecar
+                    and claim.selection_refresh_interval > 1
+                    and claim.selected_rows is not None
+                    and claim.copy_stream is not None
+                ):
+                    # Pipelined extend: queries are fixed for the whole
+                    # forward, so layer zero issues every layer's
+                    # selection, prep, and transfer; each layer then
+                    # serves from its cloned rows behind its own copy
+                    # event instead of a synchronous per-layer wait.
+                    if local_layer == 0:
+                        frees = [
+                            claim.choose_free_pages(
+                                index, queries, group_size
+                            )
+                            for index in range(claim.layer_count)
+                        ]
+                        claim._pipeline_events = claim.stage_all_layers_async(
+                            engine, frees, stream
+                        )
+                        claim._pipeline_frees = frees
+                    selected_rows = claim._selected_row_cache[local_layer]
+                    if selected_rows is None:
+                        raise RuntimeError(
+                            "pipelined extend lost its per-layer rows"
+                        )
+                    stream.wait_event(claim._pipeline_events[local_layer])
+                    if claim.verify_fast:
+                        verify_targets.append(
+                            (
+                                claim,
+                                claim._pipeline_frees[local_layer],
+                                selected_rows,
+                            )
+                        )
+                elif selected_rows is None:
                     free = claim.choose_free_pages(local_layer, queries, group_size)
                     if (
                         not prefill
