@@ -117,6 +117,18 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **P3 probe rerun (2026-08-12, non-qualifying seed 20260812, after the
+  operator build's eager phase 3):** tiered qualified 13/24 versus stock
+  12/24; goodput 0.372 versus 0.233 requests/s (ratio 1.60); tiered TTFT
+  24/24 under SLO (p50 0.88s versus stock 7.36s, stock queue divergent);
+  tiered ITL-qualified 13/24 = 54.2 percent, meeting the added criterion
+  against stock's 50 percent qualified fraction by one request. All
+  98,532 tiered decode layers served by the full-reuse fast path at 24
+  concurrent claims. The remaining ITL failures are ~0.5s gaps matching
+  synchronous claim-preparation summary streaming at arrival, not decode
+  (ITL p99 median 40ms); claim-prep overlap is the recorded next
+  increment before qualifying trials. Artifacts:
+  `results/serving/p3-tiered.json`, `results/serving/p3-stock.json`.
 - **Amendment 1 (2026-08-11):** the quality matrix (needle + multikey
   kinds, count demoted diagnostic-only by stock validation; budgets
   {32, 64, 128} x refresh {1, 1024}) passed every cell at 1.0, equal to
