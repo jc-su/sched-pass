@@ -108,10 +108,27 @@ def require_clean_mechanism(
         raise RuntimeError("NTA HiCache trial did not publish engine statistics")
     fallbacks = sum(int(entry.get("hicache_fallback_batches", 0)) for entry in stats)
     claimed = sum(int(entry.get("hicache_claimed_batches", 0)) for entry in stats)
+    def _mechanism_summary() -> str:
+        keys = (
+            "hicache_claimed_batches", "hicache_fallback_batches",
+            "tiered_claims", "tiered_external_prefix_batches",
+            "tiered_decode_layers", "external_launches",
+            "admission_considered_batches", "batches",
+        )
+        return "; ".join(
+            f"{key}={sum(int(entry.get(key, 0)) for entry in stats)}"
+            for key in keys
+        )
     if fallbacks != 0:
-        raise RuntimeError(f"NTA HiCache trial used {fallbacks} fallback batches")
+        raise RuntimeError(
+            f"NTA HiCache trial used {fallbacks} fallback batches "
+            f"({_mechanism_summary()})"
+        )
     if claimed == 0:
-        raise RuntimeError("NTA HiCache trial did not claim an external batch")
+        raise RuntimeError(
+            "NTA HiCache trial did not claim an external batch "
+            f"({_mechanism_summary()})"
+        )
     transformed = sum(
         int(entry.get("transformed_direct_launches", 0)) for entry in stats
     )
