@@ -700,7 +700,7 @@ def main() -> None:
             else:
                 os.environ["NTA_SGLANG_SUMMARY_CHUNK_ROWS"] = previous_chunk
         gathered_min, gathered_max = summary_claim._gathered_envelopes(
-            summary_pool, torch.device("cuda")
+            types.SimpleNamespace(), summary_pool, torch.device("cuda")
         )
         assert torch.equal(streamed_min, gathered_min)
         assert torch.equal(streamed_max, gathered_max)

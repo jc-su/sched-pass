@@ -913,6 +913,23 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             return True
 
     def _prepare_tiered_claim(self, pending: Any) -> None:
+        import time as _time
+
+        _prep_began = _time.monotonic()
+        try:
+            self._prepare_tiered_claim_timed(pending)
+        finally:
+            elapsed_ms = (_time.monotonic() - _prep_began) * 1_000.0
+            self._stats["tiered_claim_prep_host_ms_total"] = (
+                self._stats.get("tiered_claim_prep_host_ms_total", 0.0)
+                + elapsed_ms
+            )
+            self._stats["tiered_claim_prep_host_ms_max"] = max(
+                self._stats.get("tiered_claim_prep_host_ms_max", 0.0),
+                elapsed_ms,
+            )
+
+    def _prepare_tiered_claim_timed(self, pending: Any) -> None:
         from nta_runtime.engines.selected_tiered import TieredClaim
 
         ranges = self._tiered_object_ranges

@@ -122,6 +122,14 @@ class TieredClaim:
         cache_key = self._summary_cache_key(
             pending, host_pool, start_layer, summary_path
         )
+        import time as _time
+
+        _envelope_began = _time.monotonic()
+        _envelope_cpu_began = _time.thread_time()
+        _alloc_began = torch.cuda.memory_stats().get("num_device_alloc", 0)
+        engine._stats["tiered_host_pool_pinned"] = int(
+            bool(host_pool.k_data_refs[0].is_pinned())
+        )
         cache = getattr(engine, "_tiered_summary_cache", None)
         cache_entry = None if (verify or verify_fast or cache is None) else cache.get(
             cache_key
@@ -227,6 +235,17 @@ class TieredClaim:
             if self.external_sidecar
             else min(budget_pages * page_tokens, self.token_count)
         )
+        engine._stats["tiered_prep_envelope_ms_total"] = engine._stats.get(
+            "tiered_prep_envelope_ms_total", 0.0
+        ) + (_time.monotonic() - _envelope_began) * 1_000.0
+        engine._stats["tiered_prep_envelope_cpu_ms_total"] = engine._stats.get(
+            "tiered_prep_envelope_cpu_ms_total", 0.0
+        ) + (_time.thread_time() - _envelope_cpu_began) * 1_000.0
+        engine._stats["tiered_prep_device_allocs_total"] = engine._stats.get(
+            "tiered_prep_device_allocs_total", 0
+        ) + int(
+            torch.cuda.memory_stats().get("num_device_alloc", 0) - _alloc_began
+        )
         self.table_backed = table_views is not None
         if table_views is not None:
             # Claim-table rows: pointer-stable slices of one allocation
@@ -283,6 +302,7 @@ class TieredClaim:
                 )
 
         stream = torch.cuda.current_stream()
+        _register_began = _time.monotonic()
         objects = []
         for local_layer in range(self.layer_count):
             layer_id = start_layer + local_layer
@@ -330,6 +350,9 @@ class TieredClaim:
         engine._runtime.register_indexed_host_objects(
             first_object_slot, objects, stream=stream
         )
+        engine._stats["tiered_prep_register_ms_total"] = engine._stats.get(
+            "tiered_prep_register_ms_total", 0.0
+        ) + (_time.monotonic() - _register_began) * 1_000.0
         self.staged = (
             None
             if self.external_sidecar
@@ -485,7 +508,7 @@ class TieredClaim:
             if self.summary_path == "mapped":
                 return self._mapped_envelopes(engine, host_pool, device)
             return self._streamed_envelopes(host_pool, device)
-        kmin, kmax = self._gathered_envelopes(host_pool, device)
+        kmin, kmax = self._gathered_envelopes(engine, host_pool, device)
         if self.contiguous_host:
             if self.summary_path == "mapped":
                 streamed_kmin, streamed_kmax = self._mapped_envelopes(
@@ -525,15 +548,71 @@ class TieredClaim:
         return kmin.to(torch.float32), kmax.to(torch.float32)
 
     def _gathered_envelopes(
-        self, host_pool: Any, device: torch.device
+        self, engine: Any, host_pool: Any, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Envelopes for fragmented host mappings.
+
+        Under churn the host allocator fragments, so claims routinely
+        land here. The original form gathered AND reduced on the CPU —
+        ~230ms of scheduler-thread compute per 16K claim, which stalled
+        every live decode (the measured P3 ITL tail). The gather stays
+        on the CPU (index_select into a reused pinned bounce, the only
+        part that must touch pageable-order rows), the upload is async,
+        and the reduction runs on device — min/max select existing
+        values, so the result is bit-identical to the CPU reduction.
+        """
+        reference = host_pool.k_data_refs[0]
+        shape = (self.token_count, *reference.shape[1:])
+        arena = getattr(engine, "_summary_gather_arena", None)
+        key = (shape, str(reference.dtype))
+        if arena is not None and arena.get("key") == key:
+            bounces = arena["bounces"]
+            scratch = arena["scratch"]
+        else:
+            # Pinned allocation costs ~10ms per call; claims churn with
+            # one geometry, so the bounce pair and device scratch live on
+            # the engine and are reused across claims. Two bounces let a
+            # layer's CPU gather overlap the previous layer's upload with
+            # an event wait instead of a stream synchronize.
+            bounces = tuple(
+                torch.empty(shape, dtype=reference.dtype, pin_memory=True)
+                for _ in range(2)
+            )
+            scratch = torch.empty(
+                shape, dtype=reference.dtype, device=device
+            )
+            engine._summary_gather_arena = {
+                "key": key,
+                "bounces": bounces,
+                "scratch": scratch,
+                "events": (torch.cuda.Event(), torch.cuda.Event()),
+            }
+            arena = engine._summary_gather_arena
+            stats = getattr(engine, "_stats", None)
+            if stats is not None:
+                stats["tiered_summary_arena_bytes"] = (
+                    sum(b.numel() * b.element_size() for b in bounces)
+                    + scratch.numel() * scratch.element_size()
+                )
+        events = arena["events"]
         kmins, kmaxs = [], []
+        stream = torch.cuda.current_stream(device)
         for local_layer in range(self.layer_count):
-            rows = host_pool.k_data_refs[local_layer][self.host_rows_cpu]
-            kmin, kmax = self._page_reduce(rows)
+            slot = local_layer & 1
+            if local_layer >= 2:
+                events[slot].synchronize()
+            torch.index_select(
+                host_pool.k_data_refs[local_layer],
+                0,
+                self.host_rows_cpu,
+                out=bounces[slot],
+            )
+            scratch.copy_(bounces[slot], non_blocking=True)
+            events[slot].record(stream)
+            kmin, kmax = self._page_reduce(scratch)
             kmins.append(kmin)
             kmaxs.append(kmax)
-        return torch.stack(kmins).to(device), torch.stack(kmaxs).to(device)
+        return torch.stack(kmins), torch.stack(kmaxs)
 
     def _streamed_envelopes(
         self, host_pool: Any, device: torch.device
