@@ -329,6 +329,26 @@ Phases, smallest-first:
    explicitly: CTA ordering heuristics, L2 hints, grouped-LPT, and
    LLVM-side NVMe issue.
 
+**Landed increments.** Phase 1 (f7bc0c4, 247c881): the fixed-shape
+`ClaimTable` — single allocations with stable pointers, generation-bumped
+slot lifecycle, fence-gated reuse — and claims serving from table-backed
+row slices. Phase 2 (643fc56, bef9388, c43bbd1): the table-driven prep
+kernel (`nta_prepare_claim_table_selected_rows`, one block per claim row,
+validity-word gated, per-layer object ranges addressed inside each
+claim's lease), C API v27 plumbing, claim-lifetime table words written at
+prep, and the combined-plan decode branch deferring every staging
+table-backed claim to one launch: batched count/page writes, one
+fixed-shape kernel, per-claim transfer progress only. Mechanism gate
+(results/serving/table-prep-shakeout.json; 16 externals x 16K, refresh 8
+to force decode staging, `VERIFY=fast`): 2880 prep launches served 18432
+claim-layer stagings — 6.4 claims per launch, 16 concurrent — with every
+freshly staged layer byte-verified. Under the qualifying config
+(refresh 1024) decode staging is rare by design — prefill stages
+per-claim and reuse dominates — so phase 2's step-time value arrives
+with phase 3, whose captured reuse step consumes the fixed-shape table
+this launch keeps warm; refresh and claim-churn steps are already served
+by the single launch.
+
 The co-design statement this implements: the engine knows request SLO
 and admission pressure; the runtime owns claims, bounded staging, and
 cancellation; the compiler turns request-level external-data
