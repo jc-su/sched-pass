@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 26
+API_VERSION = 27
 
 
 class RuntimeError(Exception):
@@ -1097,6 +1097,15 @@ _phase_prepare_bounded_selected_indexed_rows = _function(
     ctypes.c_uint64,
     ctypes.c_uint64,
 )
+_phase_prepare_claim_table_selected_rows = _function(
+    "nta_jit_phase_prepare_claim_table_selected_rows",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    *([ctypes.c_uint64] * 13),
+    *([ctypes.c_uint32] * 6),
+    ctypes.c_uint64,
+)
 _phase_reduce_mapped_key_pages = _function(
     "nta_jit_phase_reduce_mapped_key_pages",
     ctypes.c_int,
@@ -2148,6 +2157,57 @@ class JitPhaseProgram(_Owner):
                 staging_indices.data_ptr(),
                 capacity,
                 copied_rows.data_ptr(),
+                _stream_address(stream),
+            )
+        )
+
+    def prepare_claim_table_selected_rows(
+        self,
+        runtime: Runtime,
+        table: Any,
+        local_layer: int,
+        stream: Any = None,
+    ) -> None:
+        """One fixed-shape launch preps every valid claim-table row."""
+        import torch
+
+        tensors = (
+            table.valid,
+            table.object_slots,
+            table.capacity_words,
+            table.selected_counts,
+            table.token_counts,
+            table.selected_pages,
+            table.cached_pages,
+            table.host_rows,
+            table.staging_rows,
+            table.selected_rows,
+            table.source_indices,
+            table.staging_indices,
+            table.copied_rows,
+        )
+        if any(
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device.type != "cuda"
+            or not tensor.is_contiguous()
+            for tensor in tensors
+        ):
+            raise ValueError(
+                "claim-table launch requires contiguous CUDA table tensors"
+            )
+        if not 0 <= int(local_layer) < int(table.layer_count):
+            raise ValueError("claim-table layer is out of range")
+        _check(
+            _phase_prepare_claim_table_selected_rows(
+                self._handle,
+                runtime._handle,
+                *(int(tensor.data_ptr()) for tensor in tensors),
+                int(table.max_claims),
+                int(table.max_budget_pages),
+                int(table.layer_count),
+                int(local_layer),
+                int(table.max_claim_tokens),
+                int(table.page_tokens),
                 _stream_address(stream),
             )
         )

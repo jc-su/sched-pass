@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 26U
+#define NTA_RUNTIME_C_API_VERSION 27U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -428,6 +428,20 @@ nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
     uint64_t host_rows, uint64_t device_rows, uint64_t cached_pages,
     uint32_t cache_slot_count, uint64_t selected_rows, uint64_t source_indices,
     uint64_t staging_indices, uint32_t capacity, uint64_t copied_rows,
+    uint64_t cuda_stream);
+/* C API v27: prepare every valid claim-table row's selected consumer
+ * table and miss-only transfer lists in one fixed-shape launch; one block
+ * per table row, gated by the device validity word. */
+nta_status nta_jit_phase_prepare_claim_table_selected_rows(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint64_t valid, uint64_t object_slots, uint64_t capacity_words,
+    uint64_t selected_counts, uint64_t token_counts,
+    uint64_t selected_pages_base, uint64_t cached_pages_base,
+    uint64_t host_rows_base, uint64_t staging_rows_base,
+    uint64_t selected_rows_base, uint64_t source_indices_base,
+    uint64_t staging_indices_base, uint64_t copied_rows_base,
+    uint32_t max_claims, uint32_t max_budget_pages, uint32_t layer_count,
+    uint32_t local_layer, uint32_t max_claim_tokens, uint32_t page_tokens,
     uint64_t cuda_stream);
 /* C API v25: reduce pinned mapped host key rows directly into device page
  * envelopes without allocating a temporary HBM copy. element_type is 0 for

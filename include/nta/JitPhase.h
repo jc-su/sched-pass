@@ -92,6 +92,18 @@ public:
       std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
       std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
       std::uint32_t capacity, std::uint64_t *copiedRows) const;
+  void prepareClaimTableSelectedRows(
+      cudaStream_t stream, abi::RuntimeView *runtime,
+      const std::int32_t *valid, const std::int32_t *objectSlots,
+      const std::int32_t *capacityWords, const std::int32_t *selectedCounts,
+      const std::int32_t *tokenCounts, const std::int64_t *selectedPagesBase,
+      std::int64_t *cachedPagesBase, const std::int32_t *hostRowsBase,
+      const std::int32_t *stagingRowsBase, std::uint32_t *selectedRowsBase,
+      std::uint32_t *sourceIndicesBase, std::uint32_t *stagingIndicesBase,
+      std::uint64_t *copiedRowsBase, std::uint32_t maxClaims,
+      std::uint32_t maxBudgetPages, std::uint32_t layerCount,
+      std::uint32_t localLayer, std::uint32_t maxClaimTokens,
+      std::uint32_t pageTokens) const;
   void reduceMappedKeyPages(cudaStream_t stream, const void *source,
                             std::uint32_t sourceRows,
                             std::uint64_t sourceStrideBytes,
