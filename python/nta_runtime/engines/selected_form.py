@@ -514,6 +514,77 @@ class SelectedAttentionExecutor:
                 + len(ctx["peer_positions"])
             )
         else:
+            if local_layer == 0:
+                for entry in ctx["claim_entries"]:
+                    entry["claim"].advance_decode_step()
+                state = self._compact_plan_state
+                fast_step = bool(
+                    ctx.get("device_plan")
+                    and state is not None
+                    and ctx["claim_entries"]
+                    and all(
+                        entry["claim"].reuse_cache_complete
+                        and not entry["claim"].refresh_due()
+                        for entry in ctx["claim_entries"]
+                    )
+                )
+                ctx["fast_reuse_step"] = fast_step
+                if fast_step:
+                    for entry in ctx["claim_entries"]:
+                        entry["claim"].layers_served += entry[
+                            "claim"
+                        ].layer_count
+            if ctx.get("fast_reuse_step"):
+                # Full-reuse step: every claim's per-layer rows are cached
+                # in stable buffers, so the layer's claim block is one
+                # index_copy of a concatenation reused until the next
+                # refresh or staging invalidates it. No per-claim Python
+                # runs between layer zero's check and attention.
+                state = self._compact_plan_state
+                cats = state.setdefault("layer_cats", {})
+                cat = cats.get(local_layer)
+                if cat is None:
+                    cat = torch.cat(
+                        [
+                            entry["claim"]._selected_row_cache[local_layer]
+                            for entry in ctx["claim_entries"]
+                        ]
+                    )
+                    cats[local_layer] = cat
+                positions = ctx.get("claim_row_positions")
+                if positions is None:
+                    entry = ctx["claim_entries"][0]
+                    ctx["plan_indices"][entry["begin"] : entry["end"]].copy_(
+                        cat
+                    )
+                else:
+                    ctx["plan_indices"].index_copy_(0, positions, cat)
+                self._run_paged(
+                    engine, ctx["verifier"], q, kv_cache, layer,
+                    out=serve_output,
+                )
+                stats["tiered_selection_reuse_layers"] = stats.get(
+                    "tiered_selection_reuse_layers", 0
+                ) + len(ctx["claim_entries"])
+                stats["tiered_fast_reuse_layers"] = (
+                    stats.get("tiered_fast_reuse_layers", 0) + 1
+                )
+                kind = "tiered_decode"
+                stats[f"{kind}_layers"] = stats.get(f"{kind}_layers", 0) + 1
+                stats["tiered_fast_layers"] = (
+                    stats.get("tiered_fast_layers", 0) + 1
+                )
+                stats["tiered_concurrent_claims_max"] = max(
+                    stats.get("tiered_concurrent_claims_max", 0),
+                    len(ctx["claim_entries"]),
+                )
+                stats["tiered_tokens_total"] = (
+                    stats.get("tiered_tokens_total", 0) + ctx["total"]
+                )
+                stats["tiered_tokens_kept"] = (
+                    stats.get("tiered_tokens_kept", 0) + ctx["kept_total"]
+                )
+                return True
             layer_rows: list[torch.Tensor | None] = []
             staging: list[tuple[Any, torch.Tensor]] = []
             staged_positions: list[int] = []
@@ -544,6 +615,11 @@ class SelectedAttentionExecutor:
                         selected_rows = claim.stage_missing(
                             engine, local_layer, free, stream
                         )
+                        fallback_state = self._compact_plan_state
+                        if fallback_state is not None:
+                            fallback_state.get("layer_cats", {}).pop(
+                                local_layer, None
+                            )
                         claim.remember_selected_rows(local_layer, selected_rows)
                         if claim.verify_fast:
                             verify_targets.append((claim, free, selected_rows))
@@ -651,6 +727,9 @@ class SelectedAttentionExecutor:
         events the compute stream must wait on before attention.
         """
         table = engine._claim_table
+        state = self._compact_plan_state
+        if state is not None:
+            state.get("layer_cats", {}).pop(local_layer, None)
         pieces: list[torch.Tensor] = []
         dests: list[torch.Tensor] = []
         slots: list[torch.Tensor] = []
@@ -1152,6 +1231,7 @@ class SelectedAttentionExecutor:
         return {
             "wrapper": wrapper,
             "verifier": verifier,
+            "device_plan": device_plan,
             "claim_ids": tuple(claim.claim_id for claim in claims),
             "claim_entries": claim_entries,
             "claim_row_positions": claim_row_positions,

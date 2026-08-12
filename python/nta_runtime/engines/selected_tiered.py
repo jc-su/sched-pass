@@ -388,7 +388,17 @@ class TieredClaim:
         self._selected_row_cache: list[torch.Tensor | None] = [
             None for _ in range(self.layer_count)
         ]
-        self._selected_decode_visits = [0 for _ in range(self.layer_count)]
+        # Refresh bookkeeping in decode steps, not per-layer visits: all
+        # layers advance together each step, so one step counter and a
+        # per-layer last-staged step express the same cadence with O(1)
+        # work per claim per step. ``_earliest_stage_step`` lets the serve
+        # loop rule out a whole step's refreshes with one comparison.
+        self._decode_step = 0
+        self._layer_stage_step: list[int | None] = [
+            None for _ in range(self.layer_count)
+        ]
+        self._earliest_stage_step: int | None = None
+        self.reuse_cache_complete = False
 
     def _summary_cache_key(
         self, pending: Any, host_pool: Any, start_layer: int, summary_path: str
@@ -877,6 +887,19 @@ class TieredClaim:
         self.requested_rows += self.kept_prefix_rows
         return self.selected_rows[: self.kept_prefix_rows], copied
 
+    def advance_decode_step(self) -> None:
+        """Mark one decode step; the serve loop calls this at layer zero."""
+        self._decode_step += 1
+
+    def refresh_due(self) -> bool:
+        """Whether any layer's selection must be rebuilt this step."""
+        if self._earliest_stage_step is None:
+            return True
+        return (
+            self._decode_step - self._earliest_stage_step
+            >= self.selection_refresh_interval
+        )
+
     def cached_selected_rows(self, local_layer: int) -> torch.Tensor | None:
         """Return a reusable selected table for this decode layer, if legal."""
         if self.selection_refresh_interval <= 1:
@@ -886,10 +909,12 @@ class TieredClaim:
         rows = self._selected_row_cache[local_layer]
         if rows is None:
             return None
-        visit = self._selected_decode_visits[local_layer]
-        if visit % self.selection_refresh_interval == 0:
+        staged = self._layer_stage_step[local_layer]
+        if (
+            staged is None
+            or self._decode_step - staged >= self.selection_refresh_interval
+        ):
             return None
-        self._selected_decode_visits[local_layer] = visit + 1
         return rows
 
     def remember_selected_rows(
@@ -921,7 +946,16 @@ class TieredClaim:
             )
         else:
             buffer.copy_(selected_rows)
-        self._selected_decode_visits[local_layer] += 1
+        self._layer_stage_step[local_layer] = self._decode_step
+        stage_steps = self._layer_stage_step
+        self._earliest_stage_step = (
+            None
+            if any(step is None for step in stage_steps)
+            else min(stage_steps)
+        )
+        self.reuse_cache_complete = all(
+            rows is not None for rows in self._selected_row_cache
+        )
 
     def physical_rows_for_pages(
         self, local_layer: int, pages: list[int]
