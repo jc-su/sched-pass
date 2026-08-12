@@ -124,7 +124,13 @@ def require_clean_mechanism(
             f"NTA HiCache trial used {fallbacks} fallback batches "
             f"({_mechanism_summary()})"
         )
-    if claimed == 0:
+    tiered_batches = sum(
+        int(entry.get("tiered_external_prefix_batches", 0)) for entry in stats
+    )
+    if claimed == 0 and tiered_batches == 0:
+        # Tiered serving routes external prefixes through claims without
+        # touching the demand-acquire counter; either counter proves the
+        # mechanism ran.
         raise RuntimeError(
             "NTA HiCache trial did not claim an external batch "
             f"({_mechanism_summary()})"

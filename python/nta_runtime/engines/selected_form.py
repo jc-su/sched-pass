@@ -67,6 +67,9 @@ class SelectedAttentionExecutor:
         self._compact_plan_verify = (
             os.environ.get("NTA_SGLANG_COMPACT_PLAN_VERIFY") == "1"
         )
+        self._device_plan_enabled = (
+            os.environ.get("NTA_SGLANG_DEVICE_PLAN", "1") != "0"
+        )
 
     def begin_tiered_forward(self) -> None:
         """Invalidate wrapper plans at the engine's forward boundary."""
@@ -935,7 +938,8 @@ class SelectedAttentionExecutor:
             for claim in claims
         )
         device_plan = (
-            not prefill
+            self._device_plan_enabled
+            and not prefill
             and not split_overlap
             and all(
                 getattr(claim, "bound_nonprefix_index", None) is not None
