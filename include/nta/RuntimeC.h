@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 28U
+#define NTA_RUNTIME_C_API_VERSION 29U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -458,6 +458,14 @@ nta_status nta_jit_phase_build_compact_plan(
 nta_status nta_jit_phase_reduce_mapped_key_pages(
     const nta_jit_phase_program *program, uint64_t source, uint32_t source_rows,
     uint64_t source_stride_bytes, uint32_t first_row, uint32_t token_count,
+    uint32_t page_tokens, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t element_type, uint64_t output_min, uint64_t output_max,
+    uint64_t cuda_stream);
+/* C API v29: the fragmented-mapping variant — token rows resolve through
+ * a device int32 index array instead of a contiguous base offset. */
+nta_status nta_jit_phase_reduce_mapped_indexed_key_pages(
+    const nta_jit_phase_program *program, uint64_t source, uint32_t source_rows,
+    uint64_t source_stride_bytes, uint64_t row_indices, uint32_t token_count,
     uint32_t page_tokens, uint32_t kv_heads, uint32_t head_dim,
     uint32_t element_type, uint64_t output_min, uint64_t output_max,
     uint64_t cuda_stream);

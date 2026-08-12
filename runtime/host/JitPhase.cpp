@@ -58,6 +58,10 @@ using PrepareBoundedSelectedIndexedRows = cudaError_t (*)(
     std::uint32_t, std::uint32_t, const std::uint32_t *, const std::uint32_t *,
     std::int64_t *, std::uint32_t, std::uint32_t *, std::uint32_t *,
     std::uint32_t *, std::uint32_t, std::uint64_t *, cudaStream_t);
+using ReduceMappedIndexedKeyPages = cudaError_t (*)(
+    const void *, std::uint32_t, std::uint64_t, const std::int32_t *,
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+    float *, float *, cudaStream_t);
 using ReduceMappedKeyPages = cudaError_t (*)(const void *, std::uint32_t,
                                              std::uint64_t, std::uint32_t,
                                              std::uint32_t, std::uint32_t,
@@ -161,6 +165,8 @@ struct JitPhaseProgram::Impl {
           load<BuildCompactPlan>(library, "nta_jit_build_compact_plan");
       reduceMappedKeyPages = load<ReduceMappedKeyPages>(
           library, "nta_jit_reduce_mapped_key_pages");
+      reduceMappedIndexedKeyPages = load<ReduceMappedIndexedKeyPages>(
+          library, "nta_jit_reduce_mapped_indexed_key_pages");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
       publish = load<Publish>(library, "nta_jit_publish_ready");
       complete = load<Complete>(library, "nta_jit_complete_launched");
@@ -199,6 +205,7 @@ struct JitPhaseProgram::Impl {
   PrepareClaimTableSelectedRows prepareClaimTableSelectedRows = nullptr;
   BuildCompactPlan buildCompactPlan = nullptr;
   ReduceMappedKeyPages reduceMappedKeyPages = nullptr;
+  ReduceMappedIndexedKeyPages reduceMappedIndexedKeyPages = nullptr;
   ProgressNvme progressNvme = nullptr;
   Publish publish = nullptr;
   Complete complete = nullptr;
@@ -462,6 +469,30 @@ void JitPhaseProgram::buildCompactPlan(
                                 claimRowCounts, compactOffsets, compactIndices,
                                 batchSize, stream),
         "nta_jit_build_compact_plan");
+}
+
+void JitPhaseProgram::reduceMappedIndexedKeyPages(
+    cudaStream_t stream, const void *source, std::uint32_t sourceRows,
+    std::uint64_t sourceStrideBytes, const std::int32_t *rowIndices,
+    std::uint32_t tokenCount, std::uint32_t pageTokens, std::uint32_t kvHeads,
+    std::uint32_t headDim, std::uint32_t elementType, float *outputMin,
+    float *outputMax) const {
+  if (source == nullptr || rowIndices == nullptr || outputMin == nullptr ||
+      outputMax == nullptr || sourceRows == 0 || sourceStrideBytes == 0 ||
+      tokenCount == 0 || pageTokens == 0 || kvHeads == 0 || headDim == 0 ||
+      elementType > 1) {
+    throw std::invalid_argument(
+        "JIT indexed mapped key reduction needs bounded geometry");
+  }
+  if (impl_->reduceMappedIndexedKeyPages == nullptr) {
+    throw std::runtime_error(
+        "phase module lacks nta_jit_reduce_mapped_indexed_key_pages");
+  }
+  check(impl_->reduceMappedIndexedKeyPages(
+            source, sourceRows, sourceStrideBytes, rowIndices, tokenCount,
+            pageTokens, kvHeads, headDim, elementType, outputMin, outputMax,
+            stream),
+        "nta_jit_reduce_mapped_indexed_key_pages");
 }
 
 void JitPhaseProgram::reduceMappedKeyPages(

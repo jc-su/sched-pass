@@ -1312,6 +1312,24 @@ nta_status nta_jit_phase_reduce_mapped_key_pages(
   });
 }
 
+nta_status nta_jit_phase_reduce_mapped_indexed_key_pages(
+    const nta_jit_phase_program *program, std::uint64_t source,
+    std::uint32_t sourceRows, std::uint64_t sourceStrideBytes,
+    std::uint64_t rowIndices, std::uint32_t tokenCount,
+    std::uint32_t pageTokens, std::uint32_t kvHeads, std::uint32_t headDim,
+    std::uint32_t elementType, std::uint64_t outputMin, std::uint64_t outputMax,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    program->value->reduceMappedIndexedKeyPages(
+        stream(cudaStream), reinterpret_cast<const void *>(source), sourceRows,
+        sourceStrideBytes, reinterpret_cast<const std::int32_t *>(rowIndices),
+        tokenCount, pageTokens, kvHeads, headDim, elementType,
+        reinterpret_cast<float *>(outputMin),
+        reinterpret_cast<float *>(outputMax));
+  });
+}
+
 nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        nta_runtime *runtime,
                                        std::uint32_t issueBudget,

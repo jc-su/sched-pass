@@ -1107,6 +1107,76 @@ nta_jit_reduce_mapped_key_pages(const void *source, std::uint32_t sourceRows,
   return nta::jit::launchStatus();
 }
 
+extern "C" __global__ void nta_reduce_mapped_indexed_key_pages(
+    const std::byte *source, std::uint32_t sourceRows,
+    std::uint64_t sourceStrideBytes, const std::int32_t *rowIndices,
+    std::uint32_t tokenCount, std::uint32_t pageTokens,
+    std::uint32_t elementCount, std::uint32_t elementType, float *outputMin,
+    float *outputMax) {
+  // The fragmented-mapping variant of the contiguous reduction above:
+  // token positions resolve through a device row-index array instead of
+  // a base offset, so a churned host pool costs the same as a fresh one.
+  const std::uint32_t pageCount = (tokenCount + pageTokens - 1U) / pageTokens;
+  const std::uint64_t outputCount =
+      static_cast<std::uint64_t>(pageCount) * elementCount;
+  for (std::uint64_t output =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       output < outputCount;
+       output += static_cast<std::uint64_t>(blockDim.x) * gridDim.x) {
+    const std::uint32_t page = output / elementCount;
+    const std::uint32_t element = output % elementCount;
+    const std::uint32_t begin = page * pageTokens;
+    const std::uint32_t end = min(tokenCount, begin + pageTokens);
+    float minimum = CUDART_INF_F;
+    float maximum = -CUDART_INF_F;
+    for (std::uint32_t token = begin; token < end; ++token) {
+      const std::uint32_t row = static_cast<std::uint32_t>(rowIndices[token]);
+      if (row >= sourceRows) {
+        continue;
+      }
+      const std::byte *address = source + row * sourceStrideBytes +
+                                 static_cast<std::uint64_t>(element) * 2U;
+      const float value =
+          elementType == 0
+              ? __half2float(*reinterpret_cast<const __half *>(address))
+              : __bfloat162float(
+                    *reinterpret_cast<const __nv_bfloat16 *>(address));
+      minimum = fminf(minimum, value);
+      maximum = fmaxf(maximum, value);
+    }
+    outputMin[output] = minimum;
+    outputMax[output] = maximum;
+  }
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_reduce_mapped_indexed_key_pages(
+    const void *source, std::uint32_t sourceRows,
+    std::uint64_t sourceStrideBytes, const std::int32_t *rowIndices,
+    std::uint32_t tokenCount, std::uint32_t pageTokens, std::uint32_t kvHeads,
+    std::uint32_t headDim, std::uint32_t elementType, float *outputMin,
+    float *outputMax, cudaStream_t stream) {
+  constexpr std::uint32_t threads = 256;
+  if (source == nullptr || rowIndices == nullptr || outputMin == nullptr ||
+      outputMax == nullptr || sourceRows == 0 || tokenCount == 0 ||
+      pageTokens == 0 || kvHeads == 0 || headDim == 0 || elementType > 1 ||
+      headDim > std::numeric_limits<std::uint32_t>::max() / kvHeads ||
+      sourceStrideBytes < static_cast<std::uint64_t>(kvHeads) * headDim * 2U) {
+    return cudaErrorInvalidValue;
+  }
+  const std::uint64_t pageCount =
+      (static_cast<std::uint64_t>(tokenCount) + pageTokens - 1U) / pageTokens;
+  const std::uint64_t outputCount = pageCount * kvHeads * headDim;
+  const std::uint64_t blocks64 = (outputCount + threads - 1U) / threads;
+  const std::uint32_t blocks =
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(blocks64, 65535U));
+  nta_reduce_mapped_indexed_key_pages<<<blocks, threads, 0, stream>>>(
+      static_cast<const std::byte *>(source), sourceRows, sourceStrideBytes,
+      rowIndices, tokenCount, pageTokens, kvHeads * headDim, elementType,
+      outputMin, outputMax);
+  return nta::jit::launchStatus();
+}
+
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_progress_validated_indexed_host_range(void *runtime,
                                               std::uint32_t firstObject,

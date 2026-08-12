@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 28
+API_VERSION = 29
 
 
 class RuntimeError(Exception):
@@ -1112,6 +1112,19 @@ _phase_build_compact_plan = _function(
     _Handle,
     *([ctypes.c_uint64] * 8),
     ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_reduce_mapped_indexed_key_pages = _function(
+    "nta_jit_phase_reduce_mapped_indexed_key_pages",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    *([ctypes.c_uint32] * 5),
+    ctypes.c_uint64,
+    ctypes.c_uint64,
     ctypes.c_uint64,
 )
 _phase_reduce_mapped_key_pages = _function(
@@ -2263,6 +2276,78 @@ class JitPhaseProgram(_Owner):
                 self._handle,
                 *(int(tensor.data_ptr()) for tensor in tensors),
                 int(batch_size),
+                _stream_address(stream),
+            )
+        )
+
+    def reduce_mapped_indexed_key_pages(
+        self,
+        source: Any,
+        row_indices: Any,
+        token_count: int,
+        page_tokens: int,
+        output_min: Any,
+        output_max: Any,
+        stream: Any = None,
+    ) -> None:
+        """Reduce fragmented pinned host K rows into CUDA page envelopes."""
+        import torch
+
+        if (
+            not isinstance(source, torch.Tensor)
+            or source.device.type != "cpu"
+            or not source.is_pinned()
+            or source.ndim != 3
+            or source.dtype not in (torch.float16, torch.bfloat16)
+            or source.stride(2) != 1
+            or source.stride(1) != int(source.shape[2])
+            or source.stride(0) < int(source.shape[1]) * int(source.shape[2])
+        ):
+            # Rows may be strided views into one pool allocation; only the
+            # per-row [heads, dim] payload must be dense — the kernel walks
+            # rows by the passed byte stride.
+            raise ValueError(
+                "mapped key reduction requires pinned fp16/bf16 dense rows"
+            )
+        if (
+            not isinstance(row_indices, torch.Tensor)
+            or row_indices.device.type != "cuda"
+            or row_indices.dtype != torch.int32
+            or not row_indices.is_contiguous()
+            or row_indices.numel() < token_count
+        ):
+            raise ValueError(
+                "mapped key reduction requires device int32 row indices"
+            )
+        pages = (token_count + page_tokens - 1) // page_tokens
+        expected = (pages, int(source.shape[1]), int(source.shape[2]))
+        if (
+            token_count <= 0
+            or page_tokens <= 0
+            or any(
+                not isinstance(output, torch.Tensor)
+                or output.device.type != "cuda"
+                or output.dtype != torch.float32
+                or tuple(output.shape) != expected
+                or not output.is_contiguous()
+                for output in (output_min, output_max)
+            )
+        ):
+            raise ValueError("mapped key reduction geometry is invalid")
+        _check(
+            _phase_reduce_mapped_indexed_key_pages(
+                self._handle,
+                source.data_ptr(),
+                source.shape[0],
+                source.stride(0) * source.element_size(),
+                row_indices.data_ptr(),
+                token_count,
+                page_tokens,
+                source.shape[1],
+                source.shape[2],
+                0 if source.dtype == torch.float16 else 1,
+                output_min.data_ptr(),
+                output_max.data_ptr(),
                 _stream_address(stream),
             )
         )

@@ -114,6 +114,12 @@ public:
                         const std::int32_t *compactOffsets,
                         std::int32_t *compactIndices,
                         std::uint32_t batchSize) const;
+  void reduceMappedIndexedKeyPages(
+      cudaStream_t stream, const void *source, std::uint32_t sourceRows,
+      std::uint64_t sourceStrideBytes, const std::int32_t *rowIndices,
+      std::uint32_t tokenCount, std::uint32_t pageTokens,
+      std::uint32_t kvHeads, std::uint32_t headDim, std::uint32_t elementType,
+      float *outputMin, float *outputMax) const;
   void reduceMappedKeyPages(cudaStream_t stream, const void *source,
                             std::uint32_t sourceRows,
                             std::uint64_t sourceStrideBytes,

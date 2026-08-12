@@ -508,7 +508,26 @@ class TieredClaim:
             if self.summary_path == "mapped":
                 return self._mapped_envelopes(engine, host_pool, device)
             return self._streamed_envelopes(host_pool, device)
+        if not self.contiguous_host and not (verify or verify_fast):
+            # Fragmented host mappings resolve rows through a device
+            # index array inside the reduction kernel: a churned pool
+            # costs the same as a fresh one and the scheduler thread
+            # only enqueues.
+            return self._mapped_indexed_envelopes(engine, host_pool, device)
         kmin, kmax = self._gathered_envelopes(engine, host_pool, device)
+        if not self.contiguous_host:
+            indexed_kmin, indexed_kmax = self._mapped_indexed_envelopes(
+                engine, host_pool, device
+            )
+            if not (
+                torch.equal(indexed_kmin, kmin)
+                and torch.equal(indexed_kmax, kmax)
+            ):
+                raise RuntimeError(
+                    "indexed mapped envelope scan diverged from the "
+                    "gathered reference; min/max are order-invariant, so "
+                    "this is a mapping or indexing defect"
+                )
         if self.contiguous_host:
             if self.summary_path == "mapped":
                 streamed_kmin, streamed_kmax = self._mapped_envelopes(
@@ -679,6 +698,35 @@ class TieredClaim:
             phases.reduce_mapped_key_pages(
                 host_key,
                 begin,
+                self.token_count,
+                self.page_tokens,
+                kmin[local_layer],
+                kmax[local_layer],
+                stream=stream,
+            )
+        return kmin, kmax
+
+    def _mapped_indexed_envelopes(
+        self, engine: Any, host_pool: Any, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse fragmented mapped-host reads and page reduction."""
+        reference = host_pool.k_data_refs[0]
+        heads, dim = int(reference.shape[-2]), int(reference.shape[-1])
+        shape = (self.layer_count, self.pages, heads, dim)
+        kmin = torch.empty(shape, dtype=torch.float32, device=device)
+        kmax = torch.empty_like(kmin)
+        phases = engine._phase_program(engine._nta_demand_decode_wrappers[0])
+        stream = torch.cuda.current_stream(device)
+        for local_layer in range(self.layer_count):
+            host_key = host_pool.k_data_refs[local_layer]
+            if (
+                host_key.shape[1:] != reference.shape[1:]
+                or host_key.dtype != reference.dtype
+            ):
+                raise RuntimeError("host key layers disagree in geometry")
+            phases.reduce_mapped_indexed_key_pages(
+                host_key,
+                self.host_rows,
                 self.token_count,
                 self.page_tokens,
                 kmin[local_layer],
