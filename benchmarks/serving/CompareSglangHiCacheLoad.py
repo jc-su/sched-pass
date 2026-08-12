@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-dir", default="build")
     parser.add_argument("--seed", type=int, default=20260802)
     parser.add_argument(
+        "--allow-oversubscribed-pool",
+        action="store_true",
+        help="forwarded to the load harness for capacity-pressure shapes",
+    )
+    parser.add_argument(
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
     )
     parser.add_argument(
@@ -145,6 +150,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         "--flashinfer-workspace-base",
         str(workspace / "flashinfer"),
     ]
+    if args.allow_oversubscribed_pool:
+        command.append("--allow-oversubscribed-pool")
     environment = os.environ.copy()
     environment["NTA_SGLANG_ACQUISITION_ADMISSION"] = "1"
     environment["NTA_SGLANG_ADMISSION_LEAD_LAYERS"] = str(args.admission_lead_layers)
