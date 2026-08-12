@@ -292,7 +292,12 @@ def main() -> int:
         int(entry.get("admission_external_bytes", 0)) for entry in stats
     )
     delayed = sum(int(entry.get("admission_delayed_batches", 0)) for entry in stats)
-    if considered == 0 or admission_bytes == 0:
+    credit_rows = sum(
+        int(entry.get("external_admission_credit_rows", 0)) for entry in stats
+    )
+    if considered == 0 or (admission_bytes == 0 and credit_rows == 0):
+        # Tiered serving admits external prefixes through pre-allocation
+        # credits rather than transfer-byte accounting.
         _write_failed_comparison(
             args.output,
             reports,
@@ -302,7 +307,31 @@ def main() -> int:
         raise RuntimeError(
             "NTA load trial did not exercise acquisition-aware admission"
         )
-    if args.batch_mode == "coalesced":
+    tiered_layers = sum(
+        int(entry.get("tiered_decode_layers", 0))
+        + int(entry.get("tiered_prefill_layers", 0))
+        for entry in stats
+    )
+    tiered_compaction = sum(
+        int(entry.get("tiered_device_compaction_launches", 0))
+        for entry in stats
+    )
+    if args.batch_mode == "coalesced" and tiered_layers > 0:
+        # Tiered serving coalesces every claimed and resident request into
+        # one compact plan per layer; its witnesses are the served tiered
+        # layers and device selection compaction, not the demand-acquire
+        # overlap counters.
+        if tiered_compaction == 0:
+            _write_failed_comparison(
+                args.output,
+                reports,
+                order,
+                "tiered selection compaction was not exercised",
+            )
+            raise RuntimeError(
+                "tiered coalesced trial never ran device selection compaction"
+            )
+    elif args.batch_mode == "coalesced":
         mixed_layers = sum(
             int(entry.get("mixed_dependency_layers", 0)) for entry in stats
         )
