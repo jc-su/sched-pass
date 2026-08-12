@@ -349,6 +349,21 @@ with phase 3, whose captured reuse step consumes the fixed-shape table
 this launch keeps warm; refresh and claim-churn steps are already served
 by the single launch.
 
+Phase 3 landed eager, and the gate line fell without capture. Three
+increments (stable in-place reuse buffers; the descriptor-driven
+device-side compact plan, dual-build byte-verified on every step; and
+the full-reuse fast path — one step counter per claim, a per-(epoch,
+layer) concatenation, one index_copy and one attention launch per
+layer with no per-claim Python) took the same-seed pressure checkpoint
+from external TPOT 2.45x stock at diagnosis to 1.46x to **1.129x**
+(14.5ms vs 12.9ms, 16 concurrent claims, 100 percent of decode layers
+on the fast path, external P99 ITL 19ms against the 100ms SLO bar).
+Step-counter bookkeeping also aligned refresh boundaries across
+claims, so refresh staging batches at 15.6 claims per prep launch.
+Checkpoint only — single trial, one seed, one shape; the pre-registered
+gate runs decide. Graph capture of the reuse step remains the recorded
+contingency if the formal runs disagree with the checkpoint.
+
 The co-design statement this implements: the engine knows request SLO
 and admission pressure; the runtime owns claims, bounded staging, and
 cancellation; the compiler turns request-level external-data
