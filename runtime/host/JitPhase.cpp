@@ -49,6 +49,10 @@ using PrepareClaimTableSelectedRows = cudaError_t (*)(
     std::uint32_t *, std::uint32_t *, std::uint32_t *, std::uint64_t *,
     std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
     std::uint32_t, std::uint32_t, cudaStream_t);
+using BuildCompactPlan = cudaError_t (*)(
+    const std::int32_t *, const std::int32_t *, const std::int32_t *,
+    const std::int32_t *, const std::int32_t *, const std::int32_t *,
+    const std::int32_t *, std::int32_t *, std::uint32_t, cudaStream_t);
 using PrepareBoundedSelectedIndexedRows = cudaError_t (*)(
     void *, std::uint32_t, std::uint32_t, const std::int64_t *, std::uint32_t,
     std::uint32_t, std::uint32_t, const std::uint32_t *, const std::uint32_t *,
@@ -153,6 +157,8 @@ struct JitPhaseProgram::Impl {
               library, "nta_jit_prepare_bounded_selected_indexed_rows");
       prepareClaimTableSelectedRows = load<PrepareClaimTableSelectedRows>(
           library, "nta_jit_prepare_claim_table_selected_rows");
+      buildCompactPlan =
+          load<BuildCompactPlan>(library, "nta_jit_build_compact_plan");
       reduceMappedKeyPages = load<ReduceMappedKeyPages>(
           library, "nta_jit_reduce_mapped_key_pages");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
@@ -191,6 +197,7 @@ struct JitPhaseProgram::Impl {
   PrepareSelectedIndexedRows prepareSelectedIndexedRows = nullptr;
   PrepareBoundedSelectedIndexedRows prepareBoundedSelectedIndexedRows = nullptr;
   PrepareClaimTableSelectedRows prepareClaimTableSelectedRows = nullptr;
+  BuildCompactPlan buildCompactPlan = nullptr;
   ReduceMappedKeyPages reduceMappedKeyPages = nullptr;
   ProgressNvme progressNvme = nullptr;
   Publish publish = nullptr;
@@ -439,6 +446,22 @@ void JitPhaseProgram::prepareClaimTableSelectedRows(
             stagingIndicesBase, copiedRowsBase, maxClaims, maxBudgetPages,
             layerCount, localLayer, maxClaimTokens, pageTokens, stream),
         "nta_jit_prepare_claim_table_selected_rows");
+}
+
+void JitPhaseProgram::buildCompactPlan(
+    cudaStream_t stream, const std::int32_t *denseIndices,
+    const std::int32_t *denseOffsets, const std::int32_t *boundLengths,
+    const std::int32_t *nonprefixOffsets, const std::int32_t *nonprefixIndices,
+    const std::int32_t *claimRowCounts, const std::int32_t *compactOffsets,
+    std::int32_t *compactIndices, std::uint32_t batchSize) const {
+  if (impl_->buildCompactPlan == nullptr) {
+    throw std::runtime_error("phase module lacks nta_jit_build_compact_plan");
+  }
+  check(impl_->buildCompactPlan(denseIndices, denseOffsets, boundLengths,
+                                nonprefixOffsets, nonprefixIndices,
+                                claimRowCounts, compactOffsets, compactIndices,
+                                batchSize, stream),
+        "nta_jit_build_compact_plan");
 }
 
 void JitPhaseProgram::reduceMappedKeyPages(

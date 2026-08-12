@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 27
+API_VERSION = 28
 
 
 class RuntimeError(Exception):
@@ -1104,6 +1104,14 @@ _phase_prepare_claim_table_selected_rows = _function(
     _Handle,
     *([ctypes.c_uint64] * 13),
     *([ctypes.c_uint32] * 6),
+    ctypes.c_uint64,
+)
+_phase_build_compact_plan = _function(
+    "nta_jit_phase_build_compact_plan",
+    ctypes.c_int,
+    _Handle,
+    *([ctypes.c_uint64] * 8),
+    ctypes.c_uint32,
     ctypes.c_uint64,
 )
 _phase_reduce_mapped_key_pages = _function(
@@ -2208,6 +2216,53 @@ class JitPhaseProgram(_Owner):
                 int(local_layer),
                 int(table.max_claim_tokens),
                 int(table.page_tokens),
+                _stream_address(stream),
+            )
+        )
+
+    def build_compact_plan(
+        self,
+        dense_indices: Any,
+        dense_offsets: Any,
+        bound_lengths: Any,
+        nonprefix_offsets: Any,
+        nonprefix_indices: Any,
+        claim_row_counts: Any,
+        compact_offsets: Any,
+        compact_indices: Any,
+        batch_size: int,
+        stream: Any = None,
+    ) -> None:
+        """Build the packed compact plan from per-request descriptors."""
+        import torch
+
+        tensors = (
+            dense_indices,
+            dense_offsets,
+            bound_lengths,
+            nonprefix_offsets,
+            nonprefix_indices,
+            claim_row_counts,
+            compact_offsets,
+            compact_indices,
+        )
+        if any(
+            not isinstance(tensor, torch.Tensor)
+            or tensor.device.type != "cuda"
+            or tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            for tensor in tensors
+        ):
+            raise ValueError(
+                "compact-plan build requires contiguous int32 CUDA tensors"
+            )
+        if batch_size <= 0:
+            raise ValueError("compact-plan batch size must be positive")
+        _check(
+            _phase_build_compact_plan(
+                self._handle,
+                *(int(tensor.data_ptr()) for tensor in tensors),
+                int(batch_size),
                 _stream_address(stream),
             )
         )

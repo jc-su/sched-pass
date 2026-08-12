@@ -950,6 +950,63 @@ nta_jit_prepare_claim_table_selected_rows(
   return nta::jit::launchStatus();
 }
 
+extern "C" __global__ void nta_build_compact_plan(
+    const std::int32_t *denseIndices, const std::int32_t *denseOffsets,
+    const std::int32_t *boundLengths, const std::int32_t *nonprefixOffsets,
+    const std::int32_t *nonprefixIndices, const std::int32_t *claimRowCounts,
+    const std::int32_t *compactOffsets, std::int32_t *compactIndices,
+    std::uint32_t batchSize) {
+  // One block per batch position. A bound external claim keeps its
+  // frozen non-prefix dense positions plus everything the table
+  // appended past the bound length; a peer keeps its whole dense
+  // segment (bound length zero, empty non-prefix list). The claim's
+  // kept-prefix block at the front of its compact segment is written
+  // per layer from the stable selected-row caches, so this kernel
+  // skips ``claimRowCounts`` slots before writing the remainder.
+  const std::uint32_t request = blockIdx.x;
+  if (request >= batchSize) {
+    return;
+  }
+  const std::int32_t denseBegin = denseOffsets[request];
+  const std::int32_t denseEnd = denseOffsets[request + 1];
+  const std::int32_t bound = boundLengths[request];
+  const std::int32_t npBegin = nonprefixOffsets[request];
+  const std::int32_t npCount = nonprefixOffsets[request + 1] - npBegin;
+  const std::int32_t out = compactOffsets[request] + claimRowCounts[request];
+  for (std::int32_t i = static_cast<std::int32_t>(threadIdx.x); i < npCount;
+       i += static_cast<std::int32_t>(blockDim.x)) {
+    compactIndices[out + i] =
+        denseIndices[denseBegin + nonprefixIndices[npBegin + i]];
+  }
+  const std::int32_t tailCount = denseEnd - denseBegin - bound;
+  const std::int32_t tailOut = out + npCount;
+  for (std::int32_t i = static_cast<std::int32_t>(threadIdx.x); i < tailCount;
+       i += static_cast<std::int32_t>(blockDim.x)) {
+    compactIndices[tailOut + i] = denseIndices[denseBegin + bound + i];
+  }
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_build_compact_plan(
+    const std::int32_t *denseIndices, const std::int32_t *denseOffsets,
+    const std::int32_t *boundLengths, const std::int32_t *nonprefixOffsets,
+    const std::int32_t *nonprefixIndices, const std::int32_t *claimRowCounts,
+    const std::int32_t *compactOffsets, std::int32_t *compactIndices,
+    std::uint32_t batchSize, cudaStream_t stream) {
+  if (denseIndices == nullptr || denseOffsets == nullptr ||
+      boundLengths == nullptr || nonprefixOffsets == nullptr ||
+      nonprefixIndices == nullptr || claimRowCounts == nullptr ||
+      compactOffsets == nullptr || compactIndices == nullptr ||
+      batchSize == 0U) {
+    return cudaErrorInvalidValue;
+  }
+  nta_build_compact_plan<<<batchSize, 128, 0, stream>>>(
+      denseIndices, denseOffsets, boundLengths, nonprefixOffsets,
+      nonprefixIndices, claimRowCounts, compactOffsets, compactIndices,
+      batchSize);
+  return nta::jit::launchStatus();
+}
+
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_prepare_bounded_selected_indexed_rows(
     void *runtime, std::uint32_t firstObject, std::uint32_t objectCount,

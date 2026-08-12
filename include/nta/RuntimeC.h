@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 27U
+#define NTA_RUNTIME_C_API_VERSION 28U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -443,6 +443,15 @@ nta_status nta_jit_phase_prepare_claim_table_selected_rows(
     uint32_t max_claims, uint32_t max_budget_pages, uint32_t layer_count,
     uint32_t local_layer, uint32_t max_claim_tokens, uint32_t page_tokens,
     uint64_t cuda_stream);
+/* C API v28: build the packed compact attention plan on device from the
+ * engine's dense indices and per-request remainder descriptors; claim
+ * kept-prefix blocks are left for the per-layer selected-row writes. */
+nta_status nta_jit_phase_build_compact_plan(
+    const nta_jit_phase_program *program, uint64_t dense_indices,
+    uint64_t dense_offsets, uint64_t bound_lengths,
+    uint64_t nonprefix_offsets, uint64_t nonprefix_indices,
+    uint64_t claim_row_counts, uint64_t compact_offsets,
+    uint64_t compact_indices, uint32_t batch_size, uint64_t cuda_stream);
 /* C API v25: reduce pinned mapped host key rows directly into device page
  * envelopes without allocating a temporary HBM copy. element_type is 0 for
  * fp16 and 1 for bf16. */

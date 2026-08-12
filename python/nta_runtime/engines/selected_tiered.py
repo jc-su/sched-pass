@@ -899,7 +899,28 @@ class TieredClaim:
             return
         if not 0 <= local_layer < self.layer_count:
             raise RuntimeError("selected-row cache layer is out of range")
-        self._selected_row_cache[local_layer] = selected_rows.detach().clone()
+        buffer = self._selected_row_cache[local_layer]
+        if buffer is None:
+            # Allocated once per layer, then refreshed in place: a stable
+            # pointer is the precondition for replaying a captured decode
+            # step across refresh boundaries (phase 3 of the operator
+            # build) — a re-cloned cache would strand the graph on the
+            # retired allocation.
+            self._selected_row_cache[local_layer] = (
+                selected_rows.detach().clone()
+            )
+        elif (
+            buffer.shape != selected_rows.shape
+            or buffer.dtype != selected_rows.dtype
+        ):
+            raise RuntimeError(
+                f"claim {self.claim_id} layer {local_layer} changed its "
+                f"selected-row shape from {tuple(buffer.shape)}/"
+                f"{buffer.dtype} to {tuple(selected_rows.shape)}/"
+                f"{selected_rows.dtype}; fixed-shape reuse cannot follow"
+            )
+        else:
+            buffer.copy_(selected_rows)
         self._selected_decode_visits[local_layer] += 1
 
     def physical_rows_for_pages(

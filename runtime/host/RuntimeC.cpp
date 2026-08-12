@@ -1239,6 +1239,28 @@ nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
   });
 }
 
+nta_status nta_jit_phase_build_compact_plan(
+    const nta_jit_phase_program *program, std::uint64_t denseIndices,
+    std::uint64_t denseOffsets, std::uint64_t boundLengths,
+    std::uint64_t nonprefixOffsets, std::uint64_t nonprefixIndices,
+    std::uint64_t claimRowCounts, std::uint64_t compactOffsets,
+    std::uint64_t compactIndices, std::uint32_t batchSize,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    program->value->buildCompactPlan(
+        stream(cudaStream),
+        reinterpret_cast<const std::int32_t *>(denseIndices),
+        reinterpret_cast<const std::int32_t *>(denseOffsets),
+        reinterpret_cast<const std::int32_t *>(boundLengths),
+        reinterpret_cast<const std::int32_t *>(nonprefixOffsets),
+        reinterpret_cast<const std::int32_t *>(nonprefixIndices),
+        reinterpret_cast<const std::int32_t *>(claimRowCounts),
+        reinterpret_cast<const std::int32_t *>(compactOffsets),
+        reinterpret_cast<std::int32_t *>(compactIndices), batchSize);
+  });
+}
+
 nta_status nta_jit_phase_prepare_claim_table_selected_rows(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     std::uint64_t valid, std::uint64_t objectSlots,

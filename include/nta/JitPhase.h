@@ -104,6 +104,16 @@ public:
       std::uint32_t maxBudgetPages, std::uint32_t layerCount,
       std::uint32_t localLayer, std::uint32_t maxClaimTokens,
       std::uint32_t pageTokens) const;
+  void buildCompactPlan(cudaStream_t stream,
+                        const std::int32_t *denseIndices,
+                        const std::int32_t *denseOffsets,
+                        const std::int32_t *boundLengths,
+                        const std::int32_t *nonprefixOffsets,
+                        const std::int32_t *nonprefixIndices,
+                        const std::int32_t *claimRowCounts,
+                        const std::int32_t *compactOffsets,
+                        std::int32_t *compactIndices,
+                        std::uint32_t batchSize) const;
   void reduceMappedKeyPages(cudaStream_t stream, const void *source,
                             std::uint32_t sourceRows,
                             std::uint64_t sourceStrideBytes,
