@@ -17,6 +17,7 @@ staging rows. FlashInfer receives only compact physical tables.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -62,6 +63,10 @@ class SelectedAttentionExecutor:
         self._wrappers: tuple[Any, Any] | None = None
         self._overlap_decode_wrappers: dict[int, tuple[Any, torch.Tensor]] = {}
         self._tiered_batch_contexts: dict[int, dict[str, Any]] = {}
+        self._compact_plan_state: dict[str, Any] | None = None
+        self._compact_plan_verify = (
+            os.environ.get("NTA_SGLANG_COMPACT_PLAN_VERIFY") == "1"
+        )
 
     def begin_tiered_forward(self) -> None:
         """Invalidate wrapper plans at the engine's forward boundary."""
@@ -720,6 +725,167 @@ class SelectedAttentionExecutor:
         )
         return events
 
+
+    def _device_compact_plan(
+        self,
+        engine: Any,
+        wrapper: Any,
+        segments: list[tuple[Any | None, torch.Tensor | None, int]],
+        kv_lengths: tuple[int, ...],
+        kept_counts: list[int],
+        total: int,
+        batch_size: int,
+        device: Any,
+    ) -> torch.Tensor:
+        """Build the packed compact plan with one descriptor-driven launch.
+
+        The Python plan build cost three launches per claim request per
+        step (index_select, cat, segment copy) plus a fresh allocation;
+        here descriptors persist across steps for a fixed batch
+        composition, the per-step host work is two cumulative sums and
+        one pinned-buffer upload, and one kernel writes every remainder.
+        Claim kept-prefix blocks stay per-layer writes. The output buffer
+        is persistent so the retained FlashInfer plan pointer — and later
+        a captured decode step — survive across steps.
+        """
+        key = (
+            id(wrapper),
+            tuple(getattr(engine, "_current_request_ids", ())),
+            tuple(
+                claim.claim_id if claim is not None else 0
+                for claim, _, _ in segments
+            ),
+        )
+        state = self._compact_plan_state
+        if state is None or state["key"] != key:
+            bound_lengths = []
+            claim_rows = []
+            np_pieces = []
+            np_offsets = [0]
+            for claim, _, _ in segments:
+                if claim is None:
+                    bound_lengths.append(0)
+                    claim_rows.append(0)
+                    np_offsets.append(np_offsets[-1])
+                else:
+                    bound_lengths.append(claim.bound_length)
+                    claim_rows.append(claim.kept_prefix_rows)
+                    np_pieces.append(
+                        claim.bound_nonprefix_index.to(torch.int32)
+                    )
+                    np_offsets.append(
+                        np_offsets[-1]
+                        + int(claim.bound_nonprefix_index.numel())
+                    )
+            np_indices = (
+                torch.cat(np_pieces).contiguous()
+                if np_pieces and np_offsets[-1] > 0
+                else torch.zeros(1, dtype=torch.int32, device=device)
+            )
+            state = {
+                "key": key,
+                "bound_lengths": torch.tensor(
+                    bound_lengths, dtype=torch.int32, device=device
+                ),
+                "claim_rows": torch.tensor(
+                    claim_rows, dtype=torch.int32, device=device
+                ),
+                "np_offsets": torch.tensor(
+                    np_offsets, dtype=torch.int32, device=device
+                ),
+                "np_indices": np_indices,
+                "pinned": torch.empty(
+                    2 * batch_size + 2, dtype=torch.int32, pin_memory=True
+                ),
+                "offsets": torch.empty(
+                    2 * batch_size + 2, dtype=torch.int32, device=device
+                ),
+                "compact": torch.empty(
+                    sum(kept_counts) + 1024 * batch_size,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            }
+            self._compact_plan_state = state
+        kept_total = sum(kept_counts)
+        if state["compact"].numel() < kept_total:
+            state["compact"] = torch.empty(
+                kept_total + 1024 * batch_size,
+                dtype=torch.int32,
+                device=device,
+            )
+        pinned = state["pinned"]
+        pinned[0] = 0
+        pinned[batch_size + 1] = 0
+        dense = 0
+        compact = 0
+        for index in range(batch_size):
+            dense += int(kv_lengths[index])
+            compact += kept_counts[index]
+            pinned[index + 1] = dense
+            pinned[batch_size + 2 + index] = compact
+        if dense != total:
+            raise RuntimeError("compact-plan dense lengths disagree with the plan")
+        state["offsets"].copy_(pinned, non_blocking=True)
+        phases = engine._phase_program(engine._nta_demand_decode_wrappers[0])
+        phases.build_compact_plan(
+            wrapper._paged_kv_indices_buf,
+            state["offsets"][: batch_size + 1],
+            state["bound_lengths"],
+            state["np_offsets"],
+            state["np_indices"],
+            state["claim_rows"],
+            state["offsets"][batch_size + 1 :],
+            state["compact"],
+            batch_size,
+            stream=torch.cuda.current_stream(),
+        )
+        stats = engine._stats
+        stats["tiered_device_plan_builds"] = (
+            stats.get("tiered_device_plan_builds", 0) + 1
+        )
+        if self._compact_plan_verify:
+            # Debug dual build: reconstruct every remainder with the
+            # reference Python ops and require byte equality. Synchronizes;
+            # never enable on a measured run.
+            reference = torch.zeros(
+                kept_total, dtype=torch.int32, device=device
+            )
+            indices = wrapper._paged_kv_indices_buf
+            dense_begin = 0
+            offset = 0
+            for (claim, _, request), count in zip(
+                segments, kept_counts, strict=True
+            ):
+                length = int(kv_lengths[request])
+                tokens = indices[dense_begin : dense_begin + length]
+                if claim is None:
+                    reference[offset : offset + count].copy_(tokens)
+                else:
+                    remainder = torch.cat(
+                        [
+                            tokens[: claim.bound_length].index_select(
+                                0, claim.bound_nonprefix_index
+                            ),
+                            tokens[claim.bound_length :],
+                        ]
+                    )
+                    begin = offset + claim.kept_prefix_rows
+                    reference[begin : offset + count].copy_(remainder)
+                    reference[offset : begin].copy_(
+                        state["compact"][offset : begin]
+                    )
+                dense_begin += length
+                offset += count
+            if not torch.equal(reference, state["compact"][:kept_total]):
+                raise RuntimeError(
+                    "device compact plan disagrees with the reference build"
+                )
+            stats["tiered_device_plan_verified"] = (
+                stats.get("tiered_device_plan_verified", 0) + 1
+            )
+        return state["compact"]
+
     def _build_multi_claim_ctx(
         self,
         engine: Any,
@@ -756,11 +922,26 @@ class SelectedAttentionExecutor:
             boundaries.append(boundaries[-1] + length)
         total = boundaries[-1]
         indices = wrapper._paged_kv_indices_buf[:total]
-        segments: list[tuple[Any | None, torch.Tensor, int]] = []
+        segments: list[tuple[Any | None, torch.Tensor | None, int]] = []
         matched_claims: set[int] = set()
         request_ids = getattr(engine, "_current_request_ids", ())
         if len(request_ids) != batch_size:
             raise RuntimeError("tiered batch omitted request identities")
+        # Once every live claim is bound, remainders are gathered by the
+        # compact-plan kernel in one launch; the Python cat/index_select
+        # per claim request per step exists only for first-serve steps.
+        split_overlap = not any(
+            int(getattr(claim, "selection_refresh_interval", 1)) > 1
+            for claim in claims
+        )
+        device_plan = (
+            not prefill
+            and not split_overlap
+            and all(
+                getattr(claim, "bound_nonprefix_index", None) is not None
+                for claim in claims
+            )
+        )
         for request in range(batch_size):
             begin = boundaries[request]
             end = boundaries[request + 1]
@@ -794,14 +975,19 @@ class SelectedAttentionExecutor:
                         )
                     matched = claim
                     matched_claims.add(claim.claim_id)
-                    remainder = torch.cat(
-                        [
-                            tokens[: claim.bound_length].index_select(
-                                0, claim.bound_nonprefix_index
-                            ),
-                            tokens[claim.bound_length :],
-                        ]
-                    )
+                    if device_plan:
+                        # The compact-plan kernel gathers this remainder on
+                        # device; its length is analytic.
+                        remainder = None
+                    else:
+                        remainder = torch.cat(
+                            [
+                                tokens[: claim.bound_length].index_select(
+                                    0, claim.bound_nonprefix_index
+                                ),
+                                tokens[claim.bound_length :],
+                            ]
+                        )
                     claim.note_serving(engine, request)
                     continue
                 prefix_mask = claim.table_prefix_mask(tokens)
@@ -838,10 +1024,6 @@ class SelectedAttentionExecutor:
         contiguous_peers = bool(peer_positions) and peer_positions == tuple(
             range(peer_positions[0], peer_positions[-1] + 1)
         )
-        split_overlap = not any(
-            int(getattr(claim, "selection_refresh_interval", 1)) > 1
-            for claim in claims
-        )
         if not prefill and contiguous_claims and contiguous_peers and split_overlap:
             return self._build_request_overlap_ctx(
                 claims,
@@ -855,30 +1037,63 @@ class SelectedAttentionExecutor:
                 total,
             )
 
-        kept_counts = [
-            int(tokens.numel())
-            + (0 if claim is None else claim.kept_prefix_rows)
-            for claim, tokens, _ in segments
-        ]
+        kept_counts = []
+        for (claim, tokens, request) in segments:
+            if claim is None:
+                kept_counts.append(int(kv_lengths[request]))
+            elif device_plan:
+                kept_counts.append(
+                    claim.kept_prefix_rows
+                    + int(claim.bound_nonprefix_index.numel())
+                    + int(kv_lengths[request])
+                    - claim.bound_length
+                )
+            else:
+                kept_counts.append(
+                    int(tokens.numel()) + claim.kept_prefix_rows
+                )
         kept_total = sum(kept_counts)
-        plan_indices = torch.empty(kept_total, dtype=torch.int32, device=q.device)
         claim_entries = []
         offset = 0
-        for (claim, tokens, request), count in zip(segments, kept_counts, strict=True):
-            if claim is None:
-                plan_indices[offset : offset + count].copy_(tokens)
-            else:
-                claim_end = offset + claim.kept_prefix_rows
-                plan_indices[claim_end : offset + count].copy_(tokens)
-                claim_entries.append(
-                    {
-                        "claim": claim,
-                        "request": request,
-                        "begin": offset,
-                        "end": claim_end,
-                    }
-                )
-            offset += count
+        if device_plan:
+            plan_indices = self._device_compact_plan(
+                engine, wrapper, segments, kv_lengths, kept_counts, total,
+                batch_size, q.device,
+            )[:kept_total]
+            for (claim, _, request), count in zip(
+                segments, kept_counts, strict=True
+            ):
+                if claim is not None:
+                    claim_entries.append(
+                        {
+                            "claim": claim,
+                            "request": request,
+                            "begin": offset,
+                            "end": offset + claim.kept_prefix_rows,
+                        }
+                    )
+                offset += count
+        else:
+            plan_indices = torch.empty(
+                kept_total, dtype=torch.int32, device=q.device
+            )
+            for (claim, tokens, request), count in zip(
+                segments, kept_counts, strict=True
+            ):
+                if claim is None:
+                    plan_indices[offset : offset + count].copy_(tokens)
+                else:
+                    claim_end = offset + claim.kept_prefix_rows
+                    plan_indices[claim_end : offset + count].copy_(tokens)
+                    claim_entries.append(
+                        {
+                            "claim": claim,
+                            "request": request,
+                            "begin": offset,
+                            "end": claim_end,
+                        }
+                    )
+                offset += count
 
         boundaries = [0]
         for count in kept_counts:
