@@ -58,6 +58,7 @@ class TieredClaim:
         claim_id: int,
         verify: bool,
         verify_fast: bool = False,
+        table_views: dict | None = None,
     ) -> None:
         self.pending = pending
         self.budget_pages = budget_pages
@@ -192,12 +193,22 @@ class TieredClaim:
             if self.external_sidecar
             else min(budget_pages * page_tokens, self.token_count)
         )
-        self.source_index = torch.zeros(
-            self.capacity_rows, dtype=torch.int32, device=device
-        )
-        self.staging_index = torch.zeros(
-            self.capacity_rows, dtype=torch.int32, device=device
-        )
+        if table_views is not None:
+            # Claim-table rows: pointer-stable slices of one allocation
+            # per field, sliced to this claim's page-aligned capacity.
+            self.source_index = table_views["source_indices"][
+                : self.capacity_rows
+            ]
+            self.staging_index = table_views["staging_indices"][
+                : self.capacity_rows
+            ]
+        else:
+            self.source_index = torch.zeros(
+                self.capacity_rows, dtype=torch.int32, device=device
+            )
+            self.staging_index = torch.zeros(
+                self.capacity_rows, dtype=torch.int32, device=device
+            )
         self.cached_pages: torch.Tensor | None = None
         self.selected_rows: torch.Tensor | None = None
         self.copy_stream: torch.cuda.Stream | None = None
@@ -206,15 +217,24 @@ class TieredClaim:
         if self.external_sidecar:
             cache_slots = self.capacity_rows // page_tokens
             if cache_slots > 0:
-                self.cached_pages = torch.full(
-                    (self.layer_count, cache_slots),
-                    -1,
-                    dtype=torch.int64,
-                    device=device,
-                )
-                self.selected_rows = torch.empty(
-                    self.capacity_rows, dtype=torch.int32, device=device
-                )
+                if table_views is not None:
+                    self.cached_pages = table_views["cached_pages"][
+                        : self.layer_count, :cache_slots
+                    ]
+                    self.cached_pages.fill_(-1)
+                    self.selected_rows = table_views["selected_rows"][
+                        : self.capacity_rows
+                    ]
+                else:
+                    self.cached_pages = torch.full(
+                        (self.layer_count, cache_slots),
+                        -1,
+                        dtype=torch.int64,
+                        device=device,
+                    )
+                    self.selected_rows = torch.empty(
+                        self.capacity_rows, dtype=torch.int32, device=device
+                    )
                 self.copy_stream = torch.cuda.Stream(device=device)
                 self.selection_ready = tuple(
                     torch.cuda.Event() for _ in range(self.layer_count)
@@ -280,7 +300,11 @@ class TieredClaim:
                 device=device,
             )
         )
-        self.copied_rows_device = torch.zeros(1, dtype=torch.int64, device=device)
+        self.copied_rows_device = (
+            table_views["copied_rows"]
+            if table_views is not None
+            else torch.zeros(1, dtype=torch.int64, device=device)
+        )
         self._copied_rows_host = torch.empty(1, dtype=torch.int64, pin_memory=True)
         self._accounting_event = torch.cuda.Event()
         self.device_accounting = False

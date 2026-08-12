@@ -20,7 +20,7 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("SKIP: CUDA is unavailable")
         return 0
-    table = ClaimTable(4, 8, 16, device="cuda")
+    table = ClaimTable(4, 8, 16, layer_count=3, device="cuda")
 
     pointers = {
         name: getattr(table, name).data_ptr()
@@ -49,6 +49,9 @@ def main() -> int:
     )
     assert int(table.selected_pages[first.index, 1]) == 9
     assert views["staging_rows"].shape == (8 * 16,)
+    assert views["cached_pages"].shape == (3, 8)
+    views["cached_pages"][2, 5] = 77
+    assert int(table.cached_pages[first.index, 2, 5]) == 77
 
     # Retirement invalidates immediately; reuse waits on the fence, and
     # the reused row carries a new generation.

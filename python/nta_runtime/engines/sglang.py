@@ -743,6 +743,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # form acquires only chosen pages per layer through the bounded
         # indexed path into SGLang's preallocated prefix slots.
         self._tiered_claims: dict[int, Any] = {}
+        self._claim_table: Any = None
         self._current_tiered_claims: tuple[Any, ...] = ()
         self._retired_tiered_accounting: list[tuple[Any, ...]] = []
         self._retired_tiered_resources: list[tuple[Any, Any, Any]] = []
@@ -843,6 +844,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("tiered claim retired without its object-range pool")
         completion = torch.cuda.Event()
         completion.record(stream)
+        table_slot = getattr(claim, "table_slot", None)
+        if table_slot is not None and self._claim_table is not None:
+            self._claim_table.retire(table_slot, completion)
         self._retired_tiered_resources.append(
             (completion, claim.object_lease, claim)
         )
@@ -861,6 +865,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             if self._retired_tiered_resources:
                 raise RuntimeError("retired tiered resources lost their range pool")
             return
+        if self._claim_table is not None:
+            self._claim_table.reclaim()
         pending: list[tuple[Any, Any, Any]] = []
         for event, lease, claim in self._retired_tiered_resources:
             if wait:
@@ -900,6 +906,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
         self._retired_tiered_accounting = pending
 
+    class _ImmediateFenceType:
+        @staticmethod
+        def query() -> bool:
+            return True
+
     def _prepare_tiered_claim(self, pending: Any) -> None:
         from nta_runtime.engines.selected_tiered import TieredClaim
 
@@ -907,7 +918,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if ranges is None:
             raise RuntimeError("tiered claim has no object-range pool")
         self._drain_tiered_resources(wait=False)
+        if self._claim_table is None:
+            from nta_runtime.claim_table import ClaimTable
+
+            self._claim_table = ClaimTable(
+                _positive_environment("NTA_SGLANG_MAX_CLAIMS", 32),
+                self._selected_executor.budget_pages,
+                self._selected_executor.page_tokens,
+                layer_count=self._model_layer_count,
+                device=torch.device("cuda"),
+            )
+        self._claim_table.reclaim()
         lease = ranges.acquire(pending.claim_id)
+        table_slot = self._claim_table.acquire(pending.claim_id)
         try:
             claim = TieredClaim(
                 pending,
@@ -920,11 +943,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 verify_fast=(
                     os.environ.get("NTA_SGLANG_SELECTED_TIERED_VERIFY") == "fast"
                 ),
+                table_views=self._claim_table.views(table_slot),
             )
         except Exception:
             ranges.release(lease)
+            self._claim_table.retire(table_slot, self._ImmediateFenceType)
             raise
         claim.object_lease = lease
+        claim.table_slot = table_slot
+        self._claim_table.activate(table_slot)
         if not claim.external_sidecar:
             for local_layer in range(claim.layer_count):
                 pending.producer_event.complete(local_layer)

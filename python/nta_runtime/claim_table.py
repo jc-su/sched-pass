@@ -39,15 +39,22 @@ class ClaimTable:
         max_budget_pages: int,
         page_tokens: int,
         *,
+        layer_count: int = 1,
         device: Any,
     ) -> None:
         import torch
 
-        if max_claims <= 0 or max_budget_pages <= 0 or page_tokens <= 0:
+        if (
+            max_claims <= 0
+            or max_budget_pages <= 0
+            or page_tokens <= 0
+            or layer_count <= 0
+        ):
             raise ValueError("claim-table geometry must be positive")
         self.max_claims = max_claims
         self.max_budget_pages = max_budget_pages
         self.page_tokens = page_tokens
+        self.layer_count = layer_count
         self.capacity_rows = max_budget_pages * page_tokens
         zeros = lambda *shape, dtype: torch.zeros(  # noqa: E731
             shape, dtype=dtype, device=device
@@ -65,8 +72,13 @@ class ClaimTable:
         self.selected_pages = zeros(
             max_claims, max_budget_pages, dtype=torch.int64
         )
+        # The bounded page cache is per (claim, layer): each layer of a
+        # claim owns its own slot-to-page mapping.
         self.cached_pages = torch.full(
-            (max_claims, max_budget_pages), -1, dtype=torch.int64, device=device
+            (max_claims, layer_count, max_budget_pages),
+            -1,
+            dtype=torch.int64,
+            device=device,
         )
         self.staging_rows = zeros(
             max_claims, self.capacity_rows, dtype=torch.int32
