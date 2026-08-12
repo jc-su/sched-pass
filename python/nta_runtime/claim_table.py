@@ -140,6 +140,9 @@ class ClaimTable:
         self.generations[index] = generation
         self.copied_rows[index] = 0
         self.cached_pages[index].fill_(-1)
+        # A reused row must not inherit its predecessor's selection count:
+        # the table kernel treats a nonzero count on a valid row as work.
+        self.selected_counts[index] = 0
         return slot
 
     def activate(self, slot: ClaimSlot) -> None:

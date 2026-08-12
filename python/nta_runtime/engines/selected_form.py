@@ -506,8 +506,10 @@ class SelectedAttentionExecutor:
                 + len(ctx["peer_positions"])
             )
         else:
-            layer_rows: list[torch.Tensor] = []
-            for entry in ctx["claim_entries"]:
+            layer_rows: list[torch.Tensor | None] = []
+            staging: list[tuple[Any, torch.Tensor]] = []
+            staged_positions: list[int] = []
+            for position, entry in enumerate(ctx["claim_entries"]):
                 claim = entry["claim"]
                 request = entry["request"]
                 if prefill:
@@ -520,18 +522,43 @@ class SelectedAttentionExecutor:
                 )
                 if selected_rows is None:
                     free = claim.choose_free_pages(local_layer, queries, group_size)
-                    selected_rows = claim.stage_missing(
-                        engine, local_layer, free, stream
-                    )
-                    claim.remember_selected_rows(local_layer, selected_rows)
-                    if claim.verify_fast:
-                        verify_targets.append((claim, free, selected_rows))
+                    if (
+                        not prefill
+                        and claim.external_sidecar
+                        and getattr(claim, "table_backed", False)
+                        and getattr(claim, "table_slot", None) is not None
+                    ):
+                        # Deferred to the single table-driven prep launch
+                        # once every staging claim's pages are known.
+                        staging.append((claim, free))
+                        staged_positions.append(position)
+                    else:
+                        selected_rows = claim.stage_missing(
+                            engine, local_layer, free, stream
+                        )
+                        claim.remember_selected_rows(local_layer, selected_rows)
+                        if claim.verify_fast:
+                            verify_targets.append((claim, free, selected_rows))
                 else:
                     stats["tiered_selection_reuse_layers"] = (
                         stats.get("tiered_selection_reuse_layers", 0) + 1
                     )
                 layer_rows.append(selected_rows)
                 claim.layers_served += 1
+            if staging:
+                copy_events = self._stage_claims_via_table(
+                    engine, ctx, staging, local_layer, stream
+                )
+                for (claim, free), position in zip(
+                    staging, staged_positions, strict=True
+                ):
+                    selected_rows = claim.selected_rows[: claim.kept_prefix_rows]
+                    claim.remember_selected_rows(local_layer, selected_rows)
+                    if claim.verify_fast:
+                        verify_targets.append((claim, free, selected_rows))
+                    layer_rows[position] = selected_rows
+                for copied in copy_events:
+                    stream.wait_event(copied)
             self._write_claim_segments(ctx, layer_rows)
             self._run_paged(
                 engine, ctx["verifier"], q, kv_cache, layer, out=serve_output
@@ -595,6 +622,103 @@ class SelectedAttentionExecutor:
         ctx["plan_indices"].index_copy_(
             0, ctx["claim_row_positions"], torch.cat(layer_rows)
         )
+
+    def _stage_claims_via_table(
+        self,
+        engine: Any,
+        ctx: dict[str, Any],
+        staging: list[tuple[Any, torch.Tensor]],
+        local_layer: int,
+        stream: Any,
+    ) -> list[Any]:
+        """Stage every claim missing this layer with one prep launch.
+
+        The per-claim ``prepare_bounded`` launches were the measured
+        host-bound cost (~0.56 ms per claim per staging layer): each is a
+        small kernel whose launch latency serializes on the CPU. Here the
+        page sets and selection counts land in the claim table through a
+        fixed number of batched writes, one fixed-shape kernel walks every
+        valid row, and only the per-claim host-transfer progress launches
+        remain on the claims' copy streams. Returns the per-claim copy
+        events the compute stream must wait on before attention.
+        """
+        table = engine._claim_table
+        pieces: list[torch.Tensor] = []
+        dests: list[torch.Tensor] = []
+        slots: list[torch.Tensor] = []
+        counts: list[torch.Tensor] = []
+        for claim, free in staging:
+            expected = (
+                int(claim.full_forced_pages.numel()) + int(free.numel()) + 1
+            )
+            if getattr(claim, "_table_page_count", None) is None:
+                index = claim.table_slot.index
+                device = table.selected_pages.device
+                claim._table_page_count = expected
+                claim._table_slot_dev = torch.tensor(
+                    [index], dtype=torch.int64, device=device
+                )
+                claim._table_count_dev = torch.tensor(
+                    [expected], dtype=torch.int32, device=device
+                )
+                claim._table_page_dest = index * table.max_budget_pages + (
+                    torch.arange(expected, dtype=torch.int64, device=device)
+                )
+            elif claim._table_page_count != expected:
+                raise RuntimeError(
+                    f"claim {claim.claim_id} changed its selection shape: "
+                    f"{claim._table_page_count} pages planned, {expected} "
+                    "offered; fixed-shape staging cannot follow"
+                )
+            pieces.extend((claim.full_forced_pages, free, claim.forced_pages[-1:]))
+            dests.append(claim._table_page_dest)
+            slots.append(claim._table_slot_dev)
+            counts.append(claim._table_count_dev)
+        # Rows not staging this layer must present a zero count: their
+        # per-layer bounded caches would otherwise chase a stale page set.
+        table.selected_counts.zero_()
+        table.selected_counts.index_copy_(0, torch.cat(slots), torch.cat(counts))
+        table.selected_pages.view(-1).index_copy_(
+            0, torch.cat(dests), torch.cat(pieces)
+        )
+        phases = engine._phase_program(engine._nta_demand_decode_wrappers[0])
+        phases.prepare_claim_table_selected_rows(
+            engine._runtime, table, local_layer, stream=stream
+        )
+        ready = ctx.get("table_prep_ready")
+        if ready is None:
+            ready = torch.cuda.Event()
+            ctx["table_prep_ready"] = ready
+        ready.record(stream)
+        events: list[Any] = []
+        for claim, _ in staging:
+            base = claim.first_object_slot + 2 * local_layer
+            claim.copy_stream.wait_event(ready)
+            phases.progress_validated_indexed_host_range(
+                engine._runtime, base, 2, stream=claim.copy_stream
+            )
+            copied = claim.copy_ready[local_layer]
+            copied.record(claim.copy_stream)
+            events.append(copied)
+            claim.device_accounting = True
+            claim.requested_rows += claim.kept_prefix_rows
+        stats = engine._stats
+        stats["tiered_device_compaction_launches"] = (
+            stats.get("tiered_device_compaction_launches", 0) + 1
+        )
+        stats["tiered_bounded_cache_launches"] = (
+            stats.get("tiered_bounded_cache_launches", 0) + 1
+        )
+        stats["tiered_device_selected_pages"] = stats.get(
+            "tiered_device_selected_pages", 0
+        ) + sum(claim._table_page_count for claim, _ in staging)
+        stats["tiered_table_prep_launches"] = (
+            stats.get("tiered_table_prep_launches", 0) + 1
+        )
+        stats["tiered_table_staged_claims"] = (
+            stats.get("tiered_table_staged_claims", 0) + len(staging)
+        )
+        return events
 
     def _build_multi_claim_ctx(
         self,

@@ -931,7 +931,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
         self._claim_table.reclaim()
         lease = ranges.acquire(pending.claim_id)
-        table_slot = self._claim_table.acquire(pending.claim_id)
+        try:
+            table_slot = self._claim_table.acquire(pending.claim_id)
+        except Exception:
+            ranges.release(lease)
+            raise
         try:
             claim = TieredClaim(
                 pending,
@@ -952,6 +956,32 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise
         claim.object_lease = lease
         claim.table_slot = table_slot
+        if claim.external_sidecar:
+            # Claim-lifetime words the table-driven prep kernel reads; the
+            # per-layer selection count stays zero until the serve loop
+            # publishes a layer's page set. Writes precede activation so a
+            # valid row is never observed half-initialized.
+            table = self._claim_table
+            if claim.token_count > table.max_claim_tokens:
+                raise RuntimeError(
+                    f"claim of {claim.token_count} tokens exceeds the "
+                    f"claim table's {table.max_claim_tokens}-token rows"
+                )
+            if claim.capacity_rows > table.capacity_rows:
+                raise RuntimeError(
+                    f"claim staging capacity {claim.capacity_rows} exceeds "
+                    f"the claim table's {table.capacity_rows}-row plan"
+                )
+            index = table_slot.index
+            table.object_slots[index] = claim.first_object_slot
+            table.capacity_words[index] = claim.capacity_rows
+            table.token_counts[index] = claim.token_count
+            table.host_rows[index, : claim.token_count] = claim.host_rows.to(
+                torch.int32
+            )
+            table.staging_rows[index, : claim.capacity_rows] = (
+                claim.device_rows[: claim.capacity_rows].to(torch.int32)
+            )
         self._claim_table.activate(table_slot)
         if not claim.external_sidecar:
             for local_layer in range(claim.layer_count):

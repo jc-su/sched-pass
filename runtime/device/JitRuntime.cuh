@@ -896,8 +896,12 @@ extern "C" __global__ void nta_prepare_claim_table_selected_rows(
       static_cast<std::uint32_t>(capacityWords[claim]);
   const std::uint64_t rowStride =
       static_cast<std::uint64_t>(maxBudgetPages) * pageTokens;
+  // Each layer owns two object ranges (K and V) inside the claim's
+  // contiguous lease, mirroring the per-claim path's
+  // ``first_object_slot + 2 * local_layer`` addressing.
   ntaPrepareSelectedRowsClaim(
-      runtime, static_cast<std::uint32_t>(objectSlots[claim]), 2U,
+      runtime,
+      static_cast<std::uint32_t>(objectSlots[claim]) + 2U * localLayer, 2U,
       selectedPagesBase + static_cast<std::uint64_t>(claim) * maxBudgetPages,
       count, pageTokens, static_cast<std::uint32_t>(tokenCounts[claim]),
       reinterpret_cast<const std::uint32_t *>(hostRowsBase) +

@@ -193,6 +193,7 @@ class TieredClaim:
             if self.external_sidecar
             else min(budget_pages * page_tokens, self.token_count)
         )
+        self.table_backed = table_views is not None
         if table_views is not None:
             # Claim-table rows: pointer-stable slices of one allocation
             # per field, sliced to this claim's page-aligned capacity.
