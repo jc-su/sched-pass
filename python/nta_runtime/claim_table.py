@@ -40,6 +40,7 @@ class ClaimTable:
         page_tokens: int,
         *,
         layer_count: int = 1,
+        max_claim_tokens: int = 32768,
         device: Any,
     ) -> None:
         import torch
@@ -49,12 +50,14 @@ class ClaimTable:
             or max_budget_pages <= 0
             or page_tokens <= 0
             or layer_count <= 0
+            or max_claim_tokens <= 0
         ):
             raise ValueError("claim-table geometry must be positive")
         self.max_claims = max_claims
         self.max_budget_pages = max_budget_pages
         self.page_tokens = page_tokens
         self.layer_count = layer_count
+        self.max_claim_tokens = max_claim_tokens
         self.capacity_rows = max_budget_pages * page_tokens
         zeros = lambda *shape, dtype: torch.zeros(  # noqa: E731
             shape, dtype=dtype, device=device
@@ -93,6 +96,18 @@ class ClaimTable:
             max_claims, self.capacity_rows, dtype=torch.int32
         )
         self.copied_rows = zeros(max_claims, dtype=torch.int64)
+        # Geometry and dispatch words the table-driven prep kernel reads
+        # per claim: the object-range base, the page-aligned staging
+        # capacity, and the number of selected pages written for the
+        # current layer.
+        self.object_slots = zeros(max_claims, dtype=torch.int32)
+        # Host-row identities per claim, so the table-driven kernel can
+        # build transfer source indices without touching claim-owned
+        # allocations.
+        self.host_rows = zeros(max_claims, max_claim_tokens, dtype=torch.int32)
+        self.capacity_words = zeros(max_claims, dtype=torch.int32)
+        self.selected_counts = zeros(max_claims, dtype=torch.int32)
+        self.layer_words = zeros(max_claims, dtype=torch.int32)
         self._generation_counter = [0] * max_claims
         self._bound: dict[int, ClaimSlot] = {}
         self._free = list(range(max_claims))
@@ -176,6 +191,9 @@ class ClaimTable:
             "source_indices": self.source_indices[index],
             "staging_indices": self.staging_indices[index],
             "copied_rows": self.copied_rows[index : index + 1],
+            "host_rows": self.host_rows[index],
+            "selected_count": self.selected_counts[index : index + 1],
+            "layer_word": self.layer_words[index : index + 1],
         }
 
     def _check(self, slot: ClaimSlot) -> None:

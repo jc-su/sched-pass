@@ -611,7 +611,7 @@ nta_jit_prepare_selected_indexed_rows(
 // misses enter the validated indexed-copy prefix. One CTA serializes slot
 // replacement so a page selected by this invocation cannot be evicted by a
 // later miss from the same set.
-extern "C" __global__ void nta_prepare_bounded_selected_indexed_rows(
+static __device__ void ntaPrepareSelectedRowsClaim(
     nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
     std::uint32_t objectCount, const std::int64_t *selectedPages,
     std::uint32_t selectedPageCount, std::uint32_t pageTokens,
@@ -850,6 +850,100 @@ extern "C" __global__ void nta_prepare_bounded_selected_indexed_rows(
     atomicAdd(reinterpret_cast<unsigned long long *>(copiedRows),
               static_cast<unsigned long long>(missRowCount));
   }
+}
+
+extern "C" __global__ void nta_prepare_bounded_selected_indexed_rows(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t objectCount, const std::int64_t *selectedPages,
+    std::uint32_t selectedPageCount, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, const std::uint32_t *hostRows,
+    const std::uint32_t *deviceRows, std::int64_t *cachedPages,
+    std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
+    std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+    std::uint32_t capacity, std::uint64_t *copiedRows) {
+  ntaPrepareSelectedRowsClaim(
+      runtime, firstObject, objectCount, selectedPages, selectedPageCount,
+      pageTokens, tokenCount, hostRows, deviceRows, cachedPages,
+      cacheSlotCount, selectedRows, sourceIndices, stagingIndices, capacity,
+      copiedRows);
+}
+
+extern "C" __global__ void nta_prepare_claim_table_selected_rows(
+    nta::abi::RuntimeView *runtime, const std::int32_t *valid,
+    const std::int32_t *objectSlots, const std::int32_t *capacityWords,
+    const std::int32_t *selectedCounts, const std::int32_t *tokenCounts,
+    const std::int64_t *selectedPagesBase, std::int64_t *cachedPagesBase,
+    const std::int32_t *hostRowsBase, const std::int32_t *stagingRowsBase,
+    std::uint32_t *selectedRowsBase, std::uint32_t *sourceIndicesBase,
+    std::uint32_t *stagingIndicesBase, std::uint64_t *copiedRowsBase,
+    std::uint32_t maxClaims, std::uint32_t maxBudgetPages,
+    std::uint32_t layerCount, std::uint32_t localLayer,
+    std::uint32_t maxClaimTokens, std::uint32_t pageTokens) {
+  // One block per claim-table row; the launch shape is fixed at the
+  // table's capacity so a captured graph replays over any live set, and
+  // invalid rows retire in a few instructions via the validity word.
+  const std::uint32_t claim = blockIdx.x;
+  if (claim >= maxClaims || valid == nullptr || valid[claim] == 0 ||
+      localLayer >= layerCount) {
+    return;
+  }
+  const std::uint32_t count =
+      static_cast<std::uint32_t>(selectedCounts[claim]);
+  if (count == 0) {
+    return;
+  }
+  const std::uint32_t capacity =
+      static_cast<std::uint32_t>(capacityWords[claim]);
+  const std::uint64_t rowStride =
+      static_cast<std::uint64_t>(maxBudgetPages) * pageTokens;
+  ntaPrepareSelectedRowsClaim(
+      runtime, static_cast<std::uint32_t>(objectSlots[claim]), 2U,
+      selectedPagesBase + static_cast<std::uint64_t>(claim) * maxBudgetPages,
+      count, pageTokens, static_cast<std::uint32_t>(tokenCounts[claim]),
+      reinterpret_cast<const std::uint32_t *>(hostRowsBase) +
+          static_cast<std::uint64_t>(claim) * maxClaimTokens,
+      reinterpret_cast<const std::uint32_t *>(stagingRowsBase) +
+          static_cast<std::uint64_t>(claim) * rowStride,
+      cachedPagesBase +
+          (static_cast<std::uint64_t>(claim) * layerCount + localLayer) *
+              maxBudgetPages,
+      capacity / pageTokens,
+      selectedRowsBase + static_cast<std::uint64_t>(claim) * rowStride,
+      sourceIndicesBase + static_cast<std::uint64_t>(claim) * rowStride,
+      stagingIndicesBase + static_cast<std::uint64_t>(claim) * rowStride,
+      capacity, copiedRowsBase + claim);
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_prepare_claim_table_selected_rows(
+    void *runtime, const std::int32_t *valid, const std::int32_t *objectSlots,
+    const std::int32_t *capacityWords, const std::int32_t *selectedCounts,
+    const std::int32_t *tokenCounts, const std::int64_t *selectedPagesBase,
+    std::int64_t *cachedPagesBase, const std::int32_t *hostRowsBase,
+    const std::int32_t *stagingRowsBase, std::uint32_t *selectedRowsBase,
+    std::uint32_t *sourceIndicesBase, std::uint32_t *stagingIndicesBase,
+    std::uint64_t *copiedRowsBase, std::uint32_t maxClaims,
+    std::uint32_t maxBudgetPages, std::uint32_t layerCount,
+    std::uint32_t localLayer, std::uint32_t maxClaimTokens,
+    std::uint32_t pageTokens, cudaStream_t stream) {
+  if (runtime == nullptr || valid == nullptr || objectSlots == nullptr ||
+      capacityWords == nullptr || selectedCounts == nullptr ||
+      tokenCounts == nullptr || selectedPagesBase == nullptr ||
+      cachedPagesBase == nullptr || hostRowsBase == nullptr ||
+      stagingRowsBase == nullptr || selectedRowsBase == nullptr ||
+      sourceIndicesBase == nullptr || stagingIndicesBase == nullptr ||
+      copiedRowsBase == nullptr || maxClaims == 0 || maxBudgetPages == 0 ||
+      layerCount == 0 || localLayer >= layerCount || maxClaimTokens == 0 ||
+      pageTokens == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_prepare_claim_table_selected_rows<<<maxClaims, 256, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), valid, objectSlots,
+      capacityWords, selectedCounts, tokenCounts, selectedPagesBase,
+      cachedPagesBase, hostRowsBase, stagingRowsBase, selectedRowsBase,
+      sourceIndicesBase, stagingIndicesBase, copiedRowsBase, maxClaims,
+      maxBudgetPages, layerCount, localLayer, maxClaimTokens, pageTokens);
+  return nta::jit::launchStatus();
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
