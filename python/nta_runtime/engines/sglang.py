@@ -845,7 +845,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         completion = torch.cuda.Event()
         completion.record(stream)
         table_slot = getattr(claim, "table_slot", None)
-        if table_slot is not None and self._claim_table is not None:
+        if table_slot is not None and getattr(self, "_claim_table", None) is not None:
             self._claim_table.retire(table_slot, completion)
         self._retired_tiered_resources.append(
             (completion, claim.object_lease, claim)
@@ -865,8 +865,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             if self._retired_tiered_resources:
                 raise RuntimeError("retired tiered resources lost their range pool")
             return
-        if self._claim_table is not None:
-            self._claim_table.reclaim()
+        claim_table = getattr(self, "_claim_table", None)
+        if claim_table is not None:
+            claim_table.reclaim()
         pending: list[tuple[Any, Any, Any]] = []
         for event, lease, claim in self._retired_tiered_resources:
             if wait:

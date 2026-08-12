@@ -660,9 +660,7 @@ def main() -> None:
     initial_mask = positional_claim.table_prefix_mask(initial_tokens)
     positional_engine = types.SimpleNamespace(
         _current_request_ids=("req-a",),
-        _active_batch=types.SimpleNamespace(
-            bindings=(types.SimpleNamespace(generation=7),)
-        ),
+        _current_req_pool_indices=(7,),
     )
     positional_claim.note_serving(positional_engine, 0, initial_mask)
     appended_tokens = torch.tensor((10, 11, 1, 2, 30), dtype=torch.int32)
