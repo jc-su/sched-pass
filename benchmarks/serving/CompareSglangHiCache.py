@@ -146,7 +146,22 @@ def require_clean_mechanism(
     external_launches = sum(int(entry.get("external_launches", 0)) for entry in stats)
     prefetched_layers = sum(int(entry.get("prefetched_layers", 0)) for entry in stats)
     demand_layers = sum(int(entry.get("demand_host_layers", 0)) for entry in stats)
-    if external_launches == 0 or external_launches != prefetched_layers + demand_layers:
+    tiered_layers = sum(
+        int(entry.get("tiered_decode_layers", 0))
+        + int(entry.get("tiered_prefill_layers", 0))
+        for entry in stats
+    )
+    if external_launches == 0 and tiered_batches > 0:
+        # Tiered serving accounts external attention in its own per-layer
+        # counters; the demand-acquire identity below is vacuous here.
+        if tiered_layers == 0:
+            raise RuntimeError(
+                "NTA tiered trial served no external attention layers "
+                f"({_mechanism_summary()})"
+            )
+    elif external_launches == 0 or external_launches != (
+        prefetched_layers + demand_layers
+    ):
         raise RuntimeError(
             "NTA did not execute exactly one external attention layer for every "
             "acquired layer "
@@ -178,14 +193,21 @@ def require_clean_mechanism(
     ticketed = sum(
         int(entry.get("ticketed_incremental_launches", 0)) for entry in stats
     )
+    selected_launches = sum(
+        int(entry.get("selected_compiler_launches", 0)) for entry in stats
+    )
     total_attention = sum(
         int(entry.get("decode_launches", 0)) + int(entry.get("prefill_launches", 0))
         for entry in stats
     )
-    if total_attention == 0 or transformed + ticketed != total_attention:
+    if (
+        total_attention == 0
+        or transformed + ticketed + selected_launches != total_attention
+    ):
         raise RuntimeError(
             "NTA did not account every attention launch to a transformed form "
-            f"({transformed} + {ticketed} != {total_attention})"
+            f"({transformed} + {ticketed} + {selected_launches} != "
+            f"{total_attention})"
         )
     verified_modules = sum(
         int(entry.get("verified_operator_modules", 0)) for entry in stats
@@ -254,11 +276,29 @@ def require_clean_mechanism(
     if (
         os.environ.get("NTA_SGLANG_REQUIRE_MIXED_ATTENTION") == "1"
         and mixed_dependency_layers == 0
+        and tiered_batches == 0
     ):
+        # Tiered serving builds one compact plan containing every claimed
+        # and resident request per layer; a split is structurally refused
+        # by the claim-identity guards, so the demand-acquire mixed-layer
+        # witness does not apply.
         raise RuntimeError(
             "trial formed no FlashInfer layer containing both direct and external work"
         )
-    if require_physical_compaction and (
+    tiered_compaction = sum(
+        int(entry.get("tiered_device_compaction_launches", 0))
+        for entry in stats
+    )
+    if require_physical_compaction and tiered_batches > 0:
+        # Tiered serving compacts selections on device per staging layer;
+        # the incremental resume-CTA identity below belongs to the
+        # demand-acquire path.
+        if tiered_compaction == 0:
+            raise RuntimeError(
+                "tiered trial never ran device selection compaction "
+                f"({_mechanism_summary()})"
+            )
+    elif require_physical_compaction and (
         compact_launches == 0
         or compact_ctas == 0
         or canonical_ctas == 0
