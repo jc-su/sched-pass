@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 29U
+#define NTA_RUNTIME_C_API_VERSION 30U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -469,6 +469,20 @@ nta_status nta_jit_phase_reduce_mapped_indexed_key_pages(
     uint32_t page_tokens, uint32_t kv_heads, uint32_t head_dim,
     uint32_t element_type, uint64_t output_min, uint64_t output_max,
     uint64_t cuda_stream);
+/* C API v30: fuse a layer's page scoring, top-k selection, ordered-page
+ * assembly, and bounded prep into one launch per claim layer. */
+nta_status nta_jit_phase_select_prepare_claim_rows(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint64_t queries, uint32_t query_tokens,
+    uint32_t query_heads, uint32_t kv_heads, uint32_t head_dim,
+    uint64_t layer_min, uint64_t layer_max, uint64_t page_scores,
+    uint32_t page_count,
+    uint64_t full_forced_pages, uint32_t full_forced_count,
+    int64_t tail_page, uint32_t free_budget, uint64_t ordered_pages_out,
+    uint32_t page_tokens, uint32_t token_count, uint64_t host_rows,
+    uint64_t device_rows, uint64_t cached_pages, uint32_t cache_slot_count,
+    uint64_t selected_rows, uint64_t source_indices, uint64_t staging_indices,
+    uint32_t capacity, uint64_t copied_rows, uint64_t cuda_stream);
 nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        nta_runtime *runtime,
                                        uint32_t issue_budget,

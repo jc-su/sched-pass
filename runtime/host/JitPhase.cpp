@@ -58,6 +58,15 @@ using PrepareBoundedSelectedIndexedRows = cudaError_t (*)(
     std::uint32_t, std::uint32_t, const std::uint32_t *, const std::uint32_t *,
     std::int64_t *, std::uint32_t, std::uint32_t *, std::uint32_t *,
     std::uint32_t *, std::uint32_t, std::uint64_t *, cudaStream_t);
+using SelectPrepareClaimRows = cudaError_t (*)(
+    void *, std::uint32_t, const void *, std::uint32_t, std::uint32_t,
+    std::uint32_t, std::uint32_t, const float *, const float *, float *,
+    std::uint32_t,
+    const std::int64_t *, std::uint32_t, std::int64_t, std::uint32_t,
+    std::int64_t *, std::uint32_t, std::uint32_t, const std::uint32_t *,
+    const std::uint32_t *, std::int64_t *, std::uint32_t, std::uint32_t *,
+    std::uint32_t *, std::uint32_t *, std::uint32_t, std::uint64_t *,
+    cudaStream_t);
 using ReduceMappedIndexedKeyPages = cudaError_t (*)(
     const void *, std::uint32_t, std::uint64_t, const std::int32_t *,
     std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
@@ -167,6 +176,8 @@ struct JitPhaseProgram::Impl {
           library, "nta_jit_reduce_mapped_key_pages");
       reduceMappedIndexedKeyPages = load<ReduceMappedIndexedKeyPages>(
           library, "nta_jit_reduce_mapped_indexed_key_pages");
+      selectPrepareClaimRows = load<SelectPrepareClaimRows>(
+          library, "nta_jit_select_prepare_claim_rows");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
       publish = load<Publish>(library, "nta_jit_publish_ready");
       complete = load<Complete>(library, "nta_jit_complete_launched");
@@ -206,6 +217,7 @@ struct JitPhaseProgram::Impl {
   BuildCompactPlan buildCompactPlan = nullptr;
   ReduceMappedKeyPages reduceMappedKeyPages = nullptr;
   ReduceMappedIndexedKeyPages reduceMappedIndexedKeyPages = nullptr;
+  SelectPrepareClaimRows selectPrepareClaimRows = nullptr;
   ProgressNvme progressNvme = nullptr;
   Publish publish = nullptr;
   Complete complete = nullptr;
@@ -469,6 +481,34 @@ void JitPhaseProgram::buildCompactPlan(
                                 claimRowCounts, compactOffsets, compactIndices,
                                 batchSize, stream),
         "nta_jit_build_compact_plan");
+}
+
+void JitPhaseProgram::selectPrepareClaimRows(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
+    const void *queries, std::uint32_t queryTokens, std::uint32_t queryHeads,
+    std::uint32_t kvHeads, std::uint32_t headDim, const float *layerMin,
+    const float *layerMax, float *pageScores, std::uint32_t pageCount,
+    const std::int64_t *fullForcedPages, std::uint32_t fullForcedCount,
+    std::int64_t tailPage, std::uint32_t freeBudget,
+    std::int64_t *orderedPagesOut, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, const std::uint32_t *hostRows,
+    const std::uint32_t *deviceRows, std::int64_t *cachedPages,
+    std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
+    std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+    std::uint32_t capacity, std::uint64_t *copiedRows) const {
+  if (impl_->selectPrepareClaimRows == nullptr) {
+    throw std::runtime_error(
+        "phase module lacks nta_jit_select_prepare_claim_rows");
+  }
+  check(impl_->selectPrepareClaimRows(
+            runtime, firstObject, queries, queryTokens, queryHeads, kvHeads,
+            headDim, layerMin, layerMax, pageScores, pageCount,
+            fullForcedPages,
+            fullForcedCount, tailPage, freeBudget, orderedPagesOut, pageTokens,
+            tokenCount, hostRows, deviceRows, cachedPages, cacheSlotCount,
+            selectedRows, sourceIndices, stagingIndices, capacity, copiedRows,
+            stream),
+        "nta_jit_select_prepare_claim_rows");
 }
 
 void JitPhaseProgram::reduceMappedIndexedKeyPages(

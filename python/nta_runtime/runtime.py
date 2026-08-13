@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 29
+API_VERSION = 30
 
 
 class RuntimeError(Exception):
@@ -1112,6 +1112,31 @@ _phase_build_compact_plan = _function(
     _Handle,
     *([ctypes.c_uint64] * 8),
     ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_select_prepare_claim_rows = _function(
+    "nta_jit_phase_select_prepare_claim_rows",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    *([ctypes.c_uint32] * 4),
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_int64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    *([ctypes.c_uint32] * 2),
+    *([ctypes.c_uint64] * 3),
+    ctypes.c_uint32,
+    *([ctypes.c_uint64] * 3),
+    ctypes.c_uint32,
+    ctypes.c_uint64,
     ctypes.c_uint64,
 )
 _phase_reduce_mapped_indexed_key_pages = _function(
@@ -2276,6 +2301,78 @@ class JitPhaseProgram(_Owner):
                 self._handle,
                 *(int(tensor.data_ptr()) for tensor in tensors),
                 int(batch_size),
+                _stream_address(stream),
+            )
+        )
+
+    def select_prepare_claim_rows(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        queries: Any,
+        layer_min: Any,
+        layer_max: Any,
+        page_scores: Any,
+        full_forced_pages: Any,
+        tail_page: int,
+        free_budget: int,
+        ordered_pages_out: Any,
+        page_tokens: int,
+        token_count: int,
+        host_rows: Any,
+        device_rows: Any,
+        cached_pages: Any,
+        selected_rows: Any,
+        source_indices: Any,
+        staging_indices: Any,
+        copied_rows: Any,
+        stream: Any = None,
+    ) -> None:
+        """One launch: score, select, order, and prep a claim layer."""
+        import torch
+
+        if (
+            queries.dtype != torch.float16
+            or queries.ndim != 3
+            or not queries.is_contiguous()
+            or layer_min.dtype != torch.float32
+            or layer_min.shape != layer_max.shape
+            or layer_min.ndim != 3
+        ):
+            raise ValueError("fused selection requires fp16 queries and fp32 envelopes")
+        page_count = int(layer_min.shape[0])
+        capacity = int(selected_rows.numel())
+        cache_slots = int(cached_pages.numel())
+        _check(
+            _phase_select_prepare_claim_rows(
+                self._handle,
+                runtime._handle,
+                int(first_object),
+                int(queries.data_ptr()),
+                int(queries.shape[0]),
+                int(queries.shape[1]),
+                int(layer_min.shape[1]),
+                int(layer_min.shape[2]),
+                int(layer_min.data_ptr()),
+                int(layer_max.data_ptr()),
+                int(page_scores.data_ptr()),
+                page_count,
+                int(full_forced_pages.data_ptr()),
+                int(full_forced_pages.numel()),
+                int(tail_page),
+                int(free_budget),
+                int(ordered_pages_out.data_ptr()),
+                int(page_tokens),
+                int(token_count),
+                int(host_rows.data_ptr()),
+                int(device_rows.data_ptr()),
+                int(cached_pages.data_ptr()),
+                cache_slots,
+                int(selected_rows.data_ptr()),
+                int(source_indices.data_ptr()),
+                int(staging_indices.data_ptr()),
+                capacity,
+                int(copied_rows.data_ptr()),
                 _stream_address(stream),
             )
         )

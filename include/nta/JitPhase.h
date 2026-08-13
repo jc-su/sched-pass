@@ -114,6 +114,20 @@ public:
                         const std::int32_t *compactOffsets,
                         std::int32_t *compactIndices,
                         std::uint32_t batchSize) const;
+  void selectPrepareClaimRows(
+      cudaStream_t stream, abi::RuntimeView *runtime,
+      std::uint32_t firstObject, const void *queries,
+      std::uint32_t queryTokens, std::uint32_t queryHeads,
+      std::uint32_t kvHeads, std::uint32_t headDim, const float *layerMin,
+      const float *layerMax, float *pageScores, std::uint32_t pageCount,
+      const std::int64_t *fullForcedPages, std::uint32_t fullForcedCount,
+      std::int64_t tailPage, std::uint32_t freeBudget,
+      std::int64_t *orderedPagesOut, std::uint32_t pageTokens,
+      std::uint32_t tokenCount, const std::uint32_t *hostRows,
+      const std::uint32_t *deviceRows, std::int64_t *cachedPages,
+      std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
+      std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+      std::uint32_t capacity, std::uint64_t *copiedRows) const;
   void reduceMappedIndexedKeyPages(
       cudaStream_t stream, const void *source, std::uint32_t sourceRows,
       std::uint64_t sourceStrideBytes, const std::int32_t *rowIndices,

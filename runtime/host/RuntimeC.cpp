@@ -1312,6 +1312,43 @@ nta_status nta_jit_phase_reduce_mapped_key_pages(
   });
 }
 
+nta_status nta_jit_phase_select_prepare_claim_rows(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint64_t queries,
+    std::uint32_t queryTokens, std::uint32_t queryHeads,
+    std::uint32_t kvHeads, std::uint32_t headDim, std::uint64_t layerMin,
+    std::uint64_t layerMax, std::uint64_t pageScores, std::uint32_t pageCount,
+    std::uint64_t fullForcedPages, std::uint32_t fullForcedCount,
+    std::int64_t tailPage, std::uint32_t freeBudget,
+    std::uint64_t orderedPagesOut, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, std::uint64_t hostRows,
+    std::uint64_t deviceRows, std::uint64_t cachedPages,
+    std::uint32_t cacheSlotCount, std::uint64_t selectedRows,
+    std::uint64_t sourceIndices, std::uint64_t stagingIndices,
+    std::uint32_t capacity, std::uint64_t copiedRows,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->selectPrepareClaimRows(
+        stream(cudaStream), runtime->value->deviceView(), firstObject,
+        reinterpret_cast<const void *>(queries), queryTokens, queryHeads,
+        kvHeads, headDim, reinterpret_cast<const float *>(layerMin),
+        reinterpret_cast<const float *>(layerMax),
+        reinterpret_cast<float *>(pageScores), pageCount,
+        reinterpret_cast<const std::int64_t *>(fullForcedPages),
+        fullForcedCount, tailPage, freeBudget,
+        reinterpret_cast<std::int64_t *>(orderedPagesOut), pageTokens,
+        tokenCount, reinterpret_cast<const std::uint32_t *>(hostRows),
+        reinterpret_cast<const std::uint32_t *>(deviceRows),
+        reinterpret_cast<std::int64_t *>(cachedPages), cacheSlotCount,
+        reinterpret_cast<std::uint32_t *>(selectedRows),
+        reinterpret_cast<std::uint32_t *>(sourceIndices),
+        reinterpret_cast<std::uint32_t *>(stagingIndices), capacity,
+        reinterpret_cast<std::uint64_t *>(copiedRows));
+  });
+}
+
 nta_status nta_jit_phase_reduce_mapped_indexed_key_pages(
     const nta_jit_phase_program *program, std::uint64_t source,
     std::uint32_t sourceRows, std::uint64_t sourceStrideBytes,

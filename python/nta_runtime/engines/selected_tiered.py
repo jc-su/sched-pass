@@ -1109,6 +1109,9 @@ class TieredClaim:
             or not self.copy_ready
         ):
             raise RuntimeError("external claim has no bounded staging cache")
+        import time as _time
+
+        _layer_began = _time.monotonic()
         offstream = os.environ.get(
             "NTA_SGLANG_EXTEND_PREP_OFFSTREAM", "1"
         ) != "0"
@@ -1117,19 +1120,32 @@ class TieredClaim:
         queries_ready = self.selection_ready[local_layer]
         queries_ready.record(stream)
         prep_stream.wait_event(queries_ready)
+        if getattr(self, "_tail_page", None) is None:
+            self._tail_page = int(self.forced_pages[-1])
+            self._ordered_pages = torch.empty(
+                int(self.full_forced_pages.numel()) + self.free_budget + 1,
+                dtype=torch.int64,
+                device=self.forced_pages.device,
+            )
+            self._page_scores = torch.empty(
+                self.pages, dtype=torch.float32,
+                device=self.forced_pages.device,
+            )
+        base = self.first_object_slot + 2 * local_layer
         with torch.cuda.stream(prep_stream):
-            free_pages = self.choose_free_pages(
-                local_layer, queries, group_size
-            )
-            ordered_pages = torch.cat(
-                [self.full_forced_pages, free_pages, self.forced_pages[-1:]]
-            )
-            base = self.first_object_slot + 2 * local_layer
-            phases.prepare_bounded_selected_indexed_rows(
+            if queries.dtype != torch.float16:
+                queries = queries.to(torch.float16)
+            phases.select_prepare_claim_rows(
                 engine._runtime,
                 base,
-                2,
-                ordered_pages,
+                queries.contiguous(),
+                self.kmin[local_layer],
+                self.kmax[local_layer],
+                self._page_scores,
+                self.full_forced_pages,
+                self._tail_page,
+                self.free_budget,
+                self._ordered_pages,
                 self.page_tokens,
                 self.token_count,
                 self.host_rows,
@@ -1150,6 +1166,25 @@ class TieredClaim:
             copied = self.copy_ready[local_layer]
             copied.record(prep_stream)
         stream.wait_event(copied)
+        if os.environ.get("NTA_SGLANG_SELECTION_VERIFY") == "1":
+            # Debug dual build: the kernel's free set must equal the
+            # reference's as a set (order parity holds by composite key;
+            # score reduction order may permute near-equal boundaries, so
+            # the set is the honest invariant). Synchronizes.
+            reference = self.choose_free_pages(local_layer, queries, group_size)
+            forced_count = int(self.full_forced_pages.numel())
+            kernel_free = self._ordered_pages[
+                forced_count : forced_count + self.free_budget
+            ]
+            if set(kernel_free.tolist()) != set(reference.tolist()):
+                raise RuntimeError(
+                    f"fused selection diverged from the reference at layer "
+                    f"{local_layer}: kernel {sorted(kernel_free.tolist())[:8]}"
+                    f"... vs reference {sorted(reference.tolist())[:8]}..."
+                )
+            engine._stats["tiered_selection_verified_layers"] = (
+                engine._stats.get("tiered_selection_verified_layers", 0) + 1
+            )
         engine._stats["tiered_pipelined_extends"] = (
             engine._stats.get("tiered_pipelined_extends", 0) + 1
         )
@@ -1164,6 +1199,12 @@ class TieredClaim:
         rows = self._selected_row_cache[local_layer]
         if rows is None:
             raise RuntimeError("wavefront extend lost its per-layer rows")
+        engine._stats["tiered_extend_layer_host_ms_total"] = engine._stats.get(
+            "tiered_extend_layer_host_ms_total", 0.0
+        ) + (_time.monotonic() - _layer_began) * 1_000.0
+        engine._stats["tiered_extend_layer_calls"] = (
+            engine._stats.get("tiered_extend_layer_calls", 0) + 1
+        )
         return rows
 
     def stage_all_layers_async(

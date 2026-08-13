@@ -1107,6 +1107,177 @@ nta_jit_reduce_mapped_key_pages(const void *source, std::uint32_t sourceRows,
   return nta::jit::launchStatus();
 }
 
+extern "C" __global__ void nta_score_claim_pages(
+    const __half *queries, std::uint32_t queryTokens,
+    std::uint32_t queryHeads, std::uint32_t kvHeads, std::uint32_t headDim,
+    const float *layerMin, const float *layerMax, std::uint32_t pageCount,
+    float *scoresOut) {
+  // One block per page: extend chunks carry thousands of query tokens,
+  // so the reduction must parallelize across the grid — a single block
+  // serialized ~4G multiply-accumulates per layer (measured 65ms/layer).
+  const std::uint32_t page = blockIdx.x;
+  if (page >= pageCount || queryHeads == 0 || kvHeads == 0 ||
+      queryHeads % kvHeads != 0U) {
+    return;
+  }
+  const std::uint32_t group = queryHeads / kvHeads;
+  const float *pageMin =
+      layerMin + static_cast<std::uint64_t>(page) * kvHeads * headDim;
+  const float *pageMax =
+      layerMax + static_cast<std::uint64_t>(page) * kvHeads * headDim;
+  const std::uint64_t lanes =
+      static_cast<std::uint64_t>(queryTokens) * queryHeads;
+  float partial = 0.0f;
+  for (std::uint64_t lane = threadIdx.x; lane < lanes; lane += blockDim.x) {
+    const std::uint32_t token = lane / queryHeads;
+    const std::uint32_t head = lane % queryHeads;
+    const std::uint32_t kvHead = head / group;
+    const __half *headQuery =
+        queries + (static_cast<std::uint64_t>(token) * queryHeads + head) *
+                      headDim;
+    const float *headMin = pageMin + kvHead * headDim;
+    const float *headMax = pageMax + kvHead * headDim;
+    float bound = 0.0f;
+    for (std::uint32_t dim = 0; dim < headDim; ++dim) {
+      const float value = __half2float(headQuery[dim]);
+      bound += fmaxf(value * headMin[dim], value * headMax[dim]);
+    }
+    partial += bound;
+  }
+  __shared__ float reduction[256];
+  reduction[threadIdx.x] = partial;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    scoresOut[page] = reduction[0];
+  }
+}
+
+extern "C" __global__ void nta_select_prepare_claim_rows(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    const float *pageScores, std::uint32_t pageCount,
+    const std::int64_t *fullForcedPages, std::uint32_t fullForcedCount,
+    std::int64_t tailPage, std::uint32_t freeBudget,
+    std::int64_t *orderedPagesOut, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, const std::uint32_t *hostRows,
+    const std::uint32_t *deviceRows, std::int64_t *cachedPages,
+    std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
+    std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+    std::uint32_t capacity, std::uint64_t *copiedRows) {
+  // One block fuses a layer's page scoring, top-k selection, ordered-page
+  // assembly, and the bounded prep (validate, dedup, compact, publish) —
+  // replacing the ~eight-kernel host-driven chain whose serialized launch
+  // latency dominated the measured 214ms extend forward.
+  extern __shared__ unsigned char sharedRaw[];
+  float *scores = reinterpret_cast<float *>(sharedRaw);
+  std::uint32_t *order = reinterpret_cast<std::uint32_t *>(scores + 1024);
+  if (pageCount > 1024U || fullForcedCount + freeBudget + 1U > pageCount) {
+    return;
+  }
+  for (std::uint32_t page = threadIdx.x; page < 1024U; page += blockDim.x) {
+    scores[page] = page < pageCount ? pageScores[page] : -CUDART_INF_F;
+    order[page] = page;
+  }
+  __syncthreads();
+  // Mask every forced page (full pages and the tail) exactly as the
+  // reference masks with -inf before ranking.
+  for (std::uint32_t index = threadIdx.x; index < fullForcedCount;
+       index += blockDim.x) {
+    scores[fullForcedPages[index]] = -CUDART_INF_F;
+  }
+  if (threadIdx.x == 0) {
+    scores[tailPage] = -CUDART_INF_F;
+  }
+  __syncthreads();
+  // Bitonic sort on the composite key (score descending, page ascending):
+  // a total order, so the result equals the reference's stable descending
+  // argsort without tie ambiguity.
+  for (std::uint32_t size = 2; size <= 1024U; size <<= 1) {
+    for (std::uint32_t stride = size >> 1; stride > 0; stride >>= 1) {
+      __syncthreads();
+      for (std::uint32_t i = threadIdx.x; i < 512U; i += blockDim.x) {
+        const std::uint32_t lane = 2U * i - (i & (stride - 1U));
+        const std::uint32_t partner = lane + stride;
+        const bool descending = ((lane & size) == 0U);
+        const float a = scores[lane];
+        const float b = scores[partner];
+        const std::uint32_t pa = order[lane];
+        const std::uint32_t pb = order[partner];
+        const bool aBeforeB = (a > b) || (a == b && pa < pb);
+        if (aBeforeB != descending) {
+          scores[lane] = b;
+          scores[partner] = a;
+          order[lane] = pb;
+          order[partner] = pa;
+        }
+      }
+    }
+  }
+  __syncthreads();
+  // Ordered pages: full forced, then the top free pages, then the tail.
+  const std::uint32_t orderedCount = fullForcedCount + freeBudget + 1U;
+  for (std::uint32_t index = threadIdx.x; index < fullForcedCount;
+       index += blockDim.x) {
+    orderedPagesOut[index] = fullForcedPages[index];
+  }
+  for (std::uint32_t index = threadIdx.x; index < freeBudget;
+       index += blockDim.x) {
+    orderedPagesOut[fullForcedCount + index] =
+        static_cast<std::int64_t>(order[index]);
+  }
+  if (threadIdx.x == 0) {
+    orderedPagesOut[orderedCount - 1U] = tailPage;
+  }
+  __syncthreads();
+  ntaPrepareSelectedRowsClaim(
+      runtime, firstObject, 2U, orderedPagesOut, orderedCount, pageTokens,
+      tokenCount, hostRows, deviceRows, cachedPages, cacheSlotCount,
+      selectedRows, sourceIndices, stagingIndices, capacity, copiedRows);
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_select_prepare_claim_rows(
+    void *runtime, std::uint32_t firstObject, const void *queries,
+    std::uint32_t queryTokens, std::uint32_t queryHeads,
+    std::uint32_t kvHeads, std::uint32_t headDim, const float *layerMin,
+    const float *layerMax, float *pageScores, std::uint32_t pageCount,
+    const std::int64_t *fullForcedPages, std::uint32_t fullForcedCount,
+    std::int64_t tailPage, std::uint32_t freeBudget,
+    std::int64_t *orderedPagesOut, std::uint32_t pageTokens,
+    std::uint32_t tokenCount, const std::uint32_t *hostRows,
+    const std::uint32_t *deviceRows, std::int64_t *cachedPages,
+    std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
+    std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
+    std::uint32_t capacity, std::uint64_t *copiedRows, cudaStream_t stream) {
+  if (runtime == nullptr || queries == nullptr || layerMin == nullptr ||
+      layerMax == nullptr || pageScores == nullptr ||
+      orderedPagesOut == nullptr || hostRows == nullptr ||
+      deviceRows == nullptr || cachedPages == nullptr ||
+      selectedRows == nullptr || sourceIndices == nullptr ||
+      stagingIndices == nullptr || copiedRows == nullptr ||
+      queryTokens == 0 || pageCount == 0 || pageCount > 1024U ||
+      freeBudget == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_score_claim_pages<<<pageCount, 256, 0, stream>>>(
+      static_cast<const __half *>(queries), queryTokens, queryHeads, kvHeads,
+      headDim, layerMin, layerMax, pageCount, pageScores);
+  const std::uint32_t sharedBytes =
+      1024U * (sizeof(float) + sizeof(std::uint32_t));
+  nta_select_prepare_claim_rows<<<1, 256, sharedBytes, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), firstObject, pageScores,
+      pageCount, fullForcedPages, fullForcedCount, tailPage, freeBudget,
+      orderedPagesOut, pageTokens, tokenCount, hostRows, deviceRows,
+      cachedPages, cacheSlotCount, selectedRows, sourceIndices,
+      stagingIndices, capacity, copiedRows);
+  return nta::jit::launchStatus();
+}
+
 extern "C" __global__ void nta_reduce_mapped_indexed_key_pages(
     const std::byte *source, std::uint32_t sourceRows,
     std::uint64_t sourceStrideBytes, const std::int32_t *rowIndices,

@@ -605,6 +605,7 @@ class SelectedAttentionExecutor:
                     and not claim.verify
                     and not claim.verify_fast
                     and claim.selection_refresh_interval > 1
+                    and claim.free_budget > 0
                     and claim.selected_rows is not None
                     and claim.copy_stream is not None
                 ):
@@ -617,6 +618,12 @@ class SelectedAttentionExecutor:
                     # stream pays one event record per layer instead of
                     # the old synchronous host round trip or the invalid
                     # all-layers burst.
+                    if local_layer == 0:
+                        span = getattr(claim, "_extend_span", None)
+                        if span is None:
+                            span = (torch.cuda.Event(True), torch.cuda.Event(True))
+                            claim._extend_span = span
+                        span[0].record(stream)
                     selected_rows = claim.stage_layer_offstream(
                         engine, local_layer, queries, group_size, stream
                     )
@@ -668,6 +675,12 @@ class SelectedAttentionExecutor:
             self._run_paged(
                 engine, ctx["verifier"], q, kv_cache, layer, out=serve_output
             )
+            if prefill and local_layer == claims[0].layer_count - 1:
+                for entry in ctx["claim_entries"]:
+                    span = getattr(entry["claim"], "_extend_span", None)
+                    if span is not None:
+                        span[1].record(stream)
+                        entry["claim"]._extend_span_armed = True
 
         if verify_targets:
             # VERIFY=fast on the live path: every freshly staged layer is

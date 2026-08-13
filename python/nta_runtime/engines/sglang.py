@@ -842,6 +842,22 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._tiered_claims.pop(claim.claim_id)
         if self._tiered_object_ranges is None:
             raise RuntimeError("tiered claim retired without its object-range pool")
+        span = getattr(claim, "_extend_span", None)
+        if span is not None and getattr(claim, "_extend_span_armed", False):
+            try:
+                span[1].synchronize()
+                elapsed = span[0].elapsed_time(span[1])
+                self._stats["tiered_extend_gpu_ms_total"] = (
+                    self._stats.get("tiered_extend_gpu_ms_total", 0.0) + elapsed
+                )
+                self._stats["tiered_extend_gpu_ms_max"] = max(
+                    self._stats.get("tiered_extend_gpu_ms_max", 0.0), elapsed
+                )
+                self._stats["tiered_extend_gpu_spans"] = (
+                    self._stats.get("tiered_extend_gpu_spans", 0) + 1
+                )
+            except RuntimeError:
+                pass
         # Cancellation can retire a claim whose transfers or summary scan
         # are still in flight on other streams; a fence recorded on the
         # compute stream alone would let reclamation race them. Bridge
