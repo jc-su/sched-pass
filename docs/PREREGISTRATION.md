@@ -117,6 +117,27 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Qualifying campaign result (2026-08-13, seeds 20260901-10 verbatim,
+  revision a0afae9, artifacts `results/serving/sglang-hicache-load-trials/`
+  plus `sglang-hicache-load-qualification.json`):** the registered
+  primary metric — absolute-SLO goodput ratio — has geomean **1.386**
+  with bootstrap 95% CI [1.164, 1.691] over the ten paired trials
+  (per-trial: 2.414, 0.981, 1.205, 1.991, 1.180, 1.184, 1.204, 1.099,
+  2.102, 1.187). Read against the registered bars: the **1.5x goodput
+  bar is not met** (point estimate below, CI straddles); the CI floor of
+  1.164 does establish goodput strictly above stock. The Amendment 2 ITL
+  criterion passes in nine of ten trials (aggregate external
+  ITL-qualified fraction 0.917 versus stock qualified fraction 0.80;
+  trial 9 fails it at 0.417 versus 0.520). The **resident P99 ITL bar
+  fails**: geomean 1.351, CI [1.122, 1.667], entirely above 1.05x.
+  External TTFT p95 geomean is 0.023x stock. Recorded as a failed gate
+  under the no-exclusions rule. Observed structure for the diagnosis
+  that follows: the two worst goodput trials (8, 9) are also the worst
+  resident-tail trials (1.151, 2.685) and the only trials with degraded
+  external ITL fractions — consistent with one contention mechanism,
+  plausibly the pipelined extend burst competing with live decodes,
+  affecting both failing bars. Any mechanism change and fresh campaign
+  will be recorded here before qualifying runs.
 - **Amendment 3 (2026-08-13, before any qualifying campaign completed;
   prompted by external review):** two harness defects were found while
   the first qualifying campaign was mid-flight, and the campaign was
