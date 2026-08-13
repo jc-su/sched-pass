@@ -683,6 +683,17 @@ class TieredClaim:
         begin = int(self.host_rows_cpu[0])
         reference = host_pool.k_data_refs[0]
         heads, dim = int(reference.shape[-2]), int(reference.shape[-1])
+        source_rows = int(reference.shape[0])
+        lowest = int(self.host_rows.min())
+        highest = int(self.host_rows.max())
+        if lowest < 0 or highest >= source_rows:
+            # The kernel must never see an out-of-range row: a silent skip
+            # would publish partial envelopes (including infinities) and
+            # corrupt selection without a failure.
+            raise RuntimeError(
+                f"claim {self.claim_id} maps host rows [{lowest}, {highest}]"
+                f" outside the {source_rows}-row pool"
+            )
         shape = (self.layer_count, self.pages, heads, dim)
         kmin = torch.empty(shape, dtype=torch.float32, device=device)
         kmax = torch.empty_like(kmin)

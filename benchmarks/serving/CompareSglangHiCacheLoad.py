@@ -59,6 +59,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-dir", default="build")
     parser.add_argument("--seed", type=int, default=20260802)
     parser.add_argument(
+        "--execution-order",
+        choices=("seeded", "stock_first", "nta_first"),
+        default="seeded",
+        help=(
+            "arm order; explicit values keep pre-registered seeds intact "
+            "instead of searching for a seed that shuffles to the order"
+        ),
+    )
+    parser.add_argument(
         "--allow-oversubscribed-pool",
         action="store_true",
         help="forwarded to the load harness for capacity-pressure shapes",
@@ -198,6 +207,27 @@ def _thresholds(stock: dict[str, Any], scale: float) -> dict[str, float]:
     }
 
 
+def _preregistered_goodput(report: dict[str, Any]) -> dict[str, Any]:
+    """The registered primary metric: completed requests per second whose
+    TTFT <= 8.0s and P99 ITL <= 100ms; both request kinds count and a
+    request violating either threshold contributes zero."""
+    qualified = 0
+    total = 0
+    for record in report["records"]:
+        total += 1
+        if (
+            float(record["ttft_seconds"]) <= 8.0
+            and float(record["p99_itl_seconds"]) <= 0.100
+        ):
+            qualified += 1
+    elapsed = float(report["elapsed_seconds"])
+    return {
+        "qualified_requests": qualified,
+        "total_requests": total,
+        "goodput_requests_per_second": qualified / elapsed,
+    }
+
+
 def _goodput(report: dict[str, Any], thresholds: dict[str, float]) -> dict[str, Any]:
     resident_ok = []
     external_ok = []
@@ -245,7 +275,10 @@ def _write_failed_comparison(
 def main() -> int:
     args = parse_args()
     order = ["flashinfer", "nta_flashinfer"]
-    random.Random(args.seed).shuffle(order)
+    if args.execution_order == "seeded":
+        random.Random(args.seed).shuffle(order)
+    elif args.execution_order == "nta_first":
+        order.reverse()
     reports = {backend: run(args, backend) for backend in order}
     stock = reports["flashinfer"]
     nta = reports["nta_flashinfer"]
@@ -371,6 +404,8 @@ def main() -> int:
     thresholds = _thresholds(stock, args.slo_scale)
     stock_goodput = _goodput(stock, thresholds)
     nta_goodput = _goodput(nta, thresholds)
+    stock_prereg = _preregistered_goodput(stock)
+    nta_prereg = _preregistered_goodput(nta)
     stock_rate = float(stock["output_token_throughput"])
     nta_rate = float(nta["output_token_throughput"])
     stock_gp = float(stock_goodput["goodput_requests_per_second"])
@@ -400,8 +435,16 @@ def main() -> int:
         "nta": nta,
         "stock_goodput": stock_goodput,
         "nta_goodput": nta_goodput,
+        "stock_preregistered_goodput": stock_prereg,
+        "nta_preregistered_goodput": nta_prereg,
         "output_throughput_ratio": nta_rate / stock_rate,
         "goodput_ratio": nta_gp / stock_gp if stock_gp else None,
+        "preregistered_goodput_ratio": (
+            nta_prereg["goodput_requests_per_second"]
+            / stock_prereg["goodput_requests_per_second"]
+            if stock_prereg["goodput_requests_per_second"]
+            else None
+        ),
         "resident_p95_ttft_ratio": resident_ttft_ratio,
         "resident_p95_tpot_ratio": resident_tpot_ratio,
         "resident_p99_itl_ratio": resident_itl_ratio,

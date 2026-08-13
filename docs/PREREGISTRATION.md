@@ -117,6 +117,27 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Amendment 3 (2026-08-13, before any qualifying campaign completed;
+  prompted by external review):** two harness defects were found while
+  the first qualifying campaign was mid-flight, and the campaign was
+  stopped rather than completed under them. First, the comparator's
+  `goodput_ratio` used relative thresholds (1.5x the stock arm's own
+  latencies) rather than the registered absolute SLO; the comparator now
+  also computes and stores `preregistered_goodput` per arm (TTFT <=
+  8.0s and P99 ITL <= 100ms over all requests) and the campaign analysis
+  uses only the registered metric. Second, the trial runner derived arm
+  order by searching forward from each registered seed until a shuffle
+  matched, silently substituting seeds (20260901, 04, 05, 07, ...); arm
+  order is now an explicit argument and the registered seeds are used
+  verbatim. Six partial trials from the stopped campaign are archived at
+  `results/serving/p3-preprotocol-diagnostics/` as non-protocol
+  diagnostics and are not evidence. Two mechanism fixes land with the
+  same commit series, both fail-closed hardening found by the same
+  review: fragmented mapped reduction now validates row indices at claim
+  preparation instead of silently skipping out-of-range rows, and claim
+  retirement fences the claim's copy stream and the summary stream so
+  cancellation cannot reclaim resources ahead of in-flight work. The
+  qualifying campaign runs on the post-fix revision.
 - **P3 probe rerun (2026-08-12, non-qualifying seed 20260812, after the
   operator build's eager phase 3):** tiered qualified 13/24 versus stock
   12/24; goodput 0.372 versus 0.233 requests/s (ratio 1.60); tiered TTFT

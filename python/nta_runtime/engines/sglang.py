@@ -842,6 +842,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._tiered_claims.pop(claim.claim_id)
         if self._tiered_object_ranges is None:
             raise RuntimeError("tiered claim retired without its object-range pool")
+        # Cancellation can retire a claim whose transfers or summary scan
+        # are still in flight on other streams; a fence recorded on the
+        # compute stream alone would let reclamation race them. Bridge
+        # every resource-owning stream into the completion event.
+        copy_stream = getattr(claim, "copy_stream", None)
+        if copy_stream is not None:
+            barrier = torch.cuda.Event()
+            barrier.record(copy_stream)
+            stream.wait_event(barrier)
+        summary_stream = getattr(self, "_summary_stream", None)
+        if summary_stream is not None:
+            barrier = torch.cuda.Event()
+            barrier.record(summary_stream)
+            stream.wait_event(barrier)
         completion = torch.cuda.Event()
         completion.record(stream)
         table_slot = getattr(claim, "table_slot", None)

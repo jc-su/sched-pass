@@ -112,7 +112,9 @@ def require_clean_mechanism(
         keys = (
             "hicache_claimed_batches", "hicache_fallback_batches",
             "tiered_claims", "tiered_external_prefix_batches",
-            "tiered_decode_layers", "external_launches",
+            "tiered_decode_layers", "tiered_pipelined_extends",
+            "tiered_table_prep_launches", "tiered_fast_reuse_layers",
+            "external_launches",
             "admission_considered_batches", "batches",
         )
         return "; ".join(

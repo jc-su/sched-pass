@@ -124,11 +124,12 @@ def main() -> int:
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     reports: list[dict[str, Any]] = []
     artifacts: list[str] = []
-    next_seed = args.seed_base
     for trial in range(args.trials):
         first = "flashinfer" if trial % 2 == 0 else "nta_flashinfer"
-        seed = _seed_for_order(next_seed, first)
-        next_seed = seed + 1
+        # Pre-registered seeds are used verbatim: arm balancing is an
+        # explicit argument, never a seed search — searching mutated the
+        # registered seed list (found 2026-08-13, external review).
+        seed = args.seed_base + trial
         artifact = (args.artifact_dir / f"trial-{trial:02d}.json").resolve()
         if artifact.is_file():
             # Resume after an interrupted campaign: the seed chain above is
@@ -150,6 +151,8 @@ def main() -> int:
             *args.comparison_args,
             "--seed",
             str(seed),
+            "--execution-order",
+            "stock_first" if first == "flashinfer" else "nta_first",
             "--output",
             str(artifact),
         ]
