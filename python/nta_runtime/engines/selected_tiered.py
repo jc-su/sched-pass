@@ -1087,7 +1087,8 @@ class TieredClaim:
     def stage_all_layers_async(
         self,
         engine: Any,
-        frees: list[torch.Tensor],
+        queries: torch.Tensor,
+        group_size: int,
         stream: torch.cuda.Stream,
     ) -> list[torch.cuda.Event]:
         """Issue every layer's selection, staging, and transfer up front.
@@ -1112,46 +1113,57 @@ class TieredClaim:
             or not self.copy_ready
         ):
             raise RuntimeError("external claim has no bounded staging cache")
-        if len(frees) != self.layer_count:
-            raise RuntimeError("pipelined staging requires one page set per layer")
         phases = engine._phase_program(engine._nta_demand_decode_wrappers[0])
+        # The arrival burst — ~250 selection, prep, clone, and transfer
+        # enqueues — must not ride the compute stream: measured on the
+        # first qualifying campaign, each claim arrival inside a live
+        # decode window added tail latency monotonically (20ms at zero
+        # overlaps to 80-143ms at eight-plus). The whole chain runs on
+        # the claim's copy stream behind one queries-ready event; the
+        # compute stream only waits per-layer copy events at attention.
+        offstream = os.environ.get("NTA_SGLANG_EXTEND_PREP_OFFSTREAM", "1") != "0"
+        prep_stream = self.copy_stream if offstream else stream
+        queries_ready = torch.cuda.Event()
+        queries_ready.record(stream)
+        prep_stream.wait_event(queries_ready)
         events: list[torch.cuda.Event] = []
-        for local_layer, free_pages in enumerate(frees):
-            ordered_pages = torch.cat(
-                [self.full_forced_pages, free_pages, self.forced_pages[-1:]]
-            )
-            base = self.first_object_slot + 2 * local_layer
-            phases.prepare_bounded_selected_indexed_rows(
-                engine._runtime,
-                base,
-                2,
-                ordered_pages,
-                self.page_tokens,
-                self.token_count,
-                self.host_rows,
-                self.device_rows,
-                self.cached_pages[local_layer],
-                self.selected_rows,
-                self.source_index[local_layer],
-                self.staging_index[local_layer],
-                self.copied_rows_device,
-                stream=stream,
-            )
-            # Clone before the next layer's prep rewrites the shared
-            # selected-row table; the cache buffer is this layer's stable
-            # source for the segment write.
-            self.remember_selected_rows(
-                local_layer, self.selected_rows[: self.kept_prefix_rows]
-            )
-            selected = self.selection_ready[local_layer]
-            selected.record(stream)
-            self.copy_stream.wait_event(selected)
-            phases.progress_validated_indexed_host_range(
-                engine._runtime, base, 2, stream=self.copy_stream
-            )
-            copied = self.copy_ready[local_layer]
-            copied.record(self.copy_stream)
-            events.append(copied)
+        with torch.cuda.stream(prep_stream):
+            for local_layer in range(self.layer_count):
+                free_pages = self.choose_free_pages(
+                    local_layer, queries, group_size
+                )
+                ordered_pages = torch.cat(
+                    [self.full_forced_pages, free_pages, self.forced_pages[-1:]]
+                )
+                base = self.first_object_slot + 2 * local_layer
+                phases.prepare_bounded_selected_indexed_rows(
+                    engine._runtime,
+                    base,
+                    2,
+                    ordered_pages,
+                    self.page_tokens,
+                    self.token_count,
+                    self.host_rows,
+                    self.device_rows,
+                    self.cached_pages[local_layer],
+                    self.selected_rows,
+                    self.source_index[local_layer],
+                    self.staging_index[local_layer],
+                    self.copied_rows_device,
+                    stream=prep_stream,
+                )
+                # Clone before the next layer's prep rewrites the shared
+                # selected-row table; the cache buffer is this layer's
+                # stable source for the segment write.
+                self.remember_selected_rows(
+                    local_layer, self.selected_rows[: self.kept_prefix_rows]
+                )
+                phases.progress_validated_indexed_host_range(
+                    engine._runtime, base, 2, stream=prep_stream
+                )
+                copied = self.copy_ready[local_layer]
+                copied.record(prep_stream)
+                events.append(copied)
         engine._stats["tiered_pipelined_extends"] = (
             engine._stats.get("tiered_pipelined_extends", 0) + 1
         )
