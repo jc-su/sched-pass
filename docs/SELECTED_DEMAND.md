@@ -364,7 +364,26 @@ Checkpoint only — single trial, one seed, one shape; the pre-registered
 gate runs decide. Graph capture of the reuse step remains the recorded
 contingency if the formal runs disagree with the checkpoint.
 
-The co-design statement this implements: the engine knows request SLO
+**Device-side selection landed (C API v30).** The extend path now runs
+selection itself on device: `nta_score_claim_pages` computes the Quest
+bound grid-parallel (one block per page — extend chunks carry thousands
+of query tokens), and `nta_select_prepare_claim_rows` ranks pages with
+a composite-key bitonic sort (score descending, page ascending — the
+reference's stable argsort order, tie-free by construction), assembles
+the ordered page list, and executes the bounded prep in the same
+launch. The chain per extend layer fell from ~eight host-driven
+kernels to score, select-prep, and transfer-progress; the measured
+extend forward fell 214ms to 58ms mean and the P3 probe qualified 24
+of 24 requests with the external ITL tail at 94ms maximum. Selection
+is byte-equal to the Python reference as a set on every verified layer
+(2,520 of 2,520 under `NTA_SGLANG_SELECTION_VERIFY=1`, fail-closed),
+and the quality battery holds 1.0 at the qualifying configuration.
+With scoring, ranking, dedup, compaction, transfer indexing, and count
+publication all device-resident, the operator the claim-table phases
+built toward is complete on the extend path; the phase-4 legality
+clause can now bind the full select-stage-consume chain.
+
+The co-design statement this implements:The co-design statement this implements: the engine knows request SLO
 and admission pressure; the runtime owns claims, bounded staging, and
 cancellation; the compiler turns request-level external-data
 dependencies into graph-capturable GPU work units that consume runtime
