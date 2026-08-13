@@ -130,6 +130,20 @@ def main() -> int:
         seed = _seed_for_order(next_seed, first)
         next_seed = seed + 1
         artifact = (args.artifact_dir / f"trial-{trial:02d}.json").resolve()
+        if artifact.is_file():
+            # Resume after an interrupted campaign: the seed chain above is
+            # deterministic, so a banked trial re-derives the same seed and
+            # arm order; accept it only when both match.
+            report = json.loads(artifact.read_text(encoding="utf-8"))
+            arm_seed = report.get("nta", {}).get("seed", -1)
+            if (
+                report.get("classification") == "sglang-hicache-load-comparison"
+                and int(arm_seed) == seed
+                and report.get("execution_order", [None])[0] == first
+            ):
+                reports.append(report)
+                artifacts.append(str(artifact))
+                continue
         command = [
             sys.executable,
             str(ROOT / "benchmarks" / "serving" / "CompareSglangHiCacheLoad.py"),
