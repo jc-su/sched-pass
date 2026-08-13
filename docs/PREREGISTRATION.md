@@ -117,6 +117,23 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Mechanism changes after the failed campaign (2026-08-13, recorded
+  before the second qualifying campaign):** the failed bars' shared
+  mechanism was located by measurement (per-request tails rise
+  monotonically with claim arrivals inside the decode window; the
+  extend forward measured 214ms of GPU serialization). Three changes:
+  the extend stages each layer on the claim's copy stream at that
+  layer's serve call (the all-layers variant was withdrawn when the
+  scored battery measured 0.0 quality from cross-layer queries);
+  per-layer selection moved on device (grid-parallel Quest scoring
+  plus a composite-key bitonic selection reproducing the reference's
+  stable order, verified set-identical on 2520 of 2520 layers
+  fail-closed); and claim preparation reductions run on device for
+  fragmented host mappings. Probe at the P3 shape after the changes:
+  24 of 24 requests qualified, external ITL p99 maximum 94ms, resident
+  p99 maximum 43ms, external TTFT p95 0.18s, extend 58ms mean. Quality
+  1.0 both kinds at the qualifying configuration. Second campaign runs
+  on this revision with NUMA interleaving pinned across both arms.
 - **Qualifying campaign result (2026-08-13, seeds 20260901-10 verbatim,
   revision a0afae9, artifacts `results/serving/sglang-hicache-load-trials/`
   plus `sglang-hicache-load-qualification.json`):** the registered
