@@ -117,6 +117,25 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **RQ1 pressure campaign result (2026-08-13, load-symmetric shape, 16
+  externals x 16,384 x 256 out with eight 4K residents at 12/s, seeds
+  20260901-10 verbatim, revision bafe897, ten of ten trials, artifacts
+  `results/serving/rq1-pressure-trials/`):** registered goodput geomean
+  **2.084 [1.762, 2.526]** — the 1.5x bar passes at this second shape
+  with the interval floor above the bar. External TTFT p95 geomean
+  0.030x. The resident P99 ITL ratio is **1.321 [1.197, 1.472]**
+  against the 1.05x bar: **failed at the load-symmetric shape as
+  well**, so the P3 failure is not explained by load asymmetry alone.
+  The residual tracks the extend-forward duration: tiered extends run
+  ~58ms and set the co-resident gap floor, versus stock's faster dense
+  chunked prefill; resident absolutes remain under the 100ms ITL SLO
+  throughout (campaign-two absolutes: tiered maximum 75ms). The
+  honest system statement supported by both campaigns: goodput and
+  TTFT dominate with confidence margins while co-resident tails pay
+  1.2-1.5x stock's — bounded, SLO-compliant, and attributable to one
+  measured mechanism (extend-forward duration), with capture of the
+  extend forward as the identified path below 1.05x if that bar is to
+  be met rather than reported.
 - **Second qualifying campaign result (2026-08-13, seeds 20260901-10
   verbatim, arm order explicit, revision 1f9dab5, ten of ten paired
   trials, artifacts `results/serving/sglang-hicache-load-trials/`):**
