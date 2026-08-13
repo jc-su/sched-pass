@@ -117,6 +117,27 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Second qualifying campaign result (2026-08-13, seeds 20260901-10
+  verbatim, arm order explicit, revision 1f9dab5, ten of ten paired
+  trials, artifacts `results/serving/sglang-hicache-load-trials/`):**
+  the registered primary — absolute-SLO goodput ratio — has geomean
+  **2.669** with bootstrap 95% CI **[2.043, 3.472]** (per-trial: 3.46,
+  1.18, 2.61, 5.70, 3.12, 2.39, 3.65, 1.80, 3.40, 1.80): the 1.5x bar
+  is met with the interval floor above the bar. The Amendment 2 ITL
+  criterion passes in ten of ten trials. External TTFT p95 geomean is
+  0.011x stock. The resident P99 ITL ratio is **1.557 [1.340, 1.766]**
+  against the 1.05x bar: **failed as registered**, and recorded so. The
+  absolute numbers behind that ratio: every resident in every trial in
+  both arms is under the 100ms ITL SLO (tiered median 55ms, maximum
+  75ms; stock median 36ms, maximum 46ms), and the registered goodput —
+  which counts residents — passes with margin. The denominator's
+  quietness is coupled to stock's queue divergence (stock's resident
+  coasts beside externals stock is failing; 0.011x TTFT ratio), so at
+  P3 the ratio compares residents under structurally different served
+  loads. That analysis does not amend the verdict; the bar failed at
+  P3 as written. The resident-interference bar is next evaluated at the
+  RQ1 pressure shape, where both arms serve the same load and the
+  comparison is load-symmetric, per the original registration.
 - **Mechanism changes after the failed campaign (2026-08-13, recorded
   before the second qualifying campaign):** the failed bars' shared
   mechanism was located by measurement (per-request tails rise
