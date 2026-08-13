@@ -608,21 +608,18 @@ class SelectedAttentionExecutor:
                     and claim.selected_rows is not None
                     and claim.copy_stream is not None
                 ):
-                    # Pipelined extend: queries are fixed for the whole
-                    # forward, so layer zero issues every layer's
-                    # selection, prep, and transfer; each layer then
-                    # serves from its cloned rows behind its own copy
-                    # event instead of a synchronous per-layer wait.
-                    if local_layer == 0:
-                        claim._pipeline_events = claim.stage_all_layers_async(
-                            engine, queries, group_size, stream
-                        )
-                    selected_rows = claim._selected_row_cache[local_layer]
-                    if selected_rows is None:
-                        raise RuntimeError(
-                            "pipelined extend lost its per-layer rows"
-                        )
-                    stream.wait_event(claim._pipeline_events[local_layer])
+                    # Wavefront extend: each layer's selection, prep, and
+                    # transfer are issued on the claim's prep stream the
+                    # moment that layer's queries exist — selection stays
+                    # on per-layer queries (layer-zero queries scored
+                    # against other layers' envelopes proved to be noise:
+                    # quality 0.0 versus stock 1.0), and the compute
+                    # stream pays one event record per layer instead of
+                    # the old synchronous host round trip or the invalid
+                    # all-layers burst.
+                    selected_rows = claim.stage_layer_offstream(
+                        engine, local_layer, queries, group_size, stream
+                    )
                 elif selected_rows is None:
                     free = claim.choose_free_pages(local_layer, queries, group_size)
                     if (

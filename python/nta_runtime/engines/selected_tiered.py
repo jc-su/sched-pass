@@ -1084,6 +1084,88 @@ class TieredClaim:
             >= self.selection_refresh_interval
         )
 
+    def stage_layer_offstream(
+        self,
+        engine: Any,
+        local_layer: int,
+        queries: torch.Tensor,
+        group_size: int,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        """Stage one extend layer off the compute stream, event-fenced.
+
+        Selection uses this layer's own queries — scoring another
+        layer's envelopes is noise — while the chain (selection, prep,
+        clone, transfer) runs on the claim's copy stream so an arrival
+        never queues kernels ahead of live decodes. The old path's cost
+        was the synchronous host wait per layer, not the transfer; here
+        attention waits a per-layer event instead.
+        """
+        if (
+            not self.external_sidecar
+            or self.cached_pages is None
+            or self.selected_rows is None
+            or self.copy_stream is None
+            or not self.copy_ready
+        ):
+            raise RuntimeError("external claim has no bounded staging cache")
+        offstream = os.environ.get(
+            "NTA_SGLANG_EXTEND_PREP_OFFSTREAM", "1"
+        ) != "0"
+        prep_stream = self.copy_stream if offstream else stream
+        phases = engine._phase_program(engine._nta_demand_decode_wrappers[0])
+        queries_ready = self.selection_ready[local_layer]
+        queries_ready.record(stream)
+        prep_stream.wait_event(queries_ready)
+        with torch.cuda.stream(prep_stream):
+            free_pages = self.choose_free_pages(
+                local_layer, queries, group_size
+            )
+            ordered_pages = torch.cat(
+                [self.full_forced_pages, free_pages, self.forced_pages[-1:]]
+            )
+            base = self.first_object_slot + 2 * local_layer
+            phases.prepare_bounded_selected_indexed_rows(
+                engine._runtime,
+                base,
+                2,
+                ordered_pages,
+                self.page_tokens,
+                self.token_count,
+                self.host_rows,
+                self.device_rows,
+                self.cached_pages[local_layer],
+                self.selected_rows,
+                self.source_index[local_layer],
+                self.staging_index[local_layer],
+                self.copied_rows_device,
+                stream=prep_stream,
+            )
+            self.remember_selected_rows(
+                local_layer, self.selected_rows[: self.kept_prefix_rows]
+            )
+            phases.progress_validated_indexed_host_range(
+                engine._runtime, base, 2, stream=prep_stream
+            )
+            copied = self.copy_ready[local_layer]
+            copied.record(prep_stream)
+        stream.wait_event(copied)
+        engine._stats["tiered_pipelined_extends"] = (
+            engine._stats.get("tiered_pipelined_extends", 0) + 1
+        )
+        engine._stats["tiered_device_compaction_launches"] = (
+            engine._stats.get("tiered_device_compaction_launches", 0) + 1
+        )
+        engine._stats["tiered_bounded_cache_launches"] = (
+            engine._stats.get("tiered_bounded_cache_launches", 0) + 1
+        )
+        self.device_accounting = True
+        self.requested_rows += self.kept_prefix_rows
+        rows = self._selected_row_cache[local_layer]
+        if rows is None:
+            raise RuntimeError("wavefront extend lost its per-layer rows")
+        return rows
+
     def stage_all_layers_async(
         self,
         engine: Any,
