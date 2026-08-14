@@ -117,6 +117,22 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Mechanism change before campaign three (2026-08-14, recorded before
+  any qualifying run):** tiered reuse decode steps now replay under the
+  CUDA graphs captured at startup — static claim-segment buffers are
+  baked into every decode graph, absent claims land in the buffer tail,
+  and replay fills the epoch's compact plan outside the recorded
+  region; refresh and staging steps drop to the eager path unchanged.
+  The scored battery holds 1.0 both kinds under replay, all activation
+  gates carry honest replay accounting, and the same-seed probes moved
+  every previously missed axis inside its bar with margin: GPU busy 97
+  percent mean (bar 85), external decode TPOT 0.60x stock at the
+  pressure shape and 6.5ms at P3, external ITL p99 maximum 41ms (bar
+  100ms), and the resident p99 maximum 35ms — below the stock arm's own
+  range, pointing the twice-failed 1.05x resident ratio at or below
+  parity. Campaigns three (P3) and four (RQ1 pressure) run on this
+  revision with graphs enabled in the tiered arm and the registered
+  seeds verbatim; all previously recorded verdicts stand.
 - **RQ1 pressure campaign result (2026-08-13, load-symmetric shape, 16
   externals x 16,384 x 256 out with eight 4K residents at 12/s, seeds
   20260901-10 verbatim, revision bafe897, ten of ten trials, artifacts
