@@ -68,6 +68,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--allow-output-divergence",
+        action="store_true",
+        help=(
+            "record instead of reject arm output divergence; graph replay's "
+            "floating-point reordering can flip near-tie tokens, and the "
+            "scored quality battery — not text equality — is the registered "
+            "quality metric"
+        ),
+    )
+    parser.add_argument(
         "--allow-oversubscribed-pool",
         action="store_true",
         help="forwarded to the load harness for capacity-pressure shapes",
@@ -305,7 +315,10 @@ def main() -> int:
             args.output, reports, order, "requested batch mode was not preserved"
         )
         raise RuntimeError("load trial did not preserve the requested batch mode")
-    if stock["generated_text_sha256"] != nta["generated_text_sha256"]:
+    outputs_diverge = (
+        stock["generated_text_sha256"] != nta["generated_text_sha256"]
+    )
+    if outputs_diverge and not args.allow_output_divergence:
         _write_failed_comparison(
             args.output,
             reports,
@@ -426,6 +439,7 @@ def main() -> int:
         "schema": 1,
         "classification": "sglang-hicache-load-comparison",
         "execution_order": order,
+        "outputs_diverge": outputs_diverge,
         "batch_mode": args.batch_mode,
         "slo_scale": args.slo_scale,
         "incremental_setup_ns": args.incremental_setup_ns,
