@@ -117,6 +117,36 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Campaign three result (2026-08-14, P3 shape, seeds verbatim, graphs
+  enabled in both arms, revision 4707d7c, ten of ten trials):** the
+  registered goodput ratio has geomean **1.251 [1.120, 1.465]** — the
+  1.5x bar **fails as registered**. The mechanism is a measurement
+  ceiling, not a regression: the tiered arm qualifies **25 of 25
+  requests in every trial** (as it did in campaign two), while the
+  stock arm's qualification rose from 13.1 to 23.9 of 25 because CUDA
+  graphs roughly halve its decode holds, lifting its service rate past
+  P3's 0.9/s arrivals — the queue that defined P3's separating power
+  (derived from eager service rates in Amendment 2) stabilizes, and
+  stock slips under the 8-second TTFT SLO (its p50 fell from 3-13s to
+  0.1-5.9s). Against the strongest baseline this shape cannot separate
+  further: with the tiered arm at the ceiling, the ratio is bounded
+  near parity regardless of mechanism quality. The resident P99 ratio
+  is **1.054 [0.917, 1.266]** — a point miss of the 1.05x bar by 0.004
+  with the interval spanning parity, versus 1.557 before capture.
+  External TTFT p95 remains 0.024x and the ITL criterion passes ten of
+  ten; one of ten trials records output divergence (near-tie token
+  flips under graph float reordering; the scored battery holds 1.0).
+  Capacity-separated evaluation continues at the RQ1 pressure shape
+  (campaign four), where stock cannot hold the working set at any
+  service rate.
+- **Amendment 4 (2026-08-14, recorded before any P4 run):** P3's
+  arrival rate is re-derived for graph-era baselines. Stock's hold at
+  P3 with graphs is ~0.65s extend plus 768 tokens at ~7ms ≈ 6.0s at
+  concurrency ~6, i.e. service ≈ 1.0/s: arrivals must exceed that for
+  queue divergence against the strongest baseline. **P4:** identical to
+  P3 except Poisson arrivals at **1.5/s**; same SLOs, bars, and seeds.
+  P4 runs only after campaign four completes and only on a recorded
+  revision.
 - **Mechanism change before campaign three (2026-08-14, recorded before
   any qualifying run):** tiered reuse decode steps now replay under the
   CUDA graphs captured at startup — static claim-segment buffers are
