@@ -1084,6 +1084,168 @@ class TieredClaim:
             >= self.selection_refresh_interval
         )
 
+    def stage_layer_host_orchestrated(
+        self,
+        engine: Any,
+        local_layer: int,
+        free_pages: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        """Host-orchestrated ablation arm (RQ3 baseline B1).
+
+        Same selection quality, same bounded cache, same indexed transfer
+        primitive as the device chain — but the control path runs where a
+        BaM-style system must run it: page identities synchronize to the
+        host, the cache directory and gather indices are host arithmetic,
+        and the index arrays upload before the transfer fires. One stream
+        synchronization per (claim, layer) refresh plus the host work is
+        exactly the cost the device-side chain removes, so a paired trial
+        against the default arm isolates orchestration from sparsity.
+        """
+        if (
+            not self.external_sidecar
+            or self.cached_pages is None
+            or self.selected_rows is None
+        ):
+            raise RuntimeError(
+                "host-orchestrated staging needs the bounded staging cache"
+            )
+        import time as _time
+
+        began = _time.monotonic()
+        state = getattr(self, "_host_orch", None)
+        if state is None:
+            cache_slots = self.capacity_rows // self.page_tokens
+            state = {
+                "device_rows_cpu": self.device_rows.to("cpu", torch.int64),
+                "forced_list": self.full_forced_pages.tolist(),
+                "directory": [
+                    dict() for _ in range(self.layer_count)
+                ],
+                "owner": [
+                    [-1] * cache_slots for _ in range(self.layer_count)
+                ],
+                "slots": cache_slots,
+            }
+            self._host_orch = state
+        tail_page = self.pages - 1
+        tail_rows = self.token_count - tail_page * self.page_tokens
+        # The device-to-host control edge: a host orchestrator cannot build
+        # gather indices without the selected page identities.
+        sync_began = _time.monotonic()
+        free_list = free_pages.cpu().tolist()
+        sync_ms = (_time.monotonic() - sync_began) * 1_000.0
+        ordered = state["forced_list"] + free_list + [tail_page]
+
+        directory = state["directory"][local_layer]
+        owner = state["owner"][local_layer]
+        selected = set(ordered)
+        if len(selected) != len(ordered):
+            raise RuntimeError(
+                "host-orchestrated selection repeated a page identity"
+            )
+        free_slots = [
+            slot
+            for slot in range(state["slots"])
+            if owner[slot] not in selected
+        ]
+        misses = [page for page in ordered if page not in directory]
+        if len(misses) > len(free_slots):
+            raise RuntimeError(
+                f"host-orchestrated cache cannot hold {len(misses)} misses "
+                f"in {len(free_slots)} free slots"
+            )
+        source_rows: list[int] = []
+        staging_rows: list[int] = []
+        device_rows_cpu = state["device_rows_cpu"]
+        host_rows_cpu = self.host_rows_cpu
+        for page in misses:
+            slot = free_slots.pop()
+            evicted = owner[slot]
+            if evicted >= 0:
+                directory.pop(evicted, None)
+            directory[page] = slot
+            owner[slot] = page
+            row_count = tail_rows if page == tail_page else self.page_tokens
+            page_begin = page * self.page_tokens
+            slot_begin = slot * self.page_tokens
+            source_rows.extend(
+                int(row)
+                for row in host_rows_cpu[page_begin : page_begin + row_count]
+            )
+            staging_rows.extend(
+                int(row)
+                for row in device_rows_cpu[slot_begin : slot_begin + row_count]
+            )
+        device = self.host_rows.device
+        if source_rows:
+            count = len(source_rows)
+            self.source_index[local_layer, :count] = torch.tensor(
+                source_rows, dtype=torch.int32
+            ).to(device)
+            self.staging_index[local_layer, :count] = torch.tensor(
+                staging_rows, dtype=torch.int32
+            ).to(device)
+            phases = engine._phase_program(
+                engine._nta_demand_decode_wrappers[0]
+            )
+            base = self.first_object_slot + 2 * local_layer
+            phases.set_indexed_row_counts(
+                engine._runtime, base, 2, count, stream=stream
+            )
+            phases.progress_validated_indexed_host_range(
+                engine._runtime, base, 2, stream=stream
+            )
+            self.rows_copied += count
+            self.copied_rows_device.add_(count)
+            self.rows_rehit += self.kept_prefix_rows - count
+        else:
+            self.rows_rehit += self.kept_prefix_rows
+
+        table: list[int] = []
+        for page in ordered:
+            slot = directory[page]
+            row_count = tail_rows if page == tail_page else self.page_tokens
+            slot_begin = slot * self.page_tokens
+            table.extend(
+                int(row)
+                for row in device_rows_cpu[slot_begin : slot_begin + row_count]
+            )
+        if len(table) != self.kept_prefix_rows:
+            raise RuntimeError(
+                f"host-orchestrated table holds {len(table)} rows but the "
+                f"fixed kept shape is {self.kept_prefix_rows}"
+            )
+        self.selected_rows[: self.kept_prefix_rows] = torch.tensor(
+            table, dtype=torch.int32
+        ).to(device)
+        if self.verify or self.verify_fast:
+            # The synchronization-heavy verifier resolves rows through the
+            # device cache directory; mirror the host directory into it only
+            # when verification is on — a real host system would not pay it.
+            self.cached_pages[local_layer, : state["slots"]] = torch.tensor(
+                owner, dtype=torch.int64
+            ).to(device)
+        self.device_accounting = True
+        self.requested_rows += self.kept_prefix_rows
+        stats = engine._stats
+        stats["tiered_host_orchestrated_layers"] = (
+            stats.get("tiered_host_orchestrated_layers", 0) + 1
+        )
+        stats["tiered_host_orchestrated_syncs"] = (
+            stats.get("tiered_host_orchestrated_syncs", 0) + 1
+        )
+        stats["tiered_host_orchestrated_sync_ms_total"] = (
+            stats.get("tiered_host_orchestrated_sync_ms_total", 0.0) + sync_ms
+        )
+        stats["tiered_host_orchestrated_host_ms_total"] = stats.get(
+            "tiered_host_orchestrated_host_ms_total", 0.0
+        ) + (_time.monotonic() - began) * 1_000.0
+        stats["tiered_host_orchestrated_pages_staged"] = (
+            stats.get("tiered_host_orchestrated_pages_staged", 0) + len(misses)
+        )
+        return self.selected_rows[: self.kept_prefix_rows]
+
     def stage_layer_offstream(
         self,
         engine: Any,
