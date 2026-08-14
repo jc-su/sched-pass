@@ -188,6 +188,33 @@ independent NTA contributions. Both systems are required sparse-serving
 controls; NTA must distinguish itself through the compiler-checked contributor
 and request-lifecycle contract and must still match their quality constraints.
 
+### GPU-Initiated Storage Primitives
+
+[BaM](https://arxiv.org/abs/2203.04910) (ASPLOS 2023) established GPU threads
+submitting NVMe commands through queue pairs mapped into GPU memory, with an
+array abstraction and a GPU-resident software cache. GPU-initiated storage
+access, fine-grained on-demand fetch, and a device-side cache are therefore
+BaM-lineage techniques, not NTA contributions, and the runtime's GPU-initiated
+NVMe path belongs to this primitive class. The anticipated reviewer challenge
+is exact and must be answered head-on: "is the win just GPU-initiated I/O,
+which BaM already provided?"
+
+The recorded answer has two parts. First, the qualifying campaigns to date
+stage from the pinned-host tier; the measured paths contain **no GPU-initiated
+storage I/O at all**, and both arms use the same host-DMA primitive stock
+SGLang uses for load-back. The measured separation is therefore attributable
+to what sits above the transfer: which bytes move, how many rows are resident,
+and how the engine trusts the result. Second, BaM has no concept of a request.
+It exposes a pointer; it has no request lifetimes or generations, no
+retraction or cancellation, no multi-tenant batch, no scheduler consuming
+progress accounting, no admission, and no SLOs. Every safety mechanism this
+project needed — claim identity against pool-row reuse, generation-tagged
+retirement, cancellation fencing across streams, verified consumption — exists
+because a serving engine sits above the transfer, a layer BaM never addresses.
+BaM is cited as the access-primitive lineage; the contribution is the
+engine-trust contract that makes device-decided acquisition consumable by a
+live serving engine.
+
 ### GPU-Owned Remote I/O And Communication
 
 [GORIO](https://arxiv.org/abs/2607.04415) keeps ANNS query evolution, page-miss
@@ -251,6 +278,39 @@ logical-work remapping, a common source descriptor, TMA after staging,
 GPU-initiated submission, priority scheduling, prefetch distance, CTA
 permutation, locality placement, and cache hints are supporting techniques and
 must not be presented as independent contributions.
+
+## Where The Measured Wins Come From (recorded 2026-08-14)
+
+The qualifying campaigns decompose the end-to-end result into ingredients, and
+the paper must attribute each honestly rather than let the composition absorb
+credit for its parts:
+
+- **~16x fewer KV bytes read per decode step** comes from Quest-lineage
+  selection. The selection algorithm is not an NTA contribution; the paper
+  claims only its execution and validation on-device inside a live engine.
+- **Graph-speed decode** comes from SGLang's CUDA graphs. The NTA contribution
+  is capture-compatibility: a decode step whose data identities are chosen
+  during execution could not previously replay under a captured graph
+  (campaign three and four record graphs enabled in both arms).
+- **Transfer primitives** are BaM/HiCache lineage, and the current evidence
+  path uses only pinned-host DMA available to both arms identically.
+- **The NTA contribution is the composition**: bounded admission without dense
+  allocation (external TTFT p95 ratios 0.011x-0.054x across campaigns),
+  device-decided selection the engine can trust (claim table, generations,
+  fenced retirement, quality gates), and capture-compatible consumption
+  (decode TPOT 0.60x stock at the pressure shape). None of the three
+  ingredient systems composes with the others today; the contracts that make
+  the composition legal are the claimed novelty, and the campaign records in
+  `PREREGISTRATION.md` are its evidence.
+
+The empirical closure for this attribution is the host-orchestrated sparse
+baseline (RQ3): the same selection quality with host-side fetch and
+orchestration — the best system buildable from the ingredient lineages without
+the device-side claim chain. If that arm matches the tiered arm, the
+composition claim fails and this document's framing must be withdrawn. The
+co-resident tail is recorded as an honest cost, not hidden: campaign four
+measures resident P99 ITL crossing the absolute 100ms SLO in three of ten
+trials at the load-symmetric shape with graphs enabled.
 
 ## Evidence Needed For A Systems Submission
 
