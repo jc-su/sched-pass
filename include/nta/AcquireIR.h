@@ -18,6 +18,11 @@ inline constexpr llvm::StringLiteral CommitPartialMarker =
 inline constexpr llvm::StringLiteral StreamCommitPartialMarker =
     "__nta_commit_stream_ordered_partial_marker";
 
+inline constexpr llvm::StringLiteral RequirementAddress =
+    "nta_requirement_address";
+inline constexpr llvm::StringLiteral RequirementTensorMap =
+    "nta_requirement_tensor_map";
+
 inline constexpr llvm::StringLiteral RequestLive = "nta_request_live";
 inline constexpr llvm::StringLiteral RequestLiveCta = "nta_request_live_cta";
 inline constexpr llvm::StringLiteral RequestLiveWorkCta =

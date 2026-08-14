@@ -6,6 +6,7 @@
 namespace llvm {
 class CallInst;
 class Function;
+class Instruction;
 } // namespace llvm
 
 namespace nta {
@@ -16,7 +17,7 @@ struct BoundSite {
 };
 
 struct RejectedSite {
-  llvm::CallInst *marker;
+  llvm::Instruction *marker;
   std::string reason;
 };
 

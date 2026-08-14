@@ -11,6 +11,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"
 
 #include <optional>
 #include <string>
@@ -468,6 +469,38 @@ bool isHarmlessPendingInstruction(Instruction &instruction) {
   return isa<PHINode>(instruction);
 }
 
+// Pointer provenance for the staged-consumption legality clause. The walk is
+// deliberately strict: it follows SSA pointer derivation (casts, GEPs, phis,
+// selects) and stops at everything else. A pointer that reaches staged memory
+// through a load or an opaque call does not certify, and the clause rejects
+// it — fail-closed matches the rest of the verifier.
+void collectProvenanceRoots(Value *pointer, SmallPtrSetImpl<Value *> &roots) {
+  SmallVector<Value *, 8> worklist{pointer};
+  SmallPtrSet<Value *, 16> visited;
+  while (!worklist.empty()) {
+    Value *value = worklist.pop_back_val()->stripPointerCasts();
+    if (!visited.insert(value).second) {
+      continue;
+    }
+    if (auto *gep = dyn_cast<GEPOperator>(value)) {
+      worklist.push_back(gep->getPointerOperand());
+      continue;
+    }
+    if (auto *phi = dyn_cast<PHINode>(value)) {
+      for (Value *incoming : phi->incoming_values()) {
+        worklist.push_back(incoming);
+      }
+      continue;
+    }
+    if (auto *select = dyn_cast<SelectInst>(value)) {
+      worklist.push_back(select->getTrueValue());
+      worklist.push_back(select->getFalseValue());
+      continue;
+    }
+    roots.insert(value);
+  }
+}
+
 std::optional<std::string>
 validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
   std::optional<AcquisitionBranch> branch = acquisitionBranch(marker);
@@ -564,6 +597,7 @@ FunctionPlan analyzeAcquisitions(Function &function) {
   SmallVector<CallInst *, 8> deferMarkers;
   SmallVector<CallInst *, 8> partialBeginMarkers;
   SmallVector<CallInst *, 8> partialCommitMarkers;
+  SmallVector<CallInst *, 8> requirementAddressCalls;
 
   for (BasicBlock &block : function) {
     for (Instruction &instruction : block) {
@@ -583,6 +617,9 @@ FunctionPlan analyzeAcquisitions(Function &function) {
         acquireMarkers.push_back(call);
       } else if (hasName(*call, ir::DeferMarker)) {
         deferMarkers.push_back(call);
+      } else if (hasName(*call, ir::RequirementAddress) ||
+                 hasName(*call, ir::RequirementTensorMap)) {
+        requirementAddressCalls.push_back(call);
       } else if (hasName(*call, ir::BeginPartialMarker)) {
         partialBeginMarkers.push_back(call);
       } else if (hasName(*call, ir::CommitPartialMarker) ||
@@ -593,7 +630,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
   }
 
   if (acquireMarkers.empty() && deferMarkers.empty() &&
-      partialBeginMarkers.empty() && partialCommitMarkers.empty()) {
+      partialBeginMarkers.empty() && partialCommitMarkers.empty() &&
+      requirementAddressCalls.empty()) {
     return plan;
   }
 
@@ -624,6 +662,99 @@ FunctionPlan analyzeAcquisitions(Function &function) {
       continue;
     }
     plan.acquisitions.push_back({marker, binding});
+  }
+
+  // Staged-consumption legality clause. Generated operators may dereference
+  // staged rows only through the pointer their acquisition marker returned, or
+  // through nta_requirement_address on the ready edge of the dependency-set
+  // acquisition that staged them. Any other pointer into staged memory skips
+  // the request-liveness and generation checks the marker certifies.
+  for (CallInst *call : requirementAddressCalls) {
+    if (call->arg_size() != 2 || !call->getType()->isPointerTy() ||
+        !call->getArgOperand(0)->getType()->isPointerTy() ||
+        !call->getArgOperand(1)->getType()->isPointerTy()) {
+      plan.rejected.push_back(
+          {call, "requirement address helper has an incompatible ABI"});
+      continue;
+    }
+    SmallPtrSet<Value *, 8> roots;
+    collectProvenanceRoots(call->getArgOperand(1), roots);
+    bool derived = false;
+    bool onReadyEdge = false;
+    for (BoundSite &acquisition : plan.acquisitions) {
+      if (!hasName(*acquisition.marker, ir::AcquireSetMarker) ||
+          acquisition.marker->getArgOperand(ir::SetRuntime) !=
+              call->getArgOperand(0) ||
+          !roots.count(acquisition.marker->getArgOperand(ir::Requirements))) {
+        continue;
+      }
+      derived = true;
+      std::optional<AcquisitionBranch> branch =
+          acquisitionBranch(*acquisition.marker);
+      if (branch.has_value() &&
+          dominatorTree.dominates(branch->ready, call->getParent())) {
+        onReadyEdge = true;
+        break;
+      }
+    }
+    if (!derived) {
+      plan.rejected.push_back(
+          {call, "requirement address does not derive from a bound "
+                 "dependency-set acquisition"});
+    } else if (!onReadyEdge) {
+      plan.rejected.push_back(
+          {call, "requirement address is reachable without its dependency-set "
+                 "acquisition"});
+    }
+  }
+
+  SmallPtrSet<Value *, 8> stagedBases;
+  for (BoundSite &acquisition : plan.acquisitions) {
+    if (hasName(*acquisition.marker, ir::AcquireSetMarker)) {
+      continue;
+    }
+    Value *base =
+        acquisition.marker->getArgOperand(ir::DirectBase)->stripPointerCasts();
+    if (!isNull(base)) {
+      stagedBases.insert(base);
+    }
+  }
+  if (!stagedBases.empty()) {
+    for (BasicBlock &block : function) {
+      for (Instruction &instruction : block) {
+        SmallVector<Value *, 2> accessed;
+        if (auto *load = dyn_cast<LoadInst>(&instruction)) {
+          accessed.push_back(load->getPointerOperand());
+        } else if (auto *store = dyn_cast<StoreInst>(&instruction)) {
+          accessed.push_back(store->getPointerOperand());
+        } else if (auto *rmw = dyn_cast<AtomicRMWInst>(&instruction)) {
+          accessed.push_back(rmw->getPointerOperand());
+        } else if (auto *exchange =
+                       dyn_cast<AtomicCmpXchgInst>(&instruction)) {
+          accessed.push_back(exchange->getPointerOperand());
+        } else if (auto *transfer =
+                       dyn_cast<AnyMemTransferInst>(&instruction)) {
+          accessed.push_back(transfer->getRawDest());
+          accessed.push_back(transfer->getRawSource());
+        } else if (auto *memory = dyn_cast<AnyMemIntrinsic>(&instruction)) {
+          accessed.push_back(memory->getRawDest());
+        }
+        for (Value *pointer : accessed) {
+          SmallPtrSet<Value *, 8> roots;
+          collectProvenanceRoots(pointer, roots);
+          bool bypasses = false;
+          for (Value *root : roots) {
+            bypasses |= stagedBases.count(root) != 0;
+          }
+          if (bypasses) {
+            plan.rejected.push_back(
+                {&instruction,
+                 "staged base is dereferenced outside its acquisition marker"});
+            break;
+          }
+        }
+      }
+    }
   }
 
   for (CallInst *marker : partialBeginMarkers) {

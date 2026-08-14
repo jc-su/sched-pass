@@ -134,6 +134,21 @@ if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
   exit 1
 fi
 
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
+  -S "${source_dir}/requirement-address.ll" \
+  -o "${output_dir}/requirement-address.lowered.ll"
+rg -q 'call i1 @nta_acquire_set_slow' \
+  "${output_dir}/requirement-address.lowered.ll"
+rg -q 'call ptr @nta_requirement_address' \
+  "${output_dir}/requirement-address.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
+  "${output_dir}/requirement-address.lowered.ll"; then
+  echo "lowered requirement-address module still contains an NTA marker" >&2
+  exit 1
+fi
+
 fixtures=(
   "reject-no-binding:no valid request binding dominates acquisition"
   "reject-live-state:pending edge contains state that cannot cross CTA deferral"
@@ -153,6 +168,9 @@ fixtures=(
   "reject-partial-duplicate-commit:partial numerical region publishes more than once"
   "reject-partial-missing-commit:partial numerical region has no publication"
   "reject-partial-commit-wrong-ticket:partial publication is not in a matching numerical region"
+  "reject-requirement-foreign:requirement address does not derive from a bound dependency-set acquisition"
+  "reject-requirement-pending:requirement address is reachable without its dependency-set acquisition"
+  "reject-staged-base-bypass:staged base is dereferenced outside its acquisition marker"
 )
 for entry in "${fixtures[@]}"; do
   fixture=${entry%%:*}
