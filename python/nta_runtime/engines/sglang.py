@@ -1342,11 +1342,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         request_ids = tuple(
             str(value) for value in (getattr(forward_batch, "rids", None) or ())
         )
-        if self.requires_eager_requests(request_ids):
-            raise RuntimeError(
-                "external-prefix requests reached dense CUDA graph replay"
-            )
+        claims_present = self.requires_eager_requests(request_ids)
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        if claims_present and not in_capture:
+            if not self._tiered_graph_replay_fill(forward_batch):
+                raise RuntimeError(
+                    "external-prefix requests reached dense CUDA graph replay"
+                )
         if getattr(self, "_tiered_graph_enabled", False):
             # Outside the recorded region on both paths: point every
             # claim-segment position at the captured plan buffer's tail
@@ -1412,11 +1414,279 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         live = set(request_ids)
         return any(claim.request_id in live for claim in self._tiered_claims.values())
 
+    def tiered_graph_epoch_ready(self, request_ids: tuple[str, ...]) -> bool:
+        """Whether this claim batch can replay under the captured graph."""
+        if not getattr(self, "_tiered_graph_enabled", False):
+            return False
+        if not self._tiered_claims or not request_ids:
+            return False
+        live = {claim.request_id: claim for claim in self._tiered_claims.values()}
+        matched = [live[rid] for rid in request_ids if rid in live]
+        if not matched:
+            return False
+        if len(matched) > self._tg_max_claims:
+            return False
+        for claim in matched:
+            if (
+                not claim.external_sidecar
+                or not getattr(claim, "reuse_cache_complete", False)
+                or claim.refresh_due()
+                or getattr(claim, "bound_nonprefix_index", None) is None
+                or claim.kept_prefix_rows > self._tg_kept_max
+                or claim.verify
+                or claim.verify_fast
+            ):
+                return False
+        return True
+
+    def _tiered_graph_replay_fill(self, forward_batch: Any) -> bool:
+        """Fill the captured plan for a claim epoch; True when armed.
+
+        Per step this is a handful of launches: the compact layout's
+        cumulative sums on the host, one offsets upload, the device
+        compact-plan kernel for peer and remainder rows, a positions
+        recompute, and the wrapper's fast plan. The per-layer claim rows
+        were copied into the static buffers when the epoch was built —
+        the captured per-layer index_copy applies them at replay.
+        """
+        raw_bs = int(
+            getattr(forward_batch, "_nta_raw_batch_size", 0)
+            or len(getattr(forward_batch, "rids", ()) or ())
+        )
+        request_ids = tuple(
+            str(value) for value in (getattr(forward_batch, "rids", None) or ())
+        )
+        padded_bs = len(request_ids)
+        live = {claim.request_id: claim for claim in self._tiered_claims.values()}
+        matched: list[tuple[int, Any]] = []
+        for position, rid in enumerate(request_ids[:raw_bs]):
+            claim = live.get(rid)
+            if claim is not None:
+                matched.append((position, claim))
+        if not matched:
+            return False
+        wrappers = getattr(self, "decode_cuda_graph_metadata", {}).get(
+            padded_bs
+        ) or ()
+        if not wrappers:
+            raise RuntimeError(
+                f"tiered graph replay found no captured wrappers for bs {padded_bs}"
+            )
+        # Stock flashinfer allocates a second wrapper group for sliding
+        # windows; full-attention models route every layer through group
+        # zero, which is also where the captured per-layer copies land.
+        wrapper = wrappers[0]
+        plan_buffer = wrapper._paged_kv_indices_buf
+        device = plan_buffer.device
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            raise RuntimeError("tiered graph replay requires host sequence lengths")
+        kv_lengths = [int(v) for v in seq_lens_cpu[:padded_bs].tolist()]
+        epoch_key = (
+            request_ids,
+            tuple(claim.claim_id for _, claim in matched),
+        )
+        state = getattr(self, "_tg_epoch_state", None)
+        if self._tg_epoch != epoch_key or state is None:
+            layer_count = self._model_layer_count
+            for _, claim in matched:
+                for local_layer in range(layer_count):
+                    rows = claim._selected_row_cache[local_layer]
+                    if rows is None:
+                        return False
+            state = {
+                "bound": [claim.bound_length for _, claim in matched],
+                "np_counts": [
+                    int(claim.bound_nonprefix_index.numel())
+                    for _, claim in matched
+                ],
+                "kept": [claim.kept_prefix_rows for _, claim in matched],
+                "positions": {p for p, _ in matched},
+                "pinned": torch.empty(
+                    2 * padded_bs + 2, dtype=torch.int32, pin_memory=True
+                ),
+                "offsets": torch.empty(
+                    2 * padded_bs + 2, dtype=torch.int32, device=device
+                ),
+                "bound_dev": None,
+            }
+            claim_map = {p: i for i, (p, _) in enumerate(matched)}
+            bound_lengths = []
+            np_offsets = [0]
+            np_pieces = []
+            claim_rows = []
+            for position in range(padded_bs):
+                index = claim_map.get(position)
+                if index is None:
+                    bound_lengths.append(0)
+                    claim_rows.append(0)
+                    np_offsets.append(np_offsets[-1])
+                else:
+                    _, claim = matched[index]
+                    bound_lengths.append(claim.bound_length)
+                    claim_rows.append(claim.kept_prefix_rows)
+                    np_pieces.append(claim.bound_nonprefix_index.to(torch.int32))
+                    np_offsets.append(
+                        np_offsets[-1] + int(claim.bound_nonprefix_index.numel())
+                    )
+            state["bound_dev"] = torch.tensor(
+                bound_lengths, dtype=torch.int32, device=device
+            )
+            state["claim_rows_dev"] = torch.tensor(
+                claim_rows, dtype=torch.int32, device=device
+            )
+            state["np_offsets_dev"] = torch.tensor(
+                np_offsets, dtype=torch.int32, device=device
+            )
+            state["np_indices_dev"] = (
+                torch.cat(np_pieces).contiguous()
+                if np_pieces and np_offsets[-1] > 0
+                else torch.zeros(1, dtype=torch.int32, device=device)
+            )
+            for slot, (_, claim) in enumerate(matched):
+                base = slot * self._tg_kept_max
+                for local_layer in range(self._model_layer_count):
+                    rows = claim._selected_row_cache[local_layer]
+                    self._tg_cats[local_layer, base : base + rows.numel()].copy_(
+                        rows
+                    )
+            self._tg_epoch = epoch_key
+            self._tg_epoch_state = state
+            self._stats["tiered_graph_epochs"] = (
+                self._stats.get("tiered_graph_epochs", 0) + 1
+            )
+        # Per-step: compact layout offsets and the peer/remainder fill.
+        pinned = state["pinned"]
+        pinned[0] = 0
+        pinned[padded_bs + 1] = 0
+        dense = 0
+        compact = 0
+        claim_map = {p: i for i, (p, _) in enumerate(matched)}
+        claim_starts: list[int] = [0] * len(matched)
+        for position in range(padded_bs):
+            index = claim_map.get(position)
+            length = kv_lengths[position]
+            dense += length
+            if index is None:
+                compact += length
+            else:
+                _, claim = matched[index]
+                claim_starts[index] = compact
+                compact += (
+                    claim.kept_prefix_rows
+                    + state["np_counts"][index]
+                    + length
+                    - state["bound"][index]
+                )
+            pinned[position + 1] = dense
+            pinned[padded_bs + 2 + position] = compact
+        if compact > plan_buffer.numel() - self._tg_span:
+            return False
+        state["offsets"].copy_(pinned, non_blocking=True)
+        dense_offsets = state["offsets"][: padded_bs + 1]
+        compact_offsets = state["offsets"][padded_bs + 1 :]
+        phases = self._phase_program(self._nta_demand_decode_wrappers[0])
+        # SGLang's dense fill already wrote the per-request dense rows
+        # into the captured buffer; rebuild it compactly in place from a
+        # dense snapshot region... the dense source must be disjoint from
+        # the compact destination, so stage the dense indices in the
+        # buffer tail beyond the compact region first.
+        dense_total = dense
+        tail_start = plan_buffer.numel() - self._tg_span - dense_total
+        if tail_start <= compact:
+            return False
+        dense_stage = plan_buffer[tail_start : tail_start + dense_total]
+        dense_stage.copy_(plan_buffer[:dense_total])
+        phases.build_compact_plan(
+            dense_stage,
+            dense_offsets,
+            state["bound_dev"],
+            state["np_offsets_dev"],
+            state["np_indices_dev"],
+            state["claim_rows_dev"],
+            compact_offsets,
+            plan_buffer,
+            padded_bs,
+            stream=torch.cuda.current_stream(),
+        )
+        # Claim-row positions for the captured per-layer copies.
+        span_positions = torch.full(
+            (self._tg_span,),
+            plan_buffer.numel() - self._tg_span,
+            dtype=torch.int64,
+            device=device,
+        )
+        cursor = 0
+        for index, (_, claim) in enumerate(matched):
+            kept = claim.kept_prefix_rows
+            start = claim_starts[index]
+            span_positions[
+                index * self._tg_kept_max : index * self._tg_kept_max + kept
+            ] = torch.arange(
+                start, start + kept, dtype=torch.int64, device=device
+            )
+            cursor += kept
+        self._tg_positions.copy_(span_positions)
+        # Re-plan the wrapper with the compact layout.
+        kv_indptr_buf = wrapper._paged_kv_indptr_buf
+        kv_indptr_buf[: padded_bs + 1].copy_(compact_offsets)
+        indptr_cpu = torch.empty(padded_bs + 1, dtype=torch.int32)
+        indptr_cpu[0] = 0
+        for position in range(padded_bs):
+            indptr_cpu[position + 1] = int(pinned[padded_bs + 2 + position])
+        import sglang.srt.layers.attention.flashinfer_backend as fib
+
+        updater = self.indices_updater_decode
+        wrapper.begin_forward(
+            kv_indptr_buf[: padded_bs + 1],
+            plan_buffer,
+            wrapper._paged_kv_last_page_len_buf[:padded_bs],
+            updater.num_qo_heads,
+            updater.num_kv_heads,
+            updater.head_dim,
+            1,
+            data_type=updater.data_type,
+            q_data_type=updater.q_data_type,
+            non_blocking=True,
+            global_override_indptr_cpu=indptr_cpu,
+        )
+        for _, claim in matched:
+            claim.advance_decode_step()
+            claim.layers_served += claim.layer_count
+        layer_count = self._model_layer_count
+        # Replayed steps serve every layer from the cached selections;
+        # the accounting must say so, both for honesty and for the
+        # fail-closed activation gates that demand reuse evidence.
+        self._stats["tiered_selection_reuse_layers"] = self._stats.get(
+            "tiered_selection_reuse_layers", 0
+        ) + layer_count * len(matched)
+        self._stats["tiered_decode_layers"] = (
+            self._stats.get("tiered_decode_layers", 0) + layer_count
+        )
+        self._stats["tiered_fast_layers"] = (
+            self._stats.get("tiered_fast_layers", 0) + layer_count
+        )
+        self._stats["tiered_graph_replay_layers"] = (
+            self._stats.get("tiered_graph_replay_layers", 0) + layer_count
+        )
+        self._stats["tiered_concurrent_claims_max"] = max(
+            self._stats.get("tiered_concurrent_claims_max", 0), len(matched)
+        )
+        self._stats["tiered_graph_replay_batches"] = (
+            self._stats.get("tiered_graph_replay_batches", 0) + 1
+        )
+        return True
+
     def init_forward_metadata_in_graph(self, forward_batch: Any) -> None:
         super().init_forward_metadata_in_graph(forward_batch)
 
     def init_forward_metadata(self, forward_batch: Any) -> None:
         self._cuda_graph_mode = False
+        if getattr(self, "_tiered_graph_enabled", False) and self._tiered_claims:
+            # Any eager tiered step may restage selections; the graph
+            # epoch's static rows would be stale, so it rebuilds on the
+            # next replay.
+            self._tg_epoch = None
         if forward_batch.forward_mode.is_mixed():
             self._stats["mixed_forward_batches"] += 1
             self._stats["mixed_forward_requests"] += len(

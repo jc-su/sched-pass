@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import importlib.metadata
 import json
+import os
 import pathlib
 import random
 import time
@@ -339,7 +340,9 @@ def main() -> int:
         context_length=args.context_length,
         max_total_tokens=args.max_total_tokens,
         max_running_requests=8,
-        cuda_graph_backend_decode="disabled",
+        cuda_graph_backend_decode=os.environ.get(
+            "NTA_QUALITY_CUDA_GRAPH_DECODE", "disabled"
+        ),
         cuda_graph_backend_prefill="disabled",
         chunked_prefill_size=args.context_length,
         enable_mixed_chunk=True,

@@ -176,6 +176,12 @@ def _route_cuda_graph_eligibility(original, runner, forward_batch):
         visited.add(id(backend))
         requires_eager = getattr(backend, "requires_eager_requests", None)
         if callable(requires_eager) and requires_eager(request_ids):
+            epoch_ready = getattr(backend, "tiered_graph_epoch_ready", None)
+            if callable(epoch_ready) and epoch_ready(request_ids):
+                backend._stats["tiered_graph_epoch_batches"] = (
+                    backend._stats.get("tiered_graph_epoch_batches", 0) + 1
+                )
+                continue
             backend._stats["tiered_graph_eager_batches"] = (
                 backend._stats.get("tiered_graph_eager_batches", 0) + 1
             )
