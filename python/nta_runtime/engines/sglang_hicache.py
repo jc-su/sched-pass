@@ -75,7 +75,19 @@ class SglangHiCacheBridge:
         self._pending: dict[int, PendingHostLoad] = {}
         self._owned: dict[int, PendingHostLoad] = {}
         self._next_claim_id = 1
-        self._next_virtual_token = 1 << 30
+        # Fixed-width recyclable ranges instead of a burn-forever cursor: a
+        # soak run's namespace consumption is bounded by live claims, not
+        # lifetime claims. Width must cover the largest external prefix.
+        from nta_runtime.virtual_namespace import VirtualTokenNamespace
+
+        self._virtual_ranges = VirtualTokenNamespace(
+            int(
+                os.environ.get(
+                    "NTA_SGLANG_VIRTUAL_RANGE_TOKENS", str(1 << 17)
+                )
+                or (1 << 17)
+            )
+        )
         self._external_prefix_capacity_rows = 0
         self._external_prefixes: dict[str, Any] = {}
         self._external_live_dense_rows = 0
@@ -142,11 +154,7 @@ class SglangHiCacheBridge:
         node_ids: tuple[int, ...],
     ) -> Any:
         """Allocate virtual identity plus bounded physical staging rows."""
-        from nta_runtime.engines.sglang_external import (
-            ExternalPrefixHandle,
-            VIRTUAL_TOKEN_BASE,
-            VIRTUAL_TOKEN_LIMIT,
-        )
+        from nta_runtime.engines.sglang_external import ExternalPrefixHandle
 
         if not self.external_prefix_enabled:
             raise RuntimeError("external-prefix ownership is disabled")
@@ -190,19 +198,16 @@ class SglangHiCacheBridge:
             allocator.free(staging_rows)
             raise RuntimeError("bounded staging allocator returned malformed rows")
         with self._lock:
-            virtual_begin = self._next_virtual_token
-            virtual_end = virtual_begin + token_count
-            namespace_exhausted = (
-                virtual_begin < VIRTUAL_TOKEN_BASE
-                or virtual_end > VIRTUAL_TOKEN_LIMIT + 1
+            claim_id = self._next_claim_id
+            self._next_claim_id += 1
+        try:
+            virtual_lease, virtual_begin = self._virtual_ranges.acquire(
+                claim_id, token_count
             )
-            if not namespace_exhausted:
-                self._next_virtual_token = virtual_end
-                claim_id = self._next_claim_id
-                self._next_claim_id += 1
-        if namespace_exhausted:
+        except RuntimeError:
             allocator.free(staging_rows)
-            raise RuntimeError("external virtual-token namespace is exhausted")
+            raise
+        virtual_end = virtual_begin + token_count
         try:
             virtual = torch.arange(
                 virtual_begin,
@@ -212,13 +217,9 @@ class SglangHiCacheBridge:
             )
         except Exception:
             # Nothing downstream owns these resources yet; a failure here
-            # must not leak bounded staging rows or burn namespace. The
-            # rollback is best-effort: it only rewinds if no later claim
-            # advanced the cursor past ours.
+            # must not leak bounded staging rows or the leased range.
             allocator.free(staging_rows)
-            with self._lock:
-                if self._next_virtual_token == virtual_end:
-                    self._next_virtual_token = virtual_begin
+            self._virtual_ranges.release(virtual_lease)
             raise
         def registry_release(handle: Any) -> None:
             with self._lock:
@@ -233,6 +234,10 @@ class SglangHiCacheBridge:
                     or self._external_live_staging_rows < 0
                 ):
                     raise RuntimeError("external-prefix capacity accounting underflow")
+            # Runs behind the GPU completion fence with the staging-row
+            # free, so no in-flight device work can observe the recycled
+            # virtual ids.
+            self._virtual_ranges.release(virtual_lease)
 
         handle = ExternalPrefixHandle(
             claim_id=claim_id,
