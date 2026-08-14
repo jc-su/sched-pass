@@ -117,6 +117,45 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Campaign four result (2026-08-14, RQ1 pressure load-symmetric
+  shape — 16 externals x 16,384 x 256 out with eight 4K residents at
+  12/s — seeds 20260901-10 verbatim, graphs enabled in both arms,
+  revision 69c7022, ten of ten trials, artifacts
+  `results/serving/rq1-pressure-trials/`, superseding the eager-stock
+  run of 2026-08-13 at this shape):** the registered goodput ratio has
+  geomean **1.576 [1.351, 1.857]** — the registered bar (geomean >=
+  1.5x with the 95% CI excluding 1.0) **passes against the strongest
+  baseline**, though the margin compresses from the eager-stock 2.084
+  and the interval floor no longer clears 1.5. Capacity separation
+  survives graph-speed stock where P3's queue separation did not:
+  stock's decode roughly doubles in speed under graphs yet still pays
+  the working-set penalty (external TTFT p95 ratio 0.054x; output
+  throughput ratio 2.102 [1.944, 2.239]). The mechanism differs from
+  every prior campaign and is recorded plainly: stock now qualifies 24
+  of 24 in nine of ten trials, so the tiered advantage at this shape is
+  qualified-request *rate*, not count. The resident P99 ITL ratio is
+  **1.547 [1.217, 1.913]** — **fails as registered** (third failure),
+  and worse than the ratio alone: the tiered arm's resident P99 ITL
+  crosses the 100ms SLO absolutely in three of ten trials (102.7,
+  105.5, 118.6ms; full range 64-119ms), disqualifying its own
+  residents (16 of 24 qualify in two trials; nine of 24 in the worst,
+  seed 20260910, where per-request ITL misses extend to externals),
+  while stock crosses once (108.7ms, seed 20260905, its only
+  16-qualified trial). The prior campaigns' statement that resident
+  absolutes remain under the ITL SLO throughout **does not hold at
+  this shape with graphs enabled**; the co-resident tail is an
+  SLO-visible cost here, not only a ratio. Attribution is unchanged —
+  the eager extend forward (~58ms per layer group) interleaving with
+  captured decode sets the interference floor — and capture or
+  chunking of the extend forward is promoted from the identified path
+  below the 1.05x ratio to the identified path below the absolute SLO.
+  All ten trials report exact output parity (the divergence flag was
+  armed and never tripped), all mechanism gates pass, evidence grade
+  qualified. Trial one (seed 20260901) was banked before a host
+  interruption (a root-owned job seized GPU memory mid-campaign);
+  trials two through ten ran after a GPU-availability gate on the same
+  revision, with the seed-verified resume validating classification,
+  seed, and arm order.
 - **Campaign three result (2026-08-14, P3 shape, seeds verbatim, graphs
   enabled in both arms, revision 4707d7c, ten of ten trials):** the
   registered goodput ratio has geomean **1.251 [1.120, 1.465]** — the
