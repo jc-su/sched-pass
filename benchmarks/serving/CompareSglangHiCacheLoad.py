@@ -10,6 +10,7 @@ import pathlib
 import random
 import subprocess
 import sys
+import time
 from typing import Any
 
 from CompareSglangHiCache import require_clean_mechanism
@@ -107,6 +108,44 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _wait_for_free_gpu(limit_mib: int = 8000, timeout_s: float = 600.0) -> None:
+    """Block until GPU memory drops below limit_mib.
+
+    The previous arm's scheduler subprocesses release device memory a few
+    seconds after their parent exits, and co-tenant jobs on the shared box come
+    and go; launching a server into that window fails its memory profile with a
+    misleading mem-fraction error. Startup ordering only — no timed phase has
+    begun when this runs.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        probe = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        try:
+            used_mib = max(
+                int(line) for line in probe.stdout.split() if line.strip()
+            )
+        except ValueError:
+            used_mib = None
+        if probe.returncode == 0 and used_mib is not None:
+            if used_mib < limit_mib:
+                return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"GPU memory still at {used_mib} MiB after {timeout_s:.0f}s; "
+                "refusing to launch a serving arm into an occupied device"
+            )
+        time.sleep(5.0)
+
+
 def _report(output: str) -> dict[str, Any]:
     for line in reversed(output.splitlines()):
         try:
@@ -191,6 +230,7 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
                 "NTA_SGLANG_INCREMENTAL_SETUP_NS": str(args.incremental_setup_ns),
             }
         )
+    _wait_for_free_gpu()
     completed = subprocess.run(
         command,
         cwd=ROOT,
