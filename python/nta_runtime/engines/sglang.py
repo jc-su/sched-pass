@@ -1571,6 +1571,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 compact += length
             else:
                 _, claim = matched[index]
+                if length < state["bound"][index]:
+                    # A shrunken table below the bound prefix would make
+                    # the remainder negative and the indptr garbage;
+                    # decline to the eager path, which raises with the
+                    # full diagnostic.
+                    return False
                 claim_starts[index] = compact
                 compact += (
                     claim.kept_prefix_rows
@@ -1582,7 +1588,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             pinned[padded_bs + 2 + position] = compact
         if compact > plan_buffer.numel() - self._tg_span:
             return False
-        state["offsets"].copy_(pinned, non_blocking=True)
+        # Synchronous by design: the pinned staging buffer is rewritten
+        # every step, and with graph replay the host runs several steps
+        # ahead of the GPU — an async upload here races the rewrite
+        # (observed as an illegal access that CUDA_LAUNCH_BLOCKING hides).
+        state["offsets"].copy_(pinned)
         dense_offsets = state["offsets"][: padded_bs + 1]
         compact_offsets = state["offsets"][padded_bs + 1 :]
         phases = self._phase_program(self._nta_demand_decode_wrappers[0])

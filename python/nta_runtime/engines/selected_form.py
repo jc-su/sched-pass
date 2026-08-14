@@ -942,7 +942,10 @@ class SelectedAttentionExecutor:
             pinned[batch_size + 2 + index] = compact
         if dense != total:
             raise RuntimeError("compact-plan dense lengths disagree with the plan")
-        state["offsets"].copy_(pinned, non_blocking=True)
+        # Synchronous for the same pinned-reuse race the graph path hit:
+        # the buffer is rewritten next step while an async upload may
+        # still be in flight.
+        state["offsets"].copy_(pinned)
         phases = engine._phase_program(engine._nta_demand_decode_wrappers[0])
         phases.build_compact_plan(
             wrapper._paged_kv_indices_buf,
