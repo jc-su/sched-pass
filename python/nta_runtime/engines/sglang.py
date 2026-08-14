@@ -1260,6 +1260,46 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
     def init_cuda_graph_state(self, *args: Any, **kwargs: Any) -> None:
         super().init_cuda_graph_state(*args, **kwargs)
+        self._tiered_graph_enabled = (
+            self._tiered_enabled
+            and os.environ.get("NTA_SGLANG_TIERED_GRAPH") == "1"
+        )
+        if not self._tiered_graph_enabled:
+            return
+        # Static claim-segment buffers baked into every decode graph: per
+        # layer one index_copy applies the current epoch's claim rows to
+        # the captured plan buffer before attention. With no claims the
+        # positions target a scratch tail and the copies are harmless,
+        # so one graph serves dense and tiered batches alike — no
+        # capture-time variants, no runtime re-capture.
+        executor = self._selected_executor
+        table = getattr(self, "_claim_table", None)
+        max_claims = (
+            table.max_claims
+            if table is not None
+            else _positive_environment("NTA_SGLANG_MAX_CLAIMS", 32)
+        )
+        kept_max = (executor.budget_pages + 2) * executor.page_tokens
+        device = torch.device("cuda")
+        self._tg_max_claims = max_claims
+        self._tg_kept_max = kept_max
+        self._tg_span = max_claims * kept_max
+        self._tg_cats = torch.zeros(
+            (self._model_layer_count, self._tg_span),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tg_positions = torch.zeros(
+            self._tg_span, dtype=torch.int64, device=device
+        )
+        # Absent-claim and dense-batch copies land in the tail of the
+        # wrapper's own captured indices buffer (index_copy targets one
+        # tensor, so the scratch region must live inside it); replay and
+        # capture fill positions accordingly once the buffer is known.
+        self._tg_epoch: tuple[Any, ...] | None = None
+        self._stats["tiered_graph_state_bytes"] = int(
+            self._tg_cats.numel() * 4 + self._tg_positions.numel() * 8
+        )
 
     def _bind_forward_requests(
         self, forward_batch: Any, *, allow_capture_ids: bool
@@ -1299,12 +1339,35 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self, forward_batch: Any, in_capture: bool = False
     ) -> None:
         self._cuda_graph_mode = True
-        request_ids = tuple(str(value) for value in getattr(forward_batch, "rids", ()))
+        request_ids = tuple(
+            str(value) for value in (getattr(forward_batch, "rids", None) or ())
+        )
         if self.requires_eager_requests(request_ids):
             raise RuntimeError(
                 "external-prefix requests reached dense CUDA graph replay"
             )
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        if getattr(self, "_tiered_graph_enabled", False):
+            # Outside the recorded region on both paths: point every
+            # claim-segment position at the captured plan buffer's tail
+            # so the in-graph copies are harmless for dense batches; a
+            # tiered replay epoch overwrites these with live positions.
+            wrappers = getattr(
+                self.forward_metadata, "decode_wrappers", None
+            ) or ()
+            for wrapper in wrappers:
+                plan_buffer = getattr(wrapper, "_paged_kv_indices_buf", None)
+                if plan_buffer is not None and plan_buffer.numel() > self._tg_span:
+                    tail = plan_buffer.numel() - self._tg_span
+                    torch.arange(
+                        tail,
+                        tail + self._tg_span,
+                        dtype=torch.int64,
+                        device=self._tg_positions.device,
+                        out=self._tg_positions,
+                    )
+                    self._tg_epoch = None
+                    break
         bindings = self._bind_forward_requests(
             forward_batch, allow_capture_ids=in_capture
         )
@@ -3580,6 +3643,16 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "NTA graph replay requires a compiler-transformed FlashInfer wrapper"
             )
         self._phase_program(wrapper)
+        if getattr(self, "_tiered_graph_enabled", False):
+            plan_buffer = getattr(wrapper, "_paged_kv_indices_buf", None)
+            if plan_buffer is not None and plan_buffer.numel() > self._tg_span:
+                # Captured claim-segment application: the epoch's rows for
+                # this layer land at the positions filled outside the
+                # graph; a dense epoch points every position at the
+                # buffer tail, making this a harmless fixed-shape copy.
+                plan_buffer.index_copy_(
+                    0, self._tg_positions, self._tg_cats[local_layer]
+                )
         runtime_tensor = self._runtime.device_view_tensor
         request_slots = tuple(binding.request_slot for binding in batch.bindings)
         if not request_slots or request_slots != tuple(
