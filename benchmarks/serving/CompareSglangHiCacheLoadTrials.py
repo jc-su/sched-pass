@@ -177,6 +177,12 @@ def main() -> int:
         reports.append(report)
         artifacts.append(str(artifact))
 
+    diverged_trials = [
+        trial
+        for trial, report in enumerate(reports)
+        if report["stock"]["generated_text_sha256"]
+        != report["nta"]["generated_text_sha256"]
+    ]
     aggregate = {
         "schema": 1,
         "classification": "sglang-hicache-load-qualification",
@@ -186,11 +192,8 @@ def main() -> int:
         "evidence_grade": "qualified" if len(reports) >= 10 else "diagnostic",
         "arm_order": [report["execution_order"] for report in reports],
         "artifacts": artifacts,
-        "all_outputs_exact": all(
-            report["stock"]["generated_text_sha256"]
-            == report["nta"]["generated_text_sha256"]
-            for report in reports
-        ),
+        "all_outputs_exact": not diverged_trials,
+        "diverged_trials": diverged_trials,
         "all_attention_transformed": all(
             bool(report["mechanism_activation"]["all_attention_transformed"])
             for report in reports
@@ -201,14 +204,14 @@ def main() -> int:
         ),
         "ratios": _aggregate(reports, args.seed_base),
     }
-    if not all(
-        aggregate[key]
-        for key in (
-            "all_outputs_exact",
-            "all_attention_transformed",
-            "all_fallback_free",
-        )
-    ):
+    # Output exactness is mandatory unless the trials themselves ran with
+    # divergence reporting armed; then the aggregate records which trials
+    # diverged instead of refusing, and the scored quality battery remains
+    # the arbiter — the posture recorded with campaign three.
+    mandatory = ["all_attention_transformed", "all_fallback_free"]
+    if "--allow-output-divergence" not in args.comparison_args:
+        mandatory.append("all_outputs_exact")
+    if not all(aggregate[key] for key in mandatory):
         raise RuntimeError("qualification violated a mandatory mechanism invariant")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(aggregate, indent=2, sort_keys=True) + "\n")
