@@ -402,12 +402,32 @@ def main() -> int:
         int(entry.get("tiered_device_compaction_launches", 0))
         for entry in stats
     )
+    host_orchestrated = any(
+        int(entry.get("host_orchestrated_mode", 0)) for entry in stats
+    )
+    host_orchestrated_syncs = sum(
+        int(entry.get("tiered_host_orchestrated_syncs", 0)) for entry in stats
+    )
     if args.batch_mode == "coalesced" and tiered_layers > 0:
         # Tiered serving coalesces every claimed and resident request into
         # one compact plan per layer; its witnesses are the served tiered
         # layers and device selection compaction, not the demand-acquire
-        # overlap counters.
-        if tiered_compaction == 0:
+        # overlap counters. The RQ3 host-orchestrated arm inverts them:
+        # host round-trips must have happened, device compaction must not.
+        if host_orchestrated:
+            if host_orchestrated_syncs == 0 or tiered_compaction != 0:
+                _write_failed_comparison(
+                    args.output,
+                    reports,
+                    order,
+                    "host-orchestrated arm witnesses are impure",
+                )
+                raise RuntimeError(
+                    "host-orchestrated trial witnesses are impure "
+                    f"(syncs={host_orchestrated_syncs}, "
+                    f"device_compaction={tiered_compaction})"
+                )
+        elif tiered_compaction == 0:
             _write_failed_comparison(
                 args.output,
                 reports,
