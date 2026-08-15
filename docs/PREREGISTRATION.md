@@ -117,6 +117,37 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **P4 campaign result (2026-08-15, P3 shape at Poisson 1.5/s per
+  Amendment 4, seeds 20260901-10 verbatim, graphs enabled in both arms,
+  revision 4054c75, ten of ten trials, artifacts
+  `results/serving/p4-trials/`):** Amendment 4's arrival arithmetic
+  held — at 1.5/s the graph-stock queue diverges again (external TTFT
+  p95 ratio 0.0169; stock qualification drops below 25) — but the
+  registered goodput ratio has geomean **1.4215 [1.3055, 1.5219]**: the
+  1.5x bar **fails as registered**, missed by 0.08 with the interval
+  upper bound brushing the bar. Separation is real and consistent
+  (every trial above 1.03, eight of ten at 1.30-1.62) yet compressed:
+  queue divergence restores the direction P3 lost, and graph-speed
+  service keeps stock's qualified rate high enough that the geomean
+  lands at 1.42, not 1.5. The resident P99 ITL ratio is **1.0964
+  [1.0082, 1.1995]** — **fails as registered** by 0.046, the closest of
+  any campaign (1.557, 1.321, 1.547, then 1.096), with five of ten
+  trials at or below 1.02 and absolutes near 20ms against the 100ms
+  SLO. One of ten trials (seed 20260910) records output divergence
+  under the armed flag (near-tie flips under graph float reordering;
+  the scored battery remains the quality arbiter). Two operational
+  notes recorded for reproducibility: the campaign was twice interrupted
+  before its first trial by a co-tenant job seizing the whole GPU (a
+  startup wait-gate landed as revision 4054c75 before the qualifying
+  run; a corrupted-revision launch earlier the same evening was killed
+  before any artifact banked), and the qualification aggregate was
+  recomputed from the banked artifacts after commit 2ce9aa2 taught it
+  to record armed divergence instead of refusing — no ratio changed.
+  The cross-shape record now reads: goodput clears its bar against
+  graph-stock only at the capacity shape (1.576); queue shapes show
+  direction without the registered margin (1.251 at 0.9/s, 1.421 at
+  1.5/s); external TTFT dominates by 20-60x everywhere; resident tails
+  run parity-to-1.5x by shape and remain the open bar.
 - **Campaign four result (2026-08-14, RQ1 pressure load-symmetric
   shape — 16 externals x 16,384 x 256 out with eight 4K residents at
   12/s — seeds 20260901-10 verbatim, graphs enabled in both arms,
