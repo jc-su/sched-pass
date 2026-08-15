@@ -291,11 +291,43 @@ def require_clean_mechanism(
         int(entry.get("tiered_device_compaction_launches", 0))
         for entry in stats
     )
+    host_orchestrated_layers = sum(
+        int(entry.get("tiered_host_orchestrated_layers", 0)) for entry in stats
+    )
+    host_orchestrated_mode = any(
+        int(entry.get("host_orchestrated_mode", 0)) for entry in stats
+    )
+    if host_orchestrated_mode != (host_orchestrated_layers > 0) and (
+        tiered_batches > 0
+    ):
+        raise RuntimeError(
+            "host-orchestrated mode flag and staging witnesses disagree "
+            f"(mode={host_orchestrated_mode}, "
+            f"layers={host_orchestrated_layers})"
+        )
     if require_physical_compaction and tiered_batches > 0:
+        if host_orchestrated_mode:
+            # RQ3 baseline B1: the arm's purity witnesses are the inverse of
+            # the device chain's — host round-trips must have happened and
+            # device compaction must not have.
+            syncs = sum(
+                int(entry.get("tiered_host_orchestrated_syncs", 0))
+                for entry in stats
+            )
+            if syncs == 0:
+                raise RuntimeError(
+                    "host-orchestrated trial recorded no host round-trips "
+                    f"({_mechanism_summary()})"
+                )
+            if tiered_compaction != 0:
+                raise RuntimeError(
+                    "host-orchestrated trial ran device selection compaction "
+                    f"({tiered_compaction} launches; the arm is not pure)"
+                )
         # Tiered serving compacts selections on device per staging layer;
         # the incremental resume-CTA identity below belongs to the
         # demand-acquire path.
-        if tiered_compaction == 0:
+        elif tiered_compaction == 0:
             raise RuntimeError(
                 "tiered trial never ran device selection compaction "
                 f"({_mechanism_summary()})"

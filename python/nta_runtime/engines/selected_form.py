@@ -599,8 +599,12 @@ class SelectedAttentionExecutor:
                 selected_rows = None if prefill else claim.cached_selected_rows(
                     local_layer
                 )
+                host_orchestrated = bool(
+                    getattr(engine, "_host_orchestrated", False)
+                )
                 if selected_rows is None and (
                     prefill
+                    and not host_orchestrated
                     and claim.external_sidecar
                     and not claim.verify
                     and not claim.verify_fast
@@ -629,7 +633,31 @@ class SelectedAttentionExecutor:
                     )
                 elif selected_rows is None:
                     free = claim.choose_free_pages(local_layer, queries, group_size)
-                    if (
+                    if host_orchestrated and claim.external_sidecar:
+                        # RQ3 baseline B1: identical selection and transfer,
+                        # orchestration through the host control edge. The
+                        # device claim chain (fused selection, table prep,
+                        # wavefront extend) is bypassed entirely.
+                        selected_rows = claim.stage_layer_host_orchestrated(
+                            engine, local_layer, free, stream
+                        )
+                        fallback_state = self._compact_plan_state
+                        if fallback_state is not None:
+                            fallback_state.get("layer_cats", {}).pop(
+                                local_layer, None
+                            )
+                        claim.remember_selected_rows(local_layer, selected_rows)
+                        if claim.verify:
+                            positions = claim.kept_prefix_positions(free)
+                            claim._verify_layer(
+                                local_layer,
+                                positions,
+                                int(positions.numel()),
+                                physical_rows=selected_rows,
+                            )
+                        elif claim.verify_fast:
+                            verify_targets.append((claim, free, selected_rows))
+                    elif (
                         not prefill
                         and claim.external_sidecar
                         and getattr(claim, "table_backed", False)

@@ -762,6 +762,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "NTA_SGLANG_SELECTED_TIERED requires a selected budget and "
                 "NTA_SGLANG_SELECTED_SERVE=1"
             )
+        # RQ3 baseline B1: identical selection, admission, and transfer, but
+        # every staging decision routes through a host round-trip instead of
+        # the device claim chain. The flag lands in the stats so artifacts
+        # record which arm produced them.
+        self._host_orchestrated = (
+            os.environ.get("NTA_SGLANG_HOST_ORCHESTRATED") == "1"
+        )
+        if self._host_orchestrated:
+            if not self._tiered_enabled:
+                raise RuntimeError(
+                    "NTA_SGLANG_HOST_ORCHESTRATED requires "
+                    "NTA_SGLANG_SELECTED_TIERED=1"
+                )
+            self._stats["host_orchestrated_mode"] = 1
         self._tiered_object_ranges = (
             FixedRangePool(
                 self._object_capacity,
