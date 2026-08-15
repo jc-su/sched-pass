@@ -312,6 +312,23 @@ co-resident tail is recorded as an honest cost, not hidden: campaign four
 measures resident P99 ITL crossing the absolute 100ms SLO in three of ten
 trials at the load-symmetric shape with graphs enabled.
 
+**First measurement (2026-08-15, flagship point):** the host-orchestrated arm
+was built with everything held identical — selection algorithm and budget,
+bounded admission, transfer primitive, graph replay between refreshes — except
+that staging control runs through the host round-trip a BaM-style system
+requires. Validated before measurement: quality parity (multikey and needle
+1.0 on both arms), byte-exact staging (2,844 host-staged layers verified
+against pinned host sources, zero mismatches), and purity witnesses enforced
+in both directions. At the capacity shape with refresh interval 1024 (five
+paired trials, same registered seeds as the device arm's ten): host-orchestrated
+goodput geomean is **0.529x the device chain's** (3.24 versus 6.13 requests
+per second), and **~0.94x dense stock** (per-trial 0.80-1.04). The measured
+sentence for the reviewer: raw fetch plus host orchestration approximately
+matches dense serving; the device-side claim chain doubles goodput on top of
+it. The refresh-interval ladder (32) is in flight; the device arm itself
+exposed a graph/eager-boundary crash at refresh 32 that is being fixed and
+recorded rather than hidden.
+
 ## Evidence Needed For A Systems Submission
 
 1. A matched vLLM or SGLang integration with real prefill/decode batches,
