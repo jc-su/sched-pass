@@ -11,6 +11,9 @@ _RELEASE_TARGET = "sglang.srt.managers.scheduler.Scheduler.release_host_resource
 _HICACHE_LOAD_TARGET = (
     "sglang.srt.managers.cache_controller.HiCacheController.start_loading"
 )
+_HICACHE_WRITE_TARGET = (
+    "sglang.srt.managers.cache_controller.HiCacheController.write"
+)
 _ABORT_TARGET = "sglang.srt.managers.scheduler.Scheduler.abort_request"
 _REQUEST_FINISH_TARGET = (
     "sglang.srt.managers.scheduler_components.batch_result_processor."
@@ -205,7 +208,10 @@ def register() -> None:
         add_attention_backend_choices,
     )
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-    from nta_runtime.engines.sglang_hicache import route_start_loading
+    from nta_runtime.engines.sglang_hicache import (
+        route_start_loading,
+        route_write,
+    )
     from nta_runtime.engines.sglang_external import (
         route_allocator_free,
         route_cache_finished,
@@ -226,6 +232,11 @@ def register() -> None:
     if not any(hook is route_start_loading for _, hook, _ in hicache_hooks):
         HookRegistry.register(
             _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
+        )
+    write_hooks = HookRegistry._hooks[_HICACHE_WRITE_TARGET]
+    if not any(hook is route_write for _, hook, _ in write_hooks):
+        HookRegistry.register(
+            _HICACHE_WRITE_TARGET, route_write, HookType.AROUND
         )
     abort_hooks = HookRegistry._hooks[_ABORT_TARGET]
     if not any(hook is _cancel_backend_requests for _, hook, _ in abort_hooks):

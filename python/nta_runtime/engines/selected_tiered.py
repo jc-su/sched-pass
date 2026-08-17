@@ -134,6 +134,37 @@ class TieredClaim:
         cache_entry = None if (verify or verify_fast or cache is None) else cache.get(
             cache_key
         )
+        if cache_entry is None and not (verify or verify_fast):
+            # Writeback-time envelopes: recorded when this prefix's KV
+            # moved to the host tier, validated against the exact host
+            # rows the claim sees now, and consumed for one small H2D
+            # copy instead of a multi-gigabyte scan. Any gap falls back
+            # to the scan below and is counted.
+            gathered = self._writeback_envelopes(engine, device)
+            if gathered is not None:
+                # Feed the ordinary cache-hit branch below: it unpacks the
+                # entry, waits the readiness event, and does the avoided-
+                # bytes accounting exactly once.
+                gathered_min, gathered_max = gathered
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(device))
+                entry_bytes = (
+                    gathered_min.numel() * gathered_min.element_size()
+                    + gathered_max.numel() * gathered_max.element_size()
+                )
+                cache_entry = (gathered_min, gathered_max, ready, entry_bytes)
+                if cache is not None:
+                    cache[cache_key] = cache_entry
+                    order = getattr(engine, "_tiered_summary_cache_order", None)
+                    if order is not None:
+                        order.append(cache_key)
+                engine._stats["tiered_summary_writeback_hits"] = (
+                    engine._stats.get("tiered_summary_writeback_hits", 0) + 1
+                )
+            elif os.environ.get("NTA_SGLANG_WRITEBACK_SUMMARIES") == "1":
+                engine._stats["tiered_summary_writeback_misses"] = (
+                    engine._stats.get("tiered_summary_writeback_misses", 0) + 1
+                )
         summary_stream = (
             None
             if (
@@ -463,6 +494,37 @@ class TieredClaim:
         ]
         self._earliest_stage_step: int | None = None
         self.reuse_cache_complete = False
+
+    def _writeback_envelopes(
+        self, engine: Any, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Gather writeback-recorded envelopes for this claim, if whole."""
+        if os.environ.get("NTA_SGLANG_WRITEBACK_SUMMARIES") != "1":
+            return None
+        controller = self.pending.controller
+        from nta_runtime.engines.sglang_hicache import find_bridge
+
+        bridge = find_bridge(controller.mem_pool_device)
+        if bridge is None:
+            return None
+        store = bridge.writeback_summary_store(controller)
+        if store is None or store.page_tokens != self.page_tokens:
+            return None
+        node_ids = tuple(getattr(self.pending, "node_ids", ()) or ())
+        gathered = store.gather(
+            node_ids,
+            self.host_rows_cpu,
+            self.layer_count,
+            self.pages,
+            self.token_count,
+        )
+        if gathered is None:
+            return None
+        kmin, kmax = gathered
+        return (
+            kmin.to(device, non_blocking=False),
+            kmax.to(device, non_blocking=False),
+        )
 
     def _summary_cache_key(
         self, pending: Any, host_pool: Any, start_layer: int, summary_path: str
