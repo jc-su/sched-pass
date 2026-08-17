@@ -169,6 +169,16 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
+    NAME nta-summary-store
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/summary_store.py
+  )
+  set_tests_properties(
+    nta-summary-store PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
     NAME nta-virtual-ranges
     COMMAND
       ${Python3_EXECUTABLE}

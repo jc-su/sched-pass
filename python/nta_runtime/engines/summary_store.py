@@ -38,21 +38,20 @@ class WritebackSummaryStore:
             raise RuntimeError("summary store needs a positive byte budget")
         self.page_tokens = page_tokens
         self.capacity_bytes = capacity_bytes
-        self._entries: dict[
-            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
-        ] = {}
-        # Content index: each recorded page is reachable by the tuple of
-        # its host-row ids. Radix node ids do not survive tree splits, but
-        # a page's host rows do — the key is simultaneously the identity
-        # check, so a host-pool reshuffle simply stops matching.
-        self._page_index: dict[tuple[int, ...], tuple[int, int]] = {}
-        # Row locator: any recorded host row resolves to its (node, page).
-        # A claim's page grid can be phase-shifted from the sequence grid
-        # (its host rows start after the device-resident prefix), so a
-        # claim page's sixteen consecutive rows fall inside at most two
-        # consecutive recorded pages; the elementwise min/max of those two
-        # envelopes is a valid, slightly looser bound for the page.
-        self._row_locator: dict[int, tuple[int, int]] = {}
+        self._entries: dict[int, tuple[torch.Tensor, int]] = {}
+        # Vectorized location: a flat host-row -> pool-slot table plus one
+        # preallocated envelope pool make a claim's whole gather two torch
+        # ops (an indexed load and a min/max reduction over each page's
+        # sixteen rows' covering envelopes) instead of a Python loop that
+        # stalled the scheduler ~90ms per claim in the P4-second campaign.
+        # The per-row union equals the per-covering-page union bound.
+        self._row_slots: torch.Tensor | None = None
+        self._pool_min: torch.Tensor | None = None
+        self._pool_max: torch.Tensor | None = None
+        self._pool_free: list[int] = []
+        self._pool_capacity = 0
+        self._node_slots: dict[int, list[int]] = {}
+        self._table_rows = 1 << 21
         self._order: list[int] = []
         self._bytes = 0
         self._lock = threading.Lock()
@@ -60,7 +59,6 @@ class WritebackSummaryStore:
         self.evicted_nodes = 0
         self.miss_reasons: dict[str, int] = {}
         self.offset_counts: dict[int, int] = {}
-        self._rows_recorded: set[int] = set()
 
     def record(
         self,
@@ -115,8 +113,9 @@ class WritebackSummaryStore:
                 return
             boundary_rows = torch.tensor(tail, dtype=torch.int64)
         covered = pages * self.page_tokens - boundary
+        pool_device = device_pool._get_key_buffer(layer_ids[0]).device
         rows = device_indices[:covered].to(
-            device="cuda", dtype=torch.long, non_blocking=False
+            device=pool_device, dtype=torch.long, non_blocking=False
         )
         minima: list[torch.Tensor] = []
         maxima: list[torch.Tensor] = []
@@ -143,46 +142,80 @@ class WritebackSummaryStore:
             + kmax.numel() * kmax.element_size()
             + host_rows.numel() * host_rows.element_size()
         )
-        host_rows_list = host_rows.tolist()
+        if int(host_rows.max()) >= self._table_rows or int(host_rows.min()) < 0:
+            self.miss_reasons["record_row_out_of_range"] = (
+                self.miss_reasons.get("record_row_out_of_range", 0) + 1
+            )
+            return
         with self._lock:
             self._drop(node_id)
             while self._bytes + entry_bytes > self.capacity_bytes and self._order:
                 self._drop(self._order[0])
                 self.evicted_nodes += 1
-            self._entries[node_id] = (host_rows, kmin, kmax, entry_bytes)
+            self._ensure_pool(kmin.shape[0], kmin.shape[2:], pages)
+            slots = [self._pool_free.pop() for _ in range(pages)]
+            slot_tensor = torch.tensor(slots, dtype=torch.int64)
+            self._pool_min[:, slot_tensor] = kmin
+            self._pool_max[:, slot_tensor] = kmax
+            page_rows = host_rows.view(pages, self.page_tokens)
+            self._row_slots[page_rows.reshape(-1)] = slot_tensor.to(
+                torch.int32
+            ).repeat_interleave(self.page_tokens)
+            self._entries[node_id] = (host_rows, entry_bytes)
             self._order.append(node_id)
             self._bytes += entry_bytes
-            for page in range(pages):
-                key = tuple(
-                    host_rows_list[
-                        page * self.page_tokens : (page + 1) * self.page_tokens
-                    ]
-                )
-                self._page_index[key] = (node_id, page)
-                self._rows_recorded.update(key)
-                for row in key:
-                    self._row_locator[row] = (node_id, page)
+            self._node_slots[node_id] = slots
             self.recorded_nodes += 1
+
+    def _ensure_pool(
+        self,
+        layer_count: int,
+        envelope_shape: torch.Size,
+        pages_needed: int,
+    ) -> None:
+        if self._row_slots is None:
+            self._row_slots = torch.full(
+                (self._table_rows,), -1, dtype=torch.int32
+            )
+        while (
+            self._pool_min is None
+            or len(self._pool_free) < pages_needed
+        ):
+            grown = 4096 if self._pool_min is None else self._pool_capacity
+            begin = self._pool_capacity
+            new_min = torch.zeros(
+                (layer_count, self._pool_capacity + grown, *envelope_shape),
+                dtype=torch.float32,
+            )
+            new_max = torch.zeros_like(new_min)
+            if self._pool_min is not None:
+                new_min[:, : self._pool_capacity] = self._pool_min
+                new_max[:, : self._pool_capacity] = self._pool_max
+            self._pool_min = new_min
+            self._pool_max = new_max
+            self._pool_capacity += grown
+            self._pool_free.extend(range(begin, self._pool_capacity))
 
     def _drop(self, node_id: int) -> None:
         entry = self._entries.pop(node_id, None)
         if entry is None:
             return
-        self._bytes -= entry[3]
+        self._bytes -= entry[1]
         self._order.remove(node_id)
-        host_rows_list = entry[0].tolist()
-        pages = len(host_rows_list) // self.page_tokens
-        for page in range(pages):
-            key = tuple(
-                host_rows_list[
-                    page * self.page_tokens : (page + 1) * self.page_tokens
-                ]
+        slots = self._node_slots.pop(node_id, [])
+        if slots and self._row_slots is not None:
+            rows = entry[0]
+            slot_tensor = torch.tensor(slots, dtype=torch.int32)
+            current = self._row_slots[rows]
+            owned = (
+                current.view(len(slots), self.page_tokens)
+                == slot_tensor.unsqueeze(1)
+            ).reshape(-1)
+            cleared = torch.where(
+                owned, torch.full_like(current, -1), current
             )
-            if self._page_index.get(key, (None, None))[0] == node_id:
-                self._page_index.pop(key, None)
-            for row in key:
-                if self._row_locator.get(row, (None, None))[0] == node_id:
-                    self._row_locator.pop(row, None)
+            self._row_slots[rows] = cleared
+        self._pool_free.extend(slots)
 
     @property
     def stored_bytes(self) -> int:
@@ -199,12 +232,11 @@ class WritebackSummaryStore:
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Assemble a claim's envelopes; None means fall back to the scan.
 
-        Each claim page resolves through the row locator to the one or two
-        consecutive recorded pages containing its rows; a single covering
-        page yields the exact envelope, two yield their elementwise union
-        — a valid, looser bound whose quality effect the scored battery
-        gates. Content identity is enforced by requiring every claim row
-        to sit inside the covering pages' recorded rows.
+        Two torch ops: the slot table maps every full-page row to its
+        newest covering envelope, and a min/max reduction over each claim
+        page's sixteen rows takes their union — a valid, slightly looser
+        bound at grid-phase boundaries, quality-gated by the scored
+        battery. Any unmapped row misses the whole claim, fail-closed.
         """
         del node_ids  # node identity does not survive radix splits
         if pages <= 0:
@@ -212,65 +244,50 @@ class WritebackSummaryStore:
                 self.miss_reasons.get("no_pages", 0) + 1
             )
             return None
-        host_rows_list = host_rows_cpu.tolist()
         full_pages = token_count // self.page_tokens
-        kmin: torch.Tensor | None = None
-        kmax: torch.Tensor | None = None
-        with self._lock:
-            for page in range(full_pages):
-                rows = host_rows_list[
-                    page * self.page_tokens : (page + 1) * self.page_tokens
-                ]
-                covering: list[tuple[int, int]] = []
-                located_all = True
-                for row in rows:
-                    located = self._row_locator.get(row)
-                    if located is None:
-                        located_all = False
-                        break
-                    if located not in covering:
-                        covering.append(located)
-                if not located_all:
-                    self.miss_reasons["page_rows_never_recorded"] = (
-                        self.miss_reasons.get("page_rows_never_recorded", 0)
-                        + 1
-                    )
-                    return None
-                for node_id, _ in covering:
-                    entry = self._entries.get(node_id)
-                    if entry is None or entry[1].shape[0] != layer_count:
-                        self.miss_reasons["entry_shape"] = (
-                            self.miss_reasons.get("entry_shape", 0) + 1
-                        )
-                        return None
-                if kmin is None:
-                    reference = self._entries[covering[0][0]][1]
-                    kmin = torch.zeros(
-                        (layer_count, pages, *reference.shape[2:]),
-                        dtype=torch.float32,
-                    )
-                    kmax = torch.zeros_like(kmin)
-                page_min: torch.Tensor | None = None
-                page_max: torch.Tensor | None = None
-                for node_id, node_page in covering:
-                    _, node_min, node_max, _ = self._entries[node_id]
-                    part_min = node_min[:, node_page]
-                    part_max = node_max[:, node_page]
-                    page_min = (
-                        part_min
-                        if page_min is None
-                        else torch.minimum(page_min, part_min)
-                    )
-                    page_max = (
-                        part_max
-                        if page_max is None
-                        else torch.maximum(page_max, part_max)
-                    )
-                kmin[:, page] = page_min
-                kmax[:, page] = page_max
-        if kmin is None:
+        if full_pages <= 0:
             self.miss_reasons["no_full_pages"] = (
                 self.miss_reasons.get("no_full_pages", 0) + 1
             )
             return None
+        with self._lock:
+            if self._row_slots is None or self._pool_min is None:
+                self.miss_reasons["store_empty"] = (
+                    self.miss_reasons.get("store_empty", 0) + 1
+                )
+                return None
+            rows = host_rows_cpu[: full_pages * self.page_tokens].to(
+                torch.int64
+            )
+            if int(rows.max()) >= self._row_slots.numel() or int(rows.min()) < 0:
+                self.miss_reasons["row_out_of_range"] = (
+                    self.miss_reasons.get("row_out_of_range", 0) + 1
+                )
+                return None
+            slots = self._row_slots[rows]
+            if bool((slots < 0).any()):
+                self.miss_reasons["page_rows_never_recorded"] = (
+                    self.miss_reasons.get("page_rows_never_recorded", 0) + 1
+                )
+                return None
+            if self._pool_min.shape[0] != layer_count:
+                self.miss_reasons["layer_mismatch"] = (
+                    self.miss_reasons.get("layer_mismatch", 0) + 1
+                )
+                return None
+            covering_min = self._pool_min[:, slots.to(torch.int64)]
+            covering_max = self._pool_max[:, slots.to(torch.int64)]
+        shape = covering_min.shape
+        paged_min = covering_min.view(
+            layer_count, full_pages, self.page_tokens, *shape[2:]
+        ).amin(dim=2)
+        paged_max = covering_max.view(
+            layer_count, full_pages, self.page_tokens, *shape[2:]
+        ).amax(dim=2)
+        kmin = torch.zeros(
+            (layer_count, pages, *shape[2:]), dtype=torch.float32
+        )
+        kmax = torch.zeros_like(kmin)
+        kmin[:, :full_pages] = paged_min
+        kmax[:, :full_pages] = paged_max
         return kmin, kmax
