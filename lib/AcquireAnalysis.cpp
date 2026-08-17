@@ -722,23 +722,50 @@ FunctionPlan analyzeAcquisitions(Function &function) {
   if (!stagedBases.empty()) {
     for (BasicBlock &block : function) {
       for (Instruction &instruction : block) {
-        SmallVector<Value *, 2> accessed;
-        bool escapesThroughCall = false;
+        // A staged base may be consumed only through the checked memory
+        // forms below. Beyond direct dereferences, three value-level uses
+        // launder the pointer past the clause and are rejected as escapes:
+        // storing it to memory, converting it to an integer, and returning
+        // it. Provenance through phis, selects, casts, and GEPs is
+        // normalized by the root walk at each use site.
+        static const char *const derefReason =
+            "staged base is dereferenced outside its acquisition marker";
+        static const char *const callReason =
+            "staged base escapes through a call";
+        static const char *const valueReason =
+            "staged base escapes as a stored or converted value";
+        SmallVector<std::pair<Value *, const char *>, 2> uses;
         if (auto *load = dyn_cast<LoadInst>(&instruction)) {
-          accessed.push_back(load->getPointerOperand());
+          uses.emplace_back(load->getPointerOperand(), derefReason);
         } else if (auto *store = dyn_cast<StoreInst>(&instruction)) {
-          accessed.push_back(store->getPointerOperand());
+          uses.emplace_back(store->getPointerOperand(), derefReason);
+          if (store->getValueOperand()->getType()->isPointerTy()) {
+            uses.emplace_back(store->getValueOperand(), valueReason);
+          }
         } else if (auto *rmw = dyn_cast<AtomicRMWInst>(&instruction)) {
-          accessed.push_back(rmw->getPointerOperand());
+          uses.emplace_back(rmw->getPointerOperand(), derefReason);
+          if (rmw->getValOperand()->getType()->isPointerTy()) {
+            uses.emplace_back(rmw->getValOperand(), valueReason);
+          }
         } else if (auto *exchange =
                        dyn_cast<AtomicCmpXchgInst>(&instruction)) {
-          accessed.push_back(exchange->getPointerOperand());
+          uses.emplace_back(exchange->getPointerOperand(), derefReason);
+          if (exchange->getNewValOperand()->getType()->isPointerTy()) {
+            uses.emplace_back(exchange->getNewValOperand(), valueReason);
+          }
         } else if (auto *transfer =
                        dyn_cast<AnyMemTransferInst>(&instruction)) {
-          accessed.push_back(transfer->getRawDest());
-          accessed.push_back(transfer->getRawSource());
+          uses.emplace_back(transfer->getRawDest(), derefReason);
+          uses.emplace_back(transfer->getRawSource(), derefReason);
         } else if (auto *memory = dyn_cast<AnyMemIntrinsic>(&instruction)) {
-          accessed.push_back(memory->getRawDest());
+          uses.emplace_back(memory->getRawDest(), derefReason);
+        } else if (auto *toInteger = dyn_cast<PtrToIntInst>(&instruction)) {
+          uses.emplace_back(toInteger->getPointerOperand(), valueReason);
+        } else if (auto *ret = dyn_cast<ReturnInst>(&instruction)) {
+          Value *returned = ret->getReturnValue();
+          if (returned != nullptr && returned->getType()->isPointerTy()) {
+            uses.emplace_back(returned, valueReason);
+          }
         } else if (auto *call = dyn_cast<CallBase>(&instruction)) {
           // A raw staged pointer handed to an ordinary call escapes the
           // clause interprocedurally — the callee can dereference it with
@@ -763,15 +790,14 @@ FunctionPlan analyzeAcquisitions(Function &function) {
                 callee->getIntrinsicID() == Intrinsic::lifetime_start ||
                 callee->getIntrinsicID() == Intrinsic::lifetime_end));
           if (!ntaMarker && !nonAccessing) {
-            escapesThroughCall = true;
             for (Value *argument : call->args()) {
               if (argument->getType()->isPointerTy()) {
-                accessed.push_back(argument);
+                uses.emplace_back(argument, callReason);
               }
             }
           }
         }
-        for (Value *pointer : accessed) {
+        for (const auto &[pointer, reason] : uses) {
           SmallPtrSet<Value *, 8> roots;
           collectProvenanceRoots(pointer, roots);
           bool bypasses = false;
@@ -779,12 +805,7 @@ FunctionPlan analyzeAcquisitions(Function &function) {
             bypasses |= stagedBases.count(root) != 0;
           }
           if (bypasses) {
-            plan.rejected.push_back(
-                {&instruction,
-                 escapesThroughCall
-                     ? "staged base escapes through a call"
-                     : "staged base is dereferenced outside its "
-                       "acquisition marker"});
+            plan.rejected.push_back({&instruction, reason});
             break;
           }
         }

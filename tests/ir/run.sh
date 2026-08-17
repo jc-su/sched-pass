@@ -172,6 +172,8 @@ fixtures=(
   "reject-requirement-pending:requirement address is reachable without its dependency-set acquisition"
   "reject-staged-base-bypass:staged base is dereferenced outside its acquisition marker"
   "reject-staged-call-escape:staged base escapes through a call"
+  "reject-staged-value-escape:staged base escapes as a stored or converted value"
+  "reject-staged-inttoptr-escape:staged base escapes as a stored or converted value"
 )
 for entry in "${fixtures[@]}"; do
   fixture=${entry%%:*}
