@@ -178,11 +178,17 @@ def main() -> int:
             check(eager > 0, f"{label}: no eager tiered batches", failures)
         else:
             check(replays > 0, f"{label}: no tiered replays", failures)
-            check(
-                eager > 0,
-                f"{label}: no eager tiered batches (no boundary crossings)",
-                failures,
-            )
+            if refresh < 192:
+                # Only a refresh interval shorter than the decode length
+                # forces mid-decode eager steps; at 1024 the extends are
+                # eager but decode replays uninterrupted, so demanding
+                # boundary crossings there was asserting the impossible.
+                check(
+                    eager > 0,
+                    f"{label}: no eager tiered batches (no boundary "
+                    "crossings)",
+                    failures,
+                )
         diverged = bool(report.get("outputs_diverge"))
         print(
             f"{label}: replays={replays} eager={eager} checked={checked} "
