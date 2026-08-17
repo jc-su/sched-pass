@@ -16,6 +16,12 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RATIO_FIELDS = (
+    # The registered primary: absolute-SLO goodput (TTFT <= 8.0s AND P99
+    # ITL <= 100ms, all requests). Its omission until 2026-08-15 made the
+    # aggregate report only the legacy relative-threshold goodput_ratio;
+    # campaign records before that date were corrected from the banked
+    # per-trial artifacts, which always carried both fields.
+    "preregistered_goodput_ratio",
     "output_throughput_ratio",
     "goodput_ratio",
     "resident_p95_ttft_ratio",
@@ -96,7 +102,10 @@ def _aggregate(reports: list[dict[str, Any]], seed: int) -> dict[str, Any]:
     for index, field in enumerate(RATIO_FIELDS):
         values = [float(report[field]) for report in reports]
         zero_values = sum(1 for value in values if value == 0.0)
-        if zero_values and field == "goodput_ratio":
+        if zero_values and field in (
+            "goodput_ratio",
+            "preregistered_goodput_ratio",
+        ):
             # A zero goodput arm makes the geometric mean undefined. Report
             # the zero-trial count and aggregate the positive trials instead
             # of discarding the entire series; consumers must read both.

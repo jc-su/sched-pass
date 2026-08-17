@@ -723,6 +723,7 @@ FunctionPlan analyzeAcquisitions(Function &function) {
     for (BasicBlock &block : function) {
       for (Instruction &instruction : block) {
         SmallVector<Value *, 2> accessed;
+        bool escapesThroughCall = false;
         if (auto *load = dyn_cast<LoadInst>(&instruction)) {
           accessed.push_back(load->getPointerOperand());
         } else if (auto *store = dyn_cast<StoreInst>(&instruction)) {
@@ -738,6 +739,37 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           accessed.push_back(transfer->getRawSource());
         } else if (auto *memory = dyn_cast<AnyMemIntrinsic>(&instruction)) {
           accessed.push_back(memory->getRawDest());
+        } else if (auto *call = dyn_cast<CallBase>(&instruction)) {
+          // A raw staged pointer handed to an ordinary call escapes the
+          // clause interprocedurally — the callee can dereference it with
+          // no liveness or generation check. NTA markers receive the base
+          // by design, and non-accessing intrinsics are not dereferences;
+          // every other callee, known or unknown, is rejected fail-closed.
+          Function *callee =
+              dyn_cast<Function>(call->getCalledOperand()->stripPointerCasts());
+          const StringRef name =
+              callee != nullptr ? callee->getName() : StringRef();
+          const bool ntaMarker =
+              name == ir::AcquireMarker ||
+              name == ir::AcquireTensorMapMarker ||
+              name == ir::AcquireSetMarker || name == ir::DeferMarker ||
+              name == ir::BindMarker || name == ir::BeginPartialMarker ||
+              name == ir::CommitPartialMarker ||
+              name == ir::StreamCommitPartialMarker;
+          const bool nonAccessing =
+              isa<DbgInfoIntrinsic>(call) ||
+              (callee != nullptr &&
+               (callee->getIntrinsicID() == Intrinsic::assume ||
+                callee->getIntrinsicID() == Intrinsic::lifetime_start ||
+                callee->getIntrinsicID() == Intrinsic::lifetime_end));
+          if (!ntaMarker && !nonAccessing) {
+            escapesThroughCall = true;
+            for (Value *argument : call->args()) {
+              if (argument->getType()->isPointerTy()) {
+                accessed.push_back(argument);
+              }
+            }
+          }
         }
         for (Value *pointer : accessed) {
           SmallPtrSet<Value *, 8> roots;
@@ -749,7 +781,10 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           if (bypasses) {
             plan.rejected.push_back(
                 {&instruction,
-                 "staged base is dereferenced outside its acquisition marker"});
+                 escapesThroughCall
+                     ? "staged base escapes through a call"
+                     : "staged base is dereferenced outside its "
+                       "acquisition marker"});
             break;
           }
         }

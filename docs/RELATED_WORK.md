@@ -322,12 +322,23 @@ against pinned host sources, zero mismatches), and purity witnesses enforced
 in both directions. At the capacity shape with refresh interval 1024 (five
 paired trials, same registered seeds as the device arm's ten): host-orchestrated
 goodput geomean is **0.529x the device chain's** (3.24 versus 6.13 requests
-per second), and **~0.94x dense stock** (per-trial 0.80-1.04). The measured
-sentence for the reviewer: raw fetch plus host orchestration approximately
-matches dense serving; the device-side claim chain doubles goodput on top of
-it. The refresh-interval ladder (32) is in flight; the device arm itself
-exposed a graph/eager-boundary crash at refresh 32 that is being fixed and
-recorded rather than hidden.
+per second), **0.92x dense stock on the registered metric** [0.797, 1.011],
+and its resident P99 ITL runs **14.1x stock** — per-layer host staging
+serialized on the scheduler thread destroys co-resident tails outright. The
+measured sentence for the reviewer: raw fetch plus host orchestration
+approximately matches dense serving on goodput while violating co-tenant
+isolation; the device-side claim chain roughly doubles goodput on top of it
+and keeps the tail bounded. Two recorded caveats before this number is
+paper-grade (2026-08-15 audit): the comparison crosses revisions (host arm
+5c8fc00, device arm 69c7022 — the intervening commits do not touch the
+device path with the arm's flag unset, but same-revision paired trials must
+replace it), and this arm is a synchronous host-control lower bound (one
+round-trip per claim-layer refresh), not the strongest host system — a
+batched one-round-trip-per-refresh variant with pinned control buffers is
+the fair upper bound and is planned. The refresh-interval ladder is paused
+until both land; the device arm itself exposed a graph/eager-boundary
+ordering defect at refresh 32 (positions overwritten after the replay fill),
+fixed and recorded rather than hidden.
 
 ## Evidence Needed For A Systems Submission
 

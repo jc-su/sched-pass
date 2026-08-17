@@ -1019,33 +1019,44 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise
         claim.object_lease = lease
         claim.table_slot = table_slot
-        if claim.external_sidecar:
-            # Claim-lifetime words the table-driven prep kernel reads; the
-            # per-layer selection count stays zero until the serve loop
-            # publishes a layer's page set. Writes precede activation so a
-            # valid row is never observed half-initialized.
-            table = self._claim_table
-            if claim.token_count > table.max_claim_tokens:
-                raise RuntimeError(
-                    f"claim of {claim.token_count} tokens exceeds the "
-                    f"claim table's {table.max_claim_tokens}-token rows"
+        try:
+            if claim.external_sidecar:
+                # Claim-lifetime words the table-driven prep kernel reads;
+                # the per-layer selection count stays zero until the serve
+                # loop publishes a layer's page set. Writes precede
+                # activation so a valid row is never observed
+                # half-initialized.
+                table = self._claim_table
+                if claim.token_count > table.max_claim_tokens:
+                    raise RuntimeError(
+                        f"claim of {claim.token_count} tokens exceeds the "
+                        f"claim table's {table.max_claim_tokens}-token rows"
+                    )
+                if claim.capacity_rows > table.capacity_rows:
+                    raise RuntimeError(
+                        f"claim staging capacity {claim.capacity_rows} "
+                        f"exceeds the claim table's "
+                        f"{table.capacity_rows}-row plan"
+                    )
+                index = table_slot.index
+                table.object_slots[index] = claim.first_object_slot
+                table.capacity_words[index] = claim.capacity_rows
+                table.token_counts[index] = claim.token_count
+                table.host_rows[index, : claim.token_count] = (
+                    claim.host_rows.to(torch.int32)
                 )
-            if claim.capacity_rows > table.capacity_rows:
-                raise RuntimeError(
-                    f"claim staging capacity {claim.capacity_rows} exceeds "
-                    f"the claim table's {table.capacity_rows}-row plan"
+                table.staging_rows[index, : claim.capacity_rows] = (
+                    claim.device_rows[: claim.capacity_rows].to(torch.int32)
                 )
-            index = table_slot.index
-            table.object_slots[index] = claim.first_object_slot
-            table.capacity_words[index] = claim.capacity_rows
-            table.token_counts[index] = claim.token_count
-            table.host_rows[index, : claim.token_count] = claim.host_rows.to(
-                torch.int32
-            )
-            table.staging_rows[index, : claim.capacity_rows] = (
-                claim.device_rows[: claim.capacity_rows].to(torch.int32)
-            )
-        self._claim_table.activate(table_slot)
+            self._claim_table.activate(table_slot)
+        except Exception:
+            # Post-construction validation must be transactional: a raise
+            # here would otherwise strand the table slot and object-range
+            # lease (the claim is not yet registered, so no retire path
+            # would ever reclaim them).
+            ranges.release(lease)
+            self._claim_table.retire(table_slot, self._ImmediateFenceType)
+            raise
         if not claim.external_sidecar:
             for local_layer in range(claim.layer_count):
                 pending.producer_event.complete(local_layer)
@@ -1358,16 +1369,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         claims_present = self.requires_eager_requests(request_ids)
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
-        if claims_present and not in_capture:
-            if not self._tiered_graph_replay_fill(forward_batch):
-                raise RuntimeError(
-                    "external-prefix requests reached dense CUDA graph replay"
-                )
         if getattr(self, "_tiered_graph_enabled", False):
             # Outside the recorded region on both paths: point every
             # claim-segment position at the captured plan buffer's tail
-            # so the in-graph copies are harmless for dense batches; a
-            # tiered replay epoch overwrites these with live positions.
+            # so the in-graph copies are harmless for dense batches. This
+            # default MUST precede the replay fill — the fill overwrites
+            # these with the epoch's live positions, and running the
+            # default afterwards would clobber them, silently sending
+            # every layer's claim rows to the scratch tail (the ordering
+            # defect behind the refresh-32 graph/eager-boundary crash).
             wrappers = getattr(
                 self.forward_metadata, "decode_wrappers", None
             ) or ()
@@ -1384,6 +1394,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     )
                     self._tg_epoch = None
                     break
+        if claims_present and not in_capture:
+            if not self._tiered_graph_replay_fill(forward_batch):
+                raise RuntimeError(
+                    "external-prefix requests reached dense CUDA graph replay"
+                )
         bindings = self._bind_forward_requests(
             forward_batch, allow_capture_ids=in_capture
         )

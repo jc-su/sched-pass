@@ -117,6 +117,33 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Correction (2026-08-15, prompted by an external audit; no new runs):**
+  the trials wrapper's aggregate omitted the registered primary
+  (`preregistered_goodput_ratio`, absolute-SLO goodput) from its ratio
+  fields and reported the legacy relative-threshold `goodput_ratio` in
+  its place. Every per-trial artifact always carried both fields, so
+  the sealed aggregates were recomputed from the banked artifacts with
+  the wrapper's own bootstrap after the fix; seeds, artifacts, and all
+  other bars are unchanged. Recorded-entry status: the RQ1-eager
+  (2.084) and campaign-three (1.251) entries below already matched the
+  registered metric and stand as written. Two entries were recorded
+  from the buggy aggregate and are corrected here: **campaign four's
+  registered goodput is 1.8302 [1.4306, 2.2877]** (recorded 1.576
+  [1.351, 1.857]) — the pass strengthens, the CI floor remains below
+  1.5; **P4's registered goodput is 1.6098 [1.3998, 1.8275]** (recorded
+  1.4215 [1.306, 1.522]) — the bar (geomean >= 1.5, CI excluding 1.0)
+  **passes as registered**, reversing the recorded goodput FAIL. P4's
+  resident verdict (1.0964, fails by 0.046) and every other recorded
+  number are unaffected. Corrected aggregates:
+  `results/serving/{rq1,p3-c3,rq1-c4,p4,rq3-b1-1024}-registered.json`.
+  The audit also found the tiered graph-replay position fill unsound
+  (the caller overwrote live positions with the scratch-tail default
+  after the fill; graphs-era campaigns were correct because per-layer
+  claim row tables coincide between refreshes, and the replay fill
+  re-plans the wrapper directly — the defect expresses at short refresh
+  intervals, matching the refresh-32 crash) — fixed same day with the
+  ordering inverted; a dedicated replay test across refresh intervals
+  is registered as a debt before any further graph campaign.
 - **P4 campaign result (2026-08-15, P3 shape at Poisson 1.5/s per
   Amendment 4, seeds 20260901-10 verbatim, graphs enabled in both arms,
   revision 4054c75, ten of ten trials, artifacts
