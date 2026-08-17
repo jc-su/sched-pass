@@ -845,6 +845,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._stats.get("tiered_rows_copied_released", 0)
                 + claim.rows_copied
             )
+            self._stats["tiered_bytes_copied_released"] = (
+                self._stats.get("tiered_bytes_copied_released", 0)
+                + claim.rows_copied * claim.row_bytes
+            )
             self._stats["tiered_rows_rehit_released"] = (
                 self._stats.get("tiered_rows_rehit_released", 0)
                 + claim.rows_rehit
@@ -930,19 +934,25 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
     def _drain_tiered_accounting(self, *, wait: bool) -> None:
         pending: list[tuple[Any, ...]] = []
-        for event, host_counter, device_counter, requested in (
+        for event, host_counter, device_counter, requested, row_bytes in (
             self._retired_tiered_accounting
         ):
             if wait:
                 event.synchronize()
             elif not event.query():
-                pending.append((event, host_counter, device_counter, requested))
+                pending.append(
+                    (event, host_counter, device_counter, requested, row_bytes)
+                )
                 continue
             copied = int(host_counter[0])
             if copied < 0 or copied > requested:
                 raise RuntimeError("tiered device accounting violated conservation")
             self._stats["tiered_rows_copied_released"] = (
                 self._stats.get("tiered_rows_copied_released", 0) + copied
+            )
+            self._stats["tiered_bytes_copied_released"] = (
+                self._stats.get("tiered_bytes_copied_released", 0)
+                + copied * row_bytes
             )
             self._stats["tiered_rows_rehit_released"] = (
                 self._stats.get("tiered_rows_rehit_released", 0)

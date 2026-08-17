@@ -311,6 +311,9 @@ class TieredClaim:
             key_cache = device_pool._get_key_buffer(layer_id)
             value_cache = device_pool._get_value_buffer(layer_id)
             element = key_cache[0].numel() * key_cache.element_size()
+            # One staged row moves this layer's K and V rows; the physical
+            # byte ledger multiplies staged-row counts by this constant.
+            self.row_bytes = 2 * element
             # Every source and destination must agree on the per-row byte
             # count the indexed copy uses; checking only one pairing lets an
             # asymmetric host layout stage silently corrupted KV.
@@ -1461,6 +1464,7 @@ class TieredClaim:
             self._copied_rows_host,
             self.copied_rows_device,
             self.requested_rows,
+            self.row_bytes,
         )
 
     def _verify_layer(

@@ -49,6 +49,15 @@ def parse_args() -> argparse.Namespace:
         / "sglang-hicache-load-qualification.json",
     )
     parser.add_argument(
+        "--allow-mixed-revisions",
+        action="store_true",
+        help=(
+            "accept banked artifacts from more than one recorded revision "
+            "(the mix is recorded in the aggregate); without this flag a "
+            "revision mismatch across trials is fatal"
+        ),
+    )
+    parser.add_argument(
         "comparison_args",
         nargs=argparse.REMAINDER,
         help="arguments for CompareSglangHiCacheLoad.py after --",
@@ -67,6 +76,30 @@ def parse_args() -> argparse.Namespace:
             + ", ".join(sorted(forbidden))
         )
     return args
+
+
+def _expected_harness_args(comparison_args: list[str]) -> dict:
+    """Parse the child harness's arguments exactly as it would."""
+    sys.path.insert(0, str(ROOT / "benchmarks" / "serving"))
+    try:
+        import CompareSglangHiCacheLoad as child
+    finally:
+        sys.path.pop(0)
+    argv = sys.argv
+    sys.argv = ["CompareSglangHiCacheLoad.py", *comparison_args]
+    try:
+        parsed = child.parse_args()
+    except SystemExit as error:
+        raise RuntimeError(
+            "comparison arguments do not parse; cannot validate banked trials"
+        ) from error
+    finally:
+        sys.argv = argv
+    return {
+        key: (str(value) if isinstance(value, pathlib.Path) else value)
+        for key, value in sorted(vars(parsed).items())
+        if key not in ("output", "seed", "execution_order")
+    }
 
 
 def _seed_for_order(seed: int, first: str) -> int:
@@ -131,6 +164,7 @@ def _aggregate(reports: list[dict[str, Any]], seed: int) -> dict[str, Any]:
 def main() -> int:
     args = parse_args()
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
+    expected_args = _expected_harness_args(args.comparison_args)
     reports: list[dict[str, Any]] = []
     artifacts: list[str] = []
     for trial in range(args.trials):
@@ -146,8 +180,25 @@ def main() -> int:
             # arm order; accept it only when both match.
             report = json.loads(artifact.read_text(encoding="utf-8"))
             arm_seed = report.get("nta", {}).get("seed", -1)
+            banked_args = report.get("harness_args")
+            args_match = True
+            if banked_args is not None:
+                current_args = expected_args
+                mismatched = {
+                    key: (banked_args.get(key), current_args.get(key))
+                    for key in set(banked_args) | set(current_args)
+                    if banked_args.get(key) != current_args.get(key)
+                }
+                if mismatched:
+                    args_match = False
+                    raise RuntimeError(
+                        f"banked trial {trial} was produced with different "
+                        f"harness arguments: {mismatched}"
+                    )
             if (
-                report.get("classification") == "sglang-hicache-load-comparison"
+                args_match
+                and report.get("classification")
+                == "sglang-hicache-load-comparison"
                 and int(arm_seed) == seed
                 and report.get("execution_order", [None])[0] == first
             ):
@@ -192,6 +243,15 @@ def main() -> int:
         if report["stock"]["generated_text_sha256"]
         != report["nta"]["generated_text_sha256"]
     ]
+    revisions = sorted(
+        {str(report.get("revision") or "unrecorded") for report in reports}
+    )
+    if len(revisions) > 1 and not args.allow_mixed_revisions:
+        raise RuntimeError(
+            "banked trials span more than one revision "
+            f"({revisions}); rerun on one revision or pass "
+            "--allow-mixed-revisions to aggregate anyway (recorded)"
+        )
     aggregate = {
         "schema": 1,
         "classification": "sglang-hicache-load-qualification",
@@ -211,8 +271,63 @@ def main() -> int:
             int(report["mechanism_activation"]["fallback_batches"]) == 0
             for report in reports
         ),
+        "revisions": revisions,
+        "harness_args": expected_args,
+        "staged_bytes_per_trial": [
+            report.get("nta_staged_bytes") for report in reports
+        ],
+        "summary_source_bytes_per_trial": [
+            report.get("nta_summary_source_bytes") for report in reports
+        ],
         "ratios": _aggregate(reports, args.seed_base),
     }
+    # Registered-bar status: "qualified" alone only certifies trial count
+    # and mechanism purity; this block states each pre-registered bar's
+    # verdict so no consumer mistakes one passing bar for a passing run.
+    registered = aggregate["ratios"].get("preregistered_goodput_ratio", {})
+    resident = aggregate["ratios"].get("resident_p99_itl_ratio", {})
+    goodput_geomean = registered.get("geometric_mean")
+    goodput_floor = (registered.get("bootstrap_95_percent_ci") or [None])[0]
+    resident_geomean = resident.get("geometric_mean")
+    aggregate["bars"] = {
+        "registered_goodput": {
+            "bar": 1.5,
+            "geometric_mean": goodput_geomean,
+            "ci_floor": goodput_floor,
+            "passes": bool(
+                goodput_geomean is not None
+                and goodput_floor is not None
+                and goodput_geomean >= 1.5
+                and goodput_floor > 1.0
+            ),
+        },
+        "resident_p99_itl": {
+            "bar": 1.05,
+            "geometric_mean": resident_geomean,
+            "passes": bool(
+                resident_geomean is not None and resident_geomean <= 1.05
+            ),
+        },
+        "outputs": {
+            # With divergence reporting armed, a recorded divergence is
+            # not a bar failure — the scored quality battery is the
+            # registered arbiter; without the flag exactness is mandatory.
+            "exact": aggregate["all_outputs_exact"],
+            "divergence_reporting_armed": (
+                "--allow-output-divergence" in args.comparison_args
+            ),
+            "diverged_trials": diverged_trials,
+            "passes": aggregate["all_outputs_exact"]
+            or "--allow-output-divergence" in args.comparison_args,
+        },
+        "mechanism": {
+            "passes": aggregate["all_attention_transformed"]
+            and aggregate["all_fallback_free"],
+        },
+    }
+    aggregate["all_bars_pass"] = all(
+        bar["passes"] for bar in aggregate["bars"].values()
+    )
     # Output exactness is mandatory unless the trials themselves ran with
     # divergence reporting armed; then the aggregate records which trials
     # diverged instead of refusing, and the scored quality battery remains

@@ -135,8 +135,21 @@ def _wait_for_free_gpu(limit_mib: int = 8000, timeout_s: float = 600.0) -> None:
             )
         except ValueError:
             used_mib = None
+        apps = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid",
+                "--format=csv,noheader",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        compute_apps = [line for line in apps.stdout.split() if line.strip()]
         if probe.returncode == 0 and used_mib is not None:
-            if used_mib < limit_mib:
+            # Memory alone misses an idle-but-resident co-tenant process;
+            # a live compute app also disqualifies the device.
+            if used_mib < limit_mib and not compute_apps:
                 return
         if time.monotonic() >= deadline:
             raise RuntimeError(
@@ -495,11 +508,28 @@ def main() -> int:
     external_ttft_ratio = float(nta["external_p95_ttft_seconds"]) / float(
         stock["external_p95_ttft_seconds"]
     )
+    harness_args = {
+        key: (str(value) if isinstance(value, pathlib.Path) else value)
+        for key, value in sorted(vars(args).items())
+        if key not in ("output", "seed", "execution_order")
+    }
     comparison = {
         "schema": 1,
         "classification": "sglang-hicache-load-comparison",
         "execution_order": order,
         "outputs_diverge": outputs_diverge,
+        # Trial identity for strict resume validation: the revision both
+        # arms ran and the full workload-shaping argument set (seed and
+        # order are validated separately; output is location-only).
+        "revision": os.environ.get("NTA_REVISION", ""),
+        "harness_args": harness_args,
+        "nta_staged_bytes": sum(
+            int(entry.get("tiered_bytes_copied", 0)) for entry in stats
+        ),
+        "nta_summary_source_bytes": sum(
+            int(entry.get("tiered_summary_source_bytes", 0))
+            for entry in stats
+        ),
         "batch_mode": args.batch_mode,
         "slo_scale": args.slo_scale,
         "incremental_setup_ns": args.incremental_setup_ns,

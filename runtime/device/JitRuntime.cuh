@@ -870,7 +870,9 @@ extern "C" __global__ void nta_prepare_bounded_selected_indexed_rows(
 
 extern "C" __global__ void nta_prepare_claim_table_selected_rows(
     nta::abi::RuntimeView *runtime, const std::int32_t *valid,
-    const std::int32_t *objectSlots, const std::int32_t *capacityWords,
+    const std::int64_t *claimIds, const std::int32_t *generations,
+    std::int64_t *observedIds, const std::int32_t *objectSlots,
+    const std::int32_t *capacityWords,
     const std::int32_t *selectedCounts, const std::int32_t *tokenCounts,
     const std::int64_t *selectedPagesBase, std::int64_t *cachedPagesBase,
     const std::int32_t *hostRowsBase, const std::int32_t *stagingRowsBase,
@@ -891,6 +893,14 @@ extern "C" __global__ void nta_prepare_claim_table_selected_rows(
       static_cast<std::uint32_t>(selectedCounts[claim]);
   if (count == 0) {
     return;
+  }
+  if (threadIdx.x == 0) {
+    // Consume the published identity: staging this row is an assertion
+    // that the device saw exactly this (claim id, generation) pair, and
+    // reclaim audits the pair after the completion fence.
+    observedIds[2ULL * claim] = claimIds[claim];
+    observedIds[2ULL * claim + 1ULL] =
+        static_cast<std::int64_t>(generations[claim]);
   }
   const std::uint32_t capacity =
       static_cast<std::uint32_t>(capacityWords[claim]);
@@ -924,7 +934,9 @@ extern "C" __global__ void nta_prepare_claim_table_selected_rows(
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_prepare_claim_table_selected_rows(
-    void *runtime, const std::int32_t *valid, const std::int32_t *objectSlots,
+    void *runtime, const std::int32_t *valid, const std::int64_t *claimIds,
+    const std::int32_t *generations, std::int64_t *observedIds,
+    const std::int32_t *objectSlots,
     const std::int32_t *capacityWords, const std::int32_t *selectedCounts,
     const std::int32_t *tokenCounts, const std::int64_t *selectedPagesBase,
     std::int64_t *cachedPagesBase, const std::int32_t *hostRowsBase,
@@ -934,7 +946,9 @@ nta_jit_prepare_claim_table_selected_rows(
     std::uint32_t maxBudgetPages, std::uint32_t layerCount,
     std::uint32_t localLayer, std::uint32_t maxClaimTokens,
     std::uint32_t pageTokens, cudaStream_t stream) {
-  if (runtime == nullptr || valid == nullptr || objectSlots == nullptr ||
+  if (runtime == nullptr || valid == nullptr || claimIds == nullptr ||
+      generations == nullptr || observedIds == nullptr ||
+      objectSlots == nullptr ||
       capacityWords == nullptr || selectedCounts == nullptr ||
       tokenCounts == nullptr || selectedPagesBase == nullptr ||
       cachedPagesBase == nullptr || hostRowsBase == nullptr ||
@@ -946,7 +960,8 @@ nta_jit_prepare_claim_table_selected_rows(
     return cudaErrorInvalidValue;
   }
   nta_prepare_claim_table_selected_rows<<<maxClaims, 256, 0, stream>>>(
-      static_cast<nta::abi::RuntimeView *>(runtime), valid, objectSlots,
+      static_cast<nta::abi::RuntimeView *>(runtime), valid, claimIds,
+      generations, observedIds, objectSlots,
       capacityWords, selectedCounts, tokenCounts, selectedPagesBase,
       cachedPagesBase, hostRowsBase, stagingRowsBase, selectedRowsBase,
       sourceIndicesBase, stagingIndicesBase, copiedRowsBase, maxClaims,
