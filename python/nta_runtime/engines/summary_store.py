@@ -181,7 +181,9 @@ class WritebackSummaryStore:
             self._pool_min is None
             or len(self._pool_free) < pages_needed
         ):
-            grown = 4096 if self._pool_min is None else self._pool_capacity
+            # A growth copies the whole pool on the writeback path; start
+            # large enough that a load-shape run never grows.
+            grown = 32768 if self._pool_min is None else self._pool_capacity
             begin = self._pool_capacity
             new_min = torch.zeros(
                 (layer_count, self._pool_capacity + grown, *envelope_shape),
@@ -275,15 +277,41 @@ class WritebackSummaryStore:
                     self.miss_reasons.get("layer_mismatch", 0) + 1
                 )
                 return None
-            covering_min = self._pool_min[:, slots.to(torch.int64)]
-            covering_max = self._pool_max[:, slots.to(torch.int64)]
-        shape = covering_min.shape
-        paged_min = covering_min.view(
-            layer_count, full_pages, self.page_tokens, *shape[2:]
-        ).amin(dim=2)
-        paged_max = covering_max.view(
-            layer_count, full_pages, self.page_tokens, *shape[2:]
-        ).amax(dim=2)
+            page_slots = slots.to(torch.int64).view(
+                full_pages, self.page_tokens
+            )
+            low = page_slots.min(dim=1).values
+            high = page_slots.max(dim=1).values
+            two_slot = bool(
+                (
+                    (page_slots == low.unsqueeze(1))
+                    | (page_slots == high.unsqueeze(1))
+                ).all()
+            )
+            if two_slot:
+                # The common shapes: an aligned page maps to one recorded
+                # slot (low == high) and a phase-shifted page straddles
+                # exactly two consecutive ones. Gathering two slots per
+                # page keeps the intermediate at two envelope copies
+                # instead of sixteen — the sixteen-fold materialization
+                # stalled claim prep ~890ms in the first probe.
+                low_min = self._pool_min[:, low]
+                high_min = self._pool_min[:, high]
+                low_max = self._pool_max[:, low]
+                high_max = self._pool_max[:, high]
+                paged_min = torch.minimum(low_min, high_min)
+                paged_max = torch.maximum(low_max, high_max)
+            else:
+                covering_min = self._pool_min[:, page_slots.reshape(-1)]
+                covering_max = self._pool_max[:, page_slots.reshape(-1)]
+                shape = covering_min.shape
+                paged_min = covering_min.view(
+                    layer_count, full_pages, self.page_tokens, *shape[2:]
+                ).amin(dim=2)
+                paged_max = covering_max.view(
+                    layer_count, full_pages, self.page_tokens, *shape[2:]
+                ).amax(dim=2)
+        shape = paged_min.shape
         kmin = torch.zeros(
             (layer_count, pages, *shape[2:]), dtype=torch.float32
         )
