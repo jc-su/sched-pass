@@ -117,6 +117,30 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **P4-second campaign result (2026-08-17, Amendment 4 shape and seeds
+  verbatim, graphs both arms, writeback summaries enabled, revision
+  0154c30, ten of ten trials, artifacts `results/serving/p4b-trials/`,
+  aggregate with per-bar verdicts
+  `results/serving/p4b-qualification.json`):** the registered goodput
+  ratio has geomean **1.5517 [CI floor 1.3528]** — the bar (geomean >=
+  1.5, CI excluding 1.0) **passes as registered** for the second
+  consecutive campaign at this shape. The resident P99 ITL ratio is
+  **1.1585** against the 1.05x bar: **fails as registered**,
+  statistically indistinguishable from P4-first's 1.0964 (four to five
+  of ten trials sit at or below ~1.04 in both). The mechanism finding
+  is recorded plainly: writeback summaries eliminated every
+  claim-creation scan in every trial (372 of 372 envelope gathers
+  served from writeback records, zero scan bytes) with quality parity
+  held — yet the P3-shape resident tail did not move. Claim-creation
+  scans were therefore not this shape's binding interference (they
+  dominate at the probe shape, where their removal cut the resident P99
+  from 95-150ms to ~23ms); the residual co-resident cost at P3 now
+  attributes to the eager extend forward alone, which has been the
+  identified path below the bar since campaign two and is now the only
+  member of the identified interference set still standing. Two of ten
+  trials record armed output divergence (trials one and ten). Every
+  trial records physical staged bytes; the aggregate's bars block
+  states each verdict and all_bars_pass=false.
 - **Mechanism changes before the P4-second campaign (2026-08-17,
   recorded before any qualifying run):** P4-second reruns Amendment 4's
   exact shape, arrival rate, seeds, SLOs, and bars — graphs enabled in
