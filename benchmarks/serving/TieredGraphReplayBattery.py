@@ -61,8 +61,22 @@ def main() -> int:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     failures: list[str] = []
-    for refresh in (1024, 32, 1):
-        artifact = args.output_dir / f"replay-refresh{refresh}.json"
+    # Two halves per refresh interval: the verify half byte-checks every
+    # staged layer (verify-mode claims never replay, so it certifies the
+    # bytes, not the replay path); the replay half runs without VERIFY so
+    # tiered epochs replay under the captured graphs, and output parity
+    # with the stock arm is the soundness signal there — the position-
+    # ordering defect corrupted per-layer rows exactly on that path.
+    for refresh, mode in (
+        (1024, "verify"),
+        (32, "verify"),
+        (1, "verify"),
+        (1024, "replay"),
+        (32, "replay"),
+        (1, "replay"),
+    ):
+        suffix = "" if mode == "verify" else "-replay"
+        artifact = args.output_dir / f"replay-refresh{refresh}{suffix}.json"
         environment = os.environ.copy()
         environment.update(
             {
@@ -73,9 +87,12 @@ def main() -> int:
                 "NTA_SGLANG_SELECTED_TIERED": "1",
                 "NTA_SGLANG_SELECTED_BUDGET": "64",
                 "NTA_SGLANG_SELECTED_REFRESH_INTERVAL": str(refresh),
-                "NTA_SGLANG_SELECTED_TIERED_VERIFY": "fast",
             }
         )
+        if mode == "verify":
+            environment["NTA_SGLANG_SELECTED_TIERED_VERIFY"] = "fast"
+        else:
+            environment.pop("NTA_SGLANG_SELECTED_TIERED_VERIFY", None)
         command = [
             sys.executable,
             str(ROOT / "benchmarks" / "serving" / "CompareSglangHiCacheLoad.py"),
@@ -114,20 +131,23 @@ def main() -> int:
             "--output",
             str(artifact),
         ]
-        completed = subprocess.run(
-            command,
-            cwd=ROOT,
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
-        label = f"refresh={refresh}"
-        if completed.returncode:
-            tail = "\n".join(completed.stdout.splitlines()[-40:])
-            failures.append(f"{label}: serving run failed\n{tail}")
-            continue
+        label = f"refresh={refresh}/{mode}"
+        if artifact.is_file():
+            print(f"{label}: reusing banked artifact")
+        else:
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            if completed.returncode:
+                tail = "\n".join(completed.stdout.splitlines()[-40:])
+                failures.append(f"{label}: serving run failed\n{tail}")
+                continue
         report = json.loads(artifact.read_text(encoding="utf-8"))
         stats = nta_stats(report)
         replays = stats.get("tiered_graph_replay_batches", 0)
@@ -136,7 +156,6 @@ def main() -> int:
         claims = stats.get("tiered_claims", 0)
         live_max = stats.get("tiered_claims_live_max", 0)
         check(stats.get("graph_replays", 0) > 0, f"{label}: no graph replays", failures)
-        check(checked > 0, f"{label}: VERIFY=fast checked no layers", failures)
         check(
             stats.get("hicache_fallback_batches", 0) == 0,
             f"{label}: fallback batches",
@@ -147,7 +166,9 @@ def main() -> int:
             f"{label}: no claim-slot reuse ({claims} claims, {live_max} live max)",
             failures,
         )
-        if refresh == 1:
+        if mode == "verify":
+            check(checked > 0, f"{label}: VERIFY=fast checked no layers", failures)
+        elif refresh == 1:
             check(
                 replays == 0,
                 f"{label}: tiered decode replayed {replays} batches despite "
