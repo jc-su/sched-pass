@@ -328,17 +328,24 @@ serialized on the scheduler thread destroys co-resident tails outright. The
 measured sentence for the reviewer: raw fetch plus host orchestration
 approximately matches dense serving on goodput while violating co-tenant
 isolation; the device-side claim chain roughly doubles goodput on top of it
-and keeps the tail bounded. Two recorded caveats before this number is
-paper-grade (2026-08-15 audit): the comparison crosses revisions (host arm
-5c8fc00, device arm 69c7022 — the intervening commits do not touch the
-device path with the arm's flag unset, but same-revision paired trials must
-replace it), and this arm is a synchronous host-control lower bound (one
-round-trip per claim-layer refresh), not the strongest host system — a
-batched one-round-trip-per-refresh variant with pinned control buffers is
-the fair upper bound and is planned. The refresh-interval ladder is paused
-until both land; the device arm itself exposed a graph/eager-boundary
-ordering defect at refresh 32 (positions overwritten after the replay fill),
-fixed and recorded rather than hidden.
+and keeps the tail bounded. The same-revision paired
+measurement (2026-08-17, revision bfc94e1, five paired trials per arm,
+seeds verbatim, writeback summaries enabled in both, pinned control
+buffers in the host arm, artifacts `results/serving/rq3sr-*`): the device
+chain serves **2.11x** stock's registered goodput while the host-orchestrated
+arm serves **0.982x** — dense parity — putting the host arm at **0.427x**
+the device chain; and the host arm's resident P99 ITL runs **14.4x** stock
+against the device chain's 1.15x. The measured sentence for the reviewer,
+now methodologically clean: BaM-lineage fetch plus host orchestration
+matches dense serving on goodput while destroying co-tenant isolation;
+the device-side claim chain is what produces both the goodput win and the
+bounded tail. The remaining fairness note stands: this host arm pays one
+synchronization per claim-layer refresh because decode queries exist only
+mid-forward — a deferred-batched variant serving one-step-stale selections
+is the strongest conceivable host system and remains future work, recorded
+rather than silently skipped. The refresh-interval ladder also remains
+open; the device arm's graph/eager-boundary ordering defect it exposed at
+refresh 32 was fixed and validated by the replay battery.
 
 ## Evidence Needed For A Systems Submission
 
