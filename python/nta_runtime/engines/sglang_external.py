@@ -9,9 +9,10 @@ from typing import Any, Callable
 
 import torch
 
-
-VIRTUAL_TOKEN_BASE = 1 << 30
-VIRTUAL_TOKEN_LIMIT = (1 << 31) - 1
+from nta_runtime.virtual_namespace import (
+    VIRTUAL_TOKEN_BASE,
+    VIRTUAL_TOKEN_LIMIT,
+)
 
 
 @dataclass
