@@ -94,7 +94,9 @@ public:
       std::uint32_t capacity, std::uint64_t *copiedRows) const;
   void prepareClaimTableSelectedRows(
       cudaStream_t stream, abi::RuntimeView *runtime,
-      const std::int32_t *valid, const std::int32_t *objectSlots,
+      const std::int32_t *valid, const std::int64_t *claimIds,
+      const std::int32_t *generations, std::int64_t *observedIds,
+      const std::int32_t *objectSlots,
       const std::int32_t *capacityWords, const std::int32_t *selectedCounts,
       const std::int32_t *tokenCounts, const std::int64_t *selectedPagesBase,
       std::int64_t *cachedPagesBase, const std::int32_t *hostRowsBase,

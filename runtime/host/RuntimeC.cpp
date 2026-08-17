@@ -1263,7 +1263,8 @@ nta_status nta_jit_phase_build_compact_plan(
 
 nta_status nta_jit_phase_prepare_claim_table_selected_rows(
     const nta_jit_phase_program *program, nta_runtime *runtime,
-    std::uint64_t valid, std::uint64_t objectSlots,
+    std::uint64_t valid, std::uint64_t claimIds, std::uint64_t generations,
+    std::uint64_t observedIds, std::uint64_t objectSlots,
     std::uint64_t capacityWords, std::uint64_t selectedCounts,
     std::uint64_t tokenCounts, std::uint64_t selectedPagesBase,
     std::uint64_t cachedPagesBase, std::uint64_t hostRowsBase,
@@ -1279,6 +1280,9 @@ nta_status nta_jit_phase_prepare_claim_table_selected_rows(
     program->value->prepareClaimTableSelectedRows(
         stream(cudaStream), runtime->value->deviceView(),
         reinterpret_cast<const std::int32_t *>(valid),
+        reinterpret_cast<const std::int64_t *>(claimIds),
+        reinterpret_cast<const std::int32_t *>(generations),
+        reinterpret_cast<std::int64_t *>(observedIds),
         reinterpret_cast<const std::int32_t *>(objectSlots),
         reinterpret_cast<const std::int32_t *>(capacityWords),
         reinterpret_cast<const std::int32_t *>(selectedCounts),

@@ -371,6 +371,10 @@ class SelectedAttentionExecutor:
         stats["tiered_rows_copied"] = (
             stats.get("tiered_rows_copied_released", 0) + claim.rows_copied
         )
+        stats["tiered_bytes_copied"] = (
+            stats.get("tiered_bytes_copied_released", 0)
+            + claim.rows_copied * claim.row_bytes
+        )
         stats["tiered_rows_rehit"] = (
             stats.get("tiered_rows_rehit_released", 0) + claim.rows_rehit
         )
@@ -730,6 +734,9 @@ class SelectedAttentionExecutor:
         stats["tiered_rows_copied"] = stats.get(
             "tiered_rows_copied_released", 0
         ) + sum(claim.rows_copied for claim in claims)
+        stats["tiered_bytes_copied"] = stats.get(
+            "tiered_bytes_copied_released", 0
+        ) + sum(claim.rows_copied * claim.row_bytes for claim in claims)
         stats["tiered_rows_rehit"] = stats.get(
             "tiered_rows_rehit_released", 0
         ) + sum(claim.rows_rehit for claim in claims)
@@ -1499,6 +1506,10 @@ class SelectedAttentionExecutor:
 
         stats["tiered_rows_copied"] = (
             stats.get("tiered_rows_copied_released", 0) + claim.rows_copied
+        )
+        stats["tiered_bytes_copied"] = (
+            stats.get("tiered_bytes_copied_released", 0)
+            + claim.rows_copied * claim.row_bytes
         )
         stats["tiered_rows_rehit"] = (
             stats.get("tiered_rows_rehit_released", 0) + claim.rows_rehit

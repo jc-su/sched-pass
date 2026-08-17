@@ -66,6 +66,11 @@ class ClaimTable:
         # branch on; ``active_count`` bounds device-side iteration.
         self.claim_ids = zeros(max_claims, dtype=torch.int64)
         self.generations = zeros(max_claims, dtype=torch.int32)
+        # Device-observed identity: the table kernel writes through the
+        # published (claim id, generation) words for every row it stages,
+        # and reclaim verifies them against the slot after the completion
+        # fence — the device-side consumption of the identity contract.
+        self.observed_ids = zeros(max_claims, 2, dtype=torch.int64)
         self.valid = zeros(max_claims, dtype=torch.int32)
         self.active_count = zeros(1, dtype=torch.int32)
         self.page_counts = zeros(max_claims, dtype=torch.int32)
@@ -144,6 +149,7 @@ class ClaimTable:
         self.claim_ids[index] = claim_id
         self.generations[index] = generation
         self.copied_rows[index] = 0
+        self.observed_ids[index].zero_()
         self.cached_pages[index].fill_(-1)
         # A reused row must not inherit its predecessor's selection count:
         # the table kernel treats a nonzero count on a valid row as work.
@@ -177,6 +183,20 @@ class ClaimTable:
         reclaimed = 0
         for slot, completion in retired:
             if completion.query():
+                # Post-fence identity audit: a nonzero observed pair means
+                # the table kernel staged this row; it must have consumed
+                # exactly this slot's published identity. Zero means the
+                # claim never took the table path, which is legal.
+                observed = self.observed_ids[slot.index].tolist()
+                if observed != [0, 0] and observed != [
+                    slot.claim_id,
+                    slot.generation,
+                ]:
+                    raise RuntimeError(
+                        f"claim-table row {slot.index} was consumed with "
+                        f"identity {observed} but was armed for "
+                        f"({slot.claim_id}, {slot.generation})"
+                    )
                 with self._lock:
                     self._free.append(slot.index)
                 reclaimed += 1

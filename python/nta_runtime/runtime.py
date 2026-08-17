@@ -1102,7 +1102,7 @@ _phase_prepare_claim_table_selected_rows = _function(
     ctypes.c_int,
     _Handle,
     _Handle,
-    *([ctypes.c_uint64] * 13),
+    *([ctypes.c_uint64] * 16),
     *([ctypes.c_uint32] * 6),
     ctypes.c_uint64,
 )
@@ -2219,6 +2219,9 @@ class JitPhaseProgram(_Owner):
 
         tensors = (
             table.valid,
+            table.claim_ids,
+            table.generations,
+            table.observed_ids,
             table.object_slots,
             table.capacity_words,
             table.selected_counts,

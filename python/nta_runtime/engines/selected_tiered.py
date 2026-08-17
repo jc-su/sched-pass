@@ -311,6 +311,9 @@ class TieredClaim:
             key_cache = device_pool._get_key_buffer(layer_id)
             value_cache = device_pool._get_value_buffer(layer_id)
             element = key_cache[0].numel() * key_cache.element_size()
+            # One staged row moves this layer's K and V rows; the physical
+            # byte ledger multiplies staged-row counts by this constant.
+            self.row_bytes = 2 * element
             # Every source and destination must agree on the per-row byte
             # count the indexed copy uses; checking only one pairing lets an
             # asymmetric host layout stage silently corrupted KV.
@@ -1126,14 +1129,42 @@ class TieredClaim:
                     [-1] * cache_slots for _ in range(self.layer_count)
                 ],
                 "slots": cache_slots,
+                # Pinned control buffers: the sync pulls page ids into
+                # pinned memory, and index/table words build into pinned
+                # staging before one non-blocking upload — the strongest
+                # per-layer host control path (audit item five).
+                "pages_pinned": torch.empty(
+                    max(self.free_budget, 1),
+                    dtype=torch.int64,
+                    pin_memory=True,
+                ),
+                "index_pinned": torch.empty(
+                    2, self.capacity_rows, dtype=torch.int32, pin_memory=True
+                ),
+                "table_pinned": torch.empty(
+                    self.kept_prefix_rows, dtype=torch.int32, pin_memory=True
+                ),
+                "host_rows_list": self.host_rows_cpu.tolist(),
+                # Reusing pinned staging while a prior non-blocking upload
+                # is in flight is the async-pinned-reuse race; this event
+                # fences every rewrite. The host wait is part of the host
+                # control path's honest cost.
+                "upload_event": torch.cuda.Event(),
+                "upload_armed": False,
             }
             self._host_orch = state
+        if state["upload_armed"]:
+            state["upload_event"].synchronize()
+            state["upload_armed"] = False
         tail_page = self.pages - 1
         tail_rows = self.token_count - tail_page * self.page_tokens
         # The device-to-host control edge: a host orchestrator cannot build
         # gather indices without the selected page identities.
         sync_began = _time.monotonic()
-        free_list = free_pages.cpu().tolist()
+        count_free = int(free_pages.numel())
+        pages_pinned = state["pages_pinned"][:count_free]
+        pages_pinned.copy_(free_pages)
+        free_list = pages_pinned.tolist()
         sync_ms = (_time.monotonic() - sync_began) * 1_000.0
         ordered = state["forced_list"] + free_list + [tail_page]
 
@@ -1180,12 +1211,19 @@ class TieredClaim:
         device = self.host_rows.device
         if source_rows:
             count = len(source_rows)
-            self.source_index[local_layer, :count] = torch.tensor(
+            index_pinned = state["index_pinned"]
+            index_pinned[0, :count] = torch.tensor(
                 source_rows, dtype=torch.int32
-            ).to(device)
-            self.staging_index[local_layer, :count] = torch.tensor(
+            )
+            index_pinned[1, :count] = torch.tensor(
                 staging_rows, dtype=torch.int32
-            ).to(device)
+            )
+            self.source_index[local_layer, :count].copy_(
+                index_pinned[0, :count], non_blocking=True
+            )
+            self.staging_index[local_layer, :count].copy_(
+                index_pinned[1, :count], non_blocking=True
+            )
             phases = engine._phase_program(
                 engine._nta_demand_decode_wrappers[0]
             )
@@ -1216,9 +1254,13 @@ class TieredClaim:
                 f"host-orchestrated table holds {len(table)} rows but the "
                 f"fixed kept shape is {self.kept_prefix_rows}"
             )
-        self.selected_rows[: self.kept_prefix_rows] = torch.tensor(
-            table, dtype=torch.int32
-        ).to(device)
+        table_pinned = state["table_pinned"]
+        table_pinned.copy_(torch.tensor(table, dtype=torch.int32))
+        self.selected_rows[: self.kept_prefix_rows].copy_(
+            table_pinned, non_blocking=True
+        )
+        state["upload_event"].record(stream)
+        state["upload_armed"] = True
         if self.verify or self.verify_fast:
             # The synchronization-heavy verifier resolves rows through the
             # device cache directory; mirror the host directory into it only
@@ -1461,6 +1503,7 @@ class TieredClaim:
             self._copied_rows_host,
             self.copied_rows_device,
             self.requested_rows,
+            self.row_bytes,
         )
 
     def _verify_layer(

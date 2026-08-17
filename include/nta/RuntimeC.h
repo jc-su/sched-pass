@@ -434,7 +434,8 @@ nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
  * per table row, gated by the device validity word. */
 nta_status nta_jit_phase_prepare_claim_table_selected_rows(
     const nta_jit_phase_program *program, nta_runtime *runtime,
-    uint64_t valid, uint64_t object_slots, uint64_t capacity_words,
+    uint64_t valid, uint64_t claim_ids, uint64_t generations,
+    uint64_t observed_ids, uint64_t object_slots, uint64_t capacity_words,
     uint64_t selected_counts, uint64_t token_counts,
     uint64_t selected_pages_base, uint64_t cached_pages_base,
     uint64_t host_rows_base, uint64_t staging_rows_base,

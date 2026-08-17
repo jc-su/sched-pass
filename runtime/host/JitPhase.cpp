@@ -43,7 +43,8 @@ using PrepareSelectedIndexedRows = cudaError_t (*)(
     std::uint32_t *, std::uint32_t *, std::uint32_t *, std::uint32_t,
     std::uint64_t *, cudaStream_t);
 using PrepareClaimTableSelectedRows = cudaError_t (*)(
-    void *, const std::int32_t *, const std::int32_t *, const std::int32_t *,
+    void *, const std::int32_t *, const std::int64_t *, const std::int32_t *,
+    std::int64_t *, const std::int32_t *, const std::int32_t *,
     const std::int32_t *, const std::int32_t *, const std::int64_t *,
     std::int64_t *, const std::int32_t *, const std::int32_t *,
     std::uint32_t *, std::uint32_t *, std::uint32_t *, std::uint64_t *,
@@ -445,6 +446,8 @@ void JitPhaseProgram::prepareBoundedSelectedIndexedRows(
 
 void JitPhaseProgram::prepareClaimTableSelectedRows(
     cudaStream_t stream, abi::RuntimeView *runtime, const std::int32_t *valid,
+    const std::int64_t *claimIds, const std::int32_t *generations,
+    std::int64_t *observedIds,
     const std::int32_t *objectSlots, const std::int32_t *capacityWords,
     const std::int32_t *selectedCounts, const std::int32_t *tokenCounts,
     const std::int64_t *selectedPagesBase, std::int64_t *cachedPagesBase,
@@ -459,7 +462,8 @@ void JitPhaseProgram::prepareClaimTableSelectedRows(
         "phase module lacks nta_jit_prepare_claim_table_selected_rows");
   }
   check(impl_->prepareClaimTableSelectedRows(
-            runtime, valid, objectSlots, capacityWords, selectedCounts,
+            runtime, valid, claimIds, generations, observedIds, objectSlots,
+            capacityWords, selectedCounts,
             tokenCounts, selectedPagesBase, cachedPagesBase, hostRowsBase,
             stagingRowsBase, selectedRowsBase, sourceIndicesBase,
             stagingIndicesBase, copiedRowsBase, maxClaims, maxBudgetPages,
