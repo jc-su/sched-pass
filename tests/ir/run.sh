@@ -174,6 +174,8 @@ fixtures=(
   "reject-staged-call-escape:staged base escapes through a call"
   "reject-staged-value-escape:staged base escapes as a stored or converted value"
   "reject-staged-inttoptr-escape:staged base escapes as a stored or converted value"
+  "reject-staged-freeze-deref:staged base is dereferenced outside its acquisition marker"
+  "reject-staged-aggregate-escape:staged base escapes as a stored or converted value"
 )
 for entry in "${fixtures[@]}"; do
   fixture=${entry%%:*}

@@ -1061,11 +1061,24 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._claim_table.activate(table_slot)
         except Exception:
             # Post-construction validation must be transactional: a raise
-            # here would otherwise strand the table slot and object-range
-            # lease (the claim is not yet registered, so no retire path
-            # would ever reclaim them).
+            # here would otherwise strand the table slot, the object-range
+            # lease, and the claim's own resources — the external handle
+            # owns staging rows, host-source ownership, and registry
+            # membership, and no retire path would ever run for a claim
+            # that was never registered. Construction enqueued summary and
+            # registration work on device streams, so the release waits on
+            # the stream before returning rows to the allocator.
             ranges.release(lease)
             self._claim_table.retire(table_slot, self._ImmediateFenceType)
+            try:
+                torch.cuda.current_stream().synchronize()
+                if claim.copy_stream is not None:
+                    claim.copy_stream.synchronize()
+                claim.release_resources()
+            except Exception:
+                logger.exception(
+                    "tiered claim rollback could not release claim resources"
+                )
             raise
         if not claim.external_sidecar:
             for local_layer in range(claim.layer_count):
@@ -1379,15 +1392,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         claims_present = self.requires_eager_requests(request_ids)
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
-        if getattr(self, "_tiered_graph_enabled", False):
-            # Outside the recorded region on both paths: point every
-            # claim-segment position at the captured plan buffer's tail
-            # so the in-graph copies are harmless for dense batches. This
-            # default MUST precede the replay fill — the fill overwrites
-            # these with the epoch's live positions, and running the
-            # default afterwards would clobber them, silently sending
-            # every layer's claim rows to the scratch tail (the ordering
-            # defect behind the refresh-32 graph/eager-boundary crash).
+        if getattr(self, "_tiered_graph_enabled", False) and not claims_present:
+            # Dense batches only: point every claim-segment position at the
+            # captured plan buffer's tail so the in-graph copies are
+            # harmless, and invalidate the tiered epoch (the tail write
+            # clobbered any live positions). Tiered batches skip this
+            # entirely — the replay fill owns the positions and reuses its
+            # epoch across consecutive replays; every event that changes
+            # the epoch's inputs (staging, refresh, retirement, batch
+            # recomposition) either routes through an eager forward, which
+            # invalidates below in init_forward_metadata, or changes the
+            # fill's (request ids, claim ids) key. Running this default on
+            # tiered batches was the ordering defect behind the refresh-32
+            # crash and, once reordered, still forced a full epoch rebuild
+            # on every replay.
             wrappers = getattr(
                 self.forward_metadata, "decode_wrappers", None
             ) or ()

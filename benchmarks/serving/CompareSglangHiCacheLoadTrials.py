@@ -324,6 +324,23 @@ def main() -> int:
             "passes": aggregate["all_attention_transformed"]
             and aggregate["all_fallback_free"],
         },
+        "physical_bytes": {
+            # The registered evidence standard records physically staged
+            # bytes per trial; artifacts predating the ledger fail this
+            # bar and must be regenerated rather than waived.
+            "recorded_trials": sum(
+                1
+                for value in (
+                    report.get("nta_staged_bytes") for report in reports
+                )
+                if isinstance(value, int) and value > 0
+            ),
+            "passes": all(
+                isinstance(report.get("nta_staged_bytes"), int)
+                and report.get("nta_staged_bytes") > 0
+                for report in reports
+            ),
+        },
     }
     aggregate["all_bars_pass"] = all(
         bar["passes"] for bar in aggregate["bars"].values()

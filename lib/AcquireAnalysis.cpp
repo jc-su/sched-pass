@@ -497,6 +497,10 @@ void collectProvenanceRoots(Value *pointer, SmallPtrSetImpl<Value *> &roots) {
       worklist.push_back(select->getFalseValue());
       continue;
     }
+    if (auto *frozen = dyn_cast<FreezeInst>(value)) {
+      worklist.push_back(frozen->getOperand(0));
+      continue;
+    }
     roots.insert(value);
   }
 }
@@ -720,60 +724,79 @@ FunctionPlan analyzeAcquisitions(Function &function) {
     }
   }
   if (!stagedBases.empty()) {
-    for (BasicBlock &block : function) {
-      for (Instruction &instruction : block) {
-        // A staged base may be consumed only through the checked memory
-        // forms below. Beyond direct dereferences, three value-level uses
-        // launder the pointer past the clause and are rejected as escapes:
-        // storing it to memory, converting it to an integer, and returning
-        // it. Provenance through phis, selects, casts, and GEPs is
-        // normalized by the root walk at each use site.
-        static const char *const derefReason =
-            "staged base is dereferenced outside its acquisition marker";
-        static const char *const callReason =
-            "staged base escapes through a call";
-        static const char *const valueReason =
-            "staged base escapes as a stored or converted value";
-        SmallVector<std::pair<Value *, const char *>, 2> uses;
-        if (auto *load = dyn_cast<LoadInst>(&instruction)) {
-          uses.emplace_back(load->getPointerOperand(), derefReason);
-        } else if (auto *store = dyn_cast<StoreInst>(&instruction)) {
-          uses.emplace_back(store->getPointerOperand(), derefReason);
-          if (store->getValueOperand()->getType()->isPointerTy()) {
-            uses.emplace_back(store->getValueOperand(), valueReason);
+    // Forward closure over the staged bases: derivation-only instructions
+    // (GEPs, casts, freeze, phis, selects) propagate the taint, and every
+    // other use of a tainted value is judged by kind. The default for an
+    // unlisted instruction kind is rejection, so a use form this list has
+    // never seen — today's aggregates and vectors included — cannot
+    // launder the pointer past the clause.
+    static const char *const derefReason =
+        "staged base is dereferenced outside its acquisition marker";
+    static const char *const callReason =
+        "staged base escapes through a call";
+    static const char *const valueReason =
+        "staged base escapes as a stored or converted value";
+    SmallVector<Value *, 8> worklist(stagedBases.begin(), stagedBases.end());
+    SmallPtrSet<Value *, 16> tainted(stagedBases.begin(), stagedBases.end());
+    SmallPtrSet<Instruction *, 8> rejectedInstructions;
+    auto reject = [&](Instruction *instruction, const char *reason) {
+      if (rejectedInstructions.insert(instruction).second) {
+        plan.rejected.push_back({instruction, reason});
+      }
+    };
+    while (!worklist.empty()) {
+      Value *value = worklist.pop_back_val();
+      for (Use &use : value->uses()) {
+        auto *instruction = dyn_cast<Instruction>(use.getUser());
+        if (instruction == nullptr) {
+          // A constant expression folding a staged base has no program
+          // point to anchor a diagnostic; taint its result instead so
+          // every eventual instruction use is judged.
+          auto *expression = dyn_cast<ConstantExpr>(use.getUser());
+          if (expression != nullptr && tainted.insert(expression).second) {
+            worklist.push_back(expression);
           }
-        } else if (auto *rmw = dyn_cast<AtomicRMWInst>(&instruction)) {
-          uses.emplace_back(rmw->getPointerOperand(), derefReason);
-          if (rmw->getValOperand()->getType()->isPointerTy()) {
-            uses.emplace_back(rmw->getValOperand(), valueReason);
+          continue;
+        }
+        const bool propagates =
+            isa<GetElementPtrInst>(instruction) || isa<CastInst>(instruction) ||
+            isa<FreezeInst>(instruction) || isa<PHINode>(instruction) ||
+            isa<SelectInst>(instruction);
+        if (propagates && !isa<PtrToIntInst>(instruction)) {
+          if (tainted.insert(instruction).second) {
+            worklist.push_back(instruction);
           }
-        } else if (auto *exchange =
-                       dyn_cast<AtomicCmpXchgInst>(&instruction)) {
-          uses.emplace_back(exchange->getPointerOperand(), derefReason);
-          if (exchange->getNewValOperand()->getType()->isPointerTy()) {
-            uses.emplace_back(exchange->getNewValOperand(), valueReason);
-          }
-        } else if (auto *transfer =
-                       dyn_cast<AnyMemTransferInst>(&instruction)) {
-          uses.emplace_back(transfer->getRawDest(), derefReason);
-          uses.emplace_back(transfer->getRawSource(), derefReason);
-        } else if (auto *memory = dyn_cast<AnyMemIntrinsic>(&instruction)) {
-          uses.emplace_back(memory->getRawDest(), derefReason);
-        } else if (auto *toInteger = dyn_cast<PtrToIntInst>(&instruction)) {
-          uses.emplace_back(toInteger->getPointerOperand(), valueReason);
-        } else if (auto *ret = dyn_cast<ReturnInst>(&instruction)) {
-          Value *returned = ret->getReturnValue();
-          if (returned != nullptr && returned->getType()->isPointerTy()) {
-            uses.emplace_back(returned, valueReason);
-          }
-        } else if (auto *call = dyn_cast<CallBase>(&instruction)) {
-          // A raw staged pointer handed to an ordinary call escapes the
-          // clause interprocedurally — the callee can dereference it with
-          // no liveness or generation check. NTA markers receive the base
-          // by design, and non-accessing intrinsics are not dereferences;
-          // every other callee, known or unknown, is rejected fail-closed.
-          Function *callee =
-              dyn_cast<Function>(call->getCalledOperand()->stripPointerCasts());
+          continue;
+        }
+        if (isa<ICmpInst>(instruction)) {
+          // Address comparisons dereference nothing; the canonical null
+          // test on acquisition results depends on them.
+          continue;
+        }
+        if (isa<LoadInst>(instruction)) {
+          reject(instruction, derefReason);
+          continue;
+        }
+        if (isa<StoreInst>(instruction)) {
+          reject(instruction,
+                 use.getOperandNo() == StoreInst::getPointerOperandIndex()
+                     ? derefReason
+                     : valueReason);
+          continue;
+        }
+        if (isa<AtomicRMWInst>(instruction) ||
+            isa<AtomicCmpXchgInst>(instruction)) {
+          reject(instruction, use.getOperandNo() == 0 ? derefReason
+                                                      : valueReason);
+          continue;
+        }
+        if (auto *call = dyn_cast<CallBase>(instruction)) {
+          // NTA markers receive the base by design; non-accessing
+          // intrinsics are not dereferences. Memory intrinsics and every
+          // other callee, known or unknown, take the pointer somewhere
+          // this clause cannot follow.
+          Function *callee = dyn_cast<Function>(
+              call->getCalledOperand()->stripPointerCasts());
           const StringRef name =
               callee != nullptr ? callee->getName() : StringRef();
           const bool ntaMarker =
@@ -789,26 +812,16 @@ FunctionPlan analyzeAcquisitions(Function &function) {
                (callee->getIntrinsicID() == Intrinsic::assume ||
                 callee->getIntrinsicID() == Intrinsic::lifetime_start ||
                 callee->getIntrinsicID() == Intrinsic::lifetime_end));
-          if (!ntaMarker && !nonAccessing) {
-            for (Value *argument : call->args()) {
-              if (argument->getType()->isPointerTy()) {
-                uses.emplace_back(argument, callReason);
-              }
-            }
+          if (ntaMarker || nonAccessing) {
+            continue;
           }
+          reject(instruction, isa<AnyMemIntrinsic>(call) ? derefReason
+                                                         : callReason);
+          continue;
         }
-        for (const auto &[pointer, reason] : uses) {
-          SmallPtrSet<Value *, 8> roots;
-          collectProvenanceRoots(pointer, roots);
-          bool bypasses = false;
-          for (Value *root : roots) {
-            bypasses |= stagedBases.count(root) != 0;
-          }
-          if (bypasses) {
-            plan.rejected.push_back({&instruction, reason});
-            break;
-          }
-        }
+        // Returns, pointer-to-integer conversions, aggregate and vector
+        // packing, and anything not enumerated above.
+        reject(instruction, valueReason);
       }
     }
   }
