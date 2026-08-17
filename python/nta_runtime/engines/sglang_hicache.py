@@ -102,7 +102,39 @@ class SglangHiCacheBridge:
         self._latest_request_work: dict[
             tuple[int, int], tuple[RequestWork, ServiceModel]
         ] = {}
+        self._summary_store: Any = None
         _register_bridge(device_pool, self)
+
+    def writeback_summary_store(self, controller: Any) -> Any:
+        """Lazily build the writeback envelope store (env-gated)."""
+        if os.environ.get("NTA_SGLANG_WRITEBACK_SUMMARIES") != "1":
+            return None
+        if self._summary_store is None:
+            from nta_runtime.engines.summary_store import WritebackSummaryStore
+
+            page_tokens = int(
+                getattr(self, "_external_prefix_page_tokens", 0) or 0
+            )
+            if page_tokens <= 0:
+                page_tokens = int(getattr(controller, "page_size", 0) or 0)
+            if page_tokens <= 0:
+                return None
+            capacity = int(
+                os.environ.get(
+                    "NTA_SGLANG_WRITEBACK_SUMMARY_BYTES", str(8 << 30)
+                )
+                or (8 << 30)
+            )
+            self._summary_store = WritebackSummaryStore(page_tokens, capacity)
+        claim_page_tokens = int(
+            getattr(self, "_external_prefix_page_tokens", 0) or 0
+        )
+        if (
+            claim_page_tokens > 0
+            and self._summary_store.page_tokens != claim_page_tokens
+        ):
+            return None
+        return self._summary_store
 
     def set_prefetch_callback(self, callback: Any) -> None:
         self._prefetch_callback = callback
@@ -714,6 +746,42 @@ def find_bridge(device_pool: Any) -> SglangHiCacheBridge | None:
         if entry is None or entry[0]() is not device_pool:
             return None
         return entry[1]()
+
+
+def route_write(
+    original: Any, controller: Any, *args: Any, **kwargs: Any
+) -> Any:
+    """Record page envelopes at device-to-host writeback (env-gated)."""
+    result = original(controller, *args, **kwargs)
+    if os.environ.get("NTA_SGLANG_WRITEBACK_SUMMARIES") != "1":
+        return result
+    if result is None:
+        return result
+    bridge = find_bridge(controller.mem_pool_device)
+    if bridge is None:
+        return result
+    try:
+        device_indices = kwargs.get("device_indices", args[0] if args else None)
+        node_id = int(kwargs.get("node_id", args[2] if len(args) > 2 else -1))
+        store = bridge.writeback_summary_store(controller)
+        if store is not None and device_indices is not None:
+            start_layer = int(
+                getattr(controller.mem_pool_device, "start_layer", 0)
+            )
+            layer_ids = tuple(
+                start_layer + local_layer
+                for local_layer in range(int(controller.layer_num))
+            )
+            store.record(
+                node_id,
+                result,
+                device_indices,
+                controller.mem_pool_device,
+                layer_ids,
+            )
+    except Exception:
+        logger.exception("writeback summary recording failed; scans continue")
+    return result
 
 
 def route_start_loading(
