@@ -1655,14 +1655,21 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         phases = self._phase_program(self._nta_demand_decode_wrappers[0])
         # SGLang's dense fill already wrote the per-request dense rows
         # into the captured buffer; rebuild it compactly in place from a
-        # dense snapshot region... the dense source must be disjoint from
-        # the compact destination, so stage the dense indices in the
-        # buffer tail beyond the compact region first.
+        # dense snapshot. The snapshot lives in a dedicated static buffer:
+        # staging it in the plan buffer's own tail overlaps the dense
+        # source whenever the batch's token sum exceeds the buffer's
+        # remaining headroom (torch refuses the aliased copy — first hit
+        # at the replay battery's oversubscribed shape).
         dense_total = dense
-        tail_start = plan_buffer.numel() - self._tg_span - dense_total
-        if tail_start <= compact:
-            return False
-        dense_stage = plan_buffer[tail_start : tail_start + dense_total]
+        stage_buffer = state.get("dense_stage")
+        if stage_buffer is None or stage_buffer.numel() < plan_buffer.numel():
+            stage_buffer = torch.empty(
+                plan_buffer.numel(),
+                dtype=plan_buffer.dtype,
+                device=plan_buffer.device,
+            )
+            state["dense_stage"] = stage_buffer
+        dense_stage = stage_buffer[:dense_total]
         dense_stage.copy_(plan_buffer[:dense_total])
         phases.build_compact_plan(
             dense_stage,
