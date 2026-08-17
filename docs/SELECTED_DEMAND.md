@@ -190,6 +190,26 @@ process held the GPU. The result is diagnostic, not qualification evidence;
 copy-and-reduce remains the default and `NTA_SGLANG_SUMMARY_PATH=mapped`
 selects the no-scratch path for a controlled transport-geometry sweep.
 
+**Writeback-time summaries (registered design, 2026-08-15; implementation
+pending).** Claim-creation summary scans are the largest avoidable resident
+interference: each new claim reads its full prefix's host K rows to build
+envelopes (~1.7 GB per six 16K claims in the quality battery, ~13 GB per
+load trial), and those reads compete with live decode for host-link
+bandwidth exactly when an arrival lands. The summary cache only helps
+repeated prefixes. The fix is to maintain envelopes where the bytes already
+flow: at HiCache writeback, when token rows move device to host, a hook
+reduces the written rows into a pool-resident per-(host-page, layer)
+min/max structure owned by the bridge and invalidated when the host pool
+frees rows. Claim creation then gathers per-page envelopes for its host
+rows directly — O(pages) reads instead of O(tokens x head_dim) — and falls
+back to the current scan (with a counter recording the fallback) only for
+rows whose summaries are missing, so correctness never depends on hook
+coverage. Envelope semantics are unchanged: min/max per page is
+associative, so incremental maintenance over writeback batches is exact.
+The measured summary-source-bytes counter must drop to near zero on the
+load shape for the change to count, and the resident P99 ITL retest at the
+capacity shape is the acceptance gate.
+
 The SGLang adapter represents an external prefix without allocating dense
 device-token slots through this contract:
 
