@@ -190,8 +190,8 @@ process held the GPU. The result is diagnostic, not qualification evidence;
 copy-and-reduce remains the default and `NTA_SGLANG_SUMMARY_PATH=mapped`
 selects the no-scratch path for a controlled transport-geometry sweep.
 
-**Writeback-time summaries (registered design, 2026-08-15; implementation
-pending).** Claim-creation summary scans are the largest avoidable resident
+**Writeback-time summaries (implemented 2026-08-17; design registered
+2026-08-15).** Claim-creation summary scans are the largest avoidable resident
 interference: each new claim reads its full prefix's host K rows to build
 envelopes (~1.7 GB per six 16K claims in the quality battery, ~13 GB per
 load trial), and those reads compete with live decode for host-link
@@ -208,7 +208,20 @@ coverage. Envelope semantics are unchanged: min/max per page is
 associative, so incremental maintenance over writeback batches is exact.
 The measured summary-source-bytes counter must drop to near zero on the
 load shape for the change to count, and the resident P99 ITL retest at the
-capacity shape is the acceptance gate.
+capacity shape is the acceptance gate. The landed implementation differs
+from the sketch in two recorded ways. First, incremental backups chunk at
+arbitrary token boundaries and a claim's page grid is phase-shifted by its
+device-resident prefix, so no record-time grid can match every claim:
+pages are recorded on the sequence's global grid (the chunk-boundary page
+stitched from ancestors' already-backed pinned rows), and a claim page
+gathers through a per-row locator as the elementwise min/max union of the
+one-to-several recorded pages covering its rows — a valid, slightly looser
+bound whose selection effect the scored quality battery gates. Second, the
+locator always reflects the newest backup of each host row, which is sound
+because device-to-host backup is the only writer of host KV rows in the
+evidence path; enabling a storage tier would add hook-invisible writers
+and requires revisiting. The probe record: gathers 20 of 20, summary scan
+bytes zero, resident P99 ITL 23ms versus 95-150ms with scans.
 
 The SGLang adapter represents an external prefix without allocating dense
 device-token slots through this contract:

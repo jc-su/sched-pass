@@ -504,12 +504,27 @@ class TieredClaim:
         controller = self.pending.controller
         from nta_runtime.engines.sglang_hicache import find_bridge
 
+        def count(reason: str) -> None:
+            key = f"tiered_summary_writeback_{reason}"
+            engine._stats[key] = engine._stats.get(key, 0) + 1
+
         bridge = find_bridge(controller.mem_pool_device)
         if bridge is None:
+            count("no_bridge")
             return None
         store = bridge.writeback_summary_store(controller)
-        if store is None or store.page_tokens != self.page_tokens:
+        if store is None:
+            count("no_store")
             return None
+        if store.page_tokens != self.page_tokens:
+            count("page_mismatch")
+            return None
+        engine._stats["tiered_summary_store_nodes"] = store.recorded_nodes
+        engine._stats["tiered_summary_store_bytes"] = store.stored_bytes
+        for reason, total in store.miss_reasons.items():
+            engine._stats[f"tiered_summary_store_miss_{reason}"] = total
+        for offset, total in store.offset_counts.items():
+            engine._stats[f"tiered_summary_store_offset_{offset}"] = total
         node_ids = tuple(getattr(self.pending, "node_ids", ()) or ())
         gathered = store.gather(
             node_ids,

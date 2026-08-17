@@ -748,37 +748,56 @@ def find_bridge(device_pool: Any) -> SglangHiCacheBridge | None:
         return entry[1]()
 
 
-def route_write(
-    original: Any, controller: Any, *args: Any, **kwargs: Any
+def route_write_backup(
+    original: Any, cache: Any, node: Any, *args: Any, **kwargs: Any
 ) -> Any:
-    """Record page envelopes at device-to-host writeback (env-gated)."""
-    result = original(controller, *args, **kwargs)
+    """Record page envelopes when a radix node backs up to host (env-gated).
+
+    Hooked above the controller so the node's global token offset is
+    known: incremental backups chunk at arbitrary boundaries, and page
+    envelopes must align to the claim's page grid over the whole prefix.
+    """
+    result = original(cache, node, *args, **kwargs)
     if os.environ.get("NTA_SGLANG_WRITEBACK_SUMMARIES") != "1":
         return result
-    if result is None:
-        return result
-    bridge = find_bridge(controller.mem_pool_device)
-    if bridge is None:
-        return result
     try:
-        device_indices = kwargs.get("device_indices", args[0] if args else None)
-        node_id = int(kwargs.get("node_id", args[2] if len(args) > 2 else -1))
+        if not result:
+            return result
+        controller = cache.cache_controller
+        bridge = find_bridge(controller.mem_pool_device)
+        if bridge is None:
+            return result
         store = bridge.writeback_summary_store(controller)
-        if store is not None and device_indices is not None:
-            start_layer = int(
-                getattr(controller.mem_pool_device, "start_layer", 0)
-            )
-            layer_ids = tuple(
-                start_layer + local_layer
-                for local_layer in range(int(controller.layer_num))
-            )
-            store.record(
-                node_id,
-                result,
-                device_indices,
-                controller.mem_pool_device,
-                layer_ids,
-            )
+        host_value = getattr(node, "host_value", None)
+        device_value = getattr(node, "value", None)
+        if store is None or host_value is None or device_value is None:
+            return result
+        # The backup invariant guarantees backed-up nodes form a contiguous
+        # prefix from root, so every ancestor's host rows are available:
+        # the store aligns to the sequence's global page grid and reduces
+        # the one chunk-boundary page from a handful of pinned host rows.
+        ancestor_rows: list[Any] = []
+        parent = getattr(node, "parent", None)
+        while parent is not None:
+            parent_host = getattr(parent, "host_value", None)
+            if parent_host is not None and len(parent_host) > 0:
+                ancestor_rows.append(parent_host)
+            parent = getattr(parent, "parent", None)
+        ancestor_rows.reverse()
+        start_layer = int(getattr(controller.mem_pool_device, "start_layer", 0))
+        layer_ids = tuple(
+            start_layer + local_layer
+            for local_layer in range(int(controller.layer_num))
+        )
+        store.record(
+            int(getattr(node, "id", -1)),
+            host_value,
+            device_value,
+            controller.mem_pool_device,
+            layer_ids,
+            ancestor_host_rows=ancestor_rows,
+            host_pool=controller.mem_pool_host,
+        )
     except Exception:
         logger.exception("writeback summary recording failed; scans continue")
     return result
