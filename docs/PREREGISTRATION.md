@@ -117,6 +117,36 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Mechanism changes before the P4-second campaign (2026-08-17,
+  recorded before any qualifying run):** P4-second reruns Amendment 4's
+  exact shape, arrival rate, seeds, SLOs, and bars — graphs enabled in
+  both arms — after the following mechanism and harness changes, all
+  landed with their own validation evidence. Mechanisms: the tiered
+  graph-replay position fill's ordering defect is fixed and its epoch
+  state now persists across consecutive replays (the replay battery at
+  refresh 1024 and 32 exercises 927 and 887 tiered replays over 42 and
+  62 epoch rebuilds, surviving the boundary regime that previously
+  crashed; verify halves byte-check 2,196 and 5,148 staged layers with
+  zero mismatches); the fill's dense snapshot moved to a dedicated
+  buffer after the plan-buffer tail aliased the source at oversubscribed
+  shapes; claim-table rows carry a device-consumed (claim id,
+  generation) pair audited at post-fence reclaim; claim construction is
+  transactional through resource release; the virtual-token namespace
+  recycles behind the retirement fence; and writeback-time summaries
+  replace claim-creation envelope scans (enabled for the campaign,
+  fallback-counted). Harness: the registered absolute-SLO goodput is the
+  aggregate's primary field; the aggregate carries explicit bar
+  verdicts, revision and argument identity, strict artifact resume, and
+  physical staged-byte records; the GPU gate refuses devices with live
+  compute apps. Quality: needle and multikey hold 1.0 on the graphs-
+  replay path at budget 64; the count aggregation task scores 0.0 on
+  the stock dense arm itself at this model scale, so it is recorded as
+  model-limited and excluded from parity claims with that reason. The
+  refresh-interval-1 diagnostic configuration fails the launch-
+  accounting identity (excess ~36 x 113 selected launches) and remains
+  an open tracked defect; no campaign configuration uses interval 1.
+  P4-second runs only after the writeback-summary validation probe
+  passes, on a recorded revision.
 - **Correction (2026-08-15, prompted by an external audit; no new runs):**
   the trials wrapper's aggregate omitted the registered primary
   (`preregistered_goodput_ratio`, absolute-SLO goodput) from its ratio
