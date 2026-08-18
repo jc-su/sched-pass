@@ -1413,6 +1413,14 @@ class TieredClaim:
                 device=self.forced_pages.device,
             )
         base = self.first_object_slot + 2 * local_layer
+        stage_profile = os.environ.get("NTA_SGLANG_STAGE_PROFILE") == "1"
+        if stage_profile:
+            profile_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            profile_events[0].record(prep_stream)
         with torch.cuda.stream(prep_stream):
             if queries.dtype != torch.float16:
                 queries = queries.to(torch.float16)
@@ -1438,6 +1446,8 @@ class TieredClaim:
                 self.copied_rows_device,
                 stream=prep_stream,
             )
+            if stage_profile:
+                profile_events[1].record(prep_stream)
             self.remember_selected_rows(
                 local_layer, self.selected_rows[: self.kept_prefix_rows]
             )
@@ -1446,7 +1456,39 @@ class TieredClaim:
             )
             copied = self.copy_ready[local_layer]
             copied.record(prep_stream)
+            if stage_profile:
+                profile_events[2].record(prep_stream)
         stream.wait_event(copied)
+        if stage_profile:
+            pending = getattr(self, "_stage_profile_events", None)
+            if pending is None:
+                pending = []
+                self._stage_profile_events = pending
+            pending.append(profile_events)
+            if local_layer == self.layer_count - 1:
+                # Diagnostic mode only: one synchronization at the extend's
+                # last layer resolves every phase pair without touching the
+                # hot path of qualifying runs.
+                profile_events[2].synchronize()
+                select_ms = sum(
+                    events[0].elapsed_time(events[1]) for events in pending
+                )
+                transfer_ms = sum(
+                    events[1].elapsed_time(events[2]) for events in pending
+                )
+                engine._stats["tiered_stage_select_ms_total"] = (
+                    engine._stats.get("tiered_stage_select_ms_total", 0.0)
+                    + select_ms
+                )
+                engine._stats["tiered_stage_transfer_ms_total"] = (
+                    engine._stats.get("tiered_stage_transfer_ms_total", 0.0)
+                    + transfer_ms
+                )
+                engine._stats["tiered_stage_profiled_layers"] = (
+                    engine._stats.get("tiered_stage_profiled_layers", 0)
+                    + len(pending)
+                )
+                pending.clear()
         if os.environ.get("NTA_SGLANG_SELECTION_VERIFY") == "1":
             # Debug dual build: the kernel's free set must equal the
             # reference's as a set (order parity holds by composite key;
