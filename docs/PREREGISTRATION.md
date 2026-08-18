@@ -117,6 +117,19 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Mechanism note before the C4-second campaign (2026-08-18, recorded
+  before any qualifying run):** the capacity-shape campaign is rerun
+  under the identical registered shape, seeds, and bars as campaign
+  four, because every interference fix recorded above (epoch-cached
+  replay, writeback summaries with the device-resident store,
+  vectorized claim preparation) landed after that campaign's resident
+  failure (1.547 with absolute SLO crossings) was measured — the same
+  fixes took the probe shape's resident tail from 95-150ms to 23ms.
+  The capacity shape's registered goodput already passes (1.830
+  corrected); its residents produce roughly one thousand P99 samples,
+  so the single-collision sensitivity that decides P4-shape trials is
+  structurally weaker there. Revision recorded at launch; the run uses
+  the corrected harness with per-bar verdicts.
 - **P4-third campaign result (2026-08-18, Amendment 4 verbatim, graphs
   both arms, writeback summaries with the device-resident store,
   revision 69736ab, ten of ten trials — one co-tenant interruption
