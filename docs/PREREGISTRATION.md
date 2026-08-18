@@ -117,6 +117,25 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **C4-second campaign result (2026-08-18, capacity shape and seeds
+  verbatim, graphs both arms, all interference fixes active, revision
+  8f61e88, ten of ten trials, artifacts `results/serving/c4b-trials/`):**
+  registered goodput **2.1107 [1.971, 2.222]** — **passes as
+  registered**, and for the first time in the graphs era the interval
+  floor clears the 1.5x bar itself (campaign four: 1.830 [1.431,
+  2.288]). The resident P99 ITL ratio is **1.2281 [1.112, 1.357]**
+  against the 1.05x bar: **fails as registered**, improved from 1.547,
+  with absolutes down from 64-119ms and three SLO crossings to
+  42-79ms and none — the interference fixes carried to this shape, two
+  trials reach parity, and the residual is the same eager-extend
+  collision mechanism as at the P4 shape, at higher frequency because
+  12/s arrivals give extends many more resident windows to land in.
+  Cross-shape status after five campaigns on the corrected metric:
+  goodput passes decisively at both registered shapes (2.11 capacity,
+  1.66 queue) with quality, mechanism, and byte bars green; the
+  resident bar fails at both for one shared, profiled reason — the
+  30-64ms eager extend span — whose registered fix is the extend
+  capture now in progress.
 - **Mechanism note before the C4-second campaign (2026-08-18, recorded
   before any qualifying run):** the capacity-shape campaign is rerun
   under the identical registered shape, seeds, and bars as campaign
