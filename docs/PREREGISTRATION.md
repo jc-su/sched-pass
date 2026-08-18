@@ -117,6 +117,28 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **P4-third campaign result (2026-08-18, Amendment 4 verbatim, graphs
+  both arms, writeback summaries with the device-resident store,
+  revision 69736ab, ten of ten trials — one co-tenant interruption
+  after trial eight, gated resume on the same revision — artifacts
+  `results/serving/p4c-trials/`):** registered goodput **1.6575
+  [1.360, 2.057]** — **passes as registered** for the third
+  consecutive campaign at this shape, the strongest margin yet. The
+  resident P99 ITL ratio is **1.0739 [0.927, 1.294]** against the
+  1.05x bar: **fails as registered by 0.024**, the closest of any
+  campaign (1.158 in P4-second, 1.096 in P4-first). The distribution
+  states the mechanism exactly: eight of ten trials sit at or below
+  parity (0.851-1.006) — claim preparation no longer perturbs
+  co-residents at all — and the entire miss is two trials (1.973,
+  1.696) in which an eager extend forward landed inside the resident's
+  ~127-sample decode window, where a single collided sample sets the
+  trial's P99. Without those two collisions the geomean is ~0.94. The
+  eager extend span (30-64ms of per-layer launch overhead; staging
+  itself is 116us per layer) is therefore the last interference
+  mechanism standing, and the long-registered extend capture — for
+  which every kernel in the staging chain is already
+  capture-compatible — is the remaining path to the bar. Two of ten
+  trials record armed near-tie divergence.
 - **Mechanism changes before the P4-third campaign (2026-08-18,
   recorded before any qualifying run):** P4-third reruns Amendment 4
   verbatim after the claim-preparation stall found in P4-second's own
