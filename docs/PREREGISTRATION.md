@@ -117,6 +117,26 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Mechanism changes before the P4-third campaign (2026-08-18,
+  recorded before any qualifying run):** P4-third reruns Amendment 4
+  verbatim after the claim-preparation stall found in P4-second's own
+  artifacts was eliminated in three recorded steps: the writeback
+  summary store's per-page Python gather (~90ms per claim on the
+  scheduler thread) was vectorized, its CPU pool's strided gathers
+  (~730ms per claim — a regression caught and recorded) were replaced
+  by a device-resident fp16 pool, after which claim preparation costs
+  ~3ms per claim with no host copies in either direction (probe:
+  23,523ms to 100.6ms total at the P4 shape). A per-stage extend
+  profiler landed with the same probes and attributes the remaining
+  co-resident interference to the eager extend forward's per-layer
+  launch overhead (staging itself measures 116us per layer; the span
+  is 30-64ms), for which the long-registered extend capture is the
+  identified mechanism and is in progress — P4-third is expected to
+  improve but not necessarily pass the resident bar, and is run to
+  seal the preparation-stall elimination under the registered
+  protocol. Same-revision RQ3 ablations (2026-08-17) are recorded in
+  RELATED_WORK.md: the device chain serves 2.11x stock against the
+  host-orchestrated arm's 0.982x with a 14.4x resident tail.
 - **P4-second campaign result (2026-08-17, Amendment 4 shape and seeds
   verbatim, graphs both arms, writeback summaries enabled, revision
   0154c30, ten of ten trials, artifacts `results/serving/p4b-trials/`,
