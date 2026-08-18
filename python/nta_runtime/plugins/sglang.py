@@ -11,6 +11,9 @@ _RELEASE_TARGET = "sglang.srt.managers.scheduler.Scheduler.release_host_resource
 _HICACHE_LOAD_TARGET = (
     "sglang.srt.managers.cache_controller.HiCacheController.start_loading"
 )
+_EXECUTE_EXTEND_TARGET = (
+    "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_extend"
+)
 _WRITE_BACKUP_TARGETS = (
     "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.write_backup",
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.write_backup",
@@ -49,6 +52,23 @@ _ALLOCATOR_FREE_TARGETS = (
     "sglang.srt.mem_cache.allocator.token.TokenToKVPoolAllocator.free",
     "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.free",
 )
+
+
+def _route_execute_extend(original, runner, forward_batch, pp_proxy_tensors=None):
+    """Serve eligible tiered extends by captured replay (env-gated)."""
+    backend = getattr(runner.model_runner, "attn_backend", None)
+    capture = getattr(backend, "_extend_capture", None)
+    if capture is None or not capture.enabled or capture.capturing:
+        return original(runner, forward_batch, pp_proxy_tensors)
+    claim = capture.eligible_claim(forward_batch)
+    if claim is None:
+        return original(runner, forward_batch, pp_proxy_tensors)
+    result = capture.run(
+        runner, forward_batch, pp_proxy_tensors, claim
+    )
+    if result is not None:
+        return result
+    return original(runner, forward_batch, pp_proxy_tensors)
 
 
 def _preserve_graph_request_metadata() -> None:
@@ -233,6 +253,11 @@ def register() -> None:
     if not any(hook is route_start_loading for _, hook, _ in hicache_hooks):
         HookRegistry.register(
             _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
+        )
+    extend_hooks = HookRegistry._hooks[_EXECUTE_EXTEND_TARGET]
+    if not any(hook is _route_execute_extend for _, hook, _ in extend_hooks):
+        HookRegistry.register(
+            _EXECUTE_EXTEND_TARGET, _route_execute_extend, HookType.AROUND
         )
     for write_target in _WRITE_BACKUP_TARGETS:
         write_hooks = HookRegistry._hooks[write_target]

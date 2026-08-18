@@ -487,6 +487,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise ValueError("NTA requires FlashInfer's FA2 attention kernels")
 
         self._hicache_enabled = bool(model_runner.server_args.enable_hierarchical_cache)
+        self._model_runner = model_runner
+        self._extend_capture: Any = None
         self._decode_jit_args: list[Any] | None = None
         self._prefill_jit_args: list[Any] | None = None
         self._install_instrumented_wrappers(model_runner, skip_prefill)
@@ -762,6 +764,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "NTA_SGLANG_SELECTED_TIERED requires a selected budget and "
                 "NTA_SGLANG_SELECTED_SERVE=1"
             )
+        if os.environ.get("NTA_SGLANG_EXTEND_CAPTURE") == "1":
+            from nta_runtime.engines.extend_capture import ExtendCaptureRunner
+
+            self._extend_capture = ExtendCaptureRunner(self)
         # RQ3 baseline B1: identical selection, admission, and transfer, but
         # every staging decision routes through a host round-trip instead of
         # the device claim chain. The flag lands in the stats so artifacts
