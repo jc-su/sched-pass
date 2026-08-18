@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 class WritebackSummaryStore:
     """Per-node K envelopes recorded at device-to-host writeback."""
 
-    def __init__(self, page_tokens: int, capacity_bytes: int) -> None:
+    def __init__(
+        self, page_tokens: int, capacity_bytes: int, device: str = "cuda"
+    ) -> None:
+        self.device = device
         if page_tokens <= 0:
             raise RuntimeError("summary store needs a positive page size")
         if capacity_bytes <= 0:
@@ -59,6 +62,9 @@ class WritebackSummaryStore:
         self.evicted_nodes = 0
         self.miss_reasons: dict[str, int] = {}
         self.offset_counts: dict[int, int] = {}
+        self.gather_ms_total = 0.0
+        self.record_ms_total = 0.0
+        self.record_calls = 0
 
     def record(
         self,
@@ -83,6 +89,9 @@ class WritebackSummaryStore:
         Runs on the caller's stream after the KV writes it summarizes; the
         device rows stay allocated until the backup acks.
         """
+        import time as _time
+
+        _record_began = _time.monotonic()
         tokens = int(device_indices.numel())
         if tokens <= 0 or node_id < 0:
             return
@@ -120,19 +129,20 @@ class WritebackSummaryStore:
         minima: list[torch.Tensor] = []
         maxima: list[torch.Tensor] = []
         for index, layer_id in enumerate(layer_ids):
-            key = device_pool._get_key_buffer(layer_id)[rows].float()
+            key = device_pool._get_key_buffer(layer_id)[rows]
             if boundary_rows is not None:
-                host_key = (
-                    host_pool.k_data_refs[index][boundary_rows]
-                    .to(key.device)
-                    .float()
+                host_key = host_pool.k_data_refs[index][boundary_rows].to(
+                    key.device
                 )
-                key = torch.cat([host_key, key])
+                key = torch.cat([host_key.to(key.dtype), key])
             paged = key.view(pages, self.page_tokens, *key.shape[1:])
             minima.append(paged.amin(dim=1))
             maxima.append(paged.amax(dim=1))
-        kmin = torch.stack(minima).to("cpu")
-        kmax = torch.stack(maxima).to("cpu")
+        # The pool lives on the device in fp16: min and max of fp16 data
+        # are exact in fp16, record is a device-to-device write with no
+        # host copy, and gathers return device tensors directly.
+        kmin = torch.stack(minima).to(torch.float16)
+        kmax = torch.stack(maxima).to(torch.float16)
         if boundary_rows is not None:
             host_rows = torch.cat([boundary_rows, node_host[:covered]])
         else:
@@ -154,10 +164,10 @@ class WritebackSummaryStore:
                 self.evicted_nodes += 1
             self._ensure_pool(kmin.shape[0], kmin.shape[2:], pages)
             slots = [self._pool_free.pop() for _ in range(pages)]
-            slot_tensor = torch.tensor(slots, dtype=torch.int64)
+            slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.device)
             self._pool_min[:, slot_tensor] = kmin
             self._pool_max[:, slot_tensor] = kmax
-            page_rows = host_rows.view(pages, self.page_tokens)
+            page_rows = host_rows.view(pages, self.page_tokens).to(self.device)
             self._row_slots[page_rows.reshape(-1)] = slot_tensor.to(
                 torch.int32
             ).repeat_interleave(self.page_tokens)
@@ -166,6 +176,8 @@ class WritebackSummaryStore:
             self._bytes += entry_bytes
             self._node_slots[node_id] = slots
             self.recorded_nodes += 1
+        self.record_ms_total += (_time.monotonic() - _record_began) * 1_000.0
+        self.record_calls += 1
 
     def _ensure_pool(
         self,
@@ -175,7 +187,7 @@ class WritebackSummaryStore:
     ) -> None:
         if self._row_slots is None:
             self._row_slots = torch.full(
-                (self._table_rows,), -1, dtype=torch.int32
+                (self._table_rows,), -1, dtype=torch.int32, device=self.device
             )
         while (
             self._pool_min is None
@@ -187,7 +199,8 @@ class WritebackSummaryStore:
             begin = self._pool_capacity
             new_min = torch.zeros(
                 (layer_count, self._pool_capacity + grown, *envelope_shape),
-                dtype=torch.float32,
+                dtype=torch.float16,
+                device=self.device,
             )
             new_max = torch.zeros_like(new_min)
             if self._pool_min is not None:
@@ -206,8 +219,8 @@ class WritebackSummaryStore:
         self._order.remove(node_id)
         slots = self._node_slots.pop(node_id, [])
         if slots and self._row_slots is not None:
-            rows = entry[0]
-            slot_tensor = torch.tensor(slots, dtype=torch.int32)
+            rows = entry[0].to(self.device)
+            slot_tensor = torch.tensor(slots, dtype=torch.int32, device=self.device)
             current = self._row_slots[rows]
             owned = (
                 current.view(len(slots), self.page_tokens)
@@ -240,6 +253,9 @@ class WritebackSummaryStore:
         bound at grid-phase boundaries, quality-gated by the scored
         battery. Any unmapped row misses the whole claim, fail-closed.
         """
+        import time as _time
+
+        _gather_began = _time.monotonic()
         del node_ids  # node identity does not survive radix splits
         if pages <= 0:
             self.miss_reasons["no_pages"] = (
@@ -259,7 +275,7 @@ class WritebackSummaryStore:
                 )
                 return None
             rows = host_rows_cpu[: full_pages * self.page_tokens].to(
-                torch.int64
+                device=self.device, dtype=torch.int64
             )
             if int(rows.max()) >= self._row_slots.numel() or int(rows.min()) < 0:
                 self.miss_reasons["row_out_of_range"] = (
@@ -313,9 +329,12 @@ class WritebackSummaryStore:
                 ).amax(dim=2)
         shape = paged_min.shape
         kmin = torch.zeros(
-            (layer_count, pages, *shape[2:]), dtype=torch.float32
+            (layer_count, pages, *shape[2:]),
+            dtype=torch.float32,
+            device=paged_min.device,
         )
         kmax = torch.zeros_like(kmin)
-        kmin[:, :full_pages] = paged_min
-        kmax[:, :full_pages] = paged_max
+        kmin[:, :full_pages] = paged_min.to(torch.float32)
+        kmax[:, :full_pages] = paged_max.to(torch.float32)
+        self.gather_ms_total += (_time.monotonic() - _gather_began) * 1_000.0
         return kmin, kmax

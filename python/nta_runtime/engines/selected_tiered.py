@@ -521,6 +521,9 @@ class TieredClaim:
             return None
         engine._stats["tiered_summary_store_nodes"] = store.recorded_nodes
         engine._stats["tiered_summary_store_bytes"] = store.stored_bytes
+        engine._stats["tiered_summary_gather_ms_total"] = store.gather_ms_total
+        engine._stats["tiered_summary_record_ms_total"] = store.record_ms_total
+        engine._stats["tiered_summary_record_calls"] = store.record_calls
         for reason, total in store.miss_reasons.items():
             engine._stats[f"tiered_summary_store_miss_{reason}"] = total
         for offset, total in store.offset_counts.items():
@@ -536,10 +539,7 @@ class TieredClaim:
         if gathered is None:
             return None
         kmin, kmax = gathered
-        return (
-            kmin.to(device, non_blocking=False),
-            kmax.to(device, non_blocking=False),
-        )
+        return kmin.to(device), kmax.to(device)
 
     def _summary_cache_key(
         self, pending: Any, host_pool: Any, start_layer: int, summary_path: str

@@ -9,7 +9,7 @@ from nta_runtime.engines.summary_store import WritebackSummaryStore
 class FakePool:
     def __init__(self, rows, heads, dim, layers):
         self.buffers = [
-            torch.randn(rows, heads, dim, dtype=torch.float32)
+            torch.randn(rows, heads, dim, dtype=torch.float16)
             for _ in range(layers)
         ]
 
@@ -24,7 +24,7 @@ class FakeHostPool:
 
 PAGE = 16
 LAYERS = 3
-store = WritebackSummaryStore(PAGE, 64 << 20)
+store = WritebackSummaryStore(PAGE, 64 << 20, device="cpu")
 pool = FakePool(4096, 2, 8, LAYERS)
 host_pool = FakeHostPool(pool, LAYERS)
 layer_ids = tuple(range(LAYERS))
@@ -40,8 +40,8 @@ assert gathered is not None
 kmin, kmax = gathered
 for layer in range(LAYERS):
     direct = pool.buffers[layer][rows_a].view(4, PAGE, 2, 8)
-    assert torch.equal(kmin[layer], direct.amin(dim=1))
-    assert torch.equal(kmax[layer], direct.amax(dim=1))
+    assert torch.equal(kmin[layer], direct.amin(dim=1).to(torch.float32))
+    assert torch.equal(kmax[layer], direct.amax(dim=1).to(torch.float32))
 
 # Phase-shifted claim (starts 5 rows in): union bound must contain the
 # true envelope of every full page.
@@ -50,7 +50,7 @@ gathered = store.gather((), shifted, LAYERS, 3, 3 * PAGE)
 assert gathered is not None
 smin, smax = gathered
 for layer in range(LAYERS):
-    true = pool.buffers[layer][shifted].view(3, PAGE, 2, 8)
+    true = pool.buffers[layer][shifted].view(3, PAGE, 2, 8).to(torch.float32)
     assert bool((smin[layer] <= true.amin(dim=1) + 1e-6).all())
     assert bool((smax[layer] >= true.amax(dim=1) - 1e-6).all())
 
@@ -69,7 +69,9 @@ store.record(
 gathered = store.gather((), rows_b[:32], LAYERS, 2, 32)
 assert gathered is not None, store.miss_reasons
 bmin, _ = gathered
-direct = pool.buffers[0][rows_b[:32]].view(2, PAGE, 2, 8).amin(dim=1)
+direct = (
+    pool.buffers[0][rows_b[:32]].view(2, PAGE, 2, 8).amin(dim=1).to(torch.float32)
+)
 assert torch.equal(bmin[0], direct)
 
 # A row never recorded fails closed.
@@ -82,7 +84,7 @@ store.record(1, rows_c, rows_c, pool, layer_ids)
 assert store.gather((), rows_a, LAYERS, 4, 4 * PAGE) is None
 
 # Eviction under a tiny budget frees slots and keeps gathers consistent.
-small = WritebackSummaryStore(PAGE, 2_000)
+small = WritebackSummaryStore(PAGE, 2_000, device="cpu")
 for index in range(8):
     rows = torch.arange(index * PAGE, (index + 1) * PAGE, dtype=torch.int64)
     small.record(10 + index, rows, rows, pool, layer_ids)
