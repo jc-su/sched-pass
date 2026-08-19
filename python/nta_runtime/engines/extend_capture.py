@@ -1,5 +1,19 @@
 """Captured extend forwards for external-prefix claims.
 
+INTEGRATION PIVOT (2026-08-19, recorded after the first serving smoke):
+the smoke run proved the hook, eligibility, and workspace paths work
+(one warmup, twelve geometry refusals) and exposed that extend token
+counts vary per request, so exact-size graphs cannot amortize — capture
+needs bucketed padding with last-real-token logits extraction. SGLang
+0.5.14 already ships exactly that machinery in PrefillCudaGraphRunner
+(bucketed capture_num_tokens, dummy ForwardBatch construction, buffer
+population, output slicing), disabled by default. The next step is to
+enable it and plug this module's workspace binding and in-graph staging
+into its backend contract instead of duplicating padding and logits
+handling here. The workspace, geometry checks, in-graph staging, and
+fail-closed counters below carry over unchanged.
+
+
 The eager extend forward costs 30-64ms of per-layer launch overhead and
 is the last co-resident interference mechanism at every registered shape
 (P4-third: eight of ten trials at parity, the miss entirely two extend
