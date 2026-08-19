@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
     )
     parser.add_argument(
+        "--cuda-graph-prefill",
+        choices=("disabled", "breakable"),
+        default="disabled",
+    )
+    parser.add_argument(
         "--require-demand-graph",
         action="store_true",
         help="require finite NTA demand-operator graph capture and replay",
@@ -218,6 +223,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         str(args.seed),
         "--cuda-graph-decode",
         args.cuda_graph_decode,
+        "--cuda-graph-prefill",
+        args.cuda_graph_prefill,
         "--flashinfer-workspace-base",
         str(workspace / "flashinfer"),
     ]

@@ -83,6 +83,17 @@ def parse_args() -> argparse.Namespace:
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
     )
     parser.add_argument(
+        "--cuda-graph-prefill",
+        choices=("disabled", "breakable"),
+        default="disabled",
+        help=(
+            "prefill-phase CUDA graph backend for BOTH arms; breakable "
+            "captures the dense per-layer compute piecewise and leaves "
+            "attention (and the tiered staging chain) eager between "
+            "pieces, shrinking the extend forward's launch-overhead span"
+        ),
+    )
+    parser.add_argument(
         "--load-warmup-iterations",
         type=int,
         default=2,
@@ -322,6 +333,7 @@ def main() -> int:
         max_total_tokens=args.max_total_tokens,
         max_running_requests=args.max_running_requests,
         cuda_graph_backend_decode=args.cuda_graph_decode,
+        cuda_graph_backend_prefill=args.cuda_graph_prefill,
         cuda_graph_backend_prefill="disabled",
         chunked_prefill_size=args.context_length,
         enable_mixed_chunk=args.batch_mode == "coalesced",
@@ -422,6 +434,7 @@ def main() -> int:
         "mixed_chunk_enabled": args.batch_mode == "coalesced",
         "hicache_ratio": args.hicache_ratio,
         "cuda_graph_decode": args.cuda_graph_decode,
+        "cuda_graph_prefill": args.cuda_graph_prefill,
         "load_warmup_iterations": args.load_warmup_iterations,
         "load_warmup_excluded": args.load_warmup_iterations >= 2,
         "load_seconds": load_seconds,
