@@ -75,6 +75,13 @@ _OBJECT_ID_BASE = 0x4E54410000000000
 _LOOKAHEAD_ALIAS_ID_BASE = _OBJECT_ID_BASE | 0x00000000FFFF0000
 _LOOKAHEAD_VERSION = 1
 _MAX_ABI_BYTES = (1 << 32) - 1
+# Incremented by the plugin's PrefillCudaGraphRunner patches (same scheduler
+# process); exported through _stats_report so artifacts attest whether the
+# breakable prefill graphs actually served batches or only captured.
+PREFILL_GRAPH_COUNTERS: dict[str, int] = {
+    "prefill_graph_served_batches": 0,
+    "prefill_graph_capture_batches": 0,
+}
 logger = logging.getLogger(__name__)
 _PagePair = tuple[tuple[int, ...], tuple[int, ...]]
 
@@ -4393,6 +4400,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             for family in families
         )
         report.update(self._hicache.admission_stats())
+        report.update(PREFILL_GRAPH_COUNTERS)
         report["finished_unix_ns"] = time.time_ns()
         return report
 

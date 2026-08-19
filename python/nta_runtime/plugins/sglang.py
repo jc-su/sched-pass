@@ -87,11 +87,14 @@ def _preserve_prefill_graph_request_metadata() -> None:
         return
 
     def load_batch(self, forward_batch, **kwargs):
+        from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+
         static_batch = current(self, forward_batch, **kwargs)
         static_batch.rids = getattr(forward_batch, "rids", None)
         priorities = getattr(forward_batch, "_nta_request_priorities", None)
         if priorities is not None:
             static_batch._nta_request_priorities = priorities
+        PREFILL_GRAPH_COUNTERS["prefill_graph_served_batches"] += 1
         return static_batch
 
     load_batch._nta_preserves_request_metadata = True
@@ -105,7 +108,10 @@ def _preserve_prefill_graph_request_metadata() -> None:
     if not getattr(current_prepare, "_nta_preserves_request_metadata", False):
 
         def capture_prepare(self, num_tokens):
+            from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+
             result = current_prepare(self, num_tokens)
+            PREFILL_GRAPH_COUNTERS["prefill_graph_capture_batches"] += 1
             forward_batch = result[0] if isinstance(result, tuple) else result
             if not getattr(forward_batch, "rids", None):
                 batch_size = int(getattr(forward_batch, "batch_size", 1) or 1)
