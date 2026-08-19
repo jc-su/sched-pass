@@ -57,6 +57,37 @@ _ALLOCATOR_FREE_TARGETS = (
 def _route_execute_extend(original, runner, forward_batch, pp_proxy_tensors=None):
     """Serve eligible tiered extends by captured replay (env-gated)."""
     backend = getattr(runner.model_runner, "attn_backend", None)
+    claims = getattr(backend, "_tiered_claims", None)
+    if claims:
+        # Classify every claim-staging extend batch by composition. The
+        # capture eligibility rules exclude mixed and multi-request
+        # batches, so whether the colliding extends ARE those batches
+        # decides whether single-claim capture can close the resident
+        # bar at all; the counters ride the artifact either way.
+        rids = tuple(getattr(forward_batch, "rids", ()) or ())
+        claim_rids = {
+            candidate.request_id
+            for candidate in claims.values()
+            if candidate.external_sidecar
+        }
+        claim_hits = sum(1 for rid in rids if rid in claim_rids)
+        if claim_hits:
+            stats = backend._stats
+
+            def bump(key: str) -> None:
+                stats[key] = stats.get(key, 0) + 1
+
+            bump("tiered_extend_batches")
+            mode = getattr(forward_batch, "forward_mode", None)
+            if mode is not None and mode.is_mixed():
+                bump("tiered_extend_batches_mixed")
+            if len(rids) > 1:
+                bump("tiered_extend_batches_multi_rid")
+            if claim_hits > 1:
+                bump("tiered_extend_batches_multi_claim")
+            stats["tiered_extend_batch_rids_max"] = max(
+                stats.get("tiered_extend_batch_rids_max", 0), len(rids)
+            )
     capture = getattr(backend, "_extend_capture", None)
     if capture is None or not capture.enabled or capture.capturing:
         return original(runner, forward_batch, pp_proxy_tensors)
