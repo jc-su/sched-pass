@@ -334,7 +334,6 @@ def main() -> int:
         max_running_requests=args.max_running_requests,
         cuda_graph_backend_decode=args.cuda_graph_decode,
         cuda_graph_backend_prefill=args.cuda_graph_prefill,
-        cuda_graph_backend_prefill="disabled",
         chunked_prefill_size=args.context_length,
         enable_mixed_chunk=args.batch_mode == "coalesced",
         enable_hierarchical_cache=True,
