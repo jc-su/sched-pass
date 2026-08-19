@@ -123,10 +123,21 @@ outcomes of the same algorithm, not independent production policies.
 
 ## 3. Research Question
 
-> Can a compiler expose request-owned data dependencies, executable
-> contributors, and exact completion conditions from optimized finite GPU
-> operators, enabling an SLO runtime to jointly prioritize external data and
-> GPU computation without persistent kernels or resident-path regression?
+> In heterogeneous serving, the engine knows request lifecycle, SLO, and
+> memory pressure, while GPU execution discovers — after launch — exactly
+> which cached data the current query needs. Can a compiler-checked contract
+> preserve the request-to-demand-to-consumer association across engine,
+> runtime, and GPU, so that selection, validation, and acquisition of
+> nonresident data execute device-side under engine admission control,
+> without persistent kernels, host identity round trips, or resident-path
+> regression?
+
+Selective KV acquisition is the flagship instantiation of that contract:
+existing boundaries lose the association between request, dynamic demand,
+tier placement, and consumer, forcing dense allocation, overfetch, or a host
+control round trip. Exact `(V, LSE)` partial contributors remain an
+additional execution form for workloads that require exact attention
+(Section 3.2); they are not the explanation for the current headline result.
 
 The target is broad applicability and low regret, not strict speedup at every
 point. Production has no oracle. Controlled identical-snapshot experiments may
@@ -141,12 +152,40 @@ that path would reproduce a weaker cache/prefetch scheduler. The project keeps
 coalesced movement, cache state, and GPU-initiated I/O as substrates, but no
 longer treats them as the performance contribution.
 
-The decisive unit is one request-owned numerical contributor inside a real
-operator. A valid experiment must show at least one contributor executing
-before the last dependency of its request arrives, preserve its `(V, LSE)`
-state, and expose that progress to later admission. If real fragmented traces
-and manually split FlashInfer cannot pass that test, the compiler/serving thesis
-is false and the project must narrow to a runtime mechanism.
+The decisive unit was defined as one request-owned numerical contributor
+inside a real operator: a valid experiment must show at least one contributor
+executing before the last dependency of its request arrives, preserve its
+`(V, LSE)` state, and expose that progress to later admission. The recorded
+falsification condition was that if real fragmented traces and manually split
+FlashInfer cannot pass that test, the compiler/serving thesis is false and
+the project must narrow to a runtime mechanism.
+
+### 3.2 Decision after the selective-KV campaigns (2026-08)
+
+The registered goodput wins (capacity shape `2.1107x` with the CI floor above
+the `1.5` bar; three consecutive Poisson-shape passes) execute through
+selected claims, bounded device staging, and tiered graph replay. In the
+winning trials `ticketed_incremental_launches`, `request_work_completed`, and
+`progress_snapshots` are all zero while `selected_compiler_launches` and
+`tiered_graph_replay_batches` are in the hundreds to thousands. The
+contributor test of Section 3.1 therefore did not produce the win, and the
+Section 3.1 falsification condition fired in a form its text did not
+anticipate: the project did not narrow to a bare runtime mechanism, because
+the compiler still carries the load-bearing association checks — fail-closed
+acquisition provenance, request-liveness verification, and generation of the
+graph-compatible transformed FlashInfer consumers that the fail-closed
+benchmark gates attest (zero stock attention, zero fallback). The research
+question above is restated to match this evidence: the contribution is the
+preserved request-to-demand-to-consumer association, with selective KV as
+the flagship instantiation. Exact contributors, work tickets, CTA suspension,
+and progress-guided admission are retained as an additional execution form
+for exact-attention workloads and as mechanism evidence, not as the claimed
+source of the headline result. The known gap in this framing is recorded in
+Section 4 terms: in the winning path the compiler checks liveness and
+generates the consumers, but selected staging completes before transformed
+direct attention runs; a claim-generation and selected-table consumption
+contract consumed inside the compiler-generated kernel is the remaining
+compiler-depth work.
 
 ## 4. Co-Design
 

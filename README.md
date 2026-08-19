@@ -198,10 +198,21 @@ does not establish a crossover. The current ABI-v23 v10 2K mixed point is also
 negative: exact output, all 1,080 attention launches transformed, zero fallback,
 `0.977x` throughput, `1.012x` resident P99 inter-token latency, and `1.021x`
 external TTFT. A five-trial admission/re-merge policy regressed the causal tail
-metric and was removed. No end-to-end SGLang speedup, production-ready status,
-or OSDI-level claim is supported yet. The immediate gate is an end-to-end
-model-generated selected-demand workload and a heterogeneous SLO result that
-beats equal-state bulk and skip/rebatch baselines with zero stock fallback.
+metric and was removed. Those negative rows describe the exact-contributor
+fragmented path, which remains negative. The selective-KV serving path now
+carries the headline evidence: the pre-registered SLO goodput bar passes at
+the capacity shape (`2.1107x`, 95% CI `[1.971, 2.222]`, CI floor above the
+registered `1.5` bar) and has passed three consecutive campaigns at the
+Poisson arrival shape (latest `1.6575x`, CI `[1.360, 2.057]`), with
+fail-closed mechanism attestation (zero stock attention, zero fallback,
+positive staged bytes) in every trial. A same-revision host-orchestrated
+ablation is at dense parity (`0.982x`), so the win requires the
+device-resident mechanism, not generic scheduling. The registered resident
+P99 ITL isolation bar (`<=1.05x`) is not yet met — best `1.0739x` at the
+Poisson shape, `1.2281x` at the capacity shape — with the measured remaining
+cause the eager extend-forward span colliding with resident decode; capturing
+that span with piecewise prefill CUDA graphs is in progress. No all-bars pass
+and no production-ready claim is supported yet.
 The corrected real FlashInfer device-selected sweep chooses transformed bulk
 at zero avoided bytes, where forced indexed acquisition delivers only `0.6431x`
 throughput. At 75%-93.75% avoided bytes it reaches `2.1259x`-`8.1731x` over

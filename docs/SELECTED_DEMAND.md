@@ -69,10 +69,14 @@ The installed SGLang 0.5.14 adapter currently implements:
 The selected path is approximate attention. It runs one compact
 FlashInfer operation over selected external rows plus the resident suffix. It
 does not yet use the exact `(V, LSE)` contributor form in the SGLang selected
-path. Resident requests may use SGLang CUDA graph replay; a batch containing an
-external sidecar is routed to the same NTA selected eager operator and is
-guarded against entering a dense captured graph. Capturing the external
-selected operator itself remains open.
+path. Resident requests may use SGLang CUDA graph replay. Tiered decode
+batches containing external sidecars now capture and replay as epoch-cached
+tiered graphs (tail-default positions for dense-only batches, in-graph
+per-layer row-table refresh, a dedicated dense-stage buffer), validated by
+the replay soundness battery's byte-checked verify halves and output-parity
+replay halves. The extend forward that stages a new claim still executes
+eagerly; capturing that span (piecewise prefill CUDA graphs, with the custom
+extend-capture runner as fallback) is the active work.
 
 The benchmark `benchmarks/serving/SglangSelectedLoad.py` rejects a tiered run
 unless all of the following are active: external claims and admission credits,
@@ -461,14 +465,21 @@ complete commands out of submission order.
 
 ## Remaining Vertical Work
 
-1. Feed writeback-time page summaries into the selector. ABI v27 caches
-   summaries across repeated claims, but the first claim still scans every key
-   once before selection.
+1. DONE (2026-08-17): writeback-time page summaries now feed claim creation —
+   the device-resident envelope store records at HiCache writeback and claim
+   creation gathers per-page envelopes (both campaign shapes measure zero
+   summary-source scan bytes with full gather coverage), eliminating the
+   first-claim key scan.
 2. Execute selected external and resident ranges through the compiler-generated
    exact contributor form where exact attention is required; retain compact
    approximate mode as a quality-gated policy option.
-3. Capture the fixed-shape selection, miss compaction, finite acquisition, and
-   consumer sequence with graph-stable staging leases.
+3. Decode side DONE: fixed-shape selection, miss compaction, finite
+   acquisition, and consumption capture and replay as epoch-cached tiered
+   graphs with graph-stable staging leases. The extend/staging forward of a
+   new claim remains eager; its capture is in progress. A deeper compiler
+   contract — claim-generation and selected-table consumption consumed inside
+   the compiler-generated kernel rather than checked before it — remains
+   open.
 4. Connect selected NVMe objects to the same claim lifecycle after CPU-DRAM
    behavior passes; do not infer NVMe benefit from DRAM measurements.
 5. Add a second real operator family. Device-routed MoE is valid only if expert
