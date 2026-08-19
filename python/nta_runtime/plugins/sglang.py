@@ -71,6 +71,33 @@ def _route_execute_extend(original, runner, forward_batch, pp_proxy_tensors=None
     return original(runner, forward_batch, pp_proxy_tensors)
 
 
+def _preserve_prefill_graph_request_metadata() -> None:
+    """Carry request identity through the prefill BCG static batch.
+
+    PrefillCudaGraphRunner.load_batch builds a static ForwardBatch for
+    piecewise replay without copying ``rids``; the NTA backend refuses
+    batches without request identity, so replays would fail closed.
+    Prefill pads tokens, not requests, so identity carries one-to-one.
+    """
+    from sglang.srt.model_executor.runner import prefill_cuda_graph_runner
+
+    runner_cls = prefill_cuda_graph_runner.PrefillCudaGraphRunner
+    current = runner_cls.load_batch
+    if getattr(current, "_nta_preserves_request_metadata", False):
+        return
+
+    def load_batch(self, forward_batch, **kwargs):
+        static_batch = current(self, forward_batch, **kwargs)
+        static_batch.rids = getattr(forward_batch, "rids", None)
+        priorities = getattr(forward_batch, "_nta_request_priorities", None)
+        if priorities is not None:
+            static_batch._nta_request_priorities = priorities
+        return static_batch
+
+    load_batch._nta_preserves_request_metadata = True
+    runner_cls.load_batch = load_batch
+
+
 def _preserve_graph_request_metadata() -> None:
     """Carry host request identity through SGLang's padded replay view."""
     from sglang.srt.model_executor.runner import decode_cuda_graph_runner
@@ -243,6 +270,7 @@ def register() -> None:
     from nta_runtime.engines.sglang_admission import route_prefill_admission
 
     _preserve_graph_request_metadata()
+    _preserve_prefill_graph_request_metadata()
 
     if BACKEND_NAME not in ATTENTION_BACKEND_CHOICES:
         add_attention_backend_choices([BACKEND_NAME])
