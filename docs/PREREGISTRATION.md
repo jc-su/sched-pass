@@ -117,6 +117,26 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Negative mechanism probe: piecewise prefill graphs (2026-08-19,
+  non-qualifying seed 20260818, extend-capture branch):** SGLang's
+  breakable prefill CUDA graph runner was evaluated as the registered
+  extend-span fix, with fail-closed request-identity preservation
+  through its static batches and engagement attestation counters
+  (166 prefill batches served through the graph runner, outputs
+  byte-identical to stock). At the light smoke shape it improved spans
+  (15.4ms avg vs 19-21ms eager). At the capacity shape it **doubled**
+  them — 79.4ms avg / 168.6ms max vs the 36-40ms / 49-55ms eager
+  baseline across all ten C4-second trials — with identical staging
+  work per span (150 vs 158-212 layer calls, same staged bytes, same
+  claim concurrency), and resident P99 ITL degraded to 1.364. The
+  load-dependent inversion isolates the cost to the runner's per-piece
+  stream joins (36 per forward), which serialize against decode-replay
+  stream depth at 12/s arrivals. Piecewise capture is rejected as the
+  extend fix; the whole-forward capture path (single graph, staging
+  in-graph) remains the candidate, pending a composition probe deciding
+  whether single-claim eligibility reaches the colliding batches.
+  Artifacts: `results/serving/extcap-smoke/c4shape1.json`,
+  `results/serving/extcap-smoke/bcg6.json`.
 - **Amendment 5 (2026-08-19, recorded before any run that uses it):**
   the registered seed set 20260901-10 has now steered several
   optimization campaigns (P4 x3, C4 x2), so a final all-bars claim on
