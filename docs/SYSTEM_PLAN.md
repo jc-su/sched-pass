@@ -123,21 +123,34 @@ outcomes of the same algorithm, not independent production policies.
 
 ## 3. Research Question
 
-> In heterogeneous serving, the engine knows request lifecycle, SLO, and
-> memory pressure, while GPU execution discovers — after launch — exactly
-> which cached data the current query needs. Can a compiler-checked contract
-> preserve the request-to-demand-to-consumer association across engine,
-> runtime, and GPU, so that selection, validation, and acquisition of
-> nonresident data execute device-side under engine admission control,
-> without persistent kernels, host identity round trips, or resident-path
-> regression?
+> In heterogeneous serving the knowledge is split: the engine alone knows
+> request lifecycle, SLO, and capacity pressure, while the GPU alone
+> discovers — during execution, after launch — exactly which cached data the
+> current query needs. Every current stack resolves that demand on the host,
+> which forces dense allocation or overfetch, a control round trip that
+> breaks CUDA graph replay, and acquisition traffic on the links co-running
+> residents depend on. Can the authority be split instead of the knowledge:
+> the engine granting bounded, generation-tagged, revocable **claims**
+> (capacity and admission sovereignty), within which the device autonomously
+> selects, validates, compacts, acquires, and consumes nonresident data —
+> identities never crossing to the host, the chain replayable under graphs —
+> with a compiler verifying, fail-closed, that delegated staging cannot
+> escape its claim and that consumers check liveness, so the delegation is
+> safe to grant?
 
-Selective KV acquisition is the flagship instantiation of that contract:
-existing boundaries lose the association between request, dynamic demand,
-tier placement, and consumer, forcing dense allocation, overfetch, or a host
-control round trip. Exact `(V, LSE)` partial contributors remain an
-additional execution form for workloads that require exact attention
-(Section 3.2); they are not the explanation for the current headline result.
+Selective KV attention is the defining workload of this problem class —
+demand that is real, large, and only discoverable at execution time — and
+the paper's measured domain. Generality beyond it is claimed only as
+mechanism evidence (the device-routed MoE fixture shows the claim lifecycle
+is not attention-specific; the NVMe control plane shows transport is not
+DRAM-specific), never as a measured result. The compiler is the trust layer
+of the delegation, not the performance layer. Exact `(V, LSE)` partial
+contributors remain an additional execution form for workloads that require
+exact attention (Section 3.2); they are not the explanation for the current
+headline result. The causal evidence for the split-authority claim is the
+same-revision host-orchestrated ablation: identical selector and budget with
+host-side staging sits at dense parity with 14.4x resident interference,
+so the win is the delegation mechanism, not the selection policy.
 
 The target is broad applicability and low regret, not strict speedup at every
 point. Production has no oracle. Controlled identical-snapshot experiments may
