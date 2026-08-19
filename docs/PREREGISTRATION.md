@@ -117,6 +117,20 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Amendment 5 (2026-08-19, recorded before any run that uses it):**
+  the registered seed set 20260901-10 has now steered several
+  optimization campaigns (P4 x3, C4 x2), so a final all-bars claim on
+  those seeds alone is exposed to a seed-overfitting objection raised in
+  external review. The final validation protocol is therefore
+  strengthened, never weakened: whenever a campaign passes every
+  registered bar on the registered seeds, a same-revision,
+  same-shape confirmation campaign runs on the held-out seed set
+  **20260911-20**, fixed here verbatim and never used by any prior or
+  intermediate run, under the identical bars and aggregation. The
+  all-bars claim is made only if the confirmation campaign also passes;
+  a confirmation failure is recorded as a negative result, and the
+  held-out set is then burned for further confirmation use. Registered
+  shapes, seeds, bars, and metrics are otherwise unchanged.
 - **C4-second campaign result (2026-08-18, capacity shape and seeds
   verbatim, graphs both arms, all interference fixes active, revision
   8f61e88, ten of ten trials, artifacts `results/serving/c4b-trials/`):**
