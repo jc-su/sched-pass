@@ -91,9 +91,19 @@ and inter-query prefetch, and fused overlap between recall and indexer
 computation. NTA cannot claim novelty from sparse-KV offload, GPU-graph recall,
 or fused index/fetch overlap.
 
-The remaining comparison is a true miss outside ECHO's lossless prefetch
-window: whether compiler-generated incremental execution outperforms waiting,
-conservative prefetch, or a manually split indexer/attention pipeline.
+The deltas that remain claimable against ECHO (storyline revision
+2026-08-19): ECHO is a cache manager for native sparse-attention models,
+exploiting their indexers' numerically predictable scores; NTA serves
+standard dense-trained models under Quest-style selection and claims the
+**engine-governed request-lease lifecycle** — admission credits, capacity
+conservation, cancellation, generation-checked device consumption —
+spanning engine, runtime, and GPU with fail-closed compiler verification,
+plus the pre-registered SLO-goodput/isolation evaluation. Honesty in both
+directions: NTA's measured path is request-epoch selection followed by
+graph-replayed consumption, not ECHO's per-step graph-resident recall, and
+must be described as such. A primary-baseline comparison against ECHO,
+SparseServe, and SPIN (BaM demoted to transport background) is required
+for submission.
 
 ### DirectKV (OSDI 2026)
 
@@ -185,8 +195,10 @@ hierarchical KV storage through a common partition abstraction, per-request HBM
 budgets, GPU-oriented replacement, and active-working-set metadata. A common
 page/partition abstraction and request-sized staging policy are therefore not
 independent NTA contributions. Both systems are required sparse-serving
-controls; NTA must distinguish itself through the compiler-checked contributor
-and request-lifecycle contract and must still match their quality constraints.
+controls; NTA must distinguish itself through the engine-governed
+request-lease lifecycle (admission, capacity, cancellation,
+generation-checked device consumption) and its compiler-checked
+confinement, and must still match their quality constraints.
 
 ### GPU-Initiated Storage Primitives
 

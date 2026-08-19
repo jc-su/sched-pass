@@ -123,20 +123,42 @@ outcomes of the same algorithm, not independent production policies.
 
 ## 3. Research Question
 
-> In heterogeneous serving the knowledge is split: the engine alone knows
-> request lifecycle, SLO, and capacity pressure, while the GPU alone
-> discovers — during execution, after launch — exactly which cached data the
-> current query needs. Every current stack resolves that demand on the host,
-> which forces dense allocation or overfetch, a control round trip that
-> breaks CUDA graph replay, and acquisition traffic on the links co-running
-> residents depend on. Can the authority be split instead of the knowledge:
-> the engine granting bounded, generation-tagged, revocable **claims**
-> (capacity and admission sovereignty), within which the device autonomously
-> selects, validates, compacts, acquires, and consumes nonresident data —
-> identities never crossing to the host, the chain replayable under graphs —
-> with a compiler verifying, fail-closed, that delegated staging cannot
-> escape its claim and that consumers check liveness, so the delegation is
-> safe to grant?
+> Tiered sparse-attention serving must make admission and HBM-capacity
+> decisions before query-conditioned KV working-set identities become
+> available: the engine alone knows request lifecycle, SLO, and capacity
+> pressure, while the working set is discovered by the GPU during
+> execution. Returning those identities to the CPU creates a same-step
+> control edge; avoiding that edge through dense promotion, prediction, or
+> stale reuse sacrifices capacity, bandwidth, or quality. Can the engine
+> instead delegate a bounded, generation-tagged, revocable **request
+> lease** to the GPU — within which the device selects, validates,
+> acquires, and consumes KV pages without exposing page identities to the
+> host — with a compiler-checked consumer contract confining accesses to
+> validated lease storage and rejecting stale or cancelled generations?
+
+The prior-work sentence is deliberately narrow: conventional tiered paths
+in mainstream serving engines either return query-dependent identities to
+the host, overfetch, or use workload-specific GPU cache mechanisms —
+ECHO (OSDI'26) performs dynamic eviction and recall inside GPU graphs for
+native sparse-attention models, SparseServe provides GPU-direct loading
+with working-set-aware batching, and SPIN sizes per-request HBM budgets
+dynamically (see RELATED_WORK for positioning). The defensible novelty is
+therefore **compiler-enforced, engine-governed GPU delegation** — the
+lease lifecycle spanning admission, capacity, cancellation, and verified
+device-side consumption — not sparse KV, graph replay, or GPU-initiated
+transfer individually.
+
+Enforcement status, stated exactly. Today the LLVM pass proves,
+fail-closed at the IR level, that staged pointers cannot escape their
+acquisition region in transformed kernels; the winning FlashInfer
+consumer binds a validated request slot and generation in-kernel
+(`bindValidatedRequestOnly`) but carries no acquisition requirements; and
+claim confinement is enforced by the runtime — generation-tagged table
+rows, fenced retirement, a post-fence identity audit. The consumer
+contract named in the research question — the transformed consumer
+receiving and validating expected claim slot, claim generation, staging
+extent, and selected-table provenance in-kernel — is the work that must
+close before that sentence is claimed in a paper (Section 3.2).
 
 Selective KV attention is the defining workload of this problem class —
 demand that is real, large, and only discoverable at execution time — and
@@ -147,10 +169,27 @@ DRAM-specific), never as a measured result. The compiler is the trust layer
 of the delegation, not the performance layer. Exact `(V, LSE)` partial
 contributors remain an additional execution form for workloads that require
 exact attention (Section 3.2); they are not the explanation for the current
-headline result. The causal evidence for the split-authority claim is the
-same-revision host-orchestrated ablation: identical selector and budget with
-host-side staging sits at dense parity with 14.4x resident interference,
-so the win is the delegation mechanism, not the selection policy.
+headline result.
+
+The causal evidence is scoped precisely. The same-revision
+host-orchestrated ablation (identical selector, budget, transformed
+kernels, bounded staging) sits at dense parity on registered goodput with
+14.4x resident interference, against 2.11x goodput and a 1.15x tail for
+the device chain: **eliminating the per-layer host control edge is
+necessary for this workload.** It does not prove every host-managed design
+loses — the deferred one-step-stale host baseline with graphs enabled
+remains the strongest conceivable host arm and is required future work
+(RELATED_WORK). Nor is delegation sufficient alone: the end-to-end win
+over dense stock composes query-dependent selection (working-set
+reduction; Quest-lineage policy, not this project's contribution), bounded
+allocation (reduction converted into admission capacity), and device-side
+execution under graphs (orchestration overhead removed) — the ablation
+isolates only the third factor between two equally selective paths. The
+measured path today is device-generated request-epoch working-set
+selection followed by graph-replayed consumption: selection refreshes at
+claim epochs, not fresh per-step selection inside every decode replay,
+which separates this design point from ECHO's graph-resident per-step
+recall and must be stated as such.
 
 The target is broad applicability and low regret, not strict speedup at every
 point. Production has no oracle. Controlled identical-snapshot experiments may
@@ -196,9 +235,12 @@ for exact-attention workloads and as mechanism evidence, not as the claimed
 source of the headline result. The known gap in this framing is recorded in
 Section 4 terms: in the winning path the compiler checks liveness and
 generates the consumers, but selected staging completes before transformed
-direct attention runs; a claim-generation and selected-table consumption
-contract consumed inside the compiler-generated kernel is the remaining
-compiler-depth work.
+direct attention runs, and the in-kernel guard binds only request slot and
+generation with no acquisition requirements. The remaining compiler-depth
+work, named as blocker one for the storyline's final claim: the
+transformed FlashInfer consumer must receive and validate the expected
+claim slot, claim generation, staging extent, and selected-table
+provenance before consuming lease storage.
 
 ## 4. Co-Design
 
