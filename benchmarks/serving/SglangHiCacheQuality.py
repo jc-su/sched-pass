@@ -343,7 +343,9 @@ def main() -> int:
         cuda_graph_backend_decode=os.environ.get(
             "NTA_QUALITY_CUDA_GRAPH_DECODE", "disabled"
         ),
-        cuda_graph_backend_prefill="disabled",
+        cuda_graph_backend_prefill=os.environ.get(
+            "NTA_QUALITY_CUDA_GRAPH_PREFILL", "disabled"
+        ),
         chunked_prefill_size=args.context_length,
         enable_mixed_chunk=True,
         enable_hierarchical_cache=True,
