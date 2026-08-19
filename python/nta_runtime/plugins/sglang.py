@@ -97,6 +97,28 @@ def _preserve_prefill_graph_request_metadata() -> None:
     load_batch._nta_preserves_request_metadata = True
     runner_cls.load_batch = load_batch
 
+    # Startup capture builds dummy batches with no request identity; give
+    # them capture placeholders (mirroring the decode runner's padding
+    # ids) so the fail-closed identity guard admits warmup and capture
+    # without weakening it for real batches.
+    current_prepare = runner_cls.capture_prepare
+    if not getattr(current_prepare, "_nta_preserves_request_metadata", False):
+
+        def capture_prepare(self, num_tokens):
+            result = current_prepare(self, num_tokens)
+            forward_batch = result[0] if isinstance(result, tuple) else result
+            if not getattr(forward_batch, "rids", None):
+                batch_size = int(getattr(forward_batch, "batch_size", 1) or 1)
+                forward_batch.rids = tuple(
+                    f"__nta_graph_padding_{index}"
+                    for index in range(batch_size)
+                )
+                forward_batch._nta_request_priorities = (0,) * batch_size
+            return result
+
+        capture_prepare._nta_preserves_request_metadata = True
+        runner_cls.capture_prepare = capture_prepare
+
 
 def _preserve_graph_request_metadata() -> None:
     """Carry host request identity through SGLang's padded replay view."""
