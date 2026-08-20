@@ -244,6 +244,49 @@ provenance before consuming lease storage.
 
 ## 4. Co-Design
 
+### 4.0 Compiler: the claim-consumer contract (blocker one)
+
+This is the enforcement the storyline's central claim depends on, and it
+is not yet built. Today `bindValidatedRequestOnly` validates the request
+slot against `requestCapacity`, reads `RequestContext::generation`, binds
+it, and publishes an **empty** acquisition marker; claim confinement is
+enforced entirely by the runtime (generation-tagged claim-table rows,
+fenced retirement, post-fence identity audit in `claim_table.reclaim`).
+So the compiler proves staged pointers cannot escape their acquisition
+region, but the consumer does not prove it is reading *its own* claim.
+
+The gap closes by giving the transformed consumer four checks before its
+mainloop, all CTA-uniform and fail-closed:
+
+```text
+claim slot        params.nta_claim_slot < runtime->claimCapacity
+claim generation  claims[slot].generation == params.nta_claim_generation
+                  && claims[slot].valid && !requests[req].cancelled
+staging extent    every consumed row index < claims[slot].stagedRows
+                  and inside the slot's bounded lease base/extent
+table provenance  selectedTableStamp[slot] == params.nta_table_stamp
+                  (stamp written by the prep kernel that produced it)
+```
+
+The ABI additions are small because the pieces already exist device-side:
+`RuntimeView` gains a `ClaimContext *claims` array plus `claimCapacity`,
+where `ClaimContext` carries `{requestSlot, generation, valid, stagedRows,
+leaseBase, leaseExtent, tableStamp}` — the same fields `claim_table.py`
+already maintains as loose device tensors (`generations`, `valid`,
+`selected_counts`, `observed_ids`, `copied_rows`). The work is therefore
+(1) publish those tensors through one ABI-typed structure, (2) thread
+claim slot/generation/stamp into the FlashInfer params struct the adapter
+builds, (3) replace the empty acquire marker with the real staging
+extent, and (4) add reject fixtures — stale generation, retired slot,
+foreign claim, out-of-extent row, stale table stamp — each asserting the
+consumer refuses rather than reads.
+
+Sequencing: this is a mechanism change, so it must land, pass the replay
+and quality batteries, and be registered before any campaign that claims
+it. It is independent of the extend-span work and can proceed in
+parallel, but it must not be built against a shared build directory while
+qualifying runs are live.
+
 ### 4.1 Compiler: make the operator incremental
 
 The compiler consumes typed request/tile and tensor-dependency semantics before
