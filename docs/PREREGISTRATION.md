@@ -117,6 +117,45 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Negative mechanism probe: single-claim extend capture is
+  unreachable at both registered shapes (2026-08-20, non-registry seeds
+  20260817 capacity / 20260815 queue, extend-capture branch):** the
+  extend-batch composition counters reject the whole-forward
+  `ExtendCaptureRunner` as the fix for the resident bar. Its eligibility
+  admits only single-request, non-mixed extend batches, and those are a
+  minority of the batches that actually stage claims:
+
+  | shape | extend batches | mixed | multi-claim | capture-reachable |
+  |---|---|---|---|---|
+  | capacity (C4, 12/s) | 48 | 31 (65%) | 29 (60%) | 35% |
+  | queue (P4, 1.5/s) | 62 | 48 (77%) | 46 (74%) | 23% |
+
+  The prediction recorded when the probe was launched — that the queue
+  shape's 8x sparser arrivals would make its extends mostly
+  single-claim — is **refuted**: P4 is *more* mixed than C4, because
+  768-token outputs keep decodes in flight continuously, so nearly
+  every extend batch has decode work to absorb. A mechanism that cannot
+  reach 65-77% of the colliding batches cannot close a p99 bar, whose
+  miss is by construction driven by the unreached tail.
+
+  The same counters replace the mechanism explanation carried in the
+  entries above. `enable_mixed_chunk` batches resident decode tokens
+  **into** the extend forward, so the dominant interference is not
+  concurrent-kernel contention between an extend and a separate resident
+  decode; it is **serialization by batching** — a resident whose decode
+  lands in an extend batch waits that entire 36-layer forward. This is
+  consistent with every prior observation (the per-trial bimodality, the
+  30-64ms spans, the collision arithmetic) and redirects the fix from
+  capturing the forward to shortening it, which is what the chunked-prefill
+  ladder below tests. The capture work is retained on branch
+  `extend-capture` as recorded negative evidence and as the mechanism for
+  any future non-mixed configuration. Artifacts:
+  `results/serving/extcap-smoke/c4shape-eager1.json`,
+  `results/serving/extcap-smoke/p4shape-comp1.json`. The P4 probe also
+  measured resident P99 ITL 0.999 with goodput 1.225 on its single
+  non-registry seed; single trials at this shape are known to be bimodal
+  (P4-third: eight of ten at parity), so this is recorded as a datapoint,
+  not evidence for the bar.
 - **Diagnostic note before the chunked-prefill ladder (2026-08-20,
   recorded before the ladder's first result):** every campaign so far ran
   `chunked_prefill_size = context_length = 32768` against 16K external
