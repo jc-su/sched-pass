@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -209,6 +210,67 @@ def route_init_load_back(
     return handle.device_indices, request.last_node
 
 
+def _isolation_defer_ns() -> int:
+    """Deferral bound in ns; zero disables the isolation gate entirely."""
+    if os.environ.get("NTA_SGLANG_ISOLATION_ADMISSION") != "1":
+        return 0
+    raw = os.environ.get("NTA_SGLANG_ISOLATION_MAX_DEFER_US", "20000")
+    try:
+        bound = int(raw)
+    except ValueError as error:
+        raise RuntimeError(
+            "NTA_SGLANG_ISOLATION_MAX_DEFER_US must be an integer "
+            f"microsecond bound, got {raw!r}"
+        ) from error
+    if bound <= 0:
+        raise RuntimeError(
+            "isolation admission requires a positive deferral bound so "
+            "external requests cannot starve"
+        )
+    return bound * 1000
+
+
+def _defer_for_isolation(adder: Any, request: Any, bridge: Any) -> bool:
+    """True when admitting this external would batch it over a live decode.
+
+    A host-prefix external stages its claim inside the extend forward, and
+    ``enable_mixed_chunk`` merges the running decode batch into that same
+    forward, so every co-resident decode token waits the whole staging
+    span (measured 37-47ms; 65-77% of claim-staging extends are mixed).
+    Withholding the external from *this* prefill batch lets the decode
+    batch run alone; the request stays in the waiting queue and is
+    admitted on a later iteration, or unconditionally once its deferral
+    bound expires, so external TTFT damage is bounded by construction.
+    """
+    bound_ns = _isolation_defer_ns()
+    if bound_ns == 0:
+        return False
+    running = getattr(adder, "running_batch", None)
+    if running is None:
+        return False
+    live_decodes = [
+        candidate
+        for candidate in getattr(running, "reqs", ()) or ()
+        if not candidate.finished()
+    ]
+    if not live_decodes:
+        return False
+    now = time.monotonic_ns()
+    since = getattr(request, "_nta_isolation_deferred_since", None)
+    if since is None:
+        request._nta_isolation_deferred_since = now
+        bridge.record_admission(
+            admission_isolation_deferred_requests=1,
+            admission_isolation_deferred_decodes=len(live_decodes),
+        )
+        return True
+    if now - int(since) < bound_ns:
+        bridge.record_admission(admission_isolation_deferred_again=1)
+        return True
+    bridge.record_admission(admission_isolation_released_on_bound=1)
+    return False
+
+
 def route_external_admission_credit(
     original: Any, adder: Any, request: Any, *args: Any, **kwargs: Any
 ) -> Any:
@@ -225,6 +287,10 @@ def route_external_admission_credit(
     if bridge is None or not callable(needs_host_load) or not needs_host_load():
         return original(adder, request, *args, **kwargs)
     _validate_external_cache(cache, request)
+    if _defer_for_isolation(adder, request, bridge):
+        from sglang.srt.managers.schedule_policy import AddReqResult
+
+        return AddReqResult.OTHER
     credit = int(getattr(request, "host_hit_length", 0))
     if credit <= 0:
         raise RuntimeError("external-prefix admission omitted its host-token credit")
