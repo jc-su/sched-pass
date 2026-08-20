@@ -117,6 +117,37 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Correction to the interference mechanism recorded earlier today
+  (2026-08-20, same day, before any campaign used it):** the entry below
+  claims the dominant resident interference is "serialization by
+  batching" caused by `enable_mixed_chunk` merging resident decodes into
+  the extend forward. That claim is **overstated and partly wrong**, and
+  is corrected here rather than left standing. Three measurements force
+  the correction. (i) The chunked-prefill ladder's first point shows the
+  chunk flag is inert on this workload — externals are host-cache hits,
+  so the extend recomputes almost no tokens and instead stages KV;
+  prefill passes per claim, extend spans, and mixed-batch counts are all
+  unchanged at chunk 4096 versus 32768. (ii) Mixing is not obviously
+  harmful in the first place: the GPU is serial, so an unmixed resident
+  decode would wait for the extend batch *and then* run its own batch,
+  which is no better than being computed inside it. (iii) The per-arm
+  absolutes show what actually differs. On C4-second trial 00 the NTA arm
+  completes the identical workload in **2.87s against stock's 6.79s**,
+  with external p95 TTFT **0.148s against 3.95s** and output throughput
+  **1783 against 754 tokens/s**, while resident P99 ITL is **55.0ms
+  against 51.3ms**. The sixteen external prefills are therefore
+  compressed into a window less than half as long, so a far larger
+  fraction of them overlap the residents' decode window, while the
+  per-event cost is comparable. The corrected statement: **the resident
+  bar is measuring interference *density*, which rises because the
+  mechanism completes external work 2.4x faster, not a per-event
+  regression unique to the device chain.** This does not excuse the bar
+  — a co-tenant experiences its own tail regardless of why — but it
+  changes which fixes can work, and it makes a matched-load isolation
+  comparison (residents measured against an arm admitting external work
+  at the same completed rate) a required addition rather than an
+  optional one. Registered bars, shapes, seeds, and metrics are
+  unchanged by this correction.
 - **Negative mechanism probe: single-claim extend capture is
   unreachable at both registered shapes (2026-08-20, non-registry seeds
   20260817 capacity / 20260815 queue, extend-capture branch):** the
