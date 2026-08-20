@@ -117,6 +117,38 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Diagnostic note before the chunked-prefill ladder (2026-08-20,
+  recorded before the ladder's first result):** every campaign so far ran
+  `chunked_prefill_size = context_length = 32768` against 16K external
+  prompts, so each external prefill executes as **one unchunked forward**
+  (measured ~0.9 prefill passes per claim), while `enable_mixed_chunk`
+  batches resident decode tokens into that forward. The composition
+  counters show 31 of 48 claim-staging extends at the capacity shape are
+  mixed batches and 29 carry multiple claims
+  (`results/serving/extcap-smoke/c4shape-eager1.json`). The hypothesis
+  this raises is that the resident P99 ITL failure is substantially
+  **serialization by batching** — a resident whose decode lands in an
+  extend batch waits the whole 36-layer extend forward — rather than
+  only concurrent-kernel contention, and it explains the observed
+  per-trial bimodality. Two facts make the configuration itself a
+  defect rather than a tuning opportunity: chunked prefill is the
+  standard decode-protection mechanism, and SGLang's own autotuner
+  selects **8192** for this GPU's memory class (97,887 MiB), so the
+  harness has been overriding the engine default with a 4x larger
+  chunk. The ladder (chunk sizes 8192, 4096, 2048, both arms
+  identically, non-registry seeds, capacity shape,
+  `results/serving/chunk-ladder/`) is diagnostic and non-qualifying.
+  Interpretation rules, fixed here before any result is seen: (a) the
+  full ladder is reported, including points that do not help; (b) no
+  chunk size or seed is selected on the basis of its measured ratio —
+  if the mechanism is adopted, the adopted value is SGLang's autotuned
+  default 8192, justified as restoring the engine default rather than
+  as a tuned choice; (c) adoption requires a registered amendment
+  recorded before any qualifying campaign, and both configurations are
+  reported in the paper, with the unchunked configuration retained as
+  the harder case rather than replaced; (d) if the resident ratio does
+  not improve, the batching hypothesis is rejected, recorded as a
+  negative, and extend capture remains the registered fix.
 - **Negative mechanism probe: piecewise prefill graphs (2026-08-19,
   non-qualifying seed 20260818, extend-capture branch):** SGLang's
   breakable prefill CUDA graph runner was evaluated as the registered
