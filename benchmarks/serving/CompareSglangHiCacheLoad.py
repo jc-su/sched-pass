@@ -10,6 +10,7 @@ import pathlib
 import random
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -170,6 +171,75 @@ def _report(output: str) -> dict[str, Any]:
     raise RuntimeError("load trial emitted no JSON report")
 
 
+
+class _CotenantSampler:
+    """Sample foreign GPU compute apps during one arm's run.
+
+    The pre-run wait-gate only proves the GPU was free at launch; on this
+    shared box co-tenant jobs can land mid-trial and arbitrarily inflate
+    whichever arm they overlap. Every report therefore carries the number
+    of 5-second samples that saw a compute app outside our process tree,
+    so contaminated trials are identifiable by an objective environmental
+    criterion instead of by their metric values.
+    """
+
+    def __init__(self) -> None:
+        self.samples = 0
+        self.foreign_samples = 0
+        self.foreign_pids: set[int] = set()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _descendants(self) -> set[int]:
+        pids = {os.getpid()}
+        try:
+            children = pathlib.Path("/proc")
+            grew = True
+            while grew:
+                grew = False
+                for stat in children.glob("[0-9]*/stat"):
+                    try:
+                        parts = stat.read_text().rsplit(") ", 1)[1].split()
+                        pid = int(stat.parent.name)
+                        ppid = int(parts[1])
+                    except (OSError, IndexError, ValueError):
+                        continue
+                    if ppid in pids and pid not in pids:
+                        pids.add(pid)
+                        grew = True
+        except OSError:
+            pass
+        return pids
+
+    def _loop(self) -> None:
+        while not self._stop.wait(5.0):
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-compute-apps=pid",
+                     "--format=csv,noheader"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                apps = {
+                    int(line) for line in out.stdout.split()
+                    if line.strip().isdigit()
+                }
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                continue
+            self.samples += 1
+            foreign = apps - self._descendants()
+            if foreign:
+                self.foreign_samples += 1
+                self.foreign_pids |= foreign
+
+    def __enter__(self) -> "_CotenantSampler":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=12)
+
+
 def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     workspace = ROOT / "results" / "serving" / "sglang-hicache-load-cache" / backend
     command = [
@@ -244,21 +314,26 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
             }
         )
     _wait_for_free_gpu()
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
+    with _CotenantSampler() as sampler:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
     if completed.returncode:
         raise RuntimeError(
             f"{backend} load trial failed:\n"
             + "\n".join(completed.stdout.splitlines()[-120:])
         )
-    return _report(completed.stdout)
+    report = _report(completed.stdout)
+    report["cotenant_gpu_samples"] = sampler.foreign_samples
+    report["gpu_samples"] = sampler.samples
+    report["cotenant_pids_seen"] = sorted(sampler.foreign_pids)
+    return report
 
 
 def _thresholds(stock: dict[str, Any], scale: float) -> dict[str, float]:
