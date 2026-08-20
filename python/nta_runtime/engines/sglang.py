@@ -75,6 +75,30 @@ _OBJECT_ID_BASE = 0x4E54410000000000
 _LOOKAHEAD_ALIAS_ID_BASE = _OBJECT_ID_BASE | 0x00000000FFFF0000
 _LOOKAHEAD_VERSION = 1
 _MAX_ABI_BYTES = (1 << 32) - 1
+# Per-FORWARD timing, populated by the plugin's forward hooks. The older
+# tiered_extend_gpu_* counters bracket a CLAIM's staging from its first to
+# its last layer, which spans several forwards once a prefill is chunked
+# (measured: 165 layer calls across 36 layers), with unrelated batches
+# running in the gaps. That makes them useless for "how long does a
+# co-resident decode wait behind one forward", which is what the resident
+# tail actually measures. These record one sample per forward instead,
+# keyed by batch composition.
+FORWARD_PROFILE: dict[str, float] = {}
+
+
+def record_forward(kind: str, milliseconds: float) -> None:
+    """Accumulate count/total/max for one forward-kind sample."""
+    FORWARD_PROFILE[f"forward_{kind}_count"] = (
+        FORWARD_PROFILE.get(f"forward_{kind}_count", 0.0) + 1.0
+    )
+    FORWARD_PROFILE[f"forward_{kind}_ms_total"] = (
+        FORWARD_PROFILE.get(f"forward_{kind}_ms_total", 0.0) + milliseconds
+    )
+    FORWARD_PROFILE[f"forward_{kind}_ms_max"] = max(
+        FORWARD_PROFILE.get(f"forward_{kind}_ms_max", 0.0), milliseconds
+    )
+
+
 logger = logging.getLogger(__name__)
 _PagePair = tuple[tuple[int, ...], tuple[int, ...]]
 
@@ -4387,6 +4411,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             for family in families
         )
         report.update(self._hicache.admission_stats())
+        report.update(FORWARD_PROFILE)
         report["finished_unix_ns"] = time.time_ns()
         return report
 
