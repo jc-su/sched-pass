@@ -117,6 +117,53 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Chunked-prefill ladder result, and a correction to the "inert"
+  claim recorded hours earlier (2026-08-20, seed 20260815 throughout,
+  arm order `nta -> stock` throughout, artifacts
+  `results/serving/chunk-ladder/`):** the full ladder, reported
+  complete as rule (a) requires:
+
+  | chunk | NTA resident P99 ITL | stock | ratio | goodput |
+  |---|---|---|---|---|
+  | 2048 | 52.0 ms | 43.6 ms | 1.193 | 1.830 |
+  | 4096 | 51.5 ms | 31.7 ms | 1.621 | 1.868 |
+  | 8192 | 84.1 ms | 32.8 ms | 2.566 | 1.799 |
+  | 32768 (control) | 89.5 ms | 41.0 ms | 2.181 | 1.733 |
+
+  **Correction:** the entry below states the chunk flag is "inert on
+  this workload," citing unchanged prefill passes per claim, extend
+  spans, and mixed-batch composition. Those counters do not move, but
+  the conclusion drawn from them was wrong. Within one seed, the NTA
+  arm's resident tail **halves** across the ladder — ~52 ms at 2048 and
+  4096 versus ~84-90 ms at 8192 and 32768 — while the stock arm's stays
+  flat and noisy at 31-44 ms with no trend. The counters were measuring
+  the claim's staging wavefront, not the forward a co-resident decode
+  actually waits behind. The asymmetry is itself the finding: **NTA's
+  resident tail is strongly chunk-sensitive and stock's is not**,
+  because a NTA extend forward carries this system's staging work,
+  which is split only when the forward itself is split.
+
+  **No chunk size is adopted on this evidence**, for two reasons that
+  were fixed in advance. Rule (b) permits adopting only SGLang's
+  autotuned default 8192, and 8192 is the ladder's *worst* point;
+  adopting 2048 or 4096 instead would be selecting a configuration by
+  its measured ratio, which rule (b) forbids. Independently, each point
+  is a single trial, and this metric's single-trial spread at this shape
+  (0.999, 1.193, 1.621, 2.181, 2.566, 3.171 measured to date, against a
+  ten-trial campaign geomean of 1.2281) is comparable to the effect
+  being chased. Recorded methodological consequence: **single-trial
+  probes cannot decide this bar** — they remain valid for mechanism
+  questions (does a path engage, are batches mixed, do bytes flow) but
+  every verdict requires the full ten-trial campaign, and then the
+  held-out seeds under Amendment 5.
+
+  The ladder's value is therefore as characterization, and it identifies
+  the principled fix that a configuration knob only approximates: bound
+  the staging work a lease may consume **per forward**, spreading a
+  claim's staging across several forwards so co-tenant tails stay
+  bounded independently of chunk configuration. That is engine-governed
+  capacity control over a delegated lease — the system's own mechanism
+  rather than a server flag — and it is the next registered increment.
 - **Correction to the interference mechanism recorded earlier today
   (2026-08-20, same day, before any campaign used it):** the entry below
   claims the dominant resident interference is "serialization by
