@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 30U
+#define NTA_RUNTIME_C_API_VERSION 31U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -50,6 +50,11 @@ typedef struct nta_runtime_config {
   uint32_t enable_cta_nvme_try_issue;
   uint32_t tenant_capacity;
   uint64_t staging_byte_capacity;
+  /* C API v28: engine-granted lease rows published for in-kernel consumer
+   * validation; zero publishes no claim table and claim-requiring
+   * consumers fail closed. Present only when struct_size covers it. */
+  uint32_t claim_capacity;
+  uint32_t reserved_claim;
 } nta_runtime_config;
 
 typedef struct nta_registered_replica {
@@ -432,6 +437,17 @@ nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
 /* C API v27: prepare every valid claim-table row's selected consumer
  * table and miss-only transfer lists in one fixed-shape launch; one block
  * per table row, gated by the device validity word. */
+/* C API v28: publish one lease row for in-kernel consumer validation.
+ * Writes the ABI ClaimContext at claim_slot on the given stream; retire
+ * publishes valid=0 with the same generation so stale consumers reject.
+ * Fails NTA_STATUS_INVALID_ARGUMENT when no claim table was configured
+ * or the slot is out of range. */
+nta_status nta_runtime_publish_claim(
+    nta_runtime *runtime, uint32_t claim_slot, uint32_t request_slot,
+    uint32_t generation, uint32_t valid, uint32_t staged_rows,
+    uint64_t lease_base, uint64_t lease_extent, uint64_t table_stamp,
+    uint64_t stream);
+
 nta_status nta_jit_phase_prepare_claim_table_selected_rows(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint64_t valid, uint64_t claim_ids, uint64_t generations,

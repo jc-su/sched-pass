@@ -58,22 +58,32 @@ int main() {
   static_assert(offsetof(RuntimeView, changedQueued) == 184);
   static_assert(offsetof(RuntimeView, changedOverflow) == 200);
   static_assert(offsetof(RuntimeView, requestProgress) == 208);
-  static_assert(offsetof(RuntimeView, reductionExpected) == 216);
-  static_assert(offsetof(RuntimeView, reductionCompleted) == 224);
-  static_assert(offsetof(RuntimeView, reductionFailed) == 232);
-  static_assert(offsetof(RuntimeView, requestCapacity) == 240);
-  static_assert(offsetof(RuntimeView, epochStartClock) == 280);
-  static_assert(offsetof(RuntimeView, epoch) == 288);
-  static_assert(offsetof(RuntimeView, abiVersion) == 300);
-  static_assert(offsetof(RuntimeView, stickyFailedCount) == 304);
+  static_assert(offsetof(RuntimeView, claims) == 216);
+  static_assert(offsetof(RuntimeView, reductionExpected) == 224);
+  static_assert(offsetof(RuntimeView, reductionCompleted) == 232);
+  static_assert(offsetof(RuntimeView, reductionFailed) == 240);
+  static_assert(offsetof(RuntimeView, claimCapacity) == 248);
+  static_assert(offsetof(RuntimeView, requestCapacity) == 252);
+  static_assert(offsetof(RuntimeView, epochStartClock) == 288);
+  static_assert(offsetof(RuntimeView, epoch) == 296);
+  static_assert(offsetof(RuntimeView, abiVersion) == 308);
+  static_assert(offsetof(RuntimeView, stickyFailedCount) == 312);
   static_assert(sizeof(RuntimeView) == 320);
+  static_assert(offsetof(ClaimContext, requestSlot) == 0);
+  static_assert(offsetof(ClaimContext, generation) == 4);
+  static_assert(offsetof(ClaimContext, valid) == 8);
+  static_assert(offsetof(ClaimContext, stagedRows) == 12);
+  static_assert(offsetof(ClaimContext, leaseBase) == 16);
+  static_assert(offsetof(ClaimContext, leaseExtent) == 24);
+  static_assert(offsetof(ClaimContext, tableStamp) == 32);
+  static_assert(sizeof(ClaimContext) == 64);
   static_assert(sourceTransferStride(packTransferStrides(17, 31)) == 17);
   static_assert(destinationTransferStride(packTransferStrides(17, 31)) == 31);
   static_assert(sourceTransferIndexLimit(packTransferIndexLimits(23, 47)) ==
                 23);
   static_assert(
       destinationTransferIndexLimit(packTransferIndexLimits(23, 47)) == 47);
-  if (Version != 27 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
+  if (Version != 28 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

@@ -208,6 +208,12 @@ struct HostRuntime::Impl {
       changedOverflow = deviceAllocate<std::uint32_t>(1);
       requestProgress =
           deviceAllocate<abi::RequestProgress>(config.requestCapacity);
+      if (config.claimCapacity != 0) {
+        claims = deviceAllocate<abi::ClaimContext>(config.claimCapacity);
+        checkCuda(cudaMemset(claims, 0,
+                             config.claimCapacity * sizeof(abi::ClaimContext)),
+                  "initialize claim table");
+      }
       reductionExpected =
           deviceAllocate<std::uint32_t>(config.workTicketCapacity);
       reductionCompleted =
@@ -331,9 +337,11 @@ struct HostRuntime::Impl {
           changedCount,
           changedOverflow,
           requestProgress,
+          claims,
           reductionExpected,
           reductionCompleted,
           reductionFailed,
+          config.claimCapacity,
           config.requestCapacity,
           config.tenantCapacity,
           config.objectCapacity,
@@ -471,6 +479,10 @@ struct HostRuntime::Impl {
       (void)cudaFree(requestProgress);
       requestProgress = nullptr;
     }
+    if (claims != nullptr) {
+      (void)cudaFree(claims);
+      claims = nullptr;
+    }
     if (reductionFailed != nullptr) {
       (void)cudaFree(reductionFailed);
       reductionFailed = nullptr;
@@ -599,6 +611,7 @@ struct HostRuntime::Impl {
   std::uint32_t *changedCount = nullptr;
   std::uint32_t *changedOverflow = nullptr;
   abi::RequestProgress *requestProgress = nullptr;
+  abi::ClaimContext *claims = nullptr;
   std::uint32_t *reductionExpected = nullptr;
   std::uint32_t *reductionCompleted = nullptr;
   std::uint32_t *reductionFailed = nullptr;
@@ -1303,6 +1316,26 @@ void HostRuntime::bindTensorMaps(std::uint32_t objectSlot,
 
 abi::RuntimeView *HostRuntime::deviceView() const noexcept {
   return impl_->view;
+}
+
+void HostRuntime::publishClaim(std::uint32_t claimSlot,
+                               const abi::ClaimContext &row,
+                               cudaStream_t stream) {
+  if (impl_->claims == nullptr) {
+    throw std::invalid_argument(
+        "claim publication requires a configured claim table");
+  }
+  if (claimSlot >= impl_->config.claimCapacity) {
+    throw std::out_of_range("claim slot exceeds the configured claim table");
+  }
+  // Pageable-source async copies are staged synchronously by CUDA, so the
+  // row is durable before return while still ordered on the caller's
+  // stream relative to consumer launches.
+  detail::CudaDeviceGuard guard(impl_->config.deviceOrdinal);
+  checkCuda(cudaMemcpyAsync(impl_->claims + claimSlot, &row,
+                            sizeof(abi::ClaimContext), cudaMemcpyHostToDevice,
+                            stream),
+            "publish claim row");
 }
 
 int HostRuntime::deviceOrdinal() const noexcept {

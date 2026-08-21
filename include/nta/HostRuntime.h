@@ -44,6 +44,10 @@ struct RuntimeConfig {
   // zero selects an unbounded compatibility limit.
   // Engine-registered staging remains governed by the engine's allocator.
   std::uint64_t stagingByteCapacity = UINT64_MAX;
+  // Engine-granted lease rows published for in-kernel consumer validation.
+  // Zero publishes no claim table: consumers compiled to require one then
+  // fail closed rather than serve unvalidated lease storage.
+  std::uint32_t claimCapacity = 0;
 };
 
 struct StagingUsage {
@@ -184,6 +188,11 @@ public:
                       const void *stagingTensorMap = nullptr);
 
   [[nodiscard]] abi::RuntimeView *deviceView() const noexcept;
+  // Publish one engine-granted lease row for in-kernel consumer
+  // validation; retire republishes valid=0 under the same generation.
+  // Throws when no claim table was configured or the slot is out of range.
+  void publishClaim(std::uint32_t claimSlot, const abi::ClaimContext &row,
+                    cudaStream_t stream);
   [[nodiscard]] int deviceOrdinal() const noexcept;
   [[nodiscard]] const RuntimeConfig &config() const noexcept;
   [[nodiscard]] StagingUsage stagingUsage() const noexcept;

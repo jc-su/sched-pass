@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 27;
+inline constexpr std::uint32_t Version = 28;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 5;
 inline constexpr std::uint32_t UrgencyBucketCount = 8;
@@ -67,6 +67,27 @@ struct alignas(32) RequestContext {
   std::uint32_t cancelled;
 };
 static_assert(sizeof(RequestContext) == 64);
+
+// One engine-granted lease row, published for in-kernel consumer
+// validation. The runtime (claim_table) already maintains these fields as
+// loose device tensors; this struct is their ABI-typed publication so a
+// transformed consumer can check, before its mainloop, that it is reading
+// its own live claim: slot in range, generation matches, row valid, owner
+// not cancelled, consumed rows inside the staged extent, and the selected
+// table stamped by the prep launch that produced it.
+struct alignas(32) ClaimContext {
+  std::uint32_t requestSlot;
+  std::uint32_t generation;
+  std::uint32_t valid;
+  std::uint32_t stagedRows;
+  std::uint64_t leaseBase;
+  std::uint64_t leaseExtent;
+  std::uint64_t tableStamp;
+  std::uint64_t reservedA;
+  std::uint64_t reservedB;
+  std::uint64_t reservedC;
+};
+static_assert(sizeof(ClaimContext) == 64);
 
 struct alignas(32) TenantContext {
   std::uint64_t maxOutstandingBytes;
@@ -415,11 +436,13 @@ struct alignas(64) RuntimeView {
   std::uint32_t *changedCount;
   std::uint32_t *changedOverflow;
   RequestProgress *requestProgress;
+  ClaimContext *claims;
   // Per-request reduction state. Work items in one request share a reduction
   // group, allowing split-work merges to proceed independently across requests.
   std::uint32_t *reductionExpected;
   std::uint32_t *reductionCompleted;
   std::uint32_t *reductionFailed;
+  std::uint32_t claimCapacity;
   std::uint32_t requestCapacity;
   std::uint32_t tenantCapacity;
   std::uint32_t objectCapacity;
@@ -443,6 +466,8 @@ struct alignas(64) RuntimeView {
 static_assert(sizeof(RuntimeView) == 320);
 
 static_assert(std::is_standard_layout_v<RequestContext>);
+static_assert(std::is_standard_layout_v<ClaimContext>);
+static_assert(std::is_trivially_copyable_v<ClaimContext>);
 static_assert(std::is_standard_layout_v<TenantContext>);
 static_assert(std::is_standard_layout_v<RequestProgress>);
 static_assert(std::is_standard_layout_v<ObjectEntry>);

@@ -344,6 +344,7 @@ nta_status nta_runtime_create(const nta_runtime_config *config,
         config->enable_cta_nvme_try_issue != 0,
         config->tenant_capacity,
         config->staging_byte_capacity,
+        config->claim_capacity,
     };
     auto handle = std::make_unique<nta_runtime>();
     if (nvme != nullptr) {
@@ -358,6 +359,26 @@ nta_status nta_runtime_create(const nta_runtime_config *config,
 }
 
 void nta_runtime_destroy(nta_runtime *runtime) { delete runtime; }
+
+nta_status nta_runtime_publish_claim(
+    nta_runtime *runtime, uint32_t claim_slot, uint32_t request_slot,
+    uint32_t generation, uint32_t valid, uint32_t staged_rows,
+    uint64_t lease_base, uint64_t lease_extent, uint64_t table_stamp,
+    uint64_t stream) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    nta::abi::ClaimContext row{};
+    row.requestSlot = request_slot;
+    row.generation = generation;
+    row.valid = valid;
+    row.stagedRows = staged_rows;
+    row.leaseBase = lease_base;
+    row.leaseExtent = lease_extent;
+    row.tableStamp = table_stamp;
+    runtime->value->publishClaim(
+        claim_slot, row, reinterpret_cast<cudaStream_t>(stream));
+  });
+}
 
 nta_status nta_runtime_set_request(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t requestId,

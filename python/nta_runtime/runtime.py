@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 30
+API_VERSION = 31
 
 
 class RuntimeError(Exception):
@@ -96,6 +96,8 @@ class _RuntimeConfig(ctypes.Structure):
         ("enable_cta_nvme_try_issue", ctypes.c_uint32),
         ("tenant_capacity", ctypes.c_uint32),
         ("staging_byte_capacity", ctypes.c_uint64),
+        ("claim_capacity", ctypes.c_uint32),
+        ("reserved_claim", ctypes.c_uint32),
     ]
 
 
@@ -421,6 +423,7 @@ class RuntimeConfig:
     enable_cta_nvme_try_issue: bool = False
     tenant_capacity: int = 0
     staging_byte_capacity: int = (1 << 64) - 1
+    claim_capacity: int = 0
 
     def native(self) -> _RuntimeConfig:
         return _RuntimeConfig(
@@ -436,6 +439,8 @@ class RuntimeConfig:
             int(self.enable_cta_nvme_try_issue),
             self.tenant_capacity,
             self.staging_byte_capacity,
+            self.claim_capacity,
+            0,
         )
 
 
@@ -664,6 +669,20 @@ def _function(name: str, restype: Any, *argtypes: Any) -> Any:
 _last_error = _function("nta_last_error", ctypes.c_char_p)
 _api_version = _function("nta_runtime_c_api_version", ctypes.c_uint32)
 _device_abi_version = _function("nta_runtime_device_abi_version", ctypes.c_uint32)
+_publish_claim = _function(
+    "nta_runtime_publish_claim",
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
 _nvme_create = _function(
     "nta_nvme_transport_create",
     ctypes.c_int,
@@ -1421,6 +1440,38 @@ class Runtime(_Owner):
 
     def cancel_request(self, slot: int, generation: int) -> None:
         _check(_runtime_cancel_request(self._handle, slot, generation))
+
+    def publish_claim(
+        self,
+        claim_slot: int,
+        request_slot: int,
+        generation: int,
+        valid: bool,
+        staged_rows: int,
+        lease_base: int,
+        lease_extent: int,
+        table_stamp: int,
+        stream: int = 0,
+    ) -> None:
+        """Publish one lease row for in-kernel consumer validation.
+
+        Retirement republishes ``valid=False`` under the same generation so
+        a stale consumer's check rejects instead of reading reused storage.
+        """
+        _check(
+            _publish_claim(
+                self._handle,
+                claim_slot,
+                request_slot,
+                generation,
+                1 if valid else 0,
+                staged_rows,
+                lease_base,
+                lease_extent,
+                table_stamp,
+                stream,
+            )
+        )
 
     def set_tenant_budget(
         self, tenant_id: int, max_bytes: int, weight: int = 1
