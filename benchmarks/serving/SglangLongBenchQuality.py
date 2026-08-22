@@ -209,8 +209,8 @@ def rouge_l(prediction: str, answers: tuple[str, ...]) -> float:
 
 def build_tasks(tokenizer: Any, args: argparse.Namespace) -> list[LongBenchTask]:
     import random
+    import zlib
 
-    rng = random.Random(args.seed)
     tasks: list[LongBenchTask] = []
     for dataset in args.task_names:
         template, metric = TASK_PROMPTS[dataset]
@@ -220,6 +220,14 @@ def build_tasks(tokenizer: Any, args: argparse.Namespace) -> list[LongBenchTask]
             for row in _longbench_rows(dataset)
             if row.get("context") and row.get("answers")
         ]
+        # Per-dataset RNG, independent of the task list: one shared RNG
+        # left later datasets' shuffles at a task-list-dependent state,
+        # so a single-task run sampled different rows than the same task
+        # inside the full battery — which invalidated a whole budget
+        # ladder (0/16 row overlap) before it was caught by comparing
+        # stored gold answers across runs. crc32, not hash(): Python
+        # salts str hashes per process.
+        rng = random.Random(args.seed * 1000003 + zlib.crc32(dataset.encode()))
         rng.shuffle(rows)
         taken = 0
         for row in rows:
