@@ -11,6 +11,12 @@ _RELEASE_TARGET = "sglang.srt.managers.scheduler.Scheduler.release_host_resource
 _HICACHE_LOAD_TARGET = (
     "sglang.srt.managers.cache_controller.HiCacheController.start_loading"
 )
+_FORWARD_EXTEND_TARGET = (
+    "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_extend"
+)
+_FORWARD_DECODE_TARGET = (
+    "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_decode"
+)
 _WRITE_BACKUP_TARGETS = (
     "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.write_backup",
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.write_backup",
@@ -49,6 +55,91 @@ _ALLOCATOR_FREE_TARGETS = (
     "sglang.srt.mem_cache.allocator.token.TokenToKVPoolAllocator.free",
     "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.free",
 )
+
+
+_OBSERVABILITY_DEGRADED: dict[str, int] = {}
+
+
+def _observability_degraded(site: str, error: Exception) -> None:
+    """First failure per observation site is loud; the rest are counted.
+
+    Mechanism guards raise (CapKV stance); observation never does (eKV
+    stance) — but silent degradation is worse than loud, so the count is
+    exported through the engine stats as observability_degraded_<site>.
+    """
+    from nta_runtime.engines.sglang import FORWARD_PROFILE
+
+    key = f"observability_degraded_{site}"
+    count = _OBSERVABILITY_DEGRADED.get(site, 0)
+    _OBSERVABILITY_DEGRADED[site] = count + 1
+    FORWARD_PROFILE[key] = float(_OBSERVABILITY_DEGRADED[site])
+    if count == 0:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "observation hook %s degraded (serving continues): %r",
+            site,
+            error,
+        )
+
+
+def _profile_forward(original, runner, forward_batch, *args, **kwargs):
+    """Time one forward and attribute it to a batch-composition class.
+
+    Enabled by NTA_SGLANG_FORWARD_PROFILE=1. Two CUDA events per forward is
+    the cheapest measurement that answers what a co-resident decode waits
+    behind; the per-claim staging spans cannot answer it because a chunked
+    prefill's staging is spread over several forwards.
+    """
+    import os
+
+    if os.environ.get("NTA_SGLANG_FORWARD_PROFILE") != "1":
+        return original(runner, forward_batch, *args, **kwargs)
+
+    import torch
+
+    from nta_runtime.engines.sglang import FORWARD_PROFILE, record_forward
+
+    backend = getattr(runner.model_runner, "attn_backend", None)
+    claims = getattr(backend, "_tiered_claims", None) or {}
+    rids = tuple(getattr(forward_batch, "rids", ()) or ())
+    claim_rids = {
+        candidate.request_id
+        for candidate in claims.values()
+        if getattr(candidate, "external_sidecar", False)
+    }
+    staging = sum(1 for rid in rids if rid in claim_rids)
+    mode = getattr(forward_batch, "forward_mode", None)
+    is_mixed = bool(mode is not None and mode.is_mixed())
+    if staging and is_mixed:
+        kind = "staging_mixed"
+    elif staging:
+        kind = "staging_pure"
+    elif is_mixed:
+        kind = "mixed_nostage"
+    else:
+        kind = "plain"
+
+    # Observability stance (eKV lineage, docs/RECOGNITION_LINEAGE.md): an
+    # observation hook must never take down serving, and event synchronize
+    # is illegal inside a captured graph. Degrade loudly once, count the
+    # rest, keep serving; the counter rides the stats report.
+    try:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+    except Exception as error:
+        _observability_degraded("forward_profile", error)
+        return original(runner, forward_batch, *args, **kwargs)
+    try:
+        return original(runner, forward_batch, *args, **kwargs)
+    finally:
+        try:
+            end.record()
+            end.synchronize()
+            record_forward(kind, start.elapsed_time(end))
+        except Exception as error:
+            _observability_degraded("forward_profile", error)
 
 
 def _preserve_graph_request_metadata() -> None:
@@ -234,6 +325,12 @@ def register() -> None:
         HookRegistry.register(
             _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
         )
+    for forward_target in (_FORWARD_EXTEND_TARGET, _FORWARD_DECODE_TARGET):
+        forward_hooks = HookRegistry._hooks[forward_target]
+        if not any(hook is _profile_forward for _, hook, _ in forward_hooks):
+            HookRegistry.register(
+                forward_target, _profile_forward, HookType.AROUND
+            )
     for write_target in _WRITE_BACKUP_TARGETS:
         write_hooks = HookRegistry._hooks[write_target]
         if not any(hook is route_write_backup for _, hook, _ in write_hooks):
