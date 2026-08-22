@@ -256,6 +256,7 @@ template <typename Params>
 struct HasClaimBinding<
     Params, std::void_t<decltype(Params::nta_claim_slot),
                         decltype(Params::nta_claim_generation),
+                        decltype(Params::nta_claim_row_bound),
                         decltype(Params::nta_table_stamp)>> : std::true_type {};
 template <typename Params>
 inline constexpr bool HasClaimBindingV = HasClaimBinding<Params>::value;
@@ -284,19 +285,22 @@ bindValidatedClaimConsumer(const Params &params, abi::RuntimeView *runtime,
         runtime->claims == nullptr) {
       return false;
     }
-    const std::uint32_t slot = params.nta_claim_slot;
+    const std::uint32_t slot =
+        static_cast<std::uint32_t>(params.nta_claim_slot);
     if (slot >= runtime->claimCapacity) {
       return false;
     }
     const abi::ClaimContext &claim = runtime->claims[slot];
-    if (claim.generation != params.nta_claim_generation ||
+    if (claim.generation !=
+            static_cast<std::uint32_t>(params.nta_claim_generation) ||
         claim.valid == 0u) {
       return false;
     }
     if (plannedRowBound > claim.stagedRows) {
       return false;
     }
-    if (claim.tableStamp != params.nta_table_stamp) {
+    if (claim.tableStamp !=
+        static_cast<std::uint64_t>(params.nta_table_stamp)) {
       return false;
     }
     return true;

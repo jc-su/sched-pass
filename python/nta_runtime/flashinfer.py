@@ -19,6 +19,27 @@ REQUEST_BOUND_TENSOR_NAMES = ["nta_runtime"]
 REQUEST_BOUND_TENSOR_DTYPES = ["uint8_t"]
 REQUEST_BOUND_SCALAR_NAMES = ["sm_scale", "nta_request_slot_offset"]
 REQUEST_BOUND_SCALAR_DTYPES = ["double", "int64_t"]
+# Claim-bound consumers extend the request-bound form with the lease
+# identity quad; kernels declaring these fields get the in-kernel
+# claim-consumer contract (bindValidatedClaimConsumer) compiled in.
+CLAIM_BOUND_TENSOR_NAMES = REQUEST_BOUND_TENSOR_NAMES
+CLAIM_BOUND_TENSOR_DTYPES = REQUEST_BOUND_TENSOR_DTYPES
+CLAIM_BOUND_SCALAR_NAMES = [
+    "sm_scale",
+    "nta_request_slot_offset",
+    "nta_claim_slot",
+    "nta_claim_generation",
+    "nta_claim_row_bound",
+    "nta_table_stamp",
+]
+CLAIM_BOUND_SCALAR_DTYPES = [
+    "double",
+    "int64_t",
+    "int64_t",
+    "int64_t",
+    "int64_t",
+    "int64_t",
+]
 
 SKIP_MERGE = 1 << 0
 PREACQUIRED = 1 << 1
@@ -94,6 +115,36 @@ def request_bound_attention_jit_args(
         REQUEST_BOUND_TENSOR_DTYPES,
         REQUEST_BOUND_SCALAR_NAMES,
         REQUEST_BOUND_SCALAR_DTYPES,
+        _DEFAULT_ATTENTION_VARIANT,
+        _DEFAULT_ATTENTION_DECL,
+    ]
+
+
+def claim_bound_attention_jit_args(
+    module_name: str,
+    *,
+    dtype_q: Any,
+    dtype_kv: Any,
+    dtype_o: Any,
+    idtype: Any,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> list[Any]:
+    """Build typed arguments for a claim-bound selected consumer module."""
+    if not module_name or min(head_dim_qk, head_dim_vo) <= 0:
+        raise ValueError("FlashInfer module name and head dimensions are required")
+    return [
+        module_name,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        CLAIM_BOUND_TENSOR_NAMES,
+        CLAIM_BOUND_TENSOR_DTYPES,
+        CLAIM_BOUND_SCALAR_NAMES,
+        CLAIM_BOUND_SCALAR_DTYPES,
         _DEFAULT_ATTENTION_VARIANT,
         _DEFAULT_ATTENTION_DECL,
     ]

@@ -49,6 +49,11 @@ DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernel(const 
     const uint32_t nta_request_index = params.request_indices[nta_work_index];
     if (!nta::flashinfer::bindValidatedRequestOnly(
             params, nta_runtime, nta_request_index)) return;
+    if constexpr (nta::flashinfer::HasClaimBindingV<Params>) {
+      if (!nta::flashinfer::bindValidatedClaimConsumer(
+              params, nta_runtime,
+              static_cast<uint32_t>(params.nta_claim_row_bound))) return;
+    }
   }
 #else
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
@@ -136,6 +141,11 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
 #endif
     if (!nta::flashinfer::bindValidatedRequestOnly(
             params, nta_runtime, nta_request_index)) return;
+    if constexpr (nta::flashinfer::HasClaimBindingV<Params>) {
+      if (!nta::flashinfer::bindValidatedClaimConsumer(
+              params, nta_runtime,
+              static_cast<uint32_t>(params.nta_claim_row_bound))) return;
+    }
   }
 #else
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
@@ -237,6 +247,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t nta_request_index = params.request_indices[nta_work_index];
     if (!nta::flashinfer::bindValidatedRequestOnly(
             params, nta_runtime, nta_request_index)) return;
+    if constexpr (nta::flashinfer::HasClaimBindingV<Params>) {
+      if (!nta::flashinfer::bindValidatedClaimConsumer(
+              params, nta_runtime,
+              static_cast<uint32_t>(params.nta_claim_row_bound))) return;
+    }
   }
 #else
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
@@ -348,6 +363,11 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
 #endif
     if (!nta::flashinfer::bindValidatedRequestOnly(
             params, nta_runtime, nta_request_index)) return;
+    if constexpr (nta::flashinfer::HasClaimBindingV<Params>) {
+      if (!nta::flashinfer::bindValidatedClaimConsumer(
+              params, nta_runtime,
+              static_cast<uint32_t>(params.nta_claim_row_bound))) return;
+    }
   }
 #else
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
