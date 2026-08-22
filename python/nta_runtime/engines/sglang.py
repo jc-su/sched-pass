@@ -1760,8 +1760,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         indptr_cpu[0] = 0
         for position in range(padded_bs):
             indptr_cpu[position + 1] = int(pinned[padded_bs + 2 + position])
-        import sglang.srt.layers.attention.flashinfer_backend as fib
-
         updater = self.indices_updater_decode
         wrapper.begin_forward(
             kv_indptr_buf[: padded_bs + 1],
