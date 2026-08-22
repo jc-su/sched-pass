@@ -1,0 +1,94 @@
+# What the Prototype Pass Already Proved About Request Identity
+
+Recorded 2026-08-22 after re-reading the original `main`-branch prototype
+(worktree at `~/Dev/sched-pass-main`, initial commit 4789f16; DESIGN.md,
+`lib/SchedWeave.cpp`, GPU-validated on sm_86 and Blackwell per its README).
+This corrects an overstatement in the current branch's framing and pins
+what is portable.
+
+## The correction
+
+The current branch's docs say the pass "does not infer request identity
+from arbitrary pointer arithmetic" and treats explicit markers as the
+only recognition path. The first half is right; the implied
+impossibility is not. The prototype demonstrated, in LLVM IR on real
+FlashAttention-class CUDA kernels, that **the paged-KV family carries
+request identity structurally**, in three mutually exclusive forms:
+
+- **Index-based mu (paged/CSR):** `hasLoadedIndex` — a bounded backward
+  walk (GEP/phi/binop/cast/select, 256-step cap) finding an address
+  data-dependent on ANOTHER load. That loaded value IS the page-table /
+  block-table row: the identity-carrying access, found with no names
+  and no annotations (CapKV's `capkv.auto` signature, ported to scalar
+  IR).
+- **Arithmetic mu (contiguous):** `reachesSlotCtaid` — the address
+  derives from ctaid(slotAxis) WITHOUT crossing a load (crossing one
+  would make it the other form). A positive classification, not a
+  fallback.
+- **cp.async streams:** FlashInfer's actual KV path recognized at the
+  inline-asm level, extracting the global source operand from the
+  "l"-constrained argument.
+
+Selection is disciplined by SCEV: only constant-stride AddRec addresses
+in innermost loops, never address-space-3, K and V streams both
+captured. And the load-bearing rule, stated in eKV's terms: a kernel
+with index-based gathers where no site matches is **skipped loudly,
+never silently re-bound** — recognition is fail-closed, exactly like
+the current verifier.
+
+Request identity operationally meant: `task = task_order[ctaid]` with
+null-table/OOB defaulting to identity (fail-safe), per-task policy
+reads, per-task timers — and eKV's row-form recovery (seq and stride
+from the SAME multiply; CSR `kv_indptr[seq]`) recovers the request
+coordinate from the kernel's own index math.
+
+The honest limits the prototype itself recorded: TMA-descriptor streams
+are invisible as plain IR loads (covered there by launch-arg/runtime
+observation levels, not the pass), and nothing here infers identity for
+kernels OUTSIDE these structural families. "Arbitrary production
+kernels" stays open; the paged family does not.
+
+## What the current branch should adopt
+
+1. **Structural candidate discovery feeding the existing verifier.**
+   Port `hasLoadedIndex` + the SCEV stride filter + cp.async source
+   extraction as a discovery phase that proposes candidate acquisition
+   sites in unmarked kernels. Candidates never self-authorize: each must
+   pass the same legality gates as marked sites (dominating binding —
+   now derivable for the paged family via row-form recovery —
+   uniformity, escape closure, defer discipline) or the kernel is
+   skipped loudly. This turns "markers only" into "typed frontend OR
+   structural recognition, both verified," and directly answers the
+   ARCHITECTURE 7.2 open item for load/cp.async cones. Validation on
+   this branch: accept fixtures cut from real FlashInfer IR plus a
+   mutation-harness extension (the discovery must never fire on a
+   taint-mutated cone).
+2. **Row-granular refusal by address-cone redirection.** CapKV's
+   `select(ok, page, sentinel)` woven INTO the address cone cost ~0%
+   (vs +33% for mask-and-branch) and stayed graph-replay-safe. The
+   claim-consumer contract currently refuses at launch granularity; a
+   sentinel-redirect per out-of-lease row is the finer fail-closed
+   action and composes with the existing check.
+3. **Graph-safety as a named invariant class.** The prototype states
+   what this branch learned empirically: every woven effect must be a
+   commutative-monoid write, an idempotent write, or a pure read —
+   that class is CUDA-graph-replay-safe by construction. Adopt as a
+   stated contract for all instrumentation (the forward profiler and
+   bindings fills already conform).
+4. **The two admission stances as vocabulary.** eKV = fail-open
+   observability (defaults are stock; results bit-exact); CapKV =
+   fail-closed protection. This branch's counters/profilers are the
+   first stance; the claim contract is the second. The paper should
+   name both.
+5. **Fail-safe identity defaults.** `task_order == null -> identity`
+   is the same design as the bindings tensor's slot = -1 row; keep the
+   continuity explicit.
+
+## Evidence hygiene
+
+ARCHITECTURE 7.2's sentence "the previous branch's recognition
+experiment is not evidence for this branch" stands: adoption means
+porting the detection INTO this branch's pass behind its verifier and
+re-validating with this branch's fixtures — not citing the prototype's
+results. The prototype is the existence proof and the design source;
+the ledger item is the port.

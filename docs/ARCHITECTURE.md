@@ -510,6 +510,13 @@ request binding or canonical ready/defer/return edge. Set lowering is independen
 of engine and kernel names. It does not yet infer arbitrary production load,
 `cp.async`, or TMA address cones. The previous branch's recognition experiment
 is not evidence for this branch.
+That experiment (prototype `main`, GPU-validated; see
+`docs/RECOGNITION_LINEAGE.md`) did demonstrate structural recognition of
+the paged-KV family — loaded-index address cones, arithmetic ctaid
+forms, and cp.async source operands, with loud-skip on any unmatched
+gather — so the open item is scoped to kernels outside those structural
+families, and the recorded adoption path is discovery-feeding-the-
+verifier, never discovery-as-authorization.
 
 FlashInfer is the first typed frontend: a version- and source-hash-checked C++
 template overlay retains its scheduler request/tile coordinates, inserts the
