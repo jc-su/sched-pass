@@ -818,6 +818,62 @@ if(NTA_ENABLE_CUDA)
   )
   set_tests_properties(nta-dependency-arrival-race PROPERTIES TIMEOUT 60)
 
+  set(NTA_CLAIM_CONSUMER_PTX
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel/ClaimConsumer.ptx")
+  set(NTA_CLAIM_CONSUMER_CUBIN
+      "${CMAKE_CURRENT_BINARY_DIR}/kernel/ClaimConsumer.cubin")
+  add_custom_command(
+    OUTPUT "${NTA_CLAIM_CONSUMER_CUBIN}"
+    BYPRODUCTS "${NTA_CLAIM_CONSUMER_PTX}"
+    COMMAND
+      "${NTA_CLANG_CUDA}"
+      -O3
+      -std=c++20
+      --cuda-device-only
+      --cuda-path=${NTA_CUDA_ROOT}
+      --cuda-gpu-arch=${NTA_CUDA_ARCH}
+      -Wno-unknown-cuda-version
+      -I${CMAKE_CURRENT_SOURCE_DIR}/include
+      -S
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/ClaimConsumerKernel.cu
+      -o "${NTA_CLAIM_CONSUMER_PTX}"
+    COMMAND
+      "${NTA_PTXAS}"
+      -arch=${NTA_CUDA_ARCH}
+      -O3
+      "${NTA_CLAIM_CONSUMER_PTX}"
+      -o "${NTA_CLAIM_CONSUMER_CUBIN}"
+    DEPENDS
+      tests/runtime/ClaimConsumerKernel.cu
+      include/nta/RuntimeABI.h
+      include/nta/FlashInferKernelPolicy.cuh
+      include/nta/KernelPolicy.cuh
+    VERBATIM
+  )
+  add_custom_target(
+    nta-claim-consumer-kernel
+    DEPENDS "${NTA_CLAIM_CONSUMER_CUBIN}"
+  )
+  add_executable(
+    nta-claim-consumer-test
+    tests/runtime/ClaimConsumerTest.cpp
+  )
+  add_dependencies(nta-claim-consumer-test nta-claim-consumer-kernel)
+  target_include_directories(nta-claim-consumer-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_link_libraries(
+    nta-claim-consumer-test
+    PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+  )
+  target_compile_definitions(
+    nta-claim-consumer-test PRIVATE
+    NTA_CLAIM_CONSUMER_CUBIN_PATH="${NTA_CLAIM_CONSUMER_CUBIN}"
+  )
+  add_test(NAME nta-claim-consumer COMMAND nta-claim-consumer-test)
+  set_tests_properties(nta-claim-consumer PROPERTIES TIMEOUT 60)
+
   add_executable(nta-multi-gpu-test tests/runtime/MultiGpuTest.cpp)
   target_include_directories(nta-multi-gpu-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
