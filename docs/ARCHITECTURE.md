@@ -563,6 +563,24 @@ held apart; one verifier gates all of them:
   The existing verifier plus these conditions authorizes, or the kernel
   is skipped loudly. Discovery proposes; the verifier alone authorizes
   — the delta over naive auto-instrumentation IS this proof set.
+
+  **Tier 2's domain is the attention family, not arbitrary kernels**
+  (decided 2026-08-22). Attention carries two invariants no arbitrary
+  kernel has: the KV gather always exists and its address cone is the
+  identity (structurally confirmed on FlashInfer production IR and, in
+  the prototype lineage, on Triton-emitted attention), and the online-
+  softmax `(V, LSE)` merge law is implementation-independent algebra,
+  so deferral composability is a property of the operator rather than
+  an inference. The headline mechanism needs only the DIRECT form —
+  entry contract, claims, pre-staged tables, address-cone consumption
+  redirect — so attention-generic auto-onboarding does not require
+  recovering live softmax state from optimized code; that remains the
+  typed frontend's job for the partial forms. Demonstration target: one
+  Triton-emitted attention kernel auto-onboarded end to end, which is
+  also the cheapest credible step toward a second engine. The
+  TMA-descriptor/cluster class (FA3-style warp specialization) is
+  refused loudly with recorded reasons this cycle; the refusal census
+  over the production attention space is part of the claim.
 - **Tier 3 — auto-woven additive policies (planned):** effects in the
   graph-replay-safe invariant class (pure hints, idempotent writes,
   commutative-monoid accumulation) may be woven at discovered sites
