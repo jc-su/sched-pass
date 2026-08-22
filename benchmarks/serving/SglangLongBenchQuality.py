@@ -112,6 +112,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-total-tokens", type=int, default=19000)
     parser.add_argument("--context-length", type=int, default=32768)
     parser.add_argument("--seed", type=int, default=20260821)
+    parser.add_argument(
+        "--flashinfer-workspace-base",
+        type=pathlib.Path,
+        default=ROOT / "results" / "serving" / "longbench-cache",
+    )
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if not args.model.is_dir():
