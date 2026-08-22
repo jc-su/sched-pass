@@ -526,6 +526,38 @@ verifier. Paired direct and preacquired-partial ragged-prefill forms now export
 one typed execution plan. A second generated-kernel frontend and automatic
 recognition of arbitrary production kernels remain open.
 
+**Authorization tiers (design of record, 2026-08-22).** Discovery,
+insertion, and proof are three different powers and are deliberately
+held apart; one verifier gates all of them:
+
+- **Tier 1 — typed frontend (production today):** the overlay inserts
+  the full contract, including partial forms. Highest capability,
+  per-kernel-family integration cost.
+- **Tier 2 — auto-instrumentation for structurally proven kernels
+  (planned):** the discovery phase (`AcquireDiscovery.cpp`; census: all
+  79 cp.async KV streams of a production paged-decode kernel carry the
+  loaded-index signature) proves membership in the paged family; a
+  declaration-lite binding maps the table argument to engine objects
+  (one typed declaration per tensor, never per site); the pass inserts
+  bind/acquire/defer **at kernel entry**, where no shared memory,
+  barriers, or TMA state are live — so boundary-placement legality,
+  the hard half of auto-insertion, holds by construction. The existing
+  verifier then proves every legality condition or the kernel is
+  skipped loudly. Discovery proposes; the verifier alone authorizes.
+- **Tier 3 — auto-woven additive policies (planned):** effects in the
+  graph-replay-safe invariant class (pure hints, idempotent writes,
+  commutative-monoid accumulation) may be woven at discovered sites
+  without the acquisition contract — the cache-citizenship policy at
+  cp.async sites being the first candidate. Fail-open by stance,
+  results-identical by class.
+
+Automation does not add soundness — the verifier, reject fixtures, and
+mutation suite are the soundness floor regardless of who inserted a
+marker. Automation adds generality: a structurally proven kernel
+onboards without a hand-built overlay, which is the affordable form of
+the second-frontend evidence. Arbitrary-kernel transformation remains
+open and is claimed nowhere.
+
 ### 7.3 Phase C: object-key derivation
 
 Derive:
