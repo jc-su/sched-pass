@@ -1164,6 +1164,32 @@ class TieredClaim:
             >= self.selection_refresh_interval
         )
 
+    def stage_layer_host_deferred(
+        self,
+        engine: Any,
+        local_layer: int,
+        free_pages: torch.Tensor,
+        stream: torch.cuda.Stream,
+    ) -> torch.Tensor:
+        """RQ3 baseline B2: one-refresh-stale host control edge.
+
+        Scaffold slice (design: docs/B2_DEFERRED_HOST.md): the cold path
+        — first refresh of a (claim, layer), when no table exists to
+        serve stale — is B1's synchronous build, counted as a cold-start
+        block. The warm path (background builder, ready-event adoption,
+        generation-partitioned staging) replaces the delegation in the
+        next slice; until then B2 measures identically to B1 by
+        construction, which is the honest scaffold baseline.
+        """
+        stats = getattr(engine, "_stats", None)
+        if stats is not None:
+            stats["b2_cold_start_blocks"] = (
+                stats.get("b2_cold_start_blocks", 0) + 1
+            )
+        return self.stage_layer_host_orchestrated(
+            engine, local_layer, free_pages, stream
+        )
+
     def stage_layer_host_orchestrated(
         self,
         engine: Any,

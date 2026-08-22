@@ -637,7 +637,26 @@ class SelectedAttentionExecutor:
                     )
                 elif selected_rows is None:
                     free = claim.choose_free_pages(local_layer, queries, group_size)
-                    if host_orchestrated and claim.external_sidecar:
+                    if host_orchestrated and claim.external_sidecar and (
+                        getattr(engine, "_host_orchestrated_mode", "1")
+                        == "deferred"
+                    ):
+                        # RQ3 baseline B2: one-refresh-stale host control
+                        # (docs/B2_DEFERRED_HOST.md). Scaffold slice: the
+                        # deferred method exists and is routed; its warm
+                        # adoption path lands with the builder.
+                        selected_rows = claim.stage_layer_host_deferred(
+                            engine, local_layer, free, stream
+                        )
+                        fallback_state = self._compact_plan_state
+                        if fallback_state is not None:
+                            fallback_state.get("layer_cats", {}).pop(
+                                local_layer, None
+                            )
+                        claim.remember_selected_rows(local_layer, selected_rows)
+                        if claim.verify_fast:
+                            verify_targets.append((claim, free, selected_rows))
+                    elif host_orchestrated and claim.external_sidecar:
                         # RQ3 baseline B1: identical selection and transfer,
                         # orchestration through the host control edge. The
                         # device claim chain (fused selection, table prep,
