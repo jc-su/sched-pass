@@ -120,6 +120,16 @@ add_test(
     ${CMAKE_CURRENT_BINARY_DIR}/ir-test
 )
 
+add_test(
+  NAME nta-ir-mutation
+  COMMAND
+    ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/ir/mutate.py
+    $<TARGET_FILE:NtaPass>
+    ${LLVM_TOOLS_BINARY_DIR}/opt
+    ${CMAKE_CURRENT_BINARY_DIR}/ir-mutation
+)
+
 add_executable(nta-abi-test tests/runtime/AbiTest.cpp)
 target_include_directories(nta-abi-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(NTA_WARNINGS_AS_ERRORS)
