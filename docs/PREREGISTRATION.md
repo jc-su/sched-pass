@@ -117,6 +117,32 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Budget ladder completed on identical rows, and a select_all
+  correctness defect isolated with a minimal repro (2026-08-22,
+  artifacts `results/serving/budget-ladder/v2-*`,
+  `selectall-needle.json`):** on row-matched samples the production
+  top-k path improves monotonically with budget on the
+  dispersed-evidence task — 0.186 (64), 0.247 (96), 0.254 (128),
+  0.258 (192), **0.282 (384) = parity with stock's 0.288** — so
+  quality parity on the hardest measured family is reached by budget
+  alone at ~384 pages, and the paper reports the
+  budget-quality-goodput surface with goodput re-quoted at the parity
+  budget per the pre-declared rule. The earlier "flat ladder" and its
+  false numerics verdict came from task-list-dependent sampling
+  (harness bug, fixed; invalid artifacts quarantined). The b1024
+  collapse (0.170) is a real defect OUTSIDE the top-k path: with
+  budget >= pages the claim takes the select_all path, and for
+  external sidecars whose token_count < budget*16 the index kernels
+  are given capacity_rows sized to the budget while staging rows are
+  allocated to the token count — out-of-bounds table entries feed
+  garbage rows into attention. Minimal repro: the synthetic needle
+  battery, perfect under top-k, scores 0/4 at budget 2048 with garbled
+  output. Campaign exposure: none — at budget 64 the claim-size floor
+  makes any select_all claim exactly 1024 tokens = capacity, no
+  mismatch, consistent with every campaign's byte-exact outputs bar.
+  Fix and a permanent select_all quality fixture are queued; until
+  merged, select_all with token_count != budget*16 is a known-broken
+  configuration recorded here.
 - **Quality finding at the serving budget (2026-08-22, LongBench
   battery, 16 samples/task, identical prompts, temperature 0, artifacts
   `results/serving/longbench16/`): budget-64 selection loses
