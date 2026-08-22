@@ -30,6 +30,7 @@ from nta_runtime.flashinfer import (
     FlashInferLayerEpoch,
     PREACQUIRED,
     attention_jit_args,
+    claim_bound_attention_jit_args,
     request_bound_attention_jit_args,
 )
 from nta_runtime.flashinfer_schedule import (
@@ -513,6 +514,16 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         self._runtime.set_tenant_budget(0, (1 << 64) - 1)
         self._request_slots = RequestSlotTracker(self._runtime, request_capacity)
+        # Per-request claim bindings for the in-kernel consumer contract
+        # (ABI v28): four int64 words per batch position {slot|-1,
+        # generation, row bound, stamp}. Pinned staging + device buffer so
+        # a captured copy replays from refreshable host memory, the same
+        # pattern as the tiered-graph row tables.
+        self._claim_bindings_pinned = torch.full(
+            (512, 4), 0, dtype=torch.int64, pin_memory=True
+        )
+        self._claim_bindings_pinned[:, 0] = -1
+        self._claim_bindings_dev = self._claim_bindings_pinned.to("cuda")
         self._hicache = SglangHiCacheBridge(self.token_to_kv_pool)
         # CUDA priorities are inverted: numerically lower values preempt higher
         # ones, and SGLang's compute stream runs at the default priority 0.
@@ -1160,17 +1171,17 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         head_dim = int(model_runner.model_config.head_dim)
         signature = f"h{head_dim}_{_dtype_tag(q_dtype)}_{_dtype_tag(kv_dtype)}"
         decode_base = (
-            f"nta_sglang_decode_{{policy}}_v11_"
+            f"nta_sglang_decode_{{policy}}_v12_"
             f"{'tc' if self.decode_use_tensor_cores else 'cc'}_"
             f"{signature}"
         )
-        prefill_base = f"nta_sglang_prefill_{{policy}}_v11_{signature}"
+        prefill_base = f"nta_sglang_prefill_{{policy}}_v12_{signature}"
         self._wrapper_modules: dict[int, str] = {}
 
         def decode_wrappers(policy: str) -> tuple[list[Any], list[Any]]:
             name = decode_base.format(policy=policy)
             jit_builder = (
-                request_bound_attention_jit_args
+                claim_bound_attention_jit_args
                 if policy == "request_bound"
                 else attention_jit_args
             )
@@ -1208,7 +1219,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         def prefill_wrappers(policy: str) -> tuple[list[Any], list[Any]]:
             name = prefill_base.format(policy=policy)
             jit_builder = (
-                request_bound_attention_jit_args
+                claim_bound_attention_jit_args
                 if policy == "request_bound"
                 else attention_jit_args
             )
@@ -1614,6 +1625,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._tg_cats[local_layer, base : base + rows.numel()].copy_(
                         rows
                     )
+            self._write_claim_bindings(matched, padded_bs)
             self._tg_epoch = epoch_key
             self._tg_epoch_state = state
             self._stats["tiered_graph_epochs"] = (
@@ -2482,10 +2494,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 raise RuntimeError(
                     "NTA direct attention requires contiguous request slots"
                 )
+            self._clear_claim_bindings(len(request_slots))
             wrapper.run(
                 q,
                 kv_cache,
                 runtime_tensor,
+                self._claim_bindings_dev,
                 layer.scaling,
                 request_slots[0],
                 out=output,
@@ -3941,10 +3955,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         finish = torch.cuda.Event(enable_timing=True)
         runtime_tensor = self._runtime.device_view_tensor
         start.record()
+        self._clear_claim_bindings(1)
         wrapper.run(
             q,
             kv_cache,
             runtime_tensor,
+            self._claim_bindings_dev,
             layer.scaling,
             batch.bindings[0].request_slot,
             out=output,
@@ -4014,6 +4030,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             q,
             kv_cache,
             runtime_tensor,
+            self._claim_bindings_dev,
             layer.scaling,
             request_slots[0],
             out=output,
@@ -4431,6 +4448,33 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             table_stamp=0,
             stream=torch.cuda.current_stream().cuda_stream,
         )
+
+
+    def _write_claim_bindings(
+        self, positioned_claims: list[tuple[int, Any]], batch_rows: int
+    ) -> None:
+        """Publish per-position claim bindings for the next consumer launch."""
+        rows = min(int(batch_rows), self._claim_bindings_pinned.shape[0])
+        staging = self._claim_bindings_pinned
+        staging[:rows, 0] = -1
+        for position, claim in positioned_claims:
+            if position >= rows:
+                raise RuntimeError(
+                    "claim binding position exceeds the bindings buffer"
+                )
+            table_slot = getattr(claim, "table_slot", None)
+            if table_slot is None:
+                raise RuntimeError("bound claim lost its table slot")
+            staging[position, 0] = int(table_slot.index)
+            staging[position, 1] = int(table_slot.generation)
+            staging[position, 2] = int(claim.kept_prefix_rows)
+            staging[position, 3] = 0
+        self._claim_bindings_dev[:rows].copy_(
+            staging[:rows], non_blocking=True
+        )
+
+    def _clear_claim_bindings(self, batch_rows: int) -> None:
+        self._write_claim_bindings([], batch_rows)
 
     def _write_stats(self) -> None:
         self._drain_tiered_accounting(wait=False)

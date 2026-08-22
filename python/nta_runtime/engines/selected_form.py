@@ -185,6 +185,7 @@ class SelectedAttentionExecutor:
             q,
             kv_cache,
             engine._runtime.device_view_tensor,
+            engine._claim_bindings_dev,
             layer.scaling,
             request_slots[0],
             out=out,
@@ -1300,6 +1301,10 @@ class SelectedAttentionExecutor:
             if len(claim_entries) > 1
             else None
         )
+        engine._write_claim_bindings(
+            [(entry["request"], entry["claim"]) for entry in claim_entries],
+            batch_size,
+        )
         return {
             "wrapper": wrapper,
             "verifier": verifier,
@@ -1413,6 +1418,12 @@ class SelectedAttentionExecutor:
                 "FlashInfer did not retain the peer-group indices buffer"
             )
 
+        engine._write_claim_bindings(
+            [(entry["request"], entry["claim"]) for entry in claim_entries],
+            1 + max(
+                entry["request"] for entry in claim_entries
+            ) if claim_entries else 1,
+        )
         return {
             "wrapper": wrapper,
             "verifier": wrapper,
@@ -1654,6 +1665,9 @@ class SelectedAttentionExecutor:
                 "the planned wrapper copied the indices buffer; in-place "
                 "per-layer rewrites would not be visible"
             )
+        engine._write_claim_bindings(
+            [(claim_request, claim)], batch_size
+        )
         return {
             "wrapper": wrapper,
             "verifier": verifier,
