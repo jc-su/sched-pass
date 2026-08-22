@@ -117,6 +117,24 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Quality finding at the serving budget (2026-08-22, LongBench
+  battery, 16 samples/task, identical prompts, temperature 0, artifacts
+  `results/serving/longbench16/`): budget-64 selection loses
+  dispersed-evidence tasks — a real, one-directional effect, not
+  noise.** Stock mean 0.1655 vs NTA 0.1411. Task-resolved:
+  multifieldqa_en 0.316 -> 0.218 with all 16 outputs changed and 13 of
+  16 scores dropped (net -0.098 mean, 80% of the whole gap);
+  gov_report mildly down the same way (-0.018); narrativeqa, qasper,
+  and hotpotqa at parity. Mechanistic reading: tasks whose evidence is
+  localized survive a 64-page working set; tasks whose evidence is
+  dispersed across the context lose pages the selector cannot afford.
+  Per the pre-declared rule (evaluation ledger, decision point three),
+  the budget ladder now runs on the sensitive task to find the
+  quality-parity budget; the paper's goodput is then re-quoted at that
+  budget via registered campaigns, never quoted at a budget that fails
+  task quality. The synthetic needle/multikey matrix that fixed budget
+  64 (Amendment 1) is hereby recorded as insufficient for
+  dispersed-evidence workloads — real-task quality supersedes it.
 - **Negative mechanism probe: cache-streaming staging does not move the
   capacity resident tail (2026-08-22, diagnostic campaign, ten trials,
   registered seeds shared with the powered capacity campaign for a
