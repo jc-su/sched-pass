@@ -247,6 +247,62 @@ bindValidatedRequestOnly(const Params &params, abi::RuntimeView *runtime,
   }
 }
 
+// Field-presence trait for claim-consumer params: kernels whose Params
+// carry the lease identity triple participate in the in-kernel claim
+// contract; kernels without it keep the request-only guard.
+template <typename Params, typename = void>
+struct HasClaimBinding : std::false_type {};
+template <typename Params>
+struct HasClaimBinding<
+    Params, std::void_t<decltype(Params::nta_claim_slot),
+                        decltype(Params::nta_claim_generation),
+                        decltype(Params::nta_table_stamp)>> : std::true_type {};
+template <typename Params>
+inline constexpr bool HasClaimBindingV = HasClaimBinding<Params>::value;
+
+// In-kernel claim-consumer contract (ABI v28). CTA-uniform, evaluated
+// before the mainloop touches lease storage: the consumer proves it is
+// reading its own live claim — slot in range, generation matched, row
+// valid (retirement republishes valid=0 under the same generation, and
+// cancellation flows through retirement), and the selected table stamped
+// by the prep launch this consumer was planned against. Any mismatch
+// refuses the launch; fail-closed, never a fallback read. Extent
+// checking is enforced by the prep kernel writing only inside
+// [leaseBase, leaseBase+leaseExtent) and stagedRows bounding row
+// indices; the consumer re-checks stagedRows against its plan bound.
+template <typename Params>
+[[nodiscard]] __device__ __forceinline__ bool
+bindValidatedClaimConsumer(const Params &params, abi::RuntimeView *runtime,
+                           std::uint32_t plannedRowBound) {
+  if constexpr (!HasClaimBindingV<Params>) {
+    (void)params;
+    (void)runtime;
+    (void)plannedRowBound;
+    return false;
+  } else {
+    if (runtime == nullptr || runtime->abiVersion != abi::Version ||
+        runtime->claims == nullptr) {
+      return false;
+    }
+    const std::uint32_t slot = params.nta_claim_slot;
+    if (slot >= runtime->claimCapacity) {
+      return false;
+    }
+    const abi::ClaimContext &claim = runtime->claims[slot];
+    if (claim.generation != params.nta_claim_generation ||
+        claim.valid == 0u) {
+      return false;
+    }
+    if (plannedRowBound > claim.stagedRows) {
+      return false;
+    }
+    if (claim.tableStamp != params.nta_table_stamp) {
+      return false;
+    }
+    return true;
+  }
+}
+
 template <typename Params>
 [[nodiscard]] __host__ __device__ __forceinline__ bool
 usesRunnableWork(const Params &params) {

@@ -506,6 +506,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 max_dependencies_per_work_ticket=2,
                 device_ordinal=torch.cuda.current_device(),
                 enable_cta_nvme_try_issue=False,
+                claim_capacity=_positive_environment(
+                    "NTA_SGLANG_MAX_CLAIMS", 32
+                ),
             )
         )
         self._runtime.set_tenant_budget(0, (1 << 64) - 1)
@@ -895,6 +898,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         table_slot = getattr(claim, "table_slot", None)
         if table_slot is not None and getattr(self, "_claim_table", None) is not None:
             self._claim_table.retire(table_slot, completion)
+            self._publish_abi_claim(table_slot, valid=False, claim=claim)
         self._retired_tiered_resources.append(
             (completion, claim.object_lease, claim)
         )
@@ -1026,6 +1030,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         except Exception:
             ranges.release(lease)
             self._claim_table.retire(table_slot, self._ImmediateFenceType)
+            self._publish_abi_claim(table_slot, valid=False)
             raise
         claim.object_lease = lease
         claim.table_slot = table_slot
@@ -1059,6 +1064,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     claim.device_rows[: claim.capacity_rows].to(torch.int32)
                 )
             self._claim_table.activate(table_slot)
+            self._publish_abi_claim(table_slot, valid=True, claim=claim)
         except Exception:
             # Post-construction validation must be transactional: a raise
             # here would otherwise strand the table slot, the object-range
@@ -1070,6 +1076,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             # the stream before returning rows to the allocator.
             ranges.release(lease)
             self._claim_table.retire(table_slot, self._ImmediateFenceType)
+            self._publish_abi_claim(table_slot, valid=False)
             try:
                 torch.cuda.current_stream().synchronize()
                 if claim.copy_stream is not None:
@@ -4395,6 +4402,35 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if self._stats_publisher is None:
             return
         self._stats_publisher.publish(self._stats_report())
+
+
+    def _publish_abi_claim(
+        self, table_slot: Any, valid: bool, claim: Any = None
+    ) -> None:
+        """Mirror a claim-table row into the ABI claim table (v28).
+
+        The in-kernel consumer contract validates against this row before
+        consuming lease storage; retirement republishes valid=0 under the
+        same generation so a stale consumer rejects instead of reading
+        reused rows. Cancellation flows through retirement, so owner
+        liveness needs no request-slot indirection here. tableStamp stays
+        zero until the prep launch stamps it (contract slice three).
+        Publication failures are mechanism failures and raise.
+        """
+        lease = getattr(claim, "object_lease", None) if claim is not None else None
+        self._runtime.publish_claim(
+            claim_slot=table_slot.index,
+            request_slot=0xFFFFFFFF,
+            generation=table_slot.generation,
+            valid=valid,
+            staged_rows=int(getattr(claim, "capacity_rows", 0) or 0),
+            lease_base=int(getattr(lease, "begin", 0) or 0),
+            lease_extent=int(
+                (getattr(lease, "end", 0) or 0) - (getattr(lease, "begin", 0) or 0)
+            ),
+            table_stamp=0,
+            stream=torch.cuda.current_stream().cuda_stream,
+        )
 
     def _write_stats(self) -> None:
         self._drain_tiered_accounting(wait=False)
