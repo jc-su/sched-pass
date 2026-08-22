@@ -17,6 +17,9 @@ _FORWARD_EXTEND_TARGET = (
 _FORWARD_DECODE_TARGET = (
     "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_decode"
 )
+_EXECUTE_EXTEND_TARGET = (
+    "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_extend"
+)
 _WRITE_BACKUP_TARGETS = (
     "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.write_backup",
     "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.write_backup",
@@ -140,6 +143,107 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
             record_forward(kind, start.elapsed_time(end))
         except Exception as error:
             _observability_degraded("forward_profile", error)
+def _route_execute_extend(original, runner, forward_batch, pp_proxy_tensors=None):
+    """Serve eligible tiered extends by captured replay (env-gated)."""
+    backend = getattr(runner.model_runner, "attn_backend", None)
+    claims = getattr(backend, "_tiered_claims", None)
+    if claims:
+        # Classify every claim-staging extend batch by composition. The
+        # capture eligibility rules exclude mixed and multi-request
+        # batches, so whether the colliding extends ARE those batches
+        # decides whether single-claim capture can close the resident
+        # bar at all; the counters ride the artifact either way.
+        rids = tuple(getattr(forward_batch, "rids", ()) or ())
+        claim_rids = {
+            candidate.request_id
+            for candidate in claims.values()
+            if candidate.external_sidecar
+        }
+        claim_hits = sum(1 for rid in rids if rid in claim_rids)
+        if claim_hits:
+            stats = backend._stats
+
+            def bump(key: str) -> None:
+                stats[key] = stats.get(key, 0) + 1
+
+            bump("tiered_extend_batches")
+            mode = getattr(forward_batch, "forward_mode", None)
+            if mode is not None and mode.is_mixed():
+                bump("tiered_extend_batches_mixed")
+            if len(rids) > 1:
+                bump("tiered_extend_batches_multi_rid")
+            if claim_hits > 1:
+                bump("tiered_extend_batches_multi_claim")
+            stats["tiered_extend_batch_rids_max"] = max(
+                stats.get("tiered_extend_batch_rids_max", 0), len(rids)
+            )
+    capture = getattr(backend, "_extend_capture", None)
+    if capture is None or not capture.enabled or capture.capturing:
+        return original(runner, forward_batch, pp_proxy_tensors)
+    claim = capture.eligible_claim(forward_batch)
+    if claim is None:
+        return original(runner, forward_batch, pp_proxy_tensors)
+    result = capture.run(
+        runner, forward_batch, pp_proxy_tensors, claim
+    )
+    if result is not None:
+        return result
+    return original(runner, forward_batch, pp_proxy_tensors)
+
+
+def _preserve_prefill_graph_request_metadata() -> None:
+    """Carry request identity through the prefill BCG static batch.
+
+    PrefillCudaGraphRunner.load_batch builds a static ForwardBatch for
+    piecewise replay without copying ``rids``; the NTA backend refuses
+    batches without request identity, so replays would fail closed.
+    Prefill pads tokens, not requests, so identity carries one-to-one.
+    """
+    from sglang.srt.model_executor.runner import prefill_cuda_graph_runner
+
+    runner_cls = prefill_cuda_graph_runner.PrefillCudaGraphRunner
+    current = runner_cls.load_batch
+    if getattr(current, "_nta_preserves_request_metadata", False):
+        return
+
+    def load_batch(self, forward_batch, **kwargs):
+        from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+
+        static_batch = current(self, forward_batch, **kwargs)
+        static_batch.rids = getattr(forward_batch, "rids", None)
+        priorities = getattr(forward_batch, "_nta_request_priorities", None)
+        if priorities is not None:
+            static_batch._nta_request_priorities = priorities
+        PREFILL_GRAPH_COUNTERS["prefill_graph_served_batches"] += 1
+        return static_batch
+
+    load_batch._nta_preserves_request_metadata = True
+    runner_cls.load_batch = load_batch
+
+    # Startup capture builds dummy batches with no request identity; give
+    # them capture placeholders (mirroring the decode runner's padding
+    # ids) so the fail-closed identity guard admits warmup and capture
+    # without weakening it for real batches.
+    current_prepare = runner_cls.capture_prepare
+    if not getattr(current_prepare, "_nta_preserves_request_metadata", False):
+
+        def capture_prepare(self, num_tokens):
+            from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+
+            result = current_prepare(self, num_tokens)
+            PREFILL_GRAPH_COUNTERS["prefill_graph_capture_batches"] += 1
+            forward_batch = result[0] if isinstance(result, tuple) else result
+            if not getattr(forward_batch, "rids", None):
+                batch_size = int(getattr(forward_batch, "batch_size", 1) or 1)
+                forward_batch.rids = tuple(
+                    f"__nta_graph_padding_{index}"
+                    for index in range(batch_size)
+                )
+                forward_batch._nta_request_priorities = (0,) * batch_size
+            return result
+
+        capture_prepare._nta_preserves_request_metadata = True
+        runner_cls.capture_prepare = capture_prepare
 
 
 def _preserve_graph_request_metadata() -> None:
@@ -314,6 +418,7 @@ def register() -> None:
     from nta_runtime.engines.sglang_admission import route_prefill_admission
 
     _preserve_graph_request_metadata()
+    _preserve_prefill_graph_request_metadata()
 
     if BACKEND_NAME not in ATTENTION_BACKEND_CHOICES:
         add_attention_backend_choices([BACKEND_NAME])
@@ -331,6 +436,11 @@ def register() -> None:
             HookRegistry.register(
                 forward_target, _profile_forward, HookType.AROUND
             )
+    extend_hooks = HookRegistry._hooks[_EXECUTE_EXTEND_TARGET]
+    if not any(hook is _route_execute_extend for _, hook, _ in extend_hooks):
+        HookRegistry.register(
+            _EXECUTE_EXTEND_TARGET, _route_execute_extend, HookType.AROUND
+        )
     for write_target in _WRITE_BACKUP_TARGETS:
         write_hooks = HookRegistry._hooks[write_target]
         if not any(hook is route_write_backup for _, hook, _ in write_hooks):

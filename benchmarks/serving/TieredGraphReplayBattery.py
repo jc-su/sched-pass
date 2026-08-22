@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=pathlib.Path, required=True)
     parser.add_argument("--output-dir", type=pathlib.Path, required=True)
     parser.add_argument("--seed", type=int, default=20260815)
+    parser.add_argument(
+        "--cuda-graph-prefill",
+        choices=("disabled", "breakable"),
+        default="disabled",
+    )
     return parser.parse_args()
 
 
@@ -76,7 +81,10 @@ def main() -> int:
         (1, "replay"),
     ):
         suffix = "" if mode == "verify" else "-replay"
-        artifact = args.output_dir / f"replay-refresh{refresh}{suffix}.json"
+        graph_tag = "" if args.cuda_graph_prefill == "disabled" else "-bcg"
+        artifact = (
+            args.output_dir / f"replay-refresh{refresh}{suffix}{graph_tag}.json"
+        )
         environment = os.environ.copy()
         environment.update(
             {
@@ -124,6 +132,8 @@ def main() -> int:
             "4",
             "--cuda-graph-decode",
             "full",
+            "--cuda-graph-prefill",
+            args.cuda_graph_prefill,
             "--seed",
             str(args.seed),
             "--allow-output-divergence",

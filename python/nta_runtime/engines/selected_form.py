@@ -213,7 +213,11 @@ class SelectedAttentionExecutor:
         Decode without verification takes the plan-once fast path; verify
         mode and extend take the reference path (dual wrappers and byte
         verification under verify, a single wrapper otherwise)."""
-        if torch.cuda.is_current_stream_capturing():
+        capture_runner = getattr(engine, "_extend_capture", None)
+        in_extend_capture = bool(
+            capture_runner is not None and capture_runner.capturing
+        )
+        if torch.cuda.is_current_stream_capturing() and not in_extend_capture:
             raise RuntimeError("tiered serving inside graph capture is unsupported")
         key_cache, value_cache = kv_cache
         local_layer = int(layer.layer_id) - claim.start_layer
@@ -409,7 +413,11 @@ class SelectedAttentionExecutor:
         """
         if not claims:
             return False
-        if torch.cuda.is_current_stream_capturing():
+        capture_runner = getattr(engine, "_extend_capture", None)
+        in_extend_capture = bool(
+            capture_runner is not None and capture_runner.capturing
+        )
+        if torch.cuda.is_current_stream_capturing() and not in_extend_capture:
             raise RuntimeError("tiered serving inside graph capture is unsupported")
         if any(not claim.fast_ok or claim.verify for claim in claims):
             if len(claims) == 1:
@@ -606,7 +614,15 @@ class SelectedAttentionExecutor:
                 host_orchestrated = bool(
                     getattr(engine, "_host_orchestrated", False)
                 )
-                if selected_rows is None and (
+                if selected_rows is None and in_extend_capture:
+                    # Captured extend: staging runs inside the recorded
+                    # region against the workspace; the row cache and
+                    # accounting copy back at unbind, so remember/verify
+                    # are skipped here.
+                    selected_rows = capture_runner.stage_layer_in_graph(
+                        local_layer, queries, stream
+                    )
+                elif selected_rows is None and (
                     prefill
                     and not host_orchestrated
                     and claim.external_sidecar
@@ -627,6 +643,10 @@ class SelectedAttentionExecutor:
                     # the old synchronous host round trip or the invalid
                     # all-layers burst.
                     if local_layer == 0:
+                        if capture_runner is not None:
+                            capture_runner.serve_refs = (
+                                wrapper, layer, kv_cache
+                            )
                         span = getattr(claim, "_extend_span", None)
                         if span is None:
                             span = (torch.cuda.Event(True), torch.cuda.Event(True))

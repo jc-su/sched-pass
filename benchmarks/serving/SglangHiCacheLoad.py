@@ -54,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--churn-tokens", type=int, default=12000)
     parser.add_argument("--max-total-tokens", type=int, default=18000)
     parser.add_argument("--context-length", type=int, default=32768)
+    # 0 keeps the historical setting (chunk == context length, i.e. a
+    # 16K prefill runs as one unchunked forward). Smaller values are
+    # the standard decode-protection configuration and apply to both
+    # arms identically.
+    parser.add_argument("--chunked-prefill-size", type=int, default=0)
     parser.add_argument("--mem-fraction-static", type=float, default=0.35)
     parser.add_argument("--hicache-ratio", type=float, default=8.0)
     parser.add_argument("--max-running-requests", type=int, default=16)
@@ -81,6 +86,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument(
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
+    )
+    parser.add_argument(
+        "--cuda-graph-prefill",
+        choices=("disabled", "breakable"),
+        default="disabled",
+        help=(
+            "prefill-phase CUDA graph backend for BOTH arms; breakable "
+            "captures the dense per-layer compute piecewise and leaves "
+            "attention (and the tiered staging chain) eager between "
+            "pieces, shrinking the extend forward's launch-overhead span"
+        ),
     )
     parser.add_argument(
         "--load-warmup-iterations",
@@ -322,8 +338,12 @@ def main() -> int:
         max_total_tokens=args.max_total_tokens,
         max_running_requests=args.max_running_requests,
         cuda_graph_backend_decode=args.cuda_graph_decode,
-        cuda_graph_backend_prefill="disabled",
-        chunked_prefill_size=args.context_length,
+        cuda_graph_backend_prefill=args.cuda_graph_prefill,
+        chunked_prefill_size=(
+            args.chunked_prefill_size
+            if args.chunked_prefill_size > 0
+            else args.context_length
+        ),
         enable_mixed_chunk=args.batch_mode == "coalesced",
         enable_hierarchical_cache=True,
         hicache_ratio=args.hicache_ratio,
@@ -420,8 +440,14 @@ def main() -> int:
         "max_total_tokens": args.max_total_tokens,
         "batch_mode": args.batch_mode,
         "mixed_chunk_enabled": args.batch_mode == "coalesced",
+        "chunked_prefill_size": (
+            args.chunked_prefill_size
+            if args.chunked_prefill_size > 0
+            else args.context_length
+        ),
         "hicache_ratio": args.hicache_ratio,
         "cuda_graph_decode": args.cuda_graph_decode,
+        "cuda_graph_prefill": args.cuda_graph_prefill,
         "load_warmup_iterations": args.load_warmup_iterations,
         "load_warmup_excluded": args.load_warmup_iterations >= 2,
         "load_seconds": load_seconds,

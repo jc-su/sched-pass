@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--churn-tokens", type=int, default=12000)
     parser.add_argument("--max-total-tokens", type=int, default=18000)
     parser.add_argument("--context-length", type=int, default=32768)
+    parser.add_argument("--chunked-prefill-size", type=int, default=0)
     parser.add_argument("--hicache-ratio", type=float, default=8.0)
     parser.add_argument("--max-running-requests", type=int, default=16)
     parser.add_argument(
@@ -86,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
+    )
+    parser.add_argument(
+        "--cuda-graph-prefill",
+        choices=("disabled", "breakable"),
+        default="disabled",
     )
     parser.add_argument(
         "--require-demand-graph",
@@ -278,6 +284,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         str(args.max_total_tokens),
         "--context-length",
         str(args.context_length),
+        "--chunked-prefill-size",
+        str(args.chunked_prefill_size),
         "--hicache-ratio",
         str(args.hicache_ratio),
         "--max-running-requests",
@@ -288,6 +296,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         str(args.seed),
         "--cuda-graph-decode",
         args.cuda_graph_decode,
+        "--cuda-graph-prefill",
+        args.cuda_graph_prefill,
         "--flashinfer-workspace-base",
         str(workspace / "flashinfer"),
     ]
