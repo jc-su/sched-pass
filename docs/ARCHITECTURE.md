@@ -539,11 +539,30 @@ held apart; one verifier gates all of them:
   loaded-index signature) proves membership in the paged family; a
   declaration-lite binding maps the table argument to engine objects
   (one typed declaration per tensor, never per site); the pass inserts
-  bind/acquire/defer **at kernel entry**, where no shared memory,
-  barriers, or TMA state are live — so boundary-placement legality,
-  the hard half of auto-insertion, holds by construction. The existing
-  verifier then proves every legality condition or the kernel is
-  skipped loudly. Discovery proposes; the verifier alone authorizes.
+  bind/acquire/defer at kernel entry. Entry insertion does NOT make
+  boundary legality free — it makes it provable, and the proofs are
+  additional verifier conditions, each with a reject fixture:
+  1. **Prologue purity on every path**: no memory effect, async copy
+     (cp.async/TMA issue), or barrier precedes the inserted boundary —
+     optimized production kernels legitimately software-pipeline their
+     first tile loads into the entry block, and deferring after an
+     issued async copy leaves pending-copy state live across re-entry.
+     Insertion lands before the first effect only where that point
+     dominates all uses and is reached CTA-uniformly; otherwise refuse.
+  2. **Boundary pinning**: the inserted markers carry convergent and
+     opaque-effect semantics so no later pass can hoist an effect above
+     them (source-frontend placement never faced this; IR-level
+     insertion must enforce it).
+  3. **Launch-mode independence**: exit-at-entry deadlocks cluster
+     launches (missed cluster-barrier arrival), cooperative launches
+     (later grid.sync), and changes PDL overlap (skipped griddepsync).
+     The verifier rejects kernels containing grid/cluster cooperative
+     or griddepcontrol intrinsics, and the engine must attest
+     non-cooperative, non-cluster launch for auto-instrumented kernels
+     — a host-side property IR alone cannot prove.
+  The existing verifier plus these conditions authorizes, or the kernel
+  is skipped loudly. Discovery proposes; the verifier alone authorizes
+  — the delta over naive auto-instrumentation IS this proof set.
 - **Tier 3 — auto-woven additive policies (planned):** effects in the
   graph-replay-safe invariant class (pure hints, idempotent writes,
   commutative-monoid accumulation) may be woven at discovered sites
