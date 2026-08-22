@@ -51,8 +51,7 @@ DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernel(const 
             params, nta_runtime, nta_request_index)) return;
     if constexpr (nta::flashinfer::HasClaimBindingV<Params>) {
       if (!nta::flashinfer::bindValidatedClaimConsumer(
-              params, nta_runtime,
-              static_cast<uint32_t>(params.nta_claim_row_bound))) return;
+              params, nta_runtime, nta_request_index)) return;
     }
   }
 #else
@@ -143,8 +142,7 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
             params, nta_runtime, nta_request_index)) return;
     if constexpr (nta::flashinfer::HasClaimBindingV<Params>) {
       if (!nta::flashinfer::bindValidatedClaimConsumer(
-              params, nta_runtime,
-              static_cast<uint32_t>(params.nta_claim_row_bound))) return;
+              params, nta_runtime, nta_request_index)) return;
     }
   }
 #else
@@ -249,8 +247,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
             params, nta_runtime, nta_request_index)) return;
     if constexpr (nta::flashinfer::HasClaimBindingV<Params>) {
       if (!nta::flashinfer::bindValidatedClaimConsumer(
-              params, nta_runtime,
-              static_cast<uint32_t>(params.nta_claim_row_bound))) return;
+              params, nta_runtime, nta_request_index)) return;
     }
   }
 #else
@@ -365,8 +362,7 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
             params, nta_runtime, nta_request_index)) return;
     if constexpr (nta::flashinfer::HasClaimBindingV<Params>) {
       if (!nta::flashinfer::bindValidatedClaimConsumer(
-              params, nta_runtime,
-              static_cast<uint32_t>(params.nta_claim_row_bound))) return;
+              params, nta_runtime, nta_request_index)) return;
     }
   }
 #else

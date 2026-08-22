@@ -248,59 +248,62 @@ bindValidatedRequestOnly(const Params &params, abi::RuntimeView *runtime,
 }
 
 // Field-presence trait for claim-consumer params: kernels whose Params
-// carry the lease identity triple participate in the in-kernel claim
-// contract; kernels without it keep the request-only guard.
+// carry the per-request claim-bindings table participate in the
+// in-kernel claim contract; kernels without it keep the request-only
+// guard. One launch serves residents and several claims together, so
+// the bindings are indexed by request position, four int64 words each:
+// {claim slot (-1 = no claim), generation, planned row bound, stamp}.
 template <typename Params, typename = void>
 struct HasClaimBinding : std::false_type {};
 template <typename Params>
 struct HasClaimBinding<
-    Params, std::void_t<decltype(Params::nta_claim_slot),
-                        decltype(Params::nta_claim_generation),
-                        decltype(Params::nta_claim_row_bound),
-                        decltype(Params::nta_table_stamp)>> : std::true_type {};
+    Params,
+    std::void_t<decltype(Params::nta_claim_bindings)>> : std::true_type {};
 template <typename Params>
 inline constexpr bool HasClaimBindingV = HasClaimBinding<Params>::value;
 
-// In-kernel claim-consumer contract (ABI v28). CTA-uniform, evaluated
-// before the mainloop touches lease storage: the consumer proves it is
-// reading its own live claim — slot in range, generation matched, row
-// valid (retirement republishes valid=0 under the same generation, and
-// cancellation flows through retirement), and the selected table stamped
-// by the prep launch this consumer was planned against. Any mismatch
-// refuses the launch; fail-closed, never a fallback read. Extent
-// checking is enforced by the prep kernel writing only inside
-// [leaseBase, leaseBase+leaseExtent) and stagedRows bounding row
-// indices; the consumer re-checks stagedRows against its plan bound.
+// In-kernel claim-consumer contract (ABI v28). CTA-uniform per request,
+// evaluated before the mainloop touches lease storage: the consumer
+// proves it is reading its own live claim — slot in range, generation
+// matched, row valid (retirement republishes valid=0 under the same
+// generation, and cancellation flows through retirement), planned row
+// bound inside the staged extent, and the selected table stamped by the
+// prep this consumer was planned against. Requests without a claim
+// (slot -1) pass untouched; any mismatch refuses the launch —
+// fail-closed, never a fallback read.
 template <typename Params>
 [[nodiscard]] __device__ __forceinline__ bool
 bindValidatedClaimConsumer(const Params &params, abi::RuntimeView *runtime,
-                           std::uint32_t plannedRowBound) {
+                           std::uint32_t requestIndex) {
   if constexpr (!HasClaimBindingV<Params>) {
     (void)params;
     (void)runtime;
-    (void)plannedRowBound;
+    (void)requestIndex;
     return false;
   } else {
+    const long long *binding = params.nta_claim_bindings +
+                               static_cast<std::size_t>(requestIndex) * 4;
+    const long long slotWord = binding[0];
+    if (slotWord < 0) {
+      return true;
+    }
     if (runtime == nullptr || runtime->abiVersion != abi::Version ||
         runtime->claims == nullptr) {
       return false;
     }
-    const std::uint32_t slot =
-        static_cast<std::uint32_t>(params.nta_claim_slot);
+    const std::uint32_t slot = static_cast<std::uint32_t>(slotWord);
     if (slot >= runtime->claimCapacity) {
       return false;
     }
     const abi::ClaimContext &claim = runtime->claims[slot];
-    if (claim.generation !=
-            static_cast<std::uint32_t>(params.nta_claim_generation) ||
+    if (claim.generation != static_cast<std::uint32_t>(binding[1]) ||
         claim.valid == 0u) {
       return false;
     }
-    if (plannedRowBound > claim.stagedRows) {
+    if (static_cast<std::uint64_t>(binding[2]) > claim.stagedRows) {
       return false;
     }
-    if (claim.tableStamp !=
-        static_cast<std::uint64_t>(params.nta_table_stamp)) {
+    if (claim.tableStamp != static_cast<std::uint64_t>(binding[3])) {
       return false;
     }
     return true;

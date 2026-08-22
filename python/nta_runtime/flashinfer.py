@@ -19,27 +19,15 @@ REQUEST_BOUND_TENSOR_NAMES = ["nta_runtime"]
 REQUEST_BOUND_TENSOR_DTYPES = ["uint8_t"]
 REQUEST_BOUND_SCALAR_NAMES = ["sm_scale", "nta_request_slot_offset"]
 REQUEST_BOUND_SCALAR_DTYPES = ["double", "int64_t"]
-# Claim-bound consumers extend the request-bound form with the lease
-# identity quad; kernels declaring these fields get the in-kernel
-# claim-consumer contract (bindValidatedClaimConsumer) compiled in.
-CLAIM_BOUND_TENSOR_NAMES = REQUEST_BOUND_TENSOR_NAMES
-CLAIM_BOUND_TENSOR_DTYPES = REQUEST_BOUND_TENSOR_DTYPES
-CLAIM_BOUND_SCALAR_NAMES = [
-    "sm_scale",
-    "nta_request_slot_offset",
-    "nta_claim_slot",
-    "nta_claim_generation",
-    "nta_claim_row_bound",
-    "nta_table_stamp",
-]
-CLAIM_BOUND_SCALAR_DTYPES = [
-    "double",
-    "int64_t",
-    "int64_t",
-    "int64_t",
-    "int64_t",
-    "int64_t",
-]
+# Claim-bound consumers extend the request-bound form with a per-request
+# claim-bindings table (four int64 words per request: slot or -1,
+# generation, planned row bound, table stamp), because one launch serves
+# residents and several claims together; kernels declaring the table get
+# the in-kernel claim-consumer contract compiled in.
+CLAIM_BOUND_TENSOR_NAMES = ["nta_runtime", "nta_claim_bindings"]
+CLAIM_BOUND_TENSOR_DTYPES = ["uint8_t", "int64_t"]
+CLAIM_BOUND_SCALAR_NAMES = REQUEST_BOUND_SCALAR_NAMES
+CLAIM_BOUND_SCALAR_DTYPES = REQUEST_BOUND_SCALAR_DTYPES
 
 SKIP_MERGE = 1 << 0
 PREACQUIRED = 1 << 1
