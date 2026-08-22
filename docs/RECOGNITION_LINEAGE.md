@@ -154,3 +154,29 @@ policy tier, aimed at the current 1.095-vs-1.05 bar).**
 3. cp.async source warming (the prototype's AsyncSite): warm the global
    source of the next staging wave during compute — relevant to the
    staging wavefront if transfer, not launch, ever dominates a shape.
+
+
+## Census on production IR (2026-08-22, code-run, not claimed from docs)
+
+The stock (non-NTA) FlashInfer 0.6.12 paged-decode kernel from a banked
+JIT cache, compiled to device IR through the same clang path serving
+uses, then run under `NTA_DISCOVERY_NOTES=1`:
+
+- Plain-load pass alone: every `BatchDecodeWithPagedKVCacheDevice`
+  instantiation reports "index-based gather present but no strided site
+  matched — skipped loudly." The identity signature fires on all of
+  them; zero sites qualify, because **FlashInfer's real KV stream is
+  cp.async**, invisible to load-stride analysis — exactly the gap the
+  prototype's AsyncSite existed for.
+- With the AsyncSite port (first "l"-constrained inline-asm operand,
+  source cone classified by the same loaded-index walk): **79 cp.async
+  candidates, every one with a loaded-index source cone**, and no
+  unmatched-gather skips remain. The structural signature recovers the
+  identity-carrying access for the actual production KV path.
+
+What this buys: measured coverage evidence for the recognition claim
+(the paged family's identity is structurally recoverable in production
+kernels, not just fixtures); the concrete path to deriving bind
+operands for that family; and a demonstration that the loud-skip
+discipline surfaces its own blind spots — the census itself found the
+cp.async gap within the hour.

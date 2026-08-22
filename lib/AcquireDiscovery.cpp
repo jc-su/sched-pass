@@ -21,6 +21,8 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
@@ -130,6 +132,60 @@ void discoverPagedCandidates(Function &function, LoopInfo &loops,
             << " B) — unmarked, skipped loudly; a typed frontend or marker "
                "is required before delegation\n";
       }
+    }
+  }
+  // FlashInfer's real KV stream is cp.async, invisible to load-stride
+  // analysis (census 2026-08-22: every production paged-decode kernel
+  // carries the loaded-index signature yet zero plain-load sites
+  // qualify). Recognize the inline-asm copies and classify their global
+  // source cones the same way (prototype AsyncSite lineage): the first
+  // "l"-constrained input operand is the gmem source.
+  for (Instruction &instruction : instructions(function)) {
+    auto *call = dyn_cast<CallInst>(&instruction);
+    if (call == nullptr) {
+      continue;
+    }
+    auto *assembly = dyn_cast<InlineAsm>(call->getCalledOperand());
+    if (assembly == nullptr) {
+      continue;
+    }
+    StringRef text = assembly->getAsmString();
+    if (!text.contains("cp.async") || !text.contains("global")) {
+      continue;
+    }
+    SmallVector<StringRef, 8> constraints;
+    StringRef(assembly->getConstraintString())
+        .split(constraints, ',', -1, /*KeepEmpty=*/false);
+    int argumentIndex = 0;
+    int globalSource = -1;
+    for (StringRef constraint : constraints) {
+      if (constraint.starts_with("=") || constraint.starts_with("~")) {
+        continue;
+      }
+      if (constraint == "l" && globalSource < 0) {
+        globalSource = argumentIndex;
+      }
+      ++argumentIndex;
+    }
+    if (globalSource < 0 ||
+        static_cast<unsigned>(globalSource) >= call->arg_size()) {
+      continue;
+    }
+    Value *source = call->getArgOperand(globalSource);
+    if (!source->getType()->isIntegerTy(64) &&
+        !source->getType()->isPointerTy()) {
+      continue;
+    }
+    const bool paged = hasLoadedIndex(source);
+    sawLoadedIndex |= paged;
+    ++candidates;
+    WithColor::remark(errs(), "nta")
+        << function.getName() << ": structural cp.async candidate ("
+        << (paged ? "loaded-index" : "direct") << " source cone) — "
+           "unmarked, skipped loudly; a typed frontend or marker is "
+           "required before delegation\n";
+    if (candidates >= 8) {
+      break;
     }
   }
   if (sawLoadedIndex && candidates == 0) {
