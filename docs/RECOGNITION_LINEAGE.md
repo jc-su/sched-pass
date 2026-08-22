@@ -92,3 +92,65 @@ porting the detection INTO this branch's pass behind its verifier and
 re-validating with this branch's fixtures — not citing the prototype's
 results. The prototype is the existence proof and the design source;
 the ledger item is the port.
+
+## Integration lineage (code-verified 2026-08-22, prototype python/ vs ours)
+
+Read from code, not docs: `nvcc_clang_shim.py`, `sitecustomize.py`,
+`patch_flashinfer.py`, `sched_sglang_plugin.py` against our
+`tools/jit/nvcc_clang.py`, `tools/jit/activate.py`,
+`tools/flashinfer/prepare_overlay.py`.
+
+**Already inherited (and in one place improved).** Our shim carries the
+prototype's full translation discipline: the bisected
+`__CUDACC_VER_MAJOR__` define (without it clang silently compiles
+FlashInfer/CUTLASS's SCALAR fallback instead of the cp.async/ldmatrix
+inline-asm fast path — races, and a silent both-arms performance lie),
+toolkit `-isystem` ordering, the dialect prelude, arch mapping,
+`-Xptxas`/deps/`-ccbin`/fatbin translation, selective instrumentation
+with `NTA_REAL_NVCC` routing, and shim logging. Header patching lives in
+`prepare_overlay.py` (`patch_header`/`patch_prefill_header`) with
+source-hash checks. One improvement over the prototype: the shim REFUSES
+an instrumented compile whose workspace lacks the NTA cache tag —
+fail-closed where the prototype could only pre-arm the env at import and
+verify later. The prototype's hazard note stands as the reason the guard
+exists: FlashInfer freezes its workspace path at module import, so a
+late-armed process silently reuses stock-cached kernels.
+
+**Landmine worth keeping visible (root-caused in the prototype,
+2026-07-07):** importing torch at interpreter start — even doing nothing
+else — corrupted Qwen generation content under SGLang; the fix was a
+lazy meta-path finder that registers only after
+`sglang.srt.managers.scheduler` finishes importing (torch initialized in
+sglang's own order) yet before FlashInfer import. Our `activate.py`
+avoids the trap by exec-ing the serving process with env pre-set and
+importing nothing early; any future bootstrap change (a sitecustomize, a
+pre-import hook) must preserve that ordering.
+
+**Gap to adopt — observability hooks must not crash serving.** The
+prototype's `_hook_error` discipline: an observation hook never takes
+down the serving process; the first error per site prints loudly
+("control plane degraded; serving continues"), later ones count, and the
+count rides the periodic stats line. Our mechanism guards rightly raise
+(CapKV stance), but our observability class — the per-forward profiler,
+co-tenant sampler, composition counters — currently raises through the
+serving path (eKV-stance code with CapKV-stance failure behavior). The
+profiler's event synchronize is also illegal inside any future
+graph-captured path. QUEUED CHANGE (branch `forward-profile`, after the
+running campaign releases that worktree): wrap the observability class
+fail-open with first-error-loud counters exported through stats, keyed
+by the stance taxonomy above.
+
+**Performance candidates for the resident tail (from the prototype's
+policy tier, aimed at the current 1.095-vs-1.05 bar).**
+1. `prefetch.L2::evict_first` on claim-staging streams — the prototype's
+   "polite" tier: streamed lines die young and stop polluting L2 for
+   co-residents. Our staging_mixed forwards sit exactly at the resident
+   p99 boundary; cache-polite staging is a cheap, graph-safe (pure-hint)
+   candidate for part of the ~5 ms delta, mechanism-owned rather than
+   config.
+2. The branchless select-address prefetch trick (disabled -> prefetch of
+   the current line, an L2 hit, ~free) as the wiring pattern for any
+   woven hint: no divergence, no extra branches, replay-safe.
+3. cp.async source warming (the prototype's AsyncSite): warm the global
+   source of the next staging wave during compute — relevant to the
+   staging wavefront if transfer, not launch, ever dominates a shape.
