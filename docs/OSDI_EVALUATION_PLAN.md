@@ -230,3 +230,24 @@ family (MoE beyond fixture); Qwen3-30B-A3B MoE serving point.
    dense parity (0.982x), so the win is the delegation, not the policy.
 6. **Cost**: co-resident tail behaviour, characterized honestly at
    matched load.
+
+
+---
+
+## Branch state (consolidated 2026-08-22)
+
+`nonresident-acquisition` now carries every validated, default-safe
+learning from this window: the campaign-proven measurement
+infrastructure (co-tenant sampling, per-forward attribution) with
+fail-open observability hardening; the harness chunk knob and the
+extend-capture archive beneath it (all env/flag-gated off, negatives
+recorded); the B2 deferred-host design and scaffold (mode-gated off);
+structural discovery with the cp.async census; systematic verifier
+mutation testing; the cache-streaming staging toggle; and the LongBench
+battery. Full CPU suite green (15/15) post-merge.
+
+Deliberately unmerged:
+- `consumer-contract` — the armed in-kernel claim contract; merges only
+  after GPU fixtures + replay/quality batteries pass and the mechanism
+  change is registered.
+- `isolation-admission` — archival WIP, self-recorded as not-validated.
