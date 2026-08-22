@@ -209,7 +209,7 @@ if echo "${discovery_notes}" | rg -q 'argument_gather'; then
   echo "discovery misclassified an argument-indexed gather as paged" >&2
   exit 1
 fi
-if [ -n "$(NTA_DISCOVERY_NOTES= "${opt}" -load-pass-plugin="${plugin}" \
+if [ -n "$(env -u NTA_DISCOVERY_NOTES "${opt}" -load-pass-plugin="${plugin}" \
       -passes=nta-acquire -S "${source_dir}/discovery-paged.ll" \
       -o /dev/null 2>&1)" ]; then
   echo "discovery emitted notes without NTA_DISCOVERY_NOTES" >&2
