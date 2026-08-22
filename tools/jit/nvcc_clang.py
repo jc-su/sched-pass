@@ -273,8 +273,18 @@ def main() -> int:
     if instrument and cache_tag and cache_tag not in workspace:
         raise RuntimeError(
             "instrumented FlashInfer JIT requires an NTA-tagged workspace")
+    if instrument and os.environ.get("NTA_STAGING_STREAMING") == "1":
+        # Compile-time cache policy forks the kernel bytes; refuse to bake
+        # it into a workspace that does not carry the marker, or a toggled
+        # env would silently reuse the other policy's cached kernels.
+        if "stream" not in workspace:
+            raise RuntimeError(
+                "NTA_STAGING_STREAMING requires a workspace tagged with "
+                "'stream' (fresh cache), not a policy-unmarked cache")
 
     command = translate(arguments, instrument)
+    if instrument and os.environ.get("NTA_STAGING_STREAMING") == "1":
+        command.append("-DNTA_STAGING_STREAMING=1")
     if LOG:
         with open(LOG, "a", encoding="utf-8") as output:
             output.write(" ".join(command) + "\n")

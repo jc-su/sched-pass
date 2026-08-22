@@ -2135,19 +2135,41 @@ namespace nta::device {
 
 __device__ __forceinline__ uint4 loadNoAllocate(const uint4 *address) {
   uint4 value;
+#ifdef NTA_STAGING_STREAMING
+  // Read-once pinned-host source: evict-first so one-shot transfer lines
+  // do not displace co-residents' L2 working set (see storeNoAllocate).
+  asm volatile("ld.global.cs.v4.b32 {%0,%1,%2,%3},[%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(address));
+#else
   asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];"
                : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
                : "l"(address));
+#endif
   return value;
 }
 
 __device__ __forceinline__ void storeNoAllocate(uint4 *address,
                                                 const uint4 &value) {
+#ifdef NTA_STAGING_STREAMING
+  // Cache-streaming staging (prototype "polite" tier, L2 edition): staged
+  // KV is written once and read once per selection epoch, so allocate it
+  // evict-first at BOTH levels instead of letting fresh staging lines
+  // evict co-residents' decode working set from L2. Compile-time policy;
+  // the JIT shim refuses this define without a streaming-tagged cache
+  // workspace so a toggled env can never silently reuse stale kernels.
+  asm volatile("st.global.cs.v4.b32 [%0],{%1,%2,%3,%4};"
+               :
+               : "l"(address), "r"(value.x), "r"(value.y), "r"(value.z),
+                 "r"(value.w)
+               : "memory");
+#else
   asm volatile("st.global.L1::no_allocate.v4.b32 [%0],{%1,%2,%3,%4};"
                :
                : "l"(address), "r"(value.x), "r"(value.y), "r"(value.z),
                  "r"(value.w)
                : "memory");
+#endif
 }
 
 __device__ __forceinline__ void copyIndexedHostObject(
