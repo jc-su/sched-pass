@@ -247,7 +247,13 @@ class _CotenantSampler:
 
 
 def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
-    workspace = ROOT / "results" / "serving" / "sglang-hicache-load-cache" / backend
+    # Kernel-byte-forking toggles (e.g. NTA_STAGING_STREAMING) require a
+    # policy-tagged cache so the shim's fail-closed guard can prove a
+    # toggled env never reuses the other policy's compiled kernels.
+    cache_name = os.environ.get(
+        "NTA_COMPARE_CACHE_NAME", "sglang-hicache-load-cache"
+    )
+    workspace = ROOT / "results" / "serving" / cache_name / backend
     command = [
         str(ROOT / "tools" / "jit" / "activate.py"),
         "--build-dir",
