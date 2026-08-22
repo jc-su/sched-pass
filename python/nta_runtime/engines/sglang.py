@@ -803,9 +803,17 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # every staging decision routes through a host round-trip instead of
         # the device claim chain. The flag lands in the stats so artifacts
         # record which arm produced them.
-        self._host_orchestrated = (
-            os.environ.get("NTA_SGLANG_HOST_ORCHESTRATED") == "1"
-        )
+        host_mode = os.environ.get("NTA_SGLANG_HOST_ORCHESTRATED", "")
+        if host_mode not in ("", "0", "1", "deferred"):
+            raise RuntimeError(
+                "NTA_SGLANG_HOST_ORCHESTRATED must be unset, 0, 1, or "
+                f"'deferred'; got {host_mode!r}"
+            )
+        # B1 ("1"): per-layer synchronous host control edge.
+        # B2 ("deferred"): one-refresh-stale serving with a background
+        # builder (docs/B2_DEFERRED_HOST.md).
+        self._host_orchestrated = host_mode in ("1", "deferred")
+        self._host_orchestrated_mode = host_mode if self._host_orchestrated else ""
         if self._host_orchestrated:
             if not self._tiered_enabled:
                 raise RuntimeError(
