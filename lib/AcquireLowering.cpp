@@ -6,7 +6,11 @@
 #include "nta/Passes.h"
 #include "nta/RuntimeABI.h"
 
+#include <cstdlib>
+
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/BasicBlock.h"
@@ -265,13 +269,37 @@ void removeUnusedMarker(Module &module, StringRef name) {
 PreservedAnalyses
 AcquireLoweringPass::run(Module &module,
                          ModuleAnalysisManager &analysisManager) {
-  (void)analysisManager;
   std::vector<FunctionPlan> plans;
   plans.reserve(module.size());
 
   for (Function &function : module) {
     if (!function.isDeclaration()) {
       plans.push_back(analyzeAcquisitions(function));
+    }
+  }
+
+  // Structural candidate discovery (diagnostic only): for functions with
+  // no NTA markers at all, report paged-signature sites so the typed-
+  // frontend gap is measurable. Proposes, never authorizes.
+  if (std::getenv("NTA_DISCOVERY_NOTES") != nullptr) {
+    auto &discoveryAnalyses =
+        analysisManager.getResult<FunctionAnalysisManagerModuleProxy>(module)
+            .getManager();
+    std::size_t planIndex = 0;
+    for (Function &function : module) {
+      if (function.isDeclaration()) {
+        continue;
+      }
+      const FunctionPlan &plan = plans[planIndex++];
+      const bool marked = !plan.bindings.empty() || !plan.acquisitions.empty() ||
+                          !plan.partialBegins.empty() ||
+                          !plan.partialCommits.empty();
+      if (marked) {
+        continue;
+      }
+      discoverPagedCandidates(
+          function, discoveryAnalyses.getResult<LoopAnalysis>(function),
+          discoveryAnalyses.getResult<ScalarEvolutionAnalysis>(function));
     }
   }
 

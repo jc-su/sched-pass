@@ -7,6 +7,8 @@ namespace llvm {
 class CallInst;
 class Function;
 class Instruction;
+class LoopInfo;
+class ScalarEvolution;
 } // namespace llvm
 
 namespace nta {
@@ -31,5 +33,10 @@ struct FunctionPlan {
 };
 
 FunctionPlan analyzeAcquisitions(llvm::Function &function);
+
+// Diagnostic-only structural recognition of paged-KV candidate sites in
+// unmarked kernels (NTA_DISCOVERY_NOTES=1); proposes, never authorizes.
+void discoverPagedCandidates(llvm::Function &function, llvm::LoopInfo &loops,
+                             llvm::ScalarEvolution &scalarEvolution);
 
 } // namespace nta

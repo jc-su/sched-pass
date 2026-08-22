@@ -196,3 +196,22 @@ for entry in "${fixtures[@]}"; do
 done
 
 echo "NTA IR tests passed"
+
+# Structural discovery (diagnostic only): the paged-signature kernel is
+# reported as a candidate, the argument-indexed sibling is not, and the
+# module still lowers to nothing (no markers, no authorization).
+discovery_notes=$(NTA_DISCOVERY_NOTES=1 "${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
+  -S "${source_dir}/discovery-paged.ll" -o /dev/null 2>&1)
+echo "${discovery_notes}" | rg -q 'paged_gather: structural paged candidate'
+if echo "${discovery_notes}" | rg -q 'argument_gather'; then
+  echo "discovery misclassified an argument-indexed gather as paged" >&2
+  exit 1
+fi
+if [ -n "$(NTA_DISCOVERY_NOTES= "${opt}" -load-pass-plugin="${plugin}" \
+      -passes=nta-acquire -S "${source_dir}/discovery-paged.ll" \
+      -o /dev/null 2>&1)" ]; then
+  echo "discovery emitted notes without NTA_DISCOVERY_NOTES" >&2
+  exit 1
+fi

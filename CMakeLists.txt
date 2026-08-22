@@ -21,6 +21,7 @@ message(STATUS "Building NTA against LLVM ${LLVM_PACKAGE_VERSION} in ${LLVM_DIR}
 
 add_library(NtaPass MODULE
   lib/AcquireAnalysis.cpp
+  lib/AcquireDiscovery.cpp
   lib/AcquireLowering.cpp
   lib/DeferralLowering.cpp
   lib/PartialLowering.cpp
