@@ -57,6 +57,32 @@ _ALLOCATOR_FREE_TARGETS = (
 )
 
 
+_OBSERVABILITY_DEGRADED: dict[str, int] = {}
+
+
+def _observability_degraded(site: str, error: Exception) -> None:
+    """First failure per observation site is loud; the rest are counted.
+
+    Mechanism guards raise (CapKV stance); observation never does (eKV
+    stance) — but silent degradation is worse than loud, so the count is
+    exported through the engine stats as observability_degraded_<site>.
+    """
+    from nta_runtime.engines.sglang import FORWARD_PROFILE
+
+    key = f"observability_degraded_{site}"
+    count = _OBSERVABILITY_DEGRADED.get(site, 0)
+    _OBSERVABILITY_DEGRADED[site] = count + 1
+    FORWARD_PROFILE[key] = float(_OBSERVABILITY_DEGRADED[site])
+    if count == 0:
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "observation hook %s degraded (serving continues): %r",
+            site,
+            error,
+        )
+
+
 def _profile_forward(original, runner, forward_batch, *args, **kwargs):
     """Time one forward and attribute it to a batch-composition class.
 
@@ -72,7 +98,7 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
 
     import torch
 
-    from nta_runtime.engines.sglang import record_forward
+    from nta_runtime.engines.sglang import FORWARD_PROFILE, record_forward
 
     backend = getattr(runner.model_runner, "attn_backend", None)
     claims = getattr(backend, "_tiered_claims", None) or {}
@@ -94,15 +120,26 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
     else:
         kind = "plain"
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    # Observability stance (eKV lineage, docs/RECOGNITION_LINEAGE.md): an
+    # observation hook must never take down serving, and event synchronize
+    # is illegal inside a captured graph. Degrade loudly once, count the
+    # rest, keep serving; the counter rides the stats report.
+    try:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+    except Exception as error:
+        _observability_degraded("forward_profile", error)
+        return original(runner, forward_batch, *args, **kwargs)
     try:
         return original(runner, forward_batch, *args, **kwargs)
     finally:
-        end.record()
-        end.synchronize()
-        record_forward(kind, start.elapsed_time(end))
+        try:
+            end.record()
+            end.synchronize()
+            record_forward(kind, start.elapsed_time(end))
+        except Exception as error:
+            _observability_degraded("forward_profile", error)
 
 
 def _preserve_graph_request_metadata() -> None:
