@@ -117,6 +117,42 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Powered capacity campaign result (2026-08-22, Amendment 6 form,
+  registered seeds verbatim, revision f0cecf1, ten of ten trials all
+  co-tenant-clean with zero contamination reruns, artifacts
+  `results/serving/c4-powered/`):** registered goodput **1.9369
+  [1.911, 1.959]** — passes with the tightest interval of any campaign
+  (the level differs from C4-second's 2.11 because Amendment 6's
+  512-token residents change the workload; the comparison is same-shape
+  and fair). Resident P99 ITL **1.0951 [1.036, 1.159]**, median 1.1215:
+  **fails the 1.05 bar by 0.045 — recorded as the registered negative
+  Amendment 6 anticipated for a failing outcome; the amendment's stated
+  expectation of a pass is refuted.** What the powered protocol bought:
+  the per-trial spread collapses from 0.51-6.65 to 0.929-1.289
+  (absolutes 41-57ms vs stock 43-51ms), so the earlier bimodality is
+  confirmed to have been sampling noise and environment, and the
+  resident cost is now a precisely characterized ~10% tail penalty with
+  a CI excluding both zero and anything catastrophic. Attribution
+  carried in every trial: `staging_mixed` forwards (claims plus
+  resident decodes in one forward; avg ~42ms, max 53-59ms) sit exactly
+  at the p99 boundary while stock's steps run 43-51ms — the ~5ms delta
+  is residents riding inside claim-staging forwards, mechanism-caused
+  and mechanism-addressable (bounding staging work per forward through
+  the lease, the registered next increment). Mechanism, outputs,
+  physical-bytes, and goodput bars all green; the held-out watcher
+  correctly declined to launch (Amendment 5 requires an all-bars pass).
+- **Amendment 7 (2026-08-22, recorded before any run that uses it):**
+  Amendment 6's powered resident measurement (512 resident output
+  tokens, per-arm co-tenant sampling with the same value-blind
+  contamination rule, per-forward attribution as observability) is
+  extended verbatim to the **queue shape** (Amendment 4: 24 externals x
+  16,384 x 768 outputs, 1 resident x 4,096, Poisson 1.5/s, pool
+  110,000). Strengthening only: all bars, aggregation, and the
+  registered seeds 20260901-10 unchanged. Motivation: the queue shape's
+  best resident measurement (1.0739, P4-third) rested on a ~10-sample
+  p99 whose noise the capacity shape has now shown dominates at that
+  sample size; the powered form measures what is actually there. No
+  expectation is registered for this campaign in either direction.
 - **Amendment 6 (2026-08-21, recorded before any run that uses it):**
   the capacity-shape resident P99 ITL measurement is re-registered in a
   statistically powered form, strengthening only. Three instrumented
