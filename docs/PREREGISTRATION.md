@@ -117,6 +117,27 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Negative mechanism probe: cache-streaming staging does not move the
+  capacity resident tail (2026-08-22, diagnostic campaign, ten trials,
+  registered seeds shared with the powered capacity campaign for a
+  seed-paired comparison, zero contamination, stream-tagged JIT cache,
+  artifacts `results/serving/c4-streaming/`):** with the staging copy's
+  loads and stores compiled `.cs` (evict-first at both cache levels),
+  resident P99 ITL is **1.0986 vs the baseline's 1.0951** — a
+  seed-paired geomean of **1.0032**, i.e. no effect — with goodput
+  unchanged (1.9502 vs 1.9369) and per-seed deltas scattered both
+  directions (0.81-1.19). The L2-displacement hypothesis for the
+  capacity shape's ~5 ms staging_mixed delta is **rejected for the
+  transfer path**: freshly staged lines evicting co-residents' L2
+  working set is not the mechanism, or not a measurable part of it.
+  Scope note recorded honestly: this probe changed only the staging
+  copy kernel; the transformed attention consumer's reads of staged
+  rows keep default cache policy, so consumer-side politeness (a Tier-3
+  weave item) is untested, not refuted. Remaining capacity-bar
+  candidates, in order: the lease staging-rate budget (bounding staging
+  work admitted per forward — the mechanism the chunk-ladder pointed
+  at), and consumer-read cache policy. The streaming toggle stays in
+  the tree, default off, as the recorded negative.
 - **HELD-OUT CONFIRMATION RESULT — THE REGISTERED CLAIM IS MADE
   (2026-08-22, Amendment 5 protocol, held-out seeds 20260911-20 used
   here for the first and only time, identical revision f0cecf1, shape,
