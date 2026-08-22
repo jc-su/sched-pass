@@ -117,6 +117,27 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **Powered queue campaign result (2026-08-22, Amendment 7 form,
+  registered seeds verbatim, revision f0cecf1, ten of ten trials
+  co-tenant-clean, artifacts `results/serving/p4-powered/`): ALL FIVE
+  REGISTERED BARS PASS — the first all-bars campaign of the project.**
+  Registered goodput **1.5338 [1.331, 1.760]**: geomean clears the 1.5
+  bar (narrowly — stated plainly) and the CI floor excludes 1.0 as
+  registered. Resident P99 ITL **0.7819 [0.716, 0.864]**: residents are
+  measurably FASTER under the mechanism than under stock, with the
+  entire interval below parity — the queue shape's old 1.0739 near-miss
+  is confirmed to have been the ~10-sample p99 noise Amendment 6
+  diagnosed, and the powered measurement (about 512 samples per trial
+  behind the p99) resolves it decisively in the mechanism's favor.
+  Mechanism, physical-bytes, and outputs bars green (trial 9 diverged
+  with divergence reporting armed, as the registered outputs bar
+  specifies; the other nine exact). Per Amendment 5 the all-bars claim
+  is **not yet made**: the held-out confirmation campaign (seeds
+  20260911-20, identical revision, shape, bars) launched automatically
+  on this verdict and the claim stands or falls with it. Cross-shape
+  status: queue shape all-bars pending confirmation; capacity shape
+  goodput passes decisively (1.9369) with the resident bar failed by
+  0.045 and precisely characterized.
 - **Powered capacity campaign result (2026-08-22, Amendment 6 form,
   registered seeds verbatim, revision f0cecf1, ten of ten trials all
   co-tenant-clean with zero contamination reruns, artifacts
