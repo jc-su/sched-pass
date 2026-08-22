@@ -11,14 +11,11 @@ _RELEASE_TARGET = "sglang.srt.managers.scheduler.Scheduler.release_host_resource
 _HICACHE_LOAD_TARGET = (
     "sglang.srt.managers.cache_controller.HiCacheController.start_loading"
 )
-_FORWARD_EXTEND_TARGET = (
-    "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_extend"
-)
-_FORWARD_DECODE_TARGET = (
-    "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_decode"
-)
 _EXECUTE_EXTEND_TARGET = (
     "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_extend"
+)
+_EXECUTE_DECODE_TARGET = (
+    "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_decode"
 )
 _WRITE_BACKUP_TARGETS = (
     "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.write_backup",
@@ -430,7 +427,7 @@ def register() -> None:
         HookRegistry.register(
             _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
         )
-    for forward_target in (_FORWARD_EXTEND_TARGET, _FORWARD_DECODE_TARGET):
+    for forward_target in (_EXECUTE_EXTEND_TARGET, _EXECUTE_DECODE_TARGET):
         forward_hooks = HookRegistry._hooks[forward_target]
         if not any(hook is _profile_forward for _, hook, _ in forward_hooks):
             HookRegistry.register(

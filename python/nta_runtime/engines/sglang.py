@@ -907,6 +907,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("tiered claim retired without its object-range pool")
         span = getattr(claim, "_extend_span", None)
         if span is not None and getattr(claim, "_extend_span_armed", False):
+            # SEMANTICS (misread once at high cost, 2026-08-21): this pair
+            # of events brackets a CLAIM's staging from its first layer to
+            # its last, which spans SEVERAL forwards once a prefill is
+            # chunked, with unrelated batches executing in the gaps. It is
+            # a claim-staging-lifetime metric and says nothing about how
+            # long any single forward blocks a co-resident decode — that
+            # question belongs to the per-forward `forward_*` metrics.
             try:
                 span[1].synchronize()
                 elapsed = span[0].elapsed_time(span[1])
