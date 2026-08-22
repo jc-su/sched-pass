@@ -18,7 +18,7 @@ remaining integration so it is executed, not re-derived.
   (`claim_bound_attention_jit_args`: request-bound tensors +
   `nta_claim_bindings` int64 tensor).
 
-## Remaining (3b): arm the check on the tiered serve path
+## DONE (3b, 8212360): armed on every transformed consumer
 1. **Wrapper family.** In `engines/sglang.py` `decode_wrappers` /
    `prefill_wrappers`, add policy `"claim_bound"` using
    `claim_bound_attention_jit_args`; build
@@ -43,13 +43,15 @@ remaining integration so it is executed, not re-derived.
    tableStamp=0, so the check is exact and trivially satisfied on the
    stamp word while remaining armed for slot/generation/valid/bound.
 
-## Remaining (3c): stamping
+## DONE (3c): staging-epoch stamp bumped at each sweep's layer zero,
+republished before the next consumer launch; layer-level provenance
+remains with the device observed-identity audit
 Engine increments a per-claim stamp at every selection epoch
 (refresh), republishes the row, and writes the same stamp into the
 bindings buffer; later depth moves the stamp write into the prep
 kernel itself.
 
-## Remaining (4): reject fixtures
+## DONE (4, 35f8906) build-verified; EXECUTION PENDING GPU
 Standalone probe (pattern: ExtendStagingCaptureProbe): build one claim,
 serve once (accept), then five mutations each asserting REFUSAL:
 stale generation (bump table generation, keep bindings),

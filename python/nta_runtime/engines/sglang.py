@@ -4445,7 +4445,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             lease_extent=int(
                 (getattr(lease, "end", 0) or 0) - (getattr(lease, "begin", 0) or 0)
             ),
-            table_stamp=0,
+            table_stamp=int(getattr(claim, "_abi_stamp", 0) or 0),
             stream=torch.cuda.current_stream().cuda_stream,
         )
 
@@ -4468,7 +4468,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             staging[position, 0] = int(table_slot.index)
             staging[position, 1] = int(table_slot.generation)
             staging[position, 2] = int(claim.kept_prefix_rows)
-            staging[position, 3] = 0
+            staging[position, 3] = int(getattr(claim, "_abi_stamp", 0) or 0)
+            if getattr(claim, "_abi_stamp_dirty", False):
+                claim._abi_stamp_dirty = False
+                self._publish_abi_claim(table_slot, valid=True, claim=claim)
         self._claim_bindings_dev[:rows].copy_(
             staging[:rows], non_blocking=True
         )

@@ -1554,6 +1554,14 @@ class TieredClaim:
             return
         if not 0 <= local_layer < self.layer_count:
             raise RuntimeError("selected-row cache layer is out of range")
+        if local_layer == 0:
+            # One staging-epoch stamp per re-selection sweep. The ABI row
+            # republishes under the new stamp before the next consumer
+            # launch, so a consumer planned against an older sweep
+            # refuses; per-layer provenance stays with the device-side
+            # observed-identity audit.
+            self._abi_stamp = getattr(self, "_abi_stamp", 0) + 1
+            self._abi_stamp_dirty = True
         buffer = self._selected_row_cache[local_layer]
         if buffer is None:
             # Allocated once per layer, then refreshed in place: a stable
