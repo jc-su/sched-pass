@@ -117,6 +117,30 @@ degrading resident-request tails.
   added criterion — P3 external P99 ITL within the 100ms SLO for at
   least the stock arm's qualified fraction — and with ITL qualified the
   goodput bar follows from queue divergence under sustained arrivals.
+- **HELD-OUT CONFIRMATION RESULT — THE REGISTERED CLAIM IS MADE
+  (2026-08-22, Amendment 5 protocol, held-out seeds 20260911-20 used
+  here for the first and only time, identical revision f0cecf1, shape,
+  bars, and aggregation as the registered-seed campaign below, ten of
+  ten trials co-tenant-clean with zero contamination reruns, artifacts
+  `results/serving/p4-heldout/`): ALL FIVE BARS PASS AGAIN.** Registered
+  goodput **1.6707 [1.406, 2.024]** — stronger than the registered-seed
+  campaign's 1.5338, with the CI floor well clear of 1.0. Resident P99
+  ITL **0.7605 [0.688, 0.846]** — confirming, on seeds no optimization
+  ever saw, that residents run meaningfully FASTER under the mechanism
+  at this shape. Mechanism, physical-bytes, and outputs bars green
+  (trial 4 diverged with reporting armed, per the registered bar). Per
+  Amendment 5, with an all-bars pass on the registered seeds and an
+  all-bars pass on the held-out seeds under the identical protocol,
+  **the RQ1 claim is now made at the queue operating point (Amendment 4
+  shape, Amendment 7 powered measurement)**: under HBM pressure from
+  held long-context working sets, serving model-selected external KV
+  through bounded staging improves SLO-qualified goodput over dense
+  HiCache serving at the registered quality, byte, and attestation
+  bars, without degrading resident-request tails — residents improve.
+  Remaining outside this claim and stated with it: the capacity shape's
+  resident bar (1.0951 vs 1.05, characterized, fix candidates queued)
+  and the breadth items in the evaluation ledger (task-quality battery,
+  model scale, competitor arms).
 - **Powered queue campaign result (2026-08-22, Amendment 7 form,
   registered seeds verbatim, revision f0cecf1, ten of ten trials
   co-tenant-clean, artifacts `results/serving/p4-powered/`): ALL FIVE
