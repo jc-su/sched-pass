@@ -251,3 +251,16 @@ Deliberately unmerged:
   after GPU fixtures + replay/quality batteries pass and the mechanism
   change is registered.
 - `isolation-admission` — archival WIP, self-recorded as not-validated.
+
+
+## LongBench first measurement (2026-08-22, n=4/task — underpowered, scaled run launched)
+
+Stock 0.1399 vs NTA 0.1277 mean (budget 64, 16K prefixes, temperature
+0, identical prompts). 9/20 outputs byte-identical; the differing 11
+scatter in both directions; the whole gap sits in two samples
+(multifieldqa-1, hotpotqa-0). Indistinguishable from sampling luck at
+n=4/task, so per the pre-declared rule no conclusion is drawn and the
+battery reruns at 16 samples/task. If a real drop confirms there, the
+budget ladder runs to the quality-parity point and goodput is re-quoted
+at that budget — the paper's number is goodput at quality parity,
+never best goodput at any budget.
