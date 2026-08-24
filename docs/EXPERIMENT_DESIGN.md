@@ -2,16 +2,23 @@
 
 Status: canonical evaluation design for the refactored project.
 
+Experiment drivers and artifact validation live under `experiments/` and
+`benchmarks/`; implementation remains under `include/`, `lib/`, `runtime/`,
+and `python/nta_runtime/`. Correctness tests under `tests/` do not own the
+experiment runner or persistent result files. Use
+`docs/ARTIFACT_EVALUATION.md` for the reproducible bundle workflow.
+
 The central question is whether one exact, late-bound work-unit mechanism
 improves execution when a batch contains heterogeneous request state. Every
-arm consumes one demand trace and the same selected identities. Selection
-quality is outside the serving claim.
+arm consumes one demand trace and the same exact consumed identities. Demand
+construction is an input/workload property; selector quality is outside the
+serving claim.
 
 ## RQ0: map the opportunity before serving
 
-Use `tools/experiments/run_work_unit_matrix.py` to sweep:
+Use `experiments/run_work_unit_matrix.py` to sweep:
 
-- candidate and selected units;
+- candidate and consumed units;
 - resident/ready/blocked/new-arrival fractions;
 - availability latency and skew;
 - compute per unit and transport bandwidth;
@@ -21,14 +28,27 @@ This runner validates the real WorkBatch, WorkLedger, generation checks, epoch
 checks, partial transitions, and byte accounting. It is a contract/regime
 runner, not a GPU performance result.
 
+The default command emits the full mechanism. `--ablation all` emits every
+declared RQ3 ablation as well. `experiments/validate_matrix_artifact.py`
+checks that each record has a shared exact-trace hash, a valid activation
+counter set, and a zero Little's-law residual. Its modeled timing fields are
+explicitly marked `synthetic_regime_contract`; they cannot be used as serving
+speedup evidence.
+
+The matrix includes the evaluation tiers HBM, host memory, NVMe, and DAX. Host
+memory's direct/staged implementation detail is selected inside the native
+transport configuration; the tier axis never changes exact demand IDs or
+the numerical workload.
+
 Use Little's law as a consistency check:
 
 ```
 L = lambda W
 ```
 
-For each stratum, record admitted work rate `lambda`, mean number of pending
-or runnable units `L`, and mean time in the corresponding state `W`. A
+For each stratum, the runner records admitted pending-work rate `lambda`, mean
+number of pending units `L`, and mean pending time `W`, together with the
+residual `abs(L - lambda*W)`. A
 violation indicates dropped observations, an incorrectly defined population,
 or a measurement boundary mismatch; it is not a performance conclusion by
 itself.
@@ -44,8 +64,8 @@ The primary workload is one continuous batch containing:
 - cancellation and request-slot reuse.
 
 The exact demand trace is generated once and replayed by every arm. The primary
-serving comparison is dense exact attention plus exact sparse demand with the
-same selected IDs, bytes, page order, and output checks.
+serving comparison is dense exact attention plus exact demand with the same
+demand IDs, bytes, page order, and output checks.
 
 The SGLang harness is
 `benchmarks/serving/CompareSglangHiCacheLoad.py`. It validates placement,
@@ -57,7 +77,7 @@ attention coverage, and mechanism counters before reporting SLO/goodput.
 Use matched arms:
 
 ```
-B0  resident dense conventional baseline
+B0  resident exact conventional baseline
 B1  host promotion + batch readiness barrier
 B2  host demand materialization + conventional exact gather
 B3  device demand + conventional exact gather
@@ -66,9 +86,17 @@ B5  heterogeneous bounded work-unit execution
 B6  exact partial consumer continuation
 ```
 
-B0--B3 isolate demand/transport/control effects. B4--B5 isolate the
-execution-side contribution. B6 is optional evidence for the general partial
-protocol and is not required for the serving headline.
+B0--B3 isolate residency, host materialization, and device demand while
+retaining the same exact demand IDs. B4--B5 isolate the execution-side
+contribution. B6 is optional evidence for the general partial protocol and is
+not required for the serving headline. B0 is resident exact execution, not a
+dense numerical workload, so the matched-demand fairness rule remains valid.
+
+The full paired specification also includes two non-adjacent, pre-registered
+comparisons: B3 versus B1 isolates device-side selection from the host-control
+round trip, and B5 versus B3 measures the complete device-demand to
+heterogeneous-work-unit mechanism jump. These are required because adjacent
+arms alone cannot seal the causal decomposition.
 
 All arms report:
 
@@ -82,7 +110,8 @@ All arms report:
 
 ## RQ3: mechanism ablations
 
-Disable exactly one boundary at a time:
+Disable exactly one boundary at a time. The executable names are the same as
+the manifest's `ablations` field and can be run with `--ablation all`:
 
 1. host-side demand/control instead of device demand;
 2. batch readiness instead of work-unit readiness;
@@ -90,10 +119,13 @@ Disable exactly one boundary at a time:
 4. manual work mapping instead of compiler-generated coordinates;
 5. generation/epoch checks on the hot path, with a shadow-only comparison;
 6. engine admission feedback;
-7. bounded staging, replaced by dense promotion.
+7. bounded staging, replaced by full promotion.
 
-An ablation is invalid if its activation counters show that the intended
-boundary never executed.
+Each record includes `execution_mode` and `activation_counters`. An ablation is
+invalid if it is marked applied but the counter for the disabled or replacement
+boundary is zero. The validator only applies this rule to arms for which the
+manifest declares that ablation applicable; unrelated arms remain useful
+matched controls.
 
 ## RQ4: strata and robustness
 
@@ -104,6 +136,15 @@ Report results by explicit strata rather than one average:
 - availability skew: low, medium, high;
 - staging pressure: under-capacity, near-capacity, over-capacity;
 - compute/transfer ratio: control-dominated, balanced, compute-dominated.
+
+The dependency-free runner emits these strata fields and Little's Law
+residuals. Its `arrival` and `load_ratio` labels are synthetic strata derived
+from availability skew and the modeled compute/transfer/control split; they do
+not claim a measured arrival process. Serving runners must preserve the same
+field names and add measured GPU/engine counters; synthetic records must never
+be presented as serving speedups. The serving harness is the source of timing
+truth for RQ1/RQ2; the dependency-free artifact is the source of contract,
+fairness, and regime truth.
 
 A result is interpretable only when the workload stratum, demand trace,
 protocol, and mechanism counters are included in the artifact.

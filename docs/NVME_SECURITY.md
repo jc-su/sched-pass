@@ -115,11 +115,17 @@ matched CPU baseline and its traces should be compared against this bootstrap.
   NVMe driver's complete quirk and platform lifecycle coverage.
 
 Use `scripts/nta-vfio-device.sh preflight`, then on an otherwise unused test
-controller run `bind-and-probe`. The safe policy remains the default. On the
+controller run `NTA_ALLOW_DEVICE_REBIND=1 scripts/nta-vfio-device.sh bind-and-probe`.
+The explicit environment guard is required because rebinding is destructive;
+the Python qualification runner requires the equivalent
+`--allow-device-rebind` flag. The safe policy remains the default. On the
 KIOXIA CD8P, which reports `NWPC=0`, use
 `NTA_NVME_MEDIA_POLICY=trusted-read-only-code` only when the dedicated-device
 threat model is acceptable. On 2026-08-01 that policy passed CPU queue/DMA
 qualification, GPU SQ-doorbell-CQ qualification, and verified application READ
 workloads; teardown restored `nvme` after testing. The 2026-08-09 ABI-v25
 qualification also completed all 640 measured 2-MiB reads with exact checksums
-and zero outstanding commands. This remains a one-controller local result.
+and zero outstanding commands. The report's `ready`/`qualified` fields are a
+transport-and-correctness gate; `performance_qualified` is recorded separately
+against the matched fio ratio. A correct but slower GPU path is therefore not
+presented as a performance win. This remains a one-controller local result.

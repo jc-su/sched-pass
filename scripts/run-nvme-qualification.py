@@ -8,6 +8,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 from typing import Any
@@ -24,7 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue-depth", type=int, default=64)
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024)
     parser.add_argument("--requests", type=int, default=32)
-    parser.add_argument("--progress-passes", type=int, default=32)
+    parser.add_argument(
+        "--progress-passes",
+        type=int,
+        default=1024,
+        help="bounded GPU completion/issue passes per replay; 1024 is the safe exact default",
+    )
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--fio-runtime", type=int, default=10)
     parser.add_argument("--fio-size", default="2G")
@@ -36,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-bandwidth-ratio", type=float, default=0.5)
     parser.add_argument("--cta-try-issue", action="store_true")
     parser.add_argument("--require-ready", action="store_true")
+    parser.add_argument(
+        "--allow-device-rebind",
+        action="store_true",
+        help="confirm that the selected NVMe controller may be rebound to VFIO",
+    )
     parser.add_argument(
         "--output",
         type=pathlib.Path,
@@ -108,6 +119,32 @@ def namespace_block_device(bdf: str, namespace: int) -> pathlib.Path:
     return candidates[0]
 
 
+def validate_bdf(bdf: str) -> None:
+    if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", bdf) is None:
+        raise RuntimeError(f"invalid PCI BDF: {bdf!r}")
+    device = pathlib.Path("/sys/bus/pci/devices") / bdf
+    if not device.is_dir():
+        raise RuntimeError(f"PCI device does not exist: {bdf}")
+
+
+def read_only_preflight(args: argparse.Namespace) -> None:
+    validate_bdf(args.bdf)
+    run(
+        [
+            str(ROOT / "scripts" / "nta-vfio-device.sh"),
+            "preflight",
+        ],
+        environment={
+            "NTA_NVME_BDF": args.bdf,
+            "NTA_NVME_NSID": str(args.namespace),
+            "NTA_NVME_QUEUE_DEPTH": str(args.queue_depth),
+            "NTA_GPU": str(args.gpu),
+            "NTA_NVME_MEDIA_POLICY": args.media_policy,
+            "NTA_NVME_REFERENCE_BYTES": str(args.bytes * args.requests),
+        },
+    )
+
+
 def fio_baseline(args: argparse.Namespace, block: pathlib.Path) -> dict[str, Any]:
     with tempfile.NamedTemporaryFile(prefix="nta-fio-", suffix=".json") as raw:
         run(
@@ -159,6 +196,7 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
         "NTA_GPU": str(args.gpu),
         "NTA_NVME_MEDIA_POLICY": args.media_policy,
         "NTA_NVME_REFERENCE_BYTES": str(args.bytes * args.requests),
+        "NTA_ALLOW_DEVICE_REBIND": "1",
         "NTA_REVISION": git_revision,
     }
     run(
@@ -185,43 +223,97 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
     return json.loads(raw_output.read_text(encoding="utf-8"))
 
 
-def main() -> int:
-    args = parse_args()
-    git_revision, dirty = revision()
-    block = namespace_block_device(args.bdf, args.namespace)
-    baseline = fio_baseline(args, block)
-    gpu = gpu_read(args, git_revision)
-    ratio = float(gpu["physical_mib_per_second"]) / float(
-        baseline["bandwidth_mib_per_second"]
-    )
-    ready = (
-        gpu.get("revision") == git_revision
-        and gpu.get("verified") is True
-        and gpu.get("translated_iommu") is True
-        and gpu.get("gpu_doorbell_mapping_validated") is True
-        and int(gpu.get("verification_failures", 1)) == 0
-        and int(gpu.get("failed", 1)) == 0
-        and int(gpu.get("outstanding", 1)) == 0
-        and ratio >= args.minimum_bandwidth_ratio
-    )
-    raw_output = args.output.with_name(f"{args.output.stem}-gpu.json")
+def write_report(
+    args: argparse.Namespace,
+    *,
+    git_revision: str,
+    dirty: bool,
+    fields: dict[str, Any],
+) -> dict[str, Any]:
     report = {
         "schema": 1,
         "classification": "nta-vfio-nvme-qualification",
+        "tier": "nvme",
         "revision": git_revision,
         "dirty": dirty,
-        "ready": ready,
-        "minimum_bandwidth_ratio": args.minimum_bandwidth_ratio,
-        "matched_bandwidth_ratio": ratio,
-        "baseline": baseline,
-        "gpu_controlled": gpu,
-        "raw_gpu_result": str(raw_output.resolve()),
+        "media_policy": args.media_policy,
+        "read_only_contract": args.media_policy == "trusted-read-only-code",
+        **fields,
     }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, sort_keys=True))
-    if args.require_ready and not ready:
-        return 2
-    return 0
+    return report
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.allow_device_rebind:
+        raise SystemExit(
+            "refusing NVMe qualification without --allow-device-rebind; "
+            "review the read-only preflight and explicitly authorize VFIO rebinding"
+        )
+    git_revision, dirty = revision()
+    phase = "preflight"
+    try:
+        read_only_preflight(args)
+        phase = "kernel-baseline"
+        block = namespace_block_device(args.bdf, args.namespace)
+        baseline = fio_baseline(args, block)
+        phase = "gpu-qualification"
+        gpu = gpu_read(args, git_revision)
+        ratio = float(gpu["physical_mib_per_second"]) / float(
+            baseline["bandwidth_mib_per_second"]
+        )
+        transport_ready = (
+            gpu.get("revision") == git_revision
+            and gpu.get("verified") is True
+            and gpu.get("translated_iommu") is True
+            and gpu.get("gpu_doorbell_mapping_validated") is True
+            and int(gpu.get("verification_failures", 1)) == 0
+            and int(gpu.get("failed", 1)) == 0
+            and int(gpu.get("outstanding", 1)) == 0
+        )
+        performance_qualified = ratio >= args.minimum_bandwidth_ratio
+        raw_output = args.output.with_name(f"{args.output.stem}-gpu.json")
+        write_report(
+            args,
+            git_revision=git_revision,
+            dirty=dirty,
+            fields={
+                "ready": transport_ready,
+                "transport_ready": transport_ready,
+                "qualified": transport_ready,
+                "status": "qualified" if transport_ready else "not_qualified",
+                "demand_semantics": "exact",
+                "minimum_bandwidth_ratio": args.minimum_bandwidth_ratio,
+                "matched_bandwidth_ratio": ratio,
+                "performance_qualified": performance_qualified,
+                "baseline": baseline,
+                "gpu_controlled": gpu,
+                "raw_gpu_result": str(raw_output.resolve()),
+            },
+        )
+        if args.require_ready and not transport_ready:
+            return 2
+        return 0
+    except (RuntimeError, OSError, ValueError) as error:
+        write_report(
+            args,
+            git_revision=git_revision,
+            dirty=dirty,
+            fields={
+                "ready": False,
+                "qualified": False,
+                "status": "blocked" if phase == "preflight" else "failed",
+                "failure_phase": phase,
+                "failure": str(error),
+                "demand_semantics": "exact",
+            },
+        )
+        if args.require_ready:
+            return 2
+        return 0
 
 
 if __name__ == "__main__":

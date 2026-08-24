@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NTA physical tier qualification",
+  "type": "object",
+  "required": ["schema", "classification", "demand_semantics", "required_tiers", "entries"],
+  "properties": {
+    "schema": {"const": 1},
+    "classification": {"const": "nta-tier-qualification"},
+    "demand_semantics": {"const": "exact"},
+    "required_tiers": {
+      "type": "array",
+      "items": {"enum": ["hbm", "host_mem", "nvme", "dax"]},
+      "uniqueItems": true
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["tier", "status", "qualified", "report"],
+        "properties": {
+          "tier": {"enum": ["hbm", "host_mem", "nvme", "dax"]},
+          "status": {"enum": ["qualified", "not_qualified"]},
+          "qualified": {"type": "boolean"},
+          "source": {"type": "object"},
+          "report": {"type": "object"}
+        }
+      }
+    }
+  }
+}

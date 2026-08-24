@@ -241,19 +241,40 @@ class ExecutionSession:
             "work_ready_fraction": self.batch.ready_fraction,
         }
 
-    def unit_for(
-        self, *, layer: int, logical_begin: int, request_index: int
+    def unit_for_ticket(
+        self,
+        *,
+        work_id: int,
+        layer: int,
+        logical_begin: int,
+        request_index: int,
     ) -> WorkUnit:
-        matches = tuple(
-            unit
-            for unit in self.batch.units
-            if unit.layer == layer
-            and unit.logical_begin == logical_begin
-            and unit.binding.request_index == request_index
-        )
+        """Resolve one native ticket and validate its semantic coordinates.
+
+        A logical KV coordinate is not necessarily unique inside a native
+        schedule: split-K and other multi-contributor plans may emit several
+        CTAs for one request and coordinate.  The schedule ordinal is the
+        engine's canonical work-ticket identity; the remaining fields are
+        checked as an invariant so a stale or reordered schedule fails closed.
+        """
+        matches = tuple(unit for unit in self.batch.units if unit.work_id == work_id)
         if len(matches) != 1:
             raise RuntimeError(
-                "native schedule has no unique semantic work unit: "
-                f"layer={layer} logical={logical_begin} request={request_index}"
+                "native schedule has no unique semantic work ticket: "
+                f"work_id={work_id} layer={layer} logical={logical_begin} "
+                f"request={request_index}"
             )
-        return matches[0]
+        unit = matches[0]
+        if (
+            unit.layer != layer
+            or unit.logical_begin != logical_begin
+            or unit.binding.request_index != request_index
+        ):
+            raise RuntimeError(
+                "native schedule semantic coordinates diverged for work ticket: "
+                f"work_id={work_id} expected=(layer={layer}, logical={logical_begin}, "
+                f"request={request_index}) actual=(layer={unit.layer}, "
+                f"logical={unit.logical_begin}, "
+                f"request={unit.binding.request_index})"
+            )
+        return unit

@@ -7,7 +7,7 @@ Status: canonical design for `refactor/late-bound-work-unit`.
 NTA binds a work unit to three facts as late as correctness permits:
 
 1. request identity: engine slot, request ID, and generation;
-2. exact demand: candidate/selected units, byte size, granularity, and epoch;
+2. exact demand: candidate/consumed units, byte size, granularity, and epoch;
 3. availability: blocked, ready, running, partial, or terminal.
 
 The protocol then launches bounded groups of ready work. Granularity is chosen
@@ -16,8 +16,8 @@ late-bound, and exact-partial execution are protocol forms of this mechanism;
 they are not separate schedulers.
 
 Demand is always exact in the serving contract. A provider supplies the IDs
-that the numerical consumer will actually use; selection quality is therefore
-not hidden inside the execution mechanism.
+that the numerical consumer will actually use; there is no hidden quality
+selector inside the execution mechanism.
 
 ## 2. Ownership
 
@@ -36,15 +36,18 @@ NTA runtime/native bridge
   completion and telemetry
 
 Compiler plugin
-  marker validation, operator mapping, native work coordinates and contracts
+  typed contract verification, structural access proof, marker lowering, and
+  native work coordinates
 
 Consumer operator
   exact numerical computation and exact partial-state merge
 ```
 
-No engine adapter creates a second generation table. No compiler pass guesses
-request identity. No serving path silently changes the numerical demand
-contract.
+No engine adapter creates a second generation table. The compiler pass does
+not guess request identity from a raw pointer: it proves structural access
+shape and lowers typed markers only when the module contract supplies
+generation, exact-demand, and tier-ownership guarantees. No serving path
+silently changes the numerical demand contract.
 
 ## 3. Execution flow
 
@@ -53,7 +56,7 @@ For SGLang:
 ```
 scheduler forward
   -> SglangAdapter: rids + real request-pool slots
-  -> SglangHiCacheBridge: owns external host load and staging lease
+  -> SglangHiCacheBridge: owns exact host load, physical page mapping, and fence
   -> _ActiveBatch: schedules and page mappings
   -> ExecutionSession: one WorkBatch per real attention launch
   -> DeviceWorkPlan.upload_work_units: checked native WorkItems
@@ -67,11 +70,13 @@ error of treating reusable wrapper positions as model layers. Every native
 plan unit is looked up by layer, logical tile, and request index and must match
 the session's request binding before upload.
 
-SGLang external prefixes are exact: they stage the host rows needed by the
-provided page map. Batches may contain resident, ready external, blocked
-external, and new requests simultaneously. The admission hook only controls
-when an external batch enters the engine; it does not own a duplicate work
-ledger.
+SGLang external pages remain ordinary physical page-table entries. The bridge
+owns the host source rows until the last layer's CUDA completion edge and
+publishes the exact page mapping to the work-unit planner. A batch may contain
+resident, externally-ready, externally-blocked, and new requests simultaneously.
+There is no virtual-prefix sidecar in the active path: a bounded sidecar would
+need a consumer that translates virtual pages and performs an exact partial
+attention merge, which is a separate implementation contract.
 
 ## 4. Identity and lifetime invariants
 
@@ -80,10 +85,10 @@ ledger.
 - A demand epoch mismatch rejects upload or completion.
 - Work IDs are unique within one heterogeneous batch.
 - A request index cannot refer to two generations in one batch.
-- Exact sparse demand names its selected IDs; exact dense demand names all
-  candidates.
-- A canceled or finished external prefix releases its staging lease only
-  after the owning stream completion edge.
+- Exact demand identifies the units consumed by the numerical operator; dense
+  demand identifies every candidate.
+- A canceled or finished HiCache load releases its physical source ownership
+  only after the owning stream completion edge.
 
 Graph replay preserves request IDs and request-pool slots. A graph path with
 missing identity fails closed; a non-contiguous slot layout is rejected by the
@@ -120,14 +125,30 @@ upload counts so the tradeoff can be audited.
 No protocol form is a selector. The current serving claim is about execution
 coordination under exact demand.
 
-## 7. Engineering boundaries
+## 7. Tier and compiler contract
+
+The C++ `TierDescriptor`, device `BackendView` capability mask, C runtime API,
+and Python `TierDescriptor` are one ABI-level tier contract. HBM,
+HostMapped, HostStaged, NVMe, and CXL DAX are backend classes, not scheduling
+policies. NVMe is device-initiated transport; CXL DAX is a bounded
+device-visible mapped replica. Hardware-specific qualification is explicit
+and fail-closed.
+
+The JIT `OperatorContract` carries four non-inferable semantic obligations:
+request-slot/generation identity, exact work-unit demand, typed access proof,
+and tier ownership. `TypedInstrumentation.cuh` anchors those values in the
+compiled module so `NtaPass` validates the same code that exports the JIT
+contract. Raw unmarked kernels remain diagnostic-only.
+
+## 8. Engineering boundaries
 
 The SGLang implementation is pinned to the tested framework version and FA2
 FlashInfer path. The vLLM boundary is intentionally structural and
-dependency-free: `VllmSchedulerProjection` is the only expected projection
-from a pinned vLLM scheduler integration. A future vLLM adapter can change
-only that projection and transport binding, not the work-unit core.
+dependency-free: `VllmSchedulerProjection` is the sole framework projection,
+and `EngineBoundary` is the common lifecycle interface. Framework-specific
+code can change that projection and transport binding, not the work-unit core
+or native ABI.
 
-Retired selector, tiering, and capture-specialization modules are not
-compatibility layers and are not part of this branch. This keeps the active
-codebase aligned with the exact system mechanism.
+There is no selector-policy taxonomy in the active runtime. Exact dense and
+exact sparse demand are input semantics; conventional, late-bound, and
+partial are protocol forms of the same mechanism.

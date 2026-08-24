@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -187,6 +188,41 @@ def read_spec(path: pathlib.Path) -> dict[str, Any]:
     return spec
 
 
+def workload_provenance(spec: dict[str, Any]) -> dict[str, Any]:
+    """Return immutable workload identity when the spec names a manifest."""
+
+    value = spec.get("workload_manifest")
+    if not isinstance(value, str) or not value:
+        return {}
+    path = pathlib.Path(value).resolve()
+    if not path.is_file():
+        return {}
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {
+        "workload_manifest": str(path),
+        "workload_manifest_digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "workload_demand_digest": manifest.get("demand_trace_digest"),
+    }
+
+
+def tier_qualification_provenance(spec: dict[str, Any]) -> dict[str, Any]:
+    """Attach the physical-tier admission artifact to every trial record."""
+
+    value = spec.get("tier_qualification")
+    if not isinstance(value, str) or not value:
+        return {}
+    path = pathlib.Path(value).resolve()
+    if not path.is_file():
+        return {}
+    return {
+        "tier_qualification": str(path),
+        "tier_qualification_digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
 def final_json(output: str) -> dict[str, Any]:
     for line in reversed(output.splitlines()):
         try:
@@ -328,6 +364,8 @@ def main() -> int:
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "machine": machine_metadata(),
     }
+    metadata.update(workload_provenance(spec))
+    metadata.update(tier_qualification_provenance(spec))
     (output / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -370,6 +408,10 @@ def main() -> int:
                 "variant": experiment["variant"],
                 "command": experiment["command"],
                 "environment": experiment.get("environment", {}),
+                "arm": experiment.get("arm"),
+                "tier": experiment.get("tier"),
+                "stratum": experiment.get("stratum"),
+                "demand_semantics": experiment.get("demand_semantics"),
                 "started_at": started_at,
                 "duration_seconds": duration,
                 "log": str(log_path.relative_to(ROOT))
@@ -377,6 +419,8 @@ def main() -> int:
                 else str(log_path),
                 "result": parsed,
             }
+            record.update(workload_provenance(spec))
+            record.update(tier_qualification_provenance(spec))
             records.append(record)
             trial_file.write(json.dumps(record, sort_keys=True) + "\n")
             trial_file.flush()

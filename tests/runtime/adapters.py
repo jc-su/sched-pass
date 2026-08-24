@@ -1,4 +1,5 @@
 from nta_runtime.adapters.sglang import SglangAdapter, SglangExecutionConfig
+from nta_runtime.adapters.base import EngineBoundary
 from nta_runtime.adapters.vllm import VllmAdapter, VllmSchedulerProjection
 from nta_runtime.execution_protocol import ProtocolKind
 from nta_runtime.work_unit import Granularity
@@ -43,6 +44,7 @@ def main() -> None:
 
     runtime = FakeRuntime()
     adapter = VllmAdapter(runtime, 8)
+    assert isinstance(adapter, EngineBoundary)
     batch = adapter.bind_batch(
         ("a", "b"),
         (1, 3),
@@ -60,6 +62,7 @@ def main() -> None:
     assert runtime.cancelled == [(1, 1)]
 
     sglang = SglangAdapter(runtime, 8)
+    assert isinstance(sglang, EngineBoundary)
     sglang_batch = sglang.bind_forward(
         FakeForward(),
         allow_capture_ids=False,
@@ -71,7 +74,7 @@ def main() -> None:
     assert sglang_batch.epoch == 9
     assert tuple(item.priority for item in sglang_batch.bindings) == (2, 5)
     assert tuple(item.request_slot for item in sglang_batch.bindings) == (5, 7)
-    vllm_batch = adapter.bind_scheduler_output(
+    vllm_batch = adapter.bind_forward(
         FakeVllmSchedulerOutput(), epoch=5, granularity=Granularity.LAYER
     )
     assert tuple(item.request_slot for item in vllm_batch.bindings) == (4, 6)

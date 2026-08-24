@@ -11,6 +11,10 @@
 
 namespace {
 
+static_assert(sizeof(nta_tier_descriptor) == 40);
+static_assert(sizeof(nta_cxl_dax_options) == 32);
+static_assert(sizeof(nta_cxl_dax_capabilities) == 32);
+
 void require(bool condition, const char *message) {
   if (!condition) {
     throw std::runtime_error(message);
@@ -42,7 +46,7 @@ int main() {
     nta_runtime_config invalid{};
     invalid.api_version = NTA_RUNTIME_C_API_VERSION;
     nta_runtime *runtime = nullptr;
-    require(nta_runtime_create(&invalid, nullptr, &runtime) ==
+    require(nta_runtime_create(&invalid, nullptr, nullptr, &runtime) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "runtime accepted an invalid config size");
     require(runtime == nullptr && nta_last_error()[0] != '\0',
@@ -59,10 +63,16 @@ int main() {
     config.max_dependencies_per_work_ticket = 1;
     config.device_ordinal = NTA_RUNTIME_USE_CURRENT_DEVICE;
     config.enable_cta_nvme_try_issue = 1;
-    requireOk(nta_runtime_create(&config, nullptr, &runtime),
+    requireOk(nta_runtime_create(&config, nullptr, nullptr, &runtime),
               "create C runtime");
     require(runtime != nullptr && nta_runtime_device_view(runtime) != 0,
             "C runtime has no device view");
+    nta_tier_descriptor hbm{};
+    requireOk(nta_runtime_get_tier_descriptor(runtime, 0, &hbm),
+              "read HBM tier descriptor");
+    require(hbm.source_kind == 0 && hbm.active != 0 &&
+                hbm.estimated_bandwidth_bytes_per_second != 0,
+            "HBM tier descriptor is incomplete");
 
     requireOk(nta_runtime_set_tenant_budget(runtime, 0, 4096, 1),
               "set tenant budget");

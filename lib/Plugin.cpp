@@ -1,7 +1,7 @@
 #include "nta/Passes.h"
 
 #include "llvm/Passes/PassBuilder.h"
-#if __has_include("llvm/Plugins/PassPlugin.h")
+#if NTA_LLVM_PLUGIN_HEADER_PLUGINS
 #include "llvm/Plugins/PassPlugin.h"
 #else
 #include "llvm/Passes/PassPlugin.h"

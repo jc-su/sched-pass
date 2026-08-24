@@ -1,0 +1,56 @@
+[
+  {
+    "id": "batch-control-low-under",
+    "request_state": "mixed",
+    "granularity": "page_group",
+    "load_ratio": "control_dominated",
+    "availability_skew": "low",
+    "staging_pressure": "under_capacity",
+    "arrival": "batch_release"
+  },
+  {
+    "id": "open-balanced-near",
+    "request_state": "mixed",
+    "granularity": "layer",
+    "load_ratio": "balanced",
+    "availability_skew": "medium",
+    "staging_pressure": "near_capacity",
+    "arrival": "calibrated_open_loop"
+  },
+  {
+    "id": "burst-compute-over",
+    "request_state": "external_blocked",
+    "granularity": "cta_tile",
+    "load_ratio": "compute_dominated",
+    "availability_skew": "high",
+    "staging_pressure": "over_capacity",
+    "arrival": "burst"
+  },
+  {
+    "id": "resident-page-under",
+    "request_state": "resident",
+    "granularity": "page_group",
+    "load_ratio": "balanced",
+    "availability_skew": "low",
+    "staging_pressure": "under_capacity",
+    "arrival": "batch_release"
+  },
+  {
+    "id": "ready-layer-near",
+    "request_state": "external_ready",
+    "granularity": "layer",
+    "load_ratio": "control_dominated",
+    "availability_skew": "high",
+    "staging_pressure": "near_capacity",
+    "arrival": "trace_timestamp"
+  },
+  {
+    "id": "arrival-tile-over",
+    "request_state": "new_arrival",
+    "granularity": "cta_tile",
+    "load_ratio": "compute_dominated",
+    "availability_skew": "medium",
+    "staging_pressure": "over_capacity",
+    "arrival": "burst"
+  }
+]

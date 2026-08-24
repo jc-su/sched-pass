@@ -240,8 +240,8 @@ def plan_host_execution(
         raise ValueError("host execution planning needs non-empty active work")
     if not 0 <= initial_runnable_tiles < runnable_tiles:
         raise ValueError("initial runnable tiles must be a proper work subset")
-    if force_rounds is not None and force_rounds <= 1:
-        raise ValueError("forced host execution needs at least two rounds")
+    if force_rounds is not None and force_rounds <= 0:
+        raise ValueError("forced host execution needs a positive round bound")
     transfer_ns = math.ceil(
         transfer_bytes * 1_000_000_000 / model.bandwidth_bytes_per_second
     )

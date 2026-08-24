@@ -37,23 +37,45 @@ vfio_cdev() {
   printf 'absent\n'
 }
 
+check_block_device() {
+  local sysfs_block=$1
+  local block_device=/dev/$(basename "$sysfs_block")
+  [[ -b $block_device ]] || die "$block_device has no block device node"
+  if findmnt -rn -S "$block_device" >/dev/null; then
+    die "$block_device is mounted"
+  fi
+  if [[ -n $(ls -A "/sys/class/block/$(basename "$sysfs_block")/holders" 2>/dev/null) ]]; then
+    die "$block_device has kernel block holders"
+  fi
+  if sudo fuser "$block_device" >/dev/null 2>&1; then
+    die "$block_device is open by another process"
+  fi
+}
+
 require_safe_device() {
   [[ -d $device ]] || die "PCI device $bdf does not exist"
+  local namespace_found=0
   local block
   for block in "$device"/nvme/nvme*/nvme*n*; do
     [[ -e $block ]] || continue
-    local block_device
-    block_device=/dev/$(basename "$block")
-    if findmnt -rn -S "$block_device" >/dev/null; then
-      die "$block_device is mounted"
+    namespace_found=1
+    local class_block=/sys/class/block/$(basename "$block")
+    local hidden
+    hidden=$(cat "$class_block/hidden" 2>/dev/null || true)
+    if [[ $hidden == 1 ]]; then
+      die "$(basename "$block") is a hidden multipath namespace"
     fi
-    if [[ -n $(ls -A "/sys/class/block/$(basename "$block")/holders" 2>/dev/null) ]]; then
-      die "$block_device has kernel block holders"
-    fi
-    if sudo fuser "$block_device" >/dev/null 2>&1; then
-      die "$block_device is open by another process"
-    fi
+
+    check_block_device "$block"
+    local partition
+    for partition in "$block"/"$(basename "$block")"p*; do
+      [[ -e $partition ]] || continue
+      check_block_device "$partition"
+    done
   done
+  if [[ $namespace_found == 0 && $(current_driver) != vfio-pci ]]; then
+    die "NVMe controller has no namespace"
+  fi
 }
 
 require_containment() {
@@ -82,6 +104,37 @@ require_containment() {
     die "NTA_NVME_MEDIA_POLICY must be hardware-write-protect or trusted-read-only-code"
 }
 
+require_rebind_confirmation() {
+  [[ ${NTA_ALLOW_DEVICE_REBIND:-0} == 1 ]] ||
+    die "device rebind is destructive; set NTA_ALLOW_DEVICE_REBIND=1 after reviewing preflight"
+}
+
+require_media_policy() {
+  [[ $media_policy == hardware-write-protect ]] || return 0
+  command -v nvme >/dev/null 2>&1 ||
+    die "hardware-write-protect requires nvme-cli for a read-only capability preflight"
+
+  local block controller controller_output nwpc nsid feature_output
+  local checked=0
+  for block in "$device"/nvme/nvme*/nvme*n*; do
+    [[ -e $block ]] || continue
+    controller=$(basename "$(dirname "$block")")
+    nsid=$(<"$block/nsid")
+    controller_output=$(sudo nvme id-ctrl "/dev/$controller" 2>&1) ||
+      die "read-only NVMe Identify Controller failed for /dev/$controller"
+    nwpc=$(awk '$1 == "nwpc" { print $3; exit }' <<<"$controller_output")
+    [[ -n $nwpc ]] ||
+      die "NVMe Identify Controller did not report NWPC for /dev/$controller"
+    if (( nwpc == 0 )); then
+      die "/dev/$controller namespace $nsid lacks NVMe Namespace Write Protection"
+    fi
+    feature_output=$(sudo nvme get-feature "/dev/$controller" -f 0x84 -n "$nsid" -H 2>&1) ||
+      die "read-only Namespace Write Protection Get Feature failed for /dev/$controller namespace $nsid"
+    checked=$((checked + 1))
+  done
+  [[ $checked -gt 0 ]] || die "no active namespace available for media-policy preflight"
+}
+
 capture_reference() {
   local block
   for block in "$device"/nvme/nvme*/nvme*n*; do
@@ -89,6 +142,8 @@ capture_reference() {
     sudo dd if="/dev/$(basename "$block")" bs=4096 \
       count="$((reference_bytes / 4096))" \
       iflag=direct status=none | dd of="$reference" bs=4096 status=none
+    [[ -f $reference && $(stat -c '%s' "$reference") == "$reference_bytes" ]] ||
+      die "reference capture has an unexpected size"
     return
   done
   [[ -f $reference ]] ||
@@ -103,6 +158,7 @@ bind_vfio() {
   fi
   require_safe_device
   require_containment
+  require_media_policy
   capture_reference
   sudo modprobe iommufd
   sudo modprobe vfio-pci
@@ -136,6 +192,7 @@ preflight)
     "$bdf" "$nsid" "$depth" "$gpu" "$media_policy"
   ;;
 bind)
+  require_rebind_confirmation
   bind_vfio
   "$0" status
   ;;
@@ -150,19 +207,27 @@ probe)
   fi
   ;;
 bind-and-probe)
+  require_rebind_confirmation
+  restore_on_exit() {
+    "$0" restore >/dev/null 2>&1 || true
+  }
+  trap restore_on_exit EXIT
   bind_vfio
   if ! "$0" probe; then
     printf 'VFIO probe failed; restoring the previous PCI driver\n' >&2
     "$0" restore
     exit 1
   fi
+  "$0" restore
+  trap - EXIT
   ;;
 qualify)
-  bind_vfio
+  require_rebind_confirmation
   restore_on_exit() {
     "$0" restore >/dev/null 2>&1 || true
   }
   trap restore_on_exit EXIT
+  bind_vfio
   [[ -x $benchmark ]] || die "benchmark executable is absent; build nta-nvme-bench"
   sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}" \
     NTA_REVISION="${NTA_REVISION:-$(git -C "$root_dir" rev-parse HEAD)}" \

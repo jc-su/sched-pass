@@ -345,7 +345,8 @@ int main(int argc, char **argv) {
                                      options.requests, options.requests};
     runtimeConfig.deviceOrdinal = options.gpu;
     runtimeConfig.enableCtaNvmeTryIssue = options.ctaTryIssue;
-    nta::HostRuntime runtime(runtimeConfig, transport);
+    nta::HostRuntime runtime(runtimeConfig,
+                             nta::RuntimeBackends{transport, nullptr});
     std::vector<nta::benchmark::TileTask> hostTasks(options.requests);
     for (std::uint32_t request = 0; request < options.requests; ++request) {
       std::unique_ptr<nta::NvmeBuffer> destination =

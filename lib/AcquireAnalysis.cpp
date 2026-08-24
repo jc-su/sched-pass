@@ -178,6 +178,129 @@ public:
 private:
   enum State : unsigned { Visiting, Uniform, Divergent };
 
+  // At -O0, clang keeps the typed work context in local memory and lowers
+  // aggregate initialization to memcpy/memset.  The address of an alloca is
+  // lane-private, but a field loaded from it can still be CTA-uniform when
+  // every write uses the same uniform source and offset.  Keep this proof
+  // separate from ordinary SSA uniformity: treating every alloca as a
+  // uniform value would incorrectly bless thread-local scratch variables.
+  AllocaInst *localStorageBase(Value *value) const {
+    value = value->stripPointerCasts();
+    if (auto *alloca = dyn_cast<AllocaInst>(value)) {
+      return alloca;
+    }
+    if (auto *gep = dyn_cast<GetElementPtrInst>(value)) {
+      return localStorageBase(gep->getPointerOperand());
+    }
+    return nullptr;
+  }
+
+  bool uniformLocalAddress(Value *value) {
+    value = value->stripPointerCasts();
+    if (isa<AllocaInst>(value)) {
+      return true;
+    }
+    if (auto *gep = dyn_cast<GetElementPtrInst>(value)) {
+      if (!uniformLocalAddress(gep->getPointerOperand())) {
+        return false;
+      }
+      for (Value *index : gep->indices()) {
+        if (!isUniform(index)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (auto *load = dyn_cast<LoadInst>(value)) {
+      return uniformLocalLoad(*load);
+    }
+    return false;
+  }
+
+  bool localObjectUniform(AllocaInst &object) {
+    const auto found = localStates_.find(&object);
+    if (found != localStates_.end()) {
+      return found->second != Divergent;
+    }
+    localStates_[&object] = Visiting;
+
+    bool sawWrite = false;
+    for (BasicBlock &block : *object.getFunction()) {
+      for (Instruction &instruction : block) {
+        if (auto *store = dyn_cast<StoreInst>(&instruction)) {
+          if (localStorageBase(store->getPointerOperand()) != &object) {
+            continue;
+          }
+          const bool uniformValue =
+              isUniform(store->getValueOperand()) ||
+              uniformLocalAddress(store->getValueOperand());
+          if (store->isAtomic() || !uniformValue ||
+              !hasUniformControl(store->getParent())) {
+            localStates_[&object] = Divergent;
+            return false;
+          }
+          sawWrite = true;
+          continue;
+        }
+
+        if (auto *transfer = dyn_cast<MemTransferInst>(&instruction)) {
+          if (localStorageBase(transfer->getRawDest()) != &object) {
+            continue;
+          }
+          if (transfer->isVolatile() ||
+              !uniformLocalAddress(transfer->getRawDest()) ||
+              !isUniform(transfer->getRawSource()) ||
+              !hasUniformControl(transfer->getParent())) {
+            localStates_[&object] = Divergent;
+            return false;
+          }
+          sawWrite = true;
+          continue;
+        }
+
+        if (auto *set = dyn_cast<MemSetInst>(&instruction)) {
+          if (localStorageBase(set->getRawDest()) != &object) {
+            continue;
+          }
+          if (set->isVolatile() || !uniformLocalAddress(set->getRawDest()) ||
+              !isUniform(set->getValue()) ||
+              !hasUniformControl(set->getParent())) {
+            localStates_[&object] = Divergent;
+            return false;
+          }
+          sawWrite = true;
+          continue;
+        }
+
+        auto *call = dyn_cast<CallBase>(&instruction);
+        if (call == nullptr || call->getCalledFunction() == nullptr) {
+          continue;
+        }
+        const StringRef name = call->getCalledFunction()->getName();
+        if (!call->getCalledFunction()->isIntrinsic() ||
+            (!name.starts_with("llvm.lifetime.") &&
+             !name.starts_with("llvm.dbg."))) {
+          for (Value *argument : call->args()) {
+            if (localStorageBase(argument) == &object) {
+              localStates_[&object] = Divergent;
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    localStates_[&object] = sawWrite ? Uniform : Divergent;
+    return sawWrite;
+  }
+
+  bool uniformLocalLoad(LoadInst &load) {
+    AllocaInst *object = localStorageBase(load.getPointerOperand());
+    return object != nullptr && !load.isVolatile() && !load.isAtomic() &&
+           uniformLocalAddress(load.getPointerOperand()) &&
+           localObjectUniform(*object);
+  }
+
   bool uniformOperands(Instruction &instruction) {
     for (Use &operand : instruction.operands()) {
       if (!isUniform(operand.get())) {
@@ -250,7 +373,8 @@ private:
     }
     if (auto *load = dyn_cast<LoadInst>(&instruction)) {
       return !load->isVolatile() && !load->isAtomic() &&
-             isUniform(load->getPointerOperand());
+             (isUniform(load->getPointerOperand()) ||
+              uniformLocalLoad(*load));
     }
     if (auto *phi = dyn_cast<PHINode>(&instruction)) {
       if (!uniformOperands(*phi)) {
@@ -278,6 +402,7 @@ private:
   }
 
   DenseMap<Instruction *, State> states_;
+  DenseMap<AllocaInst *, State> localStates_;
   PostDominatorTree &postDominatorTree_;
 };
 
@@ -339,8 +464,14 @@ validateCtaCollective(CallInst &marker, CallInst &binding,
         postDominatesSuccessor &&
         !postDominatorTree.dominates(markerBlock, controlBlock);
     if (controlsMarker && !uniformity.isUniform(condition)) {
-      return effectName.str() +
-             " is control-dependent on a non-CTA-uniform branch";
+      std::string detail = effectName.str() +
+                           " is control-dependent on a non-CTA-uniform "
+                           "branch";
+      detail += " (" + marker.getFunction()->getName().str() + ":";
+      detail +=
+          (condition->hasName() ? condition->getName().str() : "unnamed");
+      detail += ")";
+      return detail;
     }
   }
   return std::nullopt;
@@ -351,6 +482,23 @@ struct AcquisitionBranch {
   BasicBlock *pending;
   BasicBlock *ready;
 };
+
+User *onlyLiveUse(Value *value) {
+  User *live = nullptr;
+  for (User *user : value->users()) {
+    // Frontend lowering can leave a dead integer cast next to the branch that
+    // consumes a convergent result.  It carries no observable behavior and is
+    // safe to ignore; side-effecting or live forwarding uses remain strict.
+    if (user->use_empty() && isa<CastInst>(user)) {
+      continue;
+    }
+    if (live != nullptr) {
+      return nullptr;
+    }
+    live = user;
+  }
+  return live;
+}
 
 Value *valueOnAcquiredEdge(Value *value, const AcquisitionBranch &branch) {
   auto *phi = dyn_cast<PHINode>(value);
@@ -411,16 +559,61 @@ bool reachableWithoutEdges(
 
 std::optional<AcquisitionBranch> acquisitionBranch(CallInst &marker) {
   if (marker.getType()->isIntegerTy(1)) {
-    if (!marker.hasOneUse()) {
+    User *markerUse = onlyLiveUse(&marker);
+    if (markerUse == nullptr) {
       return std::nullopt;
     }
-    auto *branch = dyn_cast<BranchInst>(*marker.user_begin());
-    if (branch == nullptr || !branch->isConditional() ||
-        branch->getCondition() != &marker) {
+    auto *user = dyn_cast<Instruction>(markerUse);
+    if (user == nullptr) {
       return std::nullopt;
     }
-    return AcquisitionBranch{branch, branch->getSuccessor(1),
-                             branch->getSuccessor(0)};
+    if (auto *branch = dyn_cast<BranchInst>(user);
+        branch != nullptr && branch->isConditional() &&
+        branch->getCondition() == &marker) {
+      return AcquisitionBranch{branch, branch->getSuccessor(1),
+                               branch->getSuccessor(0)};
+    }
+
+    if (auto *phi = dyn_cast<PHINode>(user)) {
+      auto *branch = dyn_cast<BranchInst>(onlyLiveUse(phi));
+      if (phi->getBasicBlockIndex(marker.getParent()) >= 0 &&
+          phi->getIncomingValueForBlock(marker.getParent()) == &marker &&
+          branch != nullptr && branch->isConditional() &&
+          branch->getCondition() == phi) {
+        return AcquisitionBranch{branch, branch->getSuccessor(1),
+                                 branch->getSuccessor(0)};
+      }
+      return std::nullopt;
+    }
+
+    // At frontend -O0, a convergent result can cross one unconditional edge
+    // and a trivial PHI before the ready/pending branch.  This is still the
+    // same canonical deferral boundary; accepting only this exact shape keeps
+    // arbitrary result laundering rejected.
+    auto *forward = dyn_cast<BranchInst>(user);
+    if (forward == nullptr || forward->isConditional()) {
+      return std::nullopt;
+    }
+    BasicBlock *successor = forward->getSuccessor(0);
+    for (Instruction &instruction : *successor) {
+      auto *phi = dyn_cast<PHINode>(&instruction);
+      if (phi == nullptr) {
+        break;
+      }
+      if (phi->getBasicBlockIndex(marker.getParent()) < 0 ||
+          phi->getIncomingValueForBlock(marker.getParent()) != &marker ||
+          onlyLiveUse(phi) == nullptr) {
+        continue;
+      }
+      auto *branch = dyn_cast<BranchInst>(onlyLiveUse(phi));
+      if (branch == nullptr || !branch->isConditional() ||
+          branch->getCondition() != phi) {
+        continue;
+      }
+      return AcquisitionBranch{branch, branch->getSuccessor(1),
+                               branch->getSuccessor(0)};
+    }
+    return std::nullopt;
   }
 
   ICmpInst *nullComparison = nullptr;
@@ -534,6 +727,16 @@ validateDeferralBoundary(CallInst &marker, DominatorTree &dominatorTree) {
 
   for (User *user : marker.users()) {
     if (user == branch->condition) {
+      continue;
+    }
+    if (auto *forward = dyn_cast<BranchInst>(user);
+        forward != nullptr && !forward->isConditional() &&
+        forward->getSuccessor(0) == branch->condition->getParent()) {
+      continue;
+    }
+    if (auto *phi = dyn_cast<PHINode>(user);
+        phi != nullptr &&
+        phi == cast<BranchInst>(branch->condition)->getCondition()) {
       continue;
     }
     auto *instruction = dyn_cast<Instruction>(user);

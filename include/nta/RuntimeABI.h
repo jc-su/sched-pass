@@ -6,9 +6,9 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 27;
+inline constexpr std::uint32_t Version = 28;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
-inline constexpr std::uint32_t BackendCount = 5;
+inline constexpr std::uint32_t BackendCount = 6;
 inline constexpr std::uint32_t UrgencyBucketCount = 8;
 
 enum class SourceKind : std::uint32_t {
@@ -16,7 +16,8 @@ enum class SourceKind : std::uint32_t {
   HostMapped = 1,
   HostStaged = 2,
   Nvme = 3,
-  Rdma = 4,
+  Cxl = 4,
+  Rdma = 5,
 };
 
 enum ReplicaFlags : std::uint32_t {
@@ -36,6 +37,15 @@ enum BackendFlags : std::uint32_t {
   // A finite application CTA may attempt one transport submission before it
   // publishes an intent. Completion processing always remains out of line.
   BackendCtaTryIssue = 1U << 0,
+  // The backend exposes device-visible state that can be consumed directly
+  // by a typed acquisition site. This is distinct from CTA submission: a
+  // mapped CXL replica is direct, while an NVMe queue is device-initiated.
+  BackendDeviceVisible = 1U << 1,
+  // Bits 8..12 carry the shared TierCapability mask. Keeping the mask in
+  // the existing fixed-size directory entry makes tier qualification visible
+  // to device admission without changing the CUDA ABI layout.
+  BackendTierCapabilityShift = 8,
+  BackendTierCapabilityMask = 0x1fU << BackendTierCapabilityShift,
 };
 
 enum class ObjectState : std::uint32_t {
@@ -406,11 +416,12 @@ struct alignas(64) RuntimeView {
   // This closes the race between reverse-edge installation and completion.
   std::uint32_t *dependencySatisfied;
   std::uint32_t *remainingDependencies;
-  // Compatibility queue for integrations that separate dependency completion
-  // from runnable publication. Built-in backends publish directly; the
-  // explicit publish phase consumes this queue or the bounded pending index.
+  // Deferred publication queue for integrations that separate dependency
+  // completion from runnable publication. Built-in backends publish directly;
+  // the explicit publish phase consumes this queue or the bounded pending
+  // index.
   std::uint32_t *changedWorkTickets;
-  // Per-ticket compatibility-queue membership bit.
+  // Per-ticket deferred-publication membership bit.
   std::uint32_t *changedQueued;
   std::uint32_t *changedCount;
   std::uint32_t *changedOverflow;

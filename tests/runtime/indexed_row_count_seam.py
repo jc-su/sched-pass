@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 
 import torch
 
@@ -29,6 +30,20 @@ from nta_runtime.runtime import (
 ROWS = 64
 HEADS = 2
 DIM = 128
+
+
+def _runtime_abi_version() -> int:
+    configured = os.environ.get("NTA_ABI_VERSION")
+    if configured:
+        return int(configured)
+    header = pathlib.Path(__file__).resolve().parents[2] / "include/nta/RuntimeABI.h"
+    match = re.search(
+        r"inline constexpr std::uint32_t Version = (\d+);",
+        header.read_text(encoding="utf-8"),
+    )
+    if match is None:
+        raise RuntimeError(f"cannot read the NTA ABI version from {header}")
+    return int(match.group(1))
 
 
 def locate_module() -> pathlib.Path | None:
@@ -48,18 +63,29 @@ def locate_module() -> pathlib.Path | None:
             pathlib.Path.home() / ".cache/flashinfer",
         )
     )
+    abi_prefix = f"nta-abi{_runtime_abi_version()}-"
     for root in roots:
-        for pattern in (
-            "nta_batch_decode_default_v2_hooked.so",
-            "nta_sglang_decode_demand*.so",
-        ):
-            candidates = sorted(
-                root.rglob(pattern),
-                key=lambda p: p.stat().st_mtime,
+        compatible_roots = (
+            [root]
+            if root.name.startswith(abi_prefix)
+            else sorted(
+                (candidate for candidate in root.glob(f"{abi_prefix}*") if candidate.is_dir()),
+                key=lambda candidate: candidate.stat().st_mtime,
                 reverse=True,
             )
-            if candidates:
-                return candidates[0]
+        )
+        for compatible_root in compatible_roots:
+            for pattern in (
+                "nta_batch_decode_default_v2_hooked.so",
+                "nta_sglang_decode_demand*.so",
+            ):
+                candidates = sorted(
+                    compatible_root.rglob(pattern),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if candidates:
+                    return candidates[0]
     return None
 
 

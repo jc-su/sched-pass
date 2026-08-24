@@ -27,11 +27,12 @@ add_library(NtaPass MODULE
   lib/PartialLowering.cpp
   lib/Plugin.cpp
 )
-target_include_directories(NtaPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
-if(EXISTS "/usr/include/llvm-${LLVM_VERSION_MAJOR}/llvm")
-  target_include_directories(
-    NtaPass SYSTEM BEFORE PRIVATE "/usr/include/llvm-${LLVM_VERSION_MAJOR}"
-  )
+target_include_directories(NtaPass SYSTEM BEFORE PRIVATE ${LLVM_INCLUDE_DIRS})
+if(LLVM_MAIN_INCLUDE_DIR)
+  # CMake omits implicit system paths such as /usr/local/include.  Re-add the
+  # selected package path explicitly so header-layout probing cannot fall
+  # through to a different system LLVM installation.
+  target_compile_options(NtaPass PRIVATE "-isystem${LLVM_MAIN_INCLUDE_DIR}")
 endif()
 target_include_directories(NtaPass PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -40,7 +41,21 @@ target_include_directories(NtaPass PRIVATE
 target_compile_features(NtaPass PRIVATE cxx_std_20)
 
 separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
-target_compile_definitions(NtaPass PRIVATE ${LLVM_DEFINITIONS_LIST})
+if(EXISTS "${LLVM_MAIN_INCLUDE_DIR}/llvm/Plugins/PassPlugin.h")
+  set(NTA_LLVM_PLUGIN_HEADER_PLUGINS 1)
+else()
+  set(NTA_LLVM_PLUGIN_HEADER_PLUGINS 0)
+endif()
+# The pass is intentionally resolved by the matching opt/clang host instead of
+# linking a second LLVM copy.  Some static LLVM tool builds do not export the
+# ABI-check sentinel from the host executable; suppress only that header-level
+# link sentinel while retaining the ABI selected by the package's headers.
+target_compile_definitions(
+  NtaPass PRIVATE
+  LLVM_DISABLE_ABI_BREAKING_CHECKS_ENFORCING=1
+  NTA_LLVM_PLUGIN_HEADER_PLUGINS=${NTA_LLVM_PLUGIN_HEADER_PLUGINS}
+  ${LLVM_DEFINITIONS_LIST}
+)
 if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(NtaPass PRIVATE -fno-rtti)
 endif()
@@ -183,13 +198,43 @@ if(Python3_Interpreter_FOUND)
     NAME nta-experiment-matrix
     COMMAND
       ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tools/experiments/run_work_unit_matrix.py
-      --max-cases 2
-      --repetitions 1
+      ${CMAKE_CURRENT_SOURCE_DIR}/experiments/smoke_matrix.py
   )
   set_tests_properties(
     nta-experiment-matrix PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-evaluation-contract
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/experiments/validate_evaluation.py
+  )
+  add_test(
+    NAME nta-bailian-workload
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/bailian_workload.py
+  )
+  set_tests_properties(
+    nta-bailian-workload PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  add_test(
+    NAME nta-queueing
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/queueing.py
+  )
+  set_tests_properties(
+    nta-queueing PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  add_test(
+    NAME nta-serving-report
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_report.py
   )
   add_test(
     NAME nta-semantic-native-bridge
@@ -209,16 +254,6 @@ if(Python3_Interpreter_FOUND)
   )
   set_tests_properties(
     nta-critical-work PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-  )
-  add_test(
-    NAME nta-virtual-ranges
-    COMMAND
-      ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/virtual_ranges.py
-  )
-  set_tests_properties(
-    nta-virtual-ranges PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
@@ -292,6 +327,53 @@ if(NTA_ENABLE_CUDA)
   endif()
 
   set(NTA_CUDA_ARCH "sm_120" CACHE STRING "CUDA architecture for the workload")
+  execute_process(
+    COMMAND "${NTA_CLANG_CUDA}" --version
+    OUTPUT_VARIABLE NTA_CUDA_CLANG_VERSION
+    ERROR_VARIABLE NTA_CUDA_CLANG_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE
+  )
+  # The production LLVM package uses the normal optimized CUDA frontend and
+  # llc path.  The optional clangir development toolchain is intentionally
+  # recognized here because its current SROA/GVN assertions require the
+  # conservative pipeline below.  This keeps the safe fallback local to that
+  # toolchain instead of making every reproducible build pay its cost.
+  set(NTA_CUDA_OPT_DEFAULT 3)
+  if(NTA_CUDA_CLANG_VERSION MATCHES "clangir" OR
+     LLVM_PACKAGE_VERSION MATCHES "git")
+    set(NTA_CUDA_OPT_DEFAULT 0)
+  endif()
+  set(
+    NTA_CUDA_FRONTEND_OPT_LEVEL
+    "${NTA_CUDA_OPT_DEFAULT}"
+    CACHE STRING
+    "Optimization level used while clang emits raw CUDA LLVM bitcode"
+  )
+  set_property(CACHE NTA_CUDA_FRONTEND_OPT_LEVEL PROPERTY STRINGS 0 1 2 3)
+  # Raw bitcode is optimized by the NTA pass pipeline and nvptx llc below.
+  # The production default is -O3; the clangir detection above selects -O0
+  # only for the known assertion-prone development toolchain.
+  set(NTA_CUDA_FRONTEND_OPT_FLAG "-O${NTA_CUDA_FRONTEND_OPT_LEVEL}")
+  set(NTA_CUDA_FRONTEND_FLAGS "${NTA_CUDA_FRONTEND_OPT_FLAG}")
+  if(NTA_CUDA_FRONTEND_OPT_LEVEL STREQUAL "0")
+    list(APPEND NTA_CUDA_FRONTEND_FLAGS -Xclang -disable-O0-optnone)
+  endif()
+  # These are deliberately the only generic cleanup passes before the
+  # contract verifier.  The paired opt build has known assertion failures in
+  # broader simplifycfg/instcombine pipelines, while SROA plus early-CSE is
+  # sufficient to expose the typed marker and preserve fail-closed checks.
+  set(NTA_ACQUIRE_PREPASSES "function(mem2reg,sroa,early-cse)")
+  set(
+    NTA_CUDA_LLC_OPT_LEVEL
+    "${NTA_CUDA_OPT_DEFAULT}"
+    CACHE STRING
+    "Optimization level used while llc emits PTX from lowered NTA IR"
+  )
+  set_property(CACHE NTA_CUDA_LLC_OPT_LEVEL PROPERTY STRINGS 0 1 2 3)
+  # ptxas remains at -O3 below.  The clangir fallback keeps the LLVM-to-PTX
+  # translation conservative because its GVN pipeline currently asserts on
+  # this lowered module; stable LLVM uses the optimized llc path.
   set(
     NTA_CUDA_ROOT
     "${CUDAToolkit_LIBRARY_ROOT}"
@@ -302,6 +384,7 @@ if(NTA_ENABLE_CUDA)
   endif()
 
   add_library(nta-runtime-host STATIC
+    runtime/host/CxlRuntime.cpp
     runtime/host/DeviceWorkPlan.cpp
     runtime/host/FinitePhase.cpp
     runtime/host/JitPhase.cpp
@@ -344,6 +427,7 @@ if(NTA_ENABLE_CUDA)
   )
   install(
     FILES runtime/device/Acquire.cuh runtime/device/JitRuntime.cuh
+          runtime/device/TypedInstrumentation.cuh
     DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/runtime/device
   )
   install(
@@ -421,13 +505,35 @@ if(NTA_ENABLE_CUDA)
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity_study.py
     )
+    add_test(
+      NAME nta-tier-qualification
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/tier_qualification.py
+    )
+    add_test(
+      NAME nta-evaluation-spec
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/evaluation_spec.py
+    )
+    add_test(
+      NAME nta-evaluation-artifact
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/evaluation_artifact.py
+    )
+    add_test(
+      NAME nta-nvme-safety
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/nvme_safety.py
+    )
     set_tests_properties(
       nta-request-slots nta-sglang-plugin
       nta-bounded-staging
       nta-qualification-runner
       nta-serving-evidence nta-jit-operator-family
       nta-opportunity-analysis
-      nta-opportunity-study
+      nta-opportunity-study nta-tier-qualification
+      nta-evaluation-spec nta-evaluation-artifact
+      nta-nvme-safety
       PROPERTIES TIMEOUT 60
     )
     set_tests_properties(nta-python-runtime nta-sglang-plugin PROPERTIES
@@ -480,7 +586,7 @@ if(NTA_ENABLE_CUDA)
       "${CMAKE_CURRENT_BINARY_DIR}/kernel"
     COMMAND
       "${NTA_CLANG_CUDA}"
-      -O3
+      ${NTA_CUDA_FRONTEND_FLAGS}
       -std=c++20
       --cuda-device-only
       --cuda-path=${NTA_CUDA_ROOT}
@@ -495,7 +601,7 @@ if(NTA_ENABLE_CUDA)
     COMMAND
       ${LLVM_TOOLS_BINARY_DIR}/opt
       -load-pass-plugin=$<TARGET_FILE:NtaPass>
-      -passes=nta-acquire,always-inline
+      -passes=${NTA_ACQUIRE_PREPASSES},nta-acquire,always-inline
       -S
       "${NTA_KV_RAW_BC}"
       -o "${NTA_KV_LOWERED_IR}"
@@ -503,7 +609,7 @@ if(NTA_ENABLE_CUDA)
       ${LLVM_TOOLS_BINARY_DIR}/llc
       -march=nvptx64
       -mcpu=${NTA_CUDA_ARCH}
-      -O3
+      -O${NTA_CUDA_LLC_OPT_LEVEL}
       "${NTA_KV_LOWERED_IR}"
       -o "${NTA_KV_PTX}"
     COMMAND
@@ -606,7 +712,7 @@ if(NTA_ENABLE_CUDA)
       "${CMAKE_CURRENT_BINARY_DIR}/kernel"
     COMMAND
       "${NTA_CLANG_CUDA}"
-      -O3
+      ${NTA_CUDA_FRONTEND_FLAGS}
       -std=c++20
       --cuda-device-only
       --cuda-path=${NTA_CUDA_ROOT}
@@ -622,7 +728,7 @@ if(NTA_ENABLE_CUDA)
     COMMAND
       ${LLVM_TOOLS_BINARY_DIR}/opt
       -load-pass-plugin=$<TARGET_FILE:NtaPass>
-      -passes=nta-acquire,always-inline
+      -passes=${NTA_ACQUIRE_PREPASSES},nta-acquire,always-inline
       -S
       "${NTA_ATTENTION_RAW_BC}"
       -o "${NTA_ATTENTION_LOWERED_IR}"
@@ -630,7 +736,7 @@ if(NTA_ENABLE_CUDA)
       ${LLVM_TOOLS_BINARY_DIR}/llc
       -march=nvptx64
       -mcpu=${NTA_CUDA_ARCH}
-      -O3
+      -O${NTA_CUDA_LLC_OPT_LEVEL}
       "${NTA_ATTENTION_LOWERED_IR}"
       -o "${NTA_ATTENTION_PTX}"
     COMMAND
@@ -721,6 +827,23 @@ if(NTA_ENABLE_CUDA)
     )
   endif()
 
+  add_executable(nta-cxl-dax-probe tools/CxlDaxProbe.cpp)
+  target_include_directories(nta-cxl-dax-probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(
+    nta-cxl-dax-probe PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
+  )
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-cxl-dax-probe PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+  add_test(NAME nta-cxl-dax-probe COMMAND nta-cxl-dax-probe)
+  set_tests_properties(nta-cxl-dax-probe PROPERTIES
+    TIMEOUT 60 SKIP_RETURN_CODE 77
+  )
+
   add_executable(
     nta-paged-attention benchmarks/attention/PagedAttention.cpp
   )
@@ -764,7 +887,7 @@ if(NTA_ENABLE_CUDA)
     BYPRODUCTS "${NTA_DEPENDENCY_RACE_PTX}"
     COMMAND
       "${NTA_CLANG_CUDA}"
-      -O3
+      ${NTA_CUDA_FRONTEND_FLAGS}
       -std=c++20
       --cuda-device-only
       --cuda-path=${NTA_CUDA_ROOT}
@@ -1138,6 +1261,55 @@ if(NTA_ENABLE_CUDA)
       --request-credit-pages=1
   )
   set_tests_properties(nta-paged-attention-tma-gpu PROPERTIES TIMEOUT 60)
+  add_test(
+    NAME nta-paged-attention-rejects-underprovisioned-progress
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=host-staged
+      --requests=4
+      --min-pages=2
+      --max-pages=4
+      --iterations=1
+      --progress-passes=1
+      --request-credit-pages=1
+  )
+  set_tests_properties(
+    nta-paged-attention-rejects-underprovisioned-progress PROPERTIES
+    TIMEOUT 10
+    WILL_FAIL TRUE
+  )
+  add_test(
+    NAME nta-paged-attention-dax-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=dax
+      --requests=4
+      --min-pages=2
+      --max-pages=4
+      --iterations=2
+      --progress-passes=1
+  )
+  set_tests_properties(
+    nta-paged-attention-dax-gpu PROPERTIES
+    TIMEOUT 60
+    SKIP_RETURN_CODE 77
+  )
+  add_test(
+    NAME nta-paged-attention-nvme-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=nvme
+      --requests=4
+      --min-pages=2
+      --max-pages=4
+      --iterations=2
+      --progress-passes=32
+  )
+  set_tests_properties(
+    nta-paged-attention-nvme-gpu PROPERTIES
+    TIMEOUT 120
+    SKIP_RETURN_CODE 77
+  )
   if(NTA_HAVE_FLASHINFER AND Python3_Interpreter_FOUND)
     add_test(
       NAME nta-flashinfer-differential-gpu

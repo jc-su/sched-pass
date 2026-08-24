@@ -22,12 +22,14 @@ The implementation is split by responsibility:
 The partial form is valid only when the workload exposes a real continuation
 opportunity. Otherwise the exact late-bound form or conventional baseline is
 the appropriate arm. No arm may drop contributors, change the numerical
-contract, or use a quality selector to manufacture a speedup.
+contract, or use a quality selector to manufacture a speedup. B6 therefore
+measures a protocol capability and is not silently treated as the source of
+the SGLang headline result.
 
 The current SGLang serving path creates one `ExecutionSession` per real
-FlashInfer attention launch. The tier-streaming executor remains a reusable
-operator test and a future transport/consumer binding point; its historical
-performance snapshots are not current serving evidence.
+FlashInfer attention launch. The tier-streaming executor is a reusable
+operator-level implementation using the same exact work-unit contract; its
+historical performance snapshots are not current serving evidence.
 
 Evaluate this form with the shared exact demand trace in
 `experiments/heterogeneous-work-unit.json`, isolating partial continuation

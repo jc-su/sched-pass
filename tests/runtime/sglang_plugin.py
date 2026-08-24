@@ -51,7 +51,6 @@ def main() -> None:
 
     from nta_runtime.plugins.sglang import (
         BACKEND_NAME,
-        _retire_finished_request,
         register,
     )
 
@@ -72,7 +71,6 @@ def main() -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
     from nta_runtime.plugins.sglang import (
         _ABORT_TARGET,
-        _EXTERNAL_ADMISSION_TARGET,
         _HICACHE_LOAD_TARGET,
         _REQUEST_FINISH_TARGET,
         _RELEASE_TARGET,
@@ -101,10 +99,6 @@ def main() -> None:
     assert any(
         kind == HookType.AROUND
         for kind, _, _ in HookRegistry._hooks[_PREFILL_ADMISSION_TARGET]
-    )
-    assert any(
-        kind == HookType.AROUND
-        for kind, _, _ in HookRegistry._hooks[_EXTERNAL_ADMISSION_TARGET]
     )
     from nta_runtime.engines.sglang_admission import (
         AcquisitionAdmission,
@@ -325,169 +319,36 @@ def main() -> None:
         _group_external_pages_by_request,
         _pipeline_object_range,
         _plan_cache_signature,
+        _request_ranges,
     )
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
-
-    from nta_runtime.engines.sglang_external import (
-        VIRTUAL_TOKEN_BASE,
-        route_allocator_free,
-        route_cache_finished,
-        route_external_admission_credit,
-        route_init_load_back,
-    )
-
-    class ExternalDevicePool:
-        pass
-
-    class ExternalAllocator:
-        def __init__(self, device_pool) -> None:
-            self._kvcache = device_pool
-            self.allocations = []
-            self.frees = []
-            self.attempts = 0
-
-        def alloc(self, count):
-            self.attempts += 1
-            if self.attempts == 1:
-                return None
-            rows = torch.arange(100, 100 + count, dtype=torch.int64)
-            self.allocations.append(rows.clone())
-            return rows
-
-        def available_size(self):
-            return 0
-
-        def free(self, rows):
-            self.frees.append(rows.clone())
-
-    class ExternalNode:
-        def __init__(self, node_id, host_value, parent, evicted=True) -> None:
-            self.id = node_id
-            self.host_value = host_value
-            self.parent = parent
-            self.evicted = evicted
-            self.protected = 0
-
-        def protect_host(self):
-            self.protected += 1
-
-        def release_host(self):
-            self.protected -= 1
-
-    external_pool = ExternalDevicePool()
-    external_allocator = ExternalAllocator(external_pool)
-    external_controller = types.SimpleNamespace(
-        mem_pool_device=external_pool,
-        mem_pool_device_allocator=external_allocator,
-        device="cpu",
-    )
-    external_bridge = SglangHiCacheBridge(external_pool)
-    captured_handles = []
-    external_bridge.enable_external_prefixes(4, captured_handles.append)
-    resident_node = ExternalNode(1, None, None, evicted=False)
-    host_node = ExternalNode(
-        2, torch.arange(9, 15, dtype=torch.int64), resident_node
-    )
-    external_request = types.SimpleNamespace(
-        rid="external-request",
-        prefix_indices=torch.tensor((1, 2), dtype=torch.int64),
-        last_node=resident_node,
-        needs_host_load_back=lambda: True,
-        swa_host_hit_length=0,
-        mamba_host_hit_length=0,
-        host_hit_length=6,
-    )
-    external_evictions = []
-
-    def evict_external(params):
-        external_evictions.append(params.num_tokens)
-        return types.SimpleNamespace(num_tokens_evicted=params.num_tokens)
-
-    external_cache = types.SimpleNamespace(
-        cache_controller=external_controller,
-        page_size=1,
-        evict=evict_external,
-    )
-    external_params = types.SimpleNamespace(
-        req=external_request,
-        best_match_node=host_node,
-        host_hit_length=6,
-    )
-    virtual, last_node = route_init_load_back(
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("dense load-back executed")
+    ranges = _request_ranges(
+        (
+            RequestBinding(0, 5, 1, stable_request_id("r0")),
+            RequestBinding(1, 9, 1, stable_request_id("r1")),
         ),
-        external_cache,
-        external_params,
+        (0, 0, 1),
     )
-    assert last_node is resident_node
-    assert virtual.tolist() == list(range(VIRTUAL_TOKEN_BASE, VIRTUAL_TOKEN_BASE + 6))
-    assert external_evictions == [4]
-    assert external_allocator.allocations[0].numel() == 4
-    assert host_node.protected == 1 and len(captured_handles) == 1
-    external_stats = external_bridge.admission_stats()
-    assert external_stats["external_live_dense_rows"] == 6
-    assert external_stats["external_live_staging_rows"] == 4
-    assert external_stats["external_dense_high_water_rows"] == 6
-    assert external_stats["external_staging_high_water_rows"] == 4
-    finish_reasons = []
-    captured_handles[0].retire_callback = (
-        lambda reason: finish_reasons.append(reason) is None
-    )
-    _retire_finished_request(
-        types.SimpleNamespace(),
-        types.SimpleNamespace(
-            rid="external-request",
-            finished=lambda: True,
-            _nta_external_prefix=captured_handles[0],
-        ),
-    )
-    assert finish_reasons == ["finished"]
-    # The cache-release hook is the authoritative retirement edge. It is
-    # idempotent when an earlier result hook already completed the lease.
-    captured_handles[0]._released = True
-    request_finish_calls = []
-    external_request.cache_protected_len = 6
-    route_cache_finished(
-        lambda _cache, _request, is_insert=True: request_finish_calls.append(
-            (_request.cache_protected_len, is_insert)
-        ),
-        external_cache,
-        external_request,
-    )
-    assert request_finish_calls == [(2, False)]
-    captured_handles[0]._released = False
-    admission_offsets = []
-    adder = types.SimpleNamespace(
-        tree_cache=external_cache, rem_total_token_offset=50
-    )
+    assert [(item.work_begin, item.work_count, item.request_slot) for item in ranges] == [
+        (0, 2, 5),
+        (2, 1, 9),
+    ]
+    for malformed in ((0, 1, 0), (0, 0)):
+        try:
+            _request_ranges(
+                (
+                    RequestBinding(0, 5, 1, stable_request_id("r0")),
+                    RequestBinding(1, 9, 1, stable_request_id("r1")),
+                ),
+                malformed,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("malformed request schedule was accepted")
 
-    def admit(fake_adder, _request):
-        admission_offsets.append(fake_adder.rem_total_token_offset)
-        fake_adder.rem_total_token_offset += 3
-        return "admitted"
-
-    assert (
-        route_external_admission_credit(admit, adder, external_request)
-        == "admitted"
-    )
-    assert admission_offsets == [44]
-    assert adder.rem_total_token_offset == 53
-    physical_frees = []
-    route_allocator_free(
-        lambda _allocator, rows: physical_frees.append(rows.clone()),
-        external_allocator,
-        torch.tensor((7, VIRTUAL_TOKEN_BASE, 8), dtype=torch.int64),
-    )
-    assert physical_frees[0].tolist() == [7, 8]
-    captured_handles[0].release_resources()
-    assert external_allocator.frees[-1].tolist() == [100, 101, 102, 103]
-    assert host_node.protected == 0
-    external_stats = external_bridge.admission_stats()
-    assert external_stats["external_live_dense_rows"] == 0
-    assert external_stats["external_live_staging_rows"] == 0
     assert _pipeline_object_range(128, 0, 12) == (104, 128)
     assert _pipeline_object_range(128, 1, 12) == (80, 104)
     for invalid in ((0, 0, 12), (128, -1, 12), (48, 1, 12)):

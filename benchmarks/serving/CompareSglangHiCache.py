@@ -111,6 +111,18 @@ def require_clean_mechanism(
     def total(key: str) -> int:
         return sum(int(entry.get(key, 0)) for entry in stats)
 
+    protocols = {
+        str(entry.get("execution_protocol"))
+        for entry in stats
+        if entry.get("execution_protocol")
+    }
+    if len(protocols) != 1:
+        raise RuntimeError(
+            "NTA HiCache trial did not publish one execution protocol "
+            f"({sorted(protocols)})"
+        )
+    protocol = next(iter(protocols))
+
     fallbacks = total("hicache_fallback_batches")
     external_batches = total("hicache_external_batches")
     external_launches = total("external_launches")
@@ -120,19 +132,26 @@ def require_clean_mechanism(
     incremental = total("ticketed_incremental_launches")
     attention = total("decode_launches") + total("prefill_launches")
     stock_launches = total("stock_attention_launches")
+    stock_resident_launches = total("stock_resident_attention_launches")
+    stock_external_launches = total("stock_prefetched_external_attention_launches")
+    accounted_external_launches = external_launches + stock_external_launches
     if fallbacks:
         raise RuntimeError(f"NTA HiCache trial used {fallbacks} fallback batches")
-    if external_batches == 0 or external_launches == 0:
+    if external_batches == 0 or accounted_external_launches == 0:
         raise RuntimeError("NTA HiCache trial did not execute an external batch")
-    if external_launches != prefetched_layers + demand_layers:
+    if accounted_external_launches != prefetched_layers + demand_layers:
         raise RuntimeError(
             "external attention layers do not match acquisition layers "
-            f"({external_launches} != {prefetched_layers} + {demand_layers})"
+            f"({accounted_external_launches} != {prefetched_layers} + {demand_layers})"
         )
-    if stock_launches or transformed + incremental != attention:
+    if (
+        stock_launches != stock_resident_launches + stock_external_launches
+        or transformed + incremental + stock_launches != attention
+    ):
         raise RuntimeError(
             "attention accounting is not exact "
-            f"(stock={stock_launches}, transformed={transformed}, "
+            f"(stock={stock_launches}, resident_stock={stock_resident_launches}, "
+            f"external_stock={stock_external_launches}, transformed={transformed}, "
             f"incremental={incremental}, total={attention})"
         )
     contracts = [
@@ -146,9 +165,10 @@ def require_clean_mechanism(
 
     mixed_layers = total("mixed_dependency_layers")
     if (
-        os.environ.get("NTA_EXECUTION_PROTOCOL", "late_bound") == "late_bound"
+        protocol == "late_bound"
         and mixed_layers == 0
-        and external_launches > 0
+        and accounted_external_launches > 0
+        and stock_external_launches == 0
     ):
         raise RuntimeError(
             "late-bound trial formed no heterogeneous layer with direct and "
@@ -158,7 +178,10 @@ def require_clean_mechanism(
     compact_launches = total("compact_resume_launches")
     compact_ctas = total("compact_resume_cta_bound")
     canonical_ctas = total("canonical_resume_cta_bound")
-    if require_physical_compaction and (
+    # A complete exact prefetch legitimately uses the stock consumer for the
+    # external pages, so there is no resume grid to compact.  Compaction is a
+    # gate for the incremental form, not for this stock-consumer control arm.
+    if require_physical_compaction and incremental > 0 and (
         compact_launches == 0
         or compact_ctas == 0
         or canonical_ctas == 0
@@ -189,13 +212,25 @@ def require_clean_mechanism(
         )
     return {
         "all_attention_transformed": stock_launches == 0,
+        "external_attention_transformed": (
+            fallbacks == 0
+            and external_launches == prefetched_layers + demand_layers
+        ),
+        "external_attention_stock_consumer": stock_external_launches > 0,
+        "external_attention_accounted": (
+            fallbacks == 0
+            and accounted_external_launches == prefetched_layers + demand_layers
+        ),
+        "resident_reference_attention_launches": stock_resident_launches,
         "active_forms": [
             name
             for name, count in (("direct", transformed), ("incremental", incremental))
             if count
         ],
         "external_batches": external_batches,
-        "external_launches": external_launches,
+        "external_launches": accounted_external_launches,
+        "transformed_external_launches": external_launches,
+        "stock_prefetched_external_launches": stock_external_launches,
         "transformed_direct_launches": transformed,
         "ticketed_incremental_launches": incremental,
         "total_attention_launches": attention,
@@ -209,7 +244,17 @@ def require_clean_mechanism(
         "compact_resume_cta_ratio": (
             compact_ctas / canonical_ctas if canonical_ctas else None
         ),
+        "physical_compaction_applicable": incremental > 0,
+        "physical_compaction_proven": (
+            incremental == 0
+            or (
+                compact_launches > 0
+                and compact_ctas > 0
+                and canonical_ctas > compact_ctas
+            )
+        ),
         "demand_graph": demand_graph,
+        "execution_protocol": protocol,
     }
 def run(
     args: argparse.Namespace, backend: str, *, verify_transfer: bool = False

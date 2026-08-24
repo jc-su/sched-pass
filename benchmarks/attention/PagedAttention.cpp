@@ -1,9 +1,11 @@
 #include "benchmarks/CommonCuda.h"
 #include "benchmarks/attention/PagedAttentionTypes.h"
 #include "nta/DeviceWorkPlan.h"
+#include "nta/CxlRuntime.h"
 #include "nta/FinitePhase.h"
 #include "nta/FlashInferAdapter.h"
 #include "nta/HostRuntime.h"
+#include "nta/NvmeRuntime.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -43,7 +45,7 @@ using nta::benchmark::checkCuda;
 using nta::benchmark::checkDriver;
 using nta::benchmark::DeviceBuffer;
 
-enum class Mode { Resident, HostDirect, HostStaged, Mixed };
+enum class Mode { Resident, HostDirect, HostStaged, Mixed, Nvme, Dax };
 enum class CopyMode { Global, Tma };
 enum class SparsePolicy { LateBound, Overfetch };
 
@@ -60,6 +62,15 @@ struct Options {
   CopyMode copyMode = CopyMode::Global;
   bool json = false;
   std::string dumpOutput;
+  std::string cxlEndpoint;
+  std::size_t cxlWindowBytes = 0;
+  int cxlDevice = -1;
+  std::string nvmeEndpoint;
+  std::string nvmeReference;
+  std::uint64_t nvmeSourceOffset = 0;
+  std::uint32_t nvmeNamespace = 1;
+  std::uint32_t nvmeQueueDepth = 64;
+  bool nvmeCtaTryIssue = true;
 };
 
 class KernelModule {
@@ -267,6 +278,17 @@ std::uint32_t parsePositive(std::string_view value, std::string_view option) {
   return static_cast<std::uint32_t>(parsed);
 }
 
+int parseDeviceOrdinal(std::string_view value) {
+  const std::string storage(value);
+  char *end = nullptr;
+  const long parsed = std::strtol(storage.c_str(), &end, 10);
+  if (end == storage.c_str() || *end != '\0' || parsed < 0 ||
+      parsed > std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("invalid --cxl-device");
+  }
+  return static_cast<int>(parsed);
+}
+
 Options parseOptions(int argc, char **argv) {
   Options options;
   for (int index = 1; index < argc; ++index) {
@@ -286,6 +308,10 @@ Options parseOptions(int argc, char **argv) {
         options.mode = Mode::HostStaged;
       } else if (value == "mixed") {
         options.mode = Mode::Mixed;
+      } else if (value == "dax") {
+        options.mode = Mode::Dax;
+      } else if (value == "nvme") {
+        options.mode = Mode::Nvme;
       } else {
         throw std::invalid_argument("unknown attention mode");
       }
@@ -329,6 +355,40 @@ Options parseOptions(int argc, char **argv) {
         throw std::invalid_argument("--dump-output requires a path");
       }
       options.dumpOutput = value;
+    } else if (name == "--cxl-endpoint") {
+      if (value.empty()) {
+        throw std::invalid_argument("--cxl-endpoint requires a path");
+      }
+      options.cxlEndpoint = std::string(value);
+    } else if (name == "--cxl-window-mib") {
+      const std::uint32_t mib = parsePositive(value, name);
+      if (mib > std::numeric_limits<std::size_t>::max() / (1024U * 1024U)) {
+        throw std::invalid_argument("CXL DAX window is too large");
+      }
+      options.cxlWindowBytes = static_cast<std::size_t>(mib) * 1024U * 1024U;
+    } else if (name == "--cxl-device") {
+      options.cxlDevice = parseDeviceOrdinal(value);
+    } else if (name == "--nvme-endpoint") {
+      if (value.empty()) {
+        throw std::invalid_argument("--nvme-endpoint requires a VFIO path");
+      }
+      options.nvmeEndpoint = std::string(value);
+    } else if (name == "--nvme-reference") {
+      if (value.empty()) {
+        throw std::invalid_argument("--nvme-reference requires a path");
+      }
+      options.nvmeReference = std::string(value);
+    } else if (name == "--nvme-source-offset") {
+      options.nvmeSourceOffset = std::stoull(std::string(value));
+    } else if (name == "--nvme-namespace") {
+      options.nvmeNamespace = parsePositive(value, name);
+    } else if (name == "--nvme-queue-depth") {
+      options.nvmeQueueDepth = parsePositive(value, name);
+    } else if (name == "--nvme-cta-try-issue") {
+      if (value != "0" && value != "1") {
+        throw std::invalid_argument("--nvme-cta-try-issue must be 0 or 1");
+      }
+      options.nvmeCtaTryIssue = value == "1";
     } else {
       throw std::invalid_argument("unknown option " + std::string(name));
     }
@@ -344,6 +404,26 @@ Options parseOptions(int argc, char **argv) {
     throw std::invalid_argument(
         "query-dependent sparse attention currently uses global loads");
   }
+  if (options.mode == Mode::Dax && options.copyMode != CopyMode::Global) {
+    throw std::invalid_argument("DAX attention currently requires global loads");
+  }
+  if (options.mode == Mode::Nvme && options.copyMode != CopyMode::Global) {
+    throw std::invalid_argument("NVMe attention currently requires global loads");
+  }
+  if (options.mode == Mode::Nvme && options.sparseTopK != 0) {
+    throw std::invalid_argument(
+        "NVMe sparse attention is not part of the qualified exact-tier path");
+  }
+  const bool finiteProgressMode =
+      options.mode == Mode::HostStaged || options.mode == Mode::Mixed ||
+      options.mode == Mode::Nvme;
+  if (finiteProgressMode && options.sparseTopK == 0 &&
+      options.requestCreditPages != 0 &&
+      options.progressPasses < options.maxPages) {
+    throw std::invalid_argument(
+        "exact tier attention requires --progress-passes >= --max-pages "
+        "when --request-credit-pages is bounded");
+  }
   return options;
 }
 
@@ -356,6 +436,12 @@ nta::Placement placementFor(Mode mode, std::uint32_t tile) {
   }
   if (mode == Mode::HostStaged) {
     return nta::Placement::HostStaged;
+  }
+  if (mode == Mode::Nvme) {
+    return nta::Placement::HostStaged;
+  }
+  if (mode == Mode::Dax) {
+    return nta::Placement::CxlMapped;
   }
   switch (tile % 3U) {
   case 0:
@@ -377,12 +463,32 @@ const char *modeName(Mode mode) {
     return "host-staged";
   case Mode::Mixed:
     return "mixed";
+  case Mode::Dax:
+    return "dax";
+  case Mode::Nvme:
+    return "nvme";
   }
   return "unknown";
 }
 
 const char *copyModeName(CopyMode mode) {
   return mode == CopyMode::Tma ? "tma" : "global";
+}
+
+const char *tierName(Mode mode) {
+  switch (mode) {
+  case Mode::Resident:
+    return "hbm";
+  case Mode::HostDirect:
+  case Mode::HostStaged:
+  case Mode::Mixed:
+    return "host_mem";
+  case Mode::Nvme:
+    return "nvme";
+  case Mode::Dax:
+    return "dax";
+  }
+  return "unknown";
 }
 
 const char *sparsePolicyName(SparsePolicy policy) {
@@ -517,6 +623,24 @@ void writeFixture(const std::string &path,
   writeArray(output, queries);
   writeArray(output, pages);
   writeArray(output, outputValues);
+}
+
+void loadNvmeReference(const std::string &path, std::span<__half> pages) {
+  if (path.empty()) {
+    throw std::invalid_argument(
+        "NVMe attention requires --nvme-reference or "
+        "NTA_NVME_REFERENCE");
+  }
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open NVMe attention reference " + path);
+  }
+  input.read(reinterpret_cast<char *>(pages.data()),
+             static_cast<std::streamsize>(pages.size_bytes()));
+  if (input.gcount() != static_cast<std::streamsize>(pages.size_bytes())) {
+    throw std::runtime_error(
+        "NVMe attention reference is shorter than the page workload");
+  }
 }
 
 int runSparseAttention(
@@ -879,7 +1003,61 @@ int runSparseAttention(
 
 int main(int argc, char **argv) {
   try {
-    const Options options = parseOptions(argc, argv);
+    Options options = parseOptions(argc, argv);
+    if (options.mode == Mode::Dax) {
+      if (options.cxlEndpoint.empty()) {
+        const char *endpoint = std::getenv("NTA_CXL_DAX_DEVICE");
+        if (endpoint != nullptr) {
+          options.cxlEndpoint = endpoint;
+        }
+      }
+      if (options.cxlEndpoint.empty()) {
+        std::cerr << "nta-paged-attention dax skipped: set "
+                     "NTA_CXL_DAX_DEVICE or --cxl-endpoint=PATH\n";
+        return 77;
+      }
+      if (options.cxlWindowBytes == 0) {
+        const char *window = std::getenv("NTA_CXL_DAX_WINDOW_MIB");
+        const std::uint64_t mib =
+            window == nullptr || *window == '\0'
+                ? 1024U
+                : std::stoull(std::string(window));
+        if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() /
+                             (1024U * 1024U)) {
+          throw std::invalid_argument("invalid NTA_CXL_DAX_WINDOW_MIB");
+        }
+        options.cxlWindowBytes = static_cast<std::size_t>(mib) * 1024U * 1024U;
+      }
+      if (options.cxlDevice < 0) {
+        const char *device = std::getenv("NTA_CXL_DAX_GPU");
+        options.cxlDevice = device == nullptr || *device == '\0'
+                                ? 0
+                                : parseDeviceOrdinal(device);
+      }
+    }
+    if (options.mode == Mode::Nvme) {
+      if (options.nvmeEndpoint.empty()) {
+        const char *endpoint = std::getenv("NTA_NVME_ENDPOINT");
+        const char *bdf = std::getenv("NTA_NVME_BDF");
+        if (endpoint != nullptr && *endpoint != '\0') {
+          options.nvmeEndpoint = endpoint;
+        } else if (bdf != nullptr && *bdf != '\0') {
+          options.nvmeEndpoint =
+              std::string(bdf).starts_with("vfio:") ? bdf : "vfio:" + std::string(bdf);
+        }
+      }
+      if (options.nvmeReference.empty()) {
+        const char *reference = std::getenv("NTA_NVME_REFERENCE");
+        if (reference != nullptr) {
+          options.nvmeReference = reference;
+        }
+      }
+      if (options.nvmeEndpoint.empty() || options.nvmeReference.empty()) {
+        std::cerr << "nta-paged-attention nvme skipped: set "
+                     "NTA_NVME_ENDPOINT/NTA_NVME_BDF and NTA_NVME_REFERENCE\n";
+        return 77;
+      }
+    }
     checkDriver(cuInit(0), "cuInit");
     checkCuda(cudaSetDevice(0), "cudaSetDevice");
 
@@ -916,9 +1094,34 @@ int main(int argc, char **argv) {
     for (__half &value : pages) {
       value = __float2half(distribution(generator));
     }
+    if (options.mode == Mode::Nvme) {
+      loadNvmeReference(options.nvmeReference, pages);
+    }
 
-    nta::HostRuntime runtime(
-        {options.requests, taskCount, taskCount, taskCount});
+    nta::RuntimeBackends backends;
+    std::shared_ptr<nta::NvmeTransport> nvme;
+    std::shared_ptr<nta::CxlDaxTransport> cxl;
+    if (options.mode == Mode::Nvme) {
+      nta::NvmeTransportOptions nvmeOptions;
+      nvmeOptions.endpoint = options.nvmeEndpoint;
+      nvmeOptions.deviceOrdinal = 0;
+      nvmeOptions.namespaceId = options.nvmeNamespace;
+      nvmeOptions.queueDepth = options.nvmeQueueDepth;
+      nvme = std::make_shared<nta::NvmeTransport>(std::move(nvmeOptions));
+      backends.nvme = nvme;
+    }
+    if (options.mode == Mode::Dax) {
+      nta::CxlDaxOptions cxlOptions;
+      cxlOptions.endpoint = options.cxlEndpoint;
+      cxlOptions.windowBytes = options.cxlWindowBytes;
+      cxlOptions.deviceOrdinal = options.cxlDevice;
+      cxl = std::make_shared<nta::CxlDaxTransport>(std::move(cxlOptions));
+      backends.cxl = cxl;
+    }
+    nta::RuntimeConfig runtimeConfig{
+        options.requests, taskCount, taskCount, taskCount};
+    runtimeConfig.enableCtaNvmeTryIssue = options.nvmeCtaTryIssue;
+    nta::HostRuntime runtime(runtimeConfig, std::move(backends));
     for (std::uint32_t request = 0; request < options.requests; ++request) {
       const std::uint64_t requestCredit =
           options.requestCreditPages == 0
@@ -944,9 +1147,20 @@ int main(int argc, char **argv) {
           static_cast<std::size_t>(physicalPage) * valuesPerPage);
       const std::uint64_t objectId = 0x4b56504700000000ULL + physicalPage;
       const nta::Placement placement = placementFor(options.mode, physicalPage);
-      const nta::ObjectHandle object = runtime.installObject(
-          physicalPage, objectId, 1,
-          std::span<const std::byte>(page, pageBytes), placement);
+      nta::ObjectHandle object{};
+      if (options.mode == Mode::Nvme) {
+        std::unique_ptr<nta::NvmeBuffer> destination =
+            nvme->allocate(pageBytes);
+        object = runtime.installNvmeObject(
+            physicalPage, objectId, 1,
+            options.nvmeSourceOffset +
+                static_cast<std::uint64_t>(physicalPage) * pageBytes,
+            pageBytes, std::move(destination));
+      } else {
+        object = runtime.installObject(
+            physicalPage, objectId, 1,
+            std::span<const std::byte>(page, pageBytes), placement);
+      }
       std::uint64_t directTensorMap = 0;
       if (options.copyMode == CopyMode::Tma) {
         const nta::abi::ObjectEntry objectEntry =
@@ -1069,41 +1283,48 @@ int main(int argc, char **argv) {
     checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
               "cudaStreamBeginCapture");
     const std::uint32_t progressPasses =
-        options.mode == Mode::HostStaged || options.mode == Mode::Mixed
+        options.mode == Mode::HostStaged || options.mode == Mode::Mixed ||
+                options.mode == Mode::Nvme
             ? options.progressPasses
             : 0;
-    phases.enqueueHost(
-        driverStream, runtime.deviceView(),
-        {taskCount, taskCount, taskCount, progressPasses},
-        [&] {
-          checkCuda(cudaMemsetAsync(devicePartials.get(), 0,
-                                    tasks.size() * sizeof(AttentionTilePartial),
-                                    stream),
-                    "clear attention partials");
-          checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
-                                    expected.size() * sizeof(float), stream),
-                    "clear attention output");
-          if (options.copyMode == CopyMode::Tma) {
-            kernels.discoverTma(driverStream, runtime.deviceView(),
-                                deviceTasks.get(), devicePlan,
-                                deviceQueries.get(), devicePartials.get());
-          } else {
-            kernels.discover(driverStream, runtime.deviceView(),
-                             deviceTasks.get(), devicePlan, deviceQueries.get(),
-                             devicePartials.get());
-          }
-        },
-        [&] {
-          if (options.copyMode == CopyMode::Tma) {
-            kernels.readyTma(driverStream, runtime.deviceView(),
-                             deviceTasks.get(), devicePlan, deviceQueries.get(),
-                             devicePartials.get());
-          } else {
-            kernels.ready(driverStream, runtime.deviceView(), deviceTasks.get(),
-                          devicePlan, deviceQueries.get(),
-                          devicePartials.get());
-          }
-        });
+    auto initialPhase = [&] {
+      checkCuda(cudaMemsetAsync(devicePartials.get(), 0,
+                                tasks.size() * sizeof(AttentionTilePartial),
+                                stream),
+                "clear attention partials");
+      checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
+                                expected.size() * sizeof(float), stream),
+                "clear attention output");
+      if (options.copyMode == CopyMode::Tma) {
+        kernels.discoverTma(driverStream, runtime.deviceView(),
+                            deviceTasks.get(), devicePlan,
+                            deviceQueries.get(), devicePartials.get());
+      } else {
+        kernels.discover(driverStream, runtime.deviceView(), deviceTasks.get(),
+                         devicePlan, deviceQueries.get(),
+                         devicePartials.get());
+      }
+    };
+    auto readyPhase = [&] {
+      if (options.copyMode == CopyMode::Tma) {
+        kernels.readyTma(driverStream, runtime.deviceView(), deviceTasks.get(),
+                         devicePlan, deviceQueries.get(),
+                         devicePartials.get());
+      } else {
+        kernels.ready(driverStream, runtime.deviceView(), deviceTasks.get(),
+                     devicePlan, deviceQueries.get(),
+                     devicePartials.get());
+      }
+    };
+    if (options.mode == Mode::Nvme) {
+      phases.enqueueNvme(driverStream, runtime.deviceView(),
+                         {taskCount, taskCount, progressPasses, 32, 32},
+                         initialPhase, readyPhase);
+    } else {
+      phases.enqueueHost(driverStream, runtime.deviceView(),
+                         {taskCount, taskCount, taskCount, progressPasses},
+                         initialPhase, readyPhase);
+    }
     kernels.reduce(driverStream, runtime.deviceView(), deviceRequests.get(),
                    options.requests, devicePartials.get(), deviceOutput.get());
     checkCuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
@@ -1185,6 +1406,16 @@ int main(int argc, char **argv) {
     }
     const std::uint32_t failures =
         outputFailures + workTicketFailures + partialFailures + objectFailures;
+    nta::NvmeCapabilities nvmeCapabilities{};
+    nta::NvmeQueueStats nvmeStats{};
+    if (nvme != nullptr) {
+      nvmeCapabilities = nvme->capabilities();
+      nvmeStats = nvme->readStats();
+    }
+    nta::CxlDaxCapabilities cxlCapabilities{};
+    if (cxl != nullptr) {
+      cxlCapabilities = cxl->capabilities();
+    }
 
     const double milliseconds = elapsedMilliseconds / options.iterations;
     const double logicalGib =
@@ -1206,6 +1437,55 @@ int main(int argc, char **argv) {
               << " progress_passes=" << options.progressPasses
               << " request_credit_pages=" << options.requestCreditPages
               << " verification_failures=" << failures << '\n';
+    if (options.json) {
+      std::cout << "{\"schema\":1,\"classification\":\"nta-paged-attention\",\"mode\":\""
+                << modeName(options.mode)
+                << "\",\"copy\":\"" << copyModeName(options.copyMode)
+                << "\",\"tier\":\"" << tierName(options.mode)
+                << "\",\"demand_semantics\":\"exact\""
+                << ",\"requests\":" << options.requests
+                << ",\"kv_pages\":" << taskCount
+                << ",\"graph_ms\":" << std::fixed << std::setprecision(6)
+                << milliseconds << ",\"logical_gib_per_second\":"
+                << logicalGib / (milliseconds / 1000.0)
+                << ",\"max_abs_error\":" << std::scientific
+                << maximumError << ",\"useful_bytes\":"
+                << static_cast<std::uint64_t>(taskCount) * pageBytes
+                << ",\"physical_bytes\":"
+                << static_cast<std::uint64_t>(taskCount) * pageBytes
+                << ",\"intents_enqueued\":" << intentPool.enqueued
+                << ",\"intents_consumed\":" << intentPool.consumed
+                << ",\"qualification\":{";
+      if (nvme != nullptr) {
+        std::cout << "\"backend\":\"vfio-nvme\",\"qualified\":"
+                  << (nvmeCapabilities.gpuDoorbellMappingValidated &&
+                              nvmeCapabilities.translatedIommu &&
+                              nvmeCapabilities.namespaceReadOnly
+                          ? "true"
+                          : "false")
+                  << ",\"queue_depth\":" << nvmeCapabilities.queueDepth
+                  << ",\"lba_size\":" << nvmeCapabilities.lbaSize
+                  << ",\"submitted\":" << nvmeStats.submitted
+                  << ",\"completed\":" << nvmeStats.completed
+                  << ",\"failed\":" << nvmeStats.failed
+                  << ",\"direct_submitted\":" << nvmeStats.directSubmitted
+                  << ",\"direct_fallbacks\":" << nvmeStats.directFallbacks;
+      } else if (cxl != nullptr) {
+        std::cout << "\"backend\":\"cxl-devdax\",\"qualified\":"
+                  << (cxlCapabilities.hostRegistered &&
+                              cxlCapabilities.directDeviceVisible
+                          ? "true"
+                          : "false")
+                  << ",\"window_bytes\":" << cxlCapabilities.windowBytes
+                  << ",\"device_visible\":"
+                  << (cxlCapabilities.directDeviceVisible ? "true" : "false");
+      } else {
+        std::cout << "\"backend\":\"cuda\",\"qualified\":true";
+      }
+      std::cout
+                << "}"
+                << ",\"verification_failures\":" << failures << "}\n";
+    }
 
     (void)cudaEventDestroy(end);
     (void)cudaEventDestroy(begin);

@@ -1,4 +1,4 @@
-"""vLLM boundary adapter seam.
+"""vLLM boundary adapter.
 
 vLLM owns request IDs, block tables, cancellation, and scheduler slots.  The
 adapter accepts those already-normalized values and deliberately does not
@@ -65,7 +65,7 @@ class VllmAdapter(RequestIdentityAdapter):
         )
         return EngineBatch(self.engine, epoch, bindings, granularity)
 
-    def bind_scheduler_output(
+    def bind_forward(
         self,
         scheduler_output: Any,
         *,

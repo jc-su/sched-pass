@@ -25,9 +25,13 @@ from .runtime import (
     IndexedHostObject,
     JitPhaseProgram,
     OperatorCapability,
+    OperatorAccessProof,
     OperatorCoordinateMap,
+    OperatorDemandBinding,
     OperatorFamily,
     OperatorForm,
+    OperatorIdentityBinding,
+    OperatorInstrumentation,
     OperatorPartialState,
     OperatorPlan,
     OperatorPlanFlag,
@@ -893,6 +897,16 @@ class FlashInferTierStreamingOperator:
                     | OperatorCapability.GRAPH_REPLAY
                     | OperatorCapability.TYPED_FLASHINFER_FRONTEND
                 ),
+                instrumentation=(
+                    OperatorInstrumentation.TYPED_ACCESS_LOWERING
+                    | OperatorInstrumentation.EXACT_DEMAND
+                    | OperatorInstrumentation.GENERATION_SAFE_IDENTITY
+                    | OperatorInstrumentation.TIER_OWNERSHIP
+                ),
+                identity_binding=OperatorIdentityBinding.REQUEST_SLOT_GENERATION,
+                demand_binding=OperatorDemandBinding.EXACT_WORK_UNIT,
+                access_proof=OperatorAccessProof.TYPED_FRONTEND,
+                tier_mask=(1 << 6) - 1,
             )
             incremental.operator_contract.require(
                 family=OperatorFamily.FLASHINFER_PAGED_PREFILL,
@@ -907,6 +921,16 @@ class FlashInferTierStreamingOperator:
                     | OperatorCapability.GRAPH_REPLAY
                     | OperatorCapability.TYPED_FLASHINFER_FRONTEND
                 ),
+                instrumentation=(
+                    OperatorInstrumentation.TYPED_ACCESS_LOWERING
+                    | OperatorInstrumentation.EXACT_DEMAND
+                    | OperatorInstrumentation.GENERATION_SAFE_IDENTITY
+                    | OperatorInstrumentation.TIER_OWNERSHIP
+                ),
+                identity_binding=OperatorIdentityBinding.REQUEST_SLOT_GENERATION,
+                demand_binding=OperatorDemandBinding.EXACT_WORK_UNIT,
+                access_proof=OperatorAccessProof.TYPED_FRONTEND,
+                tier_mask=(1 << 6) - 1,
             )
             plan = require_operator_pair(direct, incremental)
             plan.require(

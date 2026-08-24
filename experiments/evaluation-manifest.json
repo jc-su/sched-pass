@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "classification": "nta-osdi-evaluation-contract",
+  "mechanism": "exact-late-bound-heterogeneous-work-unit",
+  "selection_semantics": "exact-demand-only",
+  "approximate_attention_claim": false,
+  "tiers": [
+    {
+      "id": "hbm",
+      "role": "resident-reference",
+      "qualification": "always",
+      "evidence": ["native_attention_correctness", "native_gpu_timing"]
+    },
+    {
+      "id": "host_mem",
+      "role": "host-registered-memory",
+      "backend": "host-mapped-or-host-staged",
+      "qualification": "cuda_can_map_host_memory",
+      "evidence": ["native_attention_correctness", "native_gpu_timing", "serving"]
+    },
+    {
+      "id": "nvme",
+      "role": "persistent-device-initiated-tier",
+      "backend": "vfio-nvme",
+      "qualification": "explicit_vfio_iommu_and_read_only_contract",
+      "evidence": ["transport_qualification", "native_acquisition_correctness", "native_gpu_timing"]
+    },
+    {
+      "id": "dax",
+      "role": "cxl-devdax-tier",
+      "backend": "cxl-dax-mapped",
+      "qualification": "explicit_devdax_endpoint_cuda_visible_mapping",
+      "evidence": ["mapping_qualification", "native_attention_correctness", "native_gpu_timing"]
+    }
+  ],
+  "research_questions": [
+    {
+      "id": "RQ0",
+      "question": "Where do anonymized production-shaped requests expose heterogeneous exact work?",
+      "primary_artifact": "bailian-structure-replay",
+      "metrics": ["input_length", "output_length", "shared_prefix_blocks", "arrival_burstiness", "state_heterogeneity"]
+    },
+    {
+      "id": "RQ1",
+      "question": "Does the mechanism improve serving goodput and tail latency under the same exact demand?",
+      "primary_artifact": "paired-serving-report",
+      "metrics": ["ttft_p50_p95_p99", "tpot_p50_p95_p99", "itl_p99", "slo_goodput", "output_correctness"]
+    },
+    {
+      "id": "RQ2",
+      "question": "Which mechanism boundary causes the improvement?",
+      "primary_artifact": "matched-ablation-matrix",
+      "metrics": ["host_round_trips", "device_demand_discoveries", "work_unit_ready_events", "staging_high_water", "physical_bytes"]
+    },
+    {
+      "id": "RQ3",
+      "question": "Does the benefit survive request, tier, load, arrival, and granularity strata?",
+      "primary_artifact": "stratified-serving-report",
+      "metrics": ["goodput", "tail_latency", "queue_delay", "admission_delay", "littles_law_residual"]
+    },
+    {
+      "id": "RQ4",
+      "question": "What is the CPU/GPU/control and memory cost of the mechanism?",
+      "primary_artifact": "profile-and-regression-bundle",
+      "metrics": ["gpu_utilization", "sm_occupancy", "cpu_time", "control_time", "tier_bandwidth", "io_depth"]
+    }
+  ],
+  "arms": [
+    {"id": "B0", "name": "resident-exact-conventional", "exact_demand": true},
+    {"id": "B1", "name": "host-promotion-batch-barrier", "exact_demand": true},
+    {"id": "B2", "name": "host-demand-conventional-gather", "exact_demand": true},
+    {"id": "B3", "name": "device-demand-conventional-gather", "exact_demand": true},
+    {"id": "B4", "name": "device-demand-late-bound", "exact_demand": true},
+    {"id": "B5", "name": "heterogeneous-bounded-work-units", "exact_demand": true},
+    {"id": "B6", "name": "exact-partial-continuation", "exact_demand": true, "serving_headline": false}
+  ],
+  "causal_pairs": [
+    {"numerator": "B1", "denominator": "B0", "role": "residency_boundary"},
+    {"numerator": "B2", "denominator": "B1", "role": "host_demand_boundary"},
+    {"numerator": "B3", "denominator": "B2", "role": "device_selection_boundary"},
+    {"numerator": "B4", "denominator": "B3", "role": "late_binding_boundary"},
+    {"numerator": "B5", "denominator": "B4", "role": "heterogeneous_work_unit_boundary"},
+    {"numerator": "B6", "denominator": "B5", "role": "partial_protocol_boundary"},
+    {"numerator": "B3", "denominator": "B1", "role": "host_round_trip_isolation"},
+    {"numerator": "B5", "denominator": "B3", "role": "complete_mechanism_isolation"}
+  ],
+  "strata": {
+    "request_state": ["resident", "external_ready", "external_blocked", "new_arrival", "mixed"],
+    "granularity": ["request", "layer", "page_group", "cta_tile"],
+    "load_ratio": ["control_dominated", "balanced", "compute_dominated"],
+    "availability_skew": ["low", "medium", "high"],
+    "staging_pressure": ["under_capacity", "near_capacity", "over_capacity"],
+    "arrival": ["batch_release", "calibrated_open_loop", "trace_timestamp", "burst"]
+  },
+  "fairness": [
+    "same request records and arrival offsets per paired arm",
+    "same exact demanded block/object IDs and page order",
+    "same output correctness contract and random seed",
+    "same model, tokenizer, CUDA graph, chunking, and scheduler bounds",
+    "tier changes transport placement/qualification, never demand semantics",
+    "offline trace order is never labeled production arrival"
+  ],
+  "statistical_protocol": {
+    "warmup_excluded": true,
+    "randomized_paired_arm_order": true,
+    "minimum_repetitions": 5,
+    "preferred_repetitions": 10,
+    "confidence_interval": "paired-bootstrap-95-percent",
+    "report_per_stratum_before_aggregate": true,
+    "reject_cherry_picking": true
+  },
+  "qualification_rules": {
+    "dax_without_endpoint": "skip_not_pass",
+    "nvme_without_vfio_iommu": "skip_not_pass",
+    "synthetic_timing": "contract_evidence_only",
+    "serving_speedup_requires": ["structured_report", "exact_demand_counters", "correctness_digest", "machine_metadata"]
+  }
+}

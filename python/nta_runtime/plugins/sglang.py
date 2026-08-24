@@ -28,25 +28,6 @@ _FORWARD_BATCH_TARGET = (
 _PREFILL_ADMISSION_TARGET = (
     "sglang.srt.managers.scheduler.Scheduler._get_new_batch_prefill_raw"
 )
-_EXTERNAL_ADMISSION_TARGET = (
-    "sglang.srt.managers.schedule_policy.PrefillAdder.add_one_req"
-)
-_EXTERNAL_PREFIX_TARGETS = (
-    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.init_load_back",
-    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.init_load_back",
-)
-_CACHE_UNFINISHED_TARGETS = (
-    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.cache_unfinished_req",
-    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.cache_unfinished_req",
-)
-_CACHE_FINISHED_TARGETS = (
-    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.cache_finished_req",
-    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.cache_finished_req",
-)
-_ALLOCATOR_FREE_TARGETS = (
-    "sglang.srt.mem_cache.allocator.token.TokenToKVPoolAllocator.free",
-    "sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator.free",
-)
 
 
 _OBSERVABILITY_DEGRADED: dict[str, int] = {}
@@ -282,11 +263,6 @@ def _retire_finished_request(processor, req, *args, **kwargs) -> None:
     request_id = getattr(req, "rid", "") or ""
     if not request_id:
         raise RuntimeError("finished SGLang request omitted its request ID")
-    handle = getattr(req, "_nta_external_prefix", None)
-    if handle is not None:
-        if not handle._released and not handle.retire("finished"):
-            raise RuntimeError("finished external prefix lost its runtime lease")
-        return
 
 
 def _attach_request_priorities(forward_batch, cls, batch, model_runner):
@@ -329,13 +305,6 @@ def register() -> None:
     )
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
     from nta_runtime.engines.sglang_hicache import route_start_loading
-    from nta_runtime.engines.sglang_external import (
-        route_allocator_free,
-        route_cache_finished,
-        route_cache_unfinished,
-        route_external_admission_credit,
-        route_init_load_back,
-    )
     from nta_runtime.engines.sglang_admission import route_prefill_admission
 
     _preserve_graph_request_metadata()
@@ -377,40 +346,6 @@ def register() -> None:
             route_prefill_admission,
             HookType.AROUND,
         )
-    external_admission_hooks = HookRegistry._hooks[_EXTERNAL_ADMISSION_TARGET]
-    if not any(
-        hook is route_external_admission_credit
-        for _, hook, _ in external_admission_hooks
-    ):
-        HookRegistry.register(
-            _EXTERNAL_ADMISSION_TARGET,
-            route_external_admission_credit,
-            HookType.AROUND,
-        )
-    for target in _EXTERNAL_PREFIX_TARGETS:
-        hooks = HookRegistry._hooks[target]
-        if not any(hook is route_init_load_back for _, hook, _ in hooks):
-            HookRegistry.register(
-                target, route_init_load_back, HookType.AROUND
-            )
-    for target in _CACHE_UNFINISHED_TARGETS:
-        hooks = HookRegistry._hooks[target]
-        if not any(hook is route_cache_unfinished for _, hook, _ in hooks):
-            HookRegistry.register(
-                target, route_cache_unfinished, HookType.AROUND
-            )
-    for target in _CACHE_FINISHED_TARGETS:
-        hooks = HookRegistry._hooks[target]
-        if not any(hook is route_cache_finished for _, hook, _ in hooks):
-            HookRegistry.register(
-                target, route_cache_finished, HookType.AROUND
-            )
-    for target in _ALLOCATOR_FREE_TARGETS:
-        hooks = HookRegistry._hooks[target]
-        if not any(hook is route_allocator_free for _, hook, _ in hooks):
-            HookRegistry.register(
-                target, route_allocator_free, HookType.AROUND
-            )
     if BACKEND_NAME in ATTENTION_BACKENDS:
         return
 

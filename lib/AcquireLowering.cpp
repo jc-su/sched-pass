@@ -3,6 +3,7 @@
 #include "PartialLoweringInternal.h"
 
 #include "nta/AcquireIR.h"
+#include "nta/OperatorContract.h"
 #include "nta/Passes.h"
 #include "nta/RuntimeABI.h"
 
@@ -40,6 +41,95 @@ STATISTIC(SitesRejected, "Number of unsafe NTA sites rejected");
 
 namespace nta {
 namespace {
+
+bool readTypedContractWord(const Module &module, StringRef name,
+                           std::uint64_t &value) {
+  const GlobalVariable *global = module.getNamedGlobal(name);
+  if (global == nullptr || !global->hasInitializer()) {
+    return false;
+  }
+  const auto *constant = dyn_cast<ConstantInt>(global->getInitializer());
+  if (constant == nullptr) {
+    return false;
+  }
+  value = constant->getZExtValue();
+  return true;
+}
+
+bool hasMarkerCall(const Module &module, StringRef name) {
+  for (const Function &function : module) {
+    if (function.isDeclaration()) {
+      continue;
+    }
+    for (const BasicBlock &block : function) {
+      for (const Instruction &instruction : block) {
+        const auto *call = dyn_cast<CallBase>(&instruction);
+        if (call == nullptr) {
+          continue;
+        }
+        const Function *callee = dyn_cast<Function>(
+            call->getCalledOperand()->stripPointerCasts());
+        if (callee != nullptr && callee->getName() == name) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+bool hasDeviceKernel(const Module &module) {
+  return llvm::any_of(module, [](const Function &function) {
+    return !function.isDeclaration() &&
+           function.getCallingConv() == CallingConv::PTX_Kernel;
+  });
+}
+
+void validateTypedInstrumentationContract(const Module &module) {
+  std::uint64_t flags = 0;
+  if (!readTypedContractWord(module, "nta_jit_instrumentation_flags", flags)) {
+    return;
+  }
+  std::uint64_t identity = 0;
+  std::uint64_t demand = 0;
+  std::uint64_t proof = 0;
+  std::uint64_t tierMask = 0;
+  if (!readTypedContractWord(module, "nta_jit_identity_binding", identity) ||
+      !readTypedContractWord(module, "nta_jit_demand_binding", demand) ||
+      !readTypedContractWord(module, "nta_jit_access_proof", proof) ||
+      !readTypedContractWord(module, "nta_jit_tier_mask", tierMask)) {
+    report_fatal_error(
+        "NTA typed operator contract is incomplete; refusing unverified code");
+  }
+  constexpr std::uint64_t requiredFlags =
+      operator_contract::TypedAccessLowering |
+      operator_contract::ExactDemand |
+      operator_contract::GenerationSafeIdentity |
+      operator_contract::TierOwnership;
+  if ((flags & requiredFlags) != requiredFlags ||
+      identity != static_cast<std::uint64_t>(
+                      operator_contract::IdentityBinding::RequestSlotGeneration) ||
+      demand != static_cast<std::uint64_t>(
+                    operator_contract::DemandBinding::ExactWorkUnit) ||
+      proof != static_cast<std::uint64_t>(
+                   operator_contract::AccessProof::TypedFrontend) ||
+      tierMask == 0) {
+    report_fatal_error(
+        "NTA typed operator contract lacks exact identity/demand/tier proofs");
+  }
+  // JIT emits the contract constants into every translation unit because the
+  // runtime ABI symbol is shared by kernels and binding helpers.  Only a
+  // device-kernel module can be an instrumented operator; helper/binding
+  // modules are allowed to carry the same contract without marker calls.
+  if (hasDeviceKernel(module) &&
+      (!hasMarkerCall(module, ir::BindMarker) ||
+       (!hasMarkerCall(module, ir::AcquireMarker) &&
+        !hasMarkerCall(module, ir::AcquireTensorMapMarker) &&
+        !hasMarkerCall(module, ir::AcquireSetMarker)))) {
+    report_fatal_error(
+        "NTA typed operator contract has no typed acquisition markers");
+  }
+}
 
 MDNode *acquisitionMetadata(LLVMContext &context, bool tensorMap) {
   Metadata *fields[] = {
@@ -269,6 +359,7 @@ void removeUnusedMarker(Module &module, StringRef name) {
 PreservedAnalyses
 AcquireLoweringPass::run(Module &module,
                          ModuleAnalysisManager &analysisManager) {
+  validateTypedInstrumentationContract(module);
   std::vector<FunctionPlan> plans;
   plans.reserve(module.size());
 
@@ -279,8 +370,9 @@ AcquireLoweringPass::run(Module &module,
   }
 
   // Structural candidate discovery (diagnostic only): for functions with
-  // no NTA markers at all, report paged-signature sites so the typed-
-  // frontend gap is measurable. Proposes, never authorizes.
+  // no NTA markers at all, report paged-signature sites so structural proof
+  // coverage is measurable. The typed module contract above still does not
+  // authorize a raw pointer; only validated typed markers are lowered.
   if (std::getenv("NTA_DISCOVERY_NOTES") != nullptr) {
     auto &discoveryAnalyses =
         analysisManager.getResult<FunctionAnalysisManagerModuleProxy>(module)

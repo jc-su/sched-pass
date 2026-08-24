@@ -1,4 +1,5 @@
 #include "nta/RuntimeABI.h"
+#include "nta/Tier.h"
 
 #include <cstddef>
 #include <iostream>
@@ -73,7 +74,11 @@ int main() {
                 23);
   static_assert(
       destinationTransferIndexLimit(packTransferIndexLimits(23, 47)) == 47);
-  if (Version != 27 || InvalidIndex != 0xffffffffU || BackendCount != 5 ||
+  static_assert(nta::decodeTierCapabilities(
+                    nta::encodeTierCapabilities(nta::TierDirectAddress |
+                                                 nta::TierHostRegistered)) ==
+                (nta::TierDirectAddress | nta::TierHostRegistered));
+  if (Version != 28 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

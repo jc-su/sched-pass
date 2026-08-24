@@ -73,18 +73,27 @@ def main() -> None:
     assert forced.rounds == 2
     assert forced.block_counts == (8, 8)
     assert forced.predicted_incremental_ns > forced.predicted_atomic_ns
+    one_round = plan_host_execution(
+        object_count=16,
+        transfer_bytes=64 * 1024,
+        runnable_tiles=8,
+        model=model,
+        force_rounds=1,
+    )
+    assert one_round.rounds == 1
+    assert one_round.block_counts == (16,)
     try:
         plan_host_execution(
             object_count=16,
             transfer_bytes=64 * 1024,
             runnable_tiles=8,
             model=model,
-            force_rounds=1,
+            force_rounds=0,
         )
     except ValueError:
         pass
     else:
-        raise AssertionError("one forced host round was accepted as incremental")
+        raise AssertionError("zero forced host rounds were accepted")
     try:
         plan_host_execution(object_count=0, transfer_bytes=1, runnable_tiles=1, model=model)
     except ValueError:

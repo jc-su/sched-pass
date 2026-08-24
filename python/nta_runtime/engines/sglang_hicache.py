@@ -75,25 +75,6 @@ class SglangHiCacheBridge:
         self._pending: dict[int, PendingHostLoad] = {}
         self._owned: dict[int, PendingHostLoad] = {}
         self._next_lease_id = 1
-        # Fixed-width recyclable ranges instead of a burn-forever cursor: a
-        # soak run's namespace consumption is bounded by live leases, not
-        # lifetime leases. Width must cover the largest external prefix.
-        from nta_runtime.virtual_namespace import VirtualTokenNamespace
-
-        self._virtual_ranges = VirtualTokenNamespace(
-            int(
-                os.environ.get(
-                    "NTA_EXECUTION_VIRTUAL_RANGE_TOKENS", str(1 << 17)
-                )
-                or (1 << 17)
-            )
-        )
-        self._external_prefix_capacity_rows = 0
-        self._external_prefixes: dict[str, Any] = {}
-        self._external_live_dense_rows = 0
-        self._external_live_staging_rows = 0
-        self._external_dense_high_water_rows = 0
-        self._external_staging_high_water_rows = 0
         self._lock = threading.Lock()
         self._prefetch_callback: Any = None
         self._admission_stats: dict[str, int] = {}
@@ -105,174 +86,6 @@ class SglangHiCacheBridge:
 
     def set_prefetch_callback(self, callback: Any) -> None:
         self._prefetch_callback = callback
-
-    @property
-    def external_prefix_enabled(self) -> bool:
-        return self._external_prefix_capacity_rows > 0
-
-    def enable_external_prefixes(
-        self, capacity_rows: int, callback: Any, *, page_tokens: int = 1
-    ) -> None:
-        if capacity_rows <= 0 or not callable(callback):
-            raise ValueError("external-prefix ownership requires capacity and callback")
-        if page_tokens <= 0 or capacity_rows % page_tokens != 0:
-            raise ValueError(
-                "external-prefix capacity must be page-aligned"
-            )
-        self._external_prefix_capacity_rows = capacity_rows
-        self._external_prefix_page_tokens = page_tokens
-        self._prefetch_callback = callback
-
-    def lease_external_prefix(
-        self,
-        request: Any,
-        host_indices: torch.Tensor,
-        source_release: Any,
-        controller: Any,
-        cache: Any,
-        *,
-        node_ids: tuple[int, ...],
-    ) -> Any:
-        """Allocate virtual identity plus bounded physical staging rows."""
-        from nta_runtime.engines.sglang_external import ExternalPrefixHandle
-
-        if not self.external_prefix_enabled:
-            raise RuntimeError("external-prefix ownership is disabled")
-        request_id = str(getattr(request, "rid", "") or "")
-        if not request_id:
-            raise RuntimeError("external-prefix request omitted its ID")
-        with self._lock:
-            if request_id in self._external_prefixes:
-                raise RuntimeError("request already has a live external prefix")
-        token_count = int(host_indices.numel())
-        if token_count <= 0:
-            raise RuntimeError("external-prefix request has no host rows")
-        if controller is None or controller.mem_pool_device is not self.device_pool:
-            raise RuntimeError("external-prefix request omitted its cache controller")
-        allocator = getattr(
-            controller.mem_pool_device_allocator,
-            "full_attn_allocator",
-            controller.mem_pool_device_allocator,
-        )
-        # Staging is leased in whole pages: the device cache and the
-        # compaction kernel both require page-aligned capacity, and a
-        # sub-page lease still owns one full slot.
-        page_tokens = getattr(self, "_external_prefix_page_tokens", 1)
-        lease_pages = (token_count + page_tokens - 1) // page_tokens
-        physical_capacity = min(
-            self._external_prefix_capacity_rows, lease_pages * page_tokens
-        )
-        staging_rows = allocator.alloc(physical_capacity)
-        evicted_rows = 0
-        if staging_rows is None:
-            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
-            available = int(allocator.available_size())
-            needed = max(1, physical_capacity - available)
-            eviction = cache.evict(EvictParams(num_tokens=needed))
-            evicted_rows = int(eviction.num_tokens_evicted)
-            staging_rows = allocator.alloc(physical_capacity)
-        if staging_rows is None:
-            raise RuntimeError("bounded external-prefix staging pool is exhausted")
-        if int(staging_rows.numel()) != physical_capacity:
-            allocator.free(staging_rows)
-            raise RuntimeError("bounded staging allocator returned malformed rows")
-        with self._lock:
-            lease_id = self._next_lease_id
-            self._next_lease_id += 1
-        try:
-            virtual_lease, virtual_begin = self._virtual_ranges.acquire(
-                lease_id, token_count
-            )
-        except RuntimeError:
-            allocator.free(staging_rows)
-            raise
-        virtual_end = virtual_begin + token_count
-        try:
-            virtual = torch.arange(
-                virtual_begin,
-                virtual_end,
-                dtype=torch.int64,
-                device=controller.device,
-            )
-        except Exception:
-            # Nothing downstream owns these resources yet; a failure here
-            # must not leak bounded staging rows or the leased range.
-            allocator.free(staging_rows)
-            self._virtual_ranges.release(virtual_lease)
-            raise
-        def registry_release(handle: Any) -> None:
-            with self._lock:
-                current = self._external_prefixes.get(handle.request_id)
-                if current is not handle:
-                    raise RuntimeError("external-prefix registry lost ownership")
-                self._external_prefixes.pop(handle.request_id)
-                self._external_live_dense_rows -= token_count
-                self._external_live_staging_rows -= physical_capacity
-                if (
-                    self._external_live_dense_rows < 0
-                    or self._external_live_staging_rows < 0
-                ):
-                    raise RuntimeError("external-prefix capacity accounting underflow")
-            # Runs behind the GPU completion fence with the staging-row
-            # free, so no in-flight device work can observe the recycled
-            # virtual ids.
-            self._virtual_ranges.release(virtual_lease)
-
-        handle = ExternalPrefixHandle(
-            lease_id=lease_id,
-            request_id=request_id,
-            consumer_index=-1,
-            host_indices=host_indices,
-            device_indices=virtual,
-            staging_rows=staging_rows,
-            controller=controller,
-            node_ids=node_ids,
-            resident_prefix_len=int(request.prefix_indices.numel()),
-            source_release=source_release,
-            registry_release=registry_release,
-        )
-        with self._lock:
-            duplicate = request_id in self._external_prefixes
-            if not duplicate:
-                self._external_prefixes[request_id] = handle
-                self._external_live_dense_rows += token_count
-                self._external_live_staging_rows += physical_capacity
-                self._external_dense_high_water_rows = max(
-                    self._external_dense_high_water_rows,
-                    self._external_live_dense_rows,
-                )
-                self._external_staging_high_water_rows = max(
-                    self._external_staging_high_water_rows,
-                    self._external_live_staging_rows,
-                )
-        if duplicate:
-            allocator.free(staging_rows)
-            raise RuntimeError("request acquired two external-prefix leases")
-        try:
-            self._prefetch_callback(handle)
-        except Exception:
-            with self._lock:
-                self._external_prefixes.pop(request_id, None)
-                self._external_live_dense_rows -= token_count
-                self._external_live_staging_rows -= physical_capacity
-            allocator.free(staging_rows)
-            raise
-        self.record_admission(
-            external_prefix_leases=1,
-            # A sub-page lease stages a whole slot and avoids nothing; the
-            # honest floor is zero, never a negative avoidance.
-            external_dense_slots_avoided=max(
-                0, token_count - physical_capacity
-            ),
-            external_staging_slots=physical_capacity,
-            external_staging_evicted_rows=evicted_rows,
-        )
-        return handle
-
-    def external_prefix(self, request_id: str) -> Any | None:
-        with self._lock:
-            return self._external_prefixes.get(request_id)
 
     @staticmethod
     def supports(controller: Any) -> bool:
@@ -425,16 +238,7 @@ class SglangHiCacheBridge:
 
     def admission_stats(self) -> dict[str, int]:
         with self._lock:
-            result = dict(self._admission_stats)
-            result.update(
-                external_live_dense_rows=self._external_live_dense_rows,
-                external_live_staging_rows=self._external_live_staging_rows,
-                external_dense_high_water_rows=self._external_dense_high_water_rows,
-                external_staging_high_water_rows=(
-                    self._external_staging_high_water_rows
-                ),
-            )
-            return result
+            return dict(self._admission_stats)
 
     def progress_publication_available(self) -> bool:
         """Return whether another nonblocking compiler snapshot can be retained."""

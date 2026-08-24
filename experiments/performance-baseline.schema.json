@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "classification": "nta-performance-baseline",
+  "revision": "captured-git-revision",
+  "machine": "captured-machine-fingerprint",
+  "report": {
+    "verification_failures": 0,
+    "graph_ms": 1.0,
+    "useful_gib_per_second": 1.0
+  },
+  "metrics": [
+    {"name": "graph latency", "path": "graph_ms", "direction": "lower_is_better", "relative_tolerance": 0.05},
+    {"name": "useful bandwidth", "path": "useful_gib_per_second", "direction": "higher_is_better", "relative_tolerance": 0.05}
+  ]
+}

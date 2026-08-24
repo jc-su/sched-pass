@@ -13,7 +13,7 @@ engine adapter
   -> WorkBatch / DemandDescriptor
   -> ExecutionSession / WorkLedger
   -> DeviceWorkPlan semantic-to-native bridge
-  -> compiler-mapped consumer
+  -> typed LLVM lowering + contract-checked consumer
 ```
 
 SGLang and vLLM are adapters, not runtime implementations. The native ABI
@@ -23,6 +23,20 @@ demand, and availability before native submission.
 The serving path is exact. Selection is an input trace, not a hidden runtime
 policy. Conventional, late-bound, and exact-partial forms
 share the same work-unit identity and demand trace.
+
+Resident-only forwards take the framework's reference FlashInfer wrapper. This
+is an intentional zero-regression boundary: the compiler/runtime mechanism is
+entered only when the forward has an external-tier dependency. A mixed forward
+still uses one NTA launch and carries resident and external work units together;
+the reference path is not used to hide external work or to change demand.
+
+The native runtime exposes one tier directory for HBM, mapped host memory,
+host-staged memory, NVMe, and CXL DAX. The same descriptor is consumed by
+host admission, device-visible backend metadata, and experiment telemetry.
+The LLVM pass uses structural pointer/load proofs only for access shape; the
+typed operator contract supplies request-generation identity, exact demand,
+and tier ownership. An unmarked or incomplete contract never authorizes a
+raw pointer to become a transport request.
 
 See [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md) for framework boundaries
 and [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md) for evaluation rules.

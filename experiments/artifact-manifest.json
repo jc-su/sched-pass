@@ -1,0 +1,138 @@
+{
+  "schema": 1,
+  "name": "nta-late-bound-work-unit",
+  "implementation_roots": [
+    "include",
+    "lib",
+    "runtime",
+    "python/nta_runtime"
+  ],
+  "canonical_entrypoints": {
+    "workload": [
+      "experiments/fetch_bailian.py",
+      "experiments/prepare_bailian.py",
+      "experiments/validate_workload.py",
+      "experiments/analyze_workload.py"
+    ],
+    "qualification": [
+      "experiments/qualify_tiers.py",
+      "experiments/validate_tier_qualification.py"
+    ],
+    "evaluation": [
+      "experiments/run_evaluation.py",
+      "experiments/make_evaluation_spec.py",
+      "experiments/analyze_evaluation.py",
+      "experiments/validate_evaluation_artifact.py"
+    ],
+    "hardware": [
+      "experiments/inspect_hardware.py"
+    ],
+    "serving": [
+      "benchmarks/serving/CompareSglangHiCacheLoad.py",
+      "experiments/validate_serving_report.py"
+    ],
+    "artifact": [
+      "experiments/reproduce.py",
+      "experiments/validate_bundle.py"
+    ]
+  },
+  "experiment_roots": [
+    "experiments",
+    "benchmarks",
+    "scripts"
+  ],
+  "evaluation_contract": "experiments/evaluation-manifest.json",
+  "workload_tools": [
+    "experiments/fetch_bailian.py",
+    "experiments/bailian.py",
+    "experiments/prepare_bailian.py",
+    "experiments/validate_workload.py",
+    "experiments/analyze_workload.py",
+    "experiments/validate_tier_qualification.py",
+    "experiments/qualify_tiers.py",
+    "experiments/tier-qualification.schema.json"
+  ],
+  "evaluation_tools": [
+    "experiments/run_evaluation.py",
+    "experiments/make_evaluation_spec.py",
+    "experiments/analyze_evaluation.py",
+    "experiments/validate_evaluation_artifact.py",
+    "experiments/validate_tier_qualification.py",
+    "experiments/validate_serving_report.py",
+    "experiments/profile.py",
+    "experiments/check_regression.py"
+  ],
+  "hardware_tools": [
+    "experiments/hardware.py",
+    "experiments/inspect_hardware.py"
+  ],
+  "profiles": {
+    "core": {
+      "kind": "dependency-free-contract",
+      "entrypoint": "experiments/run_work_unit_matrix.py",
+      "validator": "experiments/validate_matrix_artifact.py",
+      "requires": ["python >= 3.10"],
+      "outputs": ["matrix.json", "workload-manifest.json", "metadata.json", "logs/"]
+    },
+    "matrix": {
+      "kind": "full-contract-matrix",
+      "entrypoint": "experiments/run_work_unit_matrix.py",
+      "validator": "experiments/validate_matrix_artifact.py",
+      "requires": ["python >= 3.10"],
+      "outputs": ["matrix.json", "workload-manifest.json", "metadata.json", "logs/"]
+    },
+    "evaluation": {
+      "kind": "qualified-paired-evaluation",
+      "commands": ["experiments/run_evaluation.py", "experiments/validate_evaluation_artifact.py"],
+      "requires": ["external normalized workload", "paired evaluation spec", "qualified engine or native command"],
+      "outputs": ["evaluation/", "evaluation-spec.json", "workload/", "tier-qualification.json (for NVMe/DAX)", "metadata.json", "logs/"]
+    },
+    "hardware": {
+      "kind": "read-only-capability-inventory",
+      "commands": ["experiments/inspect_hardware.py"],
+      "requires": ["Python >= 3.10"],
+      "outputs": ["hardware-inventory.json", "metadata.json", "logs/"]
+    },
+    "build": {
+      "kind": "native-build",
+      "commands": ["cmake configure", "cmake build"],
+      "requires": [
+        "CMake >= 3.24",
+        "one matching LLVM package for opt/llc/clang++",
+        "Ninja or Make"
+      ],
+      "outputs": ["metadata.json", "logs/"]
+    },
+    "test": {
+      "kind": "full-ctest",
+      "commands": ["cmake configure", "cmake build", "ctest"],
+      "requires": ["build dependencies", "one matching LLVM package for opt/llc/clang++"],
+      "outputs": ["metadata.json", "logs/"]
+    },
+    "serving": {
+      "kind": "user-supplied-serving-command",
+      "commands": [
+        "the command after -- is recorded and executed verbatim",
+        "experiments/validate_serving_report.py"
+      ],
+      "requires": [
+        "pinned SGLang/FlashInfer/model environment",
+        "GPU",
+        "structured result file supplied with --result"
+      ],
+      "outputs": ["metadata.json", "logs/"]
+    }
+  },
+  "rules": [
+    "artifact output is never written into source or build trees",
+    "every command is recorded with its exact argv, duration, and raw log",
+    "repository revision, dirty state, source digest, machine, and Python distributions are recorded",
+    "synthetic matrix timing is never labeled serving evidence",
+    "serving commands must provide their own workload and validated output contract",
+    "Bailian offline order is never treated as production arrival",
+    "DAX and NVMe evidence is capability-gated and skipped when hardware is absent",
+    "hardware inventory is read-only and never binds PCI devices or opens block namespaces",
+    "performance regression checks compare captured baselines, never hardcoded machine timings"
+  ],
+  "bundle_validator": "experiments/validate_bundle.py"
+}

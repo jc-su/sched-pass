@@ -59,6 +59,30 @@ enum PlanFlag : std::uint32_t {
   ExactCompleteMerge = 1U << 4,
 };
 
+enum InstrumentationFlag : std::uint64_t {
+  TypedAccessLowering = 1ULL << 0,
+  ExactDemand = 1ULL << 1,
+  GenerationSafeIdentity = 1ULL << 2,
+  TierOwnership = 1ULL << 3,
+};
+
+enum class IdentityBinding : std::uint32_t {
+  None = 0,
+  RequestSlotGeneration = 1,
+};
+
+enum class DemandBinding : std::uint32_t {
+  None = 0,
+  ExactWorkUnit = 1,
+};
+
+enum class AccessProof : std::uint32_t {
+  None = 0,
+  LoadedIndexStride = 1,
+  CpAsyncGlobal = 2,
+  TypedFrontend = 3,
+};
+
 struct Contract {
   std::uint32_t magic;
   std::uint16_t schemaVersion;
@@ -70,9 +94,15 @@ struct Contract {
   std::uint64_t capabilities;
   std::uint64_t sourceFingerprintLow;
   std::uint64_t sourceFingerprintHigh;
+  std::uint64_t instrumentationFlags;
+  std::uint32_t identityBinding;
+  std::uint32_t demandBinding;
+  std::uint32_t accessProof;
+  std::uint32_t granularityBytes;
+  std::uint64_t tierMask;
 };
 
-static_assert(sizeof(Contract) == 48);
+static_assert(sizeof(Contract) == 80);
 
 // Shared semantic plan for all generated forms of one typed operator. Unlike
 // Contract::form, supportedForms and planFingerprint must be identical in the
@@ -118,6 +148,21 @@ inline void validate(const Contract &contract) {
       contract.form > static_cast<std::uint32_t>(Form::Incremental)) {
     throw std::runtime_error(
         "JIT operator contract contains an unknown family or form");
+  }
+  if (contract.identityBinding >
+          static_cast<std::uint32_t>(IdentityBinding::RequestSlotGeneration) ||
+      contract.demandBinding >
+          static_cast<std::uint32_t>(DemandBinding::ExactWorkUnit) ||
+      contract.accessProof >
+          static_cast<std::uint32_t>(AccessProof::TypedFrontend)) {
+    throw std::runtime_error(
+        "JIT operator contract contains an unknown instrumentation proof");
+  }
+  const std::uint64_t validTierMask =
+      (1ULL << (static_cast<std::uint32_t>(abi::SourceKind::Rdma) + 1U)) - 1ULL;
+  if ((contract.tierMask & ~validTierMask) != 0) {
+    throw std::runtime_error(
+        "JIT operator contract names an unknown source tier");
   }
 }
 
@@ -165,6 +210,13 @@ inline void validatePair(const Contract &directContract, const Plan &directPlan,
       incrementalContract.form !=
           static_cast<std::uint32_t>(Form::Incremental) ||
       directContract.family != incrementalContract.family ||
+      directContract.instrumentationFlags !=
+          incrementalContract.instrumentationFlags ||
+      directContract.identityBinding != incrementalContract.identityBinding ||
+      directContract.demandBinding != incrementalContract.demandBinding ||
+      directContract.accessProof != incrementalContract.accessProof ||
+      directContract.granularityBytes != incrementalContract.granularityBytes ||
+      directContract.tierMask != incrementalContract.tierMask ||
       directPlan.supportedForms != incrementalPlan.supportedForms ||
       directPlan.coordinateMap != incrementalPlan.coordinateMap ||
       directPlan.partialState != incrementalPlan.partialState ||

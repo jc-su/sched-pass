@@ -1,14 +1,16 @@
 //===- AcquireDiscovery.cpp - structural paged-candidate discovery -------===//
 //
-// Diagnostic-only port of the prototype pass's structural recognition
+// Structural recognition from the prototype pass's request-identity lineage
 // (docs/RECOGNITION_LINEAGE.md): for kernels carrying NO NTA markers,
 // recognize the paged-access signature — an innermost-loop, constant-
 // stride global load whose address cone passes through the result of
 // ANOTHER load (the block-table / page-table row: the identity-carrying
-// access) — and report each site as a CANDIDATE acquisition boundary.
+// access) — and report each site as a CANDIDATE acquisition boundary. Typed
+// acquisition markers are the authorization boundary; the lowering pass
+// validates their module contract and then performs the real instrumentation.
 //
-// Discovery proposes; it never authorizes. Candidates are emitted as
-// remarks under NTA_DISCOVERY_NOTES=1 so the typed-frontend gap for a
+// Discovery proposes; it never authorizes raw pointers. Candidates are emitted
+// as remarks under NTA_DISCOVERY_NOTES=1 so structural proof coverage for a
 // kernel family is measurable, and the eKV loud-skip rule is kept: a
 // function with loaded-index gathers where no strided site matches says
 // so explicitly rather than being silently classified.

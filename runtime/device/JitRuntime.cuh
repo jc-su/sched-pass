@@ -6,6 +6,7 @@
 
 #include "nta/KernelPolicy.cuh"
 #include "nta/OperatorContract.h"
+#include "runtime/device/TypedInstrumentation.cuh"
 #include "runtime/device/Acquire.cuh"
 
 #include <cuda_bf16.h>
@@ -60,6 +61,24 @@ inline cudaError_t launchStatus() { return cudaPeekAtLastError(); }
 #ifndef NTA_OPERATOR_PLAN_HASH_HIGH
 #define NTA_OPERATOR_PLAN_HASH_HIGH NTA_OPERATOR_SOURCE_HASH_HIGH
 #endif
+#ifndef NTA_OPERATOR_INSTRUMENTATION_FLAGS
+#define NTA_OPERATOR_INSTRUMENTATION_FLAGS 0ULL
+#endif
+#ifndef NTA_OPERATOR_IDENTITY_BINDING
+#define NTA_OPERATOR_IDENTITY_BINDING 0U
+#endif
+#ifndef NTA_OPERATOR_DEMAND_BINDING
+#define NTA_OPERATOR_DEMAND_BINDING 0U
+#endif
+#ifndef NTA_OPERATOR_ACCESS_PROOF
+#define NTA_OPERATOR_ACCESS_PROOF 0U
+#endif
+#ifndef NTA_OPERATOR_GRANULARITY_BYTES
+#define NTA_OPERATOR_GRANULARITY_BYTES 0U
+#endif
+#ifndef NTA_OPERATOR_TIER_MASK
+#define NTA_OPERATOR_TIER_MASK 0ULL
+#endif
 
 extern "C" __attribute__((visibility("default")))
 const nta::operator_contract::Contract *nta_jit_operator_contract() {
@@ -74,6 +93,12 @@ const nta::operator_contract::Contract *nta_jit_operator_contract() {
       NTA_OPERATOR_CAPABILITIES,
       NTA_OPERATOR_SOURCE_HASH_LOW,
       NTA_OPERATOR_SOURCE_HASH_HIGH,
+      NTA_OPERATOR_INSTRUMENTATION_FLAGS,
+      NTA_OPERATOR_IDENTITY_BINDING,
+      NTA_OPERATOR_DEMAND_BINDING,
+      NTA_OPERATOR_ACCESS_PROOF,
+      NTA_OPERATOR_GRANULARITY_BYTES,
+      NTA_OPERATOR_TIER_MASK,
   };
   return &contract;
 }

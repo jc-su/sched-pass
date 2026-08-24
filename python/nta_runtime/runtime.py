@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 30
+API_VERSION = 32
 
 
 class RuntimeError(Exception):
@@ -23,6 +23,24 @@ class Placement(enum.IntEnum):
     HBM = 0
     HOST_MAPPED = 1
     HOST_STAGED = 2
+    CXL_MAPPED = 3
+
+
+class TierKind(enum.IntEnum):
+    HBM = 0
+    HOST_MAPPED = 1
+    HOST_STAGED = 2
+    NVME = 3
+    CXL = 4
+    RDMA = 5
+
+
+class TierCapability(enum.IntFlag):
+    DIRECT_ADDRESS = 1 << 0
+    DEVICE_INITIATED = 1 << 1
+    HOST_REGISTERED = 1 << 2
+    PERSISTENT_STORAGE = 1 << 3
+    INDEXED_TRANSFER = 1 << 4
 
 
 class WorkTicketState(enum.IntEnum):
@@ -57,6 +75,30 @@ class OperatorCapability(enum.IntFlag):
     GRAPH_REPLAY = 1 << 6
     TYPED_FLASHINFER_FRONTEND = 1 << 7
     PREACQUIRED_PARTIAL_ENTRY = 1 << 8
+
+
+class OperatorInstrumentation(enum.IntFlag):
+    TYPED_ACCESS_LOWERING = 1 << 0
+    EXACT_DEMAND = 1 << 1
+    GENERATION_SAFE_IDENTITY = 1 << 2
+    TIER_OWNERSHIP = 1 << 3
+
+
+class OperatorIdentityBinding(enum.IntEnum):
+    NONE = 0
+    REQUEST_SLOT_GENERATION = 1
+
+
+class OperatorDemandBinding(enum.IntEnum):
+    NONE = 0
+    EXACT_WORK_UNIT = 1
+
+
+class OperatorAccessProof(enum.IntEnum):
+    NONE = 0
+    LOADED_INDEX_STRIDE = 1
+    CP_ASYNC_GLOBAL = 2
+    TYPED_FRONTEND = 3
 
 
 class OperatorCoordinateMap(enum.IntEnum):
@@ -111,6 +153,12 @@ class _OperatorContract(ctypes.Structure):
         ("capabilities", ctypes.c_uint64),
         ("source_fingerprint_low", ctypes.c_uint64),
         ("source_fingerprint_high", ctypes.c_uint64),
+        ("instrumentation_flags", ctypes.c_uint64),
+        ("identity_binding", ctypes.c_uint32),
+        ("demand_binding", ctypes.c_uint32),
+        ("access_proof", ctypes.c_uint32),
+        ("granularity_bytes", ctypes.c_uint32),
+        ("tier_mask", ctypes.c_uint64),
     ]
 
 
@@ -142,6 +190,12 @@ class OperatorContract:
     form: OperatorForm
     capabilities: OperatorCapability
     source_fingerprint: str
+    instrumentation_flags: OperatorInstrumentation = OperatorInstrumentation(0)
+    identity_binding: OperatorIdentityBinding = OperatorIdentityBinding.NONE
+    demand_binding: OperatorDemandBinding = OperatorDemandBinding.NONE
+    access_proof: OperatorAccessProof = OperatorAccessProof.NONE
+    granularity_bytes: int = 0
+    tier_mask: int = 0
 
     def require(
         self,
@@ -149,6 +203,11 @@ class OperatorContract:
         family: OperatorFamily,
         form: OperatorForm,
         capabilities: OperatorCapability = OperatorCapability(0),
+        instrumentation: OperatorInstrumentation = OperatorInstrumentation(0),
+        identity_binding: OperatorIdentityBinding | None = None,
+        demand_binding: OperatorDemandBinding | None = None,
+        access_proof: OperatorAccessProof | None = None,
+        tier_mask: int | None = None,
     ) -> None:
         if self.family != family or self.form != form:
             raise RuntimeError(
@@ -160,6 +219,20 @@ class OperatorContract:
             raise RuntimeError(
                 f"JIT operator contract lacks capabilities {missing!s}"
             )
+        missing_instrumentation = instrumentation & ~self.instrumentation_flags
+        if missing_instrumentation:
+            raise RuntimeError(
+                "JIT operator contract lacks instrumentation guarantees "
+                f"{missing_instrumentation!s}"
+            )
+        if identity_binding is not None and self.identity_binding != identity_binding:
+            raise RuntimeError("JIT operator contract has incompatible identity binding")
+        if demand_binding is not None and self.demand_binding != demand_binding:
+            raise RuntimeError("JIT operator contract has incompatible demand binding")
+        if access_proof is not None and self.access_proof != access_proof:
+            raise RuntimeError("JIT operator contract has incompatible access proof")
+        if tier_mask is not None and self.tier_mask & tier_mask != tier_mask:
+            raise RuntimeError("JIT operator contract does not own the required tiers")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -342,6 +415,38 @@ class _NvmeQueueStats(ctypes.Structure):
     ]
 
 
+class _CxlOptions(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("api_version", ctypes.c_uint32),
+        ("endpoint", ctypes.c_char_p),
+        ("window_bytes", ctypes.c_uint64),
+        ("device_ordinal", ctypes.c_int32),
+    ]
+
+
+class _CxlCapabilities(ctypes.Structure):
+    _fields_ = [
+        ("window_bytes", ctypes.c_uint64),
+        ("mapped_device_address", ctypes.c_uint64),
+        ("device_ordinal", ctypes.c_int32),
+        ("host_registered", ctypes.c_uint32),
+        ("direct_device_visible", ctypes.c_uint32),
+    ]
+
+
+class _TierDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("source_kind", ctypes.c_uint32),
+        ("capabilities", ctypes.c_uint32),
+        ("device_state", ctypes.c_uint64),
+        ("estimated_latency_ns", ctypes.c_uint64),
+        ("estimated_bandwidth_bytes_per_second", ctypes.c_uint64),
+        ("active", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
 class _EpochStatus(ctypes.Structure):
     _fields_ = [
         ("total", ctypes.c_uint32),
@@ -390,7 +495,8 @@ class _RequestSpec(ctypes.Structure):
 
 def _validate_abi_layouts() -> None:
     layouts = (
-        ("OperatorContract", ctypes.sizeof(_OperatorContract), 48),
+        ("OperatorContract", ctypes.sizeof(_OperatorContract), 80),
+        ("TierDescriptor", ctypes.sizeof(_TierDescriptor), 40),
         ("OperatorPlan", ctypes.sizeof(_OperatorPlan), 72),
         ("AcquireRequirement", ctypes.sizeof(AcquireRequirement), 48),
         ("WorkItem", ctypes.sizeof(WorkItem), 64),
@@ -556,6 +662,41 @@ class NvmeQueueStats:
 
 
 @dataclasses.dataclass(frozen=True)
+class CxlDaxOptions:
+    endpoint: str
+    window_bytes: int
+    device_ordinal: int = -1
+
+    def __post_init__(self) -> None:
+        if not self.endpoint:
+            raise ValueError("CXL DAX endpoint must be explicit")
+        if self.window_bytes <= 0:
+            raise ValueError("CXL DAX window_bytes must be positive")
+        if self.device_ordinal < -1:
+            raise ValueError("CXL DAX device_ordinal must be -1 or nonnegative")
+
+
+@dataclasses.dataclass(frozen=True)
+class CxlDaxCapabilities:
+    window_bytes: int
+    mapped_device_address: int
+    device_ordinal: int
+    host_registered: bool
+    direct_device_visible: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class TierDescriptor:
+    source_kind: TierKind
+    capabilities: TierCapability
+    device_state: int
+    estimated_latency_ns: int
+    estimated_bandwidth_bytes_per_second: int
+    active: bool
+    flags: int
+
+
+@dataclasses.dataclass(frozen=True)
 class EpochStatus:
     total: int
     fresh: int
@@ -683,10 +824,31 @@ _nvme_stats = _function(
     _Handle,
     ctypes.POINTER(_NvmeQueueStats),
 )
+_cxl_create = _function(
+    "nta_cxl_dax_transport_create",
+    ctypes.c_int,
+    ctypes.POINTER(_CxlOptions),
+    _HandlePointer,
+)
+_cxl_destroy = _function("nta_cxl_dax_transport_destroy", None, _Handle)
+_cxl_capabilities = _function(
+    "nta_cxl_dax_transport_get_capabilities",
+    ctypes.c_int,
+    _Handle,
+    ctypes.POINTER(_CxlCapabilities),
+)
+_runtime_tier_descriptor = _function(
+    "nta_runtime_get_tier_descriptor",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.POINTER(_TierDescriptor),
+)
 _runtime_create = _function(
     "nta_runtime_create",
     ctypes.c_int,
     ctypes.POINTER(_RuntimeConfig),
+    _Handle,
     _Handle,
     _HandlePointer,
 )
@@ -1294,19 +1456,61 @@ class NvmeTransport(_Owner):
         )
 
 
+class CxlDaxTransport(_Owner):
+    _destroy = staticmethod(_cxl_destroy)
+
+    def __init__(self, options: CxlDaxOptions):
+        self._handle = _Handle()
+        self._endpoint = options.endpoint.encode("utf-8")
+        native = _CxlOptions(
+            ctypes.sizeof(_CxlOptions),
+            API_VERSION,
+            self._endpoint,
+            options.window_bytes,
+            options.device_ordinal,
+        )
+        _check(_cxl_create(ctypes.byref(native), ctypes.byref(self._handle)))
+
+    @property
+    def capabilities(self) -> CxlDaxCapabilities:
+        value = _CxlCapabilities()
+        _check(_cxl_capabilities(self._handle, ctypes.byref(value)))
+        return CxlDaxCapabilities(
+            value.window_bytes,
+            value.mapped_device_address,
+            value.device_ordinal,
+            bool(value.host_registered),
+            bool(value.direct_device_visible),
+        )
+
+    @property
+    def device_address(self) -> int:
+        return self.capabilities.mapped_device_address
+
+
 class Runtime(_Owner):
     _destroy = staticmethod(_runtime_destroy)
 
-    def __init__(self, config: RuntimeConfig, nvme: NvmeTransport | None = None):
+    def __init__(
+        self,
+        config: RuntimeConfig,
+        nvme: NvmeTransport | None = None,
+        cxl: CxlDaxTransport | None = None,
+    ):
         self._handle = _Handle()
         native = config.native()
         nvme_handle = nvme._handle if nvme is not None else _Handle()
+        cxl_handle = cxl._handle if cxl is not None else _Handle()
         _check(
             _runtime_create(
-                ctypes.byref(native), nvme_handle, ctypes.byref(self._handle)
+                ctypes.byref(native),
+                nvme_handle,
+                cxl_handle,
+                ctypes.byref(self._handle),
             )
         )
         self._nvme = nvme
+        self._cxl = cxl
         self._config = config
         self._device_view_tensor = None
 
@@ -1321,6 +1525,23 @@ class Runtime(_Owner):
     @property
     def device_ordinal(self) -> int:
         return int(_runtime_device_ordinal(self._handle))
+
+    def tier_descriptor(self, tier: TierKind) -> TierDescriptor:
+        native = _TierDescriptor()
+        _check(
+            _runtime_tier_descriptor(
+                self._handle, int(tier), ctypes.byref(native)
+            )
+        )
+        return TierDescriptor(
+            TierKind(native.source_kind),
+            TierCapability(native.capabilities),
+            native.device_state,
+            native.estimated_latency_ns,
+            native.estimated_bandwidth_bytes_per_second,
+            bool(native.active),
+            native.flags,
+        )
 
     @property
     def device_view_tensor(self):
@@ -1862,6 +2083,12 @@ class JitPhaseProgram(_Owner):
             OperatorForm(native.form),
             OperatorCapability(native.capabilities),
             fingerprint,
+            OperatorInstrumentation(native.instrumentation_flags),
+            OperatorIdentityBinding(native.identity_binding),
+            OperatorDemandBinding(native.demand_binding),
+            OperatorAccessProof(native.access_proof),
+            int(native.granularity_bytes),
+            int(native.tier_mask),
         )
         native_plan = _OperatorPlan()
         _check(_phase_operator_plan(self._handle, ctypes.byref(native_plan)))

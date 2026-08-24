@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import random
@@ -23,6 +24,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--workload-manifest",
+        type=pathlib.Path,
+        help="normalized Bailian manifest replayed identically by both arms",
+    )
     parser.add_argument("--external-requests", type=int, default=3)
     parser.add_argument("--external-tokens", type=int, default=8192)
     parser.add_argument(
@@ -48,6 +54,8 @@ def parse_args() -> argparse.Namespace:
         default="coalesced",
     )
     parser.add_argument("--slo-scale", type=float, default=1.5)
+    parser.add_argument("--slo-ttft-seconds", type=float, default=8.0)
+    parser.add_argument("--slo-p99-itl-seconds", type=float, default=0.100)
     parser.add_argument("--admission-lead-layers", type=int, default=36)
     parser.add_argument("--admission-max-delay-us", type=int, default=10000)
     parser.add_argument(
@@ -55,11 +63,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "policy-model setup cost for the mechanism stress arm; zero forces the "
+            "modeled setup cost for the mechanism stress arm; zero forces the "
             "trial to expose the request-overlap path but does not remove real cost"
         ),
     )
     parser.add_argument("--build-dir", default="build")
+    parser.add_argument(
+        "--workspace-root",
+        type=pathlib.Path,
+        default=pathlib.Path(
+            os.environ.get("NTA_SERVING_WORKSPACE_ROOT", ROOT / "results" / "serving")
+        ),
+        help="external JIT/cache workspace root; defaults to results/serving for direct runs",
+    )
     parser.add_argument("--seed", type=int, default=20260802)
     parser.add_argument(
         "--execution-order",
@@ -104,14 +120,26 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "results" / "serving" / "sglang-hicache-load.json",
     )
     args = parser.parse_args()
-    if args.slo_scale <= 0:
-        parser.error("SLO scale must be positive")
+    if args.slo_scale <= 0 or args.slo_ttft_seconds <= 0 or args.slo_p99_itl_seconds <= 0:
+        parser.error("SLO scale and thresholds must be positive")
     if args.admission_lead_layers <= 0 or args.admission_max_delay_us < 0:
         parser.error("admission bounds are invalid")
     if args.incremental_setup_ns < 0:
         parser.error("incremental setup cost must be nonnegative")
     if args.external_suffix_tokens < 0:
         parser.error("external suffix token count cannot be negative")
+    if args.churn_tokens > args.context_length:
+        parser.error(
+            "--churn-tokens cannot exceed --context-length; choose a smaller "
+            "churn request or a larger model context"
+        )
+    if args.external_tokens + args.external_suffix_tokens > args.context_length:
+        parser.error(
+            "--external-tokens plus --external-suffix-tokens cannot exceed "
+            "--context-length"
+        )
+    if args.resident_tokens > args.context_length:
+        parser.error("--resident-tokens cannot exceed --context-length")
     return args
 
 
@@ -248,12 +276,12 @@ class _CotenantSampler:
 
 def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     # Kernel-byte-forking toggles (e.g. NTA_STAGING_STREAMING) require a
-    # policy-tagged cache so the shim's fail-closed guard can prove a
-    # toggled env never reuses the other policy's compiled kernels.
+    # variant-tagged cache so the shim's fail-closed guard can prove a
+    # toggled env never reuses the other variant's compiled kernels.
     cache_name = os.environ.get(
         "NTA_COMPARE_CACHE_NAME", "sglang-hicache-load-cache"
     )
-    workspace = ROOT / "results" / "serving" / cache_name / backend
+    workspace = args.workspace_root.resolve() / cache_name / backend
     command = [
         str(ROOT / "tools" / "jit" / "activate.py"),
         "--build-dir",
@@ -298,6 +326,10 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         str(args.max_running_requests),
         "--batch-mode",
         args.batch_mode,
+        "--slo-ttft-seconds",
+        str(args.slo_ttft_seconds),
+        "--slo-p99-itl-seconds",
+        str(args.slo_p99_itl_seconds),
         "--seed",
         str(args.seed),
         "--cuda-graph-decode",
@@ -307,6 +339,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         "--flashinfer-workspace-base",
         str(workspace / "flashinfer"),
     ]
+    if args.workload_manifest is not None:
+        command.extend(("--workload-manifest", str(args.workload_manifest.resolve())))
     if args.allow_oversubscribed_pool:
         command.append("--allow-oversubscribed-pool")
     environment = os.environ.copy()
@@ -317,11 +351,14 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         # Exercise the actual request-aware finite-kernel path. One transfer
         # wave isolates overlap from deeper transfer pipelining: resident CTAs
         # run immediately, then only the externally dependent CTAs resume.
+        protocol = os.environ.get("NTA_COMPARE_EXECUTION_PROTOCOL", "late_bound")
+        prefetch = os.environ.get("NTA_COMPARE_EXECUTION_PREFETCH", "0")
+        max_rounds = os.environ.get("NTA_COMPARE_EXECUTION_MAX_ROUNDS", "1")
         environment.update(
             {
-                "NTA_EXECUTION_PREFETCH": "0",
-                "NTA_EXECUTION_PROTOCOL": "late_bound",
-                "NTA_EXECUTION_MAX_ROUNDS": "1",
+                "NTA_EXECUTION_PREFETCH": prefetch,
+                "NTA_EXECUTION_PROTOCOL": protocol,
+                "NTA_EXECUTION_MAX_ROUNDS": max_rounds,
                 "NTA_EXECUTION_MIN_PREDICTED_GAIN": "1.0",
                 "NTA_EXECUTION_INCREMENTAL_SETUP_NS": str(args.incremental_setup_ns),
             }
@@ -337,6 +374,13 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
             stderr=subprocess.STDOUT,
             check=False,
         )
+    # Preserve the complete arm log beside its isolated JIT workspace.  A
+    # failed activation is part of the artifact's diagnosis; reporting only
+    # "no engine stats" makes an otherwise reproducible failure impossible to
+    # audit after the parent process exits.
+    log_path = workspace.parent / f"{workspace.name}.{backend}.stdout.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(completed.stdout, encoding="utf-8")
     if completed.returncode:
         raise RuntimeError(
             f"{backend} load trial failed:\n"
@@ -379,6 +423,13 @@ def _preregistered_goodput(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _ratio(numerator: float, denominator: float) -> float:
+    """Return a finite neutral ratio for metrics with no interval samples."""
+    if denominator == 0.0:
+        return 1.0 if numerator == 0.0 else float("inf")
+    return numerator / denominator
+
+
 def _goodput(report: dict[str, Any], thresholds: dict[str, float]) -> dict[str, Any]:
     resident_ok = []
     external_ok = []
@@ -410,6 +461,7 @@ def _write_failed_comparison(
     reports: dict[str, dict[str, Any]],
     order: list[str],
     reason: str,
+    diagnostics: dict[str, Any] | None = None,
 ) -> None:
     failure = {
         "schema": 1,
@@ -419,6 +471,8 @@ def _write_failed_comparison(
         "stock": reports["flashinfer"],
         "nta": reports["nta_flashinfer"],
     }
+    if diagnostics:
+        failure["diagnostics"] = diagnostics
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(failure, indent=2, sort_keys=True) + "\n")
 
@@ -433,12 +487,22 @@ def main() -> int:
     reports = {backend: run(args, backend) for backend in order}
     stock = reports["flashinfer"]
     nta = reports["nta_flashinfer"]
-    activation = require_clean_mechanism(
-        nta,
-        require_graph_replay=args.cuda_graph_decode == "full",
-        require_demand_graph=args.require_demand_graph,
-        require_physical_compaction=args.batch_mode == "coalesced",
-    )
+    try:
+        activation = require_clean_mechanism(
+            nta,
+            require_graph_replay=args.cuda_graph_decode == "full",
+            require_demand_graph=args.require_demand_graph,
+            require_physical_compaction=args.batch_mode == "coalesced",
+        )
+    except RuntimeError as error:
+        _write_failed_comparison(
+            args.output,
+            reports,
+            order,
+            "NTA mechanism activation failed",
+            {"activation_error": str(error)},
+        )
+        raise
     if not stock.get("load_warmup_excluded") or not nta.get(
         "load_warmup_excluded"
     ):
@@ -451,11 +515,46 @@ def main() -> int:
             args.output, reports, order, "cache placement was not proven"
         )
         raise RuntimeError("load trial did not prove cache placement")
+    for backend, report in reports.items():
+        if int(report.get("verification_failures", -1)) != 0:
+            _write_failed_comparison(
+                args.output,
+                reports,
+                order,
+                f"{backend} reported verification failures",
+            )
+            raise RuntimeError(f"{backend} reported verification failures")
+        little = report.get("littles_law")
+        if not isinstance(little, dict) or not math.isfinite(float(little.get("residual", float("nan")))):
+            _write_failed_comparison(
+                args.output,
+                reports,
+                order,
+                f"{backend} omitted finite-window Little's Law evidence",
+            )
+            raise RuntimeError(f"{backend} omitted finite-window Little's Law evidence")
     if stock["batch_mode"] != args.batch_mode or nta["batch_mode"] != args.batch_mode:
         _write_failed_comparison(
             args.output, reports, order, "requested batch mode was not preserved"
         )
         raise RuntimeError("load trial did not preserve the requested batch mode")
+    if args.workload_manifest is not None:
+        stock_workload = stock.get("workload")
+        nta_workload = nta.get("workload")
+        if not stock_workload or not nta_workload:
+            _write_failed_comparison(
+                args.output, reports, order, "normalized workload was not replayed"
+            )
+            raise RuntimeError("normalized workload was not replayed")
+        if (
+            stock_workload.get("manifest_digest") != nta_workload.get("manifest_digest")
+            or stock_workload.get("demand_trace_digest")
+            != nta_workload.get("demand_trace_digest")
+        ):
+            _write_failed_comparison(
+                args.output, reports, order, "paired arms used different workload manifests"
+            )
+            raise RuntimeError("paired arms used different workload manifests")
     outputs_diverge = (
         stock["generated_text_sha256"] != nta["generated_text_sha256"]
     )
@@ -503,23 +602,43 @@ def main() -> int:
     nta_rate = float(nta["output_token_throughput"])
     stock_gp = float(stock_goodput["goodput_requests_per_second"])
     nta_gp = float(nta_goodput["goodput_requests_per_second"])
-    resident_ttft_ratio = float(nta["resident_p95_ttft_seconds"]) / float(
-        stock["resident_p95_ttft_seconds"]
+    resident_ttft_ratio = _ratio(
+        float(nta["resident_p95_ttft_seconds"]),
+        float(stock["resident_p95_ttft_seconds"]),
     )
-    resident_tpot_ratio = float(nta["resident_p95_tpot_seconds"]) / float(
-        stock["resident_p95_tpot_seconds"]
+    resident_tpot_ratio = _ratio(
+        float(nta["resident_p95_tpot_seconds"]),
+        float(stock["resident_p95_tpot_seconds"]),
     )
-    resident_itl_ratio = float(nta["resident_p99_itl_seconds"]) / float(
-        stock["resident_p99_itl_seconds"]
+    resident_itl_ratio = _ratio(
+        float(nta["resident_p99_itl_seconds"]),
+        float(stock["resident_p99_itl_seconds"]),
     )
-    external_ttft_ratio = float(nta["external_p95_ttft_seconds"]) / float(
-        stock["external_p95_ttft_seconds"]
+    external_ttft_ratio = _ratio(
+        float(nta["external_p95_ttft_seconds"]),
+        float(stock["external_p95_ttft_seconds"]),
     )
     harness_args = {
         key: (str(value) if isinstance(value, pathlib.Path) else value)
         for key, value in sorted(vars(args).items())
         if key not in ("output", "seed", "execution_order")
     }
+    # These are experiment-level controls rather than runtime defaults. Record
+    # them in the report so a banked trial cannot be mistaken for the default
+    # late-bound variant when the prefetch/control ablation changes.
+    harness_args.update(
+        {
+            "nta_execution_max_rounds": os.environ.get(
+                "NTA_COMPARE_EXECUTION_MAX_ROUNDS", "1"
+            ),
+            "nta_execution_prefetch": os.environ.get(
+                "NTA_COMPARE_EXECUTION_PREFETCH", "0"
+            ),
+            "nta_execution_protocol": os.environ.get(
+                "NTA_COMPARE_EXECUTION_PROTOCOL", "late_bound"
+            ),
+        }
+    )
     comparison = {
         "schema": 1,
         "classification": "sglang-hicache-load-comparison",
@@ -528,7 +647,10 @@ def main() -> int:
         # Trial identity for strict resume validation: the revision both
         # arms ran and the full workload-shaping argument set (seed and
         # order are validated separately; output is location-only).
-        "revision": os.environ.get("NTA_REVISION", ""),
+        "revision": (
+            os.environ.get("NTA_REVISION")
+            or str(nta.get("revision") or stock.get("revision") or "")
+        ),
         "harness_args": harness_args,
         "nta_selected_bytes": sum(
             int(entry.get("work_selected_bytes", 0)) for entry in stats
@@ -538,6 +660,8 @@ def main() -> int:
         ),
         "batch_mode": args.batch_mode,
         "slo_scale": args.slo_scale,
+        "slo_ttft_seconds": args.slo_ttft_seconds,
+        "slo_p99_itl_seconds": args.slo_p99_itl_seconds,
         "incremental_setup_ns": args.incremental_setup_ns,
         "external_suffix_tokens": args.external_suffix_tokens,
         "slo_thresholds_seconds": thresholds,
@@ -545,9 +669,23 @@ def main() -> int:
         "nta": nta,
         "stock_goodput": stock_goodput,
         "nta_goodput": nta_goodput,
+        "stock_slo_goodput": float(
+            stock["slo_goodput"]["goodput_requests_per_second"]
+        ),
+        "nta_slo_goodput": float(
+            nta["slo_goodput"]["goodput_requests_per_second"]
+        ),
+        "stock_p50_ttft_seconds": float(stock["p50_ttft_seconds"]),
+        "stock_p95_ttft_seconds": float(stock["p95_ttft_seconds"]),
+        "stock_p99_ttft_seconds": float(stock["p99_ttft_seconds"]),
+        "stock_p99_itl_seconds": float(stock["p99_itl_seconds"]),
+        "nta_p50_ttft_seconds": float(nta["p50_ttft_seconds"]),
+        "nta_p95_ttft_seconds": float(nta["p95_ttft_seconds"]),
+        "nta_p99_ttft_seconds": float(nta["p99_ttft_seconds"]),
+        "nta_p99_itl_seconds": float(nta["p99_itl_seconds"]),
         "stock_preregistered_goodput": stock_prereg,
         "nta_preregistered_goodput": nta_prereg,
-        "output_throughput_ratio": nta_rate / stock_rate,
+        "output_throughput_ratio": _ratio(nta_rate, stock_rate),
         "goodput_ratio": nta_gp / stock_gp if stock_gp else None,
         "preregistered_goodput_ratio": (
             nta_prereg["goodput_requests_per_second"]

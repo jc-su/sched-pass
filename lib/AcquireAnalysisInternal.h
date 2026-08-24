@@ -34,8 +34,8 @@ struct FunctionPlan {
 
 FunctionPlan analyzeAcquisitions(llvm::Function &function);
 
-// Diagnostic-only structural recognition of paged-KV candidate sites in
-// unmarked kernels (NTA_DISCOVERY_NOTES=1); proposes, never authorizes.
+// Structural recognition of paged-KV candidate sites in unmarked kernels
+// (NTA_DISCOVERY_NOTES=1); it proposes, never authorizes raw pointers.
 void discoverPagedCandidates(llvm::Function &function, llvm::LoopInfo &loops,
                              llvm::ScalarEvolution &scalarEvolution);
 

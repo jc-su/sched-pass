@@ -34,23 +34,27 @@ struct WorkContext {
 
 [[nodiscard]] __device__ __forceinline__ bool
 prepareWorkTicket(abi::RuntimeView *runtime, const abi::WorkItem &item) {
-  if (runtime == nullptr || item.workTicket >= runtime->workTicketCapacity ||
-      item.reductionGroup >= runtime->workTicketCapacity ||
-      item.contributorCount == 0 ||
-      item.contributorIndex >= item.contributorCount) {
-    device::failWorkTicket(runtime, item.workTicket,
-                           abi::WorkTicketState::Failed);
+  const bool valid =
+      runtime != nullptr && item.workTicket < runtime->workTicketCapacity &&
+      item.reductionGroup < runtime->workTicketCapacity &&
+      item.contributorCount != 0 &&
+      item.contributorIndex < item.contributorCount;
+  if (!valid) {
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+      device::failWorkTicket(runtime, item.workTicket,
+                             abi::WorkTicketState::Failed);
+    }
     return false;
   }
-  if (threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0) {
-    return true;
-  }
-  abi::WorkTicket &ticket = runtime->workTickets[item.workTicket];
-  if (atomicAdd(&ticket.state, 0U) ==
-      static_cast<std::uint32_t>(abi::WorkTicketState::New)) {
-    ticket.estimatedComputeNs = item.estimatedComputeNs;
-    ticket.reductionGroup = item.reductionGroup;
-    ticket.contributorCount = item.contributorCount;
+
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    abi::WorkTicket &ticket = runtime->workTickets[item.workTicket];
+    if (atomicAdd(&ticket.state, 0U) ==
+        static_cast<std::uint32_t>(abi::WorkTicketState::New)) {
+      ticket.estimatedComputeNs = item.estimatedComputeNs;
+      ticket.reductionGroup = item.reductionGroup;
+      ticket.contributorCount = item.contributorCount;
+    }
   }
   return true;
 }

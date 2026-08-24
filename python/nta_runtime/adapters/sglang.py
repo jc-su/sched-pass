@@ -49,8 +49,8 @@ class SglangAdapter(RequestIdentityAdapter):
         self,
         forward_batch: Any,
         *,
-        allow_capture_ids: bool,
-        stream: Any,
+        allow_capture_ids: bool = False,
+        stream: Any = None,
         epoch: int,
         granularity: Granularity = Granularity.PAGE_GROUP,
     ) -> EngineBatch:

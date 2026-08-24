@@ -260,7 +260,8 @@ public:
   explicit VfioNvmeControlPlane(const NvmeTransportOptions &options)
       : bdf_(parseBdf(options.endpoint)), namespaceId_(options.namespaceId),
         requestedQueueDepth_(options.queueDepth),
-        adminTimeout_(options.adminTimeoutMs) {
+        adminTimeout_(options.adminTimeoutMs),
+        mediaPolicy_(options.mediaPolicy) {
     if (namespaceId_ == 0 || requestedQueueDepth_ < 2 ||
         requestedQueueDepth_ > MaximumQueueDepth ||
         options.adminTimeoutMs == 0) {
@@ -708,6 +709,15 @@ private:
   }
 
   void protectActiveNamespaces() {
+    // The trusted-read-only-code contract is deliberately a software-only
+    // contract.  Do not issue Set Features (FID 84h) in that mode: changing
+    // the namespace write-protection state is an externally visible media
+    // mutation and may persist across a controller reset.  The benchmark and
+    // runtime must remain read-only by construction instead.
+    if (mediaPolicy_ == NvmeMediaPolicy::TrustReadOnlyDeviceCode) {
+      namespaceReadOnly_ = false;
+      return;
+    }
     if (!writeProtectSupported_) {
       namespaceReadOnly_ = false;
       return;
@@ -1075,6 +1085,8 @@ private:
   std::uint32_t namespaceId_ = 0;
   std::uint32_t requestedQueueDepth_ = 0;
   std::chrono::milliseconds adminTimeout_{};
+  NvmeMediaPolicy mediaPolicy_ =
+      NvmeMediaPolicy::RequireHardwareWriteProtection;
   std::chrono::milliseconds controllerTimeout_{500};
   std::size_t pageSize_ = 0;
   FileDescriptor iommufd_;

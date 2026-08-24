@@ -31,6 +31,8 @@ def report(*, compact_ctas: int, canonical_ctas: int) -> dict:
                 "hicache_external_batches": 1,
                 "transformed_direct_launches": 0,
                 "stock_attention_launches": 0,
+                "stock_resident_attention_launches": 0,
+                "stock_prefetched_external_attention_launches": 0,
                 "external_launches": 1,
                 "prefetched_layers": 0,
                 "demand_host_layers": 1,
@@ -48,6 +50,7 @@ def report(*, compact_ctas: int, canonical_ctas: int) -> dict:
                 "demand_graph_warmups": 1,
                 "demand_graph_captures": 1,
                 "demand_graph_replays": 1,
+                "execution_protocol": "late_bound",
             }
         ]
     }
@@ -79,6 +82,36 @@ def main() -> None:
         require_physical_compaction=True,
     )
     assert activation["compact_resume_cta_ratio"] == 0.5
+
+    conventional = report(compact_ctas=1, canonical_ctas=1)
+    conventional["engine_stats"][0].update(
+        {"execution_protocol": "conventional", "mixed_dependency_layers": 0}
+    )
+    activation = module.require_clean_mechanism(conventional)
+    assert activation["execution_protocol"] == "conventional"
+
+    # A complete exact prefetch is allowed to use the framework consumer after
+    # the acquisition fence.  It must still be counted as external work, but
+    # it is not falsely reported as a transformed NTA attention launch.
+    prefetched = report(compact_ctas=1, canonical_ctas=1)
+    prefetched["engine_stats"][0].update(
+        {
+            "stock_attention_launches": 2,
+            "stock_resident_attention_launches": 1,
+            "stock_prefetched_external_attention_launches": 1,
+            "external_launches": 0,
+            "ticketed_incremental_launches": 0,
+            "prefetched_layers": 1,
+            "demand_host_layers": 0,
+            "decode_launches": 2,
+            "prefill_launches": 0,
+            "mixed_dependency_layers": 0,
+        }
+    )
+    activation = module.require_clean_mechanism(prefetched)
+    assert activation["external_attention_transformed"] is False
+    assert activation["external_attention_stock_consumer"] is True
+    assert activation["external_attention_accounted"] is True
 
 
 if __name__ == "__main__":

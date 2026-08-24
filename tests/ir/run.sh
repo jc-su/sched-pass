@@ -28,6 +28,44 @@ fi
 "${opt}" \
   -load-pass-plugin="${plugin}" \
   -passes=nta-acquire \
+  -S "${source_dir}/typed-contract.ll" \
+  -o "${output_dir}/typed-contract.lowered.ll"
+rg -q 'call ptr @nta_acquire_slow' "${output_dir}/typed-contract.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
+  "${output_dir}/typed-contract.lowered.ll"; then
+  echo "typed contract module still contains an NTA marker" >&2
+  exit 1
+fi
+
+if "${opt}" \
+    -load-pass-plugin="${plugin}" \
+    -passes=nta-acquire \
+    -S "${source_dir}/typed-contract-invalid.ll" \
+    -o "${output_dir}/typed-contract-invalid.lowered.ll" \
+    >"${output_dir}/typed-contract-invalid.stdout" \
+    2>"${output_dir}/typed-contract-invalid.stderr"; then
+  echo "incomplete typed contract was accepted" >&2
+  exit 1
+fi
+rg -Fq "NTA typed operator contract lacks exact identity/demand/tier proofs" \
+  "${output_dir}/typed-contract-invalid.stderr"
+
+if "${opt}" \
+    -load-pass-plugin="${plugin}" \
+    -passes=nta-acquire \
+    -S "${source_dir}/typed-contract-no-markers.ll" \
+    -o "${output_dir}/typed-contract-no-markers.lowered.ll" \
+    >"${output_dir}/typed-contract-no-markers.stdout" \
+    2>"${output_dir}/typed-contract-no-markers.stderr"; then
+  echo "typed contract without markers was accepted" >&2
+  exit 1
+fi
+rg -Fq "NTA typed operator contract has no typed acquisition markers" \
+  "${output_dir}/typed-contract-no-markers.stderr"
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
   -S "${source_dir}/partial-publication.ll" \
   -o "${output_dir}/partial-publication.lowered.ll"
 rg -q 'call void @nta_commit_partial' \
@@ -79,7 +117,7 @@ fi
   -o "${output_dir}/dependency-set.lowered.ll"
 rg -q 'call i1 @nta_acquire_set_slow' \
   "${output_dir}/dependency-set.lowered.ll"
-rg -Fq '!{!"request-bound", i32 27, !"dependency-set", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 28, !"dependency-set", !"split-phase-cta"}' \
   "${output_dir}/dependency-set.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
   "${output_dir}/dependency-set.lowered.ll"; then
@@ -109,7 +147,7 @@ fi
   -o "${output_dir}/tensor-map.lowered.ll"
 rg -q 'call ptr @nta_acquire_tensor_map_slow' \
   "${output_dir}/tensor-map.lowered.ll"
-rg -Fq '!{!"request-bound", i32 27, !"tensor-map", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 28, !"tensor-map", !"split-phase-cta"}' \
   "${output_dir}/tensor-map.lowered.ll"
 rg -q 'phi ptr \[ null, %entry \], \[ %direct.map, %nta.acquire.direct \]' \
   "${output_dir}/tensor-map.lowered.ll"
@@ -126,7 +164,7 @@ fi
   -o "${output_dir}/late-bound.lowered.ll"
 rg -q 'call ptr @nta_acquire_slow' "${output_dir}/late-bound.lowered.ll"
 rg -q 'and i32 %cta, %catalog.mask' "${output_dir}/late-bound.lowered.ll"
-rg -Fq '!{!"request-bound", i32 27, !"byte-address", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 28, !"byte-address", !"split-phase-cta"}' \
   "${output_dir}/late-bound.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
   "${output_dir}/late-bound.lowered.ll"; then

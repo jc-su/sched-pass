@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import pathlib
 import random
 import statistics
@@ -95,11 +96,25 @@ def _expected_harness_args(comparison_args: list[str]) -> dict:
         ) from error
     finally:
         sys.argv = argv
-    return {
+    result = {
         key: (str(value) if isinstance(value, pathlib.Path) else value)
         for key, value in sorted(vars(parsed).items())
         if key not in ("output", "seed", "execution_order")
     }
+    result.update(
+        {
+            "nta_execution_max_rounds": os.environ.get(
+                "NTA_COMPARE_EXECUTION_MAX_ROUNDS", "1"
+            ),
+            "nta_execution_prefetch": os.environ.get(
+                "NTA_COMPARE_EXECUTION_PREFETCH", "0"
+            ),
+            "nta_execution_protocol": os.environ.get(
+                "NTA_COMPARE_EXECUTION_PROTOCOL", "late_bound"
+            ),
+        }
+    )
+    return result
 
 
 def _seed_for_order(seed: int, first: str) -> int:
@@ -267,6 +282,14 @@ def main() -> int:
             bool(report["mechanism_activation"]["all_attention_transformed"])
             for report in reports
         ),
+        "all_external_attention_transformed": all(
+            bool(
+                report["mechanism_activation"].get(
+                    "external_attention_transformed", False
+                )
+            )
+            for report in reports
+        ),
         "all_fallback_free": all(
             int(report["mechanism_activation"]["fallback_batches"]) == 0
             for report in reports
@@ -321,7 +344,7 @@ def main() -> int:
             or "--allow-output-divergence" in args.comparison_args,
         },
         "mechanism": {
-            "passes": aggregate["all_attention_transformed"]
+            "passes": aggregate["all_external_attention_transformed"]
             and aggregate["all_fallback_free"],
         },
         "physical_bytes": {
@@ -349,7 +372,7 @@ def main() -> int:
     # divergence reporting armed; then the aggregate records which trials
     # diverged instead of refusing, and the scored quality battery remains
     # the arbiter — the posture recorded with campaign three.
-    mandatory = ["all_attention_transformed", "all_fallback_free"]
+    mandatory = ["all_external_attention_transformed", "all_fallback_free"]
     if "--allow-output-divergence" not in args.comparison_args:
         mandatory.append("all_outputs_exact")
     if not all(aggregate[key] for key in mandatory):

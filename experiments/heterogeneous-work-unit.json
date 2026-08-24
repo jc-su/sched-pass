@@ -27,11 +27,12 @@
     "batch_size": [4, 16, 64],
     "availability_skew_us": [0, 50, 500, 5000],
     "compute_us_per_unit": [0.25, 1.0, 4.0],
+    "tier": ["hbm", "host_mem", "nvme", "dax"],
     "granularity": ["request", "layer", "page_group", "cta_tile"],
     "staging_capacity_units": [256, 1024, 4096]
   },
   "arms": [
-    {"id": "B0", "name": "dense-resident", "protocol": "conventional"},
+    {"id": "B0", "name": "resident-exact-conventional", "protocol": "conventional"},
     {"id": "B1", "name": "host-promotion-barrier", "protocol": "conventional"},
     {"id": "B2", "name": "host-split-rebatch", "protocol": "conventional"},
     {"id": "B3", "name": "device-demand-conventional-gather", "protocol": "conventional"},
@@ -39,10 +40,20 @@
     {"id": "B5", "name": "heterogeneous-work-unit", "protocol": "late-bound"},
     {"id": "B6", "name": "exact-partial-continuation", "protocol": "partial"}
   ],
+  "ablations": [
+    {"id": "full", "name": "full-mechanism", "target_arms": []},
+    {"id": "host_demand", "name": "host-demand", "target_arms": ["B3", "B4", "B5", "B6"]},
+    {"id": "batch_readiness", "name": "batch-readiness", "target_arms": ["B4", "B5", "B6"]},
+    {"id": "coarse_granularity", "name": "coarse-granularity", "target_arms": ["B4", "B5", "B6"]},
+    {"id": "manual_mapping", "name": "manual-mapping", "target_arms": ["B4", "B5", "B6"]},
+    {"id": "shadow_generation_checks", "name": "shadow-generation-checks", "target_arms": ["B4", "B5", "B6"]},
+    {"id": "admission_feedback", "name": "no-admission-feedback", "target_arms": ["B5", "B6"]},
+    {"id": "unbounded_staging", "name": "unbounded-staging", "target_arms": ["B4", "B5", "B6"]}
+  ],
   "required_metrics": [
     "throughput",
-    "ttft",
-    "tpot",
+    "ttft_us",
+    "tpot_us",
     "slo_goodput",
     "useful_bytes",
     "physical_bytes",
@@ -55,7 +66,20 @@
     "staging_high_water_units",
     "generation_rejections",
     "epoch_rejections",
-    "verification_failures"
+    "verification_failures",
+    "ablation",
+    "demand_trace_hash",
+    "execution_mode",
+    "activation_counters",
+    "group_count",
+    "host_round_trips",
+    "device_demand_discoveries",
+    "pending_arrival_rate",
+    "mean_pending_units",
+    "mean_pending_us",
+    "littles_law_residual",
+    "tier",
+    "stratum"
   ],
   "fairness": [
     "same request trace",

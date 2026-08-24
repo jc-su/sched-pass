@@ -1,6 +1,7 @@
 #include "nta/RuntimeC.h"
 
 #include "nta/DeviceWorkPlan.h"
+#include "nta/CxlRuntime.h"
 #include "nta/HostRuntime.h"
 #include "nta/JitPhase.h"
 #include "nta/NvmeRuntime.h"
@@ -23,8 +24,13 @@ struct nta_nvme_transport {
   std::shared_ptr<nta::NvmeTransport> value;
 };
 
+struct nta_cxl_dax_transport {
+  std::shared_ptr<nta::CxlDaxTransport> value;
+};
+
 struct nta_runtime {
   std::shared_ptr<nta::NvmeTransport> nvme;
+  std::shared_ptr<nta::CxlDaxTransport> cxl;
   std::unique_ptr<nta::HostRuntime> value;
 };
 
@@ -157,6 +163,8 @@ nta::Placement placement(std::uint32_t value) {
     return nta::Placement::HostMapped;
   case NTA_PLACEMENT_HOST_STAGED:
     return nta::Placement::HostStaged;
+  case NTA_PLACEMENT_CXL_MAPPED:
+    return nta::Placement::CxlMapped;
   default:
     throw std::invalid_argument("registered replica has invalid placement");
   }
@@ -320,8 +328,80 @@ nta_status nta_nvme_transport_read_stats(const nta_nvme_transport *transport,
   });
 }
 
+nta_status nta_cxl_dax_transport_create(
+    const nta_cxl_dax_options *options,
+    nta_cxl_dax_transport **transportOut) {
+  if (transportOut != nullptr) {
+    *transportOut = nullptr;
+  }
+  return protect([&] {
+    if (options == nullptr || transportOut == nullptr) {
+      throw std::invalid_argument(
+          "CXL DAX transport creation needs options and an output handle");
+    }
+    requireVersion(options->struct_size, sizeof(*options), options->api_version,
+                   "CXL DAX transport options");
+    if (options->endpoint == nullptr || options->endpoint[0] == '\0') {
+      throw std::invalid_argument("CXL DAX endpoint must be explicit");
+    }
+    nta::CxlDaxOptions native;
+    native.endpoint = options->endpoint;
+    native.windowBytes = checkedSize(options->window_bytes, "CXL window bytes");
+    native.deviceOrdinal = options->device_ordinal;
+    auto handle = std::make_unique<nta_cxl_dax_transport>();
+    handle->value = std::make_shared<nta::CxlDaxTransport>(std::move(native));
+    *transportOut = handle.release();
+  });
+}
+
+void nta_cxl_dax_transport_destroy(nta_cxl_dax_transport *transport) {
+  delete transport;
+}
+
+nta_status nta_cxl_dax_transport_get_capabilities(
+    const nta_cxl_dax_transport *transport,
+    nta_cxl_dax_capabilities *capabilities) {
+  return protect([&] {
+    requireHandle(transport, "CXL DAX transport");
+    if (capabilities == nullptr) {
+      throw std::invalid_argument("CXL DAX capabilities output is null");
+    }
+    const nta::CxlDaxCapabilities source = transport->value->capabilities();
+    *capabilities = {
+        source.windowBytes,
+        reinterpret_cast<std::uintptr_t>(source.mappedDeviceAddress),
+        source.deviceOrdinal,
+        source.hostRegistered ? 1U : 0U,
+        source.directDeviceVisible ? 1U : 0U,
+    };
+  });
+}
+
+nta_status nta_runtime_get_tier_descriptor(
+    const nta_runtime *runtime, std::uint32_t sourceKind,
+    nta_tier_descriptor *descriptor) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (descriptor == nullptr || sourceKind >= nta::abi::BackendCount) {
+      throw std::invalid_argument("invalid tier descriptor request");
+    }
+    const nta::TierDescriptor source = runtime->value->tierDescriptor(
+        static_cast<nta::abi::SourceKind>(sourceKind));
+    *descriptor = {
+        static_cast<std::uint32_t>(source.kind),
+        source.capabilities,
+        source.deviceState,
+        source.estimatedLatencyNs,
+        source.estimatedBandwidthBytesPerSecond,
+        source.active,
+        source.flags,
+    };
+  });
+}
+
 nta_status nta_runtime_create(const nta_runtime_config *config,
                               nta_nvme_transport *nvme,
+                              nta_cxl_dax_transport *cxl,
                               nta_runtime **runtimeOut) {
   if (runtimeOut != nullptr) {
     *runtimeOut = nullptr;
@@ -346,13 +426,19 @@ nta_status nta_runtime_create(const nta_runtime_config *config,
         config->staging_byte_capacity,
     };
     auto handle = std::make_unique<nta_runtime>();
+    nta::RuntimeBackends backends;
     if (nvme != nullptr) {
       requireHandle(nvme, "NVMe transport");
       handle->nvme = nvme->value;
-      handle->value = std::make_unique<nta::HostRuntime>(native, handle->nvme);
-    } else {
-      handle->value = std::make_unique<nta::HostRuntime>(native);
+      backends.nvme = handle->nvme;
     }
+    if (cxl != nullptr) {
+      requireHandle(cxl, "CXL DAX transport");
+      handle->cxl = cxl->value;
+      backends.cxl = handle->cxl;
+    }
+    handle->value = std::make_unique<nta::HostRuntime>(native,
+                                                        std::move(backends));
     *runtimeOut = handle.release();
   });
 }
@@ -982,6 +1068,12 @@ nta_status nta_jit_phase_operator_contract(const nta_jit_phase_program *program,
         contract.capabilities,
         contract.sourceFingerprintLow,
         contract.sourceFingerprintHigh,
+        contract.instrumentationFlags,
+        contract.identityBinding,
+        contract.demandBinding,
+        contract.accessProof,
+        contract.granularityBytes,
+        contract.tierMask,
     };
   });
 }

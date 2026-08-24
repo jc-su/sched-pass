@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nta/RuntimeABI.h"
+#include "nta/Tier.h"
 
 #include <cuda_runtime_api.h>
 
@@ -16,11 +17,18 @@ class DeviceWorkPlan;
 struct WorkPlan;
 class NvmeBuffer;
 class NvmeTransport;
+class CxlDaxTransport;
 
 enum class Placement {
   Hbm,
   HostMapped,
   HostStaged,
+  CxlMapped,
+};
+
+struct RuntimeBackends {
+  std::shared_ptr<NvmeTransport> nvme;
+  std::shared_ptr<CxlDaxTransport> cxl;
 };
 
 struct RuntimeConfig {
@@ -37,12 +45,12 @@ struct RuntimeConfig {
   // traffic defaults to the request-aware scheduler warp; deployments may
   // enable the one-shot CTA path after measuring their transfer-size regime.
   bool enableCtaNvmeTryIssue = false;
-  // Zero selects requestCapacity for backward-compatible one-tenant-per-slot
-  // deployments; otherwise tenant storage is independently bounded.
+  // Zero selects requestCapacity for one-tenant-per-slot deployments;
+  // otherwise tenant storage is independently bounded.
   std::uint32_t tenantCapacity = 0;
   // Bounds only HBM staging destinations allocated and owned by HostRuntime;
-  // zero selects an unbounded compatibility limit.
-  // Engine-registered staging remains governed by the engine's allocator.
+  // zero selects an unbounded limit. Engine-registered staging remains
+  // governed by the engine's allocator.
   std::uint64_t stagingByteCapacity = UINT64_MAX;
 };
 
@@ -124,7 +132,7 @@ struct EpochStatus {
 class HostRuntime {
 public:
   explicit HostRuntime(RuntimeConfig config);
-  HostRuntime(RuntimeConfig config, std::shared_ptr<NvmeTransport> nvme);
+  HostRuntime(RuntimeConfig config, RuntimeBackends backends);
   ~HostRuntime();
 
   HostRuntime(const HostRuntime &) = delete;
@@ -186,6 +194,7 @@ public:
   [[nodiscard]] abi::RuntimeView *deviceView() const noexcept;
   [[nodiscard]] int deviceOrdinal() const noexcept;
   [[nodiscard]] const RuntimeConfig &config() const noexcept;
+  [[nodiscard]] TierDescriptor tierDescriptor(abi::SourceKind kind) const;
   [[nodiscard]] StagingUsage stagingUsage() const noexcept;
   [[nodiscard]] abi::RequestContext readRequest(std::uint32_t slot) const;
   [[nodiscard]] abi::TenantContext readTenant(std::uint32_t tenantId) const;

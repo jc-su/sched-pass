@@ -1284,6 +1284,7 @@ tryIssueFromCta(abi::RuntimeView *runtime, abi::SourceKind source,
   case abi::SourceKind::Hbm:
   case abi::SourceKind::HostMapped:
   case abi::SourceKind::HostStaged:
+  case abi::SourceKind::Cxl:
   case abi::SourceKind::Rdma:
     return TryIssueResult::Unavailable;
   }

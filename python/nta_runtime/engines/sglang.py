@@ -58,10 +58,14 @@ from nta_runtime.runtime import (
     IndexedHostObject,
     JitPhaseProgram,
     OperatorCapability,
+    OperatorAccessProof,
     OperatorContract,
     OperatorCoordinateMap,
     OperatorFamily,
     OperatorForm,
+    OperatorDemandBinding,
+    OperatorIdentityBinding,
+    OperatorInstrumentation,
     OperatorPartialState,
     OperatorPlan,
     OperatorPlanFlag,
@@ -69,6 +73,7 @@ from nta_runtime.runtime import (
     RequestRange,
     Runtime,
     RuntimeConfig,
+    TierKind,
     require_operator_pair,
 )
 
@@ -485,6 +490,45 @@ def _group_external_pages_by_request(
     )
 
 
+def _request_ranges(
+    bindings: tuple[RequestBinding, ...], request_indices: tuple[int, ...]
+) -> list[RequestRange]:
+    """Build native ranges only for schedules grouped by request.
+
+    ``DeviceWorkPlan`` requires one contiguous range per request because the
+    reduction metadata and contributor ordinals are request-relative. A
+    malformed or future FlashInfer schedule must fail closed here instead of
+    producing zero-length or misbound ranges.
+    """
+    ranges: list[RequestRange] = []
+    cursor = 0
+    for binding in bindings:
+        begin = cursor
+        while (
+            cursor < len(request_indices)
+            and request_indices[cursor] == binding.request_index
+        ):
+            cursor += 1
+        if cursor == begin:
+            raise RuntimeError(
+                "FlashInfer schedule has no work for request "
+                f"{binding.request_index}"
+            )
+        ranges.append(
+            RequestRange(
+                begin,
+                cursor - begin,
+                binding.request_slot,
+                binding.generation,
+            )
+        )
+    if cursor != len(request_indices):
+        raise RuntimeError(
+            "FlashInfer schedule is not grouped contiguously by request"
+        )
+    return ranges
+
+
 class NtaFlashInferAttnBackend(FlashInferAttnBackend):
     """FA2 backend carrying request semantics into every attention CTA."""
 
@@ -514,6 +558,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         if self.prefill_backend != "fa2" or self.decode_backend != "fa2":
             raise ValueError("NTA requires FlashInfer's FA2 attention kernels")
+
+        # Keep the stock wrappers as an explicit resident reference.  NTA's
+        # typed work-unit kernel is needed only when a forward contains an
+        # external tier dependency; routing resident-only forwards through the
+        # framework wrapper prevents instrumentation overhead from becoming a
+        # regression for requests that do not exercise the mechanism.
+        self._stock_decode_wrappers = tuple(self.decode_wrappers)
+        self._stock_prefill_paged_wrappers = tuple(self.prefill_wrappers_paged)
+        self._stock_prefill_verify_wrappers = tuple(self.prefill_wrappers_verify)
 
         self._hicache_enabled = bool(model_runner.server_args.enable_hierarchical_cache)
         self._model_runner = model_runner
@@ -580,6 +633,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._model_layer_count = int(layer_count)
         self._model_start_layer = int(getattr(self.token_to_kv_pool, "start_layer", 0))
         self._cuda_graph_mode = False
+        self._stock_forward = False
         self._execution_epoch = 0
         self._current_engine_batch: EngineBatch | None = None
         self._active_batch: _ActiveBatch | None = None
@@ -638,7 +692,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "request_rebindings": 0,
             "request_cancellations": 0,
             "external_launches": 0,
-            "resident_transformed_batches": 0,
+            "resident_reference_batches": 0,
             "hicache_external_batches": 0,
             "hicache_fallback_batches": 0,
             "indexed_host_objects": 0,
@@ -665,6 +719,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "transformed_direct_launches": 0,
             "ticketed_incremental_launches": 0,
             "stock_attention_launches": 0,
+            "stock_resident_batches": 0,
+            "stock_resident_attention_launches": 0,
+            "stock_prefetched_external_batches": 0,
+            "stock_prefetched_external_attention_launches": 0,
             "host_progress_rounds": 0,
             "parallel_indexed_progress_layers": 0,
             "fragment_lookahead_layers": 0,
@@ -777,18 +835,18 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         head_dim = int(model_runner.model_config.head_dim)
         signature = f"h{head_dim}_{_dtype_tag(q_dtype)}_{_dtype_tag(kv_dtype)}"
         decode_base = (
-            f"nta_sglang_decode_{{policy}}_v11_"
+            f"nta_sglang_decode_{{form}}_v11_"
             f"{'tc' if self.decode_use_tensor_cores else 'cc'}_"
             f"{signature}"
         )
-        prefill_base = f"nta_sglang_prefill_{{policy}}_v11_{signature}"
+        prefill_base = f"nta_sglang_prefill_{{form}}_v11_{signature}"
         self._wrapper_modules: dict[int, str] = {}
 
-        def decode_wrappers(policy: str) -> tuple[list[Any], list[Any]]:
-            name = decode_base.format(policy=policy)
+        def decode_wrappers(form: str) -> tuple[list[Any], list[Any]]:
+            name = decode_base.format(form=form)
             jit_builder = (
                 request_bound_attention_jit_args
-                if policy == "request_bound"
+                if form == "request_bound"
                 else attention_jit_args
             )
             args = jit_builder(
@@ -822,11 +880,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._select_wrappers(False)
             return
 
-        def prefill_wrappers(policy: str) -> tuple[list[Any], list[Any]]:
-            name = prefill_base.format(policy=policy)
+        def prefill_wrappers(form: str) -> tuple[list[Any], list[Any]]:
+            name = prefill_base.format(form=form)
             jit_builder = (
                 request_bound_attention_jit_args
-                if policy == "request_bound"
+                if form == "request_bound"
                 else attention_jit_args
             )
             args = jit_builder(
@@ -877,6 +935,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             if demand_acquire
             else self._nta_request_bound_prefill_verify
         )
+
+    def _select_stock_wrappers(self) -> None:
+        self.decode_wrappers = list(self._stock_decode_wrappers)
+        if self.skip_prefill:
+            return
+        self.prefill_wrappers_paged = list(self._stock_prefill_paged_wrappers)
+        self.prefill_wrappers_verify = list(self._stock_prefill_verify_wrappers)
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list[Any]:
         if self._decode_jit_args is None:
@@ -1010,6 +1075,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         else:
             schedule = paged_prefill_schedule(wrapper)
         page_pairs = batch.page_pairs.get(id(wrapper), ())
+        if not page_pairs:
+            page_pairs = tuple(((), ()) for _ in range(schedule.work_count))
+            batch.page_pairs[id(wrapper)] = page_pairs
+        batch.schedules[id(wrapper)] = schedule
         unit_bytes = int(
             kv_cache[0][0].numel() * kv_cache[0].element_size()
             + kv_cache[1][0].numel() * kv_cache[1].element_size()
@@ -1021,6 +1090,91 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             layer=int(layer.layer_id) - self._model_start_layer,
             unit_bytes=unit_bytes,
         )
+
+    def _upload_resident_plan(
+        self,
+        wrapper: Any,
+        schedule: Schedule,
+        execution: ExecutionSession,
+    ) -> DeviceWorkPlan:
+        """Materialize a direct demand plan for non-contiguous resident slots.
+
+        The request-bound kernel takes one contiguous slot offset.  SGLang's
+        pool allocator is free to return holes, so resident batches with
+        non-contiguous slots use the same explicit per-ticket plan as the
+        external path.  Dependencies are direct device views; no transfer or
+        approximation is introduced.
+        """
+        batch = self._active_batch
+        if batch is None:
+            raise RuntimeError("resident work-plan upload has no active batch")
+        plan = self._ensure_plan(wrapper, -1, schedule)
+        allocation = self._plans[(id(wrapper), -1)]
+        signature = (
+            "resident",
+            schedule.request_indices,
+            schedule.kv_tile_indices,
+            tuple(binding.request_slot for binding in batch.bindings),
+            tuple(binding.generation for binding in batch.bindings),
+        )
+        if allocation.signature == signature:
+            return plan
+
+        semantic_units = []
+        dependency_spans = []
+        dependencies: list[AcquireRequirement] = []
+        for work_ticket, (request_index, logical_begin) in enumerate(
+            zip(schedule.request_indices, schedule.kv_tile_indices, strict=True)
+        ):
+            semantic_units.append(
+                execution.unit_for_ticket(
+                    work_id=work_ticket,
+                    layer=execution.batch.units[work_ticket].layer,
+                    logical_begin=int(logical_begin),
+                    request_index=request_index,
+                )
+            )
+            dependency_begin = len(dependencies)
+            dependencies.extend(
+                (
+                    AcquireRequirement(
+                        self._runtime.device_view,
+                        0,
+                        _OBJECT_ID_BASE | 0xFFFFFFF0,
+                        0,
+                        0,
+                        1,
+                        1,
+                        0,
+                    ),
+                    AcquireRequirement(
+                        self._runtime.device_view,
+                        0,
+                        _OBJECT_ID_BASE | 0xFFFFFFF1,
+                        0,
+                        1,
+                        1,
+                        1,
+                        0,
+                    ),
+                )
+            )
+            dependency_spans.append((dependency_begin, 2, 2, work_ticket))
+
+        ranges = _request_ranges(batch.bindings, schedule.request_indices)
+        plan.upload_work_units(
+            semantic_units,
+            dependency_spans,
+            dependencies,
+            ranges,
+            epoch=execution.epoch,
+            stream=torch.cuda.current_stream(),
+        )
+        allocation.signature = signature
+        allocation.object_count = 0
+        allocation.direct_work_count = schedule.work_count
+        allocation.external_object_slots = tuple(() for _ in range(schedule.work_count))
+        return plan
 
     def _record_execution_layer(self, layer: Any) -> None:
         """Commit the semantic work boundary after native attention returns."""
@@ -1057,17 +1211,22 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self, forward_batch: Any, in_capture: bool = False
     ) -> None:
         self._cuda_graph_mode = True
+        counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
+        consumer_index = -1 if counter is None else int(counter.consumer_index)
+        pending = self._hicache.get(consumer_index)
+        self._stock_forward = pending is None
+        if self._stock_forward:
+            self._select_stock_wrappers()
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         bindings = self._bind_forward_requests(
             forward_batch, allow_capture_ids=in_capture
         )
-        counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
-        consumer_index = -1 if counter is None else int(counter.consumer_index)
-        pending = self._hicache.get(consumer_index)
         if pending is None:
             self._active_batch = _ActiveBatch(bindings, {}, None, {}, {}, {}, ())
-            self._stats["resident_transformed_batches"] += 1
+            self._stats["resident_reference_batches"] += 1
+            self._stats["stock_resident_batches"] += 1
         else:
+            self._stock_forward = False
             if not self._prefetch_enabled or not pending.prefetched_layers:
                 raise RuntimeError(
                     "CUDA graph replay requires the stream-ordered HiCache pipeline"
@@ -1098,6 +1257,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata(self, forward_batch: Any) -> None:
         self._cuda_graph_mode = False
+        self._stock_forward = False
         if forward_batch.forward_mode.is_mixed():
             self._stats["mixed_forward_batches"] += 1
             self._stats["mixed_forward_requests"] += len(
@@ -1106,6 +1266,27 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
+        request_slots = getattr(forward_batch, "_nta_request_slots", None)
+        if request_slots is None:
+            request_slots = getattr(forward_batch, "req_pool_indices", None)
+        if request_slots is not None and hasattr(request_slots, "tolist"):
+            request_slots = request_slots.tolist()
+        request_slots = tuple(int(slot) for slot in request_slots or ())
+        contiguous_request_slots = bool(request_slots) and request_slots == tuple(
+            range(request_slots[0], request_slots[0] + len(request_slots))
+        )
+        # A complete exact prefetch has already materialized every logical
+        # HiCache page in SGLang's physical KV pool.  At that boundary the
+        # acquisition mechanism has done its job; sending the ready pages
+        # through a second transformed attention consumer only adds fixed
+        # kernel and enqueue overhead.  Keep the typed path for partial or
+        # still-arriving layers, and use the framework consumer only when the
+        # readiness proof covers the whole model.
+        stock_prefetched_external = (
+            pending is not None
+            and self._prefetch_enabled
+            and len(pending.prefetched_layers) == self._model_layer_count
+        )
         demand_acquire = (
             pending is not None
             and not self._prefetch_enabled
@@ -1114,8 +1295,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 or self._overlap_enabled
                 or self._fast_bulk_plan(pending).rounds > 1
             )
-        )
-        self._select_wrappers(demand_acquire)
+        ) or not contiguous_request_slots
+        if pending is None:
+            self._stock_forward = True
+            self._select_stock_wrappers()
+        elif stock_prefetched_external:
+            self._stock_forward = True
+            self._select_stock_wrappers()
+        else:
+            self._select_wrappers(demand_acquire)
         original_use_paged = self.use_paged
         self.use_paged = True
         try:
@@ -1133,9 +1321,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     bindings, {}, None, {}, {}, {}, ()
                 )
                 self._stats["batches"] += 1
-                self._stats["resident_transformed_batches"] += 1
+                self._stats["resident_reference_batches"] += 1
+                self._stats["stock_resident_batches"] += 1
                 return
             self._init_external_metadata(forward_batch, pending, bindings=bindings)
+            if stock_prefetched_external:
+                self._stats["stock_prefetched_external_batches"] += 1
         except Exception as error:
             self._active_batch = None
             self._stats["hicache_fallback_batches"] += 1
@@ -1618,7 +1809,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         value_cache = controller.mem_pool_host.v_data_refs[0]
         key_element_bytes = key_cache[0].numel() * key_cache.element_size()
         value_element_bytes = value_cache[0].numel() * value_cache.element_size()
-        policies = {
+        plans = {
             self._execution_plan(
                 schedule,
                 page_pairs[wrapper_id],
@@ -1627,11 +1818,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
             for wrapper_id, schedule in schedules.items()
         }
-        if len(policies) != 1:
+        if len(plans) != 1:
             raise RuntimeError(
-                "FlashInfer wrappers selected inconsistent host policies"
+                "FlashInfer wrappers selected inconsistent host execution plans"
             )
-        return policies.pop()
+        return plans.pop()
 
     def _execution_plan(
         self,
@@ -1753,6 +1944,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     f"{getattr(getattr(allocation, 'plan', None), 'work_item_count', None)} "
                     f"planned_wrappers={planned}"
                 )
+        elif "request_bound" not in module_name:
+            schedule = batch.schedules.get(id(wrapper))
+            execution = batch.execution
+            if schedule is None or execution is None:
+                raise RuntimeError(
+                    "resident demand attention has no semantic CTA schedule"
+                )
+            self._upload_resident_plan(wrapper, schedule, execution)
+            allocation = self._plans[(id(wrapper), -1)]
         if "request_bound" in module_name:
             request_slots = tuple(binding.request_slot for binding in batch.bindings)
             if not request_slots or request_slots != tuple(
@@ -2127,7 +2327,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             zip(schedule.request_indices, schedule.kv_tile_indices, page_pairs)
         ):
             binding = batch.bindings[request_index]
-            semantic = execution.unit_for(
+            semantic = execution.unit_for_ticket(
+                work_id=work_ticket,
                 layer=semantic_layer,
                 logical_begin=int(kv_tile),
                 request_index=request_index,
@@ -2209,23 +2410,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 (dependency_begin, 2, direct_dependencies, work_ticket)
             )
 
-        ranges: list[RequestRange] = []
-        cursor = 0
-        for binding in batch.bindings:
-            begin = cursor
-            while (
-                cursor < schedule.work_count
-                and schedule.request_indices[cursor] == binding.request_index
-            ):
-                cursor += 1
-            ranges.append(
-                RequestRange(
-                    begin,
-                    cursor - begin,
-                    binding.request_slot,
-                    binding.generation,
-                )
-            )
+        ranges = _request_ranges(batch.bindings, schedule.request_indices)
 
         object_count = 2 if prefetched is not None else len(indexed_objects)
         if object_count == 0:
@@ -2508,7 +2693,21 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 | OperatorCapability.RUNNABLE_COMPACTION
             )
         contract = program.operator_contract
-        contract.require(family=family, form=form, capabilities=required)
+        contract.require(
+            family=family,
+            form=form,
+            capabilities=required,
+            instrumentation=(
+                OperatorInstrumentation.TYPED_ACCESS_LOWERING
+                | OperatorInstrumentation.EXACT_DEMAND
+                | OperatorInstrumentation.GENERATION_SAFE_IDENTITY
+                | OperatorInstrumentation.TIER_OWNERSHIP
+            ),
+            identity_binding=OperatorIdentityBinding.REQUEST_SLOT_GENERATION,
+            demand_binding=OperatorDemandBinding.EXACT_WORK_UNIT,
+            access_proof=OperatorAccessProof.TYPED_FRONTEND,
+            tier_mask=(1 << 6) - 1,
+        )
         plan = program.operator_plan
         plan.require(
             family=family,
@@ -2856,35 +3055,38 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         binding.request_slot for binding in batch.bindings
                     )
                     first_request_slot = min(request_slots)
-                    if request_slots != tuple(
+                    contiguous = request_slots == tuple(
                         range(first_request_slot, first_request_slot + len(request_slots))
-                    ):
-                        raise RuntimeError(
-                            "request-progress feedback requires contiguous slots"
-                        )
-                    progress_snapshot = self._runtime.request_progress_snapshot(
-                        len(request_slots)
                     )
-
-                    def publish_progress(discovery_stream: Any) -> None:
-                        progress_snapshot.capture(
-                            first_request_slot,
-                            len(request_slots),
-                            discovery_stream,
-                        )
-                        self._hicache.publish_request_progress(
-                            progress_snapshot,
-                            batch.bindings,
-                            bandwidth_bytes_per_second=(
-                                self._host_cost_model.bandwidth_bytes_per_second
-                            ),
-                            fixed_latency_ns=self._host_cost_model.round_overhead_ns,
-                        )
-                        self._stats["progress_feedback_snapshots"] = (
-                            self._stats.get("progress_feedback_snapshots", 0) + 1
+                    if contiguous:
+                        progress_snapshot = self._runtime.request_progress_snapshot(
+                            len(request_slots)
                         )
 
-                    on_discovered = publish_progress
+                        def publish_progress(discovery_stream: Any) -> None:
+                            progress_snapshot.capture(
+                                first_request_slot,
+                                len(request_slots),
+                                discovery_stream,
+                            )
+                            self._hicache.publish_request_progress(
+                                progress_snapshot,
+                                batch.bindings,
+                                bandwidth_bytes_per_second=(
+                                    self._host_cost_model.bandwidth_bytes_per_second
+                                ),
+                                fixed_latency_ns=self._host_cost_model.round_overhead_ns,
+                            )
+                            self._stats["progress_feedback_snapshots"] = (
+                                self._stats.get("progress_feedback_snapshots", 0) + 1
+                            )
+
+                        on_discovered = publish_progress
+                    else:
+                        self._stats["progress_feedback_skipped_noncontiguous"] = (
+                            self._stats.get("progress_feedback_skipped_noncontiguous", 0)
+                            + 1
+                        )
                 copy_blocks_per_group = indexed_copy_blocks_per_group(
                     transfer_bytes=allocation.transfer_bytes,
                     object_count=object_count,
@@ -3379,6 +3581,29 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     f"{bad_pages[:16]} ({len(bad_pages)}/{len(mapping)})"
                 )
 
+    def _wait_for_stock_external_layer(
+        self, pending: PendingHostLoad, layer: Any
+    ) -> int:
+        """Join the producer event before stock attention consumes a page."""
+        local_layer = int(layer.layer_id) - int(
+            getattr(pending.controller.mem_pool_device, "start_layer", 0)
+        )
+        prefetched = pending.prefetched_layers.get(local_layer)
+        if prefetched is None:
+            raise RuntimeError(
+                "stock external attention reached a layer without an exact "
+                f"prefetch event: {layer.layer_id}"
+            )
+        stream = torch.cuda.current_stream()
+        if self._profile_barrier:
+            arrive = torch.cuda.Event(enable_timing=True)
+            arrive.record(stream)
+            self._barrier_profiles.append(
+                (arrive, prefetched.ready_event, int(layer.layer_id))
+            )
+        stream.wait_event(prefetched.ready_event)
+        return local_layer
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -3393,6 +3618,34 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "NTA decode ran without transformed request metadata; stock "
                 "dispatch is disabled"
             )
+        if self._stock_forward:
+            self._stats["stock_attention_launches"] += 1
+            pending = self._active_batch.pending_host_load
+            if pending is None:
+                self._stats["stock_resident_attention_launches"] += 1
+            else:
+                self._stats["stock_prefetched_external_attention_launches"] += 1
+                local_layer = self._wait_for_stock_external_layer(pending, layer)
+            self._stats["decode_launches"] += 1
+            output = FlashInferAttnBackend.forward_decode(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+            )
+            if pending is not None:
+                self._hicache.complete_layer(pending, local_layer)
+                if local_layer + 1 == self._model_layer_count:
+                    # A complete external prefetch uses the framework's stock
+                    # consumer.  It therefore bypasses _run_attention(),
+                    # which is normally the point that publishes the NTA
+                    # engine report.  Publish after the final layer so the
+                    # paired harness can audit the exact acquisition path.
+                    self._publish_stats()
+            return output
         wrapper = self.forward_metadata.decode_wrappers[self._get_wrapper_idx(layer)]
         cache_loc = (
             forward_batch.out_cache_loc
@@ -3439,6 +3692,29 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "NTA prefill ran without transformed request metadata; stock "
                 "dispatch is disabled"
             )
+        if self._stock_forward:
+            self._stats["stock_attention_launches"] += 1
+            pending = self._active_batch.pending_host_load
+            if pending is None:
+                self._stats["stock_resident_attention_launches"] += 1
+            else:
+                self._stats["stock_prefetched_external_attention_launches"] += 1
+                local_layer = self._wait_for_stock_external_layer(pending, layer)
+            self._stats["prefill_launches"] += 1
+            output = FlashInferAttnBackend.forward_extend(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+            )
+            if pending is not None:
+                self._hicache.complete_layer(pending, local_layer)
+                if local_layer + 1 == self._model_layer_count:
+                    self._publish_stats()
+            return output
         if self.forward_metadata.use_ragged:
             raise RuntimeError("NTA requires paged FlashInfer prefill")
         wrapper = self.forward_metadata.prefill_wrappers[self._get_wrapper_idx(layer)]
@@ -3595,6 +3871,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "family": contract.family.name.lower(),
                 "form": contract.form.name.lower(),
                 "capabilities": int(contract.capabilities),
+                "instrumentation_flags": int(contract.instrumentation_flags),
+                "identity_binding": contract.identity_binding.name.lower(),
+                "demand_binding": contract.demand_binding.name.lower(),
+                "access_proof": contract.access_proof.name.lower(),
+                "granularity_bytes": contract.granularity_bytes,
+                "tier_mask": contract.tier_mask,
                 "source_fingerprint": contract.source_fingerprint,
             }
             for contract in contracts
@@ -3615,6 +3897,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             for plan in sorted(
                 self._operator_plans.values(),
                 key=lambda candidate: (int(candidate.family), candidate.plan_fingerprint),
+            )
+        ]
+        report["tier_descriptors"] = [
+            {
+                "source_kind": descriptor.source_kind.name.lower(),
+                "capabilities": int(descriptor.capabilities),
+                "device_state": descriptor.device_state,
+                "estimated_latency_ns": descriptor.estimated_latency_ns,
+                "estimated_bandwidth_bytes_per_second": descriptor.estimated_bandwidth_bytes_per_second,
+                "active": descriptor.active,
+                "flags": descriptor.flags,
+            }
+            for descriptor in (
+                self._runtime.tier_descriptor(tier) for tier in TierKind
             )
         ]
         families = {contract.family for contract in contracts}

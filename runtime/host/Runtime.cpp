@@ -1,5 +1,6 @@
 #include "CudaDeviceGuard.h"
 #include "nta/DeviceWorkPlan.h"
+#include "nta/CxlRuntime.h"
 #include "nta/HostRuntime.h"
 #include "nta/NvmeRuntime.h"
 #include "nta/WorkPlan.h"
@@ -35,6 +36,56 @@ void checkCuda(cudaError_t result, const char *operation) {
     throw std::runtime_error(std::string(operation) + ": " +
                              cudaGetErrorString(result));
   }
+}
+
+abi::SourceKind sourceKindFor(Placement placement) {
+  switch (placement) {
+  case Placement::Hbm:
+    return abi::SourceKind::Hbm;
+  case Placement::HostMapped:
+    return abi::SourceKind::HostMapped;
+  case Placement::HostStaged:
+    return abi::SourceKind::HostStaged;
+  case Placement::CxlMapped:
+    return abi::SourceKind::Cxl;
+  }
+  throw std::invalid_argument("unknown runtime placement");
+}
+
+std::uint64_t defaultLatency(abi::SourceKind kind) {
+  switch (kind) {
+  case abi::SourceKind::Hbm:
+    return 0;
+  case abi::SourceKind::HostMapped:
+    return 300;
+  case abi::SourceKind::HostStaged:
+    return 2'000;
+  case abi::SourceKind::Nvme:
+    return 80'000;
+  case abi::SourceKind::Cxl:
+    return 1'500;
+  case abi::SourceKind::Rdma:
+    return 5'000;
+  }
+  return UINT64_MAX;
+}
+
+std::uint64_t defaultBandwidth(abi::SourceKind kind) {
+  switch (kind) {
+  case abi::SourceKind::Hbm:
+    return 1'000'000'000'000ULL;
+  case abi::SourceKind::HostMapped:
+    return 50'000'000'000ULL;
+  case abi::SourceKind::HostStaged:
+    return 30'000'000'000ULL;
+  case abi::SourceKind::Nvme:
+    return 7'000'000'000ULL;
+  case abi::SourceKind::Cxl:
+    return 20'000'000'000ULL;
+  case abi::SourceKind::Rdma:
+    return 25'000'000'000ULL;
+  }
+  return 1;
 }
 
 template <typename T> T *deviceAllocate(std::size_t count) {
@@ -92,6 +143,7 @@ struct HostRuntime::Impl {
     Placement placement;
     void *hostAllocation;
     void *sourceDevice;
+    std::unique_ptr<CxlDaxBuffer> cxlBuffer;
   };
 
   struct OwnedObject {
@@ -116,17 +168,23 @@ struct HostRuntime::Impl {
   };
 
   explicit Impl(RuntimeConfig runtimeConfig,
-                std::shared_ptr<NvmeTransport> nvmeTransport = nullptr)
+                RuntimeBackends runtimeBackends = {})
       : config(normalizeRuntimeConfig(runtimeConfig)),
         requestsHost(config.requestCapacity), tenantsHost(config.tenantCapacity),
         requestInstalled(config.requestCapacity, false),
         objectInstalled(config.objectCapacity, false),
-        objects(config.objectCapacity), nvme(std::move(nvmeTransport)) {
+        objects(config.objectCapacity),
+        nvme(std::move(runtimeBackends.nvme)),
+        cxl(std::move(runtimeBackends.cxl)) {
     config.deviceOrdinal = detail::resolveCudaDevice(config.deviceOrdinal);
     detail::CudaDeviceGuard deviceGuard(config.deviceOrdinal);
     if (nvme != nullptr && nvme->deviceOrdinal() != config.deviceOrdinal) {
       throw std::invalid_argument(
           "HostRuntime and NvmeTransport must own the same CUDA device");
+    }
+    if (cxl != nullptr && cxl->deviceOrdinal() != config.deviceOrdinal) {
+      throw std::invalid_argument(
+          "HostRuntime and CxlDaxTransport must own the same CUDA device");
     }
     if (config.requestCapacity == 0 || config.tenantCapacity == 0 ||
         config.objectCapacity == 0 ||
@@ -249,16 +307,30 @@ struct HostRuntime::Impl {
                               std::uint64_t state, std::uint64_t latencyNs,
                               std::uint64_t bandwidth,
                               std::uint32_t flags = 0) {
-        return abi::BackendView{
+        const TierDescriptor descriptor{
+            kind,
+            defaultTierCapabilities(kind),
             state,
             latencyNs,
             bandwidth,
+            active ? 1U : 0U,
+            flags,
+        };
+        const std::uint32_t directFlags =
+            (descriptor.capabilities & TierDirectAddress) != 0
+                ? abi::BackendDeviceVisible
+                : 0U;
+        return abi::BackendView{
+            descriptor.deviceState,
+            descriptor.estimatedLatencyNs,
+            descriptor.estimatedBandwidthBytesPerSecond,
             0,
             UINT64_MAX,
-            static_cast<std::uint32_t>(kind),
-            active ? 1U : 0U,
-            static_cast<std::uint32_t>(kind),
-            flags,
+            static_cast<std::uint32_t>(descriptor.kind),
+            descriptor.active,
+            static_cast<std::uint32_t>(descriptor.kind),
+            descriptor.flags | directFlags |
+                encodeTierCapabilities(descriptor.capabilities),
             0,
         };
       };
@@ -275,11 +347,29 @@ struct HostRuntime::Impl {
                   nvme != nullptr && config.enableCtaNvmeTryIssue
                       ? abi::BackendCtaTryIssue
                       : 0U),
+          backend(abi::SourceKind::Cxl, cxl != nullptr,
+                  cxl == nullptr
+                      ? 0
+                      : reinterpret_cast<std::uint64_t>(cxl->deviceAddress()),
+                  1'500, 20'000'000'000ULL,
+                  cxl != nullptr ? abi::BackendDeviceVisible : 0U),
           backend(abi::SourceKind::Rdma, false, 0, 5'000, 25'000'000'000ULL),
       };
       checkCuda(cudaMemcpy(backendEntries, hostBackends.data(),
                            sizeof(hostBackends), cudaMemcpyHostToDevice),
                 "upload backend directory");
+      for (std::size_t index = 0; index < hostBackends.size(); ++index) {
+        const abi::BackendView &entry = hostBackends[index];
+        tierDescriptors[index] = {
+            static_cast<abi::SourceKind>(entry.sourceKind),
+            decodeTierCapabilities(entry.flags),
+            entry.deviceState,
+            entry.estimatedLatencyNs,
+            entry.estimatedBandwidthBytesPerSecond,
+            entry.active,
+            entry.flags,
+        };
+      }
       for (abi::TenantContext &tenant : tenantsHost) {
         tenant = {UINT64_MAX, 0, 1, 1, 0};
       }
@@ -577,6 +667,7 @@ struct HostRuntime::Impl {
   abi::ObjectEntry *objectEntries = nullptr;
   abi::ReplicaEntry *replicaEntries = nullptr;
   abi::BackendView *backendEntries = nullptr;
+  std::array<TierDescriptor, abi::BackendCount> tierDescriptors{};
   abi::IntentSlot *intents = nullptr;
   abi::WorkTicket *workTickets = nullptr;
   std::uint64_t *workRunnableNs = nullptr;
@@ -609,6 +700,7 @@ struct HostRuntime::Impl {
   std::vector<bool> objectInstalled;
   std::vector<std::optional<OwnedObject>> objects;
   std::shared_ptr<NvmeTransport> nvme;
+  std::shared_ptr<CxlDaxTransport> cxl;
   std::vector<DirectoryUpload> directoryUploads =
       std::vector<DirectoryUpload>(directoryUploadDepth());
   std::size_t nextDirectoryUpload = 0;
@@ -619,11 +711,10 @@ struct HostRuntime::Impl {
 };
 
 HostRuntime::HostRuntime(RuntimeConfig config)
-    : impl_(std::make_unique<Impl>(config)) {}
+    : impl_(std::make_unique<Impl>(config, RuntimeBackends{})) {}
 
-HostRuntime::HostRuntime(RuntimeConfig config,
-                         std::shared_ptr<NvmeTransport> nvme)
-    : impl_(std::make_unique<Impl>(config, std::move(nvme))) {}
+HostRuntime::HostRuntime(RuntimeConfig config, RuntimeBackends backends)
+    : impl_(std::make_unique<Impl>(config, std::move(backends))) {}
 
 HostRuntime::~HostRuntime() = default;
 HostRuntime::HostRuntime(HostRuntime &&) noexcept = default;
@@ -825,7 +916,7 @@ ObjectHandle HostRuntime::installReplicatedObject(
   bool hasTransport = false;
   try {
     for (const HostReplicaSpec &spec : replicas) {
-      allocation.replicas.push_back({spec.placement, nullptr, nullptr});
+      allocation.replicas.push_back({spec.placement, nullptr, nullptr, nullptr});
       Impl::OwnedReplica &owned = allocation.replicas.back();
       if (spec.placement == Placement::Hbm) {
         checkCuda(cudaMalloc(&owned.sourceDevice, bytes),
@@ -833,6 +924,14 @@ ObjectHandle HostRuntime::installReplicatedObject(
         checkCuda(cudaMemcpy(owned.sourceDevice, spec.contents.data(), bytes,
                              cudaMemcpyHostToDevice),
                   "upload HBM object replica");
+      } else if (spec.placement == Placement::CxlMapped) {
+        if (impl_->cxl == nullptr) {
+          throw std::invalid_argument(
+              "CXL placement requires an active CXL DAX transport");
+        }
+        owned.cxlBuffer = impl_->cxl->allocate(bytes);
+        std::memcpy(owned.cxlBuffer->hostAddress(), spec.contents.data(), bytes);
+        owned.sourceDevice = owned.cxlBuffer->deviceAddress();
       } else {
         checkCuda(
             cudaHostAlloc(&owned.hostAllocation, bytes, cudaHostAllocMapped),
@@ -845,20 +944,12 @@ ObjectHandle HostRuntime::installReplicatedObject(
 
       const bool direct = spec.placement != Placement::HostStaged;
       hasTransport |= !direct;
-      const abi::SourceKind sourceKind =
-          spec.placement == Placement::Hbm ? abi::SourceKind::Hbm
-          : spec.placement == Placement::HostMapped
-              ? abi::SourceKind::HostMapped
-              : abi::SourceKind::HostStaged;
+      const abi::SourceKind sourceKind = sourceKindFor(spec.placement);
       replicaEntries.push_back({
           reinterpret_cast<std::uint64_t>(owned.sourceDevice),
           0,
-          sourceKind == abi::SourceKind::Hbm          ? 0ULL
-          : sourceKind == abi::SourceKind::HostMapped ? 300ULL
-                                                      : 2'000ULL,
-          sourceKind == abi::SourceKind::Hbm          ? 1'000'000'000'000ULL
-          : sourceKind == abi::SourceKind::HostMapped ? 50'000'000'000ULL
-                                                      : 30'000'000'000ULL,
+          defaultLatency(sourceKind),
+          defaultBandwidth(sourceKind),
           static_cast<std::uint32_t>(sourceKind),
           0,
           static_cast<std::uint32_t>(sourceKind),
@@ -944,25 +1035,22 @@ HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
     }
     const bool direct = replica.placement != Placement::HostStaged;
     hasTransport |= !direct;
-    const abi::SourceKind sourceKind =
-        replica.placement == Placement::Hbm ? abi::SourceKind::Hbm
-        : replica.placement == Placement::HostMapped
-            ? abi::SourceKind::HostMapped
-            : abi::SourceKind::HostStaged;
-    const std::uint64_t defaultLatency =
-        sourceKind == abi::SourceKind::Hbm          ? 0
-        : sourceKind == abi::SourceKind::HostMapped ? 300
-                                                    : 2'000;
-    const std::uint64_t defaultBandwidth =
-        sourceKind == abi::SourceKind::Hbm          ? 1'000'000'000'000ULL
-        : sourceKind == abi::SourceKind::HostMapped ? 50'000'000'000ULL
-                                                    : 30'000'000'000ULL;
+    const abi::SourceKind sourceKind = sourceKindFor(replica.placement);
+    if (replica.placement == Placement::CxlMapped &&
+        (impl_->cxl == nullptr ||
+         !impl_->cxl->containsDeviceAddress(replica.sourceDeviceAddress,
+                                             bytes))) {
+      throw std::invalid_argument(
+          "CXL replica must belong to the active mapped CXL window");
+    }
+    const std::uint64_t defaultLatencyNs = defaultLatency(sourceKind);
+    const std::uint64_t defaultBandwidthBytes = defaultBandwidth(sourceKind);
     const std::uint64_t latency = replica.estimatedLatencyNs == 0
-                                      ? defaultLatency
+                                      ? defaultLatencyNs
                                       : replica.estimatedLatencyNs;
     const std::uint64_t bandwidth =
         replica.estimatedBandwidthBytesPerSecond == 0
-            ? defaultBandwidth
+            ? defaultBandwidthBytes
             : replica.estimatedBandwidthBytesPerSecond;
     entries.push_back({
         reinterpret_cast<std::uint64_t>(replica.sourceDeviceAddress),
@@ -1311,6 +1399,14 @@ int HostRuntime::deviceOrdinal() const noexcept {
 
 const RuntimeConfig &HostRuntime::config() const noexcept {
   return impl_->config;
+}
+
+TierDescriptor HostRuntime::tierDescriptor(abi::SourceKind kind) const {
+  const auto index = static_cast<std::uint32_t>(kind);
+  if (index >= abi::BackendCount) {
+    throw std::out_of_range("source tier exceeds runtime backend directory");
+  }
+  return impl_->tierDescriptors[index];
 }
 
 StagingUsage HostRuntime::stagingUsage() const noexcept {

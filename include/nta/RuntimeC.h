@@ -7,13 +7,14 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 30U
+#define NTA_RUNTIME_C_API_VERSION 32U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
 typedef struct nta_device_work_plan nta_device_work_plan;
 typedef struct nta_jit_phase_program nta_jit_phase_program;
 typedef struct nta_nvme_transport nta_nvme_transport;
+typedef struct nta_cxl_dax_transport nta_cxl_dax_transport;
 
 typedef enum nta_status {
   NTA_STATUS_OK = 0,
@@ -26,6 +27,7 @@ typedef enum nta_placement {
   NTA_PLACEMENT_HBM = 0,
   NTA_PLACEMENT_HOST_MAPPED = 1,
   NTA_PLACEMENT_HOST_STAGED = 2,
+  NTA_PLACEMENT_CXL_MAPPED = 3,
 } nta_placement;
 
 typedef enum nta_indexed_host_object_flags {
@@ -154,6 +156,32 @@ typedef struct nta_nvme_queue_stats {
   uint32_t next_completion_dword3;
 } nta_nvme_queue_stats;
 
+typedef struct nta_cxl_dax_options {
+  uint32_t struct_size;
+  uint32_t api_version;
+  const char *endpoint;
+  uint64_t window_bytes;
+  int32_t device_ordinal;
+} nta_cxl_dax_options;
+
+typedef struct nta_cxl_dax_capabilities {
+  uint64_t window_bytes;
+  uint64_t mapped_device_address;
+  int32_t device_ordinal;
+  uint32_t host_registered;
+  uint32_t direct_device_visible;
+} nta_cxl_dax_capabilities;
+
+typedef struct nta_tier_descriptor {
+  uint32_t source_kind;
+  uint32_t capabilities;
+  uint64_t device_state;
+  uint64_t estimated_latency_ns;
+  uint64_t estimated_bandwidth_bytes_per_second;
+  uint32_t active;
+  uint32_t flags;
+} nta_tier_descriptor;
+
 typedef struct nta_epoch_status {
   uint32_t total;
   uint32_t fresh;
@@ -205,6 +233,12 @@ typedef struct nta_operator_contract {
   uint64_t capabilities;
   uint64_t source_fingerprint_low;
   uint64_t source_fingerprint_high;
+  uint64_t instrumentation_flags;
+  uint32_t identity_binding;
+  uint32_t demand_binding;
+  uint32_t access_proof;
+  uint32_t granularity_bytes;
+  uint64_t tier_mask;
 } nta_operator_contract;
 
 typedef struct nta_operator_plan {
@@ -237,9 +271,18 @@ nta_nvme_transport_get_capabilities(const nta_nvme_transport *transport,
                                     nta_nvme_capabilities *capabilities);
 nta_status nta_nvme_transport_read_stats(const nta_nvme_transport *transport,
                                          nta_nvme_queue_stats *stats);
+nta_status nta_cxl_dax_transport_create(const nta_cxl_dax_options *options,
+                                        nta_cxl_dax_transport **transport_out);
+void nta_cxl_dax_transport_destroy(nta_cxl_dax_transport *transport);
+nta_status nta_cxl_dax_transport_get_capabilities(
+    const nta_cxl_dax_transport *transport, nta_cxl_dax_capabilities *capabilities);
+nta_status nta_runtime_get_tier_descriptor(const nta_runtime *runtime,
+                                           uint32_t source_kind,
+                                           nta_tier_descriptor *descriptor);
 
 nta_status nta_runtime_create(const nta_runtime_config *config,
                               nta_nvme_transport *nvme,
+                              nta_cxl_dax_transport *cxl,
                               nta_runtime **runtime_out);
 void nta_runtime_destroy(nta_runtime *runtime);
 nta_status nta_runtime_set_request(nta_runtime *runtime, uint32_t slot,

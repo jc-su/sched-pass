@@ -1,11 +1,12 @@
 """Engine adapters for the engine-neutral NTA execution contract."""
 
-from .base import EngineBatch, RequestIdentityAdapter
+from .base import EngineBatch, EngineBoundary, RequestIdentityAdapter
 from .sglang import SglangAdapter, SglangExecutionConfig
 from .vllm import VllmAdapter, VllmSchedulerProjection
 
 __all__ = [
     "EngineBatch",
+    "EngineBoundary",
     "RequestIdentityAdapter",
     "SglangAdapter",
     "SglangExecutionConfig",

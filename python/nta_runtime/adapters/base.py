@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from ..requests import RequestBinding, RequestIdentityRegistry
 from ..work_unit import Granularity
@@ -28,6 +28,43 @@ class EngineBatch:
             raise ValueError("engine batch must contain at least one request")
         if len({binding.request_slot for binding in self.bindings}) != len(self.bindings):
             raise ValueError("engine batch cannot reuse a request slot")
+        if len({binding.request_index for binding in self.bindings}) != len(self.bindings):
+            raise ValueError("engine batch cannot reuse a request index")
+
+    @property
+    def request_ids(self) -> tuple[int, ...]:
+        return tuple(binding.request_id for binding in self.bindings)
+
+    @property
+    def request_slots(self) -> tuple[int, ...]:
+        return tuple(binding.request_slot for binding in self.bindings)
+
+    @property
+    def generations(self) -> tuple[int, ...]:
+        return tuple(binding.generation for binding in self.bindings)
+
+
+@runtime_checkable
+class EngineBoundary(Protocol):
+    """The one lifecycle boundary shared by SGLang and vLLM adapters."""
+
+    engine: str
+
+    def bind_forward(
+        self,
+        forward_batch: Any,
+        *,
+        epoch: int,
+        stream: Any = None,
+        granularity: Granularity = Granularity.PAGE_GROUP,
+        **kwargs: Any,
+    ) -> EngineBatch:
+        ...
+
+    def cancel_matching(
+        self, request_id_prefix: str = "", *, all: bool = False
+    ) -> int:
+        ...
 
 
 class RequestIdentityAdapter:

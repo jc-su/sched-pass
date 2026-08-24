@@ -54,6 +54,12 @@ def operator_family(arguments: list[str]) -> int:
     command and remains stable across those internal implementation choices.
     """
     command = " ".join(arguments)
+    # The baseline is deliberately compiled through the same launcher for a
+    # fair differential measurement, but it has no NTA typed contract.  Its
+    # module name still contains the public FlashInfer family token, so this
+    # guard must precede family recognition.
+    if "_baseline" in command:
+        return 0
     module_tokens = (
         (("nta_sglang_decode_", "nta_batch_decode_"), 1),
         (("nta_sglang_prefill_", "nta_batch_prefill_"), 2),
@@ -75,6 +81,27 @@ def operator_family(arguments: list[str]) -> int:
     if "batch_prefill_paged_kernel" in command:
         return 2
     return 0
+
+
+def has_typed_operator_kernel_source(arguments: list[str]) -> bool:
+    """Identify translation units patched with the FlashInfer CTA hooks.
+
+    A generated FlashInfer module contains binding/helper translation units in
+    addition to the actual paged attention kernels.  The module-level name is
+    present in all of them, but only the kernel sources contain typed NTA
+    marker calls.  Contract constants must therefore not be injected into
+    helpers; doing so makes the LLVM pass reject an otherwise ordinary helper
+    TU for having no acquisition marker.
+    """
+    command = " ".join(arguments)
+    return any(
+        token in command
+        for token in (
+            "batch_decode_kernel.cu",
+            "batch_prefill_paged_kernel",
+            "batch_prefill_ragged_kernel",
+        )
+    )
 
 
 def translate(arguments: list[str], instrument: bool) -> list[str]:
@@ -112,11 +139,26 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
             request_bound = matches_filter(
                 arguments, "NTA_JIT_REQUEST_BOUND_SOURCE"
             )
+            # JitRuntime is emitted by the one source selected by
+            # NTA_JIT_PHASE_SOURCE.  Request-bound is a module-wide compile
+            # variant, but adding JitRuntime to every request-bound helper TU
+            # would create duplicate exported phase symbols at link time.
+            # The activate launcher supplies a stable phase-source selector;
+            # standalone workers must use that launcher as well.
+            phase_runtime = phase_source
             stream_ordered_direct = (
                 "nta_sglang_prefill_demand_acquire_tier_v4_"
                 in " ".join(arguments)
             )
             family = operator_family(arguments)
+            typed_module = (
+                family in (1, 2)
+                and has_typed_operator_kernel_source(arguments)
+                and any(
+                    token in " ".join(arguments)
+                    for token in ("nta_batch_", "nta_sglang_")
+                )
+            )
             operator_form = 1 if request_bound else 2
             direct_capabilities = (1 << 0) | (1 << 6) | (1 << 7)
             incremental_capabilities = sum(1 << bit for bit in range(8))
@@ -132,16 +174,24 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
             partial_state = 1 if family in (1, 2) else 0
             reduction = 1 if family in (1, 2) else 0
             plan_flags = 0x1F if family in (1, 2) else 0x9
+            instrumentation_flags = 0xF if typed_module else 0
+            identity_binding = 1 if typed_module else 0
+            demand_binding = 1 if typed_module else 0
+            access_proof = 3 if typed_module else 0
+            tier_mask = 0x3F if typed_module else 0
             plan_fingerprint = hashlib.sha256(
                 (
                     f"{os.environ.get('NTA_JIT_CACHE_TAG', '')}|{family}|6|"
-                    f"{coordinate_map}|{partial_state}|{reduction}|{plan_flags}"
+                    f"{coordinate_map}|{partial_state}|{reduction}|{plan_flags}|"
+                    f"{instrumentation_flags}|{identity_binding}|{demand_binding}|"
+                    f"{access_proof}|{tier_mask}"
                 ).encode("utf-8")
             ).digest()
             plan_hash_low = int.from_bytes(plan_fingerprint[:8], "little")
             plan_hash_high = int.from_bytes(plan_fingerprint[8:16], "little")
             command.extend([
-                f"-DNTA_DEVICE_PHASE_KERNELS={1 if phase_source else 0}",
+                f"-DNTA_DEVICE_PHASE_KERNELS={1 if phase_runtime else 0}",
+                f"-DNTA_TYPED_OPERATOR_CONTRACT={1 if typed_module else 0}",
                 f"-DNTA_FLASHINFER_REQUEST_BOUND={1 if request_bound else 0}",
                 "-DNTA_FLASHINFER_PREACQUIRED_ONLY=0",
                 "-DNTA_FLASHINFER_STREAM_ORDERED_DIRECT="
@@ -158,11 +208,19 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
                 f"-DNTA_OPERATOR_PLAN_FLAGS={plan_flags}U",
                 f"-DNTA_OPERATOR_PLAN_HASH_LOW={plan_hash_low}ULL",
                 f"-DNTA_OPERATOR_PLAN_HASH_HIGH={plan_hash_high}ULL",
+                f"-DNTA_OPERATOR_INSTRUMENTATION_FLAGS={instrumentation_flags}ULL",
+                f"-DNTA_OPERATOR_IDENTITY_BINDING={identity_binding}U",
+                f"-DNTA_OPERATOR_DEMAND_BINDING={demand_binding}U",
+                f"-DNTA_OPERATOR_ACCESS_PROOF={access_proof}U",
+                "-DNTA_OPERATOR_GRANULARITY_BYTES=0U",
+                f"-DNTA_OPERATOR_TIER_MASK={tier_mask}ULL",
+                "-include",
+                str(ROOT / "runtime/device/TypedInstrumentation.cuh"),
                 "-include",
                 str(
                     ROOT / (
                         "runtime/device/JitRuntime.cuh"
-                        if phase_source else "runtime/device/Acquire.cuh"
+                        if phase_runtime else "runtime/device/Acquire.cuh"
                     )
                 ),
             ])

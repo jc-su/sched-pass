@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "classification": "nta-paired-evaluation",
+  "workload_manifest": "/path/to/normalized-bailian/manifest.json",
+  "repetitions": 10,
+  "seed": 20260824,
+  "experiments": [
+    {
+      "name": "host-mem-exact",
+      "variant": "stock",
+      "arm": "B1",
+      "tier": "host_mem",
+      "demand_semantics": "exact",
+      "stratum": {
+        "request_state": "mixed",
+        "granularity": "page_group",
+        "load_ratio": "balanced",
+        "availability_skew": "medium",
+        "staging_pressure": "near_capacity",
+        "arrival": "trace_timestamp"
+      },
+      "command": ["/path/to/stock-command", "--workload-manifest", "/path/to/normalized-bailian/manifest.json"],
+      "metrics": ["slo_goodput", "p95_ttft_seconds", "p99_itl_seconds", "verification_failures"]
+    },
+    {
+      "name": "host-mem-exact",
+      "variant": "nta",
+      "arm": "B5",
+      "tier": "host_mem",
+      "demand_semantics": "exact",
+      "stratum": {
+        "request_state": "mixed",
+        "granularity": "page_group",
+        "load_ratio": "balanced",
+        "availability_skew": "medium",
+        "staging_pressure": "near_capacity",
+        "arrival": "trace_timestamp"
+      },
+      "command": ["/path/to/nta-command", "--workload-manifest", "/path/to/normalized-bailian/manifest.json"],
+      "metrics": ["slo_goodput", "p95_ttft_seconds", "p99_itl_seconds", "verification_failures"]
+    }
+  ],
+  "comparisons": [
+    {
+      "name": "nta-over-stock-goodput",
+      "experiment": "host-mem-exact",
+      "numerator_variant": "nta",
+      "denominator_variant": "stock",
+      "metric": "slo_goodput"
+    }
+  ]
+}
