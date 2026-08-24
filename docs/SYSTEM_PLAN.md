@@ -1,8 +1,12 @@
 # Request-Aware Incremental GPU Operators
 
-Status: canonical research and implementation roadmap; compiler/runtime plus
-bounded external-prefix SGLang slice implemented, exact contributor serving
-and OSDI evidence open
+> Refactor notice (2026-08-24): this is a pre-refactor roadmap retained for
+> provenance.  For current implementation decisions use
+> [REFRACTOR_DESIGN.md](REFRACTOR_DESIGN.md); for new experiments use
+> [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md).
+
+Status: historical research and implementation roadmap; not authoritative for
+the `refactor/late-bound-work-unit` code structure or claims
 
 This document defines the revised problem, co-design, implementation order, and
 claim boundary. `ARCHITECTURE.md` remains the mechanism contract. Historical

@@ -1,5 +1,10 @@
 # OSDI Evaluation Plan — Complete Ledger and Critical Path
 
+> Refactor notice (2026-08-24): this ledger describes the prior evaluation
+> plan.  It is retained as evidence and debt tracking only.  The redesigned
+> evaluation is [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md); the current
+> mechanism is [REFRACTOR_DESIGN.md](REFRACTOR_DESIGN.md).
+
 Written 2026-08-20. This is the single place that answers "what must still
 be measured before submission," derived from the four registered research
 questions in `ONE_GPU_EVALUATION.md`, the novelty requirements in

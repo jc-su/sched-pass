@@ -1,5 +1,9 @@
 # One-GPU Evaluation Plan
 
+> Refactor notice (2026-08-24): historical plan retained for provenance.  Do
+> not add new arms or implementation requirements here; use
+> [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md).
+
 This document defines the single-GPU evaluation for NTA. It distinguishes
 mechanism evidence from end-to-end serving evidence and tests request-aware
 incremental execution of an otherwise all-or-nothing GPU operator.

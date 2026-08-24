@@ -9,7 +9,8 @@ same-named branches may still exist on `origin` until pushed deletions).
 
 | branch | checkout | purpose | merge condition |
 |---|---|---|---|
-| `nonresident-acquisition` | main repo | THE working branch; every sealed result and doc | — |
+| `nonresident-acquisition` | parent history | parent branch containing sealed results and pre-refactor docs | — |
+| `refactor/late-bound-work-unit` | main repo (current checkout) | unified work-unit contract, engine adapters, and redesigned evaluation | contract tests + migration review, then merge intentionally |
 | `consumer-contract` | `~/Dev/sched-pass-wt/contract` | in-kernel claim-consumer contract (ABI v28), fully built, fixtures passed on GPU | replay + quality batteries green with the check armed, then a registered mechanism-change entry |
 | `e6-conventional` | `~/Dev/sched-pass-wt/e6` | E6 execution protocol (GPU selection + conventional gather), the decomposition arm of docs/CAUSAL_CHAIN.md; campaign queued from this worktree | after the E6 campaign seals, merge (mode is env-gated off) |
 | `isolation-admission` | none | archival WIP: naive external-admission deferral, self-recorded as not validated and probably self-defeating | not planned; keep as recorded negative design |

@@ -1,5 +1,10 @@
 # Validation Record
 
+> Refactor notice (2026-08-24): frozen historical validation record.  It is
+> useful for regression comparison, but its counters and old protocol names
+> are not universal requirements for every new arm.  Current acceptance gates
+> are in [REFRACTOR_DESIGN.md](REFRACTOR_DESIGN.md).
+
 Date: 2026-08-10
 
 This record supports a locally validated mechanism prototype. It does not

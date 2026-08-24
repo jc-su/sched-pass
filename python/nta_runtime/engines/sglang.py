@@ -38,6 +38,8 @@ from nta_runtime.flashinfer_schedule import (
     paged_prefill_schedule,
     require_supported_version,
 )
+from nta_runtime.adapters.base import EngineBatch
+from nta_runtime.adapters.sglang import SglangAdapter, SglangExecutionConfig
 from nta_runtime.execution_policy import (
     conservative_resume_counts,
     HostCostModel,
@@ -46,7 +48,7 @@ from nta_runtime.execution_policy import (
     plan_host_execution,
 )
 from nta_runtime.opportunity import OperatorArrival, TileArrival, append_json_line
-from nta_runtime.requests import RequestBinding, RequestSlotTracker
+from nta_runtime.requests import RequestBinding
 from nta_runtime.engines.sglang_hicache import PendingHostLoad, SglangHiCacheBridge
 from nta_runtime.fixed_range_pool import FixedRangePool
 from nta_runtime.runtime import (
@@ -529,6 +531,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._work_ticket_capacity = _positive_environment(
             "NTA_SGLANG_MAX_WORK_TICKETS", default_tickets
         )
+        try:
+            self._execution_config = SglangExecutionConfig.from_environment()
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        if self._execution_config.protocol.kind.value == "conventional":
+            raise RuntimeError(
+                "the conventional protocol is an explicit baseline and is not "
+                "wired into this refactor branch yet"
+            )
         self._object_capacity = 2 * self._work_ticket_capacity
         self._runtime = Runtime(
             RuntimeConfig(
@@ -542,7 +553,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
         )
         self._runtime.set_tenant_budget(0, (1 << 64) - 1)
-        self._request_slots = RequestSlotTracker(self._runtime, request_capacity)
+        self._request_adapter = SglangAdapter(self._runtime, request_capacity)
         self._hicache = SglangHiCacheBridge(self.token_to_kv_pool)
         # CUDA priorities are inverted: numerically lower values preempt higher
         # ones, and SGLang's compute stream runs at the default priority 0.
@@ -611,6 +622,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._model_layer_count = int(layer_count)
         self._model_start_layer = int(getattr(self.token_to_kv_pool, "start_layer", 0))
         self._cuda_graph_mode = False
+        self._execution_epoch = 0
+        self._current_engine_batch: EngineBatch | None = None
         self._active_batch: _ActiveBatch | None = None
         self._plans: dict[tuple[int, int], _PlanAllocation] = {}
         self._phase_programs: dict[str, JitPhaseProgram] = {}
@@ -638,6 +651,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "schema": 1,
             "engine": "sglang",
             "backend": "nta_flashinfer",
+            "execution_protocol": self._execution_config.protocol.kind.value,
+            "work_granularity": self._execution_config.protocol.granularity.value,
+            "protocol_max_inflight_units": self._execution_config.protocol.max_inflight_units,
+            "execution_protocol_status": "adapter_identity_only",
             "revision": os.environ.get("NTA_REVISION", "unknown"),
             "pid": os.getpid(),
             "pipeline_host_enabled": self._pipeline_host,
@@ -1166,7 +1183,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
 
     def cancel_requests(self, request_id_prefix: str, *, all: bool = False) -> int:
-        cancelled = self._request_slots.cancel_matching(request_id_prefix, all=all)
+        cancelled = self._request_adapter.cancel_matching(request_id_prefix, all=all)
         for claim in tuple(self._tiered_claims.values()):
             if all or (
                 claim.request_id is not None
@@ -1404,34 +1421,22 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
     def _bind_forward_requests(
         self, forward_batch: Any, *, allow_capture_ids: bool
     ) -> tuple[RequestBinding, ...]:
-        request_ids = getattr(forward_batch, "rids", None)
-        batch_size = int(forward_batch.batch_size)
-        if request_ids is None:
-            if not allow_capture_ids:
-                raise RuntimeError(
-                    "SGLang CUDA replay omitted request IDs from its metadata view"
-                )
-            request_ids = [
-                f"__nta_graph_capture_{index}" for index in range(batch_size)
-            ]
-        if len(request_ids) != batch_size:
-            raise RuntimeError("SGLang request IDs do not match the padded graph batch")
-        priorities = tuple(
-            int(priority)
-            for priority in getattr(
-                forward_batch, "_nta_request_priorities", (0,) * batch_size
-            )
-        )
-        bindings = self._request_slots.bind(
-            request_ids,
-            range(batch_size),
-            priorities=priorities,
+        batch = self._request_adapter.bind_forward(
+            forward_batch,
+            allow_capture_ids=allow_capture_ids,
             stream=torch.cuda.current_stream(),
+            epoch=self._execution_epoch,
+            granularity=self._execution_config.protocol.granularity,
         )
-        self._stats["request_rebindings"] += self._request_slots.last_publish_count
+        self._execution_epoch += 1
+        self._current_engine_batch = batch
+        self._stats["engine_batch_epoch"] = batch.epoch
+        self._stats["engine_batch_size"] = len(batch.bindings)
+        bindings = batch.bindings
+        self._stats["request_rebindings"] += self._request_adapter.last_publish_count
         self._stats["request_policy_updates"] = (
             self._stats.get("request_policy_updates", 0)
-            + self._request_slots.last_policy_publish_count
+            + self._request_adapter.last_policy_publish_count
         )
         return bindings
 

@@ -1,5 +1,10 @@
 # The Causal Chain: Factorization, Decomposition, and the Missing Arm
 
+> Refactor notice (2026-08-24): historical causal analysis.  Its decomposition
+> arms are preserved for audit, but the current mechanism and experiment
+> design are [REFRACTOR_DESIGN.md](REFRACTOR_DESIGN.md) and
+> [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md).
+
 Written 2026-08-24 after the external deep-review of recent OSDI work
 (InfiniGen, ECHO, Strata, DirectKV, Syncopate, MPK, CoPilotIO, Llumnix).
 This document does three things: fixes the demand/execution

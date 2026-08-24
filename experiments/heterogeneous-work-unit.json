@@ -1,0 +1,67 @@
+{
+  "schema": 2,
+  "status": "design-only-until-protocol-wired",
+  "description": "Fair evaluation matrix for exact late-bound heterogeneous work units.",
+  "source_of_truth": "docs/EXPERIMENT_DESIGN.md",
+  "repetitions": 10,
+  "seed": 20260824,
+  "demand": {
+    "semantics": "exact-sparse",
+    "trace_is_shared_across_arms": true,
+    "selector_quality_gate": "not-applicable"
+  },
+  "workload": {
+    "single_batch_contains": [
+      "resident",
+      "ready-external",
+      "blocked-external",
+      "new-arrival"
+    ],
+    "request_slot_reuse": true,
+    "cancellation": true,
+    "nonstationary_trace": true
+  },
+  "axes": {
+    "candidate_units": [64, 256, 1024, 4096],
+    "selected_fraction": [0.0625, 0.25, 0.5, 1.0],
+    "batch_size": [4, 16, 64],
+    "availability_skew_us": [0, 50, 500, 5000],
+    "compute_us_per_unit": [0.25, 1.0, 4.0],
+    "granularity": ["request", "layer", "page_group", "cta_tile"],
+    "staging_capacity_units": [256, 1024, 4096]
+  },
+  "arms": [
+    {"id": "B0", "name": "dense-resident", "protocol": "conventional"},
+    {"id": "B1", "name": "host-promotion-barrier", "protocol": "conventional"},
+    {"id": "B2", "name": "host-split-rebatch", "protocol": "conventional"},
+    {"id": "B3", "name": "device-demand-conventional-gather", "protocol": "conventional"},
+    {"id": "B4", "name": "device-demand-late-bound", "protocol": "late-bound"},
+    {"id": "B5", "name": "heterogeneous-work-unit", "protocol": "late-bound"},
+    {"id": "B6", "name": "exact-partial-continuation", "protocol": "partial"}
+  ],
+  "required_metrics": [
+    "throughput",
+    "ttft",
+    "tpot",
+    "slo_goodput",
+    "useful_bytes",
+    "physical_bytes",
+    "selection_us",
+    "protocol_control_us",
+    "time_to_runnable_us",
+    "ready_work_units",
+    "blocked_work_units",
+    "partial_work_units",
+    "staging_high_water_units",
+    "generation_rejections",
+    "epoch_rejections",
+    "verification_failures"
+  ],
+  "fairness": [
+    "same request trace",
+    "same exact selected work IDs",
+    "same transport delay distribution",
+    "same numerical output contract",
+    "explicit graph, overlap, and partial-state settings"
+  ]
+}

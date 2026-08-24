@@ -150,6 +150,26 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
+    NAME nta-work-unit
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/work_unit.py
+  )
+  set_tests_properties(
+    nta-work-unit PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-adapters
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/adapters.py
+  )
+  set_tests_properties(
+    nta-adapters PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
     NAME nta-critical-work
     COMMAND
       ${Python3_EXECUTABLE}
@@ -1192,7 +1212,7 @@ if(NTA_ENABLE_CUDA)
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py"
         --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
         --cache-root "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache"
-        --cuda-path "${CUDAToolkit_ROOT}"
+        --cuda-path "${NTA_CUDA_ROOT}"
         --flashinfer-hook
         --
         "${Python3_EXECUTABLE}"
@@ -1223,7 +1243,7 @@ if(NTA_ENABLE_CUDA)
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py"
         --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
         --cache-root "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache"
-        --cuda-path "${CUDAToolkit_ROOT}"
+        --cuda-path "${NTA_CUDA_ROOT}"
         --flashinfer-hook
         --
         "${Python3_EXECUTABLE}"

@@ -1,5 +1,10 @@
 # Device-Selected External Data
 
+> Refactor notice (2026-08-24): historical vertical-slice specification.
+> Approximate selectors described here are not the exact primary contract of
+> the refactor.  Use [REFRACTOR_DESIGN.md](REFRACTOR_DESIGN.md) for ownership
+> and [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md) for new evaluation.
+
 Status: bounded-allocation SGLang vertical slice mechanism-qualified on one
 GPU; exact contributors and paper-level performance evidence open.
 

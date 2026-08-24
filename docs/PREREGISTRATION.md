@@ -1,5 +1,10 @@
 # Pre-Registered Evaluation Protocol (RQ1 headline)
 
+> Refactor notice (2026-08-24): this pre-registration belongs to the previous
+> serving claim and is frozen historical evidence.  It does not define the
+> refactor's headline or acceptance gates.  New experiments follow
+> [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md).
+
 Written before any qualifying run, per the project's discipline: a failed
 gate is recorded, not retried until it passes, and operating points are
 not shopped after the fact. Changes to this file after the first
