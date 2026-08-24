@@ -614,6 +614,10 @@ class SelectedAttentionExecutor:
                 host_orchestrated = bool(
                     getattr(engine, "_host_orchestrated", False)
                 )
+                conventional = (
+                    getattr(engine, "_execution_protocol", "nta")
+                    == "conventional"
+                )
                 if selected_rows is None and in_extend_capture:
                     # Captured extend: staging runs inside the recorded
                     # region against the workspace; the row cache and
@@ -625,6 +629,7 @@ class SelectedAttentionExecutor:
                 elif selected_rows is None and (
                     prefill
                     and not host_orchestrated
+                    and not conventional
                     and claim.external_sidecar
                     and not claim.verify
                     and not claim.verify_fast
@@ -702,6 +707,7 @@ class SelectedAttentionExecutor:
                             verify_targets.append((claim, free, selected_rows))
                     elif (
                         not prefill
+                        and not conventional
                         and claim.external_sidecar
                         and getattr(claim, "table_backed", False)
                         and getattr(claim, "table_slot", None) is not None
@@ -711,6 +717,16 @@ class SelectedAttentionExecutor:
                         staging.append((claim, free))
                         staged_positions.append(position)
                     else:
+                        if conventional and claim.external_sidecar:
+                            # E6 (docs/CAUSAL_CHAIN.md): conventional
+                            # gather re-stages the full selected set at
+                            # every refresh — clearing the bounded-cache
+                            # directory removes cross-refresh row reuse
+                            # from this arm, so E6 vs E7 prices the
+                            # claim/overlap/graph/cache bundle and
+                            # nothing else.
+                            if claim.cached_pages is not None:
+                                claim.cached_pages[local_layer].fill_(-1)
                         selected_rows = claim.stage_missing(
                             engine, local_layer, free, stream
                         )

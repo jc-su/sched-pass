@@ -814,6 +814,31 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # builder (docs/B2_DEFERRED_HOST.md).
         self._host_orchestrated = host_mode in ("1", "deferred")
         self._host_orchestrated_mode = host_mode if self._host_orchestrated else ""
+        # E6 (docs/CAUSAL_CHAIN.md): GPU selection + conventional gather.
+        # Identical demand (selector, envelopes, budget, refresh) and the
+        # identical transfer primitive, but execution stripped to
+        # select-gather-then-run: no wavefront overlap, no bounded-cache
+        # row reuse across refreshes, no tiered graph replay. Splits the
+        # host-round-trip term (B1 vs E6) from the claim/overlap/graph
+        # bundle (E6 vs E7) inside the sealed 2.11x.
+        protocol = os.environ.get("NTA_SGLANG_EXECUTION_PROTOCOL", "")
+        if protocol not in ("", "nta", "conventional"):
+            raise RuntimeError(
+                "NTA_SGLANG_EXECUTION_PROTOCOL must be unset, 'nta', or "
+                f"'conventional'; got {protocol!r}"
+            )
+        self._execution_protocol = protocol or "nta"
+        if self._execution_protocol == "conventional":
+            if self._host_orchestrated:
+                raise RuntimeError(
+                    "the conventional protocol and host orchestration are "
+                    "different execution arms; enable exactly one"
+                )
+            if os.environ.get("NTA_SGLANG_TIERED_GRAPH") == "1":
+                raise RuntimeError(
+                    "the conventional protocol excludes tiered graph replay "
+                    "by definition; set NTA_SGLANG_TIERED_GRAPH=0"
+                )
         if self._host_orchestrated:
             if not self._tiered_enabled:
                 raise RuntimeError(
@@ -821,6 +846,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     "NTA_SGLANG_SELECTED_TIERED=1"
                 )
             self._stats["host_orchestrated_mode"] = 1
+        if self._execution_protocol == "conventional":
+            self._stats["execution_protocol_conventional"] = 1
         self._tiered_object_ranges = (
             FixedRangePool(
                 self._object_capacity,
