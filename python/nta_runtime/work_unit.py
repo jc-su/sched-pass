@@ -29,7 +29,6 @@ class DemandSemantics(str, Enum):
 
     EXACT_DENSE = "exact_dense"
     EXACT_SPARSE = "exact_sparse"
-    APPROXIMATE = "approximate"
 
 
 class Availability(str, Enum):
@@ -49,10 +48,9 @@ class Availability(str, Enum):
 class DemandDescriptor:
     """A demand result independent of how it was produced.
 
-    ``selected_units`` describes the exact amount consumed by the work unit;
-    it does not imply an approximation.  Approximation is explicit in
-    ``semantics`` so a system protocol cannot accidentally present a selector
-    as an exact numerical contract.
+    ``selected_units`` describes the exact amount consumed by the work unit.
+    Demand quality is outside this contract: the provider must supply the
+    exact IDs consumed by the numerical operator.
     """
 
     candidate_units: int
@@ -65,6 +63,8 @@ class DemandDescriptor:
     selected_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.semantics, DemandSemantics):
+            raise ValueError("demand semantics must be an exact contract")
         if self.candidate_units <= 0:
             raise ValueError("candidate_units must be positive")
         if not 0 < self.selected_units <= self.candidate_units:
@@ -106,7 +106,10 @@ class DemandDescriptor:
 
     @property
     def is_exact(self) -> bool:
-        return self.semantics is not DemandSemantics.APPROXIMATE
+        return self.semantics in (
+            DemandSemantics.EXACT_DENSE,
+            DemandSemantics.EXACT_SPARSE,
+        )
 
 
 @dataclass(frozen=True)

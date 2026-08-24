@@ -28,7 +28,7 @@ def report(*, compact_ctas: int, canonical_ctas: int) -> dict:
             {
                 "backend": "nta_flashinfer",
                 "hicache_fallback_batches": 0,
-                "hicache_claimed_batches": 1,
+                "hicache_external_batches": 1,
                 "transformed_direct_launches": 0,
                 "stock_attention_launches": 0,
                 "external_launches": 1,
@@ -41,6 +41,7 @@ def report(*, compact_ctas: int, canonical_ctas: int) -> dict:
                 "verified_operator_modules": 1,
                 "verified_operator_pairs": 1,
                 "operator_contracts": [{"abi": 1}],
+                "mixed_dependency_layers": 1,
                 "compact_resume_launches": 1,
                 "compact_resume_cta_bound": compact_ctas,
                 "canonical_resume_cta_bound": canonical_ctas,

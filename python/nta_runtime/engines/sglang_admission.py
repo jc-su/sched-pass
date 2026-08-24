@@ -34,21 +34,16 @@ class AdmissionConfig:
     lead_layers: int
     max_delay_ns: int
     minimum_bytes: int
-    summary_max_delay_ns: int
 
     @classmethod
     def from_environment(cls) -> "AdmissionConfig":
         return cls(
-            enabled=os.environ.get("NTA_SGLANG_ACQUISITION_ADMISSION", "1") != "0",
-            lead_layers=_positive_environment("NTA_SGLANG_ADMISSION_LEAD_LAYERS", 4),
+            enabled=os.environ.get("NTA_EXECUTION_ADMISSION", "1") != "0",
+            lead_layers=_positive_environment("NTA_EXECUTION_ADMISSION_LEAD_LAYERS", 4),
             max_delay_ns=1_000
-            * _nonnegative_environment("NTA_SGLANG_ADMISSION_MAX_DELAY_US", 10_000),
+            * _nonnegative_environment("NTA_EXECUTION_ADMISSION_MAX_DELAY_US", 10_000),
             minimum_bytes=_nonnegative_environment(
-                "NTA_SGLANG_ADMISSION_MIN_BYTES", 1 << 20
-            ),
-            summary_max_delay_ns=1_000
-            * _nonnegative_environment(
-                "NTA_SGLANG_SUMMARY_ADMISSION_MAX_DELAY_US", 2_000_000
+                "NTA_EXECUTION_ADMISSION_MIN_BYTES", 1 << 20
             ),
         )
 
@@ -62,7 +57,6 @@ class _StagedBatch:
     request_count: int
     external_bytes: int
     force_release: bool = False
-    summary_wait: bool = False
 
 
 def _has_runnable_decode(scheduler: Any) -> bool:
@@ -142,40 +136,6 @@ class AcquisitionAdmission:
         consumer_index = int(getattr(batch, "hicache_consumer_index", -1))
         requests = tuple(getattr(batch, "reqs", ()) or ())
         external_bytes = bridge.transfer_bytes(consumer_index)
-        request_ids = tuple(
-            str(getattr(request, "rid", "") or "") for request in requests
-        )
-        if getattr(bridge, "summaries_pending", None) is not None and (
-            bridge.summaries_pending(request_ids)
-        ):
-            # A fresh claim's envelope scan is still in flight on the
-            # summary stream — including when the extend arrives as a
-            # mixed batch, whose decode payload keeps ticking through the
-            # running batch while the prefill is held. Releasing now
-            # would enqueue the extend's selection wait onto the compute
-            # stream and stall every later decode batch behind it.
-            bridge.record_admission(
-                admission_considered_batches=1,
-                admission_considered_requests=len(requests),
-                admission_external_bytes=external_bytes,
-            )
-            if not _has_runnable_decode(scheduler):
-                bridge.record_admission(admission_released_without_decode=1)
-                return batch
-            self._staged = _StagedBatch(
-                batch,
-                bridge,
-                consumer_index,
-                self._clock(),
-                len(requests),
-                external_bytes,
-                summary_wait=True,
-            )
-            bridge.record_admission(
-                admission_summary_staged_batches=1,
-                admission_delayed_requests=len(requests),
-            )
-            return None
         if getattr(batch, "decoding_reqs", None) is not None:
             bridge.record_admission(
                 admission_considered_batches=1,
@@ -230,30 +190,6 @@ class AcquisitionAdmission:
         now = self._clock()
         elapsed = now - staged.started_ns
         staged.bridge.record_admission(admission_delay_polls=1)
-
-        if staged.summary_wait:
-            request_ids = tuple(
-                str(getattr(request, "rid", "") or "")
-                for request in tuple(getattr(staged.batch, "reqs", ()) or ())
-            )
-            reason = ""
-            if staged.force_release:
-                reason = "cancelled"
-            elif not staged.bridge.summaries_pending(request_ids):
-                reason = "summaries_ready"
-            elif elapsed >= self._config.summary_max_delay_ns:
-                reason = "summary_deadline"
-            elif not _has_runnable_decode(scheduler):
-                reason = "no_decode"
-            if not reason:
-                staged.bridge.record_admission(admission_hidden_decode_steps=1)
-                return None
-            staged.bridge.record_admission(
-                admission_delay_ns=elapsed,
-                **{f"admission_released_{reason}": 1},
-            )
-            self._staged = None
-            return staged.batch
 
         progress = staged.bridge.progress(staged.consumer_index)
 

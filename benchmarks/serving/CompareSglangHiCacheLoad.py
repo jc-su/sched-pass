@@ -310,23 +310,20 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     if args.allow_oversubscribed_pool:
         command.append("--allow-oversubscribed-pool")
     environment = os.environ.copy()
-    environment["NTA_SGLANG_ACQUISITION_ADMISSION"] = "1"
-    environment["NTA_SGLANG_ADMISSION_LEAD_LAYERS"] = str(args.admission_lead_layers)
-    environment["NTA_SGLANG_ADMISSION_MAX_DELAY_US"] = str(args.admission_max_delay_us)
-    environment["NTA_SGLANG_REQUIRE_MIXED_ATTENTION"] = (
-        "1" if backend == "nta_flashinfer" and args.batch_mode == "coalesced" else "0"
-    )
+    environment["NTA_EXECUTION_ADMISSION"] = "1"
+    environment["NTA_EXECUTION_ADMISSION_LEAD_LAYERS"] = str(args.admission_lead_layers)
+    environment["NTA_EXECUTION_ADMISSION_MAX_DELAY_US"] = str(args.admission_max_delay_us)
     if backend == "nta_flashinfer" and args.batch_mode == "coalesced":
         # Exercise the actual request-aware finite-kernel path. One transfer
         # wave isolates overlap from deeper transfer pipelining: resident CTAs
         # run immediately, then only the externally dependent CTAs resume.
         environment.update(
             {
-                "NTA_SGLANG_PIPELINE_HOST": "0",
-                "NTA_SGLANG_REQUEST_OVERLAP": "1",
-                "NTA_SGLANG_MAX_HOST_ROUNDS": "1",
-                "NTA_SGLANG_MIN_PREDICTED_GAIN": "1.0",
-                "NTA_SGLANG_INCREMENTAL_SETUP_NS": str(args.incremental_setup_ns),
+                "NTA_EXECUTION_PREFETCH": "0",
+                "NTA_EXECUTION_PROTOCOL": "late_bound",
+                "NTA_EXECUTION_MAX_ROUNDS": "1",
+                "NTA_EXECUTION_MIN_PREDICTED_GAIN": "1.0",
+                "NTA_EXECUTION_INCREMENTAL_SETUP_NS": str(args.incremental_setup_ns),
             }
         )
     _wait_for_free_gpu()
@@ -497,87 +494,6 @@ def main() -> int:
         raise RuntimeError(
             "NTA load trial did not exercise acquisition-aware admission"
         )
-    tiered_layers = sum(
-        int(entry.get("tiered_decode_layers", 0))
-        + int(entry.get("tiered_prefill_layers", 0))
-        for entry in stats
-    )
-    tiered_compaction = sum(
-        int(entry.get("tiered_device_compaction_launches", 0))
-        for entry in stats
-    )
-    host_orchestrated = any(
-        int(entry.get("host_orchestrated_mode", 0)) for entry in stats
-    )
-    host_orchestrated_syncs = sum(
-        int(entry.get("tiered_host_orchestrated_syncs", 0)) for entry in stats
-    )
-    if args.batch_mode == "coalesced" and tiered_layers > 0:
-        # Tiered serving coalesces every claimed and resident request into
-        # one compact plan per layer; its witnesses are the served tiered
-        # layers and device selection compaction, not the demand-acquire
-        # overlap counters. The RQ3 host-orchestrated arm inverts them:
-        # host round-trips must have happened, device compaction must not.
-        if host_orchestrated:
-            if host_orchestrated_syncs == 0 or tiered_compaction != 0:
-                _write_failed_comparison(
-                    args.output,
-                    reports,
-                    order,
-                    "host-orchestrated arm witnesses are impure",
-                )
-                raise RuntimeError(
-                    "host-orchestrated trial witnesses are impure "
-                    f"(syncs={host_orchestrated_syncs}, "
-                    f"device_compaction={tiered_compaction})"
-                )
-        elif tiered_compaction == 0:
-            _write_failed_comparison(
-                args.output,
-                reports,
-                order,
-                "tiered selection compaction was not exercised",
-            )
-            raise RuntimeError(
-                "tiered coalesced trial never ran device selection compaction"
-            )
-    elif args.batch_mode == "coalesced":
-        mixed_layers = sum(
-            int(entry.get("mixed_dependency_layers", 0)) for entry in stats
-        )
-        overlap_layers = sum(
-            int(entry.get("request_overlap_layers", 0)) for entry in stats
-        )
-        ticketed_layers = sum(
-            int(entry.get("ticketed_incremental_launches", 0)) for entry in stats
-        )
-        compact_initial = sum(
-            int(entry.get("compact_initial_cta_bound", 0)) for entry in stats
-        )
-        parallel_progress = sum(
-            int(entry.get("parallel_indexed_progress_layers", 0)) for entry in stats
-        )
-        if (
-            min(
-                mixed_layers,
-                overlap_layers,
-                ticketed_layers,
-                compact_initial,
-                parallel_progress,
-            )
-            == 0
-        ):
-            _write_failed_comparison(
-                args.output,
-                reports,
-                order,
-                "request-overlapped transformed attention was not exercised",
-            )
-            raise RuntimeError(
-                "coalesced trial did not execute request-overlapped FlashInfer "
-                "attention with compact grids and parallel indexed progress"
-            )
-
     thresholds = _thresholds(stock, args.slo_scale)
     stock_goodput = _goodput(stock, thresholds)
     nta_goodput = _goodput(nta, thresholds)
@@ -614,12 +530,11 @@ def main() -> int:
         # order are validated separately; output is location-only).
         "revision": os.environ.get("NTA_REVISION", ""),
         "harness_args": harness_args,
-        "nta_staged_bytes": sum(
-            int(entry.get("tiered_bytes_copied", 0)) for entry in stats
+        "nta_selected_bytes": sum(
+            int(entry.get("work_selected_bytes", 0)) for entry in stats
         ),
-        "nta_summary_source_bytes": sum(
-            int(entry.get("tiered_summary_source_bytes", 0))
-            for entry in stats
+        "nta_candidate_bytes": sum(
+            int(entry.get("work_candidate_bytes", 0)) for entry in stats
         ),
         "batch_mode": args.batch_mode,
         "slo_scale": args.slo_scale,

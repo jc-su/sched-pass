@@ -7,10 +7,38 @@ import vLLM, so contract tests run without a vLLM installation.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from .base import EngineBatch, RequestIdentityAdapter
 from ..work_unit import Granularity
+
+
+@dataclass(frozen=True)
+class VllmSchedulerProjection:
+    """The only vLLM-to-NTA projection owned by the integration layer."""
+
+    request_ids: tuple[str, ...]
+    request_slots: tuple[int, ...]
+    priorities: tuple[int, ...] | None = None
+    deadline_clocks: tuple[int, ...] | None = None
+
+    @classmethod
+    def from_scheduler_output(cls, output: Any) -> "VllmSchedulerProjection":
+        request_ids = getattr(output, "request_ids", None)
+        request_slots = getattr(output, "request_slots", None)
+        if request_ids is None or request_slots is None:
+            raise ValueError(
+                "vLLM scheduler output must expose request_ids and request_slots"
+            )
+        priorities = getattr(output, "priorities", None)
+        deadlines = getattr(output, "deadline_clocks", None)
+        return cls(
+            tuple(str(request_id) for request_id in request_ids),
+            tuple(int(request_slot) for request_slot in request_slots),
+            None if priorities is None else tuple(int(value) for value in priorities),
+            None if deadlines is None else tuple(int(value) for value in deadlines),
+        )
 
 
 class VllmAdapter(RequestIdentityAdapter):
@@ -36,3 +64,30 @@ class VllmAdapter(RequestIdentityAdapter):
             stream=stream,
         )
         return EngineBatch(self.engine, epoch, bindings, granularity)
+
+    def bind_scheduler_output(
+        self,
+        scheduler_output: Any,
+        *,
+        epoch: int,
+        stream: Any = None,
+        granularity: Granularity = Granularity.PAGE_GROUP,
+    ) -> EngineBatch:
+        """Bind one vLLM scheduler result without importing vLLM internals.
+
+        The pinned vLLM integration supplies ``request_ids`` and
+        ``request_slots`` on its scheduler projection.  Accepting a small
+        structural protocol keeps the runtime independent of vLLM's rapidly
+        changing Python class hierarchy while still making missing identity a
+        hard error.
+        """
+        projection = VllmSchedulerProjection.from_scheduler_output(scheduler_output)
+        return self.bind_batch(
+            projection.request_ids,
+            projection.request_slots,
+            epoch=epoch,
+            stream=stream,
+            priorities=projection.priorities,
+            deadline_clocks=projection.deadline_clocks,
+            granularity=granularity,
+        )

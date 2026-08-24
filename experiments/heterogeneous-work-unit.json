@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "status": "design-only-until-protocol-wired",
+  "status": "executable-contract-matrix",
   "description": "Fair evaluation matrix for exact late-bound heterogeneous work units.",
   "source_of_truth": "docs/EXPERIMENT_DESIGN.md",
   "repetitions": 10,
@@ -8,7 +8,7 @@
   "demand": {
     "semantics": "exact-sparse",
     "trace_is_shared_across_arms": true,
-    "selector_quality_gate": "not-applicable"
+    "selection_source": "shared-exact-trace"
   },
   "workload": {
     "single_batch_contains": [

@@ -22,7 +22,7 @@ from nta_runtime.critical_work import (
 
 @dataclass
 class PendingHostLoad:
-    claim_id: int
+    lease_id: int
     consumer_index: int
     host_indices: torch.Tensor
     device_indices: torch.Tensor
@@ -74,16 +74,16 @@ class SglangHiCacheBridge:
         self.device_pool = device_pool
         self._pending: dict[int, PendingHostLoad] = {}
         self._owned: dict[int, PendingHostLoad] = {}
-        self._next_claim_id = 1
+        self._next_lease_id = 1
         # Fixed-width recyclable ranges instead of a burn-forever cursor: a
-        # soak run's namespace consumption is bounded by live claims, not
-        # lifetime claims. Width must cover the largest external prefix.
+        # soak run's namespace consumption is bounded by live leases, not
+        # lifetime leases. Width must cover the largest external prefix.
         from nta_runtime.virtual_namespace import VirtualTokenNamespace
 
         self._virtual_ranges = VirtualTokenNamespace(
             int(
                 os.environ.get(
-                    "NTA_SGLANG_VIRTUAL_RANGE_TOKENS", str(1 << 17)
+                    "NTA_EXECUTION_VIRTUAL_RANGE_TOKENS", str(1 << 17)
                 )
                 or (1 << 17)
             )
@@ -95,46 +95,13 @@ class SglangHiCacheBridge:
         self._external_dense_high_water_rows = 0
         self._external_staging_high_water_rows = 0
         self._lock = threading.Lock()
-        self._summary_events: dict[str, Any] = {}
         self._prefetch_callback: Any = None
         self._admission_stats: dict[str, int] = {}
         self._progress_publications: list[_ProgressPublication] = []
         self._latest_request_work: dict[
             tuple[int, int], tuple[RequestWork, ServiceModel]
         ] = {}
-        self._summary_store: Any = None
         _register_bridge(device_pool, self)
-
-    def writeback_summary_store(self, controller: Any) -> Any:
-        """Lazily build the writeback envelope store (env-gated)."""
-        if os.environ.get("NTA_SGLANG_WRITEBACK_SUMMARIES") != "1":
-            return None
-        if self._summary_store is None:
-            from nta_runtime.engines.summary_store import WritebackSummaryStore
-
-            page_tokens = int(
-                getattr(self, "_external_prefix_page_tokens", 0) or 0
-            )
-            if page_tokens <= 0:
-                page_tokens = int(getattr(controller, "page_size", 0) or 0)
-            if page_tokens <= 0:
-                return None
-            capacity = int(
-                os.environ.get(
-                    "NTA_SGLANG_WRITEBACK_SUMMARY_BYTES", str(8 << 30)
-                )
-                or (8 << 30)
-            )
-            self._summary_store = WritebackSummaryStore(page_tokens, capacity)
-        claim_page_tokens = int(
-            getattr(self, "_external_prefix_page_tokens", 0) or 0
-        )
-        if (
-            claim_page_tokens > 0
-            and self._summary_store.page_tokens != claim_page_tokens
-        ):
-            return None
-        return self._summary_store
 
     def set_prefetch_callback(self, callback: Any) -> None:
         self._prefetch_callback = callback
@@ -142,25 +109,6 @@ class SglangHiCacheBridge:
     @property
     def external_prefix_enabled(self) -> bool:
         return self._external_prefix_capacity_rows > 0
-
-    def note_summary_event(self, request_id: str, event: Any) -> None:
-        """Record a claim's summary-scan readiness for admission gating."""
-        with self._lock:
-            self._summary_events[str(request_id)] = event
-
-    def summaries_pending(self, request_ids: tuple[str, ...]) -> bool:
-        """Whether any request still waits on its summary scan."""
-        with self._lock:
-            pending = False
-            for request_id in request_ids:
-                event = self._summary_events.get(request_id)
-                if event is None:
-                    continue
-                if event.query():
-                    self._summary_events.pop(request_id, None)
-                else:
-                    pending = True
-            return pending
 
     def enable_external_prefixes(
         self, capacity_rows: int, callback: Any, *, page_tokens: int = 1
@@ -175,7 +123,7 @@ class SglangHiCacheBridge:
         self._external_prefix_page_tokens = page_tokens
         self._prefetch_callback = callback
 
-    def claim_external_prefix(
+    def lease_external_prefix(
         self,
         request: Any,
         host_indices: torch.Tensor,
@@ -208,11 +156,11 @@ class SglangHiCacheBridge:
         )
         # Staging is leased in whole pages: the device cache and the
         # compaction kernel both require page-aligned capacity, and a
-        # sub-page claim still owns one full slot.
+        # sub-page lease still owns one full slot.
         page_tokens = getattr(self, "_external_prefix_page_tokens", 1)
-        claim_pages = (token_count + page_tokens - 1) // page_tokens
+        lease_pages = (token_count + page_tokens - 1) // page_tokens
         physical_capacity = min(
-            self._external_prefix_capacity_rows, claim_pages * page_tokens
+            self._external_prefix_capacity_rows, lease_pages * page_tokens
         )
         staging_rows = allocator.alloc(physical_capacity)
         evicted_rows = 0
@@ -230,11 +178,11 @@ class SglangHiCacheBridge:
             allocator.free(staging_rows)
             raise RuntimeError("bounded staging allocator returned malformed rows")
         with self._lock:
-            claim_id = self._next_claim_id
-            self._next_claim_id += 1
+            lease_id = self._next_lease_id
+            self._next_lease_id += 1
         try:
             virtual_lease, virtual_begin = self._virtual_ranges.acquire(
-                claim_id, token_count
+                lease_id, token_count
             )
         except RuntimeError:
             allocator.free(staging_rows)
@@ -272,7 +220,7 @@ class SglangHiCacheBridge:
             self._virtual_ranges.release(virtual_lease)
 
         handle = ExternalPrefixHandle(
-            claim_id=claim_id,
+            lease_id=lease_id,
             request_id=request_id,
             consumer_index=-1,
             host_indices=host_indices,
@@ -300,7 +248,7 @@ class SglangHiCacheBridge:
                 )
         if duplicate:
             allocator.free(staging_rows)
-            raise RuntimeError("request acquired two external-prefix claims")
+            raise RuntimeError("request acquired two external-prefix leases")
         try:
             self._prefetch_callback(handle)
         except Exception:
@@ -311,8 +259,8 @@ class SglangHiCacheBridge:
             allocator.free(staging_rows)
             raise
         self.record_admission(
-            external_prefix_claims=1,
-            # A sub-page claim stages a whole slot and avoids nothing; the
+            external_prefix_leases=1,
+            # A sub-page lease stages a whole slot and avoids nothing; the
             # honest floor is zero, never a negative avoidance.
             external_dense_slots_avoided=max(
                 0, token_count - physical_capacity
@@ -342,7 +290,7 @@ class SglangHiCacheBridge:
             and int(controller.page_size) == 1
         )
 
-    def claim(self, controller: Any) -> int | None:
+    def acquire_load(self, controller: Any) -> int | None:
         if controller.mem_pool_device is not self.device_pool:
             return None
         if not self.supports(controller):
@@ -357,10 +305,10 @@ class SglangHiCacheBridge:
         controller.load_queue.clear()
         event = controller.layer_done_counter.events[producer_id]
         with self._lock:
-            claim_id = self._next_claim_id
-            self._next_claim_id += 1
+            lease_id = self._next_lease_id
+            self._next_lease_id += 1
         pending = PendingHostLoad(
-            claim_id=claim_id,
+            lease_id=lease_id,
             consumer_index=producer_id,
             host_indices=op.host_indices,
             device_indices=op.device_indices,
@@ -372,34 +320,34 @@ class SglangHiCacheBridge:
         if self._prefetch_callback is None:
             controller.ack_load_queue.append(ack)
         else:
-            # A claimed load completes its producer events immediately, which
+            # A leased load completes its producer events immediately, which
             # would fire the ack and let loading_check unlock the host radix
-            # nodes while the claim still stages from them — churn write-back
-            # then recycles the host rows out from under the claim. Holding
-            # the ack until retire() pins the host source for the claim's
+            # nodes while the lease still stages from them — churn write-back
+            # then recycles the host rows out from under the lease. Holding
+            # the ack until retire() pins the host source for the lease's
             # whole lifetime. Retirement records a new finish event after the
             # final copy or attention consumer on the actual CUDA stream.
             pending.held_ack = ack
         with self._lock:
             self._pending[producer_id] = pending
-            self._owned[claim_id] = pending
+            self._owned[lease_id] = pending
         if self._prefetch_callback is not None:
             try:
                 self._prefetch_callback(pending)
             except Exception as error:
-                # A prefetch failure must not silently revert a claimed load to
+                # A prefetch failure must not silently revert a leased load to
                 # stock transfer: that bypasses request-level semantics and is
                 # invisible to the zero-fallback measurement gates. Restoring
                 # SGLang's own transfer is an explicit, counted opt-in for
                 # resilience deployments only.
-                if os.environ.get("NTA_SGLANG_ALLOW_PREFETCH_FALLBACK", "0") != "1":
-                    # Fail closed, but not dirty: the dead claim must not
+                if os.environ.get("NTA_EXECUTION_ALLOW_PREFETCH_FALLBACK", "0") != "1":
+                    # Fail closed, but not dirty: the dead lease must not
                     # keep the producer slot occupied or the host nodes
                     # pinned for whoever survives this exception.
                     self._drop_ownership(pending)
                     raise RuntimeError(
-                        "NTA early HiCache prefetch failed for a claimed load; "
-                        "set NTA_SGLANG_ALLOW_PREFETCH_FALLBACK=1 to restore "
+                        "NTA early HiCache prefetch failed for a leased load; "
+                        "set NTA_EXECUTION_ALLOW_PREFETCH_FALLBACK=1 to enable "
                         "SGLang transfer instead of failing"
                     ) from error
                 logging.getLogger(__name__).exception(
@@ -634,10 +582,10 @@ class SglangHiCacheBridge:
 
     def _drop_ownership(self, pending: PendingHostLoad) -> bool:
         with self._lock:
-            current = self._owned.get(pending.claim_id)
+            current = self._owned.get(pending.lease_id)
             if current is not pending:
                 return False
-            self._owned.pop(pending.claim_id)
+            self._owned.pop(pending.lease_id)
             if self._pending.get(pending.consumer_index) is pending:
                 self._pending.pop(pending.consumer_index)
         # Ownership ends exactly once, and every ending path must deliver
@@ -656,12 +604,11 @@ class SglangHiCacheBridge:
         *,
         stream: torch.cuda.Stream | None = None,
     ) -> bool:
-        """Drop a claim whose completion happened outside the layer flow.
+        """Drop an external load whose completion happened outside the layer flow.
 
-        The tiered selected path completes producer events at claim time and
-        serves layers itself; the pending entry must still be released when
-        the claim ends so producer-slot reuse stays fail-closed for genuinely
-        live entries.  A held acknowledgement must describe NTA's last use of
+        The pending entry must still be released when the request ends so
+        producer-slot reuse stays fail-closed for genuinely live entries. A
+        held acknowledgement must describe NTA's last use of
         the pinned host rows, not SGLang's already-completed producer event.
         Recording a replacement finish event on the consuming stream keeps
         reclamation asynchronous while preventing completion DMA from racing
@@ -695,7 +642,7 @@ class SglangHiCacheBridge:
                 pending.device_indices.record_stream(stream)
         pending.completed_layers = int(pending.controller.layer_num)
         if not self._drop_ownership(pending):
-            raise RuntimeError("HiCache claim changed before graph handoff")
+            raise RuntimeError("HiCache lease changed before graph handoff")
 
     def fallback(self, pending: PendingHostLoad) -> None:
         """Resume SGLang's original layer-wise transfer after a planning miss."""
@@ -748,67 +695,12 @@ def find_bridge(device_pool: Any) -> SglangHiCacheBridge | None:
         return entry[1]()
 
 
-def route_write_backup(
-    original: Any, cache: Any, node: Any, *args: Any, **kwargs: Any
-) -> Any:
-    """Record page envelopes when a radix node backs up to host (env-gated).
-
-    Hooked above the controller so the node's global token offset is
-    known: incremental backups chunk at arbitrary boundaries, and page
-    envelopes must align to the claim's page grid over the whole prefix.
-    """
-    result = original(cache, node, *args, **kwargs)
-    if os.environ.get("NTA_SGLANG_WRITEBACK_SUMMARIES") != "1":
-        return result
-    try:
-        if not result:
-            return result
-        controller = cache.cache_controller
-        bridge = find_bridge(controller.mem_pool_device)
-        if bridge is None:
-            return result
-        store = bridge.writeback_summary_store(controller)
-        host_value = getattr(node, "host_value", None)
-        device_value = getattr(node, "value", None)
-        if store is None or host_value is None or device_value is None:
-            return result
-        # The backup invariant guarantees backed-up nodes form a contiguous
-        # prefix from root, so every ancestor's host rows are available:
-        # the store aligns to the sequence's global page grid and reduces
-        # the one chunk-boundary page from a handful of pinned host rows.
-        ancestor_rows: list[Any] = []
-        parent = getattr(node, "parent", None)
-        while parent is not None:
-            parent_host = getattr(parent, "host_value", None)
-            if parent_host is not None and len(parent_host) > 0:
-                ancestor_rows.append(parent_host)
-            parent = getattr(parent, "parent", None)
-        ancestor_rows.reverse()
-        start_layer = int(getattr(controller.mem_pool_device, "start_layer", 0))
-        layer_ids = tuple(
-            start_layer + local_layer
-            for local_layer in range(int(controller.layer_num))
-        )
-        store.record(
-            int(getattr(node, "id", -1)),
-            host_value,
-            device_value,
-            controller.mem_pool_device,
-            layer_ids,
-            ancestor_host_rows=ancestor_rows,
-            host_pool=controller.mem_pool_host,
-        )
-    except Exception:
-        logger.exception("writeback summary recording failed; scans continue")
-    return result
-
-
 def route_start_loading(
     original: Any, controller: Any, *args: Any, **kwargs: Any
 ) -> int:
     bridge = find_bridge(controller.mem_pool_device)
     if bridge is not None:
-        result = bridge.claim(controller)
+        result = bridge.acquire_load(controller)
         if result is not None:
             return result
     return original(controller, *args, **kwargs)

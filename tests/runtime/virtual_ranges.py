@@ -37,7 +37,7 @@ for owner in range(1, 65):
     live.append(lease)
 assert namespace.in_use == 64
 
-# Recycling: lifetime claims exceed slot_count many times over — the cursor
+# Recycling: lifetime leases exceed slot_count many times over — the cursor
 # design this replaces exhausts exactly here.
 for lease in live:
     namespace.release(lease)
@@ -55,9 +55,9 @@ expect_error(lambda: namespace.acquire(9_999_999, 8), "exhausted")
 for lease in held:
     namespace.release(lease)
 
-# A claim wider than the range width is refused with the remedy named.
+# A lease wider than the range width is refused with the remedy named.
 expect_error(
-    lambda: namespace.acquire(7, WIDTH + 1), "NTA_SGLANG_VIRTUAL_RANGE_TOKENS"
+    lambda: namespace.acquire(7, WIDTH + 1), "NTA_EXECUTION_VIRTUAL_RANGE_TOKENS"
 )
 
 # Stale and double releases are refused.

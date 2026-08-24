@@ -2,7 +2,7 @@
 
 from .base import EngineBatch, RequestIdentityAdapter
 from .sglang import SglangAdapter, SglangExecutionConfig
-from .vllm import VllmAdapter
+from .vllm import VllmAdapter, VllmSchedulerProjection
 
 __all__ = [
     "EngineBatch",
@@ -10,4 +10,5 @@ __all__ = [
     "SglangAdapter",
     "SglangExecutionConfig",
     "VllmAdapter",
+    "VllmSchedulerProjection",
 ]

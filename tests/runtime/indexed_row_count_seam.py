@@ -5,8 +5,8 @@ Registers an engine-shaped K/V indexed object pair over fully controlled
 buffers, rewrites the shared index arrays' prefix, bounds the copy with
 nta_jit_set_indexed_row_counts, runs the validated indexed progress, and
 asserts the staged rows equal their host sources byte for byte while
-untouched rows stay untouched. Discriminates a seam defect from an
-engine-tensor-semantics defect in the tiered staging divergence.
+untouched rows stay untouched. Discriminates a transport seam defect from
+an engine-tensor-semantics defect.
 
 Requires a compiled phase module; pass it explicitly or via
 NTA_PHASE_MODULE.
@@ -224,7 +224,7 @@ def main() -> int:
             print(f"mapped summary: {dtype} envelope reduction diverged")
             failures += 1
 
-    # Device-selected path: page identities, hit filtering, transfer-list
+    # Exact sparse path: page identities, hit filtering, and transfer-list
     # construction, and row-count publication remain on the CUDA stream.
     device_k.zero_()
     device_v.zero_()

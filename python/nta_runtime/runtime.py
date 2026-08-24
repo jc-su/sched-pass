@@ -1097,48 +1097,6 @@ _phase_prepare_bounded_selected_indexed_rows = _function(
     ctypes.c_uint64,
     ctypes.c_uint64,
 )
-_phase_prepare_claim_table_selected_rows = _function(
-    "nta_jit_phase_prepare_claim_table_selected_rows",
-    ctypes.c_int,
-    _Handle,
-    _Handle,
-    *([ctypes.c_uint64] * 16),
-    *([ctypes.c_uint32] * 6),
-    ctypes.c_uint64,
-)
-_phase_build_compact_plan = _function(
-    "nta_jit_phase_build_compact_plan",
-    ctypes.c_int,
-    _Handle,
-    *([ctypes.c_uint64] * 8),
-    ctypes.c_uint32,
-    ctypes.c_uint64,
-)
-_phase_select_prepare_claim_rows = _function(
-    "nta_jit_phase_select_prepare_claim_rows",
-    ctypes.c_int,
-    _Handle,
-    _Handle,
-    ctypes.c_uint32,
-    ctypes.c_uint64,
-    *([ctypes.c_uint32] * 4),
-    ctypes.c_uint64,
-    ctypes.c_uint64,
-    ctypes.c_uint64,
-    ctypes.c_uint32,
-    ctypes.c_uint64,
-    ctypes.c_uint32,
-    ctypes.c_int64,
-    ctypes.c_uint32,
-    ctypes.c_uint64,
-    *([ctypes.c_uint32] * 2),
-    *([ctypes.c_uint64] * 3),
-    ctypes.c_uint32,
-    *([ctypes.c_uint64] * 3),
-    ctypes.c_uint32,
-    ctypes.c_uint64,
-    ctypes.c_uint64,
-)
 _phase_reduce_mapped_indexed_key_pages = _function(
     "nta_jit_phase_reduce_mapped_indexed_key_pages",
     ctypes.c_int,
@@ -1770,6 +1728,70 @@ class DeviceWorkPlan(_Owner):
             item.direct_dependency_count != item.dependency_count for item in work
         )
 
+    def upload_work_units(
+        self,
+        units: Iterable[Any],
+        dependency_spans: Iterable[tuple[int, int, int, int]],
+        dependencies: Iterable[AcquireRequirement],
+        requests: Iterable[RequestRange],
+        *,
+        epoch: int,
+        stream: Any = None,
+    ) -> None:
+        """Materialize one exact semantic epoch into the native ABI.
+
+        This is the only Python-to-native WorkItem conversion.  The native
+        ABI intentionally stores execution identity and dependency geometry;
+        demand semantics and granularity stay in the validated semantic batch.
+        """
+        unit_values = tuple(units)
+        spans = tuple(dependency_spans)
+        dependency_values = tuple(dependencies)
+        if epoch < 0:
+            raise ValueError("execution epoch cannot be negative")
+        if len(unit_values) != len(spans):
+            raise ValueError("semantic units and dependency spans must align")
+        if not unit_values:
+            raise ValueError("semantic work-unit upload cannot be empty")
+        if any(not unit.demand.is_exact for unit in unit_values):
+            raise ValueError("native WorkItem upload requires exact demand")
+        if any(unit.demand.epoch != epoch for unit in unit_values):
+            raise ValueError("semantic work-unit epochs do not match the upload")
+        dependency_total = len(dependency_values)
+        for unit, span in zip(unit_values, spans, strict=True):
+            dependency_begin, dependency_count, direct_count, work_ticket = span
+            if unit.work_id != work_ticket:
+                raise ValueError("semantic work ID and native work ticket diverge")
+            if min(dependency_begin, dependency_count, direct_count) < 0:
+                raise ValueError("native dependency spans cannot be negative")
+            if direct_count > dependency_count:
+                raise ValueError("direct dependency count exceeds total dependencies")
+            if dependency_begin + dependency_count > dependency_total:
+                raise ValueError("native dependency span exceeds the dependency array")
+        native_items = tuple(
+            WorkItem(
+                unit.binding.request_index,
+                unit.binding.request_slot,
+                unit.binding.generation,
+                unit.logical_begin,
+                dependency_begin,
+                dependency_count,
+                direct_dependency_count,
+                work_ticket,
+                unit.reduction_group,
+                unit.contributor_index,
+                unit.contributor_count,
+                unit.estimated_compute_ns,
+            )
+            for unit, (
+                dependency_begin,
+                dependency_count,
+                direct_dependency_count,
+                work_ticket,
+            ) in zip(unit_values, spans, strict=True)
+        )
+        self.upload(native_items, dependency_values, requests, stream)
+
     def wait_on(self, stream: Any) -> None:
         _check(_plan_wait(self._handle, _stream_address(stream)))
 
@@ -2203,179 +2225,6 @@ class JitPhaseProgram(_Owner):
                 staging_indices.data_ptr(),
                 capacity,
                 copied_rows.data_ptr(),
-                _stream_address(stream),
-            )
-        )
-
-    def prepare_claim_table_selected_rows(
-        self,
-        runtime: Runtime,
-        table: Any,
-        local_layer: int,
-        stream: Any = None,
-    ) -> None:
-        """One fixed-shape launch preps every valid claim-table row."""
-        import torch
-
-        tensors = (
-            table.valid,
-            table.claim_ids,
-            table.generations,
-            table.observed_ids,
-            table.object_slots,
-            table.capacity_words,
-            table.selected_counts,
-            table.token_counts,
-            table.selected_pages,
-            table.cached_pages,
-            table.host_rows,
-            table.staging_rows,
-            table.selected_rows,
-            table.source_indices,
-            table.staging_indices,
-            table.copied_rows,
-        )
-        if any(
-            not isinstance(tensor, torch.Tensor)
-            or tensor.device.type != "cuda"
-            or not tensor.is_contiguous()
-            for tensor in tensors
-        ):
-            raise ValueError(
-                "claim-table launch requires contiguous CUDA table tensors"
-            )
-        if not 0 <= int(local_layer) < int(table.layer_count):
-            raise ValueError("claim-table layer is out of range")
-        _check(
-            _phase_prepare_claim_table_selected_rows(
-                self._handle,
-                runtime._handle,
-                *(int(tensor.data_ptr()) for tensor in tensors),
-                int(table.max_claims),
-                int(table.max_budget_pages),
-                int(table.layer_count),
-                int(local_layer),
-                int(table.max_claim_tokens),
-                int(table.page_tokens),
-                _stream_address(stream),
-            )
-        )
-
-    def build_compact_plan(
-        self,
-        dense_indices: Any,
-        dense_offsets: Any,
-        bound_lengths: Any,
-        nonprefix_offsets: Any,
-        nonprefix_indices: Any,
-        claim_row_counts: Any,
-        compact_offsets: Any,
-        compact_indices: Any,
-        batch_size: int,
-        stream: Any = None,
-    ) -> None:
-        """Build the packed compact plan from per-request descriptors."""
-        import torch
-
-        tensors = (
-            dense_indices,
-            dense_offsets,
-            bound_lengths,
-            nonprefix_offsets,
-            nonprefix_indices,
-            claim_row_counts,
-            compact_offsets,
-            compact_indices,
-        )
-        if any(
-            not isinstance(tensor, torch.Tensor)
-            or tensor.device.type != "cuda"
-            or tensor.dtype != torch.int32
-            or not tensor.is_contiguous()
-            for tensor in tensors
-        ):
-            raise ValueError(
-                "compact-plan build requires contiguous int32 CUDA tensors"
-            )
-        if batch_size <= 0:
-            raise ValueError("compact-plan batch size must be positive")
-        _check(
-            _phase_build_compact_plan(
-                self._handle,
-                *(int(tensor.data_ptr()) for tensor in tensors),
-                int(batch_size),
-                _stream_address(stream),
-            )
-        )
-
-    def select_prepare_claim_rows(
-        self,
-        runtime: Runtime,
-        first_object: int,
-        queries: Any,
-        layer_min: Any,
-        layer_max: Any,
-        page_scores: Any,
-        full_forced_pages: Any,
-        tail_page: int,
-        free_budget: int,
-        ordered_pages_out: Any,
-        page_tokens: int,
-        token_count: int,
-        host_rows: Any,
-        device_rows: Any,
-        cached_pages: Any,
-        selected_rows: Any,
-        source_indices: Any,
-        staging_indices: Any,
-        copied_rows: Any,
-        stream: Any = None,
-    ) -> None:
-        """One launch: score, select, order, and prep a claim layer."""
-        import torch
-
-        if (
-            queries.dtype != torch.float16
-            or queries.ndim != 3
-            or not queries.is_contiguous()
-            or layer_min.dtype != torch.float32
-            or layer_min.shape != layer_max.shape
-            or layer_min.ndim != 3
-        ):
-            raise ValueError("fused selection requires fp16 queries and fp32 envelopes")
-        page_count = int(layer_min.shape[0])
-        capacity = int(selected_rows.numel())
-        cache_slots = int(cached_pages.numel())
-        _check(
-            _phase_select_prepare_claim_rows(
-                self._handle,
-                runtime._handle,
-                int(first_object),
-                int(queries.data_ptr()),
-                int(queries.shape[0]),
-                int(queries.shape[1]),
-                int(layer_min.shape[1]),
-                int(layer_min.shape[2]),
-                int(layer_min.data_ptr()),
-                int(layer_max.data_ptr()),
-                int(page_scores.data_ptr()),
-                page_count,
-                int(full_forced_pages.data_ptr()),
-                int(full_forced_pages.numel()),
-                int(tail_page),
-                int(free_budget),
-                int(ordered_pages_out.data_ptr()),
-                int(page_tokens),
-                int(token_count),
-                int(host_rows.data_ptr()),
-                int(device_rows.data_ptr()),
-                int(cached_pages.data_ptr()),
-                cache_slots,
-                int(selected_rows.data_ptr()),
-                int(source_indices.data_ptr()),
-                int(staging_indices.data_ptr()),
-                capacity,
-                int(copied_rows.data_ptr()),
                 _stream_address(stream),
             )
         )

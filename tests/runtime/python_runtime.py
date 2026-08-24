@@ -15,9 +15,7 @@ from nta_runtime import (
     Runtime,
     RuntimeConfig,
     WorkItem,
-    build_selected_page_work_plan,
     device_abi_version,
-    register_selected_host_pages,
 )
 
 
@@ -117,39 +115,6 @@ def main() -> None:
         assert not epoch.succeeded
         assert not epoch.has_failure
 
-    selected_source = torch.arange(8 * 16, dtype=torch.uint8, pin_memory=True).view(
-        8, 16
-    )
-    selected_staging = torch.zeros((4, 16), dtype=torch.uint8, device="cuda")
-    selected_indices = torch.tensor([[7, 1], [4, 2]], dtype=torch.int32, device="cuda")
-    with Runtime(
-        RuntimeConfig(
-            request_capacity=2,
-            object_capacity=2,
-            intent_capacity=4,
-            work_ticket_capacity=4,
-            max_dependencies_per_work_ticket=1,
-        )
-    ) as runtime:
-        for request in range(2):
-            runtime.set_request(request, 100 + request, 1)
-        acquisition = register_selected_host_pages(
-            runtime,
-            selected_source,
-            selected_staging,
-            selected_indices,
-            stream=stream,
-        )
-        with build_selected_page_work_plan(
-            runtime, acquisition, (0, 0, 1, 1), stream=stream
-        ) as plan:
-            plan.wait_on(torch.cuda.current_stream())
-            torch.cuda.synchronize()
-            assert acquisition.request_count == 2
-            assert acquisition.pages_per_request == 2
-            assert plan.work_item_count == 4
-            assert plan.dependency_count == 4
-            assert plan.has_external
     print("python_runtime=pass")
 
 

@@ -1,14 +1,14 @@
-"""Recyclable virtual-token ranges for external-prefix sidecar claims.
+"""Recyclable virtual-token ranges for external-prefix sidecar leases.
 
 Virtual token ids live in [VIRTUAL_TOKEN_BASE, VIRTUAL_TOKEN_LIMIT]: above
 any physical pool row, inside int32 for the engine's request tables. The
-namespace is ~2^30 ids; a burn-forever cursor exhausts it after ~65K claims
+namespace is ~2^30 ids; a burn-forever cursor exhausts it after ~65K leases
 of 16K tokens — hours into a soak run. Fixed-width range leases make
-lifetime consumption bounded by *live* claims instead: a range returns to
-the pool when its claim's resources release, which happens behind the GPU
+lifetime consumption bounded by *live* leases instead: a range returns to
+the pool when its lease's resources release, which happens behind the GPU
 completion fence, so no in-flight device work can still observe the ids.
 
-Reuse is LIFO. Live-range disjointness plus the claim identity binding
+Reuse is LIFO. Live-range disjointness plus the lease identity binding
 (request id + pool row, refused on mismatch) make aliasing a hard error
 rather than silent corruption, and VERIFY runs byte-check staged rows.
 """
@@ -27,7 +27,7 @@ class VirtualTokenNamespace:
     def __init__(self, range_tokens: int) -> None:
         if range_tokens <= 0:
             raise RuntimeError(
-                "NTA_SGLANG_VIRTUAL_RANGE_TOKENS must be positive"
+                "NTA_EXECUTION_VIRTUAL_RANGE_TOKENS must be positive"
             )
         self.range_tokens = range_tokens
         self._pool = FixedRangePool(
@@ -54,7 +54,7 @@ class VirtualTokenNamespace:
             raise RuntimeError(
                 f"external prefix of {token_count} tokens exceeds the "
                 f"virtual range width {self.range_tokens}; raise "
-                "NTA_SGLANG_VIRTUAL_RANGE_TOKENS"
+                "NTA_EXECUTION_VIRTUAL_RANGE_TOKENS"
             )
         try:
             lease = self._pool.acquire(owner)

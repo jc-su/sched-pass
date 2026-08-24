@@ -1,7 +1,6 @@
 from nta_runtime.adapters.sglang import SglangAdapter, SglangExecutionConfig
-from nta_runtime.adapters.vllm import VllmAdapter
+from nta_runtime.adapters.vllm import VllmAdapter, VllmSchedulerProjection
 from nta_runtime.execution_protocol import ProtocolKind
-from nta_runtime.requests import RequestBinding
 from nta_runtime.work_unit import Granularity
 
 
@@ -20,15 +19,23 @@ class FakeRuntime:
 class FakeForward:
     batch_size = 2
     rids = ("sg-a", "sg-b")
+    req_pool_indices = (5, 7)
     _nta_request_priorities = (2, 5)
+
+
+class FakeVllmSchedulerOutput:
+    request_ids = ("vllm-a", "vllm-b")
+    request_slots = (4, 6)
+    priorities = (1, 3)
+    deadline_clocks = (100, 200)
 
 
 def main() -> None:
     config = SglangExecutionConfig.from_environment(
         {
-            "NTA_SGLANG_EXECUTION_PROTOCOL": "partial",
-            "NTA_SGLANG_WORK_GRANULARITY": "cta_tile",
-            "NTA_SGLANG_MAX_INFLIGHT_UNITS": "32",
+            "NTA_EXECUTION_PROTOCOL": "partial",
+            "NTA_EXECUTION_GRANULARITY": "cta_tile",
+            "NTA_EXECUTION_MAX_INFLIGHT_UNITS": "32",
         }
     )
     assert config.protocol.kind is ProtocolKind.PARTIAL
@@ -63,7 +70,16 @@ def main() -> None:
     assert sglang_batch.engine == "sglang"
     assert sglang_batch.epoch == 9
     assert tuple(item.priority for item in sglang_batch.bindings) == (2, 5)
-    assert tuple(item.request_slot for item in sglang_batch.bindings) == (0, 1)
+    assert tuple(item.request_slot for item in sglang_batch.bindings) == (5, 7)
+    vllm_batch = adapter.bind_scheduler_output(
+        FakeVllmSchedulerOutput(), epoch=5, granularity=Granularity.LAYER
+    )
+    assert tuple(item.request_slot for item in vllm_batch.bindings) == (4, 6)
+    assert tuple(item.deadline_clock for item in vllm_batch.bindings) == (100, 200)
+    projection = VllmSchedulerProjection.from_scheduler_output(
+        FakeVllmSchedulerOutput()
+    )
+    assert projection.request_ids == ("vllm-a", "vllm-b")
     print("adapters=pass")
 
 

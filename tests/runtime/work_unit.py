@@ -132,6 +132,32 @@ def test_conventional_protocol_has_a_readiness_boundary() -> None:
     assert ledger.runnable_groups() == ((0, 1), (2,))
 
 
+def test_inflight_bound_counts_running_units() -> None:
+    units = tuple(
+        WorkUnit(
+            index,
+            binding(index, index, 1),
+            0,
+            index,
+            1,
+            demand(selected=1, candidate=2),
+        )
+        for index in range(2)
+    )
+    batch = WorkBatch(7, Granularity.PAGE_GROUP, units)
+    ledger = WorkLedger(
+        batch,
+        ExecutionProtocolConfig.late_bound(
+            granularity=Granularity.PAGE_GROUP,
+            max_inflight_units=1,
+        ),
+    )
+    for unit in units:
+        ledger.discover(unit.work_id, ready=True, binding=unit.binding, epoch=7)
+    ledger.transition(0, Availability.RUNNING, binding=units[0].binding, epoch=7)
+    assert ledger.runnable_groups() == ()
+
+
 def test_granularity_balances_skew_and_control_cost() -> None:
     model = GranularityCostModel(group_overhead_ns=10_000)
     coarse = model.estimate(
@@ -157,12 +183,26 @@ def test_granularity_balances_skew_and_control_cost() -> None:
     assert chosen.units_per_group in (4, 8, 16, 32, 64)
 
 
+def test_protocol_configuration_is_framework_neutral() -> None:
+    config = ExecutionProtocolConfig.from_environment(
+        {
+            "NTA_EXECUTION_PROTOCOL": "late_bound",
+            "NTA_EXECUTION_GRANULARITY": "page_group",
+            "NTA_EXECUTION_MAX_INFLIGHT_UNITS": "8",
+        }
+    )
+    assert config.kind.value == "late_bound"
+    assert config.max_inflight_units == 8
+
+
 def main() -> None:
     test_exact_demand_and_heterogeneous_batch()
     test_generation_checked_partial_protocol()
     test_conventional_protocol_rejects_partial_execution()
     test_conventional_protocol_has_a_readiness_boundary()
+    test_inflight_bound_counts_running_units()
     test_granularity_balances_skew_and_control_cost()
+    test_protocol_configuration_is_framework_neutral()
     print("work_unit=pass")
 
 

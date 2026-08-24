@@ -11,7 +11,6 @@ import torch
 
 from nta_runtime.virtual_namespace import (
     VIRTUAL_TOKEN_BASE,
-    VIRTUAL_TOKEN_LIMIT,
 )
 
 
@@ -19,7 +18,7 @@ from nta_runtime.virtual_namespace import (
 class ExternalPrefixHandle:
     """One request-owned host prefix and its bounded physical staging rows."""
 
-    claim_id: int
+    lease_id: int
     request_id: str
     consumer_index: int
     host_indices: torch.Tensor
@@ -172,19 +171,19 @@ def route_init_load_back(
     else:
         host_indices, source_release = _legacy_host_rows(cache, best_match_node)
     expected = int(params.host_hit_length)
-    configured = os.environ.get("NTA_SGLANG_EXTERNAL_MIN_TOKENS")
+    configured = os.environ.get("NTA_EXECUTION_EXTERNAL_MIN_TOKENS")
     minimum = (
         int(configured)
         if configured
         else int(getattr(bridge, "_external_prefix_page_tokens", 1) or 1)
     )
     if expected < max(1, minimum):
-        # Claims exist to avoid promoting large prefixes; a sub-page host
-        # hit costs nothing to serve densely, and claiming it attaches
+        # Leases exist to avoid promoting large prefixes; a sub-page host
+        # hit costs nothing to serve densely, and leasing it attaches
         # external-prefix semantics — including suppressed radix
         # insertion — to requests that are not external at all. Observed
         # failure: churn evicts the tree, every later request gets a
-        # trivial one-token host hit, the sidecar claims it, and radix
+        # trivial one-token host hit, the sidecar leases it, and radix
         # caching silently dies for the whole workload.
         source_release()
         return original(cache, params)
@@ -194,7 +193,7 @@ def route_init_load_back(
             "external-prefix host rows disagree with SGLang's logical hit length"
         )
     try:
-        handle = bridge.claim_external_prefix(
+        handle = bridge.lease_external_prefix(
             request,
             host_indices,
             source_release,
@@ -301,7 +300,7 @@ def route_cache_finished(
     if handle is None:
         return original(cache, request, *args, **kwargs)
     if not handle._released and not handle.retire("finished"):
-        raise RuntimeError("finished external prefix lost its runtime claim")
+        raise RuntimeError("finished external prefix lost its runtime lease")
     saved = request.cache_protected_len
     request.cache_protected_len = handle.resident_prefix_len
     try:

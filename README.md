@@ -1,94 +1,63 @@
 # NTA: late-bound heterogeneous execution
 
-This branch is the engineering refactor of NTA around one mechanism:
+This branch is organized around one system mechanism:
 
-> Bind each heterogeneous work unit to its request generation, demand, and
-> availability as late as correctness permits, then execute bounded runnable
-> groups at a granularity chosen from measured costs.
+> Bind every heterogeneous work unit to its request generation, exact demand,
+> and availability as late as correctness permits, then execute bounded
+> runnable groups at a granularity chosen from measured costs.
 
-The mechanism is shared by conventional, late-bound, and exact partial
-execution.  Device selection, request identity, bounded staging, compiler
-mapping, and engine feedback are cooperating parts of that mechanism; none is
-the headline in isolation.
+The mechanism is an execution protocol, not a top-k/DSA selector. The serving
+path is exact: every compared arm consumes the same demand identities and
+must preserve the same numerical contract.
 
-## Start here
+## Source of truth
 
-The current source of truth is deliberately small:
+- [docs/REFRACTOR_DESIGN.md](/home/jcsu/Dev/sched-pass/docs/REFRACTOR_DESIGN.md):
+  architecture and ownership.
+- [docs/ENGINE_INTEGRATION.md](/home/jcsu/Dev/sched-pass/docs/ENGINE_INTEGRATION.md):
+  SGLang/vLLM boundaries.
+- [docs/EXPERIMENT_DESIGN.md](/home/jcsu/Dev/sched-pass/docs/EXPERIMENT_DESIGN.md):
+  redesigned evaluation.
+- [docs/DOCUMENT_STATUS.md](/home/jcsu/Dev/sched-pass/docs/DOCUMENT_STATUS.md):
+  historical-document policy.
 
-- [REFRACTOR_DESIGN.md](docs/REFRACTOR_DESIGN.md) — architecture, ownership,
-  invariants, and migration status.
-- [EXPERIMENT_DESIGN.md](docs/EXPERIMENT_DESIGN.md) — redesigned evaluation
-  questions and fair comparison arms.
-- [DOCUMENT_STATUS.md](docs/DOCUMENT_STATUS.md) — which older documents are
-  historical evidence rather than implementation authority.
+## Runtime structure
 
-Older result ledgers are retained for provenance.  They may contain useful
-measurements, but they do not define this branch's API, mechanism, or claims.
-
-## Architecture
-
-```text
-SGLang / vLLM adapter
-        │ request slot + generation + engine metadata
-        ▼
-WorkBatch ── DemandDescriptor ── exact selected work IDs
-        │
-        ▼
-protocol planner ── granularity cost model ── runnable groups
-        │
-        ▼
-NTA runtime ── claims/dependencies ── staging/transport ── telemetry
-        │
-        ▼
-compiler-mapped consumer ── exact partial state / final output
+```
+engine adapter
+  -> request slot + generation
+WorkBatch / DemandDescriptor
+  -> exact heterogeneous work units
+protocol planner
+  -> granularity and bounded runnable groups
+semantic/native bridge
+  -> validated WorkItem + dependency ABI
+compiler-mapped consumer
+  -> exact attention execution and telemetry
 ```
 
-The native storage ABI remains canonical in
-[include/nta/RuntimeABI.h](include/nta/RuntimeABI.h).  The Python semantic
-layer is in:
+The core modules are:
 
-- [work_unit.py](python/nta_runtime/work_unit.py): demand, identity,
-  availability, and heterogeneous batches;
-- [execution_protocol.py](python/nta_runtime/execution_protocol.py): protocol
-  state transitions and transparent granularity costs;
-- [adapters](python/nta_runtime/adapters): engine-specific request translation.
+- `python/nta_runtime/work_unit.py`: exact demand, identity, availability,
+  and heterogeneous batches;
+- `python/nta_runtime/execution_protocol.py`: protocol state machine and
+  transparent granularity cost model;
+- `python/nta_runtime/execution_core.py`: one execution session for one
+  attention launch;
+- `python/nta_runtime/execution_planner.py`: measured host/device planning;
+- `python/nta_runtime/adapters/`: engine-specific metadata projections;
+- `python/nta_runtime/runtime.py`: semantic-to-native upload validation.
 
-The existing compiler pass and native runtime remain responsible for lowering,
-dependency storage, transport, claims, and device execution.  The refactor
-does not create a second request tracker or a second native ABI.
+SGLang is the first serving implementation. It keeps host HiCache ownership,
+request identity, demand, and availability at explicit boundaries while
+building an execution session for every real FlashInfer attention launch.
+The vLLM adapter exposes the same request projection without importing vLLM.
 
-## Status of this branch
-
-Implemented and tested:
-
-- exact/approximate demand is explicit in the type contract;
-- request generation and demand epoch are checked on every ledger transition;
-- conventional, late-bound, and partial protocol forms share one work-unit
-  state machine;
-- request identity is factored behind a common adapter boundary;
-- SGLang identity/configuration integration and a dependency-free vLLM seam;
-- a transparent granularity model that can select conventional execution when
-  fine-grained control is not worth its cost;
-- focused runtime tests and the existing native/compiler test suite.
-
-Still being migrated, and therefore not claimed as complete:
-
-- route the full SGLang staging/selection path through `WorkBatch`;
-- merge and fairly validate the conventional E6 execution arm;
-- connect compiler work mapping and consumer partial state to the semantic
-  contract;
-- move remaining claim/staging policy out of the monolithic SGLang backend;
-- bind the vLLM seam to one pinned vLLM release;
-- replace old protocol-specific qualification scripts with contract-based
-  validators.
-
-This distinction is intentional: a configuration seam is not presented as a
-fully migrated serving implementation, and historical speedups are not used
-as results for the refactor branch.
+Retired selector-specific serving and graph-specialization paths were removed
+from the current implementation. Their old source is recoverable through Git
+history; it is not an alternative runtime interface.
 
 ## Build and tests
-
-Configure and build in the normal project build directory:
 
 ```bash
 cmake -S . -B build
@@ -96,21 +65,16 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
-The focused Python contract tests can also run without a GPU:
+GPU- and framework-dependent tests remain capability-gated. The dependency-free
+contract tests can run with:
 
 ```bash
 PYTHONPATH=python python tests/runtime/work_unit.py
+PYTHONPATH=python python tests/runtime/execution_core.py
 PYTHONPATH=python python tests/runtime/adapters.py
+PYTHONPATH=python python tools/experiments/run_work_unit_matrix.py
 ```
 
-GPU, CUDA, NVMe, and serving tests remain capability-gated by CMake and their
-existing environment checks.
-
-## Scope
-
-The primary correctness case is exact demand: all arms consume the same
-selected work IDs and must produce the same numerical result.  Top-k/DSA and
-other approximate selectors are optional quality-gated studies, not a silent
-substitute for the exact system mechanism.  SGLang is the first engine
-integration; vLLM is designed through the same adapter contract rather than by
-copying SGLang-specific policy into the runtime.
+The native ABI in `include/nta/RuntimeABI.h` remains the storage contract;
+the semantic Python layer adds identity, demand, and availability invariants
+without creating a second native ABI.

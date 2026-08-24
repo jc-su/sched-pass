@@ -37,9 +37,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 LOAD_BENCHMARK = ROOT / "benchmarks" / "serving" / "SglangHiCacheLoad.py"
 
 PROFILE_ENVIRONMENT = {
-    "NTA_SGLANG_PROFILE_BARRIER": "1",
-    "NTA_SGLANG_PROFILE_GPU": "1",
-    "NTA_SGLANG_PROFILE_TRANSFER": "1",
+    "NTA_PROFILE_BARRIER": "1",
+    "NTA_PROFILE_GPU": "1",
+    "NTA_PROFILE_TRANSFER": "1",
 }
 
 

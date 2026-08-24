@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from nta_runtime.execution_policy import (
+from nta_runtime.execution_planner import (
     conservative_resume_counts,
     DeviceDemandCostModel,
     HostCostModel,
@@ -11,36 +11,18 @@ from nta_runtime.execution_policy import (
 
 
 def main() -> None:
-    assert indexed_copy_blocks_per_group(
-        transfer_bytes=4 * 1024 * 1024,
-        object_count=2,
-    ) == 4
-    assert indexed_copy_blocks_per_group(
-        transfer_bytes=64 * 1024,
-        object_count=2,
-    ) == 1
-    assert indexed_copy_blocks_per_group(
-        transfer_bytes=128 * 1024 * 1024,
-        object_count=2,
-    ) == 32
+    assert indexed_copy_blocks_per_group(transfer_bytes=4 * 1024 * 1024, object_count=2) == 4
+    assert indexed_copy_blocks_per_group(transfer_bytes=64 * 1024, object_count=2) == 1
+    assert indexed_copy_blocks_per_group(transfer_bytes=128 * 1024 * 1024, object_count=2) == 32
     assert conservative_resume_counts(
-        block_counts=(8, 8),
-        work_count=8,
-        max_object_fanout=1,
-        min_unresolved_dependencies=2,
+        block_counts=(8, 8), work_count=8, max_object_fanout=1, min_unresolved_dependencies=2
     ) == (4, 8)
     assert conservative_resume_counts(
-        block_counts=(2, 2),
-        work_count=32,
-        max_object_fanout=32,
-        min_unresolved_dependencies=2,
+        block_counts=(2, 2), work_count=32, max_object_fanout=32, min_unresolved_dependencies=2
     ) == (32, 32)
     try:
         conservative_resume_counts(
-            block_counts=(0,),
-            work_count=1,
-            max_object_fanout=1,
-            min_unresolved_dependencies=1,
+            block_counts=(0,), work_count=1, max_object_fanout=1, min_unresolved_dependencies=1
         )
     except ValueError:
         pass
@@ -56,10 +38,7 @@ def main() -> None:
         minimum_predicted_gain=1.03,
     )
     pipelined = plan_host_execution(
-        object_count=16,
-        transfer_bytes=4 * 1024 * 1024,
-        runnable_tiles=64,
-        model=model,
+        object_count=16, transfer_bytes=4 * 1024 * 1024, runnable_tiles=64, model=model
     )
     assert pipelined.rounds > 1
     assert sum(pipelined.block_counts) == 16
@@ -67,10 +46,7 @@ def main() -> None:
     assert pipelined.predicted_gain >= model.minimum_predicted_gain
 
     atomic = plan_host_execution(
-        object_count=2,
-        transfer_bytes=64 * 1024,
-        runnable_tiles=1,
-        model=model,
+        object_count=2, transfer_bytes=64 * 1024, runnable_tiles=1, model=model
     )
     assert atomic.block_counts == (2,)
     assert atomic.predicted_gain == 1.0
@@ -97,7 +73,6 @@ def main() -> None:
     assert forced.rounds == 2
     assert forced.block_counts == (8, 8)
     assert forced.predicted_incremental_ns > forced.predicted_atomic_ns
-
     try:
         plan_host_execution(
             object_count=16,
@@ -110,14 +85,8 @@ def main() -> None:
         pass
     else:
         raise AssertionError("one forced host round was accepted as incremental")
-
     try:
-        plan_host_execution(
-            object_count=0,
-            transfer_bytes=1,
-            runnable_tiles=1,
-            model=model,
-        )
+        plan_host_execution(object_count=0, transfer_bytes=1, runnable_tiles=1, model=model)
     except ValueError:
         pass
     else:
@@ -127,21 +96,21 @@ def main() -> None:
     bulk = plan_device_demand(
         candidate_bytes=8 * 1024 * 1024,
         selected_bytes=8 * 1024 * 1024,
-        selected_pages=512,
+        selected_units=512,
         model=device_model,
     )
     assert bulk.mode == "bulk"
     crossover = plan_device_demand(
         candidate_bytes=16 * 1024 * 1024,
         selected_bytes=8 * 1024 * 1024,
-        selected_pages=512,
+        selected_units=512,
         model=device_model,
     )
     assert crossover.mode == "indexed"
     selective = plan_device_demand(
         candidate_bytes=128 * 1024 * 1024,
         selected_bytes=8 * 1024 * 1024,
-        selected_pages=512,
+        selected_units=512,
         model=device_model,
     )
     assert selective.mode == "indexed"
@@ -150,7 +119,7 @@ def main() -> None:
         plan_device_demand(
             candidate_bytes=1024,
             selected_bytes=2048,
-            selected_pages=1,
+            selected_units=1,
             model=device_model,
         )
     except ValueError:

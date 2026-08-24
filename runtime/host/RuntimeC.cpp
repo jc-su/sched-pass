@@ -1239,65 +1239,6 @@ nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
   });
 }
 
-nta_status nta_jit_phase_build_compact_plan(
-    const nta_jit_phase_program *program, std::uint64_t denseIndices,
-    std::uint64_t denseOffsets, std::uint64_t boundLengths,
-    std::uint64_t nonprefixOffsets, std::uint64_t nonprefixIndices,
-    std::uint64_t claimRowCounts, std::uint64_t compactOffsets,
-    std::uint64_t compactIndices, std::uint32_t batchSize,
-    std::uint64_t cudaStream) {
-  return protect([&] {
-    requireHandle(program, "JIT phase program");
-    program->value->buildCompactPlan(
-        stream(cudaStream),
-        reinterpret_cast<const std::int32_t *>(denseIndices),
-        reinterpret_cast<const std::int32_t *>(denseOffsets),
-        reinterpret_cast<const std::int32_t *>(boundLengths),
-        reinterpret_cast<const std::int32_t *>(nonprefixOffsets),
-        reinterpret_cast<const std::int32_t *>(nonprefixIndices),
-        reinterpret_cast<const std::int32_t *>(claimRowCounts),
-        reinterpret_cast<const std::int32_t *>(compactOffsets),
-        reinterpret_cast<std::int32_t *>(compactIndices), batchSize);
-  });
-}
-
-nta_status nta_jit_phase_prepare_claim_table_selected_rows(
-    const nta_jit_phase_program *program, nta_runtime *runtime,
-    std::uint64_t valid, std::uint64_t claimIds, std::uint64_t generations,
-    std::uint64_t observedIds, std::uint64_t objectSlots,
-    std::uint64_t capacityWords, std::uint64_t selectedCounts,
-    std::uint64_t tokenCounts, std::uint64_t selectedPagesBase,
-    std::uint64_t cachedPagesBase, std::uint64_t hostRowsBase,
-    std::uint64_t stagingRowsBase, std::uint64_t selectedRowsBase,
-    std::uint64_t sourceIndicesBase, std::uint64_t stagingIndicesBase,
-    std::uint64_t copiedRowsBase, std::uint32_t maxClaims,
-    std::uint32_t maxBudgetPages, std::uint32_t layerCount,
-    std::uint32_t localLayer, std::uint32_t maxClaimTokens,
-    std::uint32_t pageTokens, std::uint64_t cudaStream) {
-  return protect([&] {
-    requireHandle(program, "JIT phase program");
-    requireHandle(runtime, "runtime");
-    program->value->prepareClaimTableSelectedRows(
-        stream(cudaStream), runtime->value->deviceView(),
-        reinterpret_cast<const std::int32_t *>(valid),
-        reinterpret_cast<const std::int64_t *>(claimIds),
-        reinterpret_cast<const std::int32_t *>(generations),
-        reinterpret_cast<std::int64_t *>(observedIds),
-        reinterpret_cast<const std::int32_t *>(objectSlots),
-        reinterpret_cast<const std::int32_t *>(capacityWords),
-        reinterpret_cast<const std::int32_t *>(selectedCounts),
-        reinterpret_cast<const std::int32_t *>(tokenCounts),
-        reinterpret_cast<const std::int64_t *>(selectedPagesBase),
-        reinterpret_cast<std::int64_t *>(cachedPagesBase),
-        reinterpret_cast<const std::int32_t *>(hostRowsBase),
-        reinterpret_cast<const std::int32_t *>(stagingRowsBase),
-        reinterpret_cast<std::uint32_t *>(selectedRowsBase),
-        reinterpret_cast<std::uint32_t *>(sourceIndicesBase),
-        reinterpret_cast<std::uint32_t *>(stagingIndicesBase),
-        reinterpret_cast<std::uint64_t *>(copiedRowsBase), maxClaims,
-        maxBudgetPages, layerCount, localLayer, maxClaimTokens, pageTokens);
-  });
-}
 
 nta_status nta_jit_phase_reduce_mapped_key_pages(
     const nta_jit_phase_program *program, std::uint64_t source,
@@ -1316,42 +1257,6 @@ nta_status nta_jit_phase_reduce_mapped_key_pages(
   });
 }
 
-nta_status nta_jit_phase_select_prepare_claim_rows(
-    const nta_jit_phase_program *program, nta_runtime *runtime,
-    std::uint32_t firstObject, std::uint64_t queries,
-    std::uint32_t queryTokens, std::uint32_t queryHeads,
-    std::uint32_t kvHeads, std::uint32_t headDim, std::uint64_t layerMin,
-    std::uint64_t layerMax, std::uint64_t pageScores, std::uint32_t pageCount,
-    std::uint64_t fullForcedPages, std::uint32_t fullForcedCount,
-    std::int64_t tailPage, std::uint32_t freeBudget,
-    std::uint64_t orderedPagesOut, std::uint32_t pageTokens,
-    std::uint32_t tokenCount, std::uint64_t hostRows,
-    std::uint64_t deviceRows, std::uint64_t cachedPages,
-    std::uint32_t cacheSlotCount, std::uint64_t selectedRows,
-    std::uint64_t sourceIndices, std::uint64_t stagingIndices,
-    std::uint32_t capacity, std::uint64_t copiedRows,
-    std::uint64_t cudaStream) {
-  return protect([&] {
-    requireHandle(program, "JIT phase program");
-    requireHandle(runtime, "runtime");
-    program->value->selectPrepareClaimRows(
-        stream(cudaStream), runtime->value->deviceView(), firstObject,
-        reinterpret_cast<const void *>(queries), queryTokens, queryHeads,
-        kvHeads, headDim, reinterpret_cast<const float *>(layerMin),
-        reinterpret_cast<const float *>(layerMax),
-        reinterpret_cast<float *>(pageScores), pageCount,
-        reinterpret_cast<const std::int64_t *>(fullForcedPages),
-        fullForcedCount, tailPage, freeBudget,
-        reinterpret_cast<std::int64_t *>(orderedPagesOut), pageTokens,
-        tokenCount, reinterpret_cast<const std::uint32_t *>(hostRows),
-        reinterpret_cast<const std::uint32_t *>(deviceRows),
-        reinterpret_cast<std::int64_t *>(cachedPages), cacheSlotCount,
-        reinterpret_cast<std::uint32_t *>(selectedRows),
-        reinterpret_cast<std::uint32_t *>(sourceIndices),
-        reinterpret_cast<std::uint32_t *>(stagingIndices), capacity,
-        reinterpret_cast<std::uint64_t *>(copiedRows));
-  });
-}
 
 nta_status nta_jit_phase_reduce_mapped_indexed_key_pages(
     const nta_jit_phase_program *program, std::uint64_t source,

@@ -273,11 +273,11 @@ def main() -> int:
         ),
         "revisions": revisions,
         "harness_args": expected_args,
-        "staged_bytes_per_trial": [
-            report.get("nta_staged_bytes") for report in reports
+        "selected_bytes_per_trial": [
+            report.get("nta_selected_bytes") for report in reports
         ],
-        "summary_source_bytes_per_trial": [
-            report.get("nta_summary_source_bytes") for report in reports
+        "candidate_bytes_per_trial": [
+            report.get("nta_candidate_bytes") for report in reports
         ],
         "ratios": _aggregate(reports, args.seed_base),
     }

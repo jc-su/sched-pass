@@ -19,14 +19,22 @@ class RequestBinding:
     priority: int = 0
     deadline_clock: int = 0
 
+    def __post_init__(self) -> None:
+        if min(self.request_index, self.request_slot, self.generation, self.request_id) < 0:
+            raise ValueError("request binding identity fields must be nonnegative")
+        if self.generation == 0:
+            raise ValueError("request generation must be positive")
+        if not 0 <= self.priority <= 7 or self.deadline_clock < 0:
+            raise ValueError("request priority or deadline is invalid")
+
 
 def stable_request_id(value: str) -> int:
     digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=False)
 
 
-class RequestSlotTracker:
-    """Assign generations to engine-owned slots and publish changes once."""
+class RequestIdentityRegistry:
+    """Own engine-slot identity and publish each generation exactly once."""
 
     def __init__(self, runtime: Any, capacity: int) -> None:
         if capacity <= 0:
@@ -34,8 +42,9 @@ class RequestSlotTracker:
         self._runtime = runtime
         self._capacity = capacity
         self._slots: dict[int, tuple[str, int, int, int]] = {}
+        self._active_slots: set[int] = set()
         self.last_publish_count = 0
-        self.last_policy_publish_count = 0
+        self.last_metadata_publish_count = 0
 
     def bind(
         self,
@@ -57,9 +66,9 @@ class RequestSlotTracker:
         if len(priorities) != len(request_ids) or len(deadline_clocks) != len(
             request_ids
         ):
-            raise ValueError("request policy arrays must match request IDs")
+            raise ValueError("request metadata arrays must match request IDs")
         self.last_publish_count = 0
-        self.last_policy_publish_count = 0
+        self.last_metadata_publish_count = 0
         bindings: list[RequestBinding] = []
         updates: list[RequestSpec] = []
         slot_updates: list[tuple[int, tuple[str, int, int, int]]] = []
@@ -77,7 +86,7 @@ class RequestSlotTracker:
             previous = self._slots.get(request_slot)
             if previous is None:
                 generation = 1
-            elif previous[0] == request_id:
+            elif request_slot in self._active_slots and previous[0] == request_id:
                 generation = previous[1]
             else:
                 generation = (previous[1] + 1) & 0xFFFFFFFF
@@ -98,7 +107,7 @@ class RequestSlotTracker:
                 if previous is None or previous[:2] != current[:2]:
                     self.last_publish_count += 1
                 else:
-                    self.last_policy_publish_count += 1
+                    self.last_metadata_publish_count += 1
             bindings.append(
                 RequestBinding(
                     request_index,
@@ -123,12 +132,14 @@ class RequestSlotTracker:
                 self._runtime.publish_requests_async(updates, stream)
             for request_slot, current in slot_updates:
                 self._slots[request_slot] = current
+                self._active_slots.add(request_slot)
         return tuple(bindings)
 
     def cancel(self, request_id: str) -> bool:
         for request_slot, (active_id, generation, _, _) in self._slots.items():
-            if active_id == request_id:
+            if request_slot in self._active_slots and active_id == request_id:
                 self._runtime.cancel_request(request_slot, generation)
+                self._active_slots.remove(request_slot)
                 return True
         return False
 
@@ -139,8 +150,10 @@ class RequestSlotTracker:
         matches = [
             (request_slot, generation)
             for request_slot, (request_id, generation, _, _) in self._slots.items()
-            if all or request_id.startswith(request_id_prefix)
+            if request_slot in self._active_slots
+            and (all or request_id.startswith(request_id_prefix))
         ]
         for request_slot, generation in matches:
             self._runtime.cancel_request(request_slot, generation)
+            self._active_slots.remove(request_slot)
         return len(matches)

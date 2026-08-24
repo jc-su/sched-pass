@@ -140,13 +140,13 @@ add_test(NAME nta-abi COMMAND nta-abi-test)
 
 if(Python3_Interpreter_FOUND)
   add_test(
-    NAME nta-execution-policy
+    NAME nta-execution-planner
     COMMAND
       ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/execution_policy.py
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/execution_planner.py
   )
   set_tests_properties(
-    nta-execution-policy PROPERTIES
+    nta-execution-planner PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
@@ -170,6 +170,38 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
+    NAME nta-execution-core
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/execution_core.py
+  )
+  set_tests_properties(
+    nta-execution-core PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-experiment-matrix
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/experiments/run_work_unit_matrix.py
+      --max-cases 2
+      --repetitions 1
+  )
+  set_tests_properties(
+    nta-experiment-matrix PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-semantic-native-bridge
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/semantic_native_bridge.py
+  )
+  set_tests_properties(
+    nta-semantic-native-bridge PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
     NAME nta-critical-work
     COMMAND
       ${Python3_EXECUTABLE}
@@ -180,36 +212,6 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
-    NAME nta-page-summaries
-    COMMAND
-      ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/page_summaries.py
-  )
-  set_tests_properties(
-    nta-page-summaries PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-  )
-  add_test(
-    NAME nta-quest-selector
-    COMMAND
-      ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/quest_selector.py
-  )
-  set_tests_properties(
-    nta-quest-selector PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-  )
-  add_test(
-    NAME nta-summary-store
-    COMMAND
-      ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/summary_store.py
-  )
-  set_tests_properties(
-    nta-summary-store PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-  )
-  add_test(
     NAME nta-virtual-ranges
     COMMAND
       ${Python3_EXECUTABLE}
@@ -217,16 +219,6 @@ if(Python3_Interpreter_FOUND)
   )
   set_tests_properties(
     nta-virtual-ranges PROPERTIES
-    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-  )
-  add_test(
-    NAME nta-claim-table
-    COMMAND
-      ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/claim_table.py
-  )
-  set_tests_properties(
-    nta-claim-table PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
@@ -395,21 +387,6 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_plugin.py
     )
     add_test(
-      NAME nta-selected-serving-evidence
-      COMMAND ${Python3_EXECUTABLE}
-              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/selected_serving_evidence.py
-    )
-    add_test(
-      NAME nta-selected-quality-harness
-      COMMAND ${Python3_EXECUTABLE}
-              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/selected_quality_harness.py
-    )
-    add_test(
-      NAME nta-selected-request-overlap
-      COMMAND ${Python3_EXECUTABLE}
-              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/selected_request_overlap.py
-    )
-    add_test(
       NAME nta-bounded-staging
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/bounded_staging.py
@@ -430,11 +407,6 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/qualification_runner.py
     )
     add_test(
-      NAME nta-qualification-evidence
-      COMMAND ${Python3_EXECUTABLE}
-              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/qualification_evidence.py
-    )
-    add_test(
       NAME nta-serving-evidence
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_evidence.py
@@ -450,11 +422,10 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity_study.py
     )
     set_tests_properties(
-      nta-request-slots nta-sglang-plugin nta-selected-serving-evidence
-      nta-selected-request-overlap
+      nta-request-slots nta-sglang-plugin
       nta-bounded-staging
       nta-qualification-runner
-      nta-qualification-evidence nta-serving-evidence nta-jit-operator-family
+      nta-serving-evidence nta-jit-operator-family
       nta-opportunity-analysis
       nta-opportunity-study
       PROPERTIES TIMEOUT 60
@@ -465,9 +436,6 @@ if(NTA_ENABLE_CUDA)
       TIMEOUT 60
     )
     set_tests_properties(nta-request-slots PROPERTIES
-      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-    )
-    set_tests_properties(nta-selected-request-overlap PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
     )
     set_tests_properties(nta-bounded-staging PROPERTIES

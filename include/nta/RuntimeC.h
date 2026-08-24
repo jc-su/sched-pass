@@ -429,30 +429,6 @@ nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
     uint32_t cache_slot_count, uint64_t selected_rows, uint64_t source_indices,
     uint64_t staging_indices, uint32_t capacity, uint64_t copied_rows,
     uint64_t cuda_stream);
-/* C API v27: prepare every valid claim-table row's selected consumer
- * table and miss-only transfer lists in one fixed-shape launch; one block
- * per table row, gated by the device validity word. */
-nta_status nta_jit_phase_prepare_claim_table_selected_rows(
-    const nta_jit_phase_program *program, nta_runtime *runtime,
-    uint64_t valid, uint64_t claim_ids, uint64_t generations,
-    uint64_t observed_ids, uint64_t object_slots, uint64_t capacity_words,
-    uint64_t selected_counts, uint64_t token_counts,
-    uint64_t selected_pages_base, uint64_t cached_pages_base,
-    uint64_t host_rows_base, uint64_t staging_rows_base,
-    uint64_t selected_rows_base, uint64_t source_indices_base,
-    uint64_t staging_indices_base, uint64_t copied_rows_base,
-    uint32_t max_claims, uint32_t max_budget_pages, uint32_t layer_count,
-    uint32_t local_layer, uint32_t max_claim_tokens, uint32_t page_tokens,
-    uint64_t cuda_stream);
-/* C API v28: build the packed compact attention plan on device from the
- * engine's dense indices and per-request remainder descriptors; claim
- * kept-prefix blocks are left for the per-layer selected-row writes. */
-nta_status nta_jit_phase_build_compact_plan(
-    const nta_jit_phase_program *program, uint64_t dense_indices,
-    uint64_t dense_offsets, uint64_t bound_lengths,
-    uint64_t nonprefix_offsets, uint64_t nonprefix_indices,
-    uint64_t claim_row_counts, uint64_t compact_offsets,
-    uint64_t compact_indices, uint32_t batch_size, uint64_t cuda_stream);
 /* C API v25: reduce pinned mapped host key rows directly into device page
  * envelopes without allocating a temporary HBM copy. element_type is 0 for
  * fp16 and 1 for bf16. */
@@ -470,20 +446,6 @@ nta_status nta_jit_phase_reduce_mapped_indexed_key_pages(
     uint32_t page_tokens, uint32_t kv_heads, uint32_t head_dim,
     uint32_t element_type, uint64_t output_min, uint64_t output_max,
     uint64_t cuda_stream);
-/* C API v30: fuse a layer's page scoring, top-k selection, ordered-page
- * assembly, and bounded prep into one launch per claim layer. */
-nta_status nta_jit_phase_select_prepare_claim_rows(
-    const nta_jit_phase_program *program, nta_runtime *runtime,
-    uint32_t first_object, uint64_t queries, uint32_t query_tokens,
-    uint32_t query_heads, uint32_t kv_heads, uint32_t head_dim,
-    uint64_t layer_min, uint64_t layer_max, uint64_t page_scores,
-    uint32_t page_count,
-    uint64_t full_forced_pages, uint32_t full_forced_count,
-    int64_t tail_page, uint32_t free_budget, uint64_t ordered_pages_out,
-    uint32_t page_tokens, uint32_t token_count, uint64_t host_rows,
-    uint64_t device_rows, uint64_t cached_pages, uint32_t cache_slot_count,
-    uint64_t selected_rows, uint64_t source_indices, uint64_t staging_indices,
-    uint32_t capacity, uint64_t copied_rows, uint64_t cuda_stream);
 nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        nta_runtime *runtime,
                                        uint32_t issue_budget,

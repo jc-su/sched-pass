@@ -1,4 +1,10 @@
-"""Cost model for finite request-aware host-staging rounds."""
+"""Measured planner for the unified late-bound execution mechanism.
+
+This module contains cost estimation only.  It does not own request identity,
+availability, or protocol state; those belong to ``execution_core`` and
+``execution_protocol``.  A plan is a bounded execution choice, never a data
+quality selector.
+"""
 
 from __future__ import annotations
 
@@ -16,16 +22,39 @@ class HostCostModel:
     minimum_predicted_gain: float = 1.03
     dependency_width: int = 2
 
+    @classmethod
+    def from_environment(
+        cls, environ: dict[str, str] | None = None, *, prefix: str = "NTA_EXECUTION"
+    ) -> "HostCostModel":
+        import os
+
+        values = os.environ if environ is None else environ
+        return cls(
+            bandwidth_bytes_per_second=int(
+                values.get(f"{prefix}_HOST_BANDWIDTH_BPS", cls.bandwidth_bytes_per_second)
+            ),
+            round_overhead_ns=int(
+                values.get(f"{prefix}_ROUND_OVERHEAD_NS", cls.round_overhead_ns)
+            ),
+            incremental_setup_ns=int(
+                values.get(f"{prefix}_INCREMENTAL_SETUP_NS", cls.incremental_setup_ns)
+            ),
+            tile_compute_ns=int(
+                values.get(f"{prefix}_TILE_COMPUTE_NS", cls.tile_compute_ns)
+            ),
+            max_rounds=int(values.get(f"{prefix}_MAX_ROUNDS", cls.max_rounds)),
+            minimum_predicted_gain=float(
+                values.get(f"{prefix}_MIN_PREDICTED_GAIN", cls.minimum_predicted_gain)
+            ),
+        )
+
     def validate(self) -> None:
-        if (
-            min(
-                self.bandwidth_bytes_per_second,
-                self.tile_compute_ns,
-                self.max_rounds,
-                self.dependency_width,
-            )
-            <= 0
-        ):
+        if min(
+            self.bandwidth_bytes_per_second,
+            self.tile_compute_ns,
+            self.max_rounds,
+            self.dependency_width,
+        ) <= 0:
             raise ValueError("host execution cost parameters must be positive")
         if (
             min(self.round_overhead_ns, self.incremental_setup_ns) < 0
@@ -54,8 +83,6 @@ class HostExecutionPlan:
 
 @dataclasses.dataclass(frozen=True)
 class DeviceDemandCostModel:
-    """Calibrated costs for bulk candidates versus device-indexed demand."""
-
     bulk_bandwidth_bytes_per_second: int = 55_000_000_000
     indexed_bandwidth_bytes_per_second: int = 55_000_000_000
     bulk_setup_ns: int = 10_000
@@ -64,13 +91,10 @@ class DeviceDemandCostModel:
     minimum_predicted_gain: float = 1.10
 
     def validate(self) -> None:
-        if (
-            min(
-                self.bulk_bandwidth_bytes_per_second,
-                self.indexed_bandwidth_bytes_per_second,
-            )
-            <= 0
-        ):
+        if min(
+            self.bulk_bandwidth_bytes_per_second,
+            self.indexed_bandwidth_bytes_per_second,
+        ) <= 0:
             raise ValueError("device-demand bandwidths must be positive")
         if (
             min(
@@ -107,8 +131,6 @@ def indexed_copy_blocks_per_group(
     target_bytes_per_block: int = 1024 * 1024,
     maximum_blocks: int = 32,
 ) -> int:
-    """Size the finite copy grid from transfer geometry, without a data oracle."""
-
     if min(transfer_bytes, object_count, target_bytes_per_block, maximum_blocks) <= 0:
         raise ValueError("indexed copy geometry must be positive")
     object_groups = math.ceil(object_count / 2)
@@ -120,13 +142,11 @@ def plan_device_demand(
     *,
     candidate_bytes: int,
     selected_bytes: int,
-    selected_pages: int,
+    selected_units: int,
     model: DeviceDemandCostModel,
 ) -> DeviceDemandPlan:
-    """Choose bulk or indexed transfer without observing selected identities."""
-
     model.validate()
-    if min(candidate_bytes, selected_bytes, selected_pages) <= 0:
+    if min(candidate_bytes, selected_bytes, selected_units) <= 0:
         raise ValueError("device-demand planning needs non-empty transfer geometry")
     if selected_bytes > candidate_bytes:
         raise ValueError("selected bytes cannot exceed candidate bytes")
@@ -135,7 +155,7 @@ def plan_device_demand(
     )
     indexed_ns = (
         model.indexed_setup_ns
-        + selected_pages * model.indexed_page_overhead_ns
+        + selected_units * model.indexed_page_overhead_ns
         + math.ceil(
             selected_bytes * 1_000_000_000 / model.indexed_bandwidth_bytes_per_second
         )
@@ -151,14 +171,6 @@ def conservative_resume_counts(
     max_object_fanout: int,
     min_unresolved_dependencies: int,
 ) -> tuple[int, ...]:
-    """Bound cumulative runnable work without reading a device counter.
-
-    A runnable ticket contributes at least ``min_unresolved_dependencies``
-    edges to the completed object set. Each completed object contributes at
-    most ``max_object_fanout`` edges, so edge counting gives a conservative
-    physical grid bound even when many tickets share one object.
-    """
-
     if (
         not block_counts
         or min(
@@ -174,11 +186,10 @@ def conservative_resume_counts(
     result = []
     for blocks in block_counts:
         cumulative_objects += blocks
-        edge_bound = cumulative_objects * max_object_fanout
         result.append(
             min(
                 work_count,
-                math.ceil(edge_bound / min_unresolved_dependencies),
+                math.ceil(cumulative_objects * max_object_fanout / min_unresolved_dependencies),
             )
         )
     return tuple(result)
@@ -186,10 +197,7 @@ def conservative_resume_counts(
 
 def _round_width(object_count: int, rounds: int, dependency_width: int) -> int:
     width = math.ceil(object_count / rounds)
-    return min(
-        object_count,
-        math.ceil(width / dependency_width) * dependency_width,
-    )
+    return min(object_count, math.ceil(width / dependency_width) * dependency_width)
 
 
 def _block_counts(object_count: int, width: int) -> tuple[int, ...]:
@@ -227,13 +235,6 @@ def plan_host_execution(
     force_rounds: int | None = None,
     initial_runnable_tiles: int = 0,
 ) -> HostExecutionPlan:
-    """Choose one atomic round or a bounded transfer/compute pipeline.
-
-    The model has no future oracle. It uses calibrated bandwidth, per-round
-    launch cost, and compiler/runtime tile cost. Urgency affects queue order;
-    this function controls only how much active work one finite round admits.
-    """
-
     model.validate()
     if min(object_count, transfer_bytes, runnable_tiles) <= 0:
         raise ValueError("host execution planning needs non-empty active work")
@@ -258,9 +259,7 @@ def plan_host_execution(
             + deferred_compute_ns
             + model.incremental_setup_ns
         )
-        if force_rounds is not None or (
-            atomic_ns / one_wave_ns >= model.minimum_predicted_gain
-        ):
+        if force_rounds is not None or atomic_ns / one_wave_ns >= model.minimum_predicted_gain:
             best_ns = one_wave_ns
             overlap_initial = True
 
@@ -287,14 +286,16 @@ def plan_host_execution(
     for requested_rounds in range(2, max_rounds + 1):
         width = _round_width(object_count, requested_rounds, model.dependency_width)
         counts = _block_counts(object_count, width)
-        candidate_ns = _pipeline_ns(
-            transfer_ns,
-            deferred_compute_ns,
-            len(counts),
-            model.round_overhead_ns,
-            model.incremental_setup_ns,
+        candidate_ns = max(
+            initial_compute_ns,
+            _pipeline_ns(
+                transfer_ns,
+                deferred_compute_ns,
+                len(counts),
+                model.round_overhead_ns,
+                model.incremental_setup_ns,
+            ),
         )
-        candidate_ns = max(initial_compute_ns, candidate_ns)
         if candidate_ns < best_ns:
             best_counts = counts
             best_ns = candidate_ns

@@ -99,6 +99,7 @@ def require_clean_mechanism(
     require_demand_graph: bool = False,
     require_physical_compaction: bool = False,
 ) -> dict[str, Any]:
+    """Validate the exact execution contract exercised by one serving arm."""
     stats = [
         entry
         for entry in report.get("engine_stats", [])
@@ -106,233 +107,58 @@ def require_clean_mechanism(
     ]
     if not stats:
         raise RuntimeError("NTA HiCache trial did not publish engine statistics")
-    fallbacks = sum(int(entry.get("hicache_fallback_batches", 0)) for entry in stats)
-    claimed = sum(int(entry.get("hicache_claimed_batches", 0)) for entry in stats)
-    def _mechanism_summary() -> str:
-        keys = (
-            "hicache_claimed_batches", "hicache_fallback_batches",
-            "tiered_claims", "tiered_external_prefix_batches",
-            "tiered_decode_layers", "tiered_pipelined_extends",
-            "tiered_table_prep_launches", "tiered_fast_reuse_layers",
-            "external_launches",
-            "admission_considered_batches", "batches",
-        )
-        return "; ".join(
-            f"{key}={sum(int(entry.get(key, 0)) for entry in stats)}"
-            for key in keys
-        )
-    if fallbacks != 0:
+
+    def total(key: str) -> int:
+        return sum(int(entry.get(key, 0)) for entry in stats)
+
+    fallbacks = total("hicache_fallback_batches")
+    external_batches = total("hicache_external_batches")
+    external_launches = total("external_launches")
+    prefetched_layers = total("prefetched_layers")
+    demand_layers = total("demand_host_layers")
+    transformed = total("transformed_direct_launches")
+    incremental = total("ticketed_incremental_launches")
+    attention = total("decode_launches") + total("prefill_launches")
+    stock_launches = total("stock_attention_launches")
+    if fallbacks:
+        raise RuntimeError(f"NTA HiCache trial used {fallbacks} fallback batches")
+    if external_batches == 0 or external_launches == 0:
+        raise RuntimeError("NTA HiCache trial did not execute an external batch")
+    if external_launches != prefetched_layers + demand_layers:
         raise RuntimeError(
-            f"NTA HiCache trial used {fallbacks} fallback batches "
-            f"({_mechanism_summary()})"
-        )
-    tiered_batches = sum(
-        int(entry.get("tiered_external_prefix_batches", 0)) for entry in stats
-    )
-    if claimed == 0 and tiered_batches == 0:
-        # Tiered serving routes external prefixes through claims without
-        # touching the demand-acquire counter; either counter proves the
-        # mechanism ran.
-        raise RuntimeError(
-            "NTA HiCache trial did not claim an external batch "
-            f"({_mechanism_summary()})"
-        )
-    transformed = sum(
-        int(entry.get("transformed_direct_launches", 0)) for entry in stats
-    )
-    stock_launches = sum(
-        int(entry.get("stock_attention_launches", 0)) for entry in stats
-    )
-    if stock_launches != 0:
-        raise RuntimeError(f"NTA timed {stock_launches} stock FlashInfer launches")
-    external_launches = sum(int(entry.get("external_launches", 0)) for entry in stats)
-    prefetched_layers = sum(int(entry.get("prefetched_layers", 0)) for entry in stats)
-    demand_layers = sum(int(entry.get("demand_host_layers", 0)) for entry in stats)
-    tiered_layers = sum(
-        int(entry.get("tiered_decode_layers", 0))
-        + int(entry.get("tiered_prefill_layers", 0))
-        for entry in stats
-    )
-    if external_launches == 0 and tiered_batches > 0:
-        # Tiered serving accounts external attention in its own per-layer
-        # counters; the demand-acquire identity below is vacuous here.
-        if tiered_layers == 0:
-            raise RuntimeError(
-                "NTA tiered trial served no external attention layers "
-                f"({_mechanism_summary()})"
-            )
-    elif external_launches == 0 or external_launches != (
-        prefetched_layers + demand_layers
-    ):
-        raise RuntimeError(
-            "NTA did not execute exactly one external attention layer for every "
-            "acquired layer "
+            "external attention layers do not match acquisition layers "
             f"({external_launches} != {prefetched_layers} + {demand_layers})"
         )
-    lookahead_layers = sum(
-        int(entry.get("lookahead_acquisition_layers", 0)) for entry in stats
-    )
-    lookahead_bound = sum(
-        int(entry.get("lookahead_bound_launches", 0)) for entry in stats
-    )
-    pipeline_host = any(
-        bool(
-            entry.get(
-                "pipeline_host_enabled",
-                os.environ.get("NTA_SGLANG_PIPELINE_HOST", "1") != "0",
-            )
-        )
-        for entry in stats
-    )
-    if pipeline_host and (
-        lookahead_layers != prefetched_layers or lookahead_bound != external_launches
-    ):
+    if stock_launches or transformed + incremental != attention:
         raise RuntimeError(
-            "NTA lookahead trial did not acquire and bind every external layer "
-            f"({lookahead_layers}/{lookahead_bound} versus "
-            f"{prefetched_layers}/{external_launches})"
+            "attention accounting is not exact "
+            f"(stock={stock_launches}, transformed={transformed}, "
+            f"incremental={incremental}, total={attention})"
         )
-    ticketed = sum(
-        int(entry.get("ticketed_incremental_launches", 0)) for entry in stats
-    )
-    selected_launches = sum(
-        int(entry.get("selected_compiler_launches", 0)) for entry in stats
-    )
-    total_attention = sum(
-        int(entry.get("decode_launches", 0)) + int(entry.get("prefill_launches", 0))
-        for entry in stats
-    )
-    if (
-        total_attention == 0
-        or transformed + ticketed + selected_launches != total_attention
-    ):
-        raise RuntimeError(
-            "NTA did not account every attention launch to a transformed form "
-            f"({transformed} + {ticketed} + {selected_launches} != "
-            f"{total_attention})"
-        )
-    verified_modules = sum(
-        int(entry.get("verified_operator_modules", 0)) for entry in stats
-    )
     contracts = [
         contract
         for entry in stats
         for contract in entry.get("operator_contracts", [])
     ]
+    verified_modules = total("verified_operator_modules")
     if verified_modules == 0 or not contracts:
-        raise RuntimeError(
-            "NTA HiCache trial did not verify compiler operator contracts"
-        )
-    verified_pairs = sum(
-        int(entry.get("verified_operator_pairs", 0)) for entry in stats
-    )
-    if ticketed and verified_pairs == 0:
-        raise RuntimeError(
-            "incremental HiCache attention ran without a paired direct form"
-        )
-    if os.environ.get("NTA_SGLANG_FORCE_INCREMENTAL") == "1" and ticketed == 0:
-        raise RuntimeError("forced incremental trial executed no ticketed attention")
-    fragment_layers = sum(
-        int(entry.get("fragment_lookahead_layers", 0)) for entry in stats
-    )
-    fragment_objects = sum(
-        int(entry.get("fragment_lookahead_objects", 0)) for entry in stats
-    )
-    fragment_rounds = sum(
-        int(entry.get("fragment_remaining_rounds", 0)) for entry in stats
-    )
-    request_overlap_layers = sum(
-        int(entry.get("request_overlap_layers", 0)) for entry in stats
-    )
-    mixed_dependency_layers = sum(
-        int(entry.get("mixed_dependency_layers", 0)) for entry in stats
-    )
-    compact_initial_launches = sum(
-        int(entry.get("compact_initial_launches", 0)) for entry in stats
-    )
-    compact_initial_ctas = sum(
-        int(entry.get("compact_initial_cta_bound", 0)) for entry in stats
-    )
-    canonical_initial_ctas = sum(
-        int(entry.get("canonical_initial_cta_bound", 0)) for entry in stats
-    )
-    compact_launches = sum(
-        int(entry.get("compact_resume_launches", 0)) for entry in stats
-    )
-    compact_ctas = sum(int(entry.get("compact_resume_cta_bound", 0)) for entry in stats)
-    canonical_ctas = sum(
-        int(entry.get("canonical_resume_cta_bound", 0)) for entry in stats
-    )
+        raise RuntimeError("NTA HiCache trial did not verify compiler contracts")
+
+    mixed_layers = total("mixed_dependency_layers")
     if (
-        os.environ.get("NTA_SGLANG_FORCE_INCREMENTAL") == "1"
-        and os.environ.get("NTA_SGLANG_PIPELINE_HOST", "1") == "0"
-        and os.environ.get("NTA_SGLANG_FRAGMENT_LOOKAHEAD", "1") != "0"
-        and ticketed > 1
-        and request_overlap_layers == 0
-        and min(fragment_layers, fragment_objects, fragment_rounds) == 0
+        os.environ.get("NTA_EXECUTION_PROTOCOL", "late_bound") == "late_bound"
+        and mixed_layers == 0
+        and external_launches > 0
     ):
         raise RuntimeError(
-            "fragmented trial executed ticketed attention without inter-layer "
-            "fragment acquisition"
+            "late-bound trial formed no heterogeneous layer with direct and "
+            "external work"
         )
-    if (
-        os.environ.get("NTA_SGLANG_REQUIRE_MIXED_ATTENTION") == "1"
-        and mixed_dependency_layers == 0
-        and tiered_batches == 0
-    ):
-        # Tiered serving builds one compact plan containing every claimed
-        # and resident request per layer; a split is structurally refused
-        # by the claim-identity guards, so the demand-acquire mixed-layer
-        # witness does not apply.
-        raise RuntimeError(
-            "trial formed no FlashInfer layer containing both direct and external work"
-        )
-    tiered_compaction = sum(
-        int(entry.get("tiered_device_compaction_launches", 0))
-        for entry in stats
-    )
-    host_orchestrated_layers = sum(
-        int(entry.get("tiered_host_orchestrated_layers", 0)) for entry in stats
-    )
-    host_orchestrated_mode = any(
-        int(entry.get("host_orchestrated_mode", 0)) for entry in stats
-    )
-    if host_orchestrated_mode != (host_orchestrated_layers > 0) and (
-        tiered_batches > 0
-    ):
-        raise RuntimeError(
-            "host-orchestrated mode flag and staging witnesses disagree "
-            f"(mode={host_orchestrated_mode}, "
-            f"layers={host_orchestrated_layers})"
-        )
-    if require_physical_compaction and tiered_batches > 0:
-        if host_orchestrated_mode:
-            # RQ3 baseline B1: the arm's purity witnesses are the inverse of
-            # the device chain's — host round-trips must have happened and
-            # device compaction must not have.
-            syncs = sum(
-                int(entry.get("tiered_host_orchestrated_syncs", 0))
-                for entry in stats
-            )
-            if syncs == 0:
-                raise RuntimeError(
-                    "host-orchestrated trial recorded no host round-trips "
-                    f"({_mechanism_summary()})"
-                )
-            if tiered_compaction != 0:
-                raise RuntimeError(
-                    "host-orchestrated trial ran device selection compaction "
-                    f"({tiered_compaction} launches; the arm is not pure)"
-                )
-        # Tiered serving compacts selections on device per staging layer;
-        # the incremental resume-CTA identity below belongs to the
-        # demand-acquire path.
-        elif tiered_compaction == 0:
-            raise RuntimeError(
-                "tiered trial never ran device selection compaction "
-                f"({_mechanism_summary()})"
-            )
-    elif require_physical_compaction and (
+
+    compact_launches = total("compact_resume_launches")
+    compact_ctas = total("compact_resume_cta_bound")
+    canonical_ctas = total("canonical_resume_cta_bound")
+    if require_physical_compaction and (
         compact_launches == 0
         or compact_ctas == 0
         or canonical_ctas == 0
@@ -342,99 +168,49 @@ def require_clean_mechanism(
             "incremental trial did not physically compact resume work "
             f"({compact_launches} launches, {compact_ctas}/{canonical_ctas} CTAs)"
         )
-    if (fragment_layers or request_overlap_layers) and (
-        compact_initial_launches == 0
-        or compact_initial_ctas == 0
-        or canonical_initial_ctas == 0
-        or compact_initial_ctas >= canonical_initial_ctas
-    ):
-        raise RuntimeError(
-            "incremental trial did not physically compact initial work "
-            f"({compact_initial_launches} launches, "
-            f"{compact_initial_ctas}/{canonical_initial_ctas} CTAs)"
-        )
-    if transformed + ticketed < external_launches:
-        raise RuntimeError(
-            "NTA did not execute a transformed attention kernel for every "
-            f"external layer ({transformed} + {ticketed} < {external_launches})"
-        )
+
     if require_graph_replay:
-        replays = sum(int(entry.get("graph_replays", 0)) for entry in stats)
-        captures = sum(int(entry.get("graph_captures", 0)) for entry in stats)
+        captures = total("graph_captures")
+        replays = total("graph_replays")
         if captures == 0 or replays == 0:
-            raise RuntimeError(
-                "NTA HiCache graph trial did not capture and replay a decode graph"
-            )
-        if transformed == 0:
-            raise RuntimeError("NTA graph trial did not replay a transformed kernel")
-    demand_graph_warmups = sum(
-        int(entry.get("demand_graph_warmups", 0)) for entry in stats
-    )
-    demand_graph_captures = sum(
-        int(entry.get("demand_graph_captures", 0)) for entry in stats
-    )
-    demand_graph_replays = sum(
-        int(entry.get("demand_graph_replays", 0)) for entry in stats
-    )
-    if require_demand_graph and min(
-        demand_graph_warmups, demand_graph_captures, demand_graph_replays
-    ) == 0:
+            raise RuntimeError("NTA graph trial did not capture and replay")
+    demand_graph = {
+        key: total(key)
+        for key in (
+            "demand_graph_warmups",
+            "demand_graph_captures",
+            "demand_graph_replays",
+        )
+    }
+    if require_demand_graph and min(demand_graph.values()) == 0:
         raise RuntimeError(
-            "NTA trial did not warm, capture, and launch the finite demand graph "
-            f"({demand_graph_warmups}/{demand_graph_captures}/"
-            f"{demand_graph_replays})"
+            "NTA trial did not warm, capture, and replay the demand graph "
+            f"({demand_graph})"
         )
     return {
-        "all_attention_transformed": True,
+        "all_attention_transformed": stock_launches == 0,
         "active_forms": [
             name
-            for name, count in (
-                ("direct", transformed),
-                ("incremental", ticketed),
-            )
-            if count > 0
+            for name, count in (("direct", transformed), ("incremental", incremental))
+            if count
         ],
-        "transformed_direct_launches": transformed,
-        "ticketed_incremental_launches": ticketed,
-        "total_attention_launches": total_attention,
+        "external_batches": external_batches,
         "external_launches": external_launches,
-        "stock_launches": stock_launches,
+        "transformed_direct_launches": transformed,
+        "ticketed_incremental_launches": incremental,
+        "total_attention_launches": attention,
         "fallback_batches": fallbacks,
         "verified_operator_modules": verified_modules,
-        "verified_operator_pairs": verified_pairs,
-        "lookahead_acquisition_layers": lookahead_layers,
-        "lookahead_bound_launches": lookahead_bound,
-        "fragment_lookahead_layers": fragment_layers,
-        "fragment_lookahead_objects": fragment_objects,
-        "fragment_remaining_rounds": fragment_rounds,
-        "request_overlap_layers": request_overlap_layers,
-        "mixed_dependency_layers": mixed_dependency_layers,
-        "compact_initial_launches": compact_initial_launches,
-        "compact_initial_cta_bound": compact_initial_ctas,
-        "canonical_initial_cta_bound": canonical_initial_ctas,
-        "compact_initial_cta_ratio": (
-            compact_initial_ctas / canonical_initial_ctas
-            if canonical_initial_ctas
-            else None
-        ),
+        "operator_contract_count": len(contracts),
+        "mixed_dependency_layers": mixed_layers,
         "compact_resume_launches": compact_launches,
         "compact_resume_cta_bound": compact_ctas,
         "canonical_resume_cta_bound": canonical_ctas,
-        "demand_graph_warmups": demand_graph_warmups,
-        "demand_graph_captures": demand_graph_captures,
-        "demand_graph_replays": demand_graph_replays,
         "compact_resume_cta_ratio": (
             compact_ctas / canonical_ctas if canonical_ctas else None
         ),
-        "compact_total_cta_ratio": (
-            (compact_initial_ctas + compact_ctas)
-            / (canonical_initial_ctas + canonical_ctas)
-            if canonical_initial_ctas + canonical_ctas
-            else None
-        ),
+        "demand_graph": demand_graph,
     }
-
-
 def run(
     args: argparse.Namespace, backend: str, *, verify_transfer: bool = False
 ) -> dict[str, Any]:
@@ -477,11 +253,11 @@ def run(
     if args.max_attempts is not None:
         command.extend(("--max-attempts", str(args.max_attempts)))
     environment = os.environ.copy()
-    environment.pop("NTA_SGLANG_VERIFY_TRANSFER", None)
+    environment.pop("NTA_VERIFY_TRANSFER", None)
     if verify_transfer:
         if backend != "nta_flashinfer":
             raise ValueError("transfer verification is defined only for NTA")
-        environment["NTA_SGLANG_VERIFY_TRANSFER"] = "1"
+        environment["NTA_VERIFY_TRANSFER"] = "1"
     completed = subprocess.run(
         command,
         cwd=ROOT,

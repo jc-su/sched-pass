@@ -243,7 +243,7 @@ def build_tasks(tokenizer: Any, args: argparse.Namespace) -> list[LongBenchTask]
                 str(row["context"]), add_special_tokens=False
             )
             if len(context_ids) < 4096:
-                # Short documents do not exercise tiered selection; the
+                # Short documents do not exercise external-cache execution; the
                 # battery targets the serving regime, not padded fillers.
                 continue
             if len(context_ids) > budget:

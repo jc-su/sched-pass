@@ -28,7 +28,54 @@ class ExecutionProtocolConfig:
     max_inflight_units: int
     allow_overlap: bool
     allow_partial: bool
-    require_exact_demand: bool = True
+
+    @classmethod
+    def from_environment(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        *,
+        prefix: str = "NTA_EXECUTION",
+    ) -> "ExecutionProtocolConfig":
+        """Parse the one framework-neutral protocol configuration."""
+        import os
+
+        values = os.environ if environ is None else environ
+        raw_kind = values.get(f"{prefix}_PROTOCOL", "late_bound").strip().lower()
+        try:
+            kind = ProtocolKind(raw_kind)
+        except ValueError as error:
+            raise ValueError(
+                f"{prefix}_PROTOCOL must be conventional, late_bound, or partial"
+            ) from error
+        try:
+            granularity = Granularity(
+                values.get(f"{prefix}_GRANULARITY", Granularity.PAGE_GROUP.value)
+                .strip()
+                .lower()
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"{prefix}_GRANULARITY must be request, layer, page_group, or cta_tile"
+            ) from error
+        try:
+            max_inflight = int(
+                values.get(f"{prefix}_MAX_INFLIGHT_UNITS", "4096")
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"{prefix}_MAX_INFLIGHT_UNITS must be an integer"
+            ) from error
+        if kind is ProtocolKind.CONVENTIONAL:
+            return cls.conventional(
+                granularity=granularity, max_inflight_units=max_inflight
+            )
+        if kind is ProtocolKind.PARTIAL:
+            return cls.partial(
+                granularity=granularity, max_inflight_units=max_inflight
+            )
+        return cls.late_bound(
+            granularity=granularity, max_inflight_units=max_inflight
+        )
 
     def __post_init__(self) -> None:
         if self.max_inflight_units <= 0:
@@ -101,10 +148,6 @@ class WorkLedger:
     def __init__(self, batch: WorkBatch, config: ExecutionProtocolConfig) -> None:
         if batch.granularity is not config.granularity:
             raise ValueError("batch and execution protocol use different granularities")
-        if config.require_exact_demand and any(
-            not unit.demand.is_exact for unit in batch.units
-        ):
-            raise ValueError("this execution protocol requires exact demand")
         self.batch = batch
         self.config = config
         self._units = {unit.work_id: unit for unit in batch.units}
@@ -170,7 +213,10 @@ class WorkLedger:
             self._units
         ):
             return ()
-        width = self.config.max_inflight_units
+        in_flight = len(self.units_in(Availability.RUNNING))
+        width = self.config.max_inflight_units - in_flight
+        if width <= 0:
+            return ()
         return tuple(ready[start : start + width] for start in range(0, len(ready), width))
 
     @property

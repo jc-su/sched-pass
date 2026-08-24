@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from collections.abc import Sequence
 from typing import Any
 
-from ..requests import RequestBinding, RequestSlotTracker
+from ..requests import RequestBinding, RequestIdentityRegistry
 from ..work_unit import Granularity
 
 
@@ -35,7 +35,7 @@ class RequestIdentityAdapter:
 
     def __init__(self, runtime: Any, request_capacity: int, *, engine: str) -> None:
         self.engine = engine
-        self._tracker = RequestSlotTracker(runtime, request_capacity)
+        self._identity = RequestIdentityRegistry(runtime, request_capacity)
 
     def bind(
         self,
@@ -46,7 +46,7 @@ class RequestIdentityAdapter:
         deadline_clocks: Sequence[int] | None = None,
         stream: Any = None,
     ) -> tuple[RequestBinding, ...]:
-        return self._tracker.bind(
+        return self._identity.bind(
             request_ids,
             request_slots,
             priorities=priorities,
@@ -55,12 +55,12 @@ class RequestIdentityAdapter:
         )
 
     def cancel_matching(self, request_id_prefix: str = "", *, all: bool = False) -> int:
-        return self._tracker.cancel_matching(request_id_prefix, all=all)
+        return self._identity.cancel_matching(request_id_prefix, all=all)
 
     @property
     def last_publish_count(self) -> int:
-        return self._tracker.last_publish_count
+        return self._identity.last_publish_count
 
     @property
-    def last_policy_publish_count(self) -> int:
-        return self._tracker.last_policy_publish_count
+    def last_metadata_publish_count(self) -> int:
+        return self._identity.last_metadata_publish_count

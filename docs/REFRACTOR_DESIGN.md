@@ -1,173 +1,133 @@
-# Late-Bound Heterogeneous Execution
+# Refactor design: one execution mechanism
 
-Status: source of truth for `refactor/late-bound-work-unit`
+Status: canonical design for `refactor/late-bound-work-unit`.
 
-This document is written from the current code and tests.  Older design notes
-and result ledgers are evidence archives; they do not define the refactor.
+## 1. Mechanism
 
-## 1. One mechanism
+NTA binds a work unit to three facts as late as correctness permits:
 
-The project implements one mechanism:
+1. request identity: engine slot, request ID, and generation;
+2. exact demand: candidate/selected units, byte size, granularity, and epoch;
+3. availability: blocked, ready, running, partial, or terminal.
 
-> Bind each heterogeneous work unit to its request generation, demand, and
-> availability as late as correctness permits, then execute bounded runnable
-> groups at a granularity chosen from measured transfer, compute, control, and
-> availability costs.
+The protocol then launches bounded groups of ready work. Granularity is chosen
+from transfer, compute, control, and availability-exposure costs. Conventional,
+late-bound, and exact-partial execution are protocol forms of this mechanism;
+they are not separate schedulers.
 
-The mechanism is not “GPU top-k”, “host-round-trip elimination”, or
-“completion resume” individually.  Those are demand sources or execution
-forms.  The direct, late-bound, and partial paths share the same work-unit
-contract:
+Demand is always exact in the serving contract. A provider supplies the IDs
+that the numerical consumer will actually use; selection quality is therefore
+not hidden inside the execution mechanism.
 
-```text
-unbound -> blocked/ready -> running -> partial/complete -> retired
+## 2. Ownership
+
 ```
-
-`partial` is a state transition, not a second scheduler.  A direct launch is
-the special case in which all work units are ready before execution.
-
-## 2. Contract layers
-
-The native ABI remains the storage contract.  `WorkItem`, `WorkDependency`,
-and `RequestProgress` in `include/nta/RuntimeABI.h` are canonical and must not
-be duplicated.  The Python semantic contract in
-`python/nta_runtime/work_unit.py` adds the concepts that the ABI intentionally
-does not encode as policy:
-
-```text
-RequestBinding       request slot + generation + request identity
-DemandDescriptor     candidate/selected units, bytes, semantics, epoch
-WorkUnit              binding + layer/range + dependencies + reduction identity
-WorkBatch             one heterogeneous epoch with one execution granularity
-Availability          unbound, blocked, ready, running, partial, terminal
-ExecutionProtocol     conventional, late-bound, or partial
-```
-
-The contract has three non-negotiable rules:
-
-1. A slot/generation mismatch rejects a transition and cannot publish stale
-   work.
-2. An epoch mismatch rejects demand or completion publication.
-3. Approximate demand is explicit.  An approximate selector cannot silently
-   satisfy an exact numerical protocol.
-
-## 3. Ownership
-
-```text
 SGLang / vLLM adapter
-  owns request IDs, scheduler slots, page/block tables, cancellation, graphs
+  request IDs, engine slots, cancellation, graph metadata, block/page tables
 
-Demand provider
-  owns exact sparse masks or experimental selectors
+Work-unit core
+  identity-bound demand, availability, heterogeneous batch validation
 
 Protocol planner
-  owns granularity, runnable grouping, overlap, and partial-form choice
+  granularity, bounded groups, overlap and partial-form configuration
 
-NTA runtime core
-  owns generation validation, claims, dependency state, staging capacity,
-  completion, retirement, and telemetry
-
-Transport
-  owns placement-specific registration, submission, completion, and recovery
+NTA runtime/native bridge
+  generation/epoch validation, dependency records, staging/transport ABI,
+  completion and telemetry
 
 Compiler plugin
-  owns marker validation, work mapping, and operator contracts
+  marker validation, operator mapping, native work coordinates and contracts
 
 Consumer operator
-  owns numerical partial state and exact merge semantics
+  exact numerical computation and exact partial-state merge
 ```
 
-The runtime core must not branch on SGLang or vLLM.  An adapter may translate
-engine metadata into the common contract, but it may not implement a second
-claim table, generation tracker, or staging policy.
+No engine adapter creates a second generation table. No compiler pass guesses
+request identity. No serving path silently changes the numerical demand
+contract.
 
-## 4. Granularity
+## 3. Execution flow
 
-Granularity is a first-class cost decision, not a collection of unrelated
-scheduling strategies.  The planner compares candidate group sizes using
-measured parameters:
+For SGLang:
 
-```text
-total(group) = transfer + compute + group_control + availability_exposure
+```
+scheduler forward
+  -> SglangAdapter: rids + real request-pool slots
+  -> SglangHiCacheBridge: owns external host load and staging lease
+  -> _ActiveBatch: schedules and page mappings
+  -> ExecutionSession: one WorkBatch per real attention launch
+  -> DeviceWorkPlan.upload_work_units: checked native WorkItems
+  -> compiler-instrumented FlashInfer wrapper
+  -> session completion + HiCache layer retirement
 ```
 
-Fine groups reduce exposure to availability skew but increase control and
-launch cost.  Coarse groups amortize control but recreate a barrier.  The
-planner in `python/nta_runtime/execution_protocol.py` is intentionally
-transparent and calibrated; it is not a quality oracle.
+The session is created immediately before each actual attention launch, using
+the semantic model layer and current KV-cache geometry. This avoids the prior
+error of treating reusable wrapper positions as model layers. Every native
+plan unit is looked up by layer, logical tile, and request index and must match
+the session's request binding before upload.
 
-The implementation must record, per epoch:
+SGLang external prefixes are exact: they stage the host rows needed by the
+provided page map. Batches may contain resident, ready external, blocked
+external, and new requests simultaneously. The admission hook only controls
+when an external batch enters the engine; it does not own a duplicate work
+ledger.
 
-- selected and candidate units/bytes;
-- group size and group count;
-- ready, blocked, partial, and complete work;
-- selector, staging, transfer, control, and compute time;
-- staging high-water and reclaimed capacity;
-- request-generation and epoch rejection counts.
+## 4. Identity and lifetime invariants
 
-## 5. Protocol forms
+- A request-slot reuse increments generation.
+- A request generation mismatch rejects native/runtime publication.
+- A demand epoch mismatch rejects upload or completion.
+- Work IDs are unique within one heterogeneous batch.
+- A request index cannot refer to two generations in one batch.
+- Exact sparse demand names its selected IDs; exact dense demand names all
+  candidates.
+- A canceled or finished external prefix releases its staging lease only
+  after the owning stream completion edge.
 
-### Conventional
+Graph replay preserves request IDs and request-pool slots. A graph path with
+missing identity fails closed; a non-contiguous slot layout is rejected by the
+graph consumer instead of being mapped to a false contiguous range.
 
-Select/gather/compute with a batch-level readiness boundary.  This is a
-diagnostic baseline, not the contribution.  It must use the same demand and
-selected identities as the late-bound form.
+## 5. Granularity
 
-### Late-bound
+The planner treats granularity as a cost decision:
 
-Demand and availability are bound at work-unit granularity.  Ready units may
-be grouped and launched while blocked units remain pending.  It does not
-require partial numerical state if the consumer can only consume complete
-groups.
+```
+T(group) =
+  transfer(group) + compute(group) + control(group)
+  + availability_exposure(group)
+```
 
-### Partial
+Fine groups reduce exposure to skew but increase launches and bookkeeping.
+Coarse groups amortize control but recreate a barrier. The planner's
+parameters are hardware/transport measurements, not selector quality.
 
-The consumer publishes an exact partial state and later merges only the
-current-generation contributors.  It is the general form for true
-completion-driven continuation.  It must not be enabled in serving merely to
-make a resume counter non-zero; the workload must expose a real critical-path
-opportunity.
+The implementation records selected/candidate units and bytes, group counts,
+availability states, request/epoch rejections, staging capacity, and native
+upload counts so the tradeoff can be audited.
 
-## 6. Current migration status
+## 6. Protocol forms
 
-Implemented on this branch:
+- **Conventional**: all work must be ready before launch. It is the dense or
+  batch-barrier baseline using the same demand trace.
+- **Late-bound**: ready work is exposed and bounded while blocked work remains
+  pending. This is the serving protocol.
+- **Partial**: an exact consumer may publish a partial state and continue it
+  later. It is an optional contract-level form and must be used only when the
+  workload exposes a real critical-path continuation.
 
-- semantic work-unit and demand contract;
-- generation/epoch-checked work ledger;
-- explicit granularity cost model;
-- common request-identity adapter base;
-- SGLang identity adapter;
-- vLLM dependency-free adapter seam;
-- protocol configuration validation.
+No protocol form is a selector. The current serving claim is about execution
+coordination under exact demand.
 
-Still to migrate:
+## 7. Engineering boundaries
 
-- route SGLang staging and selection through `DemandDescriptor` and
-  `ExecutionProtocolConfig` rather than local flags;
-- port the conventional E6 baseline into this branch and validate it against
-  the same demand trace;
-- move claim/staging state out of the monolithic SGLang backend;
-- connect compiler work mapping to the semantic `WorkBatch` contract;
-- implement a real vLLM adapter against one pinned vLLM version;
-- replace protocol-specific benchmark validators with contract validators.
+The SGLang implementation is pinned to the tested framework version and FA2
+FlashInfer path. The vLLM boundary is intentionally structural and
+dependency-free: `VllmSchedulerProjection` is the only expected projection
+from a pinned vLLM scheduler integration. A future vLLM adapter can change
+only that projection and transport binding, not the work-unit core.
 
-The E6 implementation in the separate `e6-conventional` worktree is not
-merged automatically.  It is an experimental reference until its fairness
-and campaign artifacts are reviewed.
-
-## 7. Engineering acceptance gates
-
-The refactor is complete only when:
-
-1. Existing ABI, compiler, runtime, and SGLang tests remain green.
-2. Conventional, late-bound, and partial forms share the same work-unit
-   identity and demand trace.
-3. A stale request generation and stale epoch fail closed in every adapter and
-   protocol test.
-4. Protocol validators do not require E7-only counters for B1 or E6.
-5. The default SGLang path does not enable approximate demand without an
-   explicit quality contract.
-6. A small-demand regime can automatically choose conventional execution when
-   control cost exceeds saved transfer or overlap benefit.
-7. The vLLM adapter passes the same identity, cancellation, and contract tests
-   without importing SGLang.
+Retired selector, tiering, and capture-specialization modules are not
+compatibility layers and are not part of this branch. This keeps the active
+codebase aligned with the exact system mechanism.

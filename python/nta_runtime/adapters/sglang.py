@@ -1,7 +1,7 @@
 """SGLang boundary adapter.
 
-Only SGLang metadata extraction belongs here.  Claim lifetime, demand
-semantics, work-unit state, and transport policy stay outside this module.
+Only SGLang metadata extraction belongs here.  External-prefix lifetime,
+demand semantics, work-unit state, and transport stay outside this module.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .base import EngineBatch, RequestIdentityAdapter
-from ..execution_protocol import ExecutionProtocolConfig, ProtocolKind
+from ..execution_protocol import ExecutionProtocolConfig
 from ..work_unit import Granularity
 
 
@@ -19,56 +19,26 @@ class SglangExecutionConfig:
     """Validated SGLang projection of the engine-neutral protocol config."""
 
     protocol: ExecutionProtocolConfig
+    prefetch: bool = True
+
+    @property
+    def grouping(self) -> str:
+        """Map semantic granularity to the transport's physical grouping."""
+        return (
+            "request"
+            if self.protocol.granularity in (Granularity.REQUEST, Granularity.LAYER)
+            else "tile"
+        )
 
     @classmethod
     def from_environment(cls, environ: dict[str, str] | None = None) -> "SglangExecutionConfig":
         import os
 
         values = os.environ if environ is None else environ
-        raw_protocol = values.get("NTA_SGLANG_EXECUTION_PROTOCOL", "late_bound").strip().lower()
-        protocol_names = {
-            "nta": ProtocolKind.LATE_BOUND,
-            "late_bound": ProtocolKind.LATE_BOUND,
-            "conventional": ProtocolKind.CONVENTIONAL,
-            "partial": ProtocolKind.PARTIAL,
-        }
-        try:
-            kind = protocol_names[raw_protocol]
-        except KeyError as error:
-            raise ValueError(
-                "NTA_SGLANG_EXECUTION_PROTOCOL must be nta, late_bound, "
-                "conventional, or partial"
-            ) from error
-        raw_granularity = values.get(
-            "NTA_SGLANG_WORK_GRANULARITY", Granularity.PAGE_GROUP.value
-        ).strip().lower()
-        try:
-            granularity = Granularity(raw_granularity)
-        except ValueError as error:
-            raise ValueError(
-                "NTA_SGLANG_WORK_GRANULARITY must be request, layer, "
-                "page_group, or cta_tile"
-            ) from error
-        try:
-            max_inflight = int(values.get("NTA_SGLANG_MAX_INFLIGHT_UNITS", "4096"))
-        except ValueError as error:
-            raise ValueError("NTA_SGLANG_MAX_INFLIGHT_UNITS must be an integer") from error
-        if kind is ProtocolKind.CONVENTIONAL:
-            protocol = ExecutionProtocolConfig.conventional(
-                granularity=granularity,
-                max_inflight_units=max_inflight,
-            )
-        elif kind is ProtocolKind.PARTIAL:
-            protocol = ExecutionProtocolConfig.partial(
-                granularity=granularity,
-                max_inflight_units=max_inflight,
-            )
-        else:
-            protocol = ExecutionProtocolConfig.late_bound(
-                granularity=granularity,
-                max_inflight_units=max_inflight,
-            )
-        return cls(protocol)
+        return cls(
+            ExecutionProtocolConfig.from_environment(environ),
+            values.get("NTA_EXECUTION_PREFETCH", "1") != "0",
+        )
 
 
 class SglangAdapter(RequestIdentityAdapter):
@@ -95,6 +65,20 @@ class SglangAdapter(RequestIdentityAdapter):
         request_ids = tuple(str(request_id) for request_id in request_ids)
         if len(request_ids) != batch_size:
             raise RuntimeError("SGLang request IDs do not match the graph batch")
+        request_slots = getattr(forward_batch, "_nta_request_slots", None)
+        if request_slots is None:
+            request_slots = getattr(forward_batch, "req_pool_indices", None)
+        if request_slots is not None and hasattr(request_slots, "tolist"):
+            request_slots = request_slots.tolist()
+        if request_slots is None:
+            if not allow_capture_ids:
+                raise RuntimeError(
+                    "SGLang forward metadata omitted request-pool slots"
+                )
+            request_slots = tuple(range(batch_size))
+        request_slots = tuple(int(slot) for slot in request_slots)
+        if len(request_slots) != batch_size:
+            raise RuntimeError("SGLang request slots do not match the graph batch")
         priorities = tuple(
             int(priority)
             for priority in getattr(
@@ -103,7 +87,7 @@ class SglangAdapter(RequestIdentityAdapter):
         )
         bindings = self.bind(
             request_ids,
-            tuple(range(batch_size)),
+            request_slots,
             priorities=priorities,
             stream=stream,
         )

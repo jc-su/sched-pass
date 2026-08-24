@@ -1,95 +1,117 @@
-# Experiment Design
+# Experiment design
 
-Status: source of truth for the refactor evaluation
+Status: canonical evaluation design for the refactored project.
 
-The old result files remain useful for debugging and regression detection, but
-they do not answer the redesigned research questions.  Every new artifact
-must record the commit, protocol, demand semantics, granularity, workload
-trace, and activation counters.
+The central question is whether one exact, late-bound work-unit mechanism
+improves execution when a batch contains heterogeneous request state. Every
+arm consumes one demand trace and the same selected identities. Selection
+quality is outside the serving claim.
 
-## RQ0 — Where can the mechanism win?
+## RQ0: map the opportunity before serving
 
-Map the regime before running long serving campaigns.  Sweep:
+Use `tools/experiments/run_work_unit_matrix.py` to sweep:
 
-- candidate units and selected units;
-- request batch size and external/resident fraction;
+- candidate and selected units;
+- resident/ready/blocked/new-arrival fractions;
 - availability latency and skew;
-- compute per work unit;
-- work-unit granularity;
-- staging capacity and transport bandwidth.
+- compute per unit and transport bandwidth;
+- granularity and staging capacity.
 
-The output is a crossover map, not a single speedup.  A regime is eligible
-only when the measured saved waiting/transfer time can exceed selection,
-staging, launch, and bookkeeping overhead.
+This runner validates the real WorkBatch, WorkLedger, generation checks, epoch
+checks, partial transitions, and byte accounting. It is a contract/regime
+runner, not a GPU performance result.
 
-## RQ1 — Does heterogeneous late binding improve end-to-end serving?
+Use Little's law as a consistency check:
 
-Use one exact demand trace across all arms.  The primary shape must contain, in
-one continuous batch, resident, ready external, blocked external, and newly
-arriving requests.  Include cancellation and request-slot reuse.
-
-The primary numerical contract is exact sparse demand: the sparse mask is
-provided by the workload and all arms compute that mask exactly.  Dense exact
-attention is a no-regression control.  Top-k/DSA selectors are separate
-quality-gated experiments, not the main system claim.
-
-## RQ2 — Which part of the mechanism matters?
-
-Required arms:
-
-```text
-B0  dense resident, no nonresident dependency
-B1  host promotion + batch barrier
-B2  host split/rebatch or layer barrier
-B3  device demand + conventional gather (E6)
-B4  device demand + late-bound staging, no partial consumer
-B5  full work-unit protocol with heterogeneous ready/blocked execution
-B6  full protocol with exact partial consumer and continuation
+```
+L = lambda W
 ```
 
-All arms use the same request trace, exact demand IDs, selected bytes, output
-contract, and transport delay distribution.  B3/B4 isolate demand routing and
-staging.  B5 isolates heterogeneous execution.  B6 measures the optional
-partial form rather than contaminating the serving headline.
+For each stratum, record admitted work rate `lambda`, mean number of pending
+or runnable units `L`, and mean time in the corresponding state `W`. A
+violation indicates dropped observations, an incorrectly defined population,
+or a measurement boundary mismatch; it is not a performance conclusion by
+itself.
 
-## RQ3 — Is co-design necessary?
+## RQ1: heterogeneous exact serving
 
-Use controlled ablations:
+The primary workload is one continuous batch containing:
 
-1. host demand materialization instead of device demand;
-2. whole-batch readiness instead of work-unit readiness;
-3. coarse layer grouping instead of the selected granularity;
-4. compiler-generated work mapping replaced by a manually prepared mapping;
-5. request-generation checks removed from the performance path but retained in
-   a fail-closed shadow validator;
-6. engine feedback/admission disabled;
-7. bounded staging replaced by unbounded promotion.
+- resident requests;
+- external requests whose rows are ready;
+- external requests whose rows are blocked;
+- newly arriving requests;
+- cancellation and request-slot reuse.
 
-The result must report both performance and the activated mechanism counters.
-An ablation that does not activate the intended path is invalid, not a
-negative result.
+The exact demand trace is generated once and replayed by every arm. The primary
+serving comparison is dense exact attention plus exact sparse demand with the
+same selected IDs, bytes, page order, and output checks.
 
-## RQ4 — Robustness
+The SGLang harness is
+`benchmarks/serving/CompareSglangHiCacheLoad.py`. It validates placement,
+fallback freedom, exact attention accounting, compiler contracts, external
+attention coverage, and mechanism counters before reporting SLO/goodput.
 
-Run nonstationary traces with changing skew, batch composition, demand
-selectivity, and staging pressure.  Compare the online granularity choice with
-fixed coarse/fine choices and a hindsight oracle.  Measure:
+## RQ2: causal decomposition
 
-- throughput and SLO goodput;
-- TTFT, TPOT, and tail ITL;
-- useful bytes/s and physical bytes moved;
-- runnable/pending work and time-to-runnable;
-- staging high-water and claim occupancy;
-- selector, protocol, and adapter overhead;
-- quality/error only where demand is approximate.
+Use matched arms:
 
-## Fairness and artifact rules
+```
+B0  resident dense conventional baseline
+B1  host promotion + batch readiness barrier
+B2  host demand materialization + conventional exact gather
+B3  device demand + conventional exact gather
+B4  device demand + late-bound exact staging
+B5  heterogeneous bounded work-unit execution
+B6  exact partial consumer continuation
+```
 
-- No arm may use a different demand mask or page order.
-- Approximate demand must declare its quality target and cannot be called
-  exact because the output happened to match on a smoke workload.
-- Every arm must state whether graphs, overlap, cache reuse, and partial state
-  are enabled.
-- Validators must check the contract appropriate to the arm; an E7 validator
-  cannot reject B1 merely because B1 has no device-compaction counter.
-- A clean worktree and exact revision are mandatory for qualification.
+B0--B3 isolate demand/transport/control effects. B4--B5 isolate the
+execution-side contribution. B6 is optional evidence for the general partial
+protocol and is not required for the serving headline.
+
+All arms report:
+
+- selected and candidate units/bytes;
+- host round trips and device launches;
+- runnable/blocked exposure and state time;
+- staging high-water and physical bytes moved;
+- granularity, group count, control overhead, and compute;
+- request-generation and epoch rejection counts;
+- TTFT, TPOT, ITL, tail SLO, throughput, and goodput.
+
+## RQ3: mechanism ablations
+
+Disable exactly one boundary at a time:
+
+1. host-side demand/control instead of device demand;
+2. batch readiness instead of work-unit readiness;
+3. coarse layer grouping instead of the chosen granularity;
+4. manual work mapping instead of compiler-generated coordinates;
+5. generation/epoch checks on the hot path, with a shadow-only comparison;
+6. engine admission feedback;
+7. bounded staging, replaced by dense promotion.
+
+An ablation is invalid if its activation counters show that the intended
+boundary never executed.
+
+## RQ4: strata and robustness
+
+Report results by explicit strata rather than one average:
+
+- request state: resident, ready external, blocked external, arrival;
+- granularity: request, layer, page group, CTA tile;
+- availability skew: low, medium, high;
+- staging pressure: under-capacity, near-capacity, over-capacity;
+- compute/transfer ratio: control-dominated, balanced, compute-dominated.
+
+A result is interpretable only when the workload stratum, demand trace,
+protocol, and mechanism counters are included in the artifact.
+
+## Fairness
+
+No arm may change demand IDs, page order, cache placement, numerical output
+contract, or request trace. A different demand trace is a different workload,
+not an ablation of execution.
+The work-unit matrix and serving harness must be run from a clean revision,
+and artifacts must contain that revision and complete activation metadata.

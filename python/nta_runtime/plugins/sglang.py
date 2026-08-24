@@ -17,10 +17,6 @@ _EXECUTE_EXTEND_TARGET = (
 _EXECUTE_DECODE_TARGET = (
     "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_decode"
 )
-_WRITE_BACKUP_TARGETS = (
-    "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.write_backup",
-    "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache.write_backup",
-)
 _ABORT_TARGET = "sglang.srt.managers.scheduler.Scheduler.abort_request"
 _REQUEST_FINISH_TARGET = (
     "sglang.srt.managers.scheduler_components.batch_result_processor."
@@ -34,10 +30,6 @@ _PREFILL_ADMISSION_TARGET = (
 )
 _EXTERNAL_ADMISSION_TARGET = (
     "sglang.srt.managers.schedule_policy.PrefillAdder.add_one_req"
-)
-_CUDA_GRAPH_ELIGIBILITY_TARGET = (
-    "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
-    "DecodeCudaGraphRunner.can_run_graph"
 )
 _EXTERNAL_PREFIX_TARGETS = (
     "sglang.srt.mem_cache.hiradix_cache.HiRadixCache.init_load_back",
@@ -86,29 +78,25 @@ def _observability_degraded(site: str, error: Exception) -> None:
 def _profile_forward(original, runner, forward_batch, *args, **kwargs):
     """Time one forward and attribute it to a batch-composition class.
 
-    Enabled by NTA_SGLANG_FORWARD_PROFILE=1. Two CUDA events per forward is
+    Enabled by NTA_PROFILE_FORWARD=1. Two CUDA events per forward is
     the cheapest measurement that answers what a co-resident decode waits
-    behind; the per-claim staging spans cannot answer it because a chunked
+    behind; the per-lease staging spans cannot answer it because a chunked
     prefill's staging is spread over several forwards.
     """
     import os
 
-    if os.environ.get("NTA_SGLANG_FORWARD_PROFILE") != "1":
+    if os.environ.get("NTA_PROFILE_FORWARD") != "1":
         return original(runner, forward_batch, *args, **kwargs)
 
     import torch
 
-    from nta_runtime.engines.sglang import FORWARD_PROFILE, record_forward
+    from nta_runtime.engines.sglang import record_forward
 
     backend = getattr(runner.model_runner, "attn_backend", None)
-    claims = getattr(backend, "_tiered_claims", None) or {}
-    rids = tuple(getattr(forward_batch, "rids", ()) or ())
-    claim_rids = {
-        candidate.request_id
-        for candidate in claims.values()
-        if getattr(candidate, "external_sidecar", False)
-    }
-    staging = sum(1 for rid in rids if rid in claim_rids)
+    active_batch = getattr(backend, "_active_batch", None)
+    staging = int(
+        getattr(active_batch, "pending_host_load", None) is not None
+    )
     mode = getattr(forward_batch, "forward_mode", None)
     is_mixed = bool(mode is not None and mode.is_mixed())
     if staging and is_mixed:
@@ -120,8 +108,7 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
     else:
         kind = "plain"
 
-    # Observability stance (eKV lineage, docs/RECOGNITION_LINEAGE.md): an
-    # observation hook must never take down serving, and event synchronize
+    # An observation hook must never take down serving, and event synchronize
     # is illegal inside a captured graph. Degrade loudly once, count the
     # rest, keep serving; the counter rides the stats report.
     try:
@@ -140,54 +127,6 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
             record_forward(kind, start.elapsed_time(end))
         except Exception as error:
             _observability_degraded("forward_profile", error)
-def _route_execute_extend(original, runner, forward_batch, pp_proxy_tensors=None):
-    """Serve eligible tiered extends by captured replay (env-gated)."""
-    backend = getattr(runner.model_runner, "attn_backend", None)
-    claims = getattr(backend, "_tiered_claims", None)
-    if claims:
-        # Classify every claim-staging extend batch by composition. The
-        # capture eligibility rules exclude mixed and multi-request
-        # batches, so whether the colliding extends ARE those batches
-        # decides whether single-claim capture can close the resident
-        # bar at all; the counters ride the artifact either way.
-        rids = tuple(getattr(forward_batch, "rids", ()) or ())
-        claim_rids = {
-            candidate.request_id
-            for candidate in claims.values()
-            if candidate.external_sidecar
-        }
-        claim_hits = sum(1 for rid in rids if rid in claim_rids)
-        if claim_hits:
-            stats = backend._stats
-
-            def bump(key: str) -> None:
-                stats[key] = stats.get(key, 0) + 1
-
-            bump("tiered_extend_batches")
-            mode = getattr(forward_batch, "forward_mode", None)
-            if mode is not None and mode.is_mixed():
-                bump("tiered_extend_batches_mixed")
-            if len(rids) > 1:
-                bump("tiered_extend_batches_multi_rid")
-            if claim_hits > 1:
-                bump("tiered_extend_batches_multi_claim")
-            stats["tiered_extend_batch_rids_max"] = max(
-                stats.get("tiered_extend_batch_rids_max", 0), len(rids)
-            )
-    capture = getattr(backend, "_extend_capture", None)
-    if capture is None or not capture.enabled or capture.capturing:
-        return original(runner, forward_batch, pp_proxy_tensors)
-    claim = capture.eligible_claim(forward_batch)
-    if claim is None:
-        return original(runner, forward_batch, pp_proxy_tensors)
-    result = capture.run(
-        runner, forward_batch, pp_proxy_tensors, claim
-    )
-    if result is not None:
-        return result
-    return original(runner, forward_batch, pp_proxy_tensors)
-
-
 def _preserve_prefill_graph_request_metadata() -> None:
     """Carry request identity through the prefill BCG static batch.
 
@@ -208,6 +147,14 @@ def _preserve_prefill_graph_request_metadata() -> None:
 
         static_batch = current(self, forward_batch, **kwargs)
         static_batch.rids = getattr(forward_batch, "rids", None)
+        static_batch._nta_request_slots = getattr(
+            forward_batch, "_nta_request_slots", None
+        )
+        if static_batch._nta_request_slots is None:
+            slots = getattr(forward_batch, "req_pool_indices", None)
+            if slots is not None and hasattr(slots, "tolist"):
+                slots = slots.tolist()
+            static_batch._nta_request_slots = slots
         priorities = getattr(forward_batch, "_nta_request_priorities", None)
         if priorities is not None:
             static_batch._nta_request_priorities = priorities
@@ -262,6 +209,14 @@ def _preserve_graph_request_metadata() -> None:
         request_ids.extend(
             f"__nta_graph_padding_{index}" for index in range(raw_bs, padded_bs)
         )
+        request_slots = getattr(forward_batch, "_nta_request_slots", None)
+        if request_slots is None:
+            request_slots = getattr(forward_batch, "req_pool_indices", None)
+        if request_slots is not None and hasattr(request_slots, "tolist"):
+            request_slots = request_slots.tolist()
+        if request_slots is None or len(request_slots) != raw_bs:
+            raise RuntimeError("SGLang graph replay omitted request-pool slots")
+        view._nta_request_slots = tuple(int(slot) for slot in request_slots)
         priorities = list(
             getattr(forward_batch, "_nta_request_priorities", (0,) * raw_bs)
         )
@@ -330,12 +285,8 @@ def _retire_finished_request(processor, req, *args, **kwargs) -> None:
     handle = getattr(req, "_nta_external_prefix", None)
     if handle is not None:
         if not handle._released and not handle.retire("finished"):
-            raise RuntimeError("finished external prefix lost its runtime claim")
+            raise RuntimeError("finished external prefix lost its runtime lease")
         return
-    for backend in _walk_attention_backends(processor):
-        finish = getattr(backend, "finish_requests", None)
-        if callable(finish):
-            finish((request_id,))
 
 
 def _attach_request_priorities(forward_batch, cls, batch, model_runner):
@@ -361,30 +312,6 @@ def _attach_request_priorities(forward_batch, cls, batch, model_runner):
     forward_batch._nta_request_priorities = priorities
 
 
-def _route_cuda_graph_eligibility(original, runner, forward_batch):
-    request_ids = tuple(str(value) for value in getattr(forward_batch, "rids", ()))
-    pending = [getattr(runner, "attn_backend", None)]
-    pending.extend(getattr(runner.model_runner, "decode_attn_backend_group", ()) or ())
-    visited: set[int] = set()
-    for backend in pending:
-        if backend is None or id(backend) in visited:
-            continue
-        visited.add(id(backend))
-        requires_eager = getattr(backend, "requires_eager_requests", None)
-        if callable(requires_eager) and requires_eager(request_ids):
-            epoch_ready = getattr(backend, "tiered_graph_epoch_ready", None)
-            if callable(epoch_ready) and epoch_ready(request_ids):
-                backend._stats["tiered_graph_epoch_batches"] = (
-                    backend._stats.get("tiered_graph_epoch_batches", 0) + 1
-                )
-                continue
-            backend._stats["tiered_graph_eager_batches"] = (
-                backend._stats.get("tiered_graph_eager_batches", 0) + 1
-            )
-            return False
-    return original(runner, forward_batch)
-
-
 def register() -> None:
     version = importlib.metadata.version("sglang")
     if version != SUPPORTED_SGLANG_VERSION:
@@ -401,10 +328,7 @@ def register() -> None:
         add_attention_backend_choices,
     )
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-    from nta_runtime.engines.sglang_hicache import (
-        route_start_loading,
-        route_write_backup,
-    )
+    from nta_runtime.engines.sglang_hicache import route_start_loading
     from nta_runtime.engines.sglang_external import (
         route_allocator_free,
         route_cache_finished,
@@ -433,17 +357,6 @@ def register() -> None:
             HookRegistry.register(
                 forward_target, _profile_forward, HookType.AROUND
             )
-    extend_hooks = HookRegistry._hooks[_EXECUTE_EXTEND_TARGET]
-    if not any(hook is _route_execute_extend for _, hook, _ in extend_hooks):
-        HookRegistry.register(
-            _EXECUTE_EXTEND_TARGET, _route_execute_extend, HookType.AROUND
-        )
-    for write_target in _WRITE_BACKUP_TARGETS:
-        write_hooks = HookRegistry._hooks[write_target]
-        if not any(hook is route_write_backup for _, hook, _ in write_hooks):
-            HookRegistry.register(
-                write_target, route_write_backup, HookType.AROUND
-            )
     abort_hooks = HookRegistry._hooks[_ABORT_TARGET]
     if not any(hook is _cancel_backend_requests for _, hook, _ in abort_hooks):
         HookRegistry.register(_ABORT_TARGET, _cancel_backend_requests, HookType.BEFORE)
@@ -462,13 +375,6 @@ def register() -> None:
         HookRegistry.register(
             _PREFILL_ADMISSION_TARGET,
             route_prefill_admission,
-            HookType.AROUND,
-        )
-    graph_hooks = HookRegistry._hooks[_CUDA_GRAPH_ELIGIBILITY_TARGET]
-    if not any(hook is _route_cuda_graph_eligibility for _, hook, _ in graph_hooks):
-        HookRegistry.register(
-            _CUDA_GRAPH_ELIGIBILITY_TARGET,
-            _route_cuda_graph_eligibility,
             HookType.AROUND,
         )
     external_admission_hooks = HookRegistry._hooks[_EXTERNAL_ADMISSION_TARGET]

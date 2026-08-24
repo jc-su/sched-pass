@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "prefill-phase CUDA graph backend for BOTH arms; breakable "
             "captures the dense per-layer compute piecewise and leaves "
-            "attention (and the tiered staging chain) eager between "
+            "attention and exact staging remain eager between "
             "pieces, shrinking the extend forward's launch-overhead span"
         ),
     )

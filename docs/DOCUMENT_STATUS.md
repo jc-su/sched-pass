@@ -1,28 +1,23 @@
-# Document Status
+# Document status
 
-The refactor branch has a smaller source-of-truth set:
+The canonical sources for the current branch are:
 
-1. Code and tests.
-2. [REFRACTOR_DESIGN.md](REFRACTOR_DESIGN.md).
-3. [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md).
-4. [ARCHITECTURE.md](ARCHITECTURE.md) as a short compatibility pointer.
-5. [VALIDATION.md](VALIDATION.md) and result artifacts as historical evidence.
+1. source code and tests;
+2. [REFRACTOR_DESIGN.md](REFRACTOR_DESIGN.md);
+3. [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md);
+4. [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md);
+5. build/CTest output and newly generated result artifacts.
 
-The following documents contain earlier hypotheses, implementation ledgers, or
-pre-refactor claims.  They are retained for provenance but must not be used to
-choose new code structure or paper claims until reconciled with the two
-documents above:
+The old prototype ledgers were removed from the working tree during this
+refactor. They remain recoverable from Git history, but are intentionally not
+part of the current design surface. This includes retired selected/tiered
+serving notes, campaign ledgers, validation snapshots, and the duplicate
+framework-integration note superseded by `ENGINE_INTEGRATION.md`.
 
-- `SYSTEM_PLAN.md`
-- `OSDI_EVALUATION_PLAN.md`
-- `ONE_GPU_EVALUATION.md`
-- `PREREGISTRATION.md`
-- `CAUSAL_CHAIN.md`
-- `SELECTED_DEMAND.md`
-- `ARCHITECTURE.md` from the parent branch (the current file is only a short
-  compatibility pointer)
+The current tree therefore has no active document that defines a retired API,
+activation flag, selector, or completion-resume claim. Earlier hypotheses and
+measurements can be inspected with `git log` when provenance is needed.
 
-When a historical document disagrees with code or the refactor documents, the
-historical statement is stale.  New experiments must be recorded in
-`EXPERIMENT_DESIGN.md` and a fresh artifact directory, not appended to an old
-campaign ledger.
+New experiments must use the exact work-unit contract, record the Git
+revision, protocol, granularity, demand trace, and activation counters, and
+write a fresh artifact instead of appending to an old campaign ledger.
