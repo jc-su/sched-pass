@@ -257,7 +257,8 @@ void setPrp1(Submission &command, std::uint64_t address) {
   std::memcpy(&command.dword[6], &little, sizeof(little));
 }
 
-class VfioNvmeControlPlane final : public NvmeControlPlane {
+class VfioNvmeControlPlane final : public NvmeControlPlane,
+                                   public NvmeMappingBackend {
 public:
   explicit VfioNvmeControlPlane(const NvmeTransportOptions &options)
       : bdf_(parseBdf(options.endpoint)), namespaceId_(options.namespaceId),
@@ -300,8 +301,11 @@ public:
     return resources_;
   }
 
-  [[nodiscard]] NvmeDmaMapping mapHost(void *address,
-                                       std::size_t bytes) override {
+  [[nodiscard]] NvmeMappingBackend &mappingBackend() noexcept override {
+    return *this;
+  }
+
+  [[nodiscard]] NvmeMapping mapHost(void *address, std::size_t bytes) override {
     std::scoped_lock lock(mutex_);
     if (quiesced_ || fatal_) {
       throw std::runtime_error("VFIO NVMe queue is not accepting DMA mappings");
@@ -321,8 +325,8 @@ public:
     return publishHostMapping(mapIoas(address, bytes), bytes);
   }
 
-  [[nodiscard]] NvmeDmaMapping mapHbm(std::uint64_t gpuAddress,
-                                      std::size_t bytes) override {
+  [[nodiscard]] NvmeMapping mapHbm(std::uint64_t gpuAddress,
+                                   std::size_t bytes) override {
     std::scoped_lock lock(mutex_);
     if (quiesced_ || fatal_) {
       throw std::runtime_error(
@@ -337,23 +341,23 @@ public:
     return mapNvidiaPeerPages(gpuAddress, bytes);
   }
 
-  void unmap(NvmeDmaMapping::Handle handle) noexcept override {
-    if (!handle) {
+  void release(NvmeMappingToken token) noexcept override {
+    if (!token) {
       return;
     }
     std::scoped_lock lock(mutex_);
-    if (handle.kind == NvmeDmaMapping::Kind::HostIoas) {
+    if (token.kind == NvmeMappingToken::Kind::HostIoas) {
       if (iommufd_.get() < 0) {
         return;
       }
-      const auto mapping = dmaMappings_.find(handle.value);
+      const auto mapping = dmaMappings_.find(token.value);
       if (mapping == dmaMappings_.end()) {
         return;
       }
       unmapIoas(mapping->first, mapping->second);
       dmaMappings_.erase(mapping);
-    } else if (handle.kind == NvmeDmaMapping::Kind::NvidiaPeerPages) {
-      unmapNvidiaPeerPages(handle.value);
+    } else if (token.kind == NvmeMappingToken::Kind::NvidiaPeerPages) {
+      unmapNvidiaPeerPages(token.value);
     }
   }
 
@@ -363,7 +367,7 @@ public:
   }
 
 private:
-  NvmeDmaMapping publishHostMapping(std::uint64_t iova, std::size_t bytes) {
+  NvmeMapping publishHostMapping(std::uint64_t iova, std::size_t bytes) {
     if (iova == 0 || bytes == 0 || bytes % pageSize_ != 0 ||
         bytes > std::numeric_limits<std::uint64_t>::max() - iova) {
       if (iova != 0) {
@@ -377,13 +381,13 @@ private:
         throw std::runtime_error("VFIO returned a duplicate DMA IOVA");
       }
       (void)mapping;
-      NvmeDmaMapping result;
-      result.handle = {NvmeDmaMapping::Kind::HostIoas, iova};
-      result.pages.reserve(bytes / pageSize_);
+      std::vector<std::uint64_t> pages;
+      pages.reserve(bytes / pageSize_);
       for (std::size_t offset = 0; offset < bytes; offset += pageSize_) {
-        result.pages.push_back(iova + offset);
+        pages.push_back(iova + offset);
       }
-      return result;
+      return makeMapping({NvmeMappingToken::Kind::HostIoas, iova},
+                         std::move(pages));
     } catch (...) {
       if (iova != 0) {
         unmapIoas(iova, bytes);
@@ -393,11 +397,9 @@ private:
     }
   }
 
-  NvmeDmaMapping mapNvidiaPeerPages(std::uint64_t gpuAddress,
-                                    std::size_t bytes) {
+  NvmeMapping mapNvidiaPeerPages(std::uint64_t gpuAddress, std::size_t bytes) {
     if (peerMapper_.get() < 0) {
-      peerMapper_.reset(
-          ::open(NTA_NVME_P2P_DEVICE_PATH, O_RDWR | O_CLOEXEC));
+      peerMapper_.reset(::open(NTA_NVME_P2P_DEVICE_PATH, O_RDWR | O_CLOEXEC));
       if (peerMapper_.get() < 0) {
         throwSystem("open " NTA_NVME_P2P_DEVICE_PATH);
       }
@@ -413,14 +415,14 @@ private:
     request.abi_version = NTA_NVME_P2P_ABI_VERSION;
     request.gpu_address = gpuAddress;
     request.bytes = bytes;
-    request.pci_domain = static_cast<std::uint32_t>(
-        std::stoul(bdf_.substr(0, 4), nullptr, 16));
-    request.pci_bus = static_cast<std::uint32_t>(
-        std::stoul(bdf_.substr(5, 2), nullptr, 16));
-    request.pci_device = static_cast<std::uint32_t>(
-        std::stoul(bdf_.substr(8, 2), nullptr, 16));
-    request.pci_function = static_cast<std::uint32_t>(
-        std::stoul(bdf_.substr(11, 1), nullptr, 16));
+    request.pci_domain =
+        static_cast<std::uint32_t>(std::stoul(bdf_.substr(0, 4), nullptr, 16));
+    request.pci_bus =
+        static_cast<std::uint32_t>(std::stoul(bdf_.substr(5, 2), nullptr, 16));
+    request.pci_device =
+        static_cast<std::uint32_t>(std::stoul(bdf_.substr(8, 2), nullptr, 16));
+    request.pci_function =
+        static_cast<std::uint32_t>(std::stoul(bdf_.substr(11, 1), nullptr, 16));
     request.dma_addresses =
         reinterpret_cast<std::uint64_t>(nativeAddresses.data());
     request.dma_capacity = static_cast<std::uint32_t>(maximumEntries);
@@ -429,10 +431,8 @@ private:
     }
     const auto rollback = [&]() noexcept {
       nta_nvme_p2p_unmap unmapRequest{sizeof(unmapRequest),
-                                      NTA_NVME_P2P_ABI_VERSION,
-                                      request.handle};
-      (void)::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_UNMAP,
-                    &unmapRequest);
+                                      NTA_NVME_P2P_ABI_VERSION, request.handle};
+      (void)::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_UNMAP, &unmapRequest);
     };
     if (request.handle == 0 || request.entry_count == 0 ||
         request.entry_count > maximumEntries || request.page_size < pageSize_ ||
@@ -444,9 +444,8 @@ private:
           "NVIDIA peer mapper returned an invalid DMA-page vector");
     }
     try {
-      NvmeDmaMapping result;
-      result.handle = {NvmeDmaMapping::Kind::NvidiaPeerPages, request.handle};
-      result.pages.reserve(bytes / pageSize_);
+      std::vector<std::uint64_t> pages;
+      pages.reserve(bytes / pageSize_);
       for (std::uint32_t index = 0; index < request.entry_count; ++index) {
         const std::uint64_t base = nativeAddresses[index];
         if (base == 0 || base % pageSize_ != 0 ||
@@ -457,19 +456,22 @@ private:
         }
         for (std::uint32_t offset = 0; offset < request.page_size;
              offset += static_cast<std::uint32_t>(pageSize_)) {
-          result.pages.push_back(base + offset);
+          pages.push_back(base + offset);
         }
       }
-      if (result.pages.size() != bytes / pageSize_) {
+      if (pages.size() != bytes / pageSize_) {
         throw std::runtime_error(
             "expanded NVIDIA peer vector does not cover the HBM range");
       }
       const auto [ignored, inserted] = peerMappings_.insert(request.handle);
       (void)ignored;
       if (!inserted) {
-        throw std::runtime_error("NVIDIA peer mapper returned a duplicate handle");
+        throw std::runtime_error(
+            "NVIDIA peer mapper returned a duplicate handle");
       }
-      return result;
+      return makeMapping(
+          {NvmeMappingToken::Kind::NvidiaPeerPages, request.handle},
+          std::move(pages));
     } catch (...) {
       rollback();
       throw;
@@ -480,8 +482,8 @@ private:
     if (peerMapper_.get() < 0 || peerMappings_.erase(handle) == 0) {
       return;
     }
-    nta_nvme_p2p_unmap request{sizeof(request),
-                               NTA_NVME_P2P_ABI_VERSION, handle};
+    nta_nvme_p2p_unmap request{sizeof(request), NTA_NVME_P2P_ABI_VERSION,
+                               handle};
     (void)::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_UNMAP, &request);
   }
 
@@ -1116,8 +1118,8 @@ private:
         (void)::ioctl(vfioDevice_.get(), VFIO_DEVICE_RESET);
       }
       for (const std::uint64_t handle : peerMappings_) {
-        nta_nvme_p2p_unmap request{sizeof(request),
-                                   NTA_NVME_P2P_ABI_VERSION, handle};
+        nta_nvme_p2p_unmap request{sizeof(request), NTA_NVME_P2P_ABI_VERSION,
+                                   handle};
         (void)::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_UNMAP, &request);
       }
       peerMappings_.clear();

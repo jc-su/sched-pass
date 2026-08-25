@@ -47,6 +47,11 @@ class EngineBatch:
     def generations(self) -> tuple[int, ...]:
         return tuple(binding.generation for binding in self.bindings)
 
+    @property
+    def tenant_ids(self) -> tuple[int, ...]:
+        """Logical tenant for each request in the engine batch."""
+        return tuple(binding.tenant_id for binding in self.bindings)
+
 
 @runtime_checkable
 class EngineBoundary(Protocol):
@@ -83,6 +88,7 @@ class RequestIdentityAdapter:
         *,
         priorities: Sequence[int] | None = None,
         deadline_clocks: Sequence[int] | None = None,
+        tenant_ids: Sequence[int] | None = None,
         stream: Any = None,
     ) -> tuple[RequestBinding, ...]:
         return self._identity.bind(
@@ -90,6 +96,7 @@ class RequestIdentityAdapter:
             request_slots,
             priorities=priorities,
             deadline_clocks=deadline_clocks,
+            tenant_ids=tenant_ids,
             stream=stream,
         )
 

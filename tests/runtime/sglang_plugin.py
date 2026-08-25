@@ -104,6 +104,7 @@ def main() -> None:
         AcquisitionAdmission,
         AdmissionConfig,
     )
+    from nta_runtime.engines.sglang import _tenant_budget_specs
     from nta_runtime.engines.sglang_hicache import (
         HostLoadProgress,
         SglangHiCacheBridge,
@@ -111,6 +112,13 @@ def main() -> None:
     from nta_runtime.requests import RequestBinding, stable_request_id
     from nta_runtime.runtime import RequestProgress
     from nta_runtime.fixed_range_pool import FixedRangePool
+
+    with patch.dict(
+        "os.environ",
+        {"NTA_TENANT_BUDGETS": "2:1048576:3,7:2097152"},
+        clear=False,
+    ):
+        assert _tenant_budget_specs() == ((2, 1048576, 3), (7, 2097152, 1))
 
     ranges = FixedRangePool(128, 24, reserved_low=2)
     first = ranges.acquire(11)

@@ -376,6 +376,35 @@ def _positive_environment(name: str, default: int) -> int:
     return value
 
 
+def _tenant_budget_specs() -> tuple[tuple[int, int, int], ...]:
+    """Parse the optional process-level tenant quota policy once at startup.
+
+    The runtime keeps an unlimited, active default for tenants that are not
+    listed.  A deployment that needs isolation opts in with
+    ``NTA_TENANT_BUDGETS=id:bytes[:weight],...``.  This keeps policy out of the
+    per-forward path and makes a missing engine tenant annotation fail through
+    the normal tenant-0 contract instead of silently changing quotas.
+    """
+    raw = os.environ.get("NTA_TENANT_BUDGETS", "").strip()
+    if not raw:
+        return ()
+    specs: list[tuple[int, int, int]] = []
+    seen: set[int] = set()
+    for item in raw.split(","):
+        fields = tuple(field.strip() for field in item.split(":") if field.strip())
+        if len(fields) not in (2, 3):
+            raise ValueError("NTA_TENANT_BUDGETS entries must be id:bytes[:weight]")
+        tenant_id, max_bytes = (int(fields[0]), int(fields[1]))
+        weight = 1 if len(fields) == 2 else int(fields[2])
+        if tenant_id < 0 or max_bytes < 0 or weight <= 0:
+            raise ValueError("NTA_TENANT_BUDGETS contains an invalid value")
+        if tenant_id in seen:
+            raise ValueError("NTA_TENANT_BUDGETS repeats a tenant")
+        seen.add(tenant_id)
+        specs.append((tenant_id, max_bytes, weight))
+    return tuple(specs)
+
+
 def _nonnegative_environment(name: str, default: int) -> int:
     value = int(os.environ.get(name, default))
     if value < 0:
@@ -595,6 +624,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "a physical serving tier requires SGLang hierarchical cache metadata"
             )
         self._object_capacity = 2 * self._work_ticket_capacity
+        self._tenant_capacity = _positive_environment(
+            "NTA_TENANT_CAPACITY", request_capacity
+        )
         self._runtime = Runtime(
             RuntimeConfig(
                 request_capacity=request_capacity,
@@ -604,13 +636,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 max_dependencies_per_work_ticket=2,
                 device_ordinal=torch.cuda.current_device(),
                 enable_cta_nvme_try_issue=False,
+                tenant_capacity=self._tenant_capacity,
             ),
             nvme=self._tier_service.nvme,
             cxl=self._tier_service.cxl,
         )
         self._closed = False
         self._resources_closed = False
-        self._runtime.set_tenant_budget(0, (1 << 64) - 1)
+        self._configure_tenant_budgets()
         self._request_adapter = SglangAdapter(self._runtime, request_capacity)
         self._hicache = SglangHiCacheBridge(self.token_to_kv_pool)
         # CUDA priorities are inverted: acquisition movers always use the
@@ -850,6 +883,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         elif self._frontier_enabled and self._model_layer_count > 1:
             self._hicache.set_prefetch_callback(self._publish_cross_layer_frontier)
         atexit.register(self._write_stats)
+
+    def _configure_tenant_budgets(self) -> None:
+        for tenant_id, max_bytes, weight in _tenant_budget_specs():
+            if tenant_id >= self._tenant_capacity:
+                raise RuntimeError(
+                    f"tenant {tenant_id} exceeds NTA_TENANT_CAPACITY="
+                    f"{self._tenant_capacity}"
+                )
+            self._runtime.set_tenant_budget(tenant_id, max_bytes, weight)
 
     def cancel_requests(self, request_id_prefix: str, *, all: bool = False) -> int:
         cancelled = self._request_adapter.cancel_matching(request_id_prefix, all=all)

@@ -22,6 +22,7 @@ class VllmSchedulerProjection:
     request_slots: tuple[int, ...]
     priorities: tuple[int, ...] | None = None
     deadline_clocks: tuple[int, ...] | None = None
+    tenant_ids: tuple[int, ...] | None = None
 
     @classmethod
     def from_scheduler_output(cls, output: Any) -> "VllmSchedulerProjection":
@@ -33,11 +34,13 @@ class VllmSchedulerProjection:
             )
         priorities = getattr(output, "priorities", None)
         deadlines = getattr(output, "deadline_clocks", None)
+        tenant_ids = getattr(output, "tenant_ids", None)
         return cls(
             tuple(str(request_id) for request_id in request_ids),
             tuple(int(request_slot) for request_slot in request_slots),
             None if priorities is None else tuple(int(value) for value in priorities),
             None if deadlines is None else tuple(int(value) for value in deadlines),
+            None if tenant_ids is None else tuple(int(value) for value in tenant_ids),
         )
 
 
@@ -54,6 +57,7 @@ class VllmAdapter(RequestIdentityAdapter):
         stream: Any = None,
         priorities: tuple[int, ...] | None = None,
         deadline_clocks: tuple[int, ...] | None = None,
+        tenant_ids: tuple[int, ...] | None = None,
         granularity: Granularity = Granularity.PAGE_GROUP,
     ) -> EngineBatch:
         bindings = self.bind(
@@ -61,6 +65,7 @@ class VllmAdapter(RequestIdentityAdapter):
             request_slots,
             priorities=priorities,
             deadline_clocks=deadline_clocks,
+            tenant_ids=tenant_ids,
             stream=stream,
         )
         return EngineBatch(self.engine, epoch, bindings, granularity)
@@ -89,5 +94,6 @@ class VllmAdapter(RequestIdentityAdapter):
             stream=stream,
             priorities=projection.priorities,
             deadline_clocks=projection.deadline_clocks,
+            tenant_ids=projection.tenant_ids,
             granularity=granularity,
         )

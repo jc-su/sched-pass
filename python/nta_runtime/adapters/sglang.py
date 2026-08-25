@@ -87,10 +87,19 @@ class SglangAdapter(RequestIdentityAdapter):
                 forward_batch, "_nta_request_priorities", (0,) * batch_size
             )
         )
+        raw_tenant_ids = getattr(forward_batch, "_nta_request_tenant_ids", None)
+        if raw_tenant_ids is None:
+            raw_tenant_ids = (0,) * batch_size
+        elif hasattr(raw_tenant_ids, "tolist"):
+            raw_tenant_ids = raw_tenant_ids.tolist()
+        tenant_ids = tuple(int(tenant_id) for tenant_id in raw_tenant_ids)
+        if len(tenant_ids) != batch_size:
+            raise RuntimeError("SGLang request tenants do not match the batch")
         bindings = self.bind(
             request_ids,
             request_slots,
             priorities=priorities,
+            tenant_ids=tenant_ids,
             stream=stream,
         )
         return EngineBatch(self.engine, epoch, bindings, granularity)

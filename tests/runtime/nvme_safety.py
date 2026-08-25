@@ -37,11 +37,19 @@ def main() -> None:
     runtime = (ROOT / "runtime" / "host" / "NvmeRuntime.cpp").read_text(
         encoding="utf-8"
     )
-    assert "controlPlane->mapHbm(preflight.address" in runtime
+    assert "controlPlane->mappingBackend().mapHbm" in runtime
+    assert "retainPagePrefix" in runtime
+    assert "mappingBackend().mapHost" in runtime
     assert "NvmeHbmMappingBackend::NvidiaPeerPages" in runtime
     assert "cuMemAlloc(&allocation.base" in runtime
     assert "cuMemGetHandleForAddressRange" not in runtime
     assert "CU_GPU_DIRECT_RDMA_WRITES_ORDERING_OWNER" in runtime
+    assert "ioctl" not in (
+        ROOT / "runtime" / "device" / "Acquire.cuh"
+    ).read_text(encoding="utf-8")
+    assert "NvmeDmaMapping" not in (
+        ROOT / "runtime" / "host" / "NvmeControlPlane.h"
+    ).read_text(encoding="utf-8")
     python_runtime = (ROOT / "python" / "nta_runtime" / "runtime.py").read_text(
         encoding="utf-8"
     )

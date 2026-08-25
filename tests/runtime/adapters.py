@@ -8,10 +8,14 @@ from nta_runtime.work_unit import Granularity
 class FakeRuntime:
     def __init__(self) -> None:
         self.published = []
+        self.tenant_ids = []
         self.cancelled = []
 
-    def set_request(self, slot, request_id, generation, *, priority, deadline_clock):
+    def set_request(
+        self, slot, request_id, generation, *, tenant_id, priority, deadline_clock
+    ):
         self.published.append((slot, request_id, generation, priority, deadline_clock))
+        self.tenant_ids.append(tenant_id)
 
     def cancel_request(self, slot, generation):
         self.cancelled.append((slot, generation))
@@ -22,6 +26,7 @@ class FakeForward:
     rids = ("sg-a", "sg-b")
     req_pool_indices = (5, 7)
     _nta_request_priorities = (2, 5)
+    _nta_request_tenant_ids = (3, 7)
 
 
 class FakeVllmSchedulerOutput:
@@ -29,6 +34,7 @@ class FakeVllmSchedulerOutput:
     request_slots = (4, 6)
     priorities = (1, 3)
     deadline_clocks = (100, 200)
+    tenant_ids = (4, 6)
 
 
 def main() -> None:
@@ -73,12 +79,16 @@ def main() -> None:
     assert sglang_batch.engine == "sglang"
     assert sglang_batch.epoch == 9
     assert tuple(item.priority for item in sglang_batch.bindings) == (2, 5)
+    assert tuple(item.tenant_id for item in sglang_batch.bindings) == (3, 7)
+    assert sglang_batch.tenant_ids == (3, 7)
     assert tuple(item.request_slot for item in sglang_batch.bindings) == (5, 7)
     vllm_batch = adapter.bind_forward(
         FakeVllmSchedulerOutput(), epoch=5, granularity=Granularity.LAYER
     )
     assert tuple(item.request_slot for item in vllm_batch.bindings) == (4, 6)
     assert tuple(item.deadline_clock for item in vllm_batch.bindings) == (100, 200)
+    assert tuple(item.tenant_id for item in vllm_batch.bindings) == (4, 6)
+    assert vllm_batch.tenant_ids == (4, 6)
     projection = VllmSchedulerProjection.from_scheduler_output(
         FakeVllmSchedulerOutput()
     )

@@ -1,7 +1,8 @@
 # NVMe-to-HBM security and lifecycle contract
 
 Status: qualified on one dedicated controller/GPU platform; trusted-process
-research mechanism, not a multi-tenant storage API.
+transport, with logical serving-tenant quotas enforced above it. This is not a
+multi-tenant storage isolation API.
 
 ## What the path is
 
@@ -89,6 +90,13 @@ The CPU control plane exclusively owns reset/enable, Identify, optional write
 protection, queue-count negotiation, admin commands, and I/O queue
 create/delete. It performs a bounded CPU-issued READ before publication to
 validate queue creation and ordinary IOMMU mappings.
+
+The mapping backend is a typed RAII lease: host IOAS and NVIDIA peer-page
+mapping tokens cannot be interchanged, and leases are created/released only at
+buffer lifetime boundaries. The GPU queue receives the resulting PRP/page-list
+address once; the device acquisition path contains no ioctl or host callback
+per request. Mapping caches reduce repeated setup without moving any payload
+through host memory.
 
 The GPU data plane receives only the engine-neutral `NvmeQueueView`. Before the
 queue becomes usable, the runtime registers the isolated doorbell page with

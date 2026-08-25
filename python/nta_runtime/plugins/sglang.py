@@ -139,6 +139,9 @@ def _preserve_prefill_graph_request_metadata() -> None:
         priorities = getattr(forward_batch, "_nta_request_priorities", None)
         if priorities is not None:
             static_batch._nta_request_priorities = priorities
+        tenant_ids = getattr(forward_batch, "_nta_request_tenant_ids", None)
+        if tenant_ids is not None:
+            static_batch._nta_request_tenant_ids = tenant_ids
         PREFILL_GRAPH_COUNTERS["prefill_graph_served_batches"] += 1
         return static_batch
 
@@ -164,6 +167,7 @@ def _preserve_prefill_graph_request_metadata() -> None:
                     f"__nta_graph_padding_{index}" for index in range(batch_size)
                 )
                 forward_batch._nta_request_priorities = (0,) * batch_size
+                forward_batch._nta_request_tenant_ids = (0,) * batch_size
             return result
 
         capture_prepare._nta_preserves_request_metadata = True
@@ -203,8 +207,15 @@ def _preserve_graph_request_metadata() -> None:
         if len(priorities) != raw_bs:
             raise RuntimeError("SGLang graph replay omitted request priorities")
         priorities.extend(0 for _ in range(raw_bs, padded_bs))
+        tenant_ids = list(
+            getattr(forward_batch, "_nta_request_tenant_ids", (0,) * raw_bs)
+        )
+        if len(tenant_ids) != raw_bs:
+            raise RuntimeError("SGLang graph replay omitted request tenants")
+        tenant_ids.extend(0 for _ in range(raw_bs, padded_bs))
         view.rids = request_ids
         view._nta_request_priorities = tuple(priorities)
+        view._nta_request_tenant_ids = tuple(int(tenant_id) for tenant_id in tenant_ids)
         view._nta_raw_batch_size = raw_bs
         return view
 

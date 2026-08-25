@@ -74,6 +74,10 @@ SGLang is the first serving implementation. It keeps host HiCache ownership,
 request identity, demand, and availability at explicit boundaries while
 building an execution session for every real FlashInfer attention launch.
 The vLLM adapter exposes the same request projection without importing vLLM.
+Logical multi-tenant admission is part of that shared contract: an aligned
+tenant annotation is carried with each request binding, and optional startup
+quotas (`NTA_TENANT_BUDGETS=id:bytes[:weight],...`) bound device staging rather
+than adding a framework-specific scheduler.
 
 Retired selector-specific serving and graph-specialization paths were removed
 from the current implementation. Their old source is recoverable through Git
