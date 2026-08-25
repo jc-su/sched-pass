@@ -31,6 +31,8 @@ def main() -> None:
     assert "NTA_NVME_BDF must use DDDD:BB:SS.F syntax" in vfio_script
     assert "nvme get-feature" in vfio_script
     assert "reference capture has an unexpected size" in vfio_script
+    assert "no namespace block device exists and reference file is absent" in vfio_script
+    assert "fs.protected_regular" in vfio_script
     assert "wait_for_nvme_namespace" in vfio_script
     assert "returned to the nvme driver but no live namespace appeared" in vfio_script
     assert "driver_override is only a transactional bind aid" in vfio_script
@@ -101,6 +103,13 @@ def main() -> None:
     assert "mediaPolicy_(options.mediaPolicy)" in control_plane
     assert "Do not issue Set Features" in control_plane
     assert "NTA_NVME_P2P_IOCTL_MAP" in control_plane
+    attention = (ROOT / "benchmarks" / "attention" / "PagedAttention.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert "An NVMe object owns an HBM destination" in attention
+    assert "options.mode == Mode::Nvme" in attention
+    assert "nvmeStats.completed == nvmeStats.submitted" in attention
+    assert "\\\",\\\"queue_depth\\\":" in attention
     assert "progressNvmeUntilIdle" in runtime or "progressNvmeUntilIdle" in (
         ROOT / "include" / "nta" / "FinitePhase.h"
     ).read_text(encoding="utf-8")

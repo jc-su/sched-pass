@@ -50,6 +50,18 @@ enum class Mode { Resident, HostDirect, HostStaged, Mixed, Nvme, Dax };
 enum class CopyMode { Global, Tma };
 enum class SparsePolicy { LateBound, Overfetch };
 
+nta::NvmeMediaPolicy parseNvmeMediaPolicy(std::string_view value) {
+  if (value == "hardware-write-protect") {
+    return nta::NvmeMediaPolicy::RequireHardwareWriteProtection;
+  }
+  if (value == "trusted-read-only-code") {
+    return nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode;
+  }
+  throw std::invalid_argument(
+      "NVMe media policy must be hardware-write-protect or "
+      "trusted-read-only-code");
+}
+
 struct Options {
   Mode mode = Mode::Mixed;
   std::uint32_t requests = 32;
@@ -71,7 +83,10 @@ struct Options {
   std::uint64_t nvmeSourceOffset = 0;
   std::uint32_t nvmeNamespace = 1;
   std::uint32_t nvmeQueueDepth = 64;
+  nta::NvmeMediaPolicy nvmeMediaPolicy =
+      nta::NvmeMediaPolicy::RequireHardwareWriteProtection;
   bool nvmeCtaTryIssue = true;
+  bool nvmeMediaPolicyExplicit = false;
 };
 
 class KernelModule {
@@ -385,6 +400,9 @@ Options parseOptions(int argc, char **argv) {
       options.nvmeNamespace = parsePositive(value, name);
     } else if (name == "--nvme-queue-depth") {
       options.nvmeQueueDepth = parsePositive(value, name);
+    } else if (name == "--nvme-media-policy") {
+      options.nvmeMediaPolicy = parseNvmeMediaPolicy(value);
+      options.nvmeMediaPolicyExplicit = true;
     } else if (name == "--nvme-cta-try-issue") {
       if (value != "0" && value != "1") {
         throw std::invalid_argument("--nvme-cta-try-issue must be 0 or 1");
@@ -1042,6 +1060,12 @@ int main(int argc, char **argv) {
       }
     }
     if (options.mode == Mode::Nvme) {
+      if (!options.nvmeMediaPolicyExplicit) {
+        const char *policy = std::getenv("NTA_NVME_MEDIA_POLICY");
+        if (policy != nullptr && *policy != '\0') {
+          options.nvmeMediaPolicy = parseNvmeMediaPolicy(policy);
+        }
+      }
       if (options.nvmeEndpoint.empty()) {
         const char *endpoint = std::getenv("NTA_NVME_ENDPOINT");
         const char *bdf = std::getenv("NTA_NVME_BDF");
@@ -1113,6 +1137,7 @@ int main(int argc, char **argv) {
       nvmeOptions.deviceOrdinal = 0;
       nvmeOptions.namespaceId = options.nvmeNamespace;
       nvmeOptions.queueDepth = options.nvmeQueueDepth;
+      nvmeOptions.mediaPolicy = options.nvmeMediaPolicy;
       nvme = std::make_shared<nta::NvmeTransport>(std::move(nvmeOptions));
       backends.nvme = nvme;
     }
@@ -1186,8 +1211,16 @@ int main(int argc, char **argv) {
         }
         runtime.bindTensorMaps(physicalPage, 0, replicaMap, stagingMap);
       }
+      // An NVMe object owns an HBM destination for DMA, but that destination
+      // is not a consumer-visible direct source.  Publishing it as directBase
+      // would make the work planner mark the dependency as pre-satisfied and
+      // silently bypass the GPU-owned NVMe acquisition path.
+      const std::uint64_t directBase =
+          options.mode == Mode::Nvme
+              ? 0
+              : reinterpret_cast<std::uint64_t>(object.directDeviceBase);
       pageBindings[physicalPage] = {
-          reinterpret_cast<std::uint64_t>(object.directDeviceBase),
+          directBase,
           directTensorMap,
           objectId,
           physicalPage,
@@ -1463,19 +1496,32 @@ int main(int argc, char **argv) {
                 << ",\"intents_consumed\":" << intentPool.consumed
                 << ",\"qualification\":{";
       if (nvme != nullptr) {
-        std::cout << "\"backend\":\"vfio-nvme\",\"qualified\":"
-                  << (nvmeCapabilities.gpuDoorbellMappingValidated &&
-                              nvmeCapabilities.translatedIommu &&
-                              nvmeCapabilities.namespaceReadOnly
-                          ? "true"
-                          : "false")
-                  << ",\"queue_depth\":" << nvmeCapabilities.queueDepth
-                  << ",\"lba_size\":" << nvmeCapabilities.lbaSize
-                  << ",\"submitted\":" << nvmeStats.submitted
-                  << ",\"completed\":" << nvmeStats.completed
-                  << ",\"failed\":" << nvmeStats.failed
-                  << ",\"direct_submitted\":" << nvmeStats.directSubmitted
-                  << ",\"direct_fallbacks\":" << nvmeStats.directFallbacks;
+        const bool nvmeIoCompleted =
+            nvmeStats.submitted != 0 &&
+            nvmeStats.completed == nvmeStats.submitted &&
+            nvmeStats.failed == 0;
+        std::cout
+            << "\"backend\":\"vfio-nvme\",\"qualified\":"
+            << (nvmeCapabilities.gpuDoorbellMappingValidated &&
+                        nvmeCapabilities.translatedIommu &&
+                        (nvmeCapabilities.namespaceReadOnly ||
+                         options.nvmeMediaPolicy ==
+                             nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode) &&
+                        nvmeIoCompleted && failures == 0
+                    ? "true"
+                    : "false")
+            << ",\"media_policy\":\""
+            << (options.nvmeMediaPolicy ==
+                        nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode
+                    ? "trusted-read-only-code"
+                    : "hardware-write-protect")
+            << "\",\"queue_depth\":" << nvmeCapabilities.queueDepth
+            << ",\"lba_size\":" << nvmeCapabilities.lbaSize
+            << ",\"submitted\":" << nvmeStats.submitted
+            << ",\"completed\":" << nvmeStats.completed
+            << ",\"failed\":" << nvmeStats.failed
+            << ",\"direct_submitted\":" << nvmeStats.directSubmitted
+            << ",\"direct_fallbacks\":" << nvmeStats.directFallbacks;
       } else if (cxl != nullptr) {
         std::cout << "\"backend\":\"cxl-devdax\",\"qualified\":"
                   << (cxlCapabilities.hostRegistered &&

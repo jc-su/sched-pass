@@ -158,6 +158,18 @@ endif()
 add_test(NAME nta-nvme-discovery COMMAND nta-nvme-discovery-test)
 set_tests_properties(nta-nvme-discovery PROPERTIES LABELS "contract;tier")
 
+add_executable(nta-cxl-dax-discovery-test tests/runtime/CxlDaxDiscoveryTest.cpp)
+target_include_directories(nta-cxl-dax-discovery-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+if(NTA_WARNINGS_AS_ERRORS)
+  target_compile_options(
+    nta-cxl-dax-discovery-test PRIVATE -Wall -Wextra -Wpedantic -Werror
+  )
+endif()
+add_test(NAME nta-cxl-dax-discovery COMMAND nta-cxl-dax-discovery-test)
+set_tests_properties(nta-cxl-dax-discovery PROPERTIES LABELS "contract;tier")
+
 install(DIRECTORY include/nta DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(
   TARGETS nta-work-plan nta-cxl-dax-allocator nta-flashinfer-adapter

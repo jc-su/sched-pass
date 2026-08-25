@@ -14,6 +14,7 @@ dma_target=${NTA_NVME_DMA_TARGET:-hbm-peer}
 probe=${NTA_VFIO_PROBE:-$root_dir/build/nta-vfio-nvme-probe}
 benchmark=${NTA_NVME_BENCHMARK:-$root_dir/build/nta-nvme-bench}
 state=/run/nta-vfio-${bdf}.driver
+partition_state=/run/nta-vfio-${bdf}.partitions
 
 die() {
   printf 'nta-vfio-device: %s\n' "$*" >&2
@@ -59,6 +60,21 @@ wait_for_nvme_namespace() {
     sleep 0.1
   done
   die "$bdf returned to the nvme driver but no live namespace appeared"
+}
+
+wait_for_expected_partitions() {
+  [[ -r $partition_state ]] || return 0
+  local partition _
+  while IFS= read -r partition; do
+    [[ -n $partition ]] || continue
+    for _ in {1..100}; do
+      [[ -b /dev/$partition ]] && break
+      sleep 0.1
+    done
+    [[ -b /dev/$partition ]] ||
+      die \
+        "$bdf returned to nvme but expected partition /dev/$partition did not reappear"
+  done < "$partition_state"
 }
 
 vfio_cdev() {
@@ -197,13 +213,48 @@ capture_reference() {
     [[ $(<"$block/nsid") == "$nsid" ]] || continue
     sudo dd if="/dev/$(basename "$block")" bs=4096 \
       count="$((reference_bytes / 4096))" \
-      iflag=direct status=none | dd of="$reference" bs=4096 status=none
+      iflag=direct status=none | write_reference bs=4096
     [[ -f $reference && $(stat -c '%s' "$reference") == "$reference_bytes" ]] ||
       die "reference capture has an unexpected size"
     return
   done
   [[ -f $reference ]] ||
     die "no namespace block device exists and reference file is absent"
+}
+
+write_reference() {
+  local owner_uid
+  if [[ $EUID -eq 0 && -e $reference ]]; then
+    owner_uid=$(stat -c '%u' "$reference")
+    if [[ $owner_uid != 0 ]]; then
+      # fs.protected_regular can reject root opening another user's file in a
+      # sticky directory such as /tmp.  Preserve the artifact owner instead of
+      # weakening that protection or replacing the existing file.
+      sudo -u "#$owner_uid" dd of="$reference" status=none "$@"
+      return
+    fi
+  fi
+  dd of="$reference" status=none "$@"
+}
+
+snapshot_partitions() {
+  local block partition
+  local partitions
+  partitions=$(
+    for block in "$device"/nvme/nvme*/nvme*n*; do
+      [[ -e $block ]] || continue
+      for partition in "$block"p*; do
+        [[ -e $partition ]] || continue
+        printf '%s\n' "$(basename "$partition")"
+      done
+    done
+  )
+  if [[ -n $partitions ]]; then
+    printf '%s\n' "$partitions" | sudo tee "$partition_state" >/dev/null
+    sudo chmod 0644 "$partition_state"
+  else
+    sudo rm -f "$partition_state"
+  fi
 }
 
 bind_vfio() {
@@ -216,6 +267,7 @@ bind_vfio() {
   require_containment
   require_media_policy
   require_hbm_peer
+  snapshot_partitions
   capture_reference
   sudo modprobe iommufd
   sudo modprobe vfio-pci
@@ -321,7 +373,9 @@ restore)
   # later hotplug and recovery depend on stale experiment state.
   printf '\n' | sudo tee "$device/driver_override" >/dev/null
   [[ $driver != nvme ]] || wait_for_nvme_namespace
+  [[ $driver != nvme ]] || wait_for_expected_partitions
   sudo rm -f "$state"
+  sudo rm -f "$partition_state"
   "$0" status
   ;;
 *)

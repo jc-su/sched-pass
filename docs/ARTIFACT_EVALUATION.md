@@ -174,6 +174,11 @@ every machine, while only `nta-vfio-nvme-probe` and the qualification runner
 can qualify the GPU-controlled NVMe data path. The same rule applies to
 multi-GPU and framework-specific serving tests.
 
+`nta-cxl-dax-discovery` and `nta-nvme-discovery` always execute the read-only
+capability-discovery path and report `candidate=none` when the platform has no
+usable endpoint. The physical mapping probes remain capability-gated because
+turning an absent endpoint into a passing result would invalidate the artifact.
+
 For an already provisioned devdax endpoint, install
 `config/udev/99-nta-dax.rules`, create the system group `dax`, and add the
 artifact user to that group. Reload udev rules (or reboot) before qualification.
@@ -238,6 +243,26 @@ Protection support. `trusted-read-only-code` is an explicit weaker boundary for
 a dedicated experiment controller; it relies on the generated device program
 emitting only NVMe READ commands. Neither policy authorizes formatting,
 filesystem changes, writes, discard, sanitize, or deletion.
+
+The native attention consumer can be checked after the transport qualification
+without changing the device policy.  Keep the controller bound to VFIO and
+run the benchmark as a user with access to `/dev/nta_nvme_p2p` (or through
+`sudo`):
+
+```bash
+sudo env LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64 \
+  NTA_NVME_MEDIA_POLICY=trusted-read-only-code \
+  build/nta-paged-attention \
+  --mode=nvme --nvme-endpoint=vfio:0000:d8:00.0 \
+  --nvme-reference=/path/to/reference.bin \
+  --nvme-media-policy=trusted-read-only-code --json=1
+```
+
+The report is only `qualified:true` when the exact attention run submitted and
+completed NVMe reads, had no transport failures, and had no output or
+verification failures.  An HBM destination owned by the NVMe transport is not
+published as a direct consumer source; doing so would make the planner bypass
+the typed acquisition path.
 
 The machine-readable report separates transport qualification from matched
 performance qualification. It records exact checksums, queue counters, HBM
