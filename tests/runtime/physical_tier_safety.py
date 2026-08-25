@@ -35,6 +35,7 @@ def main() -> None:
         "daxctl list -u",
         "topology=",
         "root_decoders_only",
+        "type2_pci_endpoint_without_memdev",
     ):
         assert required in cxl_script
 

@@ -45,13 +45,14 @@ def main() -> int:
         if not re.search(rf"\b{re.escape(module)}=(?:loaded|unloaded)\b", output):
             raise AssertionError(f"CXL status omitted module state for {module}")
 
-    topology = re.search(r"\btopology=([a-z_]+)\b", output)
+    topology = re.search(r"\btopology=([a-z0-9_]+)\b", output)
     if topology is None:
         raise AssertionError("CXL status omitted the topology state")
     if topology.group(1) not in {
         "devdax_ready",
         "region_without_devdax",
         "type3_memdev_without_region",
+        "type2_pci_endpoint_without_memdev",
         "root_decoders_only",
         "no_cxl_topology",
     }:
