@@ -120,6 +120,31 @@ try:
 finally:
     requests_module.stable_request_id = original_stable_request_id
 
+# An active request can be absent from one forward batch while waiting in the
+# engine scheduler. It must remain in the bounded collision table until its
+# slot is rebound or the request is cancelled.
+omitted_runtime = Runtime()
+omitted_registry = RequestIdentityRegistry(omitted_runtime, 3)
+original_stable_request_id = requests_module.stable_request_id
+requests_module.stable_request_id = lambda value: {
+    "omitted-active": 23,
+    "other-active": 24,
+    "colliding-omitted": 23,
+}[value]
+try:
+    omitted_registry.bind(["omitted-active"], [0])
+    omitted_registry.bind(["other-active"], [1])
+    try:
+        omitted_registry.bind(["colliding-omitted"], [2])
+    except ValueError as error:
+        assert "hash collision" in str(error)
+    else:
+        raise AssertionError(
+            "an omitted active request was dropped from collision tracking"
+        )
+finally:
+    requests_module.stable_request_id = original_stable_request_id
+
 async_runtime = Runtime()
 async_tracker = RequestIdentityRegistry(async_runtime, 4)
 async_bindings = async_tracker.bind(["request-z", "request-y"], [1, 0], stream=1234)

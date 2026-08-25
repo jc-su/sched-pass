@@ -1,5 +1,5 @@
 from nta_runtime.adapters.sglang import SglangAdapter, SglangExecutionConfig
-from nta_runtime.adapters.base import EngineBoundary
+from nta_runtime.adapters.base import ConsumerContract, ConsumerKind, EngineBoundary
 from nta_runtime.adapters.vllm import VllmAdapter, VllmSchedulerProjection
 from nta_runtime.adapters.vllm_v1 import VllmV1Hook
 from nta_runtime.execution_protocol import ProtocolKind
@@ -152,6 +152,27 @@ def main() -> None:
     assert v1_batch.exact_demand is not None
     assert v1_batch.exact_demand.request_unit_ids == ((10, 11), (20, 21, 22))
     assert v1_batch.tenant_ids == (9, 11)
+    projection_contract = v1_hook.projection_contract()
+    assert projection_contract.kind is ConsumerKind.PROJECTION_ONLY
+    assert projection_contract.formal_execution is False
+    native_contract = ConsumerContract.native_work_unit(
+        engine="sglang", backend="nta_flashinfer", engine_version="0.5.14"
+    )
+    assert native_contract.as_dict()["numerical_consumer"] is True
+    try:
+        ConsumerContract(
+            engine="vllm",
+            backend="test",
+            kind="native_work_unit",  # type: ignore[arg-type]
+            exact_demand=True,
+            typed_work_plan=True,
+            native_submission=True,
+            numerical_consumer=True,
+        )
+    except TypeError as error:
+        assert "kind" in str(error)
+    else:
+        raise AssertionError("raw consumer kind was accepted")
     try:
         v1_hook.bind_forward(
             FakeVllmV1SchedulerOutput(),

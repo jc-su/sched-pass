@@ -18,6 +18,11 @@ import random
 import statistics
 from typing import Any, Iterable
 
+try:
+    from .consumer_contract import validate_consumer_contract
+except ImportError:  # pragma: no cover - direct script execution
+    from consumer_contract import validate_consumer_contract
+
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_STRATA = {
@@ -88,7 +93,7 @@ def _workload_digest(
     return evaluation_metadata.get("workload_demand_digest")
 
 
-def _validate_result(record: dict[str, Any]) -> None:
+def _validate_result(record: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     result = record.get("result")
     if not isinstance(result, dict):
         raise ValueError("trial result is not a JSON object")
@@ -103,6 +108,22 @@ def _validate_result(record: dict[str, Any]) -> None:
             f"trial {record.get('experiment')}/{record.get('variant')} "
             "does not prove zero verification failures"
         )
+    stats = result.get("engine_stats")
+    if stats is None:
+        return ()
+    if not isinstance(stats, list):
+        raise ValueError("engine_stats must be a list when present")
+    contracts: list[dict[str, Any]] = []
+    for entry in stats:
+        if not isinstance(entry, dict) or entry.get("backend") != "nta_flashinfer":
+            continue
+        contracts.append(
+            validate_consumer_contract(
+                entry.get("consumer_contract"),
+                require_formal_execution=True,
+            )
+        )
+    return tuple(contracts)
 
 
 def _load(output: Path) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
@@ -182,6 +203,7 @@ def analyze(output: Path) -> dict[str, Any]:
 
     seen: set[tuple[str, str, int]] = set()
     workload_digests: set[str] = set()
+    consumer_contracts: set[str] = set()
     for record in records:
         identity = (
             record.get("experiment"),
@@ -212,7 +234,10 @@ def analyze(output: Path) -> dict[str, Any]:
             record["stratum"]
         ):
             raise ValueError("trial artifact is missing required strata")
-        _validate_result(record)
+        for contract in _validate_result(record):
+            consumer_contracts.add(
+                json.dumps(contract, sort_keys=True, separators=(",", ":"))
+            )
         if physical_tiers:
             if record.get("tier_qualification_digest") != qualification_digest:
                 raise ValueError(
@@ -335,6 +360,9 @@ def analyze(output: Path) -> dict[str, Any]:
             "tier_qualification_digest": qualification_digest,
             "qualified_physical_tiers": sorted(physical_tiers),
             "trial_count": len(records),
+            "consumer_contracts": [
+                json.loads(value) for value in sorted(consumer_contracts)
+            ],
         },
         "strata": strata,
         "causal_comparisons": causal,

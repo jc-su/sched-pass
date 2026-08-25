@@ -4,10 +4,148 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Sequence
+from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from ..requests import RequestBinding, RequestIdentityRegistry
 from ..work_unit import Granularity
+
+
+class ConsumerKind(str, Enum):
+    """Numerical consumer reached after an engine projection.
+
+    A projection is deliberately not an execution result.  Keeping these
+    states explicit prevents a scheduler hook from being reported as a
+    native work-unit consumer in an artifact.
+    """
+
+    NATIVE_WORK_UNIT = "native_work_unit"
+    FRAMEWORK_REFERENCE = "framework_reference"
+    PROJECTION_ONLY = "projection_only"
+
+
+@dataclass(frozen=True)
+class ConsumerContract:
+    """Typed evidence for the boundary that consumed an :class:`EngineBatch`.
+
+    ``exact_demand`` describes the numerical operation, while the remaining
+    flags describe how that operation was reached.  They are separate on
+    purpose: an exact vLLM scheduler projection has exact demand but has not
+    yet submitted or consumed an NTA work plan.
+    """
+
+    engine: str
+    backend: str
+    kind: ConsumerKind
+    exact_demand: bool
+    typed_work_plan: bool
+    native_submission: bool
+    numerical_consumer: bool
+    engine_version: str = "unknown"
+
+    def __post_init__(self) -> None:
+        if not self.engine or not self.backend or not self.engine_version:
+            raise ValueError("consumer contract identity must be non-empty")
+        if not isinstance(self.kind, ConsumerKind):
+            raise TypeError("consumer contract kind must be a ConsumerKind")
+        for field in (
+            "exact_demand",
+            "typed_work_plan",
+            "native_submission",
+            "numerical_consumer",
+        ):
+            if type(getattr(self, field)) is not bool:
+                raise TypeError(f"consumer contract {field} must be bool")
+        if self.kind is ConsumerKind.NATIVE_WORK_UNIT and not all(
+            (self.exact_demand, self.typed_work_plan, self.native_submission, self.numerical_consumer)
+        ):
+            raise ValueError(
+                "native work-unit consumer requires exact demand, typed plan, "
+                "native submission, and numerical consumption"
+            )
+        if self.kind is ConsumerKind.FRAMEWORK_REFERENCE and not (
+            self.exact_demand
+            and not self.typed_work_plan
+            and not self.native_submission
+            and self.numerical_consumer
+        ):
+            raise ValueError(
+                "framework reference consumer requires exact demand, no native "
+                "submission, and numerical consumption"
+            )
+        if self.kind is ConsumerKind.PROJECTION_ONLY and (
+            self.native_submission or self.numerical_consumer
+        ):
+            raise ValueError(
+                "projection-only contract cannot claim native submission or "
+                "numerical consumption"
+            )
+
+    @classmethod
+    def native_work_unit(
+        cls, *, engine: str, backend: str, engine_version: str = "unknown"
+    ) -> "ConsumerContract":
+        return cls(
+            engine=engine,
+            backend=backend,
+            kind=ConsumerKind.NATIVE_WORK_UNIT,
+            exact_demand=True,
+            typed_work_plan=True,
+            native_submission=True,
+            numerical_consumer=True,
+            engine_version=engine_version,
+        )
+
+    @classmethod
+    def framework_reference(
+        cls, *, engine: str, backend: str, engine_version: str = "unknown"
+    ) -> "ConsumerContract":
+        return cls(
+            engine=engine,
+            backend=backend,
+            kind=ConsumerKind.FRAMEWORK_REFERENCE,
+            exact_demand=True,
+            typed_work_plan=False,
+            native_submission=False,
+            numerical_consumer=True,
+            engine_version=engine_version,
+        )
+
+    @classmethod
+    def projection_only(
+        cls, *, engine: str, backend: str, engine_version: str = "unknown"
+    ) -> "ConsumerContract":
+        return cls(
+            engine=engine,
+            backend=backend,
+            kind=ConsumerKind.PROJECTION_ONLY,
+            exact_demand=True,
+            typed_work_plan=False,
+            native_submission=False,
+            numerical_consumer=False,
+            engine_version=engine_version,
+        )
+
+    @property
+    def formal_execution(self) -> bool:
+        """Whether this contract is eligible for formal serving evidence."""
+        return self.kind in {
+            ConsumerKind.NATIVE_WORK_UNIT,
+            ConsumerKind.FRAMEWORK_REFERENCE,
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema": 1,
+            "engine": self.engine,
+            "backend": self.backend,
+            "kind": self.kind.value,
+            "exact_demand": self.exact_demand,
+            "typed_work_plan": self.typed_work_plan,
+            "native_submission": self.native_submission,
+            "numerical_consumer": self.numerical_consumer,
+            "engine_version": self.engine_version,
+        }
 
 
 @dataclass(frozen=True)

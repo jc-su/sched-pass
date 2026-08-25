@@ -89,11 +89,14 @@ class RequestIdentityRegistry:
         slot_updates: list[tuple[int, tuple[str, int, int, int, int]]] = []
         batch_request_slots: dict[str, int] = {}
         target_slots = set(request_slots)
-        prospective_active_ids = {
-            stable_id: identity
-            for stable_id, identity in self._active_ids.items()
-            if identity[1] not in target_slots
-        }
+        # The engine may temporarily omit an active request from a forward
+        # batch.  Omission is not retirement: keep every other active slot in
+        # the collision table and remove only identities whose slots are
+        # actually being rebound by this batch.
+        prospective_active_ids = dict(self._active_ids)
+        for stable_id, identity in tuple(prospective_active_ids.items()):
+            if identity[1] in target_slots:
+                prospective_active_ids.pop(stable_id, None)
         batch_stable_ids: dict[int, str] = {}
         for request_index, (
             request_id,
@@ -203,13 +206,26 @@ class RequestIdentityRegistry:
         return tuple(bindings)
 
     def cancel(self, request_id: str) -> bool:
-        for request_slot, (active_id, generation, _, _, _) in self._slots.items():
-            if request_slot in self._active_slots and active_id == request_id:
-                self._runtime.cancel_request(request_slot, generation)
-                self._active_slots.remove(request_slot)
-                self._active_ids.pop(stable_request_id(active_id), None)
-                return True
-        return False
+        active = self._active_ids.get(stable_request_id(request_id))
+        if active is None or active[0] != request_id:
+            return False
+        request_slot = active[1]
+        current = self._slots.get(request_slot)
+        if (
+            request_slot not in self._active_slots
+            or current is None
+            or current[0] != request_id
+        ):
+            # Keep the bounded identity table self-healing if an engine-side
+            # cancellation hook was called during exceptional teardown.
+            self._active_ids.pop(stable_request_id(request_id), None)
+            self._active_slots.discard(request_slot)
+            return False
+        generation = current[1]
+        self._runtime.cancel_request(request_slot, generation)
+        self._active_slots.remove(request_slot)
+        self._active_ids.pop(stable_request_id(request_id), None)
+        return True
 
     def cancel_matching(self, request_id_prefix: str = "", *, all: bool = False) -> int:
         """Cancel every current generation selected by an engine abort event."""

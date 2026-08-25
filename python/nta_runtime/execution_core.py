@@ -9,7 +9,7 @@ epoch-checked.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 from .execution_protocol import ExecutionProtocolConfig, WorkLedger
@@ -66,6 +66,16 @@ class ExecutionSession:
     batch: WorkBatch
     protocol: ExecutionProtocolConfig
     ledger: WorkLedger
+    _units_by_work_id: dict[int, WorkUnit] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        # Native plan upload resolves every schedule ticket through this
+        # boundary.  Keep that lookup O(1): a linear scan here turns a large
+        # heterogeneous schedule into an accidental O(work_units^2) Python
+        # control-plane cost before the GPU can overlap any transfer.
+        self._units_by_work_id = {unit.work_id: unit for unit in self.batch.units}
 
     @classmethod
     def from_tiles(
@@ -132,10 +142,8 @@ class ExecutionSession:
 
     def _binding(self, work_id: int) -> RequestBinding:
         try:
-            return next(
-                unit.binding for unit in self.batch.units if unit.work_id == work_id
-            )
-        except StopIteration as error:
+            return self._units_by_work_id[work_id].binding
+        except KeyError as error:
             raise KeyError(f"unknown work unit {work_id}") from error
 
     def make_ready(self, work_ids: Iterable[int]) -> None:
@@ -259,14 +267,13 @@ class ExecutionSession:
         engine's canonical work-ticket identity; the remaining fields are
         checked as an invariant so a stale or reordered schedule fails closed.
         """
-        matches = tuple(unit for unit in self.batch.units if unit.work_id == work_id)
-        if len(matches) != 1:
+        unit = self._units_by_work_id.get(work_id)
+        if unit is None:
             raise RuntimeError(
                 "native schedule has no unique semantic work ticket: "
                 f"work_id={work_id} layer={layer} logical={logical_begin} "
                 f"request={request_index}"
             )
-        unit = matches[0]
         if (
             unit.layer != layer
             or unit.logical_begin != logical_begin

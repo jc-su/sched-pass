@@ -28,6 +28,31 @@ _FORWARD_BATCH_TARGET = (
 _PREFILL_ADMISSION_TARGET = (
     "sglang.srt.managers.scheduler.Scheduler._get_new_batch_prefill_raw"
 )
+_PREFILL_GRAPH_LOAD_BATCH_TARGET = (
+    "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+    "PrefillCudaGraphRunner.load_batch"
+)
+_PREFILL_GRAPH_CAPTURE_PREPARE_TARGET = (
+    "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+    "PrefillCudaGraphRunner.capture_prepare"
+)
+_DECODE_GRAPH_REPLAY_VIEW_TARGET = (
+    "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
+    "build_replay_fb_view"
+)
+_REQUIRED_HOOK_TARGETS = (
+    _RELEASE_TARGET,
+    _HICACHE_LOAD_TARGET,
+    _EXECUTE_EXTEND_TARGET,
+    _EXECUTE_DECODE_TARGET,
+    _ABORT_TARGET,
+    _REQUEST_FINISH_TARGET,
+    _FORWARD_BATCH_TARGET,
+    _PREFILL_ADMISSION_TARGET,
+    _PREFILL_GRAPH_LOAD_BATCH_TARGET,
+    _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
+    _DECODE_GRAPH_REPLAY_VIEW_TARGET,
+)
 
 
 _OBSERVABILITY_DEGRADED: dict[str, int] = {}
@@ -109,118 +134,136 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
 
 
 def _preserve_prefill_graph_request_metadata() -> None:
-    """Carry request identity through the prefill BCG static batch.
+    """Register official AROUND hooks for the prefill graph metadata views.
 
-    PrefillCudaGraphRunner.load_batch builds a static ForwardBatch for
-    piecewise replay without copying ``rids``; the NTA backend refuses
-    batches without request identity, so replays would fail closed.
-    Prefill pads tokens, not requests, so identity carries one-to-one.
+    PrefillCudaGraphRunner builds a static ForwardBatch without copying
+    ``rids``.  The NTA backend refuses batches without request identity, so
+    replay would fail closed.  These hooks are registered through SGLang's
+    HookRegistry rather than replacing methods directly; that keeps plugin
+    provenance, ordering, duplicate detection, and application lifecycle in
+    one mechanism.
     """
-    from sglang.srt.model_executor.runner import prefill_cuda_graph_runner
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    runner_cls = prefill_cuda_graph_runner.PrefillCudaGraphRunner
-    current = runner_cls.load_batch
-    if getattr(current, "_nta_preserves_request_metadata", False):
-        return
+    _register_hook(
+        HookRegistry,
+        _PREFILL_GRAPH_LOAD_BATCH_TARGET,
+        _preserve_prefill_load_batch,
+        HookType.AROUND,
+    )
+    _register_hook(
+        HookRegistry,
+        _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
+        _preserve_prefill_capture_prepare,
+        HookType.AROUND,
+    )
 
-    def load_batch(self, forward_batch, **kwargs):
-        from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
 
-        static_batch = current(self, forward_batch, **kwargs)
-        static_batch.rids = getattr(forward_batch, "rids", None)
-        static_batch._nta_request_slots = getattr(
-            forward_batch, "_nta_request_slots", None
+def _preserve_prefill_load_batch(original, self, forward_batch, **kwargs):
+    """Copy live request metadata into a static prefill graph batch."""
+    from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+
+    static_batch = original(self, forward_batch, **kwargs)
+    static_batch.rids = getattr(forward_batch, "rids", None)
+    static_batch._nta_request_slots = getattr(
+        forward_batch, "_nta_request_slots", None
+    )
+    if static_batch._nta_request_slots is None:
+        slots = getattr(forward_batch, "req_pool_indices", None)
+        if slots is not None and hasattr(slots, "tolist"):
+            slots = slots.tolist()
+        static_batch._nta_request_slots = slots
+    priorities = getattr(forward_batch, "_nta_request_priorities", None)
+    if priorities is not None:
+        static_batch._nta_request_priorities = priorities
+    tenant_ids = getattr(forward_batch, "_nta_request_tenant_ids", None)
+    if tenant_ids is not None:
+        static_batch._nta_request_tenant_ids = tenant_ids
+    PREFILL_GRAPH_COUNTERS["prefill_graph_served_batches"] += 1
+    return static_batch
+
+
+def _preserve_prefill_capture_prepare(original, self, num_tokens, *args, **kwargs):
+    """Give graph-capture-only prefill batches stable placeholder identity."""
+    from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+
+    result = original(self, num_tokens, *args, **kwargs)
+    PREFILL_GRAPH_COUNTERS["prefill_graph_capture_batches"] += 1
+    forward_batch = result[0] if isinstance(result, tuple) else result
+    if not getattr(forward_batch, "rids", None):
+        batch_size = int(getattr(forward_batch, "batch_size", 1) or 1)
+        forward_batch.rids = tuple(
+            f"__nta_graph_padding_{index}" for index in range(batch_size)
         )
-        if static_batch._nta_request_slots is None:
-            slots = getattr(forward_batch, "req_pool_indices", None)
-            if slots is not None and hasattr(slots, "tolist"):
-                slots = slots.tolist()
-            static_batch._nta_request_slots = slots
-        priorities = getattr(forward_batch, "_nta_request_priorities", None)
-        if priorities is not None:
-            static_batch._nta_request_priorities = priorities
-        tenant_ids = getattr(forward_batch, "_nta_request_tenant_ids", None)
-        if tenant_ids is not None:
-            static_batch._nta_request_tenant_ids = tenant_ids
-        PREFILL_GRAPH_COUNTERS["prefill_graph_served_batches"] += 1
-        return static_batch
-
-    load_batch._nta_preserves_request_metadata = True
-    runner_cls.load_batch = load_batch
-
-    # Startup capture builds dummy batches with no request identity; give
-    # them capture placeholders (mirroring the decode runner's padding
-    # ids) so the fail-closed identity guard admits warmup and capture
-    # without weakening it for real batches.
-    current_prepare = runner_cls.capture_prepare
-    if not getattr(current_prepare, "_nta_preserves_request_metadata", False):
-
-        def capture_prepare(self, num_tokens):
-            from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
-
-            result = current_prepare(self, num_tokens)
-            PREFILL_GRAPH_COUNTERS["prefill_graph_capture_batches"] += 1
-            forward_batch = result[0] if isinstance(result, tuple) else result
-            if not getattr(forward_batch, "rids", None):
-                batch_size = int(getattr(forward_batch, "batch_size", 1) or 1)
-                forward_batch.rids = tuple(
-                    f"__nta_graph_padding_{index}" for index in range(batch_size)
-                )
-                forward_batch._nta_request_priorities = (0,) * batch_size
-                forward_batch._nta_request_tenant_ids = (0,) * batch_size
-            return result
-
-        capture_prepare._nta_preserves_request_metadata = True
-        runner_cls.capture_prepare = capture_prepare
+        forward_batch._nta_request_priorities = (0,) * batch_size
+        forward_batch._nta_request_tenant_ids = (0,) * batch_size
+    return result
 
 
 def _preserve_graph_request_metadata() -> None:
-    """Carry host request identity through SGLang's padded replay view."""
-    from sglang.srt.model_executor.runner import decode_cuda_graph_runner
+    """Register the decode graph replay metadata hook with SGLang."""
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    current = decode_cuda_graph_runner.build_replay_fb_view
-    if getattr(current, "_nta_preserves_request_metadata", False):
-        return
+    _register_hook(
+        HookRegistry,
+        _DECODE_GRAPH_REPLAY_VIEW_TARGET,
+        _preserve_decode_replay_view,
+        HookType.AROUND,
+    )
 
-    def build_replay_fb_view(*args, **kwargs):
-        view = current(*args, **kwargs)
-        forward_batch = kwargs.get("forward_batch", args[0] if args else None)
-        raw_bs = int(kwargs.get("raw_bs", args[3] if len(args) > 3 else 0))
-        padded_bs = int(kwargs.get("bs", args[2] if len(args) > 2 else raw_bs))
-        request_ids = list(getattr(forward_batch, "rids", ()) or ())
-        if len(request_ids) != raw_bs:
-            raise RuntimeError("SGLang graph replay omitted live request IDs")
-        request_ids.extend(
-            f"__nta_graph_padding_{index}" for index in range(raw_bs, padded_bs)
-        )
-        request_slots = getattr(forward_batch, "_nta_request_slots", None)
-        if request_slots is None:
-            request_slots = getattr(forward_batch, "req_pool_indices", None)
-        if request_slots is not None and hasattr(request_slots, "tolist"):
-            request_slots = request_slots.tolist()
-        if request_slots is None or len(request_slots) != raw_bs:
-            raise RuntimeError("SGLang graph replay omitted request-pool slots")
-        view._nta_request_slots = tuple(int(slot) for slot in request_slots)
-        priorities = list(
-            getattr(forward_batch, "_nta_request_priorities", (0,) * raw_bs)
-        )
-        if len(priorities) != raw_bs:
-            raise RuntimeError("SGLang graph replay omitted request priorities")
-        priorities.extend(0 for _ in range(raw_bs, padded_bs))
-        tenant_ids = list(
-            getattr(forward_batch, "_nta_request_tenant_ids", (0,) * raw_bs)
-        )
-        if len(tenant_ids) != raw_bs:
-            raise RuntimeError("SGLang graph replay omitted request tenants")
-        tenant_ids.extend(0 for _ in range(raw_bs, padded_bs))
-        view.rids = request_ids
-        view._nta_request_priorities = tuple(priorities)
-        view._nta_request_tenant_ids = tuple(int(tenant_id) for tenant_id in tenant_ids)
-        view._nta_raw_batch_size = raw_bs
-        return view
 
-    build_replay_fb_view._nta_preserves_request_metadata = True
-    decode_cuda_graph_runner.build_replay_fb_view = build_replay_fb_view
+def _preserve_decode_replay_view(original, *args, **kwargs):
+    """Carry live identity and tenant metadata through padded replay views."""
+    view = original(*args, **kwargs)
+    forward_batch = kwargs.get("forward_batch", args[0] if args else None)
+    raw_bs = int(kwargs.get("raw_bs", args[3] if len(args) > 3 else 0))
+    padded_bs = int(kwargs.get("bs", args[2] if len(args) > 2 else raw_bs))
+    request_ids = list(getattr(forward_batch, "rids", ()) or ())
+    if len(request_ids) != raw_bs:
+        raise RuntimeError("SGLang graph replay omitted live request IDs")
+    request_ids.extend(
+        f"__nta_graph_padding_{index}" for index in range(raw_bs, padded_bs)
+    )
+    request_slots = getattr(forward_batch, "_nta_request_slots", None)
+    if request_slots is None:
+        request_slots = getattr(forward_batch, "req_pool_indices", None)
+    if request_slots is not None and hasattr(request_slots, "tolist"):
+        request_slots = request_slots.tolist()
+    if request_slots is None or len(request_slots) != raw_bs:
+        raise RuntimeError("SGLang graph replay omitted request-pool slots")
+    view._nta_request_slots = tuple(int(slot) for slot in request_slots)
+    priorities = list(getattr(forward_batch, "_nta_request_priorities", (0,) * raw_bs))
+    if len(priorities) != raw_bs:
+        raise RuntimeError("SGLang graph replay omitted request priorities")
+    priorities.extend(0 for _ in range(raw_bs, padded_bs))
+    tenant_ids = list(getattr(forward_batch, "_nta_request_tenant_ids", (0,) * raw_bs))
+    if len(tenant_ids) != raw_bs:
+        raise RuntimeError("SGLang graph replay omitted request tenants")
+    tenant_ids.extend(0 for _ in range(raw_bs, padded_bs))
+    view.rids = request_ids
+    view._nta_request_priorities = tuple(priorities)
+    view._nta_request_tenant_ids = tuple(int(tenant_id) for tenant_id in tenant_ids)
+    view._nta_raw_batch_size = raw_bs
+    return view
+
+
+def _register_hook(registry, target, hook, hook_type) -> None:
+    """Register one hook idempotently while keeping SGLang's source tracking."""
+    hooks = registry._hooks[target]
+    if not any(existing is hook for _, existing, _ in hooks):
+        registry.register(target, hook, hook_type)
+
+
+def _require_hooks_installed(registry) -> None:
+    """Reject a backend construction after SGLang skipped a required hook."""
+    missing = tuple(
+        target for target in _REQUIRED_HOOK_TARGETS if target not in registry._patched
+    )
+    if missing:
+        raise RuntimeError(
+            "NTA SGLang plugin did not install required lifecycle hooks: "
+            + ", ".join(missing)
+        )
 
 
 def _walk_attention_backends(scheduler):
@@ -320,47 +363,37 @@ def register() -> None:
 
     if BACKEND_NAME not in ATTENTION_BACKEND_CHOICES:
         add_attention_backend_choices([BACKEND_NAME])
-    hooks = HookRegistry._hooks[_RELEASE_TARGET]
-    if not any(hook is _flush_backend_stats for _, hook, _ in hooks):
-        HookRegistry.register(_RELEASE_TARGET, _flush_backend_stats, HookType.BEFORE)
-    hicache_hooks = HookRegistry._hooks[_HICACHE_LOAD_TARGET]
-    if not any(hook is route_start_loading for _, hook, _ in hicache_hooks):
-        HookRegistry.register(
-            _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
-        )
+    _register_hook(
+        HookRegistry, _RELEASE_TARGET, _flush_backend_stats, HookType.BEFORE
+    )
+    _register_hook(
+        HookRegistry, _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
+    )
     for forward_target in (_EXECUTE_EXTEND_TARGET, _EXECUTE_DECODE_TARGET):
-        forward_hooks = HookRegistry._hooks[forward_target]
-        if not any(hook is _profile_forward for _, hook, _ in forward_hooks):
-            HookRegistry.register(forward_target, _profile_forward, HookType.AROUND)
-    abort_hooks = HookRegistry._hooks[_ABORT_TARGET]
-    if not any(hook is _cancel_backend_requests for _, hook, _ in abort_hooks):
-        HookRegistry.register(_ABORT_TARGET, _cancel_backend_requests, HookType.BEFORE)
-    finish_hooks = HookRegistry._hooks[_REQUEST_FINISH_TARGET]
-    if not any(hook is _retire_finished_request for _, hook, _ in finish_hooks):
-        HookRegistry.register(
-            _REQUEST_FINISH_TARGET, _retire_finished_request, HookType.BEFORE
+        _register_hook(
+            HookRegistry, forward_target, _profile_forward, HookType.AROUND
         )
-    forward_hooks = HookRegistry._hooks[_FORWARD_BATCH_TARGET]
-    if not any(hook is _attach_request_priorities for _, hook, _ in forward_hooks):
-        HookRegistry.register(
-            _FORWARD_BATCH_TARGET, _attach_request_priorities, HookType.AFTER
-        )
-    admission_hooks = HookRegistry._hooks[_PREFILL_ADMISSION_TARGET]
-    if not any(hook is route_prefill_admission for _, hook, _ in admission_hooks):
-        HookRegistry.register(
-            _PREFILL_ADMISSION_TARGET,
-            route_prefill_admission,
-            HookType.AROUND,
-        )
-    if BACKEND_NAME in ATTENTION_BACKENDS:
-        return
+    _register_hook(
+        HookRegistry, _ABORT_TARGET, _cancel_backend_requests, HookType.BEFORE
+    )
+    _register_hook(
+        HookRegistry, _REQUEST_FINISH_TARGET, _retire_finished_request, HookType.BEFORE
+    )
+    _register_hook(
+        HookRegistry, _FORWARD_BATCH_TARGET, _attach_request_priorities, HookType.AFTER
+    )
+    _register_hook(
+        HookRegistry, _PREFILL_ADMISSION_TARGET, route_prefill_admission, HookType.AROUND
+    )
+    if BACKEND_NAME not in ATTENTION_BACKENDS:
 
-    @register_attention_backend(BACKEND_NAME)
-    def create_backend(model_runner):
-        if model_runner.use_mla_backend:
-            raise ValueError("NTA's SGLang backend does not support MLA models")
-        from nta_runtime.engines.sglang import NtaFlashInferAttnBackend
+        @register_attention_backend(BACKEND_NAME)
+        def create_backend(model_runner):
+            _require_hooks_installed(HookRegistry)
+            if model_runner.use_mla_backend:
+                raise ValueError("NTA's SGLang backend does not support MLA models")
+            from nta_runtime.engines.sglang import NtaFlashInferAttnBackend
 
-        return NtaFlashInferAttnBackend(
-            model_runner, init_new_workspace=model_runner.init_new_workspace
-        )
+            return NtaFlashInferAttnBackend(
+                model_runner, init_new_workspace=model_runner.init_new_workspace
+            )

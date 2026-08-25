@@ -21,6 +21,14 @@ SGLang and vLLM are adapters, not runtime implementations. The native ABI
 stores work and dependencies; the semantic layer validates generation, epoch,
 demand, and availability before native submission.
 
+Both frameworks can select FlashInfer, but FlashInfer is the shared numerical
+operator ABI, not a shared framework lifecycle. SGLang supplies
+`ForwardBatch`/HiCache metadata through its attention-backend and plugin
+registries; vLLM supplies V1 `SchedulerOutput`/`InputBatch` metadata through
+its worker and attention-backend seams. The common layer begins only after
+those projections become an `EngineBatch`; no adapter reaches into the other
+framework's scheduler or cache metadata.
+
 The serving path is exact. Selection is an input trace, not a hidden runtime
 policy. Conventional, late-bound, and exact-partial forms
 share the same work-unit identity and demand trace.
@@ -49,6 +57,12 @@ The LLVM pass uses structural pointer/load proofs only for access shape; the
 typed operator contract supplies request-generation identity, exact demand,
 and tier ownership. An unmarked or incomplete contract never authorizes a
 raw pointer to become a transport request.
+Engine statistics carry a typed consumer contract as well: a scheduler
+projection is not a numerical consumer, and artifact gates reject
+`projection_only` evidence. The schema is implemented once in
+`experiments/consumer_contract.py`; serving and paired-evaluation validators
+share it instead of maintaining independent interpretations of the same
+claim.
 
 See [ENGINE_INTEGRATION.md](ENGINE_INTEGRATION.md) for framework boundaries
 and [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md) for evaluation rules.

@@ -19,7 +19,7 @@ import heapq
 import importlib.metadata
 from typing import Any
 
-from .base import ExactDemandProjection, EngineBatch
+from .base import ConsumerContract, ExactDemandProjection, EngineBatch
 from .vllm import VllmAdapter
 from ..work_unit import Granularity
 
@@ -199,6 +199,20 @@ class VllmV1Hook:
     @property
     def adapter(self) -> VllmAdapter:
         return self._adapter
+
+    def projection_contract(self) -> ConsumerContract:
+        """Describe this hook without overstating what it executes.
+
+        The V1 hook publishes identity and exact block demand.  A model
+        runner or attention backend must replace this projection-only
+        contract with a native or framework-reference consumer contract
+        after it has actually consumed the returned batch.
+        """
+        return ConsumerContract.projection_only(
+            engine="vllm",
+            backend="vllm_v1_worker_projection",
+            engine_version=self._expected_version,
+        )
 
     def _check_version(self) -> None:
         installed = self._version_provider()

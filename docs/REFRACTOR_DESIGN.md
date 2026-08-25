@@ -78,6 +78,12 @@ error of treating reusable wrapper positions as model layers. Every native
 plan unit is looked up by layer, logical tile, and request index and must match
 the session's request binding before upload.
 
+The session keeps an immutable work-id index for that validation boundary. A
+native schedule with `W` work units therefore performs O(W) ticket validation
+for a launch rather than accidentally turning repeated Python-side lookups
+into O(W²) control-plane work. Device-side dependency admission remains
+bounded by the configured intent, ticket, and dependency capacities.
+
 SGLang external pages remain ordinary physical page-table entries. The bridge
 owns the host source rows until the last layer's CUDA completion edge and
 publishes the exact page mapping to the work-unit planner. A batch may contain
@@ -189,11 +195,19 @@ contract. Raw unmarked kernels remain diagnostic-only.
 ## 8. Engineering boundaries
 
 The SGLang implementation is pinned to the tested framework version and FA2
-FlashInfer path. The vLLM boundary is intentionally structural and
-dependency-free: `VllmSchedulerProjection` is the sole framework projection,
-and `EngineBoundary` is the common lifecycle interface. Framework-specific
-code can change that projection and transport binding, not the work-unit core
-or native ABI.
+FlashInfer path. Its out-of-tree package uses the official general-plugin
+entry point, attention-backend registry, and HookRegistry; graph metadata
+preservation is part of that hook lifecycle rather than direct monkey
+patching. The vLLM boundary is intentionally structural and dependency-free:
+`VllmV1Hook` projects the pinned V1 worker, while `EngineBoundary` is the
+common lifecycle interface. Framework-specific code can change that
+projection and transport binding, not the work-unit core or native ABI.
+
+The vLLM general-plugin entry point is only a bootstrap seam. The formal
+numerical consumer must be a pinned V1 `AttentionBackend`/`AttentionImpl`
+integration. A V1 `KVConnector` can stage or fence cache data, but it cannot be
+reported as the NTA numerical consumer by itself. Until that attention seam is
+implemented and verified, vLLM artifacts remain projection-only.
 
 The vLLM projection is executable only when it supplies exact block tables and
 page bytes. An identity-only projection is intentionally rejected by

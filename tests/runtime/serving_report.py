@@ -46,7 +46,22 @@ def single() -> dict[str, object]:
         "correctness": {"verification_failures": 0, "generated_text_sha256": "all"},
         "generated_text_sha256": "all",
         "records": records,
-        "engine_stats": [{"backend": "nta_flashinfer"}],
+        "engine_stats": [
+            {
+                "backend": "nta_flashinfer",
+                "consumer_contract": {
+                    "schema": 1,
+                    "engine": "sglang",
+                    "backend": "nta_flashinfer",
+                    "kind": "native_work_unit",
+                    "exact_demand": True,
+                    "typed_work_plan": True,
+                    "native_submission": True,
+                    "numerical_consumer": True,
+                    "engine_version": "0.5.14",
+                },
+            }
+        ],
         "p50_ttft_seconds": 0.1,
         "p95_ttft_seconds": 0.1,
         "p99_ttft_seconds": 0.1,
@@ -97,6 +112,35 @@ def main() -> None:
         "external_p95_ttft_ratio": 0.9,
     }
     validate(comparison)
+    invalid_contract = copy.deepcopy(comparison)
+    invalid_contract["nta"]["engine_stats"][0]["consumer_contract"]["kind"] = (
+        "projection_only"
+    )
+    invalid_contract["nta"]["engine_stats"][0]["consumer_contract"][
+        "native_submission"
+    ] = False
+    invalid_contract["nta"]["engine_stats"][0]["consumer_contract"][
+        "typed_work_plan"
+    ] = False
+    invalid_contract["nta"]["engine_stats"][0]["consumer_contract"][
+        "numerical_consumer"
+    ] = False
+    try:
+        validate(invalid_contract)
+    except ValueError as error:
+        assert "projection-only" in str(error)
+    else:
+        raise AssertionError("projection-only serving evidence was accepted")
+    invalid_type = copy.deepcopy(comparison)
+    invalid_type["nta"]["engine_stats"][0]["consumer_contract"][
+        "numerical_consumer"
+    ] = 1
+    try:
+        validate(invalid_type)
+    except ValueError as error:
+        assert "not boolean" in str(error)
+    else:
+        raise AssertionError("non-boolean consumer evidence was accepted")
     invalid = copy.deepcopy(comparison)
     invalid["outputs_diverge"] = True
     try:

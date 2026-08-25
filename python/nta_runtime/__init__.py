@@ -84,6 +84,8 @@ _EXPORTS = {
     "ExecutionSession": ("execution_core", "ExecutionSession"),
     "ExecutionTile": ("execution_core", "ExecutionTile"),
     "EngineBatch": ("adapters", "EngineBatch"),
+    "ConsumerContract": ("adapters", "ConsumerContract"),
+    "ConsumerKind": ("adapters", "ConsumerKind"),
     "ExactDemandProjection": ("adapters", "ExactDemandProjection"),
     "EngineBoundary": ("adapters", "EngineBoundary"),
     "SglangAdapter": ("adapters", "SglangAdapter"),

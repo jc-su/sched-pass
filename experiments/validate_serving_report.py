@@ -9,6 +9,11 @@ import math
 from pathlib import Path
 from typing import Any
 
+try:
+    from .consumer_contract import validate_consumer_contract
+except ImportError:  # pragma: no cover - direct script execution
+    from consumer_contract import validate_consumer_contract
+
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
@@ -151,6 +156,24 @@ def _validate_tier_provenance(report: dict[str, Any]) -> None:
                 isinstance(entry.get("tier_capabilities"), dict),
                 "physical-tier serving report has no capability evidence",
             )
+
+
+def _validate_consumer_contract(
+    report: dict[str, Any], *, require_formal_execution: bool
+) -> None:
+    """Validate the numerical consumer, not only the scheduler projection."""
+    for entry in report.get("engine_stats", []):
+        if not isinstance(entry, dict) or entry.get("backend") != "nta_flashinfer":
+            continue
+        try:
+            validate_consumer_contract(
+                entry.get("consumer_contract"),
+                expected_engine="sglang",
+                expected_backend=entry.get("backend"),
+                require_formal_execution=require_formal_execution,
+            )
+        except ValueError as error:
+            raise ValueError(str(error)) from error
 
 
 def _validate_single(
@@ -303,6 +326,9 @@ def _validate_single(
     _validate_workload(report)
     _validate_byte_accounting(report)
     _validate_tier_provenance(report)
+    _validate_consumer_contract(
+        report, require_formal_execution=require_engine_stats
+    )
 
 
 def validate(report: dict[str, Any]) -> dict[str, Any]:

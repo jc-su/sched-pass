@@ -27,6 +27,17 @@ def report(*, compact_ctas: int, canonical_ctas: int) -> dict:
         "engine_stats": [
             {
                 "backend": "nta_flashinfer",
+                "consumer_contract": {
+                    "schema": 1,
+                    "engine": "sglang",
+                    "backend": "nta_flashinfer",
+                    "kind": "native_work_unit",
+                    "exact_demand": True,
+                    "typed_work_plan": True,
+                    "native_submission": True,
+                    "numerical_consumer": True,
+                    "engine_version": "0.5.14",
+                },
                 "hicache_fallback_batches": 0,
                 "hicache_external_batches": 1,
                 "transformed_direct_launches": 0,

@@ -60,23 +60,30 @@ def main() -> None:
     assert ATTENTION_BACKEND_CHOICES.count(BACKEND_NAME) == 1
     assert callable(ATTENTION_BACKENDS[BACKEND_NAME])
 
-    from sglang.srt.model_executor.runner import decode_cuda_graph_runner
-
-    assert getattr(
-        decode_cuda_graph_runner.build_replay_fb_view,
-        "_nta_preserves_request_metadata",
-        False,
-    )
-
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
     from nta_runtime.plugins.sglang import (
         _ABORT_TARGET,
+        _DECODE_GRAPH_REPLAY_VIEW_TARGET,
         _HICACHE_LOAD_TARGET,
+        _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
+        _PREFILL_GRAPH_LOAD_BATCH_TARGET,
         _REQUEST_FINISH_TARGET,
         _RELEASE_TARGET,
         _FORWARD_BATCH_TARGET,
         _PREFILL_ADMISSION_TARGET,
     )
+
+    HookRegistry.apply_hooks()
+
+    for target in (
+        _DECODE_GRAPH_REPLAY_VIEW_TARGET,
+        _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
+        _PREFILL_GRAPH_LOAD_BATCH_TARGET,
+    ):
+        assert any(
+            kind == HookType.AROUND
+            for kind, _, _ in HookRegistry._hooks[target]
+        )
 
     assert any(
         kind == HookType.AROUND

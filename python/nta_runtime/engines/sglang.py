@@ -39,7 +39,7 @@ from nta_runtime.flashinfer_schedule import (
     paged_prefill_schedule,
     require_supported_version,
 )
-from nta_runtime.adapters.base import EngineBatch
+from nta_runtime.adapters.base import ConsumerContract, EngineBatch
 from nta_runtime.adapters.sglang import SglangAdapter, SglangExecutionConfig
 from nta_runtime.execution_core import ExecutionSession, ExecutionTile
 from nta_runtime.execution_protocol import ProtocolKind
@@ -751,6 +751,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "execution_protocol_status": "native_work_unit",
             "execution_demand_semantics": "exact",
             "execution_session_scope": "attention_launch",
+            "consumer_contract": ConsumerContract.native_work_unit(
+                engine="sglang",
+                backend="nta_flashinfer",
+                engine_version=os.environ.get("NTA_SGLANG_VERSION", "0.5.14"),
+            ).as_dict(),
             "revision": os.environ.get("NTA_REVISION", "unknown"),
             "pid": os.getpid(),
             "prefetch_enabled": self._prefetch_enabled,

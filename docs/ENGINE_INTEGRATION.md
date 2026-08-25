@@ -5,13 +5,24 @@ into the same request-bound work-unit contract.
 
 ## SGLang
 
-The plugin is responsible for:
+The installed package uses SGLang's `sglang.srt.plugins` general-plugin
+entry point. Registration is performed during SGLang's plugin-loading phase;
+attention selection goes through SGLang's `ATTENTION_BACKENDS` registry, and
+metadata/lifecycle interception goes through `HookRegistry`. The plugin is
+responsible for:
 
 - registering the pinned `nta_flashinfer` backend;
 - preserving request IDs and request-pool slots through graph views;
 - preserving an optional `_nta_request_tenant_ids` vector through graph views;
 - routing HiCache host-load ownership, admission, cancellation, and release;
 - attaching priority metadata.
+
+Graph replay metadata is installed as `AROUND` hooks for the prefill static
+batch, capture-preparation, and decode replay-view boundaries. It does not
+replace those methods directly. This keeps duplicate detection and hook
+ordering under SGLang's lifecycle, while the pinned version check makes a
+target-path change a hard error when the NTA backend is constructed rather
+than a silent partial install.
 
 `SglangAdapter.bind_forward` converts those fields into an
 `EngineBatch`. The backend then creates an `ExecutionSession` for each
@@ -94,6 +105,16 @@ The hook must not add a second generation tracker, policy taxonomy, or native
 work ABI. The same `ServingTierService` is passed to a pinned consumer hook;
 the tier catalog and native transport are selected once per worker.
 
+vLLM's `vllm.general_plugins` entry point is a process/bootstrap extension
+point; it is not a substitute for the numerical `AttentionBackend`/
+`AttentionImpl` path. vLLM's V1 `KVConnector` lifecycle is useful for
+transport preparation and readiness, but a connector alone is not an NTA
+attention consumer. A complete vLLM integration therefore needs a pinned V1
+attention consumer that calls the same engine-neutral execution core after
+the projection and before the stock FlashInfer numerical result is accepted.
+The vLLM and SGLang adapters may share the FlashInfer operator ABI, but they
+must not share framework metadata or lifecycle code.
+
 `VllmV1Hook` is now a real pinned worker projection, but it is not by itself a
 complete vLLM serving backend: a vLLM model-runner/attention consumer still
 has to pass the returned `EngineBatch` into the NTA execution core. An artifact
@@ -101,6 +122,16 @@ may not label vLLM results as end-to-end evidence until that consumer is wired
 and passes the same exact-demand, correctness, tier-placement, and performance
 gates used by SGLang. Version drift is an intentional hard failure, not a
 best-effort field guess.
+
+The distinction is machine-checked in engine statistics. A
+`consumer_contract.kind` of `projection_only` is valid for adapter tests but
+invalid for serving evidence. `native_work_unit` requires exact demand, a
+typed work plan, native submission, and numerical consumption; a
+`framework_reference` contract is the explicit stock-attention reference
+after an exact acquisition fence. This prevents a scheduler projection or a
+KV-prefetch hook from being mistaken for the NTA attention consumer. The
+artifact validators share `experiments/consumer_contract.py`, so malformed
+types and schema drift fail before an artifact is assembled.
 
 ## Common contract
 

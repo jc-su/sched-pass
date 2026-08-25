@@ -9,6 +9,11 @@ import math
 from pathlib import Path
 from typing import Any
 
+try:
+    from .consumer_contract import validate_consumer_contract
+except ImportError:  # pragma: no cover - direct script execution
+    from consumer_contract import validate_consumer_contract
+
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
@@ -45,6 +50,19 @@ def validate(output: Path) -> dict[str, Any]:
         isinstance(provenance, dict) and provenance.get("trial_count", 0) > 0,
         "report has no trial provenance",
     )
+    contracts = provenance.get("consumer_contracts", [])
+    _require(
+        isinstance(contracts, list),
+        "report consumer contract provenance is not a list",
+    )
+    for contract in contracts:
+        try:
+            validate_consumer_contract(
+                contract,
+                require_formal_execution=True,
+            )
+        except ValueError as error:
+            raise ValueError(f"invalid consumer contract provenance: {error}") from error
     _require(
         isinstance(provenance.get("workload_demand_digest"), str)
         and bool(provenance["workload_demand_digest"]),

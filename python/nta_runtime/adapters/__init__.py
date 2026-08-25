@@ -1,6 +1,8 @@
 """Engine adapters for the engine-neutral NTA execution contract."""
 
 from .base import (
+    ConsumerContract,
+    ConsumerKind,
     ExactDemandProjection,
     EngineBatch,
     EngineBoundary,
@@ -15,6 +17,8 @@ from .vllm_v1 import (
 )
 
 __all__ = [
+    "ConsumerContract",
+    "ConsumerKind",
     "EngineBatch",
     "ExactDemandProjection",
     "EngineBoundary",
