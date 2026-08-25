@@ -57,9 +57,10 @@ The core modules are:
 The native tier contract covers HBM, mapped host memory, host-staged memory,
 NVMe, and CXL DAX. `nta_runtime_get_tier_descriptor` and
 `Runtime.tier_descriptor()` expose the same capability and ownership metadata
-used by device admission and experiments. CXL qualification is explicit via
-`nta-cxl-dax-probe`; without a qualified endpoint the CXL backend stays
-inactive.
+used by device admission and experiments. Physical qualification probes
+auto-discover an already-qualified VFIO NVMe controller and CXL devdax
+endpoint (`nta-vfio-nvme-probe` and `nta-cxl-dax-probe`); without a qualified
+endpoint the corresponding backend stays inactive.
 
 The NVMe production target is a direct READ DMA into HBM, not host staging.
 `runtime/host/` owns VFIO/IOMMUFD administration, `kernel/nta_nvme_p2p/` is the

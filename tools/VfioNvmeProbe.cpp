@@ -4,8 +4,11 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -34,18 +37,100 @@ const char *hbmBackendName(nta::NvmeHbmMappingBackend backend) {
   return "unknown";
 }
 
+std::optional<std::string> discoverVfioNvmeEndpoint() {
+  const std::filesystem::path devices("/sys/bus/pci/devices");
+  std::error_code error;
+  if (!std::filesystem::is_directory(devices, error) || error) {
+    return std::nullopt;
+  }
+  for (const auto &entry : std::filesystem::directory_iterator(devices, error)) {
+    if (error || !entry.is_directory(error)) {
+      continue;
+    }
+    const std::filesystem::path device = entry.path();
+    std::ifstream classFile(device / "class");
+    std::string classCode;
+    if (!(classFile >> classCode) || !classCode.starts_with("0x0108")) {
+      continue;
+    }
+    std::error_code driverError;
+    const std::filesystem::path driver =
+        std::filesystem::read_symlink(device / "driver", driverError);
+    if (driverError || driver.filename() != "vfio-pci") {
+      continue;
+    }
+    bool hasNamespace = false;
+    const std::filesystem::path controllerRoot = device / "nvme";
+    std::error_code namespaceError;
+    if (std::filesystem::is_directory(controllerRoot, namespaceError) &&
+        !namespaceError) {
+      for (const auto &controller : std::filesystem::directory_iterator(
+               controllerRoot, namespaceError)) {
+        if (namespaceError) {
+          break;
+        }
+        std::error_code entryError;
+        if (!std::filesystem::is_directory(controller, entryError) ||
+            entryError) {
+          continue;
+        }
+        for (const auto &namespaceEntry : std::filesystem::directory_iterator(
+                 controller.path(), entryError)) {
+          if (entryError) {
+            break;
+          }
+          const std::string name = namespaceEntry.path().filename().string();
+          if (name.starts_with("nvme") &&
+              name.find('n', std::string("nvme").size()) !=
+                  std::string::npos) {
+            hasNamespace = true;
+            break;
+          }
+        }
+        if (hasNamespace) {
+          break;
+        }
+      }
+    }
+    if (hasNamespace) {
+      return "vfio:" + device.filename().string();
+    }
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
-    if (argc < 2 || argc > 7) {
+    if (argc > 7) {
       throw std::invalid_argument(
-          "usage: nta-vfio-nvme-probe vfio:DDDD:BB:SS.F [gpu] [nsid] [depth] "
+          "usage: nta-vfio-nvme-probe [vfio:DDDD:BB:SS.F] [gpu] [nsid] [depth] "
           "[hardware-write-protect|trusted-read-only-code] "
           "[hbm-peer|host-mapped]");
     }
     nta::NvmeTransportOptions options;
-    options.endpoint = argv[1];
+    const char *configuredEndpoint = std::getenv("NTA_NVME_ENDPOINT");
+    if (argc > 1) {
+      options.endpoint = argv[1];
+    } else if (configuredEndpoint != nullptr && *configuredEndpoint != '\0') {
+      options.endpoint = configuredEndpoint;
+    } else {
+      const char *configuredBdf = std::getenv("NTA_NVME_BDF");
+      if (configuredBdf != nullptr && *configuredBdf != '\0') {
+        options.endpoint = std::string(configuredBdf).starts_with("vfio:")
+                               ? configuredBdf
+                               : "vfio:" + std::string(configuredBdf);
+      } else {
+        options.endpoint = discoverVfioNvmeEndpoint().value_or(std::string{});
+      }
+    }
+    if (options.endpoint.empty()) {
+      std::cerr << "nta-vfio-nvme-probe skipped: no VFIO-bound NVMe "
+                   "controller with a namespace was discovered; bind a "
+                   "dedicated controller or set NTA_NVME_ENDPOINT\n";
+      return 77;
+    }
     if (argc > 2) {
       const std::uint32_t gpu = parse(argv[2], "GPU ordinal", true);
       if (gpu > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {

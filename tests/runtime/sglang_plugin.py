@@ -367,6 +367,17 @@ def main() -> None:
     assert critical.compute_order == ()
     assert progress_bridge.poll_critical_work({resident_id}) is None
     assert progress_bridge.admission_stats()["progress_feedback_consumed"] == 1
+    progress_bridge.close()
+    try:
+        progress_bridge.publish_request_progress(
+            Snapshot((blocked,)),
+            (binding,),
+            bandwidth_bytes_per_second=10_000_000_000,
+        )
+    except RuntimeError as error:
+        assert "closed" in str(error)
+    else:
+        raise AssertionError("closed HiCache bridge accepted progress feedback")
 
     from nta_runtime.engines.sglang import (
         NtaFlashInferAttnBackend,
@@ -386,6 +397,25 @@ def main() -> None:
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
+    class CloseProbe:
+        def __init__(self, log, *, fail: bool = False) -> None:
+            self.log = log
+            self.fail = fail
+
+        def close(self) -> None:
+            self.log.append("close")
+            if self.fail:
+                raise RuntimeError("synthetic close failure")
+
+    partial_log = []
+    partial_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
+    partial_backend._resources_closed = False
+    partial_backend._hicache = CloseProbe(partial_log, fail=True)
+    partial_backend._resources = CloseProbe(partial_log)
+    partial_backend.__del__()
+    assert partial_log == ["close", "close"]
+    assert partial_backend._resources_closed
+
     assert _flag_value(ResourceCapability.DIRECT_ADDRESS | ResourceCapability.HOST_REGISTERED) == 5
     assert (
         _consumer_contract_for_stats({}, engine_version="0.5.16").kind.value

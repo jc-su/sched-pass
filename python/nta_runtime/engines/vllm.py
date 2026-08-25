@@ -288,23 +288,32 @@ class VllmV1WorkerController:
                 "NTA_VLLM_WORK_TICKET_CAPACITY",
                 max(request_capacity, 4 * request_capacity),
             )
-            self._runtime = _build_runtime(runner, request_capacity, work_capacity)
-            tenant_specs = tenant_budget_specs()
-            tenant_capacity = int(self._runtime.config.tenant_capacity)
-            for tenant_id, max_bytes, weight in tenant_specs:
-                if tenant_id >= tenant_capacity:
-                    raise RuntimeError(
-                        f"tenant {tenant_id} exceeds NTA_TENANT_CAPACITY="
-                        f"{tenant_capacity}"
-                    )
-                self._runtime.set_tenant_budget(tenant_id, max_bytes, weight)
-            self._hook = VllmV1Hook(
-                self._runtime,
-                request_capacity,
-                page_bytes=page_bytes,
-                expected_vllm_version=SUPPORTED_VLLM_VERSION,
-                tenant_for_request=tenant_mapper_from_environment(),
-            )
+            runtime = _build_runtime(runner, request_capacity, work_capacity)
+            try:
+                tenant_specs = tenant_budget_specs()
+                tenant_capacity = int(runtime.config.tenant_capacity)
+                for tenant_id, max_bytes, weight in tenant_specs:
+                    if tenant_id >= tenant_capacity:
+                        raise RuntimeError(
+                            f"tenant {tenant_id} exceeds NTA_TENANT_CAPACITY="
+                            f"{tenant_capacity}"
+                        )
+                    runtime.set_tenant_budget(tenant_id, max_bytes, weight)
+                hook = VllmV1Hook(
+                    runtime,
+                    request_capacity,
+                    page_bytes=page_bytes,
+                    expected_vllm_version=SUPPORTED_VLLM_VERSION,
+                    tenant_for_request=tenant_mapper_from_environment(),
+                )
+            except BaseException:
+                try:
+                    runtime.close()
+                except BaseException:
+                    pass
+                raise
+            self._runtime = runtime
+            self._hook = hook
             self._request_capacity = request_capacity
             self._page_bytes = page_bytes
         elif (
@@ -379,6 +388,16 @@ class VllmV1WorkerController:
         self._request_capacity = 0
         if runtime is not None:
             runtime.close()
+
+    def __del__(self) -> None:
+        # vLLM may abandon a worker during initialization (for example after
+        # a tenant policy or KV geometry rejection).  The normal shutdown hook
+        # is not guaranteed to run for that partial worker, so retain the same
+        # best-effort runtime ownership fallback as the serving adapters.
+        try:
+            self.close()
+        except BaseException:
+            pass
 
     @property
     def hook(self) -> VllmV1Hook:

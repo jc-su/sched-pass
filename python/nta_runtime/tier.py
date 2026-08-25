@@ -30,6 +30,8 @@ from .resource_contract import (
 
 
 _UINT64_MAX = (1 << 64) - 1
+_UINT32_MAX = (1 << 32) - 1
+_INT32_MAX = (1 << 31) - 1
 
 
 class ServingTier(str, enum.Enum):
@@ -273,20 +275,36 @@ class ServingTierConfig:
     trust_read_only_device_code: bool = False
 
     def __post_init__(self) -> None:
-        if self.namespace_id <= 0:
-            raise ValueError("namespace_id must be positive")
-        if self.queue_depth <= 0:
-            raise ValueError("queue_depth must be positive")
-        if self.window_bytes < 0:
-            raise ValueError("window_bytes cannot be negative")
-        if self.window_bytes > _UINT64_MAX:
-            raise ValueError("window_bytes exceeds the native uint64 limit")
-        if self.device_ordinal < -1:
-            raise ValueError("device_ordinal must be -1 or nonnegative")
-        if self.issue_budget <= 0 or self.completion_budget <= 0:
-            raise ValueError("NVMe issue and completion budgets must be positive")
-        if self.progress_rounds <= 0 or self.progress_timeout_ns <= 0:
-            raise ValueError("NVMe progress settings must be positive")
+        if not isinstance(self.tier, ServingTier):
+            raise ValueError("tier must be a ServingTier value")
+        for name in (
+            "namespace_id",
+            "queue_depth",
+            "issue_budget",
+            "completion_budget",
+            "progress_rounds",
+        ):
+            _bounded_int(getattr(self, name), name, minimum=1, maximum=_UINT32_MAX)
+        _bounded_int(
+            self.progress_timeout_ns,
+            "progress_timeout_ns",
+            minimum=1,
+            maximum=_UINT64_MAX,
+        )
+        _bounded_int(
+            self.window_bytes,
+            "window_bytes",
+            minimum=0,
+            maximum=_UINT64_MAX,
+        )
+        _bounded_int(
+            self.device_ordinal,
+            "device_ordinal",
+            minimum=-1,
+            maximum=_INT32_MAX,
+        )
+        if not isinstance(self.trust_read_only_device_code, bool):
+            raise ValueError("trust_read_only_device_code must be boolean")
         if self.tier is ServingTier.CXL_DAX and self.window_bytes <= 0:
             raise ValueError("CXL DAX window_bytes must be positive")
         if self.tier is ServingTier.NVME and self.window_bytes != 0:
@@ -468,10 +486,29 @@ class ServingTierService:
         nvme, cxl = self.nvme, self.cxl
         self.nvme = None
         self.cxl = None
+        first_error: BaseException | None = None
         if nvme is not None:
-            nvme.close()
+            try:
+                nvme.close()
+            except BaseException as error:
+                first_error = error
         if cxl is not None:
-            cxl.close()
+            try:
+                cxl.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise RuntimeError("serving tier transport teardown failed") from first_error
+
+    def __del__(self) -> None:
+        # A physical transport can be created before a later capability check
+        # rejects the service.  Keep the same best-effort owner cleanup on that
+        # exceptional construction path as on normal runtime shutdown.
+        try:
+            self.close()
+        except BaseException:
+            pass
 
     @property
     def tier(self) -> ServingTier:
@@ -571,6 +608,25 @@ def _positive_int(value: Any, name: str) -> int:
         raise ValueError(f"{name} must be a positive integer")
     if result <= 0:
         raise ValueError(f"{name} must be a positive integer")
+    return result
+
+
+def _bounded_int(value: Any, name: str, *, minimum: int, maximum: int) -> int:
+    if minimum > 0:
+        result = _positive_int(value, name)
+    elif minimum == 0:
+        result = _nonnegative_int(value, name)
+    else:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+        try:
+            result = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name} must be an integer") from error
+        if isinstance(value, float) and result != value:
+            raise ValueError(f"{name} must be an integer")
+    if result < minimum or result > maximum:
+        raise ValueError(f"{name} is outside [{minimum}, {maximum}]")
     return result
 
 

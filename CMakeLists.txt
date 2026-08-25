@@ -537,6 +537,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_evidence.py
     )
     add_test(
+      NAME nta-stats-publisher
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/stats_publisher.py
+    )
+    add_test(
       NAME nta-opportunity-analysis
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity.py
@@ -576,6 +581,7 @@ if(NTA_ENABLE_CUDA)
       nta-bounded-staging
       nta-qualification-runner
       nta-serving-evidence nta-jit-operator-family
+      nta-stats-publisher
       nta-opportunity-analysis
       nta-opportunity-study nta-tier-qualification
       nta-evaluation-spec nta-evaluation-artifact nta-performance-gate
@@ -922,6 +928,10 @@ if(Python3_Interpreter_FOUND)
       nta-vfio-nvme-probe PRIVATE -Wall -Wextra -Wpedantic -Werror
     )
   endif()
+  add_test(NAME nta-vfio-nvme-probe COMMAND nta-vfio-nvme-probe)
+  set_tests_properties(nta-vfio-nvme-probe PROPERTIES
+    TIMEOUT 60 SKIP_RETURN_CODE 77
+  )
 
   add_executable(nta-cxl-dax-probe tools/CxlDaxProbe.cpp)
   target_include_directories(nta-cxl-dax-probe PRIVATE

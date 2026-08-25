@@ -40,6 +40,7 @@ class _StatsPublisher:
         self._submitted = 0
         self._completed = 0
         self._error: Exception | None = None
+        self._stopping = False
         self._thread = threading.Thread(
             target=self._run, name="nta-stats-publisher", daemon=True
         )
@@ -47,6 +48,10 @@ class _StatsPublisher:
 
     def publish(self, report: dict[str, Any], *, wait: bool = False) -> None:
         with self._condition:
+            if self._stopping:
+                raise RuntimeError("NTA engine statistics publisher is closed")
+            if self._error is not None:
+                raise RuntimeError("NTA engine statistics publisher failed") from self._error
             self._submitted += 1
             sequence = self._submitted
             self._pending = (sequence, report)
@@ -60,10 +65,21 @@ class _StatsPublisher:
                         "failed to publish NTA engine statistics"
                     ) from self._error
 
+    def close(self) -> None:
+        """Stop the writer thread after all already-published work settles."""
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()
+        self._thread.join()
+
     def _run(self) -> None:
         while True:
             with self._condition:
-                self._condition.wait_for(lambda: self._pending is not None)
+                self._condition.wait_for(
+                    lambda: self._pending is not None or self._stopping
+                )
+                if self._pending is None and self._stopping:
+                    return
                 sequence, report = self._pending
                 self._pending = None
             try:

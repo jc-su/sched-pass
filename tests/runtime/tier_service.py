@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +25,7 @@ from nta_runtime.resource_contract import (  # noqa: E402
     resource_contract,
 )
 from nta_runtime.runtime_resources import RuntimeResourceConfig  # noqa: E402
+import nta_runtime.runtime_resources as runtime_resources  # noqa: E402
 
 
 def main() -> None:
@@ -60,6 +62,66 @@ def main() -> None:
         device_ordinal=-1,
     )
     assert config.staging_byte_capacity == (1 << 64) - 1
+    class FakeTier:
+        contract = host_staged
+        nvme = None
+        cxl = None
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FailingRuntime:
+        closed = False
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.constructor_arguments = (_args, _kwargs)
+
+        def tier_descriptor(self, _tier) -> object:
+            raise RuntimeError("descriptor query failed")
+
+        def close(self) -> None:
+            self.closed = True
+
+    class CloseProbe:
+        def __init__(self, log: list[str], name: str, fail: bool = False) -> None:
+            self.log = log
+            self.name = name
+            self.fail = fail
+
+        def close(self) -> None:
+            self.log.append(self.name)
+            if self.fail:
+                raise RuntimeError("synthetic transport close failure")
+
+    close_log: list[str] = []
+    partial_service = ServingTierService.__new__(ServingTierService)
+    partial_service.nvme = CloseProbe(close_log, "nvme", fail=True)
+    partial_service.cxl = CloseProbe(close_log, "cxl")
+    try:
+        partial_service.close()
+    except RuntimeError as error:
+        assert "teardown" in str(error)
+    else:
+        raise AssertionError("tier close failure was silently accepted")
+    assert close_log == ["nvme", "cxl"]
+    assert partial_service.nvme is None and partial_service.cxl is None
+
+    fake_tier = FakeTier()
+    failing_runtime = FailingRuntime()
+    with (
+        patch.object(runtime_resources, "ServingTierService", return_value=fake_tier),
+        patch.object(runtime_resources, "Runtime", return_value=failing_runtime),
+    ):
+        try:
+            runtime_resources.ServingRuntimeResources.open(
+                tier_config=ServingTierConfig(), runtime_config=config
+            )
+        except RuntimeError as error:
+            assert "descriptor query failed" in str(error)
+        else:
+            raise AssertionError("descriptor failure was silently accepted")
+    assert failing_runtime.closed and fake_tier.closed
     try:
         RuntimeResourceConfig(
             request_capacity=0,
@@ -89,9 +151,35 @@ def main() -> None:
     try:
         ServingTierConfig(window_bytes=1 << 64)
     except ValueError as error:
-        assert "uint64" in str(error)
+        assert "window_bytes" in str(error)
     else:
         raise AssertionError("an out-of-range tier window was accepted")
+    for field in ("namespace_id", "queue_depth", "issue_budget", "progress_rounds"):
+        try:
+            ServingTierConfig(**{field: 1 << 32})
+        except ValueError as error:
+            assert field in str(error)
+        else:
+            raise AssertionError(f"{field} overflow was accepted")
+    try:
+        ServingTierConfig(device_ordinal=1 << 31)
+    except ValueError as error:
+        assert "device_ordinal" in str(error)
+    else:
+        raise AssertionError("device ordinal overflow was accepted")
+    try:
+        RuntimeResourceConfig(
+            request_capacity=1 << 32,
+            object_capacity=8,
+            intent_capacity=8,
+            work_ticket_capacity=8,
+            tenant_capacity=4,
+            device_ordinal=-1,
+        )
+    except ValueError as error:
+        assert "request_capacity" in str(error)
+    else:
+        raise AssertionError("runtime uint32 capacity overflow was accepted")
 
     document = {
         "schema": 1,

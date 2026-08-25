@@ -86,20 +86,44 @@ class SglangHiCacheBridge:
             tuple[int, int], tuple[RequestWork, ServiceModel]
         ] = {}
         self._latest_request_key: dict[int, tuple[int, int]] = {}
+        self._closed = False
         _register_bridge(device_pool, self)
 
     def set_prefetch_callback(self, callback: Any) -> None:
         self._prefetch_callback = callback
 
     def close(self) -> None:
-        """Retire every outstanding lease during orderly engine teardown."""
+        """Retire leases and release feedback snapshots during engine teardown.
+
+        The backend synchronizes CUDA before calling this method.  Keeping the
+        synchronization at the backend owner avoids a hidden device-wide sync
+        in the steady-state hook while making it safe to drop snapshots that
+        retain pinned staging buffers.  Every lease is attempted even when one
+        retirement fails, so a single malformed acknowledgement cannot leak
+        the remaining host ownership records.
+        """
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             pending = tuple(self._owned.values())
-        if not pending:
-            return
-        stream = torch.cuda.current_stream()
-        for lease in pending:
-            self.retire(lease, stream=stream)
+        first_error: BaseException | None = None
+        if pending:
+            stream = torch.cuda.current_stream()
+            for lease in pending:
+                try:
+                    self.retire(lease, stream=stream)
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+        with self._lock:
+            self._progress_publications.clear()
+            self._latest_request_work.clear()
+            self._latest_request_key.clear()
+        if first_error is not None:
+            raise RuntimeError(
+                "SGLang HiCache bridge failed to retire one or more leases"
+            ) from first_error
 
     @staticmethod
     def supports(controller: Any) -> bool:
@@ -118,6 +142,9 @@ class SglangHiCacheBridge:
         )
 
     def acquire_load(self, controller: Any) -> int | None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("SGLang HiCache bridge is closed")
         if controller.mem_pool_device is not self.device_pool:
             return None
         if not self.supports(controller):
@@ -283,6 +310,8 @@ class SglangHiCacheBridge:
         model.validate()
         self._drain_progress_publications()
         with self._lock:
+            if self._closed:
+                raise RuntimeError("SGLang HiCache bridge is closed")
             if len(self._progress_publications) >= 8:
                 raise RuntimeError("request-progress publication ring is full")
             self._progress_publications.append(

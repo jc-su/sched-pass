@@ -9,6 +9,7 @@ transport before the native runtime has quiesced.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import numbers
 import os
 
 from .runtime import Runtime, RuntimeConfig, TierKind
@@ -16,6 +17,17 @@ from .tier import ServingTier, ServingTierConfig, ServingTierService
 
 
 _UINT64_MAX = (1 << 64) - 1
+_UINT32_MAX = (1 << 32) - 1
+_INT32_MAX = (1 << 31) - 1
+
+
+def _bounded_integer(value: int, name: str, *, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError(f"{name} must be an integer")
+    result = int(value)
+    if result < minimum or result > maximum:
+        raise ValueError(f"{name} is outside [{minimum}, {maximum}]")
+    return result
 
 
 def _nonnegative_environment(name: str, default: int) -> int:
@@ -49,12 +61,21 @@ class RuntimeResourceConfig:
             "tenant_capacity",
             "max_dependencies_per_work_ticket",
         ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
-        if self.device_ordinal < -1:
-            raise ValueError("device_ordinal must be -1 or nonnegative")
-        if not 0 <= self.staging_byte_capacity <= _UINT64_MAX:
-            raise ValueError("staging_byte_capacity is outside uint64")
+            _bounded_integer(
+                getattr(self, name), name, minimum=1, maximum=_UINT32_MAX
+            )
+        _bounded_integer(
+            self.device_ordinal,
+            "device_ordinal",
+            minimum=-1,
+            maximum=_INT32_MAX,
+        )
+        _bounded_integer(
+            self.staging_byte_capacity,
+            "staging_byte_capacity",
+            minimum=0,
+            maximum=_UINT64_MAX,
+        )
 
     def native(self) -> RuntimeConfig:
         return RuntimeConfig(
@@ -118,36 +139,39 @@ class ServingRuntimeResources:
         runtime_config: RuntimeResourceConfig,
     ) -> "ServingRuntimeResources":
         tier = ServingTierService(tier_config)
+        runtime: Runtime | None = None
         try:
             runtime = Runtime(
                 runtime_config.native(),
                 nvme=tier.nvme,
                 cxl=tier.cxl,
             )
+            native_kind = {
+                ServingTier.HOST_STAGED: TierKind.HOST_STAGED,
+                ServingTier.NVME: TierKind.NVME,
+                ServingTier.CXL_DAX: TierKind.CXL,
+            }[tier_config.tier]
+            descriptor = runtime.tier_descriptor(native_kind)
+            if (
+                not descriptor.active
+                or descriptor.capabilities != tier.contract.capabilities
+                or descriptor.protocol_owner is not tier.contract.protocol_owner
+                or descriptor.payload_owner is not tier.contract.payload_owner
+                or descriptor.transfer_destination_owner
+                is not tier.contract.transfer_destination_owner
+            ):
+                raise RuntimeError(
+                    "native tier descriptor diverges from the selected resource contract"
+                )
         except BaseException:
-            tier.close()
-            raise
-        native_kind = {
-            ServingTier.HOST_STAGED: TierKind.HOST_STAGED,
-            ServingTier.NVME: TierKind.NVME,
-            ServingTier.CXL_DAX: TierKind.CXL,
-        }[tier_config.tier]
-        descriptor = runtime.tier_descriptor(native_kind)
-        if (
-            not descriptor.active
-            or descriptor.capabilities != tier.contract.capabilities
-            or descriptor.protocol_owner is not tier.contract.protocol_owner
-            or descriptor.payload_owner is not tier.contract.payload_owner
-            or descriptor.transfer_destination_owner
-            is not tier.contract.transfer_destination_owner
-        ):
             try:
-                runtime.close()
+                if runtime is not None:
+                    runtime.close()
             finally:
                 tier.close()
-            raise RuntimeError(
-                "native tier descriptor diverges from the selected resource contract"
-            )
+            raise
+        if runtime is None:
+            raise RuntimeError("runtime construction returned no owner")
         return cls(tier, runtime, runtime_config)
 
     def close(self) -> None:

@@ -302,6 +302,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         init_new_workspace: bool = False,
     ) -> None:
         require_supported_version()
+        # Register cleanup state before any operation that may fail.  The
+        # backend constructor opens the selected tier before creating several
+        # CUDA streams and graph-side objects; a later configuration error
+        # must still release that owner when Python destroys the partial
+        # object.
+        self._resources: ServingRuntimeResources | None = None
+        self._resources_closed = True
+        self._closed = True
         if model_runner.server_args.speculative_algorithm is not None:
             raise ValueError(
                 "NTA's SGLang adapter does not support speculative decoding"
@@ -673,36 +681,84 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._stats["request_cancellations"] += cancelled
         return cancelled
 
+    def __del__(self) -> None:
+        """Release resources if construction failed before normal close()."""
+        try:
+            if getattr(self, "_resources_closed", True):
+                return
+            hicache = getattr(self, "_hicache", None)
+            if hicache is not None:
+                try:
+                    hicache.close()
+                except BaseException:
+                    pass
+            resources = getattr(self, "_resources", None)
+            if resources is not None:
+                try:
+                    resources.close()
+                except BaseException:
+                    pass
+            self._resources_closed = True
+        except BaseException:
+            # Destructors cannot safely report or propagate errors. Explicit
+            # close() remains strict; this path only prevents a partial
+            # constructor from retaining a native transport indefinitely.
+            pass
+
     def close(self) -> None:
         """Flush observations and release CUDA/native tier resources."""
         if self._closed:
             return
         self._collect_transfer_profiles()
         self._collect_barrier_profiles()
-        self._write_stats()
+        self._write_stats(strict=True)
 
     def _close_resources(self) -> None:
         if self._resources_closed:
             return
+        errors: list[BaseException] = []
         # Plans, graphs, and native runtime buffers all contain device pointers.
         # Quiesce every stream before releasing them, including direct NVMe HBM
-        # destinations and CXL-backed mappings.
-        torch.cuda.synchronize()
-        self._hicache.close()
+        # destinations and CXL-backed mappings.  Teardown continues after an
+        # individual owner fails so one bad lease cannot leak later owners.
+        try:
+            torch.cuda.synchronize()
+        except BaseException as error:
+            errors.append(error)
+        try:
+            self._hicache.close()
+        except BaseException as error:
+            errors.append(error)
         self._demand_graphs.clear()
         self._demand_graph_warmups.clear()
         self._demand_sync_events.clear()
         for allocation in tuple(self._plans.values()):
-            allocation.plan.close()
+            try:
+                allocation.plan.close()
+            except BaseException as error:
+                errors.append(error)
         self._plans.clear()
         for program in tuple(self._phase_programs.values()):
-            program.close()
+            try:
+                program.close()
+            except BaseException as error:
+                errors.append(error)
         self._phase_programs.clear()
         for program in tuple(self._operator_programs.values()):
-            program.close()
+            try:
+                program.close()
+            except BaseException as error:
+                errors.append(error)
         self._operator_programs.clear()
-        self._resources.close()
+        try:
+            self._resources.close()
+        except BaseException as error:
+            errors.append(error)
         self._resources_closed = True
+        if errors:
+            raise RuntimeError(
+                f"NTA resource teardown encountered {len(errors)} error(s)"
+            ) from errors[0]
 
     def _install_instrumented_wrappers(
         self, model_runner: Any, skip_prefill: bool
@@ -4032,10 +4088,29 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             return
         self._stats_publisher.publish(self._stats_report())
 
-    def _write_stats(self) -> None:
+    def _write_stats(self, *, strict: bool = False) -> None:
         if self._closed:
             return
-        if self._stats_publisher is not None:
-            self._stats_publisher.publish(self._stats_report(), wait=True)
-        self._close_resources()
-        self._closed = True
+        shutdown_error: BaseException | None = None
+        try:
+            if self._stats_publisher is not None:
+                self._stats_publisher.publish(self._stats_report(), wait=True)
+        except BaseException as error:
+            shutdown_error = error
+        finally:
+            try:
+                if self._stats_publisher is not None:
+                    self._stats_publisher.close()
+            except BaseException as error:
+                if shutdown_error is None:
+                    shutdown_error = error
+            try:
+                self._close_resources()
+            except BaseException as error:
+                if shutdown_error is None:
+                    shutdown_error = error
+            self._closed = True
+        if shutdown_error is not None and strict:
+            raise RuntimeError(
+                "NTA engine shutdown completed with a statistics or resource error"
+            ) from shutdown_error
