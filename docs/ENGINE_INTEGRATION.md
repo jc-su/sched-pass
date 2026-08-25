@@ -57,6 +57,13 @@ The SGLang implementation currently requires the tested 0.5.16 API, FA2
 FlashInfer kernels, full-attention page geometry, and valid request identity.
 Unsupported metadata or graph layouts fail closed.
 
+The serving harnesses configure this boundary before importing SGLang.  A
+`nta_flashinfer` invocation of `SglangSmoke.py` or `SglangHiCache.py` therefore
+automatically enters the same ABI-tagged clang/pass/overlay environment as
+`tools/jit/activate.py`; a custom application still uses the activation
+launcher explicitly.  This prevents a module with an NTA filename from being
+compiled by stock nvcc without the exported phase ABI.
+
 The stock FlashInfer wrapper is selected for a resident-only forward. This
 avoids charging requests that never touch HiCache for NTA instrumentation. An
 external forward has two exact cases. If the NTA pipeline has completely
