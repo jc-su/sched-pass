@@ -102,6 +102,13 @@ _MAX_ABI_BYTES = (1 << 32) - 1
 FORWARD_PROFILE: dict[str, float] = {}
 
 
+def _flag_value(value: Any) -> int:
+    """Serialize both IntFlag and Flag values without losing their mask."""
+
+    raw = getattr(value, "value", value)
+    return int(raw)
+
+
 def record_forward(kind: str, milliseconds: float) -> None:
     """Accumulate count/total/max for one forward-kind sample."""
     FORWARD_PROFILE[f"forward_{kind}_count"] = (
@@ -3992,7 +3999,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         report["tier_descriptors"] = [
             {
                 "source_kind": descriptor.source_kind.name.lower(),
-                "capabilities": int(descriptor.capabilities),
+                "capabilities": _flag_value(descriptor.capabilities),
                 "device_state": descriptor.device_state,
                 "estimated_latency_ns": descriptor.estimated_latency_ns,
                 "estimated_bandwidth_bytes_per_second": descriptor.estimated_bandwidth_bytes_per_second,

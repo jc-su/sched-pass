@@ -377,13 +377,16 @@ def main() -> None:
         _group_external_pages_by_request,
         _pipeline_object_range,
         _plan_cache_signature,
+        _flag_value,
     )
+    from nta_runtime.resource_contract import ResourceCapability
     from nta_runtime.flashinfer import (
         request_ranges_for_schedule as _request_ranges,
     )
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
+    assert _flag_value(ResourceCapability.DIRECT_ADDRESS | ResourceCapability.HOST_REGISTERED) == 5
     assert (
         _consumer_contract_for_stats({}, engine_version="0.5.16").kind.value
         == "projection_only"

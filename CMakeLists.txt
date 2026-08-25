@@ -313,6 +313,16 @@ if(Python3_Interpreter_FOUND)
       ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/tier_streaming_evidence.py
   )
+  add_test(
+    NAME nta-flashinfer-overlay
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/flashinfer_overlay.py
+  )
+  set_tests_properties(
+    nta-flashinfer-overlay PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}"
+  )
 endif()
 
 install(

@@ -77,6 +77,7 @@ def configure_jit_environment(args: argparse.Namespace) -> pathlib.Path:
         workspace=args.flashinfer_workspace_base,
         host_cxx=getattr(args, "cuda_host_cxx", None),
         cuda_home=getattr(args, "cuda_home", None),
+        instrumented=args.attention_backend == "nta_flashinfer",
     )
     return host_cxx
 

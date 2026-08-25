@@ -103,6 +103,7 @@ def configure_environment(args: argparse.Namespace) -> pathlib.Path:
         host_cxx=getattr(args, "cuda_host_cxx", None),
         cuda_home=getattr(args, "cuda_home", None),
         revision=os.environ.get("NTA_REVISION", git_value("rev-parse", "HEAD")),
+        instrumented=args.attention_backend == "nta_flashinfer",
     )
     return workspace
 

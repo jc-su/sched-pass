@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 
 
 def _resolve_host_cxx(requested: pathlib.Path | None) -> pathlib.Path:
@@ -94,8 +95,17 @@ def configure_jit_environment(
     host_cxx: pathlib.Path | None = None,
     cuda_home: pathlib.Path | None = None,
     revision: str | None = None,
+    instrumented: bool = False,
 ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
-    """Configure both serving JIT builders and return host/toolkit/workspace."""
+    """Configure serving JIT builders and return host/toolkit/workspace.
+
+    An NTA attention backend must use the complete launcher environment from
+    ``tools/jit/activate.py``.  Configuring only FlashInfer's stock nvcc
+    wrapper is unsafe: the resulting module can have an NTA name and overlay
+    source while missing the exported phase ABI.  ``instrumented=True``
+    therefore activates the pass, overlay, ABI-tagged cache, and runtime
+    library before any framework imports or JIT compilation occur.
+    """
 
     resolved_host_cxx = _resolve_host_cxx(host_cxx)
     resolved_cuda_home = _resolve_cuda_home(cuda_home)
@@ -153,6 +163,66 @@ def configure_jit_environment(
             "NTA_ENGINE_STATS_FILE": str(resolved_workspace / "nta-engine.json"),
         }
     )
+    if instrumented:
+        activation = root / "tools" / "jit" / "activate.py"
+        if not activation.is_file():
+            raise RuntimeError(f"NTA JIT activation script is missing: {activation}")
+        activation_result = subprocess.run(
+            [
+                sys.executable,
+                str(activation),
+                "--build-dir",
+                str(root / "build"),
+                "--cache-root",
+                str(workspace.resolve()),
+                "--cuda-path",
+                str(resolved_cuda_home),
+                "--flashinfer-hook",
+                "--print-env",
+            ],
+            cwd=root,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if activation_result.returncode != 0:
+            detail = activation_result.stderr.strip()
+            raise RuntimeError(
+                "NTA JIT activation failed"
+                + (f": {detail}" if detail else "")
+            )
+        activated: dict[str, str] = {}
+        for line in activation_result.stdout.splitlines():
+            if not line.startswith("export "):
+                continue
+            name, value = line[7:].split("=", 1)
+            parsed = shlex.split(value)
+            if len(parsed) != 1:
+                raise RuntimeError(f"invalid NTA activation export: {line!r}")
+            activated[name] = parsed[0]
+        required = {
+            "FLASHINFER_NVCC",
+            "FLASHINFER_WORKSPACE_BASE",
+            "NTA_PLUGIN",
+            "NTA_RUNTIME_LIBRARY",
+            "NTA_FLASHINFER_HOOK",
+            "NTA_FLASHINFER_OVERLAY",
+        }
+        missing = sorted(required - activated.keys())
+        if missing:
+            raise RuntimeError(
+                "NTA JIT activation did not provide required settings: "
+                + ", ".join(missing)
+            )
+        os.environ.update(activated)
+        resolved_workspace = pathlib.Path(
+            activated["FLASHINFER_WORKSPACE_BASE"]
+        ).resolve()
+        resolved_workspace.mkdir(parents=True, exist_ok=True)
+        for stale in resolved_workspace.glob("nta-engine.*.json"):
+            stale.unlink()
+    os.environ["NTA_ENGINE_STATS_FILE"] = str(resolved_workspace / "nta-engine.json")
     if revision is not None:
         os.environ["NTA_REVISION"] = revision
     return resolved_host_cxx, resolved_cuda_home, resolved_workspace

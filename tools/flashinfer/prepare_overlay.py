@@ -719,7 +719,10 @@ def sha256(path: pathlib.Path) -> str:
 def tree_hash(root: pathlib.Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(
-        candidate for candidate in root.rglob("*") if candidate.is_file()
+        candidate
+        for candidate in root.rglob("*")
+        if candidate.is_file()
+        and not candidate.name.endswith((".bak", ".sched_bak", "~"))
     ):
         digest.update(path.relative_to(root).as_posix().encode("utf-8"))
         digest.update(b"\0")
