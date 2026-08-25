@@ -216,9 +216,10 @@ consumer is the V1 `AttentionBackend`/`AttentionImpl`; a V1 `KVConnector` is
 reserved for an upstream-compatible persistent prefix-cache loading/fence
 path and cannot be reported as the NTA consumer by itself. The native vLLM
 qualification covers eager single-token decode for resident CUDA KV and the
-catalog-backed NVMe/CXL physical path, subject to the corresponding hardware
-and exactness gates. This does not claim that the upstream KVConnector
-prefix-cache/eviction lifecycle is implemented.
+catalog-backed NVMe/CXL physical replay path, subject to
+`NTA_VLLM_PHYSICAL_CATALOG=1` and the corresponding hardware/exactness gates.
+This does not claim that the upstream KVConnector prefix-cache, new-token
+write-back, or eviction lifecycle is implemented.
 
 The vLLM projection is executable only when it supplies exact block tables and
 page bytes. An identity-only projection is intentionally rejected by

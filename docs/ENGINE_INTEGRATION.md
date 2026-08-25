@@ -194,8 +194,11 @@ resident-only run does not exercise a remote-tier dependency and must not pay
 the NTA protocol overhead. When `NTA_SERVING_TIER=nvme` or `cxl_dax`, the same
 native consumer resolves vLLM's exact current block-table pages through the
 immutable tier catalog: NVMe installs runtime-owned HBM destination objects,
-while CXL emits direct device-visible dependencies. The physical profile is
-still hardware-qualified separately and has no stock-attention fallback.
+while CXL emits direct device-visible dependencies. This catalog-replay
+profile additionally requires `NTA_VLLM_PHYSICAL_CATALOG=1`; it is a deliberate
+boundary because the current project does not yet own vLLM's dynamic
+prefix-cache write-back/eviction lifecycle. The physical profile is still
+hardware-qualified separately and has no stock-attention fallback.
 The builder reports no CUDA-graph support until plan upload/replay has its own
 graph-stability gate. Prefill, mixed batches, TRTLLM, and external NVMe/CXL
 loads remain explicit fail-closed boundaries; `NTA_VLLM_ALLOW_STOCK_FALLBACK=1`
@@ -207,7 +210,10 @@ contains the corresponding native launches and tier capability proof. The
 shared vLLM/SGLang runtime and tenant contract are integrated. This direct
 attention path deliberately does not claim implementation of vLLM's upstream
 `KVConnector` prefix-cache protocol: scheduler-side matching, persistent
-prefix ownership, eviction, and connector recovery remain a separate seam.
+prefix ownership, eviction, new-token write-back, and connector recovery
+remain a separate seam. A catalog-replay artifact must contain every page it
+will consume; if a newly allocated vLLM page is absent, the exact catalog lookup
+fails closed instead of reading an unrelated resident page.
 
 `benchmarks/serving/VllmSmoke.py` is the reproducible resident integration gate:
 run it once with `--backend stock` and once with `--backend nta` using the same

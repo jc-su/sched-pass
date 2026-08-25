@@ -50,11 +50,18 @@ def validate_vllm_attention_tier(
         raise RuntimeError(
             "NTA_SERVING_TIER must be host_staged, nvme, or cxl_dax for vLLM"
         )
-    if selected in {"nvme", "cxl_dax"} and values.get("NTA_VLLM_NATIVE", "0") != "1":
-        raise RuntimeError(
-            "vLLM physical tiers require NTA_VLLM_NATIVE=1; stock resident "
-            "attention cannot consume NVMe or CXL-DAX data"
-        )
+    if selected in {"nvme", "cxl_dax"}:
+        if values.get("NTA_VLLM_NATIVE", "0") != "1":
+            raise RuntimeError(
+                "vLLM physical tiers require NTA_VLLM_NATIVE=1; stock resident "
+                "attention cannot consume NVMe or CXL-DAX data"
+            )
+        if values.get("NTA_VLLM_PHYSICAL_CATALOG", "0") != "1":
+            raise RuntimeError(
+                "vLLM physical tiers require the explicit "
+                "NTA_VLLM_PHYSICAL_CATALOG=1 replay profile; the upstream "
+                "KVConnector ownership/write-back lifecycle is not implicit"
+            )
     return selected
 
 

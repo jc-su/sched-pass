@@ -119,10 +119,22 @@ def main() -> None:
             raise AssertionError("vLLM physical tier was accepted without native mode")
         assert (
             validate_vllm_attention_tier(
-                {"NTA_SERVING_TIER": value, "NTA_VLLM_NATIVE": "1"}
+                {
+                    "NTA_SERVING_TIER": value,
+                    "NTA_VLLM_NATIVE": "1",
+                    "NTA_VLLM_PHYSICAL_CATALOG": "1",
+                }
             )
             == ("cxl_dax" if value == "cxl" else value)
         )
+        try:
+            validate_vllm_attention_tier(
+                {"NTA_SERVING_TIER": value, "NTA_VLLM_NATIVE": "1"}
+            )
+        except RuntimeError as error:
+            assert "PHYSICAL_CATALOG" in str(error)
+        else:
+            raise AssertionError("vLLM physical replay profile was implicit")
 
     config = SglangExecutionConfig.from_environment(
         {
