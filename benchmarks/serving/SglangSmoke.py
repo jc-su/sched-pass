@@ -9,7 +9,6 @@ import importlib.metadata
 import json
 import os
 import pathlib
-import shutil
 import statistics
 import time
 from typing import Any
@@ -46,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         default=RESULTS_ROOT / "qualification" / "sglang-flashinfer",
     )
     parser.add_argument("--cuda-host-cxx", type=pathlib.Path)
+    parser.add_argument(
+        "--cuda-home",
+        type=pathlib.Path,
+        help="CUDA toolkit used by both tvm-ffi and FlashInfer JIT",
+    )
     args = parser.parse_args()
     if not args.model.is_dir():
         parser.error(f"model directory does not exist: {args.model}")
@@ -66,55 +70,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_jit_environment(args: argparse.Namespace) -> pathlib.Path:
-    host_cxx = args.cuda_host_cxx
-    if host_cxx is None:
-        discovered = next(
-            (shutil.which(name) for name in ("g++-14", "g++-13", "g++-12")),
-            None,
-        )
-        if discovered is None:
-            raise RuntimeError(
-                "CUDA-compatible host compiler not found; pass --cuda-host-cxx"
-            )
-        host_cxx = pathlib.Path(discovered)
-    host_cxx = host_cxx.resolve()
-    if not host_cxx.is_file():
-        raise RuntimeError(f"CUDA host compiler does not exist: {host_cxx}")
+    from cuda_environment import configure_jit_environment as configure_shared
 
-    configured_launcher = os.environ.get("FLASHINFER_NVCC")
-    launcher = (
-        pathlib.Path(configured_launcher).resolve()
-        if configured_launcher
-        else (ROOT / "tools" / "flashinfer" / "nvcc_compat.py").resolve()
+    host_cxx, _, _ = configure_shared(
+        root=ROOT,
+        workspace=args.flashinfer_workspace_base,
+        host_cxx=getattr(args, "cuda_host_cxx", None),
+        cuda_home=getattr(args, "cuda_home", None),
     )
-    if not launcher.is_file():
-        raise RuntimeError(f"FlashInfer NVCC launcher does not exist: {launcher}")
-    configured_workspace = os.environ.get("FLASHINFER_WORKSPACE_BASE")
-    workspace = (
-        pathlib.Path(configured_workspace).resolve()
-        if configured_workspace
-        else args.flashinfer_workspace_base.resolve()
-    )
-    workspace.mkdir(parents=True, exist_ok=True)
-    for stale in workspace.glob("nta-engine.*.json"):
-        stale.unlink()
-    os.environ["NTA_ENGINE_STATS_FILE"] = str(workspace / "nta-engine.json")
-
-    # CC serves two masters: Triton compiles C11 launcher stubs through $CC
-    # (a C++ compiler breaks them), while FlashInfer's ninja passes $CC to
-    # nvcc as -ccbin (a CUDA-incompatible GCC breaks that). The CUDA-matched
-    # C driver paired with the chosen host C++ compiler satisfies both.
-    host_cc = os.environ.get("CC") or shutil.which(host_cxx.name.replace("g++", "gcc"))
-    if host_cc is None:
-        raise RuntimeError(
-            f"no CUDA-compatible C compiler matches {host_cxx.name}; set CC explicitly"
-        )
-    os.environ["CC"] = str(host_cc)
-    os.environ["CXX"] = str(host_cxx)
-    os.environ["CUDAHOSTCXX"] = str(host_cxx)
-    os.environ["NTA_NVCC_HOST_COMPILER"] = str(host_cxx)
-    os.environ["FLASHINFER_NVCC"] = str(launcher)
-    os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
     return host_cxx
 
 
@@ -193,6 +156,7 @@ def main() -> int:
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "cuda_host_cxx": str(host_cxx),
+        "cuda_home": os.environ.get("CUDA_HOME"),
         "flashinfer_workspace_base": os.environ["FLASHINFER_WORKSPACE_BASE"],
         "model": str(args.model.resolve()),
         "requests": args.requests,

@@ -53,6 +53,7 @@ def main() -> None:
         BACKEND_NAME,
         _EXECUTE_DECODE_TARGET,
         _EXECUTE_EXTEND_TARGET,
+        _attach_request_priorities,
         _require_hooks_installed,
         register,
     )
@@ -117,6 +118,29 @@ def main() -> None:
         kind == HookType.AROUND
         for kind, _, _ in HookRegistry._hooks[_PREFILL_ADMISSION_TARGET]
     )
+
+    # SGLang 0.5.16 passes capture_hidden_mode through ForwardBatch.init_new.
+    # The policy sidecar does not consume that extension argument, but the
+    # hook must remain callable when SGLang adds it (or equivalent arguments).
+    hook_forward_batch = types.SimpleNamespace(
+        rids=("request-0", "request-1"),
+        req_pool_indices=torch.tensor((11, 23), dtype=torch.int32),
+    )
+    hook_batch = types.SimpleNamespace(
+        reqs=(types.SimpleNamespace(priority=0), types.SimpleNamespace(priority=0))
+    )
+    hook_runner = types.SimpleNamespace(
+        server_args=types.SimpleNamespace(enable_priority_scheduling=False)
+    )
+    _attach_request_priorities(
+        hook_forward_batch,
+        object,
+        hook_batch,
+        hook_runner,
+        capture_hidden_mode=None,
+    )
+    assert hook_forward_batch._nta_forward_metadata.request_slots == (11, 23)
+
     from nta_runtime.engines.sglang_admission import (
         AcquisitionAdmission,
         AdmissionConfig,

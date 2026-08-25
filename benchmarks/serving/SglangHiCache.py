@@ -9,7 +9,6 @@ import importlib.metadata
 import json
 import os
 import pathlib
-import shutil
 import statistics
 import subprocess
 import time
@@ -52,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mem-fraction-static", type=float, default=0.35)
     parser.add_argument("--hicache-ratio", type=float, default=4.0)
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
+    parser.add_argument("--cuda-home", type=pathlib.Path)
+    parser.add_argument("--cuda-host-cxx", type=pathlib.Path)
     parser.add_argument(
         "--cuda-graph-decode",
         choices=("disabled", "full"),
@@ -88,35 +89,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_environment(args: argparse.Namespace) -> pathlib.Path:
-    host_cxx = next(
-        (shutil.which(name) for name in ("g++-14", "g++-13", "g++-12")), None
-    )
-    if host_cxx is None:
-        raise RuntimeError("CUDA-compatible host compiler not found")
-    launcher = pathlib.Path(
-        os.environ.get(
-            "FLASHINFER_NVCC", ROOT / "tools" / "flashinfer" / "nvcc_compat.py"
-        )
-    ).resolve()
-    workspace = pathlib.Path(
-        os.environ.get("FLASHINFER_WORKSPACE_BASE", args.flashinfer_workspace_base)
-    ).resolve()
-    workspace.mkdir(parents=True, exist_ok=True)
-    for stale in workspace.glob("nta-engine.*.json"):
-        stale.unlink()
-    os.environ.update(
-        {
-            "CC": host_cxx,
-            "CXX": host_cxx,
-            "CUDAHOSTCXX": host_cxx,
-            "NTA_NVCC_HOST_COMPILER": host_cxx,
-            "FLASHINFER_NVCC": str(launcher),
-            "FLASHINFER_WORKSPACE_BASE": str(workspace),
-            "NTA_ENGINE_STATS_FILE": str(workspace / "nta-engine.json"),
-            "NTA_REVISION": os.environ.get(
-                "NTA_REVISION", git_value("rev-parse", "HEAD")
-            ),
-        }
+    from cuda_environment import configure_jit_environment
+
+    _, _, workspace = configure_jit_environment(
+        root=ROOT,
+        workspace=args.flashinfer_workspace_base,
+        host_cxx=getattr(args, "cuda_host_cxx", None),
+        cuda_home=getattr(args, "cuda_home", None),
+        revision=os.environ.get("NTA_REVISION", git_value("rev-parse", "HEAD")),
     )
     return workspace
 
@@ -161,6 +141,7 @@ def main() -> int:
     args = parse_args()
     workspace = configure_environment(args)
     import sglang as sgl
+    import torch
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()))
@@ -299,6 +280,9 @@ def main() -> int:
         "engine": "sglang",
         "engine_version": importlib.metadata.version("sglang"),
         "flashinfer_version": importlib.metadata.version("flashinfer-python"),
+        "torch_cuda_version": torch.version.cuda,
+        "cuda_home": os.environ.get("CUDA_HOME"),
+        "cuda_host_cxx": os.environ.get("CUDAHOSTCXX"),
         "attention_backend": args.attention_backend,
         "cuda_graph_decode": args.cuda_graph_decode,
         "model": str(args.model.resolve()),

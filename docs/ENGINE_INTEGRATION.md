@@ -131,8 +131,18 @@ The framework distributions must be installed only after the deployment has
 resolved their non-conflicting serving dependencies. `tests/runtime/engine_environment.py`
 and the native CTest gate then verify the actual interpreter, imports, and
 framework/plugin versions; artifact metadata records those versions. Never
-use `pip install -e '.[sglang,vllm]'` as the dual-engine command until the
-upstream pins converge.
+expect `pip install -e '.[sglang,vllm]'` to resolve this profile: pip currently
+rejects the upstream `numba` and `apache-tvm-ffi` pin conflict. After the
+framework environment is provisioned as above, the editable project install
+can be expressed as `pip install -e '.[sglang,vllm]' --no-deps`; the environment
+gate remains mandatory and prevents an unqualified combination from becoming
+an artifact claim.
+
+Serving harnesses share `benchmarks/serving/cuda_environment.py`. They select
+the toolkit matching `torch.version.cuda` (or an explicit `--cuda-home`), pass
+the same host compiler to tvm-ffi and FlashInfer, and apply the glibc feature
+macro workaround only to CUDA toolkits that need it. This avoids silently
+using a `/usr/local/cuda` symlink from a different toolkit generation.
 
 The vLLM plugin has two distinct responsibilities:
 

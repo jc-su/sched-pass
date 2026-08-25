@@ -365,8 +365,15 @@ def _retire_finished_request(processor, req, *args, **kwargs) -> None:
         raise RuntimeError("finished SGLang request omitted its request ID")
 
 
-def _attach_request_priorities(forward_batch, cls, batch, model_runner):
-    del cls
+def _attach_request_priorities(
+    forward_batch, cls, batch, model_runner, *hook_args, **hook_kwargs
+):
+    # SGLang extends ForwardBatch.init_new's hook signature across releases
+    # (for example, capture_hidden_mode was added after the plugin was first
+    # integrated).  The sidecar only depends on the stable batch and runner
+    # objects; accepting and deliberately ignoring extension arguments keeps
+    # the integration version-tolerant without hiding required state.
+    del cls, hook_args, hook_kwargs
     from nta_runtime.adapters.sglang import (
         FORWARD_METADATA_ATTRIBUTE,
         SglangForwardMetadata,
