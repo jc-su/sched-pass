@@ -64,6 +64,13 @@ automatically enters the same ABI-tagged clang/pass/overlay environment as
 launcher explicitly.  This prevents a module with an NTA filename from being
 compiled by stock nvcc without the exported phase ABI.
 
+`SglangSmoke.py` reports backend selection separately from execution evidence:
+`nta_backend_selected` means the requested backend was accepted, while
+`nta_execution_verified` and `nta_integrated` require a published
+`native_work_unit` consumer contract.  A resident-only smoke can therefore
+prove framework/JIT startup and numerical generation without being mistaken
+for an external-tier mechanism run.
+
 The stock FlashInfer wrapper is selected for a resident-only forward. This
 avoids charging requests that never touch HiCache for NTA instrumentation. An
 external forward has two exact cases. If the NTA pipeline has completely
