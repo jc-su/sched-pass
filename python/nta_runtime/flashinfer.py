@@ -39,6 +39,20 @@ def _current_cuda_stream() -> Any:
     return torch.cuda.current_stream()
 
 
+def _stream_is_capturing() -> bool:
+    """Return whether the current stream is inside CUDA graph capture.
+
+    Work-plan consumer fences are host-owned lifetime state. Recording one
+    into a graph would make the event a capture-time dependency and leave the
+    reusable plan with an event whose lifetime no longer matches graph replay.
+    Graph callers publish the fence immediately after replay instead.
+    """
+
+    import torch
+
+    return bool(torch.cuda.is_current_stream_capturing())
+
+
 def direct_requirement(
     direct_base: int,
     bytes: int,
@@ -209,7 +223,8 @@ def enqueue_resident_attention(
         out=out,
         **options,
     )
-    plan.mark_consumed(_current_cuda_stream())
+    if not _stream_is_capturing():
+        plan.mark_consumed(_current_cuda_stream())
 
 
 class FlashInferLayerEpoch:
@@ -247,7 +262,7 @@ class FlashInferLayerEpoch:
         if self.plan.work_item_count <= 0:
             raise ValueError("FlashInfer layer epoch needs an uploaded work plan")
         self.epoch.work_ticket_count = self.plan.work_item_count
-        if self._wait_for_plan:
+        if self._wait_for_plan and not _stream_is_capturing():
             self.plan.wait_on(stream)
 
     def _launch(
@@ -281,7 +296,13 @@ class FlashInferLayerEpoch:
             out=out,
             **options,
         )
-        self.plan.mark_consumed(_current_cuda_stream())
+        if not _stream_is_capturing():
+            self.plan.mark_consumed(_current_cuda_stream())
+
+    def mark_consumed_after_replay(self, stream: Any) -> None:
+        """Publish the plan fence after a graph replay has completed enqueue."""
+
+        self.plan.mark_consumed(stream)
 
     def run_host(
         self,

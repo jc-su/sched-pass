@@ -10,13 +10,19 @@ import re
 import subprocess
 import sys
 
+try:
+    from cuda_toolkit import cuda_release, filter_cuda_include_args, resolve_cuda_home
+except ModuleNotFoundError:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from cuda_toolkit import cuda_release, filter_cuda_include_args, resolve_cuda_home
+
 
 ROOT = pathlib.Path(
     os.environ.get("NTA_PROJECT_ROOT", pathlib.Path(__file__).parents[2])
 ).resolve()
 CLANG = os.environ.get("NTA_CLANG", "clang++-22")
 PLUGIN = os.environ.get("NTA_PLUGIN", "")
-CUDA_PATH = os.environ.get("NTA_CUDA_PATH", "/usr/local/cuda-12.9")
+CUDA_PATH = str(resolve_cuda_home())
 LOG = os.environ.get("NTA_JIT_LOG", "")
 PRELUDE = pathlib.Path(__file__).with_name("clang_cuda_prelude.h")
 
@@ -123,6 +129,10 @@ def prefill_has_cta_tile_32(arguments: list[str]) -> bool:
 
 
 def translate(arguments: list[str], instrument: bool) -> list[str]:
+    # FlashInfer/tvm-ffi may have discovered a different CUDA root before the
+    # NTA launcher runs.  Keep only the selected toolkit include tree; Clang's
+    # --cuda-path and the explicit include below then describe one ABI.
+    arguments = filter_cuda_include_args(arguments)
     command = [
         CLANG,
         "-x",
@@ -328,10 +338,9 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
 def main() -> int:
     arguments = sys.argv[1:]
     if "--version" in arguments:
-        toolkit = re.search(r"cuda-(\d+\.\d+)", CUDA_PATH)
-        release = toolkit.group(1) if toolkit else "12.9"
+        major, minor = cuda_release(pathlib.Path(CUDA_PATH))
         print("nvcc: NVIDIA (R) Cuda compiler driver (NTA clang JIT shim)")
-        print(f"Cuda compilation tools, release {release}, V{release}.0")
+        print(f"Cuda compilation tools, release {major}.{minor}, V{major}.{minor}.0")
         return 0
 
     instrument = should_instrument(arguments)

@@ -2865,6 +2865,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         ],
         eager_events: tuple[torch.cuda.Event, tuple[torch.cuda.Event, ...]],
         on_discovered: Callable[[Any], None] | None,
+        on_replayed: Callable[[], None] | None,
     ) -> torch.Tensor:
         """Warm, capture, or replay one finite incremental operator."""
         captured = self._demand_graphs.get(key)
@@ -2889,6 +2890,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 static_tensor.copy_(current, non_blocking=True)
             captured.query.copy_(query, non_blocking=True)
             captured.graph.replay()
+            if on_replayed is not None:
+                on_replayed()
             self._stats["demand_graph_replays"] += 1
             family_counter = f"demand_graph_{key.operator_family}_replays"
             self._stats[family_counter] = self._stats.get(family_counter, 0) + 1
@@ -2937,6 +2940,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # output. Launch it once after instantiation, preserving stream order
         # with the current plan, directory, and static-query upload.
         graph.replay()
+        if on_replayed is not None:
+            on_replayed()
         self._stats["demand_graph_replays"] += 1
         family_counter = f"demand_graph_{key.operator_family}_replays"
         self._stats[family_counter] = self._stats.get(family_counter, 0) + 1
@@ -3315,6 +3320,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         enqueue_demand,
                         eager_events,
                         on_discovered,
+                        lambda: epoch.mark_consumed_after_replay(stream),
                     )
                 else:
                     enqueue_demand(q, output, eager_events, on_discovered)

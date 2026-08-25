@@ -14,6 +14,17 @@ import shlex
 import subprocess
 import sys
 
+try:
+    from cuda_toolkit import nvcc_path, resolve_cuda_home
+except ModuleNotFoundError:
+    # Installed activation lives in ``bin`` while the JIT helpers live beside
+    # the installed NTA data root.
+    _installed_jit = pathlib.Path(__file__).resolve().parent.parent / "share" / "nta" / "tools" / "jit"
+    if not (_installed_jit / "cuda_toolkit.py").is_file():
+        raise
+    sys.path.insert(0, str(_installed_jit))
+    from cuda_toolkit import nvcc_path, resolve_cuda_home
+
 
 def project_layout(
     script: pathlib.Path, configured_root: str | None
@@ -73,7 +84,13 @@ def main() -> int:
     parser.add_argument("--plugin")
     parser.add_argument("--runtime-library")
     parser.add_argument("--clang", default="/usr/bin/clang++-22")
-    parser.add_argument("--cuda-path", default="/usr/local/cuda-12.9")
+    parser.add_argument(
+        "--cuda-path",
+        help=(
+            "CUDA toolkit root; defaults to NTA_CUDA_PATH/CUDA_HOME, then the "
+            "installed framework CUDA ABI and finally the system nvcc"
+        ),
+    )
     parser.add_argument("--flashinfer-hook", action="store_true")
     parser.add_argument("--print-env", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -114,10 +131,8 @@ def main() -> int:
     except RuntimeError as error:
         parser.error(str(error))
     try:
-        real_nvcc = first_file(
-            [pathlib.Path(options.cuda_path) / "bin" / "nvcc"],
-            "CUDA nvcc",
-        )
+        cuda_home = resolve_cuda_home(options.cuda_path)
+        real_nvcc = first_file([nvcc_path(cuda_home)], "CUDA nvcc")
     except RuntimeError as error:
         parser.error(str(error))
     abi_header = root / "include/nta/RuntimeABI.h"
@@ -177,8 +192,10 @@ def main() -> int:
         "NTA_PROJECT_ROOT": str(root),
         "NTA_PLUGIN": str(plugin),
         "NTA_CLANG": options.clang,
-        "NTA_CUDA_PATH": options.cuda_path,
+        "NTA_CUDA_PATH": str(cuda_home),
         "NTA_REAL_NVCC": str(real_nvcc),
+        "CUDA_HOME": str(cuda_home),
+        "CUDA_PATH": str(cuda_home),
         "NTA_JIT_CACHE_TAG": tag,
         "NTA_ABI_VERSION": str(abi_version),
         "NTA_BUILD_DIR": str(build),

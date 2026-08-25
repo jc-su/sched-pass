@@ -574,7 +574,7 @@ if(NTA_ENABLE_CUDA)
     DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/runtime/device
   )
   install(
-    PROGRAMS tools/jit/nvcc_clang.py
+    PROGRAMS tools/jit/nvcc_clang.py tools/jit/cuda_toolkit.py
     DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/tools/jit
   )
   install(
