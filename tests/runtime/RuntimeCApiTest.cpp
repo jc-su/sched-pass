@@ -11,7 +11,7 @@
 
 namespace {
 
-static_assert(sizeof(nta_tier_descriptor) == 40);
+static_assert(sizeof(nta_tier_descriptor) == 56);
 static_assert(sizeof(nta_cxl_dax_options) == 32);
 static_assert(sizeof(nta_cxl_dax_capabilities) == 32);
 
@@ -73,6 +73,10 @@ int main() {
     require(hbm.source_kind == 0 && hbm.active != 0 &&
                 hbm.estimated_bandwidth_bytes_per_second != 0,
             "HBM tier descriptor is incomplete");
+    require(hbm.protocol_owner == NTA_TIER_OWNER_ENGINE &&
+                hbm.payload_owner == NTA_TIER_OWNER_ENGINE &&
+                hbm.transfer_destination_owner == NTA_TIER_OWNER_NONE,
+            "HBM tier descriptor ownership is incomplete");
 
     requireOk(nta_runtime_set_tenant_budget(runtime, 0, 4096, 1),
               "set tenant budget");

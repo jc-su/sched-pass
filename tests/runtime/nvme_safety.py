@@ -69,6 +69,15 @@ def main() -> None:
     assert "class VfioNvmeControlPlane final : public NvmeControlPlane" in control_plane
     assert "class VfioNvmeControlPlane final : public NvmeMappingBackend" not in control_plane
     assert "mappingBackend_->shutdown()" in control_plane
+    assert "std::shared_ptr<NvmeTransport::Impl> owner;" in runtime
+    assert "detail::NvmeMapping dmaMapping;" in runtime
+    buffer_impl = runtime[runtime.index("struct NvmeBuffer::Impl") :]
+    assert buffer_impl.index("detail::NvmeMapping dmaMapping;") > buffer_impl.index(
+        "std::shared_ptr<NvmeTransport::Impl> owner;"
+    )
+    assert runtime.index("controlPlane.reset()") > runtime.index(
+        "releaseMappingResources(mapping)"
+    )
     assert "mediaPolicy_(options.mediaPolicy)" in control_plane
     assert "Do not issue Set Features" in control_plane
     assert "NTA_NVME_P2P_IOCTL_MAP" in control_plane

@@ -162,18 +162,41 @@ def _validate_consumer_contract(
     report: dict[str, Any], *, require_formal_execution: bool
 ) -> None:
     """Validate the numerical consumer, not only the scheduler projection."""
+    contracts = []
     for entry in report.get("engine_stats", []):
         if not isinstance(entry, dict) or entry.get("backend") != "nta_flashinfer":
             continue
         try:
-            validate_consumer_contract(
-                entry.get("consumer_contract"),
-                expected_engine="sglang",
-                expected_backend=entry.get("backend"),
-                require_formal_execution=require_formal_execution,
+            contracts.append(
+                validate_consumer_contract(
+                    entry.get("consumer_contract"),
+                    expected_engine="sglang",
+                    expected_backend=entry.get("backend"),
+                    require_formal_execution=require_formal_execution,
+                )
             )
         except ValueError as error:
             raise ValueError(str(error)) from error
+    if require_formal_execution:
+        _require(
+            contracts,
+            "formal NTA serving evidence has no numerical consumer",
+        )
+        if any(
+            contract.get("kind") == "framework_reference"
+            for contract in contracts
+        ):
+            stock_external_launches = sum(
+                int(entry.get("stock_prefetched_external_attention_launches", 0))
+                for entry in report.get("engine_stats", [])
+                if isinstance(entry, dict)
+                and entry.get("backend") == "nta_flashinfer"
+            )
+            _require(
+                stock_external_launches > 0,
+                "framework-reference consumer was not backed by an external "
+                "exact prefetch",
+            )
 
 
 def _validate_single(

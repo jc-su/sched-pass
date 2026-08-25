@@ -511,6 +511,7 @@ struct HostRuntime::Impl {
                               std::uint64_t state, std::uint64_t latencyNs,
                               std::uint64_t bandwidth,
                               std::uint32_t flags = 0) {
+        const TierOwnership ownership = defaultTierOwnership(kind);
         const TierDescriptor descriptor{
             kind,
             defaultTierCapabilities(kind),
@@ -519,6 +520,10 @@ struct HostRuntime::Impl {
             bandwidth,
             active ? 1U : 0U,
             flags,
+            static_cast<std::uint32_t>(ownership.protocol),
+            static_cast<std::uint32_t>(ownership.payload),
+            static_cast<std::uint32_t>(ownership.transferDestination),
+            0,
         };
         const std::uint32_t directFlags =
             (descriptor.capabilities & TierDirectAddress) != 0
@@ -573,6 +578,8 @@ struct HostRuntime::Impl {
                 "upload backend directory");
       for (std::size_t index = 0; index < hostBackends.size(); ++index) {
         const abi::BackendView &entry = hostBackends[index];
+        const TierOwnership ownership = defaultTierOwnership(
+            static_cast<abi::SourceKind>(entry.sourceKind));
         tierDescriptors[index] = {
             static_cast<abi::SourceKind>(entry.sourceKind),
             decodeTierCapabilities(entry.flags),
@@ -581,6 +588,10 @@ struct HostRuntime::Impl {
             entry.estimatedBandwidthBytesPerSecond,
             entry.active,
             entry.flags,
+            static_cast<std::uint32_t>(ownership.protocol),
+            static_cast<std::uint32_t>(ownership.payload),
+            static_cast<std::uint32_t>(ownership.transferDestination),
+            0,
         };
       }
       for (abi::TenantContext &tenant : tenantsHost) {

@@ -139,9 +139,11 @@ so the demand digest is not merely an offline annotation.
 Synthetic matrix timing is contract evidence only.  A speedup claim requires a
 structured serving artifact with the same demand trace and correctness digest.
 
-The mandatory tiers are HBM reference, host memory, VFIO NVMe, and CXL DAX.
-Host memory can be direct mapped or bounded staged memory, but the distinction
-is recorded. NVMe requires the explicit read-only VFIO/IOMMU qualification;
+The mandatory serving tiers are HBM reference, host-staged memory, VFIO NVMe,
+and CXL DAX. The current serving path names host memory explicitly as
+`host_staged`; it does not silently switch between mapped and staged host
+access. `host_mapped` is retained as a matched NVMe DMA-destination baseline,
+not as another serving tier. NVMe requires the explicit read-only VFIO/IOMMU qualification;
 its admission gate proves exact GPU-controlled reads directly into HBM through
 the NVIDIA peer-page backend, translated-IOMMU containment, no new target DMAR
 fault, and zero outstanding work. A host-mapped destination is a baseline and

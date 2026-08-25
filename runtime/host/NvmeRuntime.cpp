@@ -658,6 +658,10 @@ struct NvmeBuffer::Impl {
     }
   }
 
+  // Declaration order is part of the lifetime contract: C++ destroys fields
+  // in reverse order, so dmaMapping is released before owner.  The mapping's
+  // non-owning backend pointer is consequently valid even when a buffer
+  // outlives the public NvmeTransport handle.
   std::shared_ptr<NvmeTransport::Impl> owner;
   void *hostAllocation = nullptr;
   void *hostAddress = nullptr;

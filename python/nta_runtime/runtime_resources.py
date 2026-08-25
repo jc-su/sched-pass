@@ -136,6 +136,10 @@ class ServingRuntimeResources:
         if (
             not descriptor.active
             or descriptor.capabilities != tier.contract.capabilities
+            or descriptor.protocol_owner is not tier.contract.protocol_owner
+            or descriptor.payload_owner is not tier.contract.payload_owner
+            or descriptor.transfer_destination_owner
+            is not tier.contract.transfer_destination_owner
         ):
             try:
                 runtime.close()

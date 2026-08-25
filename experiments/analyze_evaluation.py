@@ -120,6 +120,7 @@ def _validate_result(record: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         contracts.append(
             validate_consumer_contract(
                 entry.get("consumer_contract"),
+                expected_kind="native_work_unit",
                 require_formal_execution=True,
             )
         )

@@ -8,8 +8,15 @@ into the same request-bound work-unit contract.
 The installed package uses SGLang's `sglang.srt.plugins` general-plugin
 entry point. Registration is performed during SGLang's plugin-loading phase;
 attention selection goes through SGLang's `ATTENTION_BACKENDS` registry, and
-metadata/lifecycle interception goes through `HookRegistry`. The plugin is
-responsible for:
+metadata/lifecycle interception goes through `HookRegistry`.
+
+The supported environment is installable as `pip install -e '.[sglang]'`.
+The extra pins the tested SGLang and FlashInfer versions; the base package
+does not import either framework. This is important because SGLang's general
+plugin entry point is discovered process-wide and its hook targets are not a
+stable cross-version ABI.
+
+The plugin is responsible for:
 
 - registering the pinned `nta_flashinfer` backend;
 - preserving request IDs and request-pool slots through graph views;
@@ -55,7 +62,9 @@ fallbacks.
 ### Tier attachment
 
 The serving process selects one `ServingTierService` from `NTA_SERVING_TIER`.
-`host_staged` is the default and retains the indexed host path. `nvme`
+`host_staged` is the default host-memory serving tier and retains the indexed
+host path. `host_mapped` is not a second hidden host serving mode: it is the
+explicit matched baseline for an NVMe DMA destination. `nvme`
 requires `NTA_NVME_ENDPOINT` and an exact `NTA_TIER_CATALOG`; each requested
 device-page group is validated as one contiguous K/V extent, installed as an
 HBM object no larger than the controller's advertised MDTS/PRP transfer limit.
@@ -78,12 +87,18 @@ physical-tier result from a host run.
 
 The selected service exposes the same typed resource contract used by the
 native tier descriptor: resource kind, capability set, protocol owner,
-allocation owners, runtime-owned directory, setup requirements, and
-steady-state path. `NTA_STAGING_BYTE_CAPACITY` limits runtime-owned HBM
-staging allocations; engine-owned registered staging is non-owning and must
-be governed by the framework allocator's own quota.
+payload owner, transfer-destination owner, runtime-owned directory, setup
+requirements, and steady-state path. `NTA_STAGING_BYTE_CAPACITY` limits the
+runtime-owned HBM destination of the host-staged path; the engine-owned pinned
+HiCache payload remains under the framework allocator's quota and is borrowed
+only until the explicit CUDA completion fence.
 
 ## vLLM
+
+The projection/adapter contract can be tested with `pip install -e '.[vllm]'`,
+which pins the vLLM V1 layout used by this repository. This extra does not
+make the projection a completed vLLM serving backend; the numerical consumer
+gate below remains mandatory.
 
 The vLLM integration boundary is `VllmV1Hook` for the pinned vLLM 0.13.0 V1
 worker. The dependency-free `VllmSchedulerProjection` remains useful for
@@ -101,17 +116,25 @@ SGLang. The hook checks the installed vLLM version, rejects missing rows,
 multiple KV groups, empty exact demand, and finish/reschedule ID ambiguity. It
 must be called after vLLM's `_update_states` and before the attention launch;
 that call is control-plane metadata publication, not a per-request I/O path.
+`VllmV1Hook.consume_forward` is the typed handoff to the concrete V1
+`AttentionImpl`: it refuses to execute when only the projection exists, and
+passes the exact `EngineBatch` plus framework attention arguments to the
+delegate. This is a real seam for the backend implementation, not a fake
+numerical plugin.
 The hook must not add a second generation tracker, policy taxonomy, or native
-work ABI. The same `ServingTierService` is passed to a pinned consumer hook;
-the tier catalog and native transport are selected once per worker.
+work ABI. The concrete consumer owns the same `ServingTierService` and the
+tier catalog/native transport is selected once per worker; the projection hook
+only hands it the typed batch.
 
 vLLM's `vllm.general_plugins` entry point is a process/bootstrap extension
 point; it is not a substitute for the numerical `AttentionBackend`/
 `AttentionImpl` path. vLLM's V1 `KVConnector` lifecycle is useful for
 transport preparation and readiness, but a connector alone is not an NTA
 attention consumer. A complete vLLM integration therefore needs a pinned V1
-attention consumer that calls the same engine-neutral execution core after
-the projection and before the stock FlashInfer numerical result is accepted.
+`AttentionBackend`/`AttentionImpl` implementation that supplies the
+`VllmV1NumericalConsumer` delegate and calls the same engine-neutral execution
+core after the projection and before the stock FlashInfer numerical result is
+accepted.
 The vLLM and SGLang adapters may share the FlashInfer operator ABI, but they
 must not share framework metadata or lifecycle code.
 

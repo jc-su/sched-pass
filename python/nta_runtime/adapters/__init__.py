@@ -13,6 +13,7 @@ from .vllm import VllmAdapter, VllmSchedulerProjection
 from .vllm_v1 import (
     SUPPORTED_VLLM_V1_VERSION,
     VllmV1Hook,
+    VllmV1NumericalConsumer,
     VllmV1SchedulerProjection,
 )
 
@@ -29,5 +30,6 @@ __all__ = [
     "VllmSchedulerProjection",
     "SUPPORTED_VLLM_V1_VERSION",
     "VllmV1Hook",
+    "VllmV1NumericalConsumer",
     "VllmV1SchedulerProjection",
 ]

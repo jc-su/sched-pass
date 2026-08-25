@@ -11,10 +11,10 @@ import pathlib
 from collections.abc import Iterable
 from typing import Any
 
-from .resource_contract import ResourceCapability
+from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 34
+API_VERSION = 35
 
 
 class RuntimeError(Exception):
@@ -459,6 +459,10 @@ class _TierDescriptor(ctypes.Structure):
         ("estimated_bandwidth_bytes_per_second", ctypes.c_uint64),
         ("active", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
+        ("protocol_owner", ctypes.c_uint32),
+        ("payload_owner", ctypes.c_uint32),
+        ("transfer_destination_owner", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
     ]
 
 
@@ -511,7 +515,7 @@ class _RequestSpec(ctypes.Structure):
 def _validate_abi_layouts() -> None:
     layouts = (
         ("OperatorContract", ctypes.sizeof(_OperatorContract), 80),
-        ("TierDescriptor", ctypes.sizeof(_TierDescriptor), 40),
+        ("TierDescriptor", ctypes.sizeof(_TierDescriptor), 56),
         ("OperatorPlan", ctypes.sizeof(_OperatorPlan), 72),
         ("AcquireRequirement", ctypes.sizeof(AcquireRequirement), 48),
         ("WorkItem", ctypes.sizeof(WorkItem), 64),
@@ -729,6 +733,19 @@ class TierDescriptor:
     estimated_bandwidth_bytes_per_second: int
     active: bool
     flags: int
+    protocol_owner: ResourceOwner
+    payload_owner: ResourceOwner
+    transfer_destination_owner: ResourceOwner | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.protocol_owner, ResourceOwner):
+            raise TypeError("tier protocol owner is not typed")
+        if not isinstance(self.payload_owner, ResourceOwner):
+            raise TypeError("tier payload owner is not typed")
+        if self.transfer_destination_owner is not None and not isinstance(
+            self.transfer_destination_owner, ResourceOwner
+        ):
+            raise TypeError("tier transfer destination owner is not typed")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1588,6 +1605,22 @@ class Runtime(_Owner):
     def tier_descriptor(self, tier: TierKind) -> TierDescriptor:
         native = _TierDescriptor()
         _check(_runtime_tier_descriptor(self._handle, int(tier), ctypes.byref(native)))
+        if native.reserved != 0:
+            raise RuntimeError("native tier descriptor reserved bits are nonzero")
+
+        def owner(value: int, *, optional: bool = False) -> ResourceOwner | None:
+            if value == 0 and optional:
+                return None
+            values = {
+                1: ResourceOwner.ENGINE,
+                2: ResourceOwner.RUNTIME,
+                3: ResourceOwner.TRANSPORT,
+            }
+            try:
+                return values[int(value)]
+            except KeyError as error:
+                raise RuntimeError("native tier descriptor has invalid owner") from error
+
         return TierDescriptor(
             TierKind(native.source_kind),
             TierCapability(native.capabilities),
@@ -1596,6 +1629,9 @@ class Runtime(_Owner):
             native.estimated_bandwidth_bytes_per_second,
             bool(native.active),
             native.flags,
+            owner(native.protocol_owner),
+            owner(native.payload_owner),
+            owner(native.transfer_destination_owner, optional=True),
         )
 
     @property

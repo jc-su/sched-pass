@@ -97,6 +97,13 @@ int main() {
                     123456789 &&
                 calibratedHostStaged.estimatedLatencyNs == 4321,
             "native tier descriptors ignored calibration inputs");
+    require(calibratedHostStaged.protocolOwner ==
+                    static_cast<std::uint32_t>(nta::TierOwner::Runtime) &&
+                calibratedHostStaged.payloadOwner ==
+                    static_cast<std::uint32_t>(nta::TierOwner::Engine) &&
+                calibratedHostStaged.transferDestinationOwner ==
+                    static_cast<std::uint32_t>(nta::TierOwner::Runtime),
+            "host-staged tier descriptor ownership is incomplete");
     require(runtime.deviceOrdinal() == originalDevice,
             "runtime did not retain its CUDA device owner");
     bool uninitializedCancelRejected = false;

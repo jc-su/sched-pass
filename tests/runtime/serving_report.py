@@ -112,6 +112,32 @@ def main() -> None:
         "external_p95_ttft_ratio": 0.9,
     }
     validate(comparison)
+    framework_reference = copy.deepcopy(nta)
+    framework_reference["engine_stats"][0]["consumer_contract"] = {
+        "schema": 1,
+        "engine": "sglang",
+        "backend": "nta_flashinfer",
+        "kind": "framework_reference",
+        "exact_demand": True,
+        "typed_work_plan": False,
+        "native_submission": False,
+        "numerical_consumer": True,
+        "engine_version": "0.5.14",
+    }
+    framework_reference["engine_stats"][0][
+        "stock_prefetched_external_attention_launches"
+    ] = 1
+    validate(framework_reference)
+    invalid_reference = copy.deepcopy(framework_reference)
+    invalid_reference["engine_stats"][0][
+        "stock_prefetched_external_attention_launches"
+    ] = 0
+    try:
+        validate(invalid_reference)
+    except ValueError as error:
+        assert "external exact prefetch" in str(error)
+    else:
+        raise AssertionError("unfenced framework-reference evidence was accepted")
     invalid_contract = copy.deepcopy(comparison)
     invalid_contract["nta"]["engine_stats"][0]["consumer_contract"]["kind"] = (
         "projection_only"
@@ -141,6 +167,16 @@ def main() -> None:
         assert "not boolean" in str(error)
     else:
         raise AssertionError("non-boolean consumer evidence was accepted")
+    invalid_backend = copy.deepcopy(comparison)
+    invalid_backend["nta"]["engine_stats"] = [
+        {"backend": "stock_flashinfer", "latency_ms": 1.0}
+    ]
+    try:
+        validate(invalid_backend)
+    except ValueError as error:
+        assert "numerical consumer" in str(error)
+    else:
+        raise AssertionError("non-NTA engine statistics were accepted as NTA evidence")
     invalid = copy.deepcopy(comparison)
     invalid["outputs_diverge"] = True
     try:

@@ -410,6 +410,10 @@ nta_status nta_runtime_get_tier_descriptor(
         source.estimatedBandwidthBytesPerSecond,
         source.active,
         source.flags,
+        source.protocolOwner,
+        source.payloadOwner,
+        source.transferDestinationOwner,
+        source.reserved,
     };
   });
 }

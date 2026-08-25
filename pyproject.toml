@@ -8,6 +8,20 @@ version = "0.1.0"
 description = "Python engine bindings for finite-kernel nonresident acquisition"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+# The adapters are deliberately version-pinned.  They bind framework-private
+# batch layouts and therefore must not silently run against an unqualified
+# distribution.  Keep the base package engine-neutral and install only the
+# framework extra used by a deployment or artifact.
+sglang = [
+    "sglang==0.5.14",
+    "flashinfer-python==0.6.12",
+]
+vllm = [
+    "vllm==0.13.0",
+    "flashinfer-python==0.6.12",
+]
+
 [project.entry-points."sglang.srt.plugins"]
 nta = "nta_runtime.plugins.sglang:register"
 

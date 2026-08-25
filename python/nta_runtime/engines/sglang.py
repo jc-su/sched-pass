@@ -13,7 +13,7 @@ import os
 import pathlib
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import torch
@@ -102,6 +102,41 @@ def record_forward(kind: str, milliseconds: float) -> None:
     )
     FORWARD_PROFILE[f"forward_{kind}_ms_max"] = max(
         FORWARD_PROFILE.get(f"forward_{kind}_ms_max", 0.0), milliseconds
+    )
+
+
+def _consumer_contract_for_stats(
+    stats: Mapping[str, Any], *, engine_version: str
+) -> ConsumerContract:
+    """Classify the numerical consumer actually represented by one report.
+
+    Backend selection is not execution.  Native launch counters take
+    precedence when a process served a mixed workload; otherwise a complete
+    exact prefetch is a framework-reference consumer, and a resident-only
+    process remains projection-only for evidence purposes.
+    """
+    native_launches = int(stats.get("transformed_direct_launches", 0)) + int(
+        stats.get("ticketed_incremental_launches", 0)
+    )
+    stock_external_launches = int(
+        stats.get("stock_prefetched_external_attention_launches", 0)
+    )
+    if native_launches:
+        return ConsumerContract.native_work_unit(
+            engine="sglang",
+            backend="nta_flashinfer",
+            engine_version=engine_version,
+        )
+    if stock_external_launches:
+        return ConsumerContract.framework_reference(
+            engine="sglang",
+            backend="nta_flashinfer",
+            engine_version=engine_version,
+        )
+    return ConsumerContract.projection_only(
+        engine="sglang",
+        backend="nta_flashinfer",
+        engine_version=engine_version,
     )
 
 
@@ -4231,6 +4266,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._collect_transfer_profiles()
         self._collect_barrier_profiles()
         report = dict(self._stats)
+        consumer_contract = _consumer_contract_for_stats(
+            report,
+            engine_version=os.environ.get("NTA_SGLANG_VERSION", "0.5.14"),
+        )
+        report["consumer_contract"] = consumer_contract.as_dict()
+        report["execution_protocol_status"] = consumer_contract.kind.value
         if self._barrier_stall_by_layer:
             report["profiled_barrier_stall_by_layer_ms"] = {
                 str(layer): round(stall, 4)

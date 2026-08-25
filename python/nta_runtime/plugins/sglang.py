@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import os
 
 
 SUPPORTED_SGLANG_VERSION = "0.5.14"
@@ -40,11 +41,9 @@ _DECODE_GRAPH_REPLAY_VIEW_TARGET = (
     "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
     "build_replay_fb_view"
 )
-_REQUIRED_HOOK_TARGETS = (
+_REQUIRED_LIFECYCLE_HOOK_TARGETS = (
     _RELEASE_TARGET,
     _HICACHE_LOAD_TARGET,
-    _EXECUTE_EXTEND_TARGET,
-    _EXECUTE_DECODE_TARGET,
     _ABORT_TARGET,
     _REQUEST_FINISH_TARGET,
     _FORWARD_BATCH_TARGET,
@@ -54,8 +53,35 @@ _REQUIRED_HOOK_TARGETS = (
     _DECODE_GRAPH_REPLAY_VIEW_TARGET,
 )
 
+# HookRegistry owns ordering and application.  This local set only makes a
+# repeated ``register()`` call idempotent; it deliberately does not inspect or
+# mutate HookRegistry's private hook list.
+_REGISTERED_HOOKS: set[tuple[str, int, str]] = set()
+_PROFILE_FORWARD_ENABLED: bool | None = None
+
 
 _OBSERVABILITY_DEGRADED: dict[str, int] = {}
+
+
+def _required_hook_targets() -> tuple[str, ...]:
+    """Return hooks required by this process's enabled instrumentation.
+
+    Forward timing is diagnostic opt-in.  It must not become a hidden
+    correctness requirement when its hot-path wrappers are intentionally not
+    registered.
+    """
+    targets = list(_REQUIRED_LIFECYCLE_HOOK_TARGETS)
+    if _profile_forward_enabled():
+        targets.extend((_EXECUTE_EXTEND_TARGET, _EXECUTE_DECODE_TARGET))
+    return tuple(targets)
+
+
+def _profile_forward_enabled() -> bool:
+    """Freeze the diagnostic choice at the first plugin registration."""
+    global _PROFILE_FORWARD_ENABLED
+    if _PROFILE_FORWARD_ENABLED is None:
+        _PROFILE_FORWARD_ENABLED = os.environ.get("NTA_PROFILE_FORWARD") == "1"
+    return _PROFILE_FORWARD_ENABLED
 
 
 def _observability_degraded(site: str, error: Exception) -> None:
@@ -84,16 +110,12 @@ def _observability_degraded(site: str, error: Exception) -> None:
 def _profile_forward(original, runner, forward_batch, *args, **kwargs):
     """Time one forward and attribute it to a batch-composition class.
 
-    Enabled by NTA_PROFILE_FORWARD=1. Two CUDA events per forward is
-    the cheapest measurement that answers what a co-resident decode waits
-    behind; the per-lease staging spans cannot answer it because a chunked
-    prefill's staging is spread over several forwards.
+    This function is registered only when ``NTA_PROFILE_FORWARD=1`` at
+    process startup. Two CUDA events per forward is the cheapest measurement
+    that answers what a co-resident decode waits behind; the per-lease staging
+    spans cannot answer it because a chunked prefill's staging is spread over
+    several forwards.
     """
-    import os
-
-    if os.environ.get("NTA_PROFILE_FORWARD") != "1":
-        return original(runner, forward_batch, *args, **kwargs)
-
     import torch
 
     from nta_runtime.engines.sglang import record_forward
@@ -248,16 +270,40 @@ def _preserve_decode_replay_view(original, *args, **kwargs):
 
 
 def _register_hook(registry, target, hook, hook_type) -> None:
-    """Register one hook idempotently while keeping SGLang's source tracking."""
-    hooks = registry._hooks[target]
-    if not any(existing is hook for _, existing, _ in hooks):
-        registry.register(target, hook, hook_type)
+    """Register one hook idempotently through SGLang's public API."""
+    patched = getattr(registry, "_patched", None)
+    if not isinstance(patched, set):
+        raise RuntimeError(
+            "unsupported SGLang HookRegistry: missing its pinned applied-target "
+            "state"
+        )
+    if target in patched:
+        raise RuntimeError(
+            f"cannot register NTA hook after SGLang already applied {target}"
+        )
+    key = (target, id(hook), hook_type.value)
+    if key in _REGISTERED_HOOKS:
+        return
+    registry.register(target, hook, hook_type)
+    _REGISTERED_HOOKS.add(key)
 
 
 def _require_hooks_installed(registry) -> None:
-    """Reject a backend construction after SGLang skipped a required hook."""
+    """Reject construction after SGLang skipped a required hook.
+
+    SGLang 0.5.14 exposes registration publicly but has no public query for
+    whether ``apply_hooks`` succeeded; its loader also logs-and-continues on
+    application errors.  The pinned adapter therefore reads only the
+    version-qualified applied-target set here, and fails closed if that
+    private compatibility seam changes.
+    """
+    patched = getattr(registry, "_patched", None)
+    if not isinstance(patched, set):
+        raise RuntimeError(
+            "unsupported SGLang HookRegistry: cannot verify applied hooks"
+        )
     missing = tuple(
-        target for target in _REQUIRED_HOOK_TARGETS if target not in registry._patched
+        target for target in _required_hook_targets() if target not in patched
     )
     if missing:
         raise RuntimeError(
@@ -369,10 +415,17 @@ def register() -> None:
     _register_hook(
         HookRegistry, _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
     )
-    for forward_target in (_EXECUTE_EXTEND_TARGET, _EXECUTE_DECODE_TARGET):
-        _register_hook(
-            HookRegistry, forward_target, _profile_forward, HookType.AROUND
-        )
+    # Forward timing is diagnostic instrumentation, not part of the serving
+    # contract.  Do not leave an AROUND wrapper on the hottest framework
+    # methods when profiling is disabled: even a fast wrapper adds a Python
+    # call and an environment lookup to every prefill/decode step.  The
+    # process-start setting is intentional; changing it after plugin loading
+    # cannot safely remove an already-applied monkey patch.
+    if _profile_forward_enabled():
+        for forward_target in (_EXECUTE_EXTEND_TARGET, _EXECUTE_DECODE_TARGET):
+            _register_hook(
+                HookRegistry, forward_target, _profile_forward, HookType.AROUND
+            )
     _register_hook(
         HookRegistry, _ABORT_TARGET, _cancel_backend_requests, HookType.BEFORE
     )

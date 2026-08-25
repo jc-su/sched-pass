@@ -26,6 +26,38 @@ def validate(document: dict[str, Any]) -> None:
     tier_ids = {tier.get("id") for tier in document.get("tiers", [])}
     if not {"hbm", "host_mem", "nvme", "dax"} <= tier_ids:
         raise ValueError("evaluation contract lacks HBM/host/NVMe/DAX tiers")
+    expected_resources = {
+        "hbm": ("hbm", "gpu_hbm_load"),
+        "host_mem": ("host_staged", "host_indexed_copy"),
+        "nvme": ("nvme", "gpu_owned_nvme_to_hbm"),
+        "dax": ("cxl_dax", "cuda_visible_cxl_direct"),
+    }
+    tiers = {tier["id"]: tier for tier in document["tiers"]}
+    for tier_id, (resource_kind, steady_state_path) in expected_resources.items():
+        tier = tiers.get(tier_id)
+        if not isinstance(tier, dict):
+            raise ValueError(f"evaluation contract lacks tier object: {tier_id}")
+        if tier.get("resource_kind") != resource_kind:
+            raise ValueError(
+                f"{tier_id} must name resource kind {resource_kind!r}"
+            )
+        if tier.get("steady_state_path") != steady_state_path:
+            raise ValueError(
+                f"{tier_id} must name steady-state path {steady_state_path!r}"
+            )
+    if document.get("matched_baselines") != [
+        {
+            "id": "host_mapped",
+            "resource_kind": "host_mapped",
+            "steady_state_path": "gpu_mapped_host_load",
+            "scope": "nvme_dma_destination",
+            "serving_tier": False,
+        }
+    ]:
+        raise ValueError(
+            "evaluation contract must keep host-mapped as an explicit matched "
+            "baseline, not an ambiguous host serving tier"
+        )
     arms = document.get("arms", [])
     if [arm.get("id") for arm in arms] != [f"B{index}" for index in range(7)]:
         raise ValueError("evaluation contract must define B0-B6 in order")

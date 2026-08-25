@@ -18,6 +18,39 @@ enum TierCapability : std::uint32_t {
   TierIndexedTransfer = 1U << 4,
 };
 
+enum class TierOwner : std::uint32_t {
+  None = 0,
+  Engine = 1,
+  Runtime = 2,
+  Transport = 3,
+};
+
+struct TierOwnership {
+  TierOwner protocol = TierOwner::None;
+  TierOwner payload = TierOwner::None;
+  TierOwner transferDestination = TierOwner::None;
+};
+
+[[nodiscard]] constexpr TierOwnership
+defaultTierOwnership(abi::SourceKind kind) noexcept {
+  switch (kind) {
+  case abi::SourceKind::Hbm:
+  case abi::SourceKind::HostMapped:
+    return {TierOwner::Engine, TierOwner::Engine, TierOwner::None};
+  case abi::SourceKind::HostStaged:
+    return {TierOwner::Runtime, TierOwner::Engine, TierOwner::Runtime};
+  case abi::SourceKind::Nvme:
+    return {TierOwner::Transport, TierOwner::Transport,
+            TierOwner::Transport};
+  case abi::SourceKind::Cxl:
+    return {TierOwner::Transport, TierOwner::Transport, TierOwner::None};
+  case abi::SourceKind::Rdma:
+    return {TierOwner::Transport, TierOwner::Transport,
+            TierOwner::Transport};
+  }
+  return {};
+}
+
 [[nodiscard]] constexpr std::uint32_t
 encodeTierCapabilities(std::uint32_t capabilities) noexcept {
   return (capabilities << abi::BackendTierCapabilityShift) &
@@ -38,8 +71,15 @@ struct TierDescriptor {
   std::uint64_t estimatedBandwidthBytesPerSecond;
   std::uint32_t active;
   std::uint32_t flags;
+  // Ownership fields mirror ResourceContract.  They are setup/lifetime
+  // metadata; the device BackendView still carries only data-path capability
+  // bits so this descriptor does not enlarge the steady-state GPU directory.
+  std::uint32_t protocolOwner;
+  std::uint32_t payloadOwner;
+  std::uint32_t transferDestinationOwner;
+  std::uint32_t reserved;
 };
-static_assert(sizeof(TierDescriptor) == 40);
+static_assert(sizeof(TierDescriptor) == 56);
 
 [[nodiscard]] constexpr std::uint32_t
 defaultTierCapabilities(abi::SourceKind kind) noexcept {

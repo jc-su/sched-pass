@@ -23,11 +23,13 @@ try:
     from .validate_tier_qualification import (
         validate_file as validate_tier_qualification,
     )
+    from .validate_evaluation import validate as validate_evaluation_contract
     from .validate_evaluation_artifact import validate as validate_evaluation_artifact
 except ImportError:
     from validate_workload import validate as validate_workload
     from analyze_evaluation import analyze as analyze_evaluation
     from validate_tier_qualification import validate_file as validate_tier_qualification
+    from validate_evaluation import validate as validate_evaluation_contract
     from validate_evaluation_artifact import validate as validate_evaluation_artifact
 
 
@@ -78,6 +80,7 @@ def validate_spec(
     if evaluation_profile not in EVALUATION_PROFILES:
         raise ValueError("evaluation_profile must be contract or osdi-complete")
     contract = json.loads(EVALUATION_MANIFEST.read_text(encoding="utf-8"))
+    validate_evaluation_contract(contract)
     tiers = {tier["id"] for tier in contract["tiers"]}
     arms = {arm["id"] for arm in contract["arms"]}
     allowed_strata = contract["strata"]

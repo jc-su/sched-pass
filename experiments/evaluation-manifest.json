@@ -8,20 +8,26 @@
     {
       "id": "hbm",
       "role": "resident-reference",
+      "resource_kind": "hbm",
+      "steady_state_path": "gpu_hbm_load",
       "qualification": "always",
       "evidence": ["native_attention_correctness", "native_gpu_timing"]
     },
     {
       "id": "host_mem",
-      "role": "host-registered-memory",
-      "backend": "host-mapped-or-host-staged",
-      "qualification": "cuda_can_map_host_memory",
+      "role": "host-staged-serving-tier",
+      "backend": "indexed-host-staged",
+      "resource_kind": "host_staged",
+      "steady_state_path": "host_indexed_copy",
+      "qualification": "cuda_can_register_pinned_host_memory",
       "evidence": ["native_attention_correctness", "native_gpu_timing", "serving"]
     },
     {
       "id": "nvme",
       "role": "persistent-device-initiated-tier",
       "backend": "vfio-nvme",
+      "resource_kind": "nvme",
+      "steady_state_path": "gpu_owned_nvme_to_hbm",
       "qualification": "explicit_vfio_iommu_and_read_only_contract",
       "evidence": ["transport_qualification", "native_acquisition_correctness", "native_gpu_timing"]
     },
@@ -29,8 +35,19 @@
       "id": "dax",
       "role": "cxl-devdax-tier",
       "backend": "cxl-dax-mapped",
+      "resource_kind": "cxl_dax",
+      "steady_state_path": "cuda_visible_cxl_direct",
       "qualification": "explicit_devdax_endpoint_cuda_visible_mapping",
       "evidence": ["mapping_qualification", "native_attention_correctness", "native_gpu_timing"]
+    }
+  ],
+  "matched_baselines": [
+    {
+      "id": "host_mapped",
+      "resource_kind": "host_mapped",
+      "steady_state_path": "gpu_mapped_host_load",
+      "scope": "nvme_dma_destination",
+      "serving_tier": false
     }
   ],
   "research_questions": [

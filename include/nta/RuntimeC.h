@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 34U
+#define NTA_RUNTIME_C_API_VERSION 35U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -48,6 +48,13 @@ typedef enum nta_nvme_hbm_mapping_backend {
   NTA_NVME_HBM_MAPPING_UNAVAILABLE = 0,
   NTA_NVME_HBM_MAPPING_NVIDIA_PEER_PAGES = 1,
 } nta_nvme_hbm_mapping_backend;
+
+typedef enum nta_tier_owner {
+  NTA_TIER_OWNER_NONE = 0,
+  NTA_TIER_OWNER_ENGINE = 1,
+  NTA_TIER_OWNER_RUNTIME = 2,
+  NTA_TIER_OWNER_TRANSPORT = 3,
+} nta_tier_owner;
 
 typedef struct nta_runtime_config {
   uint32_t struct_size;
@@ -192,6 +199,10 @@ typedef struct nta_tier_descriptor {
   uint64_t estimated_bandwidth_bytes_per_second;
   uint32_t active;
   uint32_t flags;
+  uint32_t protocol_owner;
+  uint32_t payload_owner;
+  uint32_t transfer_destination_owner;
+  uint32_t reserved;
 } nta_tier_descriptor;
 
 typedef struct nta_epoch_status {
@@ -510,7 +521,8 @@ nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        uint32_t issue_budget,
                                        uint32_t completion_budget,
                                        uint64_t cuda_stream);
-/* C API v34: completion-driven NVMe progress. One launch remains active until
+/* C API v35: typed tier ownership is exported with each descriptor; this
+ * retains the completion-driven NVMe progress API. One launch remains active until
  * both the acquisition intent queue and controller queue are idle, or the
  * device-side timeout expires. */
 nta_status nta_jit_phase_progress_nvme_until_idle(

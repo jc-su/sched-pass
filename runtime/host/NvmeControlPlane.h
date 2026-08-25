@@ -48,6 +48,12 @@ class NvmeMappingBackend;
 // description consumed by the GPU queue; the backend token is released by the
 // lease destructor.  Callers cannot accidentally release a peer mapping through
 // the host IOAS path, and no steady-state I/O operation needs this object.
+//
+// The backend pointer is intentionally non-owning: NvmeBuffer::Impl retains a
+// shared owner of the complete NvmeTransport::Impl before it stores this lease.
+// That owner keeps the control plane and mapping backend alive until the lease
+// is destroyed, including when the public NvmeTransport handle is moved or
+// destroyed before the buffer.
 class NvmeMapping {
 public:
   NvmeMapping() = default;

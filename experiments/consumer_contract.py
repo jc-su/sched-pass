@@ -28,6 +28,7 @@ def validate_consumer_contract(
     *,
     expected_engine: str | None = None,
     expected_backend: str | None = None,
+    expected_kind: str | None = None,
     require_formal_execution: bool = False,
 ) -> dict[str, Any]:
     """Validate and return a normalized consumer contract."""
@@ -51,6 +52,16 @@ def validate_consumer_contract(
     kind = value["kind"]
     if kind not in CONSUMER_KINDS:
         raise ValueError(f"unknown consumer contract kind: {kind!r}")
+    if expected_kind is not None and kind != expected_kind:
+        if kind == "projection_only":
+            raise ValueError(
+                "projection-only consumer contract cannot satisfy the expected "
+                f"kind {expected_kind!r}"
+            )
+        raise ValueError(
+            "consumer contract kind diverges from the expected kind: "
+            f"{kind!r} != {expected_kind!r}"
+        )
     booleans: dict[str, bool] = {}
     for field in _BOOLEAN_FIELDS:
         field_value = value.get(field)

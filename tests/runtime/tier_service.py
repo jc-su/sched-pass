@@ -32,18 +32,25 @@ def main() -> None:
     host_staged = resource_contract(ResourceKind.HOST_STAGED)
     nvme = resource_contract(ResourceKind.NVME)
     cxl = resource_contract(ResourceKind.CXL_DAX)
-    assert hbm.direct_device_visible and hbm.owner is ResourceOwner.ENGINE
+    assert (
+        hbm.direct_device_visible
+        and hbm.protocol_owner is ResourceOwner.ENGINE
+        and hbm.payload_owner is ResourceOwner.ENGINE
+        and hbm.transfer_destination_owner is None
+    )
     assert host_mapped.direct_device_visible
     assert host_staged.uses_host_proxy and not host_staged.physical
     assert nvme.physical and not nvme.direct_device_visible
     assert cxl.physical and cxl.direct_device_visible
     assert host_staged.directory_owner is ResourceOwner.RUNTIME
-    assert host_staged.allocation_owners == {
-        ResourceOwner.ENGINE,
-        ResourceOwner.RUNTIME,
-    }
-    assert nvme.allocation_owners == {ResourceOwner.TRANSPORT}
+    assert host_staged.protocol_owner is ResourceOwner.RUNTIME
+    assert host_staged.payload_owner is ResourceOwner.ENGINE
+    assert host_staged.transfer_destination_owner is ResourceOwner.RUNTIME
+    assert nvme.protocol_owner is ResourceOwner.TRANSPORT
+    assert nvme.payload_owner is ResourceOwner.TRANSPORT
+    assert nvme.transfer_destination_owner is ResourceOwner.TRANSPORT
     assert nvme.as_dict()["steady_state_path"] == "gpu_owned_nvme_to_hbm"
+    assert nvme.as_dict()["transfer_destination_owner"] == "transport"
     config = RuntimeResourceConfig.with_environment_staging_limit(
         request_capacity=4,
         object_capacity=8,

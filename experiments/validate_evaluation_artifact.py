@@ -59,6 +59,7 @@ def validate(output: Path) -> dict[str, Any]:
         try:
             validate_consumer_contract(
                 contract,
+                expected_kind="native_work_unit",
                 require_formal_execution=True,
             )
         except ValueError as error:

@@ -17,7 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import heapq
 import importlib.metadata
-from typing import Any
+from typing import Any, Protocol
 
 from .base import ConsumerContract, ExactDemandProjection, EngineBatch
 from .vllm import VllmAdapter
@@ -25,6 +25,20 @@ from ..work_unit import Granularity
 
 
 SUPPORTED_VLLM_V1_VERSION = "0.13.0"
+
+
+class VllmV1NumericalConsumer(Protocol):
+    """The explicit handoff from vLLM V1 metadata to numerical execution.
+
+    A scheduler projection is not an attention implementation.  The concrete
+    vLLM ``AttentionImpl`` adapter supplies this delegate after it has been
+    constructed in the worker, so the identity/demand boundary remains
+    testable without importing vLLM in the core runtime.
+    """
+
+    def consumer_contract(self) -> ConsumerContract: ...
+
+    def consume(self, batch: EngineBatch, **attention_args: Any) -> Any: ...
 
 
 def _installed_vllm_version() -> str | None:
@@ -182,6 +196,7 @@ class VllmV1Hook:
         tenant_for_request: Callable[[str], int] | None = None,
         priority_for_request: Callable[[str], int] | None = None,
         deadline_for_request: Callable[[str], int] | None = None,
+        consumer: VllmV1NumericalConsumer | None = None,
     ) -> None:
         if page_bytes <= 0:
             raise ValueError("vLLM V1 page_bytes must be positive")
@@ -195,6 +210,7 @@ class VllmV1Hook:
         self._tenant_for_request = tenant_for_request
         self._priority_for_request = priority_for_request
         self._deadline_for_request = deadline_for_request
+        self._consumer = consumer
 
     @property
     def adapter(self) -> VllmAdapter:
@@ -213,6 +229,20 @@ class VllmV1Hook:
             backend="vllm_v1_worker_projection",
             engine_version=self._expected_version,
         )
+
+    def consumer_contract(self) -> ConsumerContract:
+        """Return the contract of the numerical delegate, if one is wired."""
+        if self._consumer is None:
+            return self.projection_contract()
+        contract = self._consumer.consumer_contract()
+        if not isinstance(contract, ConsumerContract):
+            raise TypeError("vLLM V1 numerical consumer returned no typed contract")
+        if contract.engine != "vllm" or not contract.formal_execution:
+            raise RuntimeError(
+                "vLLM V1 numerical consumer must provide a formal vLLM "
+                "consumer contract"
+            )
+        return contract
 
     def _check_version(self) -> None:
         installed = self._version_provider()
@@ -270,3 +300,35 @@ class VllmV1Hook:
             exact_demand=projection.exact_demand(),
             granularity=granularity,
         )
+
+    def consume_forward(
+        self,
+        scheduler_output: Any,
+        input_batch: Any,
+        *,
+        epoch: int,
+        stream: Any = None,
+        granularity: Granularity = Granularity.PAGE_GROUP,
+        **attention_args: Any,
+    ) -> Any:
+        """Bind one V1 step and hand it to the real numerical consumer.
+
+        This is the only vLLM-to-NTA execution seam.  It performs no transport
+        operation itself; a concrete ``AttentionImpl`` owns the numerical
+        launch and may consume the typed batch plus framework attention
+        arguments.  Calling it without that implementation is an explicit
+        error rather than a stock-attention disguise.
+        """
+        if self._consumer is None:
+            raise RuntimeError(
+                "vLLM V1 projection has no numerical attention consumer"
+            )
+        batch = self.bind_forward(
+            scheduler_output,
+            input_batch,
+            epoch=epoch,
+            stream=stream,
+            granularity=granularity,
+        )
+        self.consumer_contract()
+        return self._consumer.consume(batch, **attention_args)

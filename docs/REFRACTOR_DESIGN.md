@@ -49,13 +49,17 @@ shape and lowers typed markers only when the module contract supplies
 generation, exact-demand, and tier-ownership guarantees. No serving path
 silently changes the numerical demand contract.
 
-Resource ownership is split into three explicit domains. The transport/control
-owner drives the backend protocol, the runtime owns the device directory, and
-`allocation_owners` records who may allocate or lend payload memory. This
-distinction matters for host-staged transfers: the native object API may own
-the HBM staging destination, while an engine adapter may register an existing
-staging tensor. NVMe and CXL-DAX mappings remain transport-owned; their
-steady-state path never includes a host proxy or a per-request control ioctl.
+Resource ownership is split into explicit domains. The
+`protocol_owner` drives the backend protocol, the runtime owns the device
+directory, `payload_owner` owns the bytes in the selected tier, and
+`transfer_destination_owner` owns a temporary or device destination when the
+path materializes one. A `None` destination means the resource is consumed
+directly. This avoids treating a set of permitted allocators as the owner of
+one actual transfer: host-staged payload is engine-owned and its bounded HBM
+destination is runtime-owned, while NVMe media and its direct-HBM destination
+are transport-owned and CXL-DAX is consumed directly from transport-owned
+mapped storage. NVMe and CXL-DAX steady-state paths never include a host proxy
+or a per-request control ioctl.
 
 ## 3. Execution flow
 
@@ -142,11 +146,13 @@ coordination under exact demand.
 ## 7. Tier and compiler contract
 
 The C++ `TierDescriptor`, device `BackendView` capability mask, C runtime API,
-and Python `TierDescriptor` are one ABI-level tier contract. HBM,
-HostMapped, HostStaged, NVMe, and CXL DAX are backend classes, not scheduling
-policies. NVMe is device-initiated transport; CXL DAX is a bounded
-device-visible mapped replica. Hardware-specific qualification is explicit
-and fail-closed.
+and Python `TierDescriptor` are one ABI-level tier contract. The descriptor
+exports capabilities and the typed protocol/payload/destination owners, so a
+Python adapter cannot accept a capability-compatible but lifetime-incompatible
+native backend. HBM, HostMapped, HostStaged, NVMe, and CXL DAX are backend
+classes, not scheduling policies. NVMe is device-initiated transport; CXL DAX
+is a bounded device-visible mapped replica. Hardware-specific qualification is
+explicit and fail-closed.
 
 The NVMe implementation has two separate lifecycle owners. The control plane
 owns VFIO attachment, controller reset, queue creation, BAR/doorbell state, and

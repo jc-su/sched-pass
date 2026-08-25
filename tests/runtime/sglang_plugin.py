@@ -51,16 +51,25 @@ def main() -> None:
 
     from nta_runtime.plugins.sglang import (
         BACKEND_NAME,
+        _EXECUTE_DECODE_TARGET,
+        _EXECUTE_EXTEND_TARGET,
+        _require_hooks_installed,
         register,
     )
+    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    register()
-    register()
+    # Profiling is an explicit process-start diagnostic.  The default plugin
+    # must not wrap SGLang's hottest forward methods.
+    with patch.dict("os.environ", {"NTA_PROFILE_FORWARD": "0"}):
+        register()
+        register()
     assert BACKEND_NAME in ATTENTION_BACKENDS
     assert ATTENTION_BACKEND_CHOICES.count(BACKEND_NAME) == 1
     assert callable(ATTENTION_BACKENDS[BACKEND_NAME])
 
-    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+    for target in (_EXECUTE_EXTEND_TARGET, _EXECUTE_DECODE_TARGET):
+        assert target not in HookRegistry._hooks
+
     from nta_runtime.plugins.sglang import (
         _ABORT_TARGET,
         _DECODE_GRAPH_REPLAY_VIEW_TARGET,
@@ -74,6 +83,7 @@ def main() -> None:
     )
 
     HookRegistry.apply_hooks()
+    _require_hooks_installed(HookRegistry)
 
     for target in (
         _DECODE_GRAPH_REPLAY_VIEW_TARGET,
@@ -337,6 +347,7 @@ def main() -> None:
     from nta_runtime.engines.sglang import (
         NtaFlashInferAttnBackend,
         _ActiveBatch,
+        _consumer_contract_for_stats,
         _demand_graph_key,
         _frontier_transfer_bytes,
         _group_external_pages_by_request,
@@ -347,6 +358,27 @@ def main() -> None:
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
+    assert (
+        _consumer_contract_for_stats({}, engine_version="0.5.14").kind.value
+        == "projection_only"
+    )
+    assert (
+        _consumer_contract_for_stats(
+            {"stock_prefetched_external_attention_launches": 1},
+            engine_version="0.5.14",
+        ).kind.value
+        == "framework_reference"
+    )
+    assert (
+        _consumer_contract_for_stats(
+            {
+                "stock_prefetched_external_attention_launches": 1,
+                "ticketed_incremental_launches": 1,
+            },
+            engine_version="0.5.14",
+        ).kind.value
+        == "native_work_unit"
+    )
     ranges = _request_ranges(
         (
             RequestBinding(0, 5, 1, stable_request_id("r0")),

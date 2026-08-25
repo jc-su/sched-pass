@@ -67,6 +67,20 @@ class FakeVllmV1InputBatch:
     block_table = FakeVllmV1BlockTable()
 
 
+class FakeVllmV1Consumer:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def consumer_contract(self):
+        return ConsumerContract.native_work_unit(
+            engine="vllm", backend="nta_flashinfer", engine_version="0.13.0"
+        )
+
+    def consume(self, batch, **attention_args):
+        self.calls.append((batch, attention_args))
+        return "attention-output"
+
+
 def main() -> None:
     config = SglangExecutionConfig.from_environment(
         {
@@ -155,6 +169,37 @@ def main() -> None:
     projection_contract = v1_hook.projection_contract()
     assert projection_contract.kind is ConsumerKind.PROJECTION_ONLY
     assert projection_contract.formal_execution is False
+    try:
+        v1_hook.consume_forward(
+            FakeVllmV1SchedulerOutput(),
+            FakeVllmV1InputBatch(),
+            epoch=6,
+        )
+    except RuntimeError as error:
+        assert "numerical attention consumer" in str(error)
+    else:
+        raise AssertionError("projection-only vLLM hook executed attention")
+    consumer = FakeVllmV1Consumer()
+    consuming_hook = VllmV1Hook(
+        runtime,
+        4,
+        page_bytes=4096,
+        version_provider=lambda: "0.13.0",
+        consumer=consumer,
+    )
+    assert consuming_hook.consumer_contract().kind is ConsumerKind.NATIVE_WORK_UNIT
+    assert (
+        consuming_hook.consume_forward(
+            FakeVllmV1SchedulerOutput(),
+            FakeVllmV1InputBatch(),
+            epoch=8,
+            attention_metadata="typed-metadata",
+        )
+        == "attention-output"
+    )
+    assert len(consumer.calls) == 1
+    assert consumer.calls[0][0].exact_demand is not None
+    assert consumer.calls[0][1] == {"attention_metadata": "typed-metadata"}
     native_contract = ConsumerContract.native_work_unit(
         engine="sglang", backend="nta_flashinfer", engine_version="0.5.14"
     )
