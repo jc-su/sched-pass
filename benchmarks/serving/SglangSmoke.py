@@ -92,6 +92,27 @@ def output_tokens(result: dict[str, Any]) -> int:
     return len(output_ids) if isinstance(output_ids, list) else 0
 
 
+def integration_evidence(
+    attention_backend: str, engine_stats: list[dict[str, Any]]
+) -> dict[str, bool]:
+    """Separate backend selection from verified numerical execution."""
+    backend_selected = attention_backend == "nta_flashinfer"
+    nta_stats = [
+        entry
+        for entry in engine_stats
+        if entry.get("backend") == "nta_flashinfer"
+    ]
+    native_execution = any(
+        isinstance(contract := entry.get("consumer_contract"), dict)
+        and contract.get("kind") == "native_work_unit"
+        for entry in nta_stats
+    )
+    return {
+        "nta_backend_selected": backend_selected,
+        "nta_execution_verified": native_execution,
+    }
+
+
 def main() -> int:
     args = parse_args()
     host_cxx = configure_jit_environment(args)
@@ -145,11 +166,12 @@ def main() -> int:
             engine_stats.append(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             pass
-    integrated = args.attention_backend == "nta_flashinfer"
+    evidence = integration_evidence(args.attention_backend, engine_stats)
     report = {
         "schema": 1,
         "classification": "serving-integration-smoke",
-        "nta_integrated": integrated,
+        "nta_integrated": evidence["nta_execution_verified"],
+        **evidence,
         "engine": "sglang",
         "attention_backend": args.attention_backend,
         "engine_version": importlib.metadata.version("sglang"),
