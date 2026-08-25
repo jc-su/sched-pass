@@ -57,9 +57,12 @@ python experiments/reproduce.py \
 python experiments/validate_bundle.py /tmp/nta-artifacts/hardware
 ```
 
-This records GPU visibility, NVMe driver/IOMMU ownership, and `/dev/dax*`
-visibility. It does not bind PCI devices, open block namespaces, or qualify a
-tier. Qualification remains an explicit, separately validated operation.
+This records GPU visibility, NVMe driver/IOMMU ownership, `/dev/dax*`
+visibility, and the CXL topology state. In particular, it distinguishes a
+root-decoder-only platform from an unconfigured memory endpoint, an existing
+region, and an exposed devdax endpoint. It does not bind PCI devices, open
+block namespaces, create/delete CXL regions, or qualify a tier. Qualification
+remains an explicit, separately validated operation.
 
 Serving physical tiers also require an immutable exact page catalog. Validate
 it without opening the endpoint before launching the worker:

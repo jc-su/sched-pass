@@ -134,6 +134,13 @@ static_assert(sizeof(Plan) == 72);
 }
 
 inline void validate(const Contract &contract) {
+  constexpr std::uint64_t validCapabilities =
+      RequestBinding | ObjectDependencies | FiniteDeferral |
+      PartialPublication | CompleteContributorMerge | RunnableCompaction |
+      GraphReplay | TypedFlashInferFrontend | PreacquiredPartialEntry;
+  constexpr std::uint64_t validInstrumentationFlags =
+      TypedAccessLowering | ExactDemand | GenerationSafeIdentity |
+      TierOwnership;
   if (contract.magic != Magic || contract.schemaVersion != SchemaVersion ||
       contract.structBytes != sizeof(Contract)) {
     throw std::runtime_error(
@@ -158,6 +165,12 @@ inline void validate(const Contract &contract) {
     throw std::runtime_error(
         "JIT operator contract contains an unknown instrumentation proof");
   }
+  if (contract.reserved != 0 ||
+      (contract.capabilities & ~validCapabilities) != 0 ||
+      (contract.instrumentationFlags & ~validInstrumentationFlags) != 0) {
+    throw std::runtime_error(
+        "JIT operator contract contains unknown flags or reserved bits");
+  }
   const std::uint64_t validTierMask =
       (1ULL << (static_cast<std::uint32_t>(abi::SourceKind::Rdma) + 1U)) - 1ULL;
   if ((contract.tierMask & ~validTierMask) != 0) {
@@ -167,6 +180,11 @@ inline void validate(const Contract &contract) {
 }
 
 inline void validate(const Plan &plan, const Contract &contract) {
+  constexpr std::uint32_t validForms =
+      formBit(Form::Direct) | formBit(Form::Incremental);
+  constexpr std::uint32_t validPlanFlags =
+      FixedCapacity | GraphStable | ExternalWaveSources | GenerationBound |
+      ExactCompleteMerge;
   if (plan.magic != PlanMagic || plan.schemaVersion != PlanSchemaVersion ||
       plan.structBytes != sizeof(Plan)) {
     throw std::runtime_error("JIT module has an incompatible operator plan");
@@ -175,6 +193,11 @@ inline void validate(const Plan &plan, const Contract &contract) {
       plan.runtimeAbiVersion != contract.runtimeAbiVersion) {
     throw std::runtime_error(
         "JIT operator plan uses an incompatible runtime ABI");
+  }
+  if (plan.reserved != 0 || (plan.supportedForms & ~validForms) != 0 ||
+      (plan.flags & ~validPlanFlags) != 0) {
+    throw std::runtime_error(
+        "JIT operator plan contains unknown flags or reserved bits");
   }
   if (plan.family != contract.family ||
       (plan.supportedForms & formBit(static_cast<Form>(contract.form))) == 0U) {

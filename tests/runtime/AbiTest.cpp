@@ -1,8 +1,10 @@
 #include "nta/RuntimeABI.h"
+#include "nta/OperatorContract.h"
 #include "nta/Tier.h"
 
 #include <cstddef>
 #include <iostream>
+#include <stdexcept>
 #include <type_traits>
 
 int main() {
@@ -81,6 +83,33 @@ int main() {
   if (Version != 29 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
+  }
+
+  nta::operator_contract::Contract contract{
+      nta::operator_contract::Magic,
+      nta::operator_contract::SchemaVersion,
+      sizeof(nta::operator_contract::Contract),
+      Version,
+      static_cast<std::uint32_t>(nta::operator_contract::Family::Generic),
+      static_cast<std::uint32_t>(nta::operator_contract::Form::Direct),
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+  };
+  nta::operator_contract::validate(contract);
+  contract.instrumentationFlags = 1ULL << 63U;
+  try {
+    nta::operator_contract::validate(contract);
+    return 1;
+  } catch (const std::runtime_error &) {
+    // Unknown semantic flags must not cross the JIT/runtime boundary.
   }
 
   std::cout << "NTA ABI v" << Version << ": " << sizeof(RuntimeView)

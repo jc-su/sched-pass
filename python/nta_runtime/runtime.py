@@ -240,9 +240,18 @@ class OperatorContract:
     tier_mask: int = 0
 
     def __post_init__(self) -> None:
+        known_capabilities = (1 << 9) - 1
+        known_instrumentation = (1 << 4) - 1
+        if int(self.capabilities) & ~known_capabilities:
+            raise ValueError("JIT operator contract names unknown capabilities")
+        if int(self.instrumentation_flags) & ~known_instrumentation:
+            raise ValueError(
+                "JIT operator contract names unknown instrumentation flags"
+            )
         known_tiers = (1 << 6) - 1
         if self.tier_mask < 0 or self.tier_mask & ~known_tiers:
             raise ValueError("JIT operator contract names an unknown tier")
+        _u32(self.granularity_bytes, "JIT operator granularity")
 
     def require(
         self,
@@ -294,6 +303,16 @@ class OperatorPlan:
     flags: OperatorPlanFlag
     source_fingerprint: str
     plan_fingerprint: str
+
+    def __post_init__(self) -> None:
+        valid_forms = (1 << int(OperatorForm.DIRECT)) | (
+            1 << int(OperatorForm.INCREMENTAL)
+        )
+        valid_flags = (1 << 5) - 1
+        if self.supported_forms & ~valid_forms:
+            raise ValueError("JIT operator plan names unknown forms")
+        if int(self.flags) & ~valid_flags:
+            raise ValueError("JIT operator plan names unknown flags")
 
     def supports(self, form: OperatorForm) -> bool:
         return form != OperatorForm.UNSPECIFIED and bool(

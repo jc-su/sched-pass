@@ -11,6 +11,15 @@ from nta_runtime import (
     IndexedHostObject,
     CxlDaxOptions,
     NvmeOptions,
+    OperatorCapability,
+    OperatorContract,
+    OperatorFamily,
+    OperatorForm,
+    OperatorInstrumentation,
+    OperatorPartialState,
+    OperatorPlan,
+    OperatorPlanFlag,
+    OperatorReduction,
     Placement,
     Replica,
     RequestRange,
@@ -36,6 +45,37 @@ def main() -> None:
             pass
         else:
             raise AssertionError("out-of-range native ABI input was accepted")
+    try:
+        OperatorContract(
+            1,
+            29,
+            OperatorFamily.GENERIC,
+            OperatorForm.DIRECT,
+            OperatorCapability(0),
+            "0" * 32,
+            OperatorInstrumentation(1 << 8),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown operator instrumentation was accepted")
+    try:
+        OperatorPlan(
+            1,
+            29,
+            OperatorFamily.GENERIC,
+            1 << 8,
+            0,
+            OperatorPartialState.NONE,
+            OperatorReduction.NONE,
+            OperatorPlanFlag(0),
+            "0" * 32,
+            "1" * 32,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown operator plan form was accepted")
     assert device_abi_version() > 0
     source = torch.empty(4096, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()

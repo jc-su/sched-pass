@@ -2,6 +2,7 @@
 #include "benchmarks/attention/PagedAttentionTypes.h"
 #include "nta/DeviceWorkPlan.h"
 #include "nta/CxlRuntime.h"
+#include "nta/CxlDaxDiscovery.h"
 #include "nta/FinitePhase.h"
 #include "nta/FlashInferAdapter.h"
 #include "nta/HostRuntime.h"
@@ -1012,8 +1013,13 @@ int main(int argc, char **argv) {
         }
       }
       if (options.cxlEndpoint.empty()) {
-        std::cerr << "nta-paged-attention dax skipped: set "
-                     "NTA_CXL_DAX_DEVICE or --cxl-endpoint=PATH\n";
+        options.cxlEndpoint =
+            nta::qualification::discoverDaxEndpoint().value_or(std::string{});
+      }
+      if (options.cxlEndpoint.empty()) {
+        std::cerr << "nta-paged-attention dax skipped: no /dev/dax* "
+                     "character device is exposed; set NTA_CXL_DAX_DEVICE "
+                     "or --cxl-endpoint=PATH\n";
         return 77;
       }
       if (options.cxlWindowBytes == 0) {

@@ -157,10 +157,18 @@ def main() -> None:
         iommu = sysfs / "iommu" / "7"
         iommu.mkdir(parents=True)
         (pci / "iommu_group").symlink_to(iommu, target_is_directory=True)
-        inventory = collect(sysfs_root=sysfs, dev_root=dev)
+        cxl = root / "cxl"
+        (cxl / "root0").mkdir(parents=True)
+        decoder = cxl / "decoder0.0"
+        decoder.mkdir()
+        (decoder / "size").write_text("0x100000000\n", encoding="utf-8")
+        (decoder / "target_list").write_text("3\n", encoding="utf-8")
+        inventory = collect(sysfs_root=sysfs, dev_root=dev, cxl_sysfs_root=cxl)
         validate(inventory)
         assert inventory["nvme"]["controllers"][0]["driver"] == "nvme"
         assert inventory["nvme"]["controllers"][0]["namespaces"] == ["nvme0n1"]
+        assert inventory["cxl"]["status"] == "root_decoder_only"
+        assert inventory["cxl"]["decoders"][0]["target_list"] == "3"
         assert inventory["safety"]["qualification_performed"] is False
     print("evaluation_spec=pass")
 

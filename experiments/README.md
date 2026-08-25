@@ -11,7 +11,7 @@ it does not define a second runtime state machine or native ABI.
 | --- | --- | --- |
 | RQ0 workload opportunity | `prepare_bailian.py`, `validate_workload.py`, `analyze_workload.py` | structure/demand/arrival digests and explicit arrival provenance |
 | Physical tier capability | `qualify_tiers.py`, `validate_tier_qualification.py` | exact HBM/host/NVMe/DAX qualification; missing hardware is skip |
-| Hardware preflight | `inspect_hardware.py` | read-only GPU/NVMe/DAX capability inventory; never binds devices |
+| Hardware preflight | `inspect_hardware.py` | read-only GPU/NVMe/CXL/DAX capability inventory; never binds devices |
 | RQ1--RQ3 paired execution | `run_evaluation.py`, `analyze_evaluation.py` | exact demand, paired metadata, six strata, causal comparisons, bootstrap CI, Little's Law |
 | RQ4 cost and regression | `profile.py`, `check_regression.py`, `validate_performance_artifact.py` | complete profiler + baseline + measured report + passing regression gate |
 | Reproduction packaging | `reproduce.py`, `validate_bundle.py` | self-contained external bundle with command and digest provenance |

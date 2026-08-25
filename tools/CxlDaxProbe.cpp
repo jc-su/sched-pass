@@ -1,4 +1,5 @@
 #include "nta/CxlRuntime.h"
+#include "nta/CxlDaxDiscovery.h"
 
 #include <cuda.h>
 
@@ -50,15 +51,21 @@ int main(int argc, char **argv) {
       throw std::invalid_argument(
           "usage: nta-cxl-dax-probe [endpoint] [window-mib] [gpu] [--json=1]");
     }
-    const std::string endpoint =
+    const std::string configuredEndpoint =
         !positional.empty() ? positional[0] : environment("NTA_CXL_DAX_DEVICE");
+    const std::string endpoint = configuredEndpoint.empty()
+                                     ? nta::qualification::discoverDaxEndpoint()
+                                           .value_or(std::string{})
+                                     : configuredEndpoint;
     if (endpoint.empty()) {
       if (jsonOutput) {
         std::cout << "{\"schema\":1,\"classification\":\"nta-dax-qualification\","
                      "\"tier\":\"dax\",\"status\":\"skipped\","
                      "\"qualified\":false,\"reason\":\"missing_endpoint\"}\n";
       } else {
-        std::cerr << "nta-cxl-dax-probe skipped: set NTA_CXL_DAX_DEVICE\n";
+        std::cerr << "nta-cxl-dax-probe skipped: no /dev/dax* character "
+                     "device is exposed; set NTA_CXL_DAX_DEVICE for an "
+                     "explicit endpoint\n";
       }
       return 77;
     }

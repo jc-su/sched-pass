@@ -19,6 +19,7 @@ from typing import Any
 
 SCHEMA = 1
 CLASSIFICATION = "nta-hardware-inventory"
+DEFAULT_CXL_SYSFS_ROOT = Path("/sys/bus/cxl/devices")
 
 
 def _text(path: Path) -> str | None:
@@ -111,13 +112,99 @@ def _dax_devices(dev_root: Path) -> list[dict[str, Any]]:
     return devices
 
 
+def _cxl_attr(path: Path, name: str) -> str | None:
+    return _text(path / name)
+
+
+def _cxl_decoders(cxl_sysfs_root: Path) -> list[dict[str, Any]]:
+    decoders: list[dict[str, Any]] = []
+    for path in sorted(cxl_sysfs_root.glob("decoder*")):
+        if not path.is_dir():
+            continue
+        decoders.append(
+            {
+                "device": path.name,
+                "size": _cxl_attr(path, "size"),
+                "target_list": _cxl_attr(path, "target_list"),
+                "interleave_ways": _cxl_attr(path, "interleave_ways"),
+                "interleave_granularity": _cxl_attr(
+                    path, "interleave_granularity"
+                ),
+                "locked": _cxl_attr(path, "locked"),
+                "cap_ram": _cxl_attr(path, "cap_ram"),
+                "cap_pmem": _cxl_attr(path, "cap_pmem"),
+                "create_ram_region": (path / "create_ram_region").is_file(),
+                "create_pmem_region": (path / "create_pmem_region").is_file(),
+            }
+        )
+    return decoders
+
+
+def _cxl_inventory(
+    dev_root: Path, cxl_sysfs_root: Path
+) -> dict[str, Any]:
+    names = sorted(
+        path.name
+        for path in cxl_sysfs_root.iterdir()
+        if path.is_dir()
+    ) if cxl_sysfs_root.is_dir() else []
+    memdevs = [name for name in names if name.startswith("mem")]
+    endpoints = [name for name in names if name.startswith("endpoint")]
+    regions = [name for name in names if name.startswith("region")]
+    ports = [name for name in names if name.startswith("port")]
+    root_ports = [name for name in names if name.startswith("root")]
+    decoders = _cxl_decoders(cxl_sysfs_root)
+    dax_devices = _dax_devices(dev_root)
+    dax_present = any(entry["character_device"] for entry in dax_devices)
+    if dax_present:
+        status = "devdax_endpoint_present"
+        next_step = "run the explicit DAX qualification probe"
+    elif regions:
+        status = "region_present_without_devdax"
+        next_step = "reconfigure an idle region namespace to devdax"
+    elif memdevs or endpoints:
+        status = "memdev_present_without_region"
+        next_step = "provision a region only after platform ownership review"
+    elif decoders:
+        status = "root_decoder_only"
+        next_step = "platform has no enumerated CXL memory endpoint to provision"
+    else:
+        status = "no_cxl_topology"
+        next_step = "enable and enumerate CXL memory in platform firmware"
+    inventory: dict[str, Any] = {
+        "status": status,
+        "next_step": next_step,
+        "sysfs_root": str(cxl_sysfs_root),
+        "root_ports": root_ports,
+        "ports": ports,
+        "endpoints": endpoints,
+        "memdevs": memdevs,
+        "regions": regions,
+        "decoders": decoders,
+        "cxl_list": {},
+        "ndctl_list": None,
+        "daxctl_list": None,
+    }
+    if cxl_sysfs_root == DEFAULT_CXL_SYSFS_ROOT:
+        inventory["cxl_list"] = {
+            "buses": _command(["cxl", "list", "-BMu"]),
+            "memdevs": _command(["cxl", "list", "-iM"]),
+            "decoders": _command(["cxl", "list", "-D"]),
+        }
+        inventory["ndctl_list"] = _command(["ndctl", "list", "-Ru"])
+        inventory["daxctl_list"] = _command(["daxctl", "list", "-u"])
+    return inventory
+
+
 def collect(
     *,
     sysfs_root: Path = Path("/sys/bus/pci/devices"),
     dev_root: Path = Path("/dev"),
+    cxl_sysfs_root: Path = DEFAULT_CXL_SYSFS_ROOT,
 ) -> dict[str, Any]:
     nvme = _nvme_controllers(sysfs_root, dev_root)
     dax = _dax_devices(dev_root)
+    cxl = _cxl_inventory(dev_root, cxl_sysfs_root)
     vfio_nvme = [entry for entry in nvme if entry["vfio_owned"]]
     return {
         "schema": SCHEMA,
@@ -151,6 +238,7 @@ def collect(
                 else "no_devdax_endpoint"
             ),
         },
+        "cxl": cxl,
         "safety": {
             "read_only_inventory": True,
             "pci_binding_performed": False,
@@ -166,7 +254,7 @@ def validate(document: dict[str, Any]) -> dict[str, Any]:
         or document.get("classification") != CLASSIFICATION
     ):
         raise ValueError("unsupported hardware inventory")
-    for section in ("machine", "gpu", "nvme", "dax", "safety"):
+    for section in ("machine", "gpu", "nvme", "dax", "cxl", "safety"):
         if not isinstance(document.get(section), dict):
             raise ValueError(f"hardware inventory lacks {section}")
     safety = document["safety"]
@@ -192,6 +280,12 @@ def validate(document: dict[str, Any]) -> dict[str, Any]:
     dax = document["dax"].get("devices")
     if not isinstance(dax, list):
         raise ValueError("hardware inventory has no DAX device list")
+    cxl = document["cxl"]
+    for field in ("memdevs", "regions", "decoders"):
+        if not isinstance(cxl.get(field), list):
+            raise ValueError(f"hardware inventory has no CXL {field} list")
+    if not isinstance(cxl.get("status"), str):
+        raise ValueError("hardware inventory has no CXL status")
     return document
 
 
