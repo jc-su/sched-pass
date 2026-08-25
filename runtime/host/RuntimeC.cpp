@@ -785,6 +785,73 @@ nta_status nta_runtime_install_nvme_object_async(
   });
 }
 
+nta_status nta_runtime_install_external_nvme_object(
+    nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
+    std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
+    std::uint64_t destinationDeviceAddress,
+    std::uint64_t *destinationDeviceAddressOut) {
+  if (destinationDeviceAddressOut != nullptr) {
+    *destinationDeviceAddressOut = 0;
+  }
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (runtime->nvme == nullptr) {
+      throw std::invalid_argument(
+          "runtime was not created with an NVMe transport");
+    }
+    if (destinationDeviceAddress == 0) {
+      throw std::invalid_argument("external NVMe destination is null");
+    }
+    const std::size_t nativeBytes = checkedSize(bytes, "NVMe object bytes");
+    auto destination = runtime->nvme->mapExternalHbm(
+        reinterpret_cast<void *>(static_cast<std::uintptr_t>(
+            destinationDeviceAddress)),
+        nativeBytes);
+    const nta::ObjectHandle object = runtime->value->installNvmeObject(
+        slot, objectId, version, sourceByteOffset, nativeBytes,
+        std::move(destination));
+    if (destinationDeviceAddressOut != nullptr) {
+      *destinationDeviceAddressOut =
+          reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
+    }
+  });
+}
+
+nta_status nta_runtime_install_external_nvme_object_async(
+    nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
+    std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
+    std::uint64_t destinationDeviceAddress, std::uint64_t cudaStream,
+    std::uint64_t priorConsumerEvent,
+    std::uint64_t *destinationDeviceAddressOut) {
+  if (destinationDeviceAddressOut != nullptr) {
+    *destinationDeviceAddressOut = 0;
+  }
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (runtime->nvme == nullptr) {
+      throw std::invalid_argument(
+          "runtime was not created with an NVMe transport");
+    }
+    if (destinationDeviceAddress == 0 || cudaStream == 0) {
+      throw std::invalid_argument(
+          "external NVMe installation requires destination and stream");
+    }
+    const std::size_t nativeBytes = checkedSize(bytes, "NVMe object bytes");
+    auto destination = runtime->nvme->mapExternalHbm(
+        reinterpret_cast<void *>(static_cast<std::uintptr_t>(
+            destinationDeviceAddress)),
+        nativeBytes);
+    const nta::ObjectHandle object = runtime->value->installNvmeObjectAsync(
+        slot, objectId, version, sourceByteOffset, nativeBytes,
+        stream(cudaStream), event(priorConsumerEvent),
+        std::move(destination));
+    if (destinationDeviceAddressOut != nullptr) {
+      *destinationDeviceAddressOut =
+          reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
+    }
+  });
+}
+
 nta_status nta_runtime_read_pending_count(const nta_runtime *runtime,
                                           std::uint32_t *pendingCount) {
   return protect([&] {

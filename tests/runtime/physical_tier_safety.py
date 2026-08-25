@@ -33,6 +33,8 @@ def main() -> None:
         "device_dax",
         "cxl list -M -i",
         "daxctl list -u",
+        "topology=",
+        "root_decoders_only",
     ):
         assert required in cxl_script
 

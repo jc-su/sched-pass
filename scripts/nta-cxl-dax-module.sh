@@ -43,6 +43,34 @@ module_state() {
   fi
 }
 
+sysfs_count() {
+  local root=$1
+  local pattern=$2
+  if [[ ! -d $root ]]; then
+    printf '0'
+    return
+  fi
+  find "$root" -maxdepth 1 -mindepth 1 -type d -name "$pattern" -printf '.' 2>/dev/null | wc -c
+}
+
+topology_state() {
+  local memdevs regions dax_nodes
+  memdevs=$(sysfs_count /sys/bus/cxl/devices 'mem[0-9]*')
+  regions=$(sysfs_count /sys/bus/cxl/devices 'region[0-9]*')
+  dax_nodes=$(sysfs_count /sys/class/dax 'dax[0-9]*.[0-9]*')
+  if (( dax_nodes > 0 )); then
+    printf 'devdax_ready'
+  elif (( regions > 0 )); then
+    printf 'region_without_devdax'
+  elif (( memdevs > 0 )); then
+    printf 'type3_memdev_without_region'
+  elif [[ -d /sys/bus/cxl/devices/root0 ]]; then
+    printf 'root_decoders_only'
+  else
+    printf 'no_cxl_topology'
+  fi
+}
+
 inventory() {
   printf 'cxl_memdevs=\n'
   if command -v cxl >/dev/null 2>&1; then
@@ -69,6 +97,12 @@ print_module_state() {
   for module in "${CXL_MODULES[@]}"; do
     printf ' %s' "$(module_state "$module")"
   done
+  printf ' topology=%s' "$(topology_state)"
+  if [[ -e /sys/firmware/acpi/tables/CEDT ]]; then
+    printf ' cedt=present'
+  else
+    printf ' cedt=absent'
+  fi
   printf '\n'
 }
 

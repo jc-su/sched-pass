@@ -213,10 +213,12 @@ change that projection and transport binding, not the work-unit core or ABI.
 
 The vLLM general-plugin entry point is only bootstrap. The formal numerical
 consumer is the V1 `AttentionBackend`/`AttentionImpl`; a V1 `KVConnector` is
-reserved for external tier loading and fences and cannot be reported as the
-NTA consumer by itself. The native vLLM qualification currently covers
-resident eager single-token decode. External NVMe/CXL vLLM artifacts remain
-gated until the KVConnector source/lifetime path is implemented and tested.
+reserved for an upstream-compatible persistent prefix-cache loading/fence
+path and cannot be reported as the NTA consumer by itself. The native vLLM
+qualification covers eager single-token decode for resident CUDA KV and the
+catalog-backed NVMe/CXL physical path, subject to the corresponding hardware
+and exactness gates. This does not claim that the upstream KVConnector
+prefix-cache/eviction lifecycle is implemented.
 
 The vLLM projection is executable only when it supplies exact block tables and
 page bytes. An identity-only projection is intentionally rejected by

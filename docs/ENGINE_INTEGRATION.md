@@ -187,20 +187,27 @@ FlashInfer module (the defaults are the tensor-core
 `nta_batch_decode_default_v2_hooked*` artifacts are retained for the
 non-tensor-core decode profile).
 
-The native vLLM consumer is intentionally qualified first for resident CUDA
-KV, one KV group, pure single-token decode, FA2 (non-TRTLLM), and eager mode.
-It is opt-in with `NTA_VLLM_NATIVE=1`; the default is vLLM's reference
-attention because resident-only work does not exercise a remote-tier
-dependency and must not pay the NTA protocol overhead.
+The native vLLM consumer is intentionally qualified first for one KV group,
+pure single-token decode, FA2 (non-TRTLLM), and eager mode. It is opt-in with
+`NTA_VLLM_NATIVE=1`; the default is vLLM's reference attention because a
+resident-only run does not exercise a remote-tier dependency and must not pay
+the NTA protocol overhead. When `NTA_SERVING_TIER=nvme` or `cxl_dax`, the same
+native consumer resolves vLLM's exact current block-table pages through the
+immutable tier catalog: NVMe installs runtime-owned HBM destination objects,
+while CXL emits direct device-visible dependencies. The physical profile is
+still hardware-qualified separately and has no stock-attention fallback.
 The builder reports no CUDA-graph support until plan upload/replay has its own
 graph-stability gate. Prefill, mixed batches, TRTLLM, and external NVMe/CXL
 loads remain explicit fail-closed boundaries; `NTA_VLLM_ALLOW_STOCK_FALLBACK=1`
 is a debugging reference only and is invalid for native artifacts.
 
-Consequently, a vLLM artifact can currently claim native NTA execution only for
-that resident decode profile. The shared vLLM/SGLang runtime and tenant
-contract are integrated, but that does not turn vLLM's resident projection into
-an external-tier implementation.
+Consequently, a vLLM artifact can claim native NTA execution for the resident
+profile or for a catalog-backed physical decode profile only when its evidence
+contains the corresponding native launches and tier capability proof. The
+shared vLLM/SGLang runtime and tenant contract are integrated. This direct
+attention path deliberately does not claim implementation of vLLM's upstream
+`KVConnector` prefix-cache protocol: scheduler-side matching, persistent
+prefix ownership, eviction, and connector recovery remain a separate seam.
 
 `benchmarks/serving/VllmSmoke.py` is the reproducible resident integration gate:
 run it once with `--backend stock` and once with `--backend nta` using the same
@@ -209,12 +216,14 @@ model, request count, seed, and limits. The NTA run requires the worker's
 digests. It is a correctness/integration gate, not a remote-tier performance
 claim.
 
-vLLM's V1 `KVConnector` remains the correct next seam for external tier
-ownership/readiness: scheduler metadata and worker load/fence lifecycle belong
-there, while `AttentionImpl` remains the numerical consumer. A connector alone
-must never be reported as NTA execution. The project is no longer blocked on
-vLLM's attention path, but multi-tier vLLM evidence is gated on a concrete
-KVConnector implementation and its exact correctness/ownership tests.
+vLLM's V1 `KVConnector` remains the seam for a future upstream-compatible
+prefix-cache ownership/readiness path: scheduler metadata and worker
+load/fence lifecycle belong there, while `AttentionImpl` remains the numerical
+consumer. A connector alone must never be reported as NTA execution. The
+current multi-tier vLLM path instead uses the exact block-table projection and
+NTA catalog contract; a future KVConnector must add its own exact
+request/prefix identity, eviction, and lifetime tests rather than silently
+sharing this decode-only catalog path.
 
 The distinction is machine-checked in engine statistics. A
 `consumer_contract.kind` of `projection_only` is valid for adapter tests but

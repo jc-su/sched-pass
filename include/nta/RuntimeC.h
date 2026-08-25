@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 36U
+#define NTA_RUNTIME_C_API_VERSION 37U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -362,6 +362,20 @@ nta_runtime_install_nvme_object(nta_runtime *runtime, uint32_t slot,
 nta_status nta_runtime_install_nvme_object_async(
     nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
     uint64_t source_byte_offset, uint64_t bytes, uint64_t cuda_stream,
+    uint64_t prior_consumer_event, uint64_t *destination_device_address_out);
+// Install an NVMe object into a caller-owned CUDA HBM range. The runtime owns
+// only the NVMe peer mapping and DMA page list; it never frees the destination
+// allocation. The mapping is created during installation and retained until
+// the object slot's stream-ordered lifetime ends.
+nta_status nta_runtime_install_external_nvme_object(
+    nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
+    uint64_t source_byte_offset, uint64_t bytes,
+    uint64_t destination_device_address,
+    uint64_t *destination_device_address_out);
+nta_status nta_runtime_install_external_nvme_object_async(
+    nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
+    uint64_t source_byte_offset, uint64_t bytes,
+    uint64_t destination_device_address, uint64_t cuda_stream,
     uint64_t prior_consumer_event, uint64_t *destination_device_address_out);
 nta_status nta_runtime_read_pending_count(const nta_runtime *runtime,
                                           uint32_t *pending_count);

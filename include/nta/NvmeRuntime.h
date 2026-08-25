@@ -85,6 +85,10 @@ public:
   [[nodiscard]] std::uint32_t dmaPageCount() const noexcept;
   [[nodiscard]] std::size_t bytes() const noexcept;
   [[nodiscard]] NvmeDmaTarget dmaTarget() const noexcept;
+  // False for a mapping lease over caller-owned HBM (for example a vLLM KV
+  // block).  The lease still owns the NVMe peer mapping and page list, but it
+  // never frees the caller's CUDA allocation.
+  [[nodiscard]] bool ownsDestinationMemory() const noexcept;
 
 private:
   struct Impl;
@@ -111,6 +115,13 @@ public:
   [[nodiscard]] NvmeQueueStats readStats() const;
   [[nodiscard]] std::unique_ptr<NvmeBuffer>
   allocate(std::size_t bytes);
+  // Map a caller-owned CUDA HBM range for direct NVMe DMA.  This is a setup /
+  // lifetime operation: the returned lease must remain alive until every
+  // queued command using the range has completed.  The range must satisfy the
+  // peer mapper's 64 KiB alignment contract; arbitrary subranges are rejected
+  // rather than silently mapping a different destination.
+  [[nodiscard]] std::unique_ptr<NvmeBuffer>
+  mapExternalHbm(void *deviceAddress, std::size_t bytes);
 
 private:
   struct Impl;

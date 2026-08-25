@@ -200,6 +200,14 @@ int main() {
     require(nta_copy_host_to_device_async(0, 0, 0, 0) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "C API accepted an invalid host-to-device copy");
+    require(nta_runtime_install_external_nvme_object(
+                nullptr, 0, 0, 0, 0, 0, 0, nullptr) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted a null external NVMe runtime");
+    require(nta_runtime_install_external_nvme_object_async(
+                nullptr, 0, 0, 0, 0, 0, 0, 0, 0, nullptr) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted a null external async NVMe runtime");
     nta_operator_plan operatorPlan{};
     require(nta_jit_phase_operator_plan(nullptr, &operatorPlan) ==
                 NTA_STATUS_INVALID_ARGUMENT,

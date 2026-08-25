@@ -45,17 +45,27 @@ def main() -> int:
         if not re.search(rf"\b{re.escape(module)}=(?:loaded|unloaded)\b", output):
             raise AssertionError(f"CXL status omitted module state for {module}")
 
+    topology = re.search(r"\btopology=([a-z_]+)\b", output)
+    if topology is None:
+        raise AssertionError("CXL status omitted the topology state")
+    if topology.group(1) not in {
+        "devdax_ready",
+        "region_without_devdax",
+        "type3_memdev_without_region",
+        "root_decoders_only",
+        "no_cxl_topology",
+    }:
+        raise AssertionError(f"unknown CXL topology state: {topology.group(1)}")
+
     daxctl_available = "unavailable (daxctl utility is not installed)" not in output
     cxl_available = "unavailable (cxl utility is not installed)" not in output
-    live_endpoint = any(
-        line.strip().startswith("dax") and "[]" not in line
-        for line in output.splitlines()
-    )
+    live_endpoint = topology.group(1) == "devdax_ready"
     print(
         "physical_tier_capability=pass"
         f" cxl_cli={int(cxl_available)}"
         f" daxctl_cli={int(daxctl_available)}"
         f" devdax_inventory_candidate={int(live_endpoint)}"
+        f" topology={topology.group(1)}"
     )
     return 0
 

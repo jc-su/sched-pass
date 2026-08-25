@@ -1748,6 +1748,15 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
     cudaEvent_t priorConsumerEvent) {
+  return installNvmeObjectAsync(
+      slot, objectId, version, sourceByteOffset, bytes, stream,
+      priorConsumerEvent, std::unique_ptr<NvmeBuffer>{});
+}
+
+ObjectHandle HostRuntime::installNvmeObjectAsync(
+    std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
+    std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
+    cudaEvent_t priorConsumerEvent, std::unique_ptr<NvmeBuffer> destination) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
   if (stream == nullptr) {
@@ -1777,14 +1786,16 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
   }
 
   NvmeBuffer *buffer = nullptr;
-  std::unique_ptr<NvmeBuffer> destination;
   bool reuseExisting = false;
-  if (hasCurrent && impl_->objects[slot]->nvmeBuffer != nullptr &&
+  if (destination == nullptr && hasCurrent &&
+      impl_->objects[slot]->nvmeBuffer != nullptr &&
       impl_->objects[slot]->nvmeBuffer->bytes() >= bytes) {
     buffer = impl_->objects[slot]->nvmeBuffer.get();
     reuseExisting = true;
-  } else {
+  } else if (destination == nullptr) {
     destination = impl_->nvme->allocate(bytes);
+    buffer = destination.get();
+  } else {
     buffer = destination.get();
   }
   if (buffer == nullptr || bytes > buffer->bytes()) {

@@ -220,6 +220,14 @@ public:
       std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
       std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
       cudaEvent_t priorConsumerEvent);
+  // Same stream-ordered publication contract, with a caller-owned HBM
+  // destination whose NVMe mapping lease is transferred to the object slot.
+  // The destination memory itself remains owned by the caller; only the DMA
+  // mapping/page-list lease is retired with the slot.
+  ObjectHandle installNvmeObjectAsync(
+      std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
+      std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
+      cudaEvent_t priorConsumerEvent, std::unique_ptr<NvmeBuffer> destination);
   void bindTensorMaps(std::uint32_t objectSlot, std::uint32_t relativeReplica,
                       const void *replicaTensorMap,
                       const void *stagingTensorMap = nullptr);

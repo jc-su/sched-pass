@@ -9,7 +9,7 @@ from a skipped test or a previous boot.
 | --- | --- | --- | --- | --- | --- |
 | Native runtime/resource contract | implemented | implemented | implemented; physical qualification required | implemented; endpoint qualification required | typed budget/admission implemented |
 | SGLang + FlashInfer | exact resident and mixed external work | exact indexed path | exact catalog path, GPU-owned progress | exact direct-address path | sidecar tenant IDs plus startup budgets |
-| vLLM 0.26 v1 API / V2 model runner | reference by default; opt-in exact eager single-token decode/FA2 NTA consumer | not a serving claim | fail-closed; external connector/consumer not implemented | fail-closed; external connector/consumer not implemented | request-prefix adapter plus startup budgets |
+| vLLM 0.26 v1 API / V2 model runner | reference by default; opt-in exact eager single-token decode/FA2 NTA consumer | not a serving claim | opt-in exact catalog-backed single-token decode; hardware qualification required | opt-in exact catalog-backed single-token decode; endpoint qualification required | request-prefix adapter plus startup budgets |
 | LLVM/compiler | typed marker lowering and contract checks | same | same | same | identity comes from typed binding, not guessing |
 
 The compiler's marker-free paged-signature discovery is diagnostic only. It
@@ -31,6 +31,9 @@ they are the tests that may issue device traffic or require exclusive device
 ownership.
 
 The matrix is deliberately narrower than the internal API surface. Prefill,
-mixed batches, CUDA graph replay, external vLLM tiers, multi-GPU physical
-routes, and storage fault recovery require their own correctness gates before
-they can be presented as supported evaluation claims.
+mixed batches, CUDA graph replay, multi-GPU physical routes, storage fault
+recovery, and a vLLM scheduler-side persistent KVConnector still require their
+own correctness gates before they can be presented as supported evaluation
+claims. The vLLM physical row is the native NTA attention consumer for the
+current exact block-table projection; it is not a claim that vLLM's upstream
+prefix-cache/eviction lifecycle has been replaced.

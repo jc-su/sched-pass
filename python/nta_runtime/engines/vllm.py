@@ -1,4 +1,4 @@
-"""vLLM 0.26 V1 consumer for instrumented FlashInfer decode attention.
+"""vLLM 0.26 V1 consumer for instrumented FlashInfer attention.
 
 The worker controller is the only framework-private bridge in this module.
 It publishes an engine-neutral :class:`EngineBatch` after vLLM updates its
@@ -6,11 +6,12 @@ persistent input batch.  ``NtaVllmFlashInferImpl`` then consumes that batch
 through a real vLLM ``AttentionImpl`` call and submits the same typed NTA
 work-plan ABI used by the SGLang adapter.
 
-This first consumer is deliberately narrow: resident CUDA KV, one KV group,
-non-TRTLLM single-token decode, and no CUDA graph capture.  Unsupported
-features use vLLM's reference implementation only when explicitly enabled;
-the native path otherwise fails closed so an artifact cannot silently claim
-NTA execution for a stock launch.
+The qualified profile is one KV group, FA2 single-token decode, and no CUDA
+graph capture. Host-staged uses resident CUDA KV; NVMe and CXL-DAX use the
+same exact work-plan/phase protocol as SGLang. Unsupported features use
+vLLM's reference implementation only when explicitly enabled; the native path
+otherwise fails closed so an artifact cannot silently claim NTA execution for
+a stock launch.
 """
 
 from __future__ import annotations
@@ -45,11 +46,18 @@ from nta_runtime.adapters.vllm_v1 import (
 )
 from nta_runtime.execution_core import ExecutionSession, ExecutionTile
 from nta_runtime.execution_protocol import ExecutionProtocolConfig
+from nta_runtime.runtime_resources import (
+    RuntimeResourceConfig,
+    ServingRuntimeResources,
+)
+from nta_runtime.tier import ServingTierConfig
 from nta_runtime.flashinfer import (
     BIND_CURRENT_GENERATION,
+    FlashInferLayerEpoch,
     PREACQUIRED,
     attention_jit_args,
     direct_requirement,
+    enqueue_resident_attention,
     request_ranges_for_schedule,
 )
 from nta_runtime.flashinfer_schedule import decode_schedule
@@ -70,7 +78,6 @@ from nta_runtime.runtime import (
     OperatorCoordinateMap,
     OperatorReduction,
     Runtime,
-    RuntimeConfig,
 )
 from nta_runtime.work_unit import Granularity
 
@@ -220,7 +227,9 @@ def _close_phase_programs() -> None:
     _PHASE_PROGRAMS.clear()
 
 
-def _build_runtime(runner: Any, request_capacity: int, work_capacity: int) -> Runtime:
+def _build_resources(
+    runner: Any, request_capacity: int, work_capacity: int
+) -> ServingRuntimeResources:
     device = getattr(runner, "device", None)
     device_ordinal = (
         int(device.index)
@@ -228,16 +237,20 @@ def _build_runtime(runner: Any, request_capacity: int, work_capacity: int) -> Ru
         else int(torch.cuda.current_device())
     )
     tenant_capacity = _positive_env("NTA_TENANT_CAPACITY", max(1, request_capacity))
-    return Runtime(
-        RuntimeConfig(
+    return ServingRuntimeResources.open(
+        tier_config=ServingTierConfig.from_environment(),
+        runtime_config=RuntimeResourceConfig.with_environment_staging_limit(
             request_capacity=request_capacity,
-            object_capacity=max(2, 2 * request_capacity),
-            intent_capacity=max(2, 2 * request_capacity),
+            # A physical work item owns a K/V object pair. Keep object
+            # capacity proportional to the ticket bound instead of the
+            # mutable vLLM batch row count.
+            object_capacity=max(2, 2 * work_capacity),
+            intent_capacity=max(2, 2 * work_capacity),
             work_ticket_capacity=work_capacity,
             max_dependencies_per_work_ticket=2,
             device_ordinal=device_ordinal,
             tenant_capacity=tenant_capacity,
-        )
+        ),
     )
 
 
@@ -252,6 +265,7 @@ class VllmV1WorkerController:
     def __init__(self, runner: Any) -> None:
         self._runner_ref = weakref.ref(runner)
         self._runtime: Runtime | None = None
+        self._resources: ServingRuntimeResources | None = None
         self._hook: VllmV1Hook | None = None
         self._page_size = 0
         self._page_bytes = 0
@@ -288,7 +302,8 @@ class VllmV1WorkerController:
                 "NTA_VLLM_WORK_TICKET_CAPACITY",
                 max(request_capacity, 4 * request_capacity),
             )
-            runtime = _build_runtime(runner, request_capacity, work_capacity)
+            resources = _build_resources(runner, request_capacity, work_capacity)
+            runtime = resources.runtime
             try:
                 tenant_specs = tenant_budget_specs()
                 tenant_capacity = int(runtime.config.tenant_capacity)
@@ -308,10 +323,11 @@ class VllmV1WorkerController:
                 )
             except BaseException:
                 try:
-                    runtime.close()
+                    resources.close()
                 except BaseException:
                     pass
                 raise
+            self._resources = resources
             self._runtime = runtime
             self._hook = hook
             self._request_capacity = request_capacity
@@ -382,11 +398,14 @@ class VllmV1WorkerController:
     def close(self) -> None:
         """Close the runtime after the framework has stopped using the runner."""
         runtime, self._runtime = self._runtime, None
+        resources, self._resources = self._resources, None
         self._hook = None
         self._page_size = 0
         self._page_bytes = 0
         self._request_capacity = 0
-        if runtime is not None:
+        if resources is not None:
+            resources.close()
+        elif runtime is not None:
             runtime.close()
 
     def __del__(self) -> None:
@@ -410,6 +429,12 @@ class VllmV1WorkerController:
         if self._page_size <= 0:
             raise RuntimeError("vLLM V1 worker controller has no page size")
         return self._page_size
+
+    @property
+    def tier_service(self) -> Any:
+        if self._resources is None:
+            raise RuntimeError("vLLM worker controller has no serving tier")
+        return self._resources.tier
 
 
 def _controller(runner: Any) -> VllmV1WorkerController:
@@ -457,13 +482,48 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         self._nta_plan: DeviceWorkPlan | None = None
         self._nta_plan_capacity = 0
         self._nta_program: JitPhaseProgram | None = None
-        # Resident-only vLLM requests do not exercise a remote-tier
-        # dependency.  Keep the framework reference as the no-regression
-        # default; the native work-unit consumer is an explicit integration
-        # profile until an external KVConnector supplies the same exact
-        # demand/lifetime boundary.
+        self._physical_quiescence_event: torch.cuda.Event | None = None
+        self._physical_quiescence_recorded = False
+        # Native mode is explicit. Physical tiers are additionally checked by
+        # the worker resource owner and are never silently routed through the
+        # resident framework path.
         self._native_enabled = os.environ.get("NTA_VLLM_NATIVE", "0") == "1"
-        validate_vllm_attention_tier()
+        self._serving_tier = validate_vllm_attention_tier()
+
+    @staticmethod
+    def _physical_pages(
+        batch: EngineBatch,
+        schedule: Any,
+        request_index: int,
+        kv_tile: int,
+        page_size: int,
+    ) -> tuple[int, ...]:
+        if batch.exact_demand is None:
+            raise RuntimeError("vLLM physical plan has no exact page demand")
+        if request_index < 0 or request_index >= len(
+            batch.exact_demand.request_unit_ids
+        ):
+            raise RuntimeError("vLLM physical plan referenced an invalid request")
+        pages = batch.exact_demand.request_unit_ids[request_index]
+        chunk_tokens = int(getattr(schedule, "kv_chunk_tokens", 0))
+        if chunk_tokens == 0:
+            if kv_tile != 0:
+                raise RuntimeError(
+                    "unsplit vLLM FlashInfer schedule emitted a nonzero KV tile"
+                )
+            selected = pages
+        else:
+            if chunk_tokens % page_size != 0:
+                raise RuntimeError(
+                    "vLLM physical acquisition requires page-aligned FlashInfer "
+                    "KV chunks"
+                )
+            pages_per_tile = chunk_tokens // page_size
+            begin = kv_tile * pages_per_tile
+            selected = pages[begin : begin + pages_per_tile]
+        if not selected:
+            raise RuntimeError("vLLM physical schedule selected no KV pages")
+        return tuple(int(page) for page in selected)
 
     def _ensure_wrapper(self, query: torch.Tensor, kv_cache: torch.Tensor) -> None:
         if self._nta_wrapper is not None:
@@ -520,6 +580,8 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         self,
         state: Any,
         schedule: Any,
+        *,
+        layer: int = 0,
     ) -> ExecutionSession:
         batch = state.batch
         if not isinstance(batch, EngineBatch) or batch.exact_demand is None:
@@ -546,7 +608,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 ExecutionTile(
                     work_id=work_id,
                     binding=binding,
-                    layer=0,
+                    layer=layer,
                     logical_begin=int(kv_tile),
                     candidate_units=candidates,
                     selected_ids=tuple(range(candidates)),
@@ -570,6 +632,151 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             ),
             tiles=tiles,
         )
+
+    def _upload_physical_plan(
+        self,
+        state: Any,
+        schedule: Any,
+        execution: ExecutionSession,
+        layer: int,
+        page_size: int,
+        key_bytes: int,
+        value_bytes: int,
+    ) -> tuple[DeviceWorkPlan, int, bool]:
+        """Upload exact CXL/NVMe dependencies for one vLLM layer.
+
+        vLLM's packed resident KV layout is not a safe destination for a
+        separate K/V physical extent.  The NTA attention module therefore
+        consumes the two typed dependency addresses/staging objects directly,
+        exactly as SGLang's physical path does.  This keeps NVMe DMA in HBM
+        and leaves CXL as a device-visible direct dependency.
+        """
+        tier = getattr(state, "tier_service", None)
+        if tier is None or tier.is_host:
+            raise RuntimeError("vLLM physical plan has no physical tier service")
+        batch = state.batch
+        if not isinstance(batch, EngineBatch):
+            raise RuntimeError("vLLM physical plan has no engine batch")
+        runtime = state.hook.runtime
+        work_count = schedule.work_count
+        if work_count <= 0:
+            raise RuntimeError("vLLM physical schedule is empty")
+        if work_count > self._nta_plan_capacity:
+            if self._nta_plan is not None:
+                torch.cuda.current_stream().synchronize()
+                self._nta_plan.close()
+            self._nta_plan = DeviceWorkPlan(
+                work_count,
+                2 * work_count,
+                runtime.device_ordinal,
+            )
+            self._nta_plan_capacity = work_count
+        assert self._nta_plan is not None
+
+        stream = torch.cuda.current_stream()
+        version = int(batch.epoch) + 1
+        object_slots: dict[tuple[int, ...], tuple[int, int]] = {}
+        dependencies: list[AcquireRequirement] = []
+        spans: list[tuple[int, int, int, int]] = []
+        object_count = 0
+        for work_id, (request_index, kv_tile) in enumerate(
+            zip(schedule.request_indices, schedule.kv_tile_indices, strict=True)
+        ):
+            pages = self._physical_pages(
+                batch, schedule, int(request_index), int(kv_tile), page_size
+            )
+            begin = len(dependencies)
+            if tier.is_cxl:
+                key_extent = tier.extent(layer, pages, "key", key_bytes)
+                value_extent = tier.extent(layer, pages, "value", value_bytes)
+                dependencies.extend(
+                    (
+                        direct_requirement(
+                            tier.device_address(key_extent), key_extent.bytes
+                        ),
+                        direct_requirement(
+                            tier.device_address(value_extent), value_extent.bytes
+                        ),
+                    )
+                )
+                direct_count = 2
+            elif tier.is_nvme:
+                slots = object_slots.get(pages)
+                if slots is None:
+                    key_extent = tier.extent(layer, pages, "key", key_bytes)
+                    value_extent = tier.extent(layer, pages, "value", value_bytes)
+                    if object_count + 2 > runtime.config.object_capacity:
+                        raise RuntimeError(
+                            "vLLM physical layer exceeds the runtime object capacity"
+                        )
+                    key_slot = object_count
+                    key_address = runtime.install_nvme_object_async(
+                        key_slot,
+                        0x4E54410000000000 | key_slot,
+                        version,
+                        key_extent.offset,
+                        key_extent.bytes,
+                        stream,
+                        self._physical_quiescence_event
+                        if self._physical_quiescence_recorded
+                        else None,
+                    )
+                    value_slot = key_slot + 1
+                    value_address = runtime.install_nvme_object_async(
+                        value_slot,
+                        0x4E54410000000000 | value_slot,
+                        version,
+                        value_extent.offset,
+                        value_extent.bytes,
+                        stream,
+                        self._physical_quiescence_event
+                        if self._physical_quiescence_recorded
+                        else None,
+                    )
+                    del key_address, value_address
+                    slots = (key_slot, value_slot)
+                    object_slots[pages] = slots
+                    object_count += 2
+                key_slot, value_slot = slots
+                dependencies.extend(
+                    (
+                        AcquireRequirement(
+                            0,
+                            0,
+                            0x4E54410000000000 | key_slot,
+                            0,
+                            key_slot,
+                            version,
+                            len(pages) * key_bytes,
+                            0,
+                        ),
+                        AcquireRequirement(
+                            0,
+                            0,
+                            0x4E54410000000000 | value_slot,
+                            0,
+                            value_slot,
+                            version,
+                            len(pages) * value_bytes,
+                            0,
+                        ),
+                    )
+                )
+                direct_count = 0
+            else:
+                raise RuntimeError(f"unsupported vLLM physical tier {tier.tier}")
+            spans.append((begin, 2, direct_count, work_id))
+
+        ranges = request_ranges_for_schedule(batch.bindings, schedule.request_indices)
+        self._nta_plan.upload_work_units(
+            execution.batch.units,
+            spans,
+            dependencies,
+            ranges,
+            epoch=execution.epoch,
+            stream=stream,
+        )
+        return self._nta_plan, object_count, tier.is_nvme
 
     def _upload_plan(
         self,
@@ -694,7 +901,18 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             disable_split_kv=True,
         )
         schedule = decode_schedule(self._nta_wrapper)
-        execution = self._build_plan(state, schedule)
+        physical = self._serving_tier != "host_staged"
+        raw_layer_id = getattr(layer, "layer_id", None)
+        if physical and raw_layer_id is None:
+            raise RuntimeError(
+                "vLLM physical attention requires a stable transformer layer_id"
+            )
+        layer_id = 0 if raw_layer_id is None else int(raw_layer_id)
+        execution = self._build_plan(
+            state,
+            schedule,
+            layer=layer_id if physical else 0,
+        )
         if self._nta_program is None:
             raise RuntimeError("vLLM NTA attention has no validated phase program")
         # vLLM reuses one worker-local Runtime across attention layers and
@@ -703,33 +921,93 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         # work-ticket, CTA-completion, reduction, or request-progress state.
         # Reset on the same CUDA stream before uploading the next exact plan so
         # a reused ticket index can never observe an older request generation.
-        self._nta_program.reset(
-            state.hook.runtime,
-            object_count=0,
-            work_ticket_count=schedule.work_count,
-            stream=torch.cuda.current_stream(),
-        )
-        plan = self._upload_plan(
-            execution,
-            schedule,
-            state.hook.runtime,
-            batch.bindings,
-        )
+        if physical:
+            tier = getattr(state, "tier_service", None)
+            if tier is None or tier.tier.value != self._serving_tier:
+                raise RuntimeError(
+                    "vLLM forward tier does not match the worker resource owner"
+                )
+            if batch.exact_demand is None or batch.exact_demand.unit_bytes % 2:
+                raise RuntimeError(
+                    "vLLM physical KV page bytes must split evenly into K/V"
+                )
+            plan, object_count, is_nvme = self._upload_physical_plan(
+                state,
+                schedule,
+                execution,
+                layer_id,
+                page_size,
+                batch.exact_demand.unit_bytes // 2,
+                batch.exact_demand.unit_bytes // 2,
+            )
+            self._nta_program.reset(
+                state.hook.runtime,
+                object_count=object_count,
+                work_ticket_count=schedule.work_count,
+                stream=torch.cuda.current_stream(),
+            )
+        else:
+            is_nvme = False
+            self._nta_program.reset(
+                state.hook.runtime,
+                object_count=0,
+                work_ticket_count=schedule.work_count,
+                stream=torch.cuda.current_stream(),
+            )
+            plan = self._upload_plan(
+                execution,
+                schedule,
+                state.hook.runtime,
+                batch.bindings,
+            )
         kv_cache_permute = kv_cache.permute(
             *FlashInferBackend.get_kv_cache_stride_order()
         )
         kv_cache_for_flashinfer = kv_cache_permute.split(self.head_size, dim=-1)
-        self._nta_wrapper.run(
-            query,
-            kv_cache_for_flashinfer,
-            state.hook.runtime.device_view_tensor,
-            plan.work_items_tensor,
-            plan.dependencies_tensor,
-            self.scale,
-            schedule.work_count,
-            PREACQUIRED | BIND_CURRENT_GENERATION,
-            out=output,
-        )
+        if physical and is_nvme:
+            epoch = FlashInferLayerEpoch(
+                state.hook.runtime,
+                plan,
+                self._nta_program,
+                object_count=object_count,
+                max_progress_rounds=tier.config.progress_rounds,
+                wait_for_plan=False,
+            )
+            progress_rounds = epoch.enqueue_nvme(
+                self._nta_wrapper,
+                query,
+                kv_cache_for_flashinfer,
+                output,
+                issue_budget=tier.config.issue_budget,
+                completion_budget=tier.config.completion_budget,
+                timeout_ns=tier.config.progress_timeout_ns,
+                sm_scale=self.scale,
+                stream=torch.cuda.current_stream(),
+            )
+            if os.environ.get("NTA_VLLM_VERIFY_TRANSFER") == "1":
+                epoch.check(progress_rounds, torch.cuda.current_stream())
+        elif physical:
+            enqueue_resident_attention(
+                state.hook.runtime,
+                plan,
+                self._nta_wrapper,
+                query,
+                kv_cache_for_flashinfer,
+                output,
+                sm_scale=self.scale,
+            )
+        else:
+            self._nta_wrapper.run(
+                query,
+                kv_cache_for_flashinfer,
+                state.hook.runtime.device_view_tensor,
+                plan.work_items_tensor,
+                plan.dependencies_tensor,
+                self.scale,
+                schedule.work_count,
+                PREACQUIRED | BIND_CURRENT_GENERATION,
+                out=output,
+            )
         if os.environ.get("NTA_VLLM_COMPARE_STOCK") == "1":
             # Differential diagnosis is opt-in because the reference launch
             # adds a synchronization and one extra attention kernel. It
@@ -746,10 +1024,17 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 VLLM_STATS["native_stock_diff_max_milli"],
                 int(difference * 1000),
             )
-        plan.mark_consumed(torch.cuda.current_stream())
+        if physical and is_nvme:
+            if self._physical_quiescence_event is None:
+                self._physical_quiescence_event = torch.cuda.Event()
+            self._physical_quiescence_event.record(torch.cuda.current_stream())
+            self._physical_quiescence_recorded = True
+        elif not physical:
+            plan.mark_consumed(torch.cuda.current_stream())
         execution.record_layer_completion(0)
         state.hook.record_native_launch()
         VLLM_STATS["native_decode_launches"] += 1
+        VLLM_STATS["physical_decode_launches"] += int(physical)
         VLLM_STATS["native_decode_work_items"] += schedule.work_count
         return output
 
@@ -864,7 +1149,8 @@ def consumer_contract() -> dict[str, Any]:
             {
                 "native_launches": native,
                 "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
-                "resident_only": True,
+                "resident_only": VLLM_STATS["physical_decode_launches"] == 0,
+                "physical_decode_launches": VLLM_STATS["physical_decode_launches"],
             }
         )
         return contract
@@ -904,6 +1190,7 @@ def _publish_vllm_evidence() -> None:
         )
         == "1",
         "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
+        "physical_decode_launches": VLLM_STATS["physical_decode_launches"],
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

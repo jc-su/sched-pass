@@ -290,6 +290,8 @@ struct NvmeTransport::Impl {
     NvmeDmaTarget target = NvmeDmaTarget::HostMapped;
     void *hostAddress = nullptr;
     void *deviceAddress = nullptr;
+    bool cacheable = true;
+    bool ownsDestinationMemory = true;
   };
 
   static constexpr std::size_t MappingCacheCapacity = 256;
@@ -510,13 +512,15 @@ struct NvmeTransport::Impl {
       (void)cudaFree(mapping.devicePageList);
       mapping.devicePageList = nullptr;
     }
-    if (mapping.hostAllocation != nullptr) {
+    if (mapping.ownsDestinationMemory && mapping.hostAllocation != nullptr) {
       (void)cudaFreeHost(mapping.hostAllocation);
       mapping.hostAllocation = nullptr;
     }
     HbmAllocation hbm{mapping.hbmBase, mapping.hbmAddress,
                       mapping.hbmAllocationBytes, mapping.hbmMappedBytes};
-    releaseHbmAllocation(hbm);
+    if (mapping.ownsDestinationMemory) {
+      releaseHbmAllocation(hbm);
+    }
     mapping.hbmBase = 0;
     mapping.hbmAddress = 0;
     mapping.hbmAllocationBytes = 0;
@@ -529,7 +533,8 @@ struct NvmeTransport::Impl {
   }
 
   void cacheMappingResourcesLocked(RetiredMapping mapping) noexcept {
-    if (!mapping.dmaMapping || mapping.devicePageList == nullptr ||
+    if (!mapping.cacheable || !mapping.dmaMapping ||
+        mapping.devicePageList == nullptr ||
         mapping.pageCount == 0 || mapping.allocationBytes == 0 ||
         mapping.resourceBytes == 0) {
       releaseMappingResources(mapping);
@@ -648,6 +653,8 @@ struct NvmeBuffer::Impl {
       mapping.target = target;
       mapping.hostAddress = hostAddress;
       mapping.deviceAddress = deviceAddress;
+      mapping.cacheable = cacheable;
+      mapping.ownsDestinationMemory = ownsDestinationMemory;
       owner->releaseMapping(std::move(mapping));
       hostAllocation = nullptr;
       hostAddress = nullptr;
@@ -680,6 +687,8 @@ struct NvmeBuffer::Impl {
   std::size_t hbmAllocationBytes = 0;
   std::size_t hbmMappedBytes = 0;
   NvmeDmaTarget target = NvmeDmaTarget::HostMapped;
+  bool cacheable = true;
+  bool ownsDestinationMemory = true;
 };
 
 NvmeBuffer::NvmeBuffer(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -704,6 +713,10 @@ std::size_t NvmeBuffer::bytes() const noexcept {
 }
 
 NvmeDmaTarget NvmeBuffer::dmaTarget() const noexcept { return impl_->target; }
+
+bool NvmeBuffer::ownsDestinationMemory() const noexcept {
+  return impl_ != nullptr && impl_->ownsDestinationMemory;
+}
 
 NvmeTransport::NvmeTransport(std::string devicePath, int deviceOrdinal)
     : NvmeTransport(
@@ -851,6 +864,96 @@ std::unique_ptr<NvmeBuffer> NvmeTransport::allocate(std::size_t bytes) {
                            sizeof(buffer->dmaMapping.pages().front()),
                        cudaMemcpyHostToDevice),
             "upload NVMe DMA page list");
+  return std::unique_ptr<NvmeBuffer>(new NvmeBuffer(std::move(buffer)));
+}
+
+std::unique_ptr<NvmeBuffer>
+NvmeTransport::mapExternalHbm(void *deviceAddress, std::size_t bytes) {
+  detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
+  impl_->reapMappings();
+  constexpr std::size_t peerAlignment = 64U * 1024U;
+  if (impl_->dmaTarget != NvmeDmaTarget::HbmPeer) {
+    throw std::invalid_argument(
+        "external HBM NVMe destinations require dmaTarget=hbm-peer");
+  }
+  if (deviceAddress == nullptr || bytes == 0 ||
+      bytes > impl_->capabilities.maxTransferBytes ||
+      bytes % impl_->capabilities.lbaSize != 0 ||
+      reinterpret_cast<std::uintptr_t>(deviceAddress) % peerAlignment != 0 ||
+      bytes % peerAlignment != 0 ||
+      bytes % impl_->capabilities.controllerPageSize != 0) {
+    throw std::invalid_argument(
+        "external HBM NVMe destination must be LBA/page/64 KiB aligned and "
+        "within the controller transfer limit");
+  }
+
+  cudaPointerAttributes attributes{};
+  const cudaError_t attributeStatus =
+      cudaPointerGetAttributes(&attributes, deviceAddress);
+  if (attributeStatus != cudaSuccess) {
+    (void)cudaGetLastError();
+    throw std::invalid_argument(
+        "external HBM NVMe destination is not a live CUDA allocation");
+  }
+  if (attributes.type != cudaMemoryTypeDevice ||
+      attributes.device != impl_->deviceOrdinal) {
+    throw std::invalid_argument(
+        "external NVMe destination must be device memory on the transport "
+        "CUDA device");
+  }
+
+  CUdeviceptr allocationBase = 0;
+  std::size_t allocationBytes = 0;
+  checkDriver(cuMemGetAddressRange(
+                  &allocationBase, &allocationBytes,
+                  reinterpret_cast<CUdeviceptr>(deviceAddress)),
+              "query external HBM allocation range");
+  const CUdeviceptr address = reinterpret_cast<CUdeviceptr>(deviceAddress);
+  if (address < allocationBase ||
+      static_cast<std::size_t>(address - allocationBase) > allocationBytes ||
+      bytes >
+          allocationBytes - static_cast<std::size_t>(address - allocationBase)) {
+    throw std::invalid_argument(
+        "external HBM NVMe destination exceeds its CUDA allocation");
+  }
+
+  auto buffer = std::make_unique<NvmeBuffer::Impl>();
+  buffer->owner = impl_;
+  buffer->target = NvmeDmaTarget::HbmPeer;
+  buffer->deviceAddress = deviceAddress;
+  buffer->allocationBytes = bytes;
+  buffer->resourceBytes = bytes;
+  buffer->cacheable = false;
+  buffer->ownsDestinationMemory = false;
+
+  detail::NvmeMapping mapping = impl_->controlPlane->mappingBackend().mapHbm(
+      address, bytes);
+  const std::size_t requiredPages =
+      bytes / impl_->capabilities.controllerPageSize;
+  if (mapping.pages().size() < requiredPages) {
+    throw std::runtime_error(
+        "external HBM DMA mapping is shorter than the requested transfer");
+  }
+  mapping.retainPagePrefix(requiredPages);
+  buffer->dmaMapping = std::move(mapping);
+  if (!buffer->dmaMapping || buffer->dmaMapping.pages().empty() ||
+      buffer->dmaMapping.pages().size() >
+          std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error(
+        "external HBM backend returned an invalid DMA page list");
+  }
+  buffer->pageCount =
+      static_cast<std::uint32_t>(buffer->dmaMapping.pages().size());
+  checkCuda(cudaMalloc(reinterpret_cast<void **>(&buffer->devicePageList),
+                       buffer->dmaMapping.pages().size() *
+                           sizeof(buffer->dmaMapping.pages().front())),
+            "cudaMalloc external NVMe DMA page list");
+  checkCuda(cudaMemcpy(buffer->devicePageList,
+                       buffer->dmaMapping.pages().data(),
+                       buffer->dmaMapping.pages().size() *
+                           sizeof(buffer->dmaMapping.pages().front()),
+                       cudaMemcpyHostToDevice),
+            "upload external NVMe DMA page list");
   return std::unique_ptr<NvmeBuffer>(new NvmeBuffer(std::move(buffer)));
 }
 

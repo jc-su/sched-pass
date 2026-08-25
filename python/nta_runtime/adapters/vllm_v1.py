@@ -35,13 +35,10 @@ def validate_vllm_attention_tier(
 ) -> str:
     """Validate the tier visible to the vLLM numerical consumer.
 
-    The current vLLM ``AttentionImpl`` consumes resident KV pages.  A
-    physical tier must therefore be rejected before construction; otherwise
-    an operator could set ``NTA_SERVING_TIER=nvme`` while the framework still
-    served the resident cache and produce a misleading artifact.  The
-    framework-neutral host-staged default remains allowed for the reference
-    and resident qualification profiles; it is not treated as proof of an
-    external vLLM transfer.
+    A physical tier is accepted only as an explicit NTA native profile.  The
+    worker resource owner opens and validates the transport, while the
+    attention consumer still fails closed if it is not enabled.  This avoids
+    silently treating a physical-tier configuration as resident vLLM data.
     """
     values = os.environ if environ is None else environ
     selected = values.get("NTA_SERVING_TIER", "host_staged").strip().lower()
@@ -53,10 +50,10 @@ def validate_vllm_attention_tier(
         raise RuntimeError(
             "NTA_SERVING_TIER must be host_staged, nvme, or cxl_dax for vLLM"
         )
-    if selected in {"nvme", "cxl_dax"}:
+    if selected in {"nvme", "cxl_dax"} and values.get("NTA_VLLM_NATIVE", "0") != "1":
         raise RuntimeError(
-            "vLLM resident attention cannot consume a physical tier; configure "
-            "a tested V1 KVConnector/data-lifetime adapter first"
+            "vLLM physical tiers require NTA_VLLM_NATIVE=1; stock resident "
+            "attention cannot consume NVMe or CXL-DAX data"
         )
     return selected
 
@@ -77,6 +74,7 @@ class VllmV1ForwardState:
     input_batch: Any | None = None
     batch: EngineBatch | None = None
     hook: "VllmV1Hook | None" = None
+    tier_service: Any | None = None
     page_size: int = 0
     reference_warmup: bool = False
 

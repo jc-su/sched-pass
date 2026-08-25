@@ -41,6 +41,15 @@ def main() -> None:
     )
     assert "controlPlane->mappingBackend().mapHbm" in runtime
     assert "retainPagePrefix" in runtime
+    assert "mapExternalHbm" in runtime
+    assert "ownsDestinationMemory" in runtime
+    assert "mapping.cacheable = cacheable" in runtime
+    external_begin = runtime.index("NvmeTransport::mapExternalHbm")
+    external_end = runtime.index("} // namespace nta", external_begin)
+    external_mapping = runtime[external_begin:external_end]
+    assert "cacheable = false" in external_mapping
+    assert "cudaMemoryTypeDevice" in external_mapping
+    assert "cuMemGetAddressRange" in external_mapping
     assert "mappingBackend().mapHost" in runtime
     assert "NvmeHbmMappingBackend::NvidiaPeerPages" in runtime
     assert "cuMemAlloc(&allocation.base" in runtime
@@ -138,6 +147,8 @@ def main() -> None:
     runtime_c = (ROOT / "include" / "nta" / "RuntimeC.h").read_text(encoding="utf-8")
     assert "nta_jit_phase_progress_nvme_until_idle" in runtime_c
     assert "nta_runtime_install_nvme_object_async" in runtime_c
+    assert "nta_runtime_install_external_nvme_object" in runtime_c
+    assert "nta_runtime_install_external_nvme_object_async" in runtime_c
     runtime_c_impl = (ROOT / "runtime" / "host" / "RuntimeC.cpp").read_text(
         encoding="utf-8"
     )

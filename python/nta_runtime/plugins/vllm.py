@@ -117,6 +117,7 @@ def _patch_v1_runner(runner_class: type[Any]) -> None:
         state.input_batch = self.input_batch
         state.batch = controller.bind(scheduler_output)
         state.hook = controller.hook
+        state.tier_service = controller.tier_service
         state.page_size = controller.page_size
         return result
 
@@ -217,6 +218,7 @@ def _patch_v2_runner(runner_class: type[Any]) -> None:
             num_blocks=counts,
         )
         state.hook = controller.hook
+        state.tier_service = controller.tier_service
         state.page_size = controller.page_size
         return result
 

@@ -116,7 +116,13 @@ def main() -> None:
         except RuntimeError as error:
             assert "physical tier" in str(error)
         else:
-            raise AssertionError("vLLM resident consumer accepted a physical tier")
+            raise AssertionError("vLLM physical tier was accepted without native mode")
+        assert (
+            validate_vllm_attention_tier(
+                {"NTA_SERVING_TIER": value, "NTA_VLLM_NATIVE": "1"}
+            )
+            == ("cxl_dax" if value == "cxl" else value)
+        )
 
     config = SglangExecutionConfig.from_environment(
         {

@@ -15,7 +15,7 @@ from typing import Any
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 36
+API_VERSION = 37
 _UINT32_MAX = (1 << 32) - 1
 _UINT64_MAX = (1 << 64) - 1
 _INT32_MAX = (1 << 31) - 1
@@ -1135,6 +1135,31 @@ _runtime_install_nvme_object_async = _function(
     ctypes.c_uint64,
     ctypes.POINTER(ctypes.c_uint64),
 )
+_runtime_install_external_nvme_object = _function(
+    "nta_runtime_install_external_nvme_object",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint64),
+)
+_runtime_install_external_nvme_object_async = _function(
+    "nta_runtime_install_external_nvme_object_async",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint64),
+)
 _runtime_pending_count = _function(
     "nta_runtime_read_pending_count",
     ctypes.c_int,
@@ -1997,6 +2022,70 @@ class Runtime(_Owner):
                 version,
                 source_byte_offset,
                 bytes,
+                _stream_address(stream),
+                _event_address(prior_consumer_event),
+                ctypes.byref(destination),
+            )
+        )
+        return int(destination.value)
+
+    def install_external_nvme_object(
+        self,
+        slot: int,
+        object_id: int,
+        version: int,
+        source_byte_offset: int,
+        bytes: int,
+        destination_device_address: int,
+    ) -> int:
+        """Publish a direct-NVMe object into caller-owned HBM.
+
+        The caller retains ownership of the CUDA allocation. NTA retains the
+        peer mapping lease until the object is safely retired.
+        """
+        if destination_device_address <= 0:
+            raise ValueError("external NVMe destination address must be positive")
+        destination = ctypes.c_uint64()
+        _check(
+            _runtime_install_external_nvme_object(
+                self._handle,
+                slot,
+                object_id,
+                version,
+                source_byte_offset,
+                bytes,
+                destination_device_address,
+                ctypes.byref(destination),
+            )
+        )
+        return int(destination.value)
+
+    def install_external_nvme_object_async(
+        self,
+        slot: int,
+        object_id: int,
+        version: int,
+        source_byte_offset: int,
+        bytes: int,
+        destination_device_address: int,
+        stream: Any,
+        prior_consumer_event: Any = None,
+    ) -> int:
+        """Stream-order a direct-NVMe object into caller-owned HBM."""
+        if destination_device_address <= 0:
+            raise ValueError("external NVMe destination address must be positive")
+        if stream is None:
+            raise ValueError("asynchronous NVMe installation requires a stream")
+        destination = ctypes.c_uint64()
+        _check(
+            _runtime_install_external_nvme_object_async(
+                self._handle,
+                slot,
+                object_id,
+                version,
+                source_byte_offset,
+                bytes,
+                destination_device_address,
                 _stream_address(stream),
                 _event_address(prior_consumer_event),
                 ctypes.byref(destination),
