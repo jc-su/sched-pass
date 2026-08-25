@@ -17,22 +17,32 @@
 
 namespace nta::qualification {
 
-inline bool isCxlDaxNode(const std::string &name) {
-  const std::filesystem::path classDevice =
-      std::filesystem::path("/sys/class/dax") / name;
-  const std::filesystem::path cxlDevices("/sys/bus/cxl/devices");
-  std::error_code error;
+struct CxlDaxDiscoveryRoots {
+  std::filesystem::path devRoot = "/dev";
+  std::filesystem::path classRoot = "/sys/class/dax";
+  std::filesystem::path cxlDevicesRoot = "/sys/bus/cxl/devices";
+};
+
+inline bool isCxlDaxNode(
+    const std::string &name,
+    const CxlDaxDiscoveryRoots &roots = CxlDaxDiscoveryRoots{}) {
+  const std::filesystem::path classDevice = roots.classRoot / name;
+  const std::filesystem::path cxlDevices = roots.cxlDevicesRoot;
+  std::error_code canonicalError;
   const std::filesystem::path resolved =
-      std::filesystem::weakly_canonical(classDevice, error);
-  if (error || resolved.empty()) {
+      std::filesystem::weakly_canonical(classDevice, canonicalError);
+  if (canonicalError || resolved.empty()) {
     return false;
   }
   for (std::filesystem::path current = resolved; !current.empty();
        current = current.parent_path()) {
     const std::string component = current.filename().string();
-    if (component.starts_with("region") &&
-        std::filesystem::exists(cxlDevices / component, error) && !error) {
-      return true;
+    if (component.starts_with("region")) {
+      std::error_code existsError;
+      if (std::filesystem::exists(cxlDevices / component, existsError) &&
+          !existsError) {
+        return true;
+      }
     }
     if (current == current.parent_path()) {
       break;
@@ -41,8 +51,9 @@ inline bool isCxlDaxNode(const std::string &name) {
   return false;
 }
 
-inline std::optional<std::string> discoverDaxEndpoint() {
-  const std::filesystem::path devRoot("/dev");
+inline std::optional<std::string> discoverDaxEndpoint(
+    const CxlDaxDiscoveryRoots &roots = CxlDaxDiscoveryRoots{}) {
+  const std::filesystem::path devRoot = roots.devRoot;
   std::error_code error;
   if (!std::filesystem::is_directory(devRoot, error) || error) {
     return std::nullopt;
@@ -52,7 +63,7 @@ inline std::optional<std::string> discoverDaxEndpoint() {
        it != end && !error; it.increment(error)) {
     const std::filesystem::path path = it->path();
     const std::string name = path.filename().string();
-    if (!name.starts_with("dax") || !isCxlDaxNode(name)) {
+    if (!name.starts_with("dax") || !isCxlDaxNode(name, roots)) {
       continue;
     }
     struct stat status {};

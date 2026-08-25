@@ -8,11 +8,16 @@
 
 namespace nta::qualification {
 
+struct NvmeDiscoveryRoots {
+  std::filesystem::path pciDevicesRoot = "/sys/bus/pci/devices";
+};
+
 // Discovery is deliberately read-only.  A candidate is usable by the
 // transport only after an explicit VFIO rebind and the transport's own
 // translated-IOMMU, namespace-policy, and GPU-doorbell checks.
-inline std::optional<std::string> discoverVfioNvmeEndpoint() {
-  const std::filesystem::path devices("/sys/bus/pci/devices");
+inline std::optional<std::string> discoverVfioNvmeEndpoint(
+    const NvmeDiscoveryRoots &roots = NvmeDiscoveryRoots{}) {
+  const std::filesystem::path devices = roots.pciDevicesRoot;
   std::error_code error;
   if (!std::filesystem::is_directory(devices, error) || error) {
     return std::nullopt;

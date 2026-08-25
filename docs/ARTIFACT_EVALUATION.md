@@ -175,9 +175,13 @@ can qualify the GPU-controlled NVMe data path. The same rule applies to
 multi-GPU and framework-specific serving tests.
 
 `nta-cxl-dax-discovery` and `nta-nvme-discovery` always execute the read-only
-capability-discovery path and report `candidate=none` when the platform has no
-usable endpoint. The physical mapping probes remain capability-gated because
-turning an absent endpoint into a passing result would invalidate the artifact.
+capability-discovery path, including a temporary sysfs/devdax fixture, and
+report `candidate=none` for the live platform when it has no usable endpoint.
+The physical mapping probes remain capability-gated because turning an absent
+endpoint into a passing result would invalidate the artifact. On a new host,
+`./scripts/nta-cxl-dax-module.sh load` loads the read-only kernel plumbing and
+prints the CXL memdev/region and devdax inventory; it does not create regions or
+reconfigure namespaces.
 
 For an already provisioned devdax endpoint, install
 `config/udev/99-nta-dax.rules`, create the system group `dax`, and add the

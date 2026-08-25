@@ -631,6 +631,11 @@ if(NTA_ENABLE_CUDA)
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/nvme_safety.py
     )
+    add_test(
+      NAME nta-physical-tier-safety
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/physical_tier_safety.py
+    )
     set_tests_properties(
       nta-request-slots nta-sglang-plugin
       nta-bounded-staging
@@ -640,7 +645,7 @@ if(NTA_ENABLE_CUDA)
       nta-opportunity-analysis
       nta-opportunity-study nta-tier-qualification
       nta-evaluation-spec nta-evaluation-artifact nta-performance-gate
-      nta-nvme-safety
+      nta-nvme-safety nta-physical-tier-safety
       PROPERTIES TIMEOUT 60
     )
     set_tests_properties(nta-python-runtime nta-sglang-plugin PROPERTIES
