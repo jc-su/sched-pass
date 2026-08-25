@@ -138,3 +138,12 @@ class ServingRuntimeResources:
             self.runtime.close()
         finally:
             self.tier.close()
+
+    def __del__(self) -> None:
+        # NtaFlashInferAttnBackend can fail during partially initialized
+        # construction after assigning this owner.  Preserve the same
+        # runtime-before-transport order on that exceptional path.
+        try:
+            self.close()
+        except Exception:
+            pass

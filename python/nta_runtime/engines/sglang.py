@@ -934,6 +934,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._hicache.close()
         self._demand_graphs.clear()
         self._demand_graph_warmups.clear()
+        self._demand_sync_events.clear()
         for allocation in tuple(self._plans.values()):
             allocation.plan.close()
         self._plans.clear()
