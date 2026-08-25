@@ -65,6 +65,10 @@ def main() -> None:
     control_plane = (ROOT / "runtime" / "host" / "NvmeVfioControlPlane.cpp").read_text(
         encoding="utf-8"
     )
+    assert "class VfioNvmeMappingBackend final" in control_plane
+    assert "class VfioNvmeControlPlane final : public NvmeControlPlane" in control_plane
+    assert "public NvmeMappingBackend" not in control_plane
+    assert "mappingBackend_->shutdown()" in control_plane
     assert "mediaPolicy_(options.mediaPolicy)" in control_plane
     assert "Do not issue Set Features" in control_plane
     assert "NTA_NVME_P2P_IOCTL_MAP" in control_plane
