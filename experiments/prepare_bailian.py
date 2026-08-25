@@ -72,7 +72,10 @@ def main(argv: list[str] | None = None) -> int:
             synthesize_prompts=args.synthesize_prompts,
             state_policy=args.state_policy,
         )
-        manifest["source_file"] = str(args.input.resolve())
+        # Keep the normalized bundle portable.  The source digest is the
+        # immutable identity; an absolute checkout path would make a copied
+        # artifact appear machine-specific even when its records are intact.
+        manifest["source_file"] = args.input.name
         manifest["source_digest"] = (
             __import__("hashlib").sha256(args.input.read_bytes()).hexdigest()
         )

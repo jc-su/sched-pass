@@ -134,6 +134,8 @@ def main() -> None:
         )
         validate(cli_manifest)
         cli_document = json.loads(cli_manifest.read_text(encoding="utf-8"))
+        assert cli_document["source_file"] == fixture.name
+        assert not Path(cli_document["source_file"]).is_absolute()
         assert cli_document["selection"] == {
             "mode": "source_prefix",
             "max_requests": 2,
