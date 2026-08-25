@@ -49,6 +49,14 @@ shape and lowers typed markers only when the module contract supplies
 generation, exact-demand, and tier-ownership guarantees. No serving path
 silently changes the numerical demand contract.
 
+Resource ownership is split into three explicit domains. The transport/control
+owner drives the backend protocol, the runtime owns the device directory, and
+`allocation_owners` records who may allocate or lend payload memory. This
+distinction matters for host-staged transfers: the native object API may own
+the HBM staging destination, while an engine adapter may register an existing
+staging tensor. NVMe and CXL-DAX mappings remain transport-owned; their
+steady-state path never includes a host proxy or a per-request control ioctl.
+
 ## 3. Execution flow
 
 For SGLang:

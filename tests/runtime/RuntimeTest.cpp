@@ -225,6 +225,25 @@ int main() {
     require(stagedEntry.state ==
                 static_cast<std::uint32_t>(nta::abi::ObjectState::New),
             "staged object must begin nonresident");
+    const std::uint64_t outstandingObjectIssue = 1;
+    require(cudaMemcpy(&hostView.objects[2].issueCount,
+                       &outstandingObjectIssue, sizeof(outstandingObjectIssue),
+                       cudaMemcpyHostToDevice) == cudaSuccess,
+            "object issue-count injection failed");
+    bool liveObjectReuseRejected = false;
+    try {
+      runtime.installObject(2, 2003, 4, contents, nta::Placement::HostMapped);
+    } catch (const std::runtime_error &) {
+      liveObjectReuseRejected = true;
+    }
+    require(liveObjectReuseRejected,
+            "object replacement must wait for the acquisition epoch");
+    const std::uint64_t noOutstandingObjectIssue = 0;
+    require(cudaMemcpy(&hostView.objects[2].issueCount,
+                       &noOutstandingObjectIssue,
+                       sizeof(noOutstandingObjectIssue),
+                       cudaMemcpyHostToDevice) == cudaSuccess,
+            "object issue-count reset failed");
 
     nta::RuntimeConfig stagingConfig{1, 2, 1, 1};
     stagingConfig.stagingByteCapacity = contents.size();

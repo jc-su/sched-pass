@@ -809,6 +809,54 @@ struct HostRuntime::Impl {
     }
   }
 
+  void ensureObjectReplaceable(std::uint32_t slot) const {
+    checkObjectSlot(slot);
+    if (!objectInstalled[slot]) {
+      return;
+    }
+    const abi::ObjectEntry current = downloadOne(objectEntries, slot);
+    const auto state = static_cast<abi::ObjectState>(current.state);
+    if (current.issueCount != 0 || state == abi::ObjectState::Queued ||
+        state == abi::ObjectState::Issued) {
+      throw std::runtime_error(
+          "object slot is still referenced by the current acquisition epoch; "
+          "reset and quiesce the epoch before replacing it");
+    }
+  }
+
+  void ensureObjectRangeReplaceable(std::uint32_t firstSlot,
+                                    std::uint32_t count) const {
+    if (count == 0 || firstSlot > config.objectCapacity ||
+        count > config.objectCapacity - firstSlot) {
+      throw std::out_of_range("object replacement range exceeds capacity");
+    }
+    bool hasInstalled = false;
+    for (std::uint32_t slot = firstSlot; slot < firstSlot + count; ++slot) {
+      hasInstalled |= objectInstalled[slot];
+    }
+    if (!hasInstalled) {
+      return;
+    }
+    std::vector<abi::ObjectEntry> current(count);
+    checkCuda(cudaMemcpy(current.data(), objectEntries + firstSlot,
+                         current.size() * sizeof(current.front()),
+                         cudaMemcpyDeviceToHost),
+              "read object replacement state");
+    for (std::uint32_t index = 0; index < count; ++index) {
+      if (!objectInstalled[firstSlot + index]) {
+        continue;
+      }
+      const abi::ObjectEntry &entry = current[index];
+      const auto state = static_cast<abi::ObjectState>(entry.state);
+      if (entry.issueCount != 0 || state == abi::ObjectState::Queued ||
+          state == abi::ObjectState::Issued) {
+        throw std::runtime_error(
+            "object slot is still referenced by the current acquisition "
+            "epoch; reset and quiesce the epoch before replacing it");
+      }
+    }
+  }
+
   RuntimeConfig config;
   std::uint32_t replicaCapacity = 0;
   std::uint32_t dependencyCapacity = 0;
@@ -1052,6 +1100,7 @@ ObjectHandle HostRuntime::installReplicatedObject(
   if (bytes > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("objects are limited to 4 GiB");
   }
+  impl_->ensureObjectReplaceable(slot);
   for (const HostReplicaSpec &replica : replicas) {
     if (replica.contents.size() != bytes) {
       throw std::invalid_argument(
@@ -1174,6 +1223,7 @@ HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
     throw std::invalid_argument(
         "registered object size and replicas must fit the runtime ABI");
   }
+  impl_->ensureObjectReplaceable(slot);
 
   std::vector<abi::ReplicaEntry> entries;
   entries.reserve(replicas.size());
@@ -1293,6 +1343,8 @@ void HostRuntime::registerIndexedHostObjects(
       objects.size() > impl_->config.objectCapacity - firstSlot) {
     throw std::invalid_argument("indexed host object range exceeds capacity");
   }
+  impl_->ensureObjectRangeReplaceable(
+      firstSlot, static_cast<std::uint32_t>(objects.size()));
 
   std::vector<abi::ObjectEntry> entries;
   std::vector<abi::ReplicaEntry> replicas(
@@ -1387,6 +1439,8 @@ void HostRuntime::registerIndexedHostObjectsAsync(
       objects.size() > impl_->config.objectCapacity - firstSlot) {
     throw std::invalid_argument("indexed host object range exceeds capacity");
   }
+  impl_->ensureObjectRangeReplaceable(
+      firstSlot, static_cast<std::uint32_t>(objects.size()));
 
   Impl::DirectoryUpload &upload =
       impl_->directoryUploads[impl_->nextDirectoryUpload++ %
@@ -1498,6 +1552,7 @@ ObjectHandle HostRuntime::installNvmeObject(
     throw std::invalid_argument(
         "NVMe transport and destination buffer are required");
   }
+  impl_->ensureObjectReplaceable(slot);
   const NvmeCapabilities &capabilities = impl_->nvme->capabilities();
   if (bytes == 0 || bytes > destination->bytes() ||
       bytes % capabilities.lbaSize != 0 ||

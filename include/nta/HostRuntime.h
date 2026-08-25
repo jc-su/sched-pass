@@ -163,6 +163,11 @@ public:
   installReplicatedObject(std::uint32_t slot, std::uint64_t objectId,
                           std::uint32_t version,
                           std::span<const HostReplicaSpec> replicas);
+  // Registration replaces the device directory entry. A slot may be reused
+  // only after the acquisition epoch that referenced its previous entry has
+  // been reset and quiesced; the runtime rejects an in-flight replacement.
+  // Replica/source buffers remain caller-owned unless an API says otherwise,
+  // and must remain live through that acquisition epoch.
   ObjectHandle registerObject(std::uint32_t slot, std::uint64_t objectId,
                               std::uint32_t version, std::size_t bytes,
                               void *stagingDeviceAddress,

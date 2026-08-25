@@ -324,6 +324,9 @@ def analyze(output: Path) -> dict[str, Any]:
         "provenance": {
             "revision": metadata.get("revision"),
             "dirty": metadata.get("dirty"),
+            "evaluation_profile": evaluation_metadata.get(
+                "evaluation_profile", "contract"
+            ),
             "spec_digest": evaluation_metadata.get("spec_digest"),
             "workload_manifest_digest": evaluation_metadata.get(
                 "workload_manifest_digest"

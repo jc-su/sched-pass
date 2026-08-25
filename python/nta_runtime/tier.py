@@ -268,6 +268,34 @@ class ServingTierConfig:
     progress_timeout_ns: int = 100_000_000
     trust_read_only_device_code: bool = False
 
+    def __post_init__(self) -> None:
+        if self.namespace_id <= 0:
+            raise ValueError("namespace_id must be positive")
+        if self.queue_depth <= 0:
+            raise ValueError("queue_depth must be positive")
+        if self.window_bytes < 0:
+            raise ValueError("window_bytes cannot be negative")
+        if self.device_ordinal < -1:
+            raise ValueError("device_ordinal must be -1 or nonnegative")
+        if self.issue_budget <= 0 or self.completion_budget <= 0:
+            raise ValueError("NVMe issue and completion budgets must be positive")
+        if self.progress_rounds <= 0 or self.progress_timeout_ns <= 0:
+            raise ValueError("NVMe progress settings must be positive")
+        if self.tier is ServingTier.CXL_DAX and self.window_bytes <= 0:
+            raise ValueError("CXL DAX window_bytes must be positive")
+        if self.tier is ServingTier.NVME and self.window_bytes != 0:
+            raise ValueError("NVMe does not accept a CXL window_bytes value")
+        if self.tier is not ServingTier.HOST_STAGED and (
+            not self.endpoint or self.catalog_path is None
+        ):
+            raise ValueError(
+                "physical serving tiers require an endpoint and page catalog"
+            )
+        if self.tier is ServingTier.HOST_STAGED and (
+            self.endpoint is not None or self.catalog_path is not None
+        ):
+            raise ValueError("host-staged tier cannot own a physical endpoint/catalog")
+
     @classmethod
     def from_environment(
         cls, environ: Mapping[str, str] | None = None

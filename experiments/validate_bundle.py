@@ -13,6 +13,7 @@ try:
     from .hardware import validate as validate_hardware
     from .validate_evaluation import validate as validate_evaluation
     from .validate_evaluation_artifact import validate as validate_evaluation_artifact
+    from .run_evaluation import validate_spec
     from .validate_matrix_artifact import validate as validate_matrix
     from .validate_serving_report import validate as validate_serving_report
     from .validate_tier_qualification import (
@@ -25,6 +26,7 @@ except ImportError:  # Direct script execution.
     from hardware import validate as validate_hardware
     from validate_evaluation import validate as validate_evaluation
     from validate_evaluation_artifact import validate as validate_evaluation_artifact
+    from run_evaluation import validate_spec
     from validate_matrix_artifact import validate as validate_matrix
     from validate_serving_report import validate as validate_serving_report
     from validate_tier_qualification import validate_file as validate_tier_qualification
@@ -217,6 +219,7 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             not physical_tiers or bool(qualification_name),
             "physical-tier evaluation bundle has no tier qualification",
         )
+        qualification_file: Path | None = None
         if qualification_name:
             qualification_path = Path(str(qualification_name))
             _require(
@@ -240,6 +243,11 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
                 qualification_file,
                 required_tiers=physical_tiers or {"hbm", "host_mem"},
             )
+        validate_spec(
+            copied_spec,
+            bundle / "workload/manifest.json",
+            qualification_path=qualification_file,
+        )
     return metadata
 
 

@@ -93,6 +93,7 @@ def main() -> None:
         )
         assert len(spec["experiments"]) == len(PAIRS) * len(strata) * 2
         assert len(spec["comparisons"]) == len(PAIRS) * len(strata)
+        assert spec["evaluation_profile"] == "osdi-complete"
         assert {trial["arm"] for trial in spec["experiments"]} == set(ARMS)
         assert all(
             trial["demand_semantics"] == "exact" for trial in spec["experiments"]
@@ -129,6 +130,18 @@ def main() -> None:
         subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         cli_spec = json.loads(cli_output.read_text(encoding="utf-8"))
         assert len(cli_spec["comparisons"]) == len(PAIRS) * len(strata)
+        assert cli_spec["evaluation_profile"] == "osdi-complete"
+
+        incomplete = json.loads(json.dumps(spec))
+        incomplete["experiments"] = [
+            trial for trial in incomplete["experiments"] if trial["arm"] != "B6"
+        ]
+        try:
+            validate_spec(incomplete, manifest_path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("incomplete osdi evaluation was accepted")
 
         sysfs = root / "sysfs"
         dev = root / "dev"

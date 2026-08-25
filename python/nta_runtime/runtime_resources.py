@@ -11,8 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
-from .runtime import Runtime, RuntimeConfig
-from .tier import ServingTierConfig, ServingTierService
+from .runtime import Runtime, RuntimeConfig, TierKind
+from .tier import ServingTier, ServingTierConfig, ServingTierService
 
 
 _UINT64_MAX = (1 << 64) - 1
@@ -127,6 +127,23 @@ class ServingRuntimeResources:
         except BaseException:
             tier.close()
             raise
+        native_kind = {
+            ServingTier.HOST_STAGED: TierKind.HOST_STAGED,
+            ServingTier.NVME: TierKind.NVME,
+            ServingTier.CXL_DAX: TierKind.CXL,
+        }[tier_config.tier]
+        descriptor = runtime.tier_descriptor(native_kind)
+        if (
+            not descriptor.active
+            or descriptor.capabilities != tier.contract.capabilities
+        ):
+            try:
+                runtime.close()
+            finally:
+                tier.close()
+            raise RuntimeError(
+                "native tier descriptor diverges from the selected resource contract"
+            )
         return cls(tier, runtime, runtime_config)
 
     def close(self) -> None:

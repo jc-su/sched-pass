@@ -241,7 +241,7 @@ def _assign_serving_states(rows: list[dict[str, Any]], policy: str) -> dict[str,
             "source": "parent_chat_id_or_turn",
             "counts": counts,
         }
-    raise AssertionError(f"unhandled serving state policy {policy}")
+    raise ValueError(f"unhandled serving state policy {policy}")
 
 
 def _normalize_arrivals(

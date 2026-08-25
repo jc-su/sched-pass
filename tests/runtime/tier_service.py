@@ -37,6 +37,12 @@ def main() -> None:
     assert host_staged.uses_host_proxy and not host_staged.physical
     assert nvme.physical and not nvme.direct_device_visible
     assert cxl.physical and cxl.direct_device_visible
+    assert host_staged.directory_owner is ResourceOwner.RUNTIME
+    assert host_staged.allocation_owners == {
+        ResourceOwner.ENGINE,
+        ResourceOwner.RUNTIME,
+    }
+    assert nvme.allocation_owners == {ResourceOwner.TRANSPORT}
     assert nvme.as_dict()["steady_state_path"] == "gpu_owned_nvme_to_hbm"
     config = RuntimeResourceConfig.with_environment_staging_limit(
         request_capacity=4,
@@ -67,6 +73,12 @@ def main() -> None:
         assert "NTA_NVME_ENDPOINT" in str(error)
     else:
         raise AssertionError("NVMe selection silently accepted a missing endpoint")
+    try:
+        ServingTierConfig(tier=ServingTier.NVME)
+    except ValueError as error:
+        assert "endpoint" in str(error)
+    else:
+        raise AssertionError("invalid physical tier config was accepted")
 
     document = {
         "schema": 1,

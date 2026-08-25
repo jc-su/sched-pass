@@ -63,10 +63,11 @@ publish the tier, catalog digest, capability evidence, and
 physical-tier result from a host run.
 
 The selected service exposes the same typed resource contract used by the
-native tier descriptor: resource kind, capability set, owner, setup
-requirements, and steady-state path. `NTA_STAGING_BYTE_CAPACITY` limits
-runtime-owned HBM staging allocations; engine-owned registered staging is
-non-owning and must be governed by the framework allocator's own quota.
+native tier descriptor: resource kind, capability set, protocol owner,
+allocation owners, runtime-owned directory, setup requirements, and
+steady-state path. `NTA_STAGING_BYTE_CAPACITY` limits runtime-owned HBM
+staging allocations; engine-owned registered staging is non-owning and must
+be governed by the framework allocator's own quota.
 
 ## vLLM
 

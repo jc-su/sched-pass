@@ -37,7 +37,9 @@ host admission, device-visible backend metadata, and experiment telemetry.
 The engine-neutral `ServingTierService` is the only serving attachment point:
 host-staged uses indexed host objects, NVMe installs catalog-validated HBM
 objects and runs the finite device progress loop, and CXL emits catalog-
-validated direct dependencies. Physical-tier configuration never silently
+validated direct dependencies. The Python resource contract makes protocol
+ownership, allocation ownership, and runtime directory ownership explicit;
+physical-tier configuration never silently
 falls back to host data movement.
 The NVMe production backend is GPU-controlled READ DMA directly into HBM
 through a translated VFIO/IOMMUFD domain; host-mapped DMA is only its matched

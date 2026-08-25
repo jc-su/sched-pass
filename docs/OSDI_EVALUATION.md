@@ -120,6 +120,13 @@ cross-boundary checks: B3 versus B1 isolates the host-control round trip, and
 B5 versus B3 isolates the full device-demand/heterogeneous-work-unit
 mechanism from the conventional gather path.
 
+The generated trial specification is explicitly marked
+`evaluation_profile=osdi-complete`. This profile is a machine-checked gate,
+not a documentation label: it requires all B0--B6 arms, all eight canonical
+causal boundaries in every declared stratum, and at least six strata. Minimal
+fixtures use `evaluation_profile=contract` and cannot be presented as the
+complete evaluation.
+
 Every serving report must include p50/p95/p99 TTFT/TPOT/ITL percentiles, SLO goodput,
 throughput, queue/admission delay, selected and physical KV accounting (or an
 explicit `not_exposed` status), exact-demand identity, activation counters,

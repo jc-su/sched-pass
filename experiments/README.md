@@ -60,6 +60,11 @@ the two decisive cross-boundary pairs (`B3` vs `B1` for host-control
 round-trip isolation and `B5` vs `B3` for the complete mechanism jump). It
 requires a concrete command for every arm and validates the resulting spec
 before writing it; no missing arm is silently treated as a baseline.
+Generated specifications carry `evaluation_profile=osdi-complete`. The runner
+requires all B0--B6 arms, every canonical causal boundary in every declared
+stratum, and at least six strata for that profile. The checked-in example spec
+is marked `evaluation_profile=contract` because it is only a minimal API
+fixture; it must not be used as an OSDI result.
 
 For machine capability provenance, run the read-only artifact profile:
 

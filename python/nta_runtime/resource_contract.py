@@ -45,7 +45,13 @@ class ResourceContract:
 
     kind: ResourceKind
     capabilities: ResourceCapability
+    # ``owner`` is the component that controls the backend protocol.  Memory
+    # allocation can be split from that protocol owner: host-staged transfers
+    # are runtime-owned when the native object API allocates the destination,
+    # but engine-owned when an adapter registers an existing HBM destination.
     owner: ResourceOwner
+    allocation_owners: frozenset[ResourceOwner]
+    directory_owner: ResourceOwner
     steady_state_path: str
     requires_catalog: bool
     requires_endpoint: bool
@@ -55,6 +61,10 @@ class ResourceContract:
     def __post_init__(self) -> None:
         if not self.steady_state_path:
             raise ValueError("resource steady-state path must be named")
+        if not self.allocation_owners:
+            raise ValueError("resource allocation ownership cannot be empty")
+        if self.directory_owner is not ResourceOwner.RUNTIME:
+            raise ValueError("native resource directories must be runtime-owned")
         if self.requires_catalog != self.requires_endpoint:
             raise ValueError(
                 "physical resource catalog and endpoint requirements must match"
@@ -72,7 +82,11 @@ class ResourceContract:
         elif self.uses_host_proxy:
             raise ValueError("only host-staged resources may use a host proxy")
         if self.kind in (ResourceKind.NVME, ResourceKind.CXL_DAX):
-            if not self.requires_catalog or self.owner is not ResourceOwner.TRANSPORT:
+            if (
+                not self.requires_catalog
+                or self.owner is not ResourceOwner.TRANSPORT
+                or self.allocation_owners != frozenset({ResourceOwner.TRANSPORT})
+            ):
                 raise ValueError("physical resources require transport ownership")
 
     @property
@@ -88,6 +102,10 @@ class ResourceContract:
                 if self.capabilities & capability
             ],
             "owner": self.owner.value,
+            "allocation_owners": sorted(
+                owner.value for owner in self.allocation_owners
+            ),
+            "directory_owner": self.directory_owner.value,
             "steady_state_path": self.steady_state_path,
             "requires_catalog": self.requires_catalog,
             "requires_endpoint": self.requires_endpoint,
@@ -101,6 +119,8 @@ _CONTRACTS = {
         ResourceKind.HBM,
         ResourceCapability.DIRECT_ADDRESS,
         ResourceOwner.ENGINE,
+        frozenset({ResourceOwner.ENGINE}),
+        ResourceOwner.RUNTIME,
         "gpu_hbm_load",
         False,
         False,
@@ -111,6 +131,8 @@ _CONTRACTS = {
         ResourceKind.HOST_MAPPED,
         ResourceCapability.DIRECT_ADDRESS | ResourceCapability.HOST_REGISTERED,
         ResourceOwner.ENGINE,
+        frozenset({ResourceOwner.ENGINE}),
+        ResourceOwner.RUNTIME,
         "gpu_mapped_host_load",
         False,
         False,
@@ -120,6 +142,8 @@ _CONTRACTS = {
     ResourceKind.HOST_STAGED: ResourceContract(
         ResourceKind.HOST_STAGED,
         ResourceCapability.INDEXED_TRANSFER,
+        ResourceOwner.RUNTIME,
+        frozenset({ResourceOwner.ENGINE, ResourceOwner.RUNTIME}),
         ResourceOwner.RUNTIME,
         "host_indexed_copy",
         False,
@@ -131,6 +155,8 @@ _CONTRACTS = {
         ResourceKind.NVME,
         ResourceCapability.DEVICE_INITIATED | ResourceCapability.PERSISTENT_STORAGE,
         ResourceOwner.TRANSPORT,
+        frozenset({ResourceOwner.TRANSPORT}),
+        ResourceOwner.RUNTIME,
         "gpu_owned_nvme_to_hbm",
         True,
         True,
@@ -143,6 +169,8 @@ _CONTRACTS = {
         | ResourceCapability.HOST_REGISTERED
         | ResourceCapability.PERSISTENT_STORAGE,
         ResourceOwner.TRANSPORT,
+        frozenset({ResourceOwner.TRANSPORT}),
+        ResourceOwner.RUNTIME,
         "cuda_visible_cxl_direct",
         True,
         True,

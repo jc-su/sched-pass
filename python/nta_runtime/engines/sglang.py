@@ -2457,7 +2457,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 # caller constructs the requirements from the same catalog so
                 # the storage address never becomes an inferred/approximate
                 # page-table mapping.
-                raise AssertionError("CXL direct dependencies do not allocate objects")
+                raise RuntimeError(
+                    "CXL direct dependencies must be emitted as direct requirements"
+                )
             index_map = batch.index_maps.get(pair)
             if index_map is None:
                 index_map = (

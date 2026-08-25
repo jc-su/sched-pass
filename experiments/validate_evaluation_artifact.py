@@ -53,6 +53,44 @@ def validate(output: Path) -> dict[str, Any]:
     evaluation_metadata = json.loads(
         (output / "evaluation-metadata.json").read_text(encoding="utf-8")
     )
+    evaluation_profile = evaluation_metadata.get("evaluation_profile", "contract")
+    _require(
+        evaluation_profile in {"contract", "osdi-complete"},
+        "unknown evaluation profile",
+    )
+    _require(
+        provenance.get("evaluation_profile", "contract") == evaluation_profile,
+        "report evaluation profile diverges from evaluation metadata",
+    )
+    if evaluation_profile == "osdi-complete":
+        contract = json.loads(
+            (output / "evaluation-contract.json").read_text(encoding="utf-8")
+        )
+        expected_arms = [f"B{index}" for index in range(7)]
+        _require(
+            evaluation_metadata.get("arm_set") == expected_arms,
+            "osdi-complete artifact does not contain exactly B0-B6",
+        )
+        _require(
+            isinstance(evaluation_metadata.get("tier_set"), list)
+            and len(evaluation_metadata["tier_set"]) == 1,
+            "osdi-complete artifact must measure one tier per paired spec",
+        )
+        _require(
+            isinstance(evaluation_metadata.get("strata_count"), int)
+            and evaluation_metadata["strata_count"] >= 6,
+            "osdi-complete artifact has too few workload strata",
+        )
+        expected_pairs = sorted(
+            {
+                f"{pair['numerator']}>{pair['denominator']}"
+                for pair in contract.get("causal_pairs", [])
+            }
+        )
+        _require(
+            evaluation_metadata.get("causal_pairs") == expected_pairs,
+            "osdi-complete artifact is missing a canonical causal boundary",
+        )
     _require(
         provenance["workload_demand_digest"]
         == evaluation_metadata.get("workload_demand_digest"),

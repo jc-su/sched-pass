@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 try:
     from .validate_workload import validate as validate_workload
@@ -42,6 +42,8 @@ REQUIRED_STRATA = {
     "staging_pressure",
     "arrival",
 }
+EVALUATION_PROFILES = {"contract", "osdi-complete"}
+CANONICAL_ARMS = {f"B{index}" for index in range(7)}
 
 
 def _digest(path: Path) -> str:
@@ -72,6 +74,9 @@ def validate_spec(
     trials = spec.get("experiments")
     if not isinstance(trials, list) or not trials:
         raise ValueError("evaluation trial spec contains no experiments")
+    evaluation_profile = spec.get("evaluation_profile", "contract")
+    if evaluation_profile not in EVALUATION_PROFILES:
+        raise ValueError("evaluation_profile must be contract or osdi-complete")
     contract = json.loads(EVALUATION_MANIFEST.read_text(encoding="utf-8"))
     tiers = {tier["id"] for tier in contract["tiers"]}
     arms = {arm["id"] for arm in contract["arms"]}
@@ -175,6 +180,66 @@ def validate_spec(
                 f"causal comparison {name} references an unmeasured metric"
             )
         comparison_names.add(name)
+    if evaluation_profile == "osdi-complete":
+        declared_arms = {trial["arm"] for trial in identities.values()}
+        if declared_arms != CANONICAL_ARMS:
+            raise ValueError("osdi-complete evaluation must contain exactly B0-B6")
+        declared_tiers = {trial["tier"] for trial in identities.values()}
+        if len(declared_tiers) != 1:
+            raise ValueError(
+                "osdi-complete evaluation must measure one tier per paired spec"
+            )
+
+        def stratum_key(value: Mapping[str, Any]) -> str:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+        arm_strata = {
+            arm: {
+                stratum_key(trial["stratum"])
+                for trial in identities.values()
+                if trial["arm"] == arm
+            }
+            for arm in CANONICAL_ARMS
+        }
+        if len({frozenset(value) for value in arm_strata.values()}) != 1:
+            raise ValueError("osdi-complete arms do not cover the same strata")
+        stratum_keys = next(iter(arm_strata.values()))
+        if len(stratum_keys) < 6:
+            raise ValueError(
+                "osdi-complete evaluation needs at least six workload strata"
+            )
+
+        actual_pairs: set[tuple[str, str, str]] = set()
+        for comparison in comparisons:
+            variants = by_name[comparison["experiment"]]
+            numerator_trials = [
+                trial
+                for trial in variants
+                if trial["variant"] == comparison["numerator_variant"]
+            ]
+            if len(numerator_trials) != 1:
+                raise ValueError(
+                    "osdi-complete causal comparisons must identify one stratum"
+                )
+            actual_pairs.add(
+                (
+                    comparison["numerator_variant"],
+                    comparison["denominator_variant"],
+                    stratum_key(numerator_trials[0]["stratum"]),
+                )
+            )
+        if len(actual_pairs) != len(comparisons):
+            raise ValueError("osdi-complete causal comparisons contain duplicates")
+        expected_pairs = {
+            (pair["numerator"], pair["denominator"], stratum)
+            for pair in contract["causal_pairs"]
+            for stratum in stratum_keys
+        }
+        if actual_pairs != expected_pairs:
+            raise ValueError(
+                "osdi-complete causal comparisons must cover every canonical "
+                "boundary in every declared stratum"
+            )
     required_qualification_tiers = _required_qualification_tiers(spec)
     if required_qualification_tiers and qualification_path is None:
         raise ValueError(
@@ -238,6 +303,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "schema": 1,
                     "classification": "nta-osdi-paired-evaluation",
+                    "evaluation_profile": spec.get("evaluation_profile", "contract"),
                     "spec": str(spec_path),
                     "spec_digest": _digest(spec_path),
                     "workload_manifest": str(workload_path),
@@ -253,6 +319,20 @@ def main(argv: list[str] | None = None) -> int:
                     "evaluation_contract_digest": _digest(EVALUATION_MANIFEST),
                     "repetitions": spec["repetitions"],
                     "randomized_order": True,
+                    "arm_set": sorted({trial["arm"] for trial in spec["experiments"]}),
+                    "tier_set": sorted({trial["tier"] for trial in spec["experiments"]}),
+                    "causal_pairs": sorted(
+                        {
+                            f"{comparison['numerator_variant']}>{comparison['denominator_variant']}"
+                            for comparison in spec["comparisons"]
+                        }
+                    ),
+                    "strata_count": len(
+                        {
+                            json.dumps(trial["stratum"], sort_keys=True)
+                            for trial in spec["experiments"]
+                        }
+                    ),
                 },
                 indent=2,
                 sort_keys=True,

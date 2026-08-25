@@ -161,6 +161,7 @@ def build_spec(
     spec: dict[str, Any] = {
         "schema": 1,
         "classification": "nta-paired-evaluation",
+        "evaluation_profile": "osdi-complete",
         "generated_by": "experiments/make_evaluation_spec.py",
         "workload_manifest": str(workload_manifest.resolve()),
         "tier": tier,

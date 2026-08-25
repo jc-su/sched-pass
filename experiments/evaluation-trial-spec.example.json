@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "classification": "nta-paired-evaluation",
+  "evaluation_profile": "contract",
   "workload_manifest": "/path/to/normalized-bailian/manifest.json",
   "repetitions": 10,
   "seed": 20260824,
