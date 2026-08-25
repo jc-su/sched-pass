@@ -623,7 +623,8 @@ struct HostRuntime::Impl {
   }
 
   void reserveStaging(std::uint64_t bytes, OwnedObject &object) {
-    if (bytes > config.stagingByteCapacity - ownedStagingBytes) {
+    if (ownedStagingBytes > config.stagingByteCapacity ||
+        bytes > config.stagingByteCapacity - ownedStagingBytes) {
       throw std::runtime_error(
           "runtime-owned HBM staging byte capacity exhausted");
     }

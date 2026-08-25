@@ -18,9 +18,48 @@ from nta_runtime.tier import (  # noqa: E402
     TierPageCatalog,
     _validate_nvme_extent,
 )
+from nta_runtime.resource_contract import (  # noqa: E402
+    ResourceKind,
+    ResourceOwner,
+    resource_contract,
+)
+from nta_runtime.runtime_resources import RuntimeResourceConfig  # noqa: E402
 
 
 def main() -> None:
+    hbm = resource_contract(ResourceKind.HBM)
+    host_mapped = resource_contract(ResourceKind.HOST_MAPPED)
+    host_staged = resource_contract(ResourceKind.HOST_STAGED)
+    nvme = resource_contract(ResourceKind.NVME)
+    cxl = resource_contract(ResourceKind.CXL_DAX)
+    assert hbm.direct_device_visible and hbm.owner is ResourceOwner.ENGINE
+    assert host_mapped.direct_device_visible
+    assert host_staged.uses_host_proxy and not host_staged.physical
+    assert nvme.physical and not nvme.direct_device_visible
+    assert cxl.physical and cxl.direct_device_visible
+    assert nvme.as_dict()["steady_state_path"] == "gpu_owned_nvme_to_hbm"
+    config = RuntimeResourceConfig.with_environment_staging_limit(
+        request_capacity=4,
+        object_capacity=8,
+        intent_capacity=8,
+        work_ticket_capacity=8,
+        tenant_capacity=4,
+        device_ordinal=-1,
+    )
+    assert config.staging_byte_capacity == (1 << 64) - 1
+    try:
+        RuntimeResourceConfig(
+            request_capacity=0,
+            object_capacity=8,
+            intent_capacity=8,
+            work_ticket_capacity=8,
+            tenant_capacity=4,
+            device_ordinal=-1,
+        )
+    except ValueError as error:
+        assert "request_capacity" in str(error)
+    else:
+        raise AssertionError("invalid runtime resource capacity was accepted")
     assert ServingTierConfig.from_environment().tier is ServingTier.HOST_STAGED
     try:
         ServingTierConfig.from_environment({"NTA_SERVING_TIER": "nvme"})
@@ -96,7 +135,10 @@ def main() -> None:
             }
         )
         assert config.catalog_path == path
-        assert ServingTierService(ServingTierConfig()).stats()["tier_fallback"] is False
+        service = ServingTierService(ServingTierConfig())
+        assert service.stats()["tier_fallback"] is False
+        assert service.stats()["resource_contract"]["kind"] == "host_staged"
+        service.close()
         _validate_nvme_extent(
             catalog.span(layer=3, pages=(7,), kind="key", row_bytes=4096),
             lba_size=4096,

@@ -70,8 +70,11 @@ class _ProgressPublication:
 class SglangHiCacheBridge:
     """Own intercepted HiCache loads until the final attention layer retires."""
 
-    def __init__(self, device_pool: Any) -> None:
+    def __init__(self, device_pool: Any, *, work_capacity: int = 4096) -> None:
+        if work_capacity <= 0:
+            raise ValueError("HiCache progress work capacity must be positive")
         self.device_pool = device_pool
+        self._work_capacity = work_capacity
         self._pending: dict[int, PendingHostLoad] = {}
         self._owned: dict[int, PendingHostLoad] = {}
         self._next_lease_id = 1
@@ -364,6 +367,19 @@ class SglangHiCacheBridge:
         with self._lock:
             self._progress_publications.extend(incomplete)
             for work, model in completed:
+                # Keep only the newest generation for a request.  Feedback is
+                # advisory admission state, not an ownership record; stale
+                # generations must not accumulate until a long-lived server
+                # exhausts memory.
+                for key in tuple(self._latest_request_work):
+                    if key[0] == work.request_id:
+                        self._latest_request_work.pop(key, None)
+                if len(self._latest_request_work) >= self._work_capacity:
+                    self._latest_request_work.pop(next(iter(self._latest_request_work)))
+                    self._admission_stats["progress_feedback_evictions"] = (
+                        self._admission_stats.get("progress_feedback_evictions", 0)
+                        + 1
+                    )
                 self._latest_request_work[(work.request_id, work.generation)] = (
                     work,
                     model,

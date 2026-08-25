@@ -53,7 +53,11 @@ from nta_runtime.execution_planner import (
 from nta_runtime.opportunity import OperatorArrival, TileArrival, append_json_line
 from nta_runtime.requests import RequestBinding
 from nta_runtime.engines.sglang_hicache import PendingHostLoad, SglangHiCacheBridge
-from nta_runtime.tier import ServingTierConfig, ServingTierService
+from nta_runtime.runtime_resources import (
+    RuntimeResourceConfig,
+    ServingRuntimeResources,
+)
+from nta_runtime.tier import ServingTierConfig
 from nta_runtime.runtime import (
     AcquireRequirement,
     DeviceWorkPlan,
@@ -73,8 +77,6 @@ from nta_runtime.runtime import (
     OperatorPlanFlag,
     OperatorReduction,
     RequestRange,
-    Runtime,
-    RuntimeConfig,
     TierKind,
     require_operator_pair,
 )
@@ -607,45 +609,57 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._work_ticket_capacity = _positive_environment(
             "NTA_RUNTIME_MAX_WORK_TICKETS", default_tickets
         )
-        try:
-            self._execution_config = SglangExecutionConfig.from_environment()
-        except ValueError as error:
-            raise RuntimeError(str(error)) from error
-        try:
-            self._tier_service = ServingTierService(
-                ServingTierConfig.from_environment()
-            )
-        except (OSError, ValueError, RuntimeError) as error:
-            raise RuntimeError(
-                f"invalid NTA serving tier configuration: {error}"
-            ) from error
-        if not self._tier_service.is_host and not self._hicache_enabled:
-            raise RuntimeError(
-                "a physical serving tier requires SGLang hierarchical cache metadata"
-            )
         self._object_capacity = 2 * self._work_ticket_capacity
         self._tenant_capacity = _positive_environment(
             "NTA_TENANT_CAPACITY", request_capacity
         )
-        self._runtime = Runtime(
-            RuntimeConfig(
-                request_capacity=request_capacity,
-                object_capacity=self._object_capacity,
-                intent_capacity=self._object_capacity,
-                work_ticket_capacity=self._work_ticket_capacity,
-                max_dependencies_per_work_ticket=2,
-                device_ordinal=torch.cuda.current_device(),
-                enable_cta_nvme_try_issue=False,
-                tenant_capacity=self._tenant_capacity,
-            ),
-            nvme=self._tier_service.nvme,
-            cxl=self._tier_service.cxl,
-        )
+        tenant_specs = _tenant_budget_specs()
+        for tenant_id, _, _ in tenant_specs:
+            if tenant_id >= self._tenant_capacity:
+                raise RuntimeError(
+                    f"tenant {tenant_id} exceeds NTA_TENANT_CAPACITY="
+                    f"{self._tenant_capacity}"
+                )
+        try:
+            self._execution_config = SglangExecutionConfig.from_environment()
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        resources: ServingRuntimeResources | None = None
+        try:
+            tier_config = ServingTierConfig.from_environment()
+            resources = ServingRuntimeResources.open(
+                tier_config=tier_config,
+                runtime_config=RuntimeResourceConfig.with_environment_staging_limit(
+                    request_capacity=request_capacity,
+                    object_capacity=self._object_capacity,
+                    intent_capacity=self._object_capacity,
+                    work_ticket_capacity=self._work_ticket_capacity,
+                    max_dependencies_per_work_ticket=2,
+                    device_ordinal=torch.cuda.current_device(),
+                    tenant_capacity=self._tenant_capacity,
+                ),
+            )
+            if not resources.tier.is_host and not self._hicache_enabled:
+                raise RuntimeError(
+                    "a physical serving tier requires SGLang hierarchical cache metadata"
+                )
+        except (OSError, ValueError, RuntimeError) as error:
+            if resources is not None:
+                resources.close()
+            raise RuntimeError(
+                f"invalid NTA serving tier configuration: {error}"
+            ) from error
+        assert resources is not None
+        self._resources = resources
+        self._tier_service = resources.tier
+        self._runtime = resources.runtime
         self._closed = False
         self._resources_closed = False
-        self._configure_tenant_budgets()
+        self._configure_tenant_budgets(tenant_specs)
         self._request_adapter = SglangAdapter(self._runtime, request_capacity)
-        self._hicache = SglangHiCacheBridge(self.token_to_kv_pool)
+        self._hicache = SglangHiCacheBridge(
+            self.token_to_kv_pool, work_capacity=max(4096, request_capacity * 4)
+        )
         # CUDA priorities are inverted: acquisition movers always use the
         # lowest priority so they cannot preempt decode.
         mover_priority = _mover_stream_priority()
@@ -723,6 +737,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "execution_protocol": self._execution_config.protocol.kind.value,
             "work_granularity": self._execution_config.protocol.granularity.value,
             "protocol_max_inflight_units": self._execution_config.protocol.max_inflight_units,
+            "runtime_tenant_capacity": self._resources.config.tenant_capacity,
+            "runtime_staging_byte_capacity": self._resources.config.staging_byte_capacity,
             "execution_protocol_status": "native_work_unit",
             "execution_demand_semantics": "exact",
             "execution_session_scope": "attention_launch",
@@ -884,8 +900,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._hicache.set_prefetch_callback(self._publish_cross_layer_frontier)
         atexit.register(self._write_stats)
 
-    def _configure_tenant_budgets(self) -> None:
-        for tenant_id, max_bytes, weight in _tenant_budget_specs():
+    def _configure_tenant_budgets(
+        self, specs: tuple[tuple[int, int, int], ...]
+    ) -> None:
+        for tenant_id, max_bytes, weight in specs:
             if tenant_id >= self._tenant_capacity:
                 raise RuntimeError(
                     f"tenant {tenant_id} exceeds NTA_TENANT_CAPACITY="
@@ -925,8 +943,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         for program in tuple(self._operator_programs.values()):
             program.close()
         self._operator_programs.clear()
-        self._runtime.close()
-        self._tier_service.close()
+        self._resources.close()
         self._resources_closed = True
 
     def _install_instrumented_wrappers(

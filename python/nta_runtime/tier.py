@@ -22,6 +22,12 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from .resource_contract import (
+    ResourceContract,
+    ResourceKind,
+    resource_contract,
+)
+
 
 _UINT64_MAX = (1 << 64) - 1
 
@@ -30,6 +36,13 @@ class ServingTier(str, enum.Enum):
     HOST_STAGED = "host_staged"
     NVME = "nvme"
     CXL_DAX = "cxl_dax"
+
+
+_RESOURCE_KIND_FOR_SERVING_TIER = {
+    ServingTier.HOST_STAGED: ResourceKind.HOST_STAGED,
+    ServingTier.NVME: ResourceKind.NVME,
+    ServingTier.CXL_DAX: ResourceKind.CXL_DAX,
+}
 
 
 @dataclass(frozen=True)
@@ -339,6 +352,7 @@ class ServingTierService:
 
     def __init__(self, config: ServingTierConfig) -> None:
         self.config = config
+        self.contract = resource_contract(_RESOURCE_KIND_FOR_SERVING_TIER[config.tier])
         self.catalog = (
             None
             if config.catalog_path is None
@@ -440,6 +454,11 @@ class ServingTierService:
     def catalog_digest(self) -> str | None:
         return None if self.catalog is None else self.catalog.digest
 
+    @property
+    def resource_contract(self) -> ResourceContract:
+        """The immutable setup/data-path contract for the selected tier."""
+        return self.contract
+
     def extent(
         self, layer: int, pages: tuple[int, ...], kind: str, row_bytes: int
     ) -> PageExtent:
@@ -477,13 +496,8 @@ class ServingTierService:
         result: dict[str, Any] = {
             "serving_tier": self.tier.value,
             "tier_catalog_digest": self.catalog_digest,
-            "tier_data_path": (
-                "host_indexed_copy"
-                if self.is_host
-                else "gpu_owned_nvme_to_hbm"
-                if self.is_nvme
-                else "cuda_visible_cxl_direct"
-            ),
+            "tier_data_path": self.contract.steady_state_path,
+            "resource_contract": self.contract.as_dict(),
             "tier_fallback": False,
         }
         if self.nvme is not None:

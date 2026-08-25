@@ -155,6 +155,13 @@ cancellation or replacement; slot generations reject stale device work. This
 keeps collision defense fail-closed without making long-running serving memory
 grow with historical request cardinality.
 
+`python/nta_runtime/resource_contract.py` is the shared typed resource
+contract for HBM, mapped host, host-staged, NVMe, and CXL-DAX. It records
+capabilities, owner, setup requirements, and the steady-state path. The
+framework-facing tier service and native `TierDescriptor` use the same
+capability vocabulary; no adapter is allowed to infer a host proxy from a
+physical-tier failure.
+
 Tier latency and bandwidth are startup calibration inputs rather than hidden
 compile-time truths. Native descriptors accept
 `NTA_TIER_<HBM|HOST_MAPPED|HOST_STAGED|NVME|CXL|RDMA>_LATENCY_NS` and
@@ -177,6 +184,10 @@ dependency-free: `VllmSchedulerProjection` is the sole framework projection,
 and `EngineBoundary` is the common lifecycle interface. Framework-specific
 code can change that projection and transport binding, not the work-unit core
 or native ABI.
+
+The vLLM projection is executable only when it supplies exact block tables and
+page bytes. An identity-only projection is intentionally rejected by
+`bind_forward`; it is a contract test seam, not end-to-end serving evidence.
 
 There is no selector-policy taxonomy in the active runtime. Exact dense and
 exact sparse demand are input semantics; conventional, late-bound, and

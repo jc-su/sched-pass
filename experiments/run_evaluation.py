@@ -23,10 +23,12 @@ try:
     from .validate_tier_qualification import (
         validate_file as validate_tier_qualification,
     )
+    from .validate_evaluation_artifact import validate as validate_evaluation_artifact
 except ImportError:
     from validate_workload import validate as validate_workload
     from analyze_evaluation import analyze as analyze_evaluation
     from validate_tier_qualification import validate_file as validate_tier_qualification
+    from validate_evaluation_artifact import validate as validate_evaluation_artifact
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -259,6 +261,11 @@ def main(argv: list[str] | None = None) -> int:
             encoding="utf-8",
         )
         analyze_evaluation(output)
+        # Keep the direct evaluator fail-closed as well as the outer artifact
+        # packager.  A caller must never mistake a generated-but-incomplete
+        # report for a qualified result simply because it skipped the second
+        # command-line validator.
+        validate_evaluation_artifact(output)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"run_evaluation refused: {error}", file=sys.stderr)
         return 2

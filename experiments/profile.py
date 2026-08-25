@@ -76,6 +76,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--tool", choices=("auto", "nsys", "ncu", "perf"), default="auto"
     )
     parser.add_argument("--allow-dirty", action="store_true")
+    parser.add_argument(
+        "--require-tool",
+        action="store_true",
+        help="fail instead of recording unavailable profiler evidence",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -107,7 +112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         print("profiler=unavailable")
-        return 0
+        return 2 if args.require_tool else 0
     tool = Path(tool_path).name
     profiled = _profile_command(tool, output, command)
     output.mkdir(parents=True, exist_ok=True)

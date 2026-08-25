@@ -35,6 +35,8 @@ class FakeVllmSchedulerOutput:
     priorities = (1, 3)
     deadline_clocks = (100, 200)
     tenant_ids = (4, 6)
+    block_tables = ((10, 11), (20, 21, 22))
+    kv_page_bytes = 4096
 
 
 def main() -> None:
@@ -89,10 +91,22 @@ def main() -> None:
     assert tuple(item.deadline_clock for item in vllm_batch.bindings) == (100, 200)
     assert tuple(item.tenant_id for item in vllm_batch.bindings) == (4, 6)
     assert vllm_batch.tenant_ids == (4, 6)
+    assert vllm_batch.exact_demand is not None
+    assert vllm_batch.exact_demand.request_unit_ids == ((10, 11), (20, 21, 22))
+    assert vllm_batch.exact_demand.unit_bytes == 4096
     projection = VllmSchedulerProjection.from_scheduler_output(
         FakeVllmSchedulerOutput()
     )
     assert projection.request_ids == ("vllm-a", "vllm-b")
+    try:
+        projection_without_demand = VllmSchedulerProjection(
+            projection.request_ids, projection.request_slots
+        )
+        projection_without_demand.exact_demand()
+    except RuntimeError as error:
+        assert "exact block_tables" in str(error)
+    else:
+        raise AssertionError("vLLM identity-only projection was accepted")
     print("adapters=pass")
 
 

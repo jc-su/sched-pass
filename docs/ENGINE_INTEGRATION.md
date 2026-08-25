@@ -62,6 +62,12 @@ publish the tier, catalog digest, capability evidence, and
 `tier_fallback: false`, so an artifact validator can distinguish a real
 physical-tier result from a host run.
 
+The selected service exposes the same typed resource contract used by the
+native tier descriptor: resource kind, capability set, owner, setup
+requirements, and steady-state path. `NTA_STAGING_BYTE_CAPACITY` limits
+runtime-owned HBM staging allocations; engine-owned registered staging is
+non-owning and must be governed by the framework allocator's own quota.
+
 ## vLLM
 
 The vLLM integration boundary is `VllmSchedulerProjection`. A pinned vLLM
@@ -85,8 +91,10 @@ worker, not once per framework implementation.
 
 The current vLLM adapter is a tested structural seam, not a serving backend:
 it proves the common identity/epoch contract without importing vLLM internals.
+`bind_forward` additionally requires a normalized `block_tables` projection
+and `kv_page_bytes`; request identity alone is not an executable exact demand.
 An artifact may not label vLLM results as end-to-end evidence until a pinned
-vLLM hook supplies the projection and passes the same exact-demand,
+vLLM hook supplies that projection and passes the same exact-demand,
 correctness, tier-placement, and performance gates used by SGLang.
 
 ## Common contract

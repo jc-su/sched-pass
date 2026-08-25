@@ -11,6 +11,27 @@ from ..work_unit import Granularity
 
 
 @dataclass(frozen=True)
+class ExactDemandProjection:
+    """Engine-neutral exact page/unit demand supplied by an adapter."""
+
+    request_unit_ids: tuple[tuple[int, ...], ...]
+    unit_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.unit_bytes <= 0:
+            raise ValueError("exact demand unit_bytes must be positive")
+        if not self.request_unit_ids or any(
+            not units for units in self.request_unit_ids
+        ):
+            raise ValueError("exact demand must contain units for every request")
+        if any(
+            any(unit < 0 for unit in units) or len(set(units)) != len(units)
+            for units in self.request_unit_ids
+        ):
+            raise ValueError("exact demand unit IDs must be unique and nonnegative")
+
+
+@dataclass(frozen=True)
 class EngineBatch:
     """The minimum engine-to-runtime handoff for one forward."""
 
@@ -18,6 +39,7 @@ class EngineBatch:
     epoch: int
     bindings: tuple[RequestBinding, ...]
     granularity: Granularity
+    exact_demand: ExactDemandProjection | None = None
 
     def __post_init__(self) -> None:
         if not self.engine:
@@ -34,6 +56,10 @@ class EngineBatch:
             self.bindings
         ):
             raise ValueError("engine batch cannot reuse a request index")
+        if self.exact_demand is not None and len(
+            self.exact_demand.request_unit_ids
+        ) != len(self.bindings):
+            raise ValueError("exact demand rows must match the engine batch")
 
     @property
     def request_ids(self) -> tuple[int, ...]:

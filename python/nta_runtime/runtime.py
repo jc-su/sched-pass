@@ -11,6 +11,8 @@ import pathlib
 from collections.abc import Iterable
 from typing import Any
 
+from .resource_contract import ResourceCapability
+
 
 API_VERSION = 34
 
@@ -45,12 +47,9 @@ class NvmeHbmMappingBackend(enum.IntEnum):
     NVIDIA_PEER_PAGES = 1
 
 
-class TierCapability(enum.IntFlag):
-    DIRECT_ADDRESS = 1 << 0
-    DEVICE_INITIATED = 1 << 1
-    HOST_REGISTERED = 1 << 2
-    PERSISTENT_STORAGE = 1 << 3
-    INDEXED_TRANSFER = 1 << 4
+# Keep the public ABI-facing name while using the same dependency-free typed
+# contract as catalog validation and framework adapters.
+TierCapability = ResourceCapability
 
 
 class WorkTicketState(enum.IntEnum):
@@ -543,6 +542,24 @@ class RuntimeConfig:
     enable_cta_nvme_try_issue: bool = False
     tenant_capacity: int = 0
     staging_byte_capacity: int = (1 << 64) - 1
+
+    def __post_init__(self) -> None:
+        for name in (
+            "request_capacity",
+            "object_capacity",
+            "intent_capacity",
+            "work_ticket_capacity",
+            "max_replicas_per_object",
+            "max_dependencies_per_work_ticket",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.device_ordinal < -1:
+            raise ValueError("device_ordinal must be -1 or nonnegative")
+        if self.tenant_capacity < 0:
+            raise ValueError("tenant_capacity cannot be negative")
+        if not 0 <= self.staging_byte_capacity <= (1 << 64) - 1:
+            raise ValueError("staging_byte_capacity is outside uint64")
 
     def native(self) -> _RuntimeConfig:
         return _RuntimeConfig(
