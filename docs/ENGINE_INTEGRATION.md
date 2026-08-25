@@ -46,6 +46,13 @@ request text or batch position. Quotas are configured once at worker startup wit
 `NTA_TENANT_BUDGETS=id:bytes[:weight],...` and are enforced by native device
 admission counters.
 
+The vLLM worker has no stable upstream tenant field, so its deployment adapter
+may use `NTA_TENANT_REQUEST_PREFIXES=tenant_id:request-id-prefix,...` to create
+the same explicit mapping. Prefixes must be disjoint and are rejected at
+startup when malformed or overlapping; an unmatched request remains tenant 0.
+This is an identity adapter, not a classifier or a per-request scheduler
+policy.
+
 The SGLang implementation currently requires the tested 0.5.16 API, FA2
 FlashInfer kernels, full-attention page geometry, and valid request identity.
 Unsupported metadata or graph layouts fail closed.
@@ -113,6 +120,13 @@ python -m pip install --no-deps vllm==0.26.0 sglang==0.5.16
 python -m pip install -e .
 ```
 
+FlashInfer 0.6.14 does not use the separately versioned 0.6.12 cubin
+package. If an older `flashinfer-cubin` distribution is already installed,
+remove that stale package before importing FlashInfer; bypassing its version
+check would allow incompatible kernels into the experiment. The
+`nta-engine-environment` gate is the authoritative check for this complete
+matrix.
+
 The framework distributions must be installed only after the deployment has
 resolved their non-conflicting serving dependencies. `tests/runtime/engine_environment.py`
 and the native CTest gate then verify the actual interpreter, imports, and
@@ -144,10 +158,18 @@ non-tensor-core decode profile).
 
 The native vLLM consumer is intentionally qualified first for resident CUDA
 KV, one KV group, pure single-token decode, FA2 (non-TRTLLM), and eager mode.
+It is opt-in with `NTA_VLLM_NATIVE=1`; the default is vLLM's reference
+attention because resident-only work does not exercise a remote-tier
+dependency and must not pay the NTA protocol overhead.
 The builder reports no CUDA-graph support until plan upload/replay has its own
 graph-stability gate. Prefill, mixed batches, TRTLLM, and external NVMe/CXL
 loads remain explicit fail-closed boundaries; `NTA_VLLM_ALLOW_STOCK_FALLBACK=1`
 is a debugging reference only and is invalid for native artifacts.
+
+Consequently, a vLLM artifact can currently claim native NTA execution only for
+that resident decode profile. The shared vLLM/SGLang runtime and tenant
+contract are integrated, but that does not turn vLLM's resident projection into
+an external-tier implementation.
 
 vLLM's V1 `KVConnector` remains the correct next seam for external tier
 ownership/readiness: scheduler metadata and worker load/fence lifecycle belong

@@ -540,6 +540,7 @@ def run_hooked(
         flags,
         out=output,
     )
+    fixture.plan.mark_consumed(torch.cuda.current_stream())
 
 
 def run_prefill_hooked(
@@ -561,6 +562,7 @@ def run_prefill_hooked(
         int(skip_merge),
         out=output,
     )
+    fixture.plan.mark_consumed(torch.cuda.current_stream())
 
 
 def main() -> None:

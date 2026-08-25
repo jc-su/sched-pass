@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace nta {
 namespace {
@@ -105,6 +106,11 @@ struct DeviceWorkPlan::Impl {
     bool pending = false;
   };
 
+  struct ConsumerFence {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t complete = nullptr;
+  };
+
   static constexpr std::size_t UploadDepth = 2;
 
   Impl(std::uint32_t requestedWorkCapacity,
@@ -170,6 +176,12 @@ struct DeviceWorkPlan::Impl {
         (void)cudaFreeHost(slot.host);
       }
     }
+    for (ConsumerFence &fence : consumerFences) {
+      if (fence.complete != nullptr) {
+        (void)cudaEventSynchronize(fence.complete);
+        (void)cudaEventDestroy(fence.complete);
+      }
+    }
     if (allocation != nullptr) {
       (void)cudaFree(allocation);
     }
@@ -190,6 +202,7 @@ struct DeviceWorkPlan::Impl {
       throw std::logic_error(
           "device work plans must be uploaded before CUDA graph capture");
     }
+    waitForConsumers(stream);
     const std::size_t uploadIndex = acquireUploadSlot();
     UploadSlot &upload = uploads[uploadIndex];
     workCount = static_cast<std::uint32_t>(plan.workItems.size());
@@ -213,6 +226,51 @@ struct DeviceWorkPlan::Impl {
     upload.pending = true;
     latestUpload = uploadIndex;
     hasUpload = true;
+  }
+
+  void waitForConsumers(cudaStream_t stream) {
+    if (consumerFences.empty()) {
+      return;
+    }
+    for (const ConsumerFence &fence : consumerFences) {
+      checkCuda(cudaStreamWaitEvent(stream, fence.complete, 0),
+                "wait for device work-plan consumer");
+    }
+    for (ConsumerFence &fence : consumerFences) {
+      (void)cudaEventDestroy(fence.complete);
+      fence.complete = nullptr;
+    }
+    consumerFences.clear();
+  }
+
+  void recordConsumer(cudaStream_t stream) {
+    if (!hasUpload) {
+      return;
+    }
+    for (ConsumerFence &fence : consumerFences) {
+      if (fence.stream == stream) {
+        checkCuda(cudaEventRecord(fence.complete, stream),
+                  "record device work-plan consumer");
+        return;
+      }
+    }
+    ConsumerFence fence;
+    fence.stream = stream;
+    checkCuda(cudaEventCreateWithFlags(&fence.complete, cudaEventDisableTiming),
+              "create device work-plan consumer event");
+    try {
+      checkCuda(cudaEventRecord(fence.complete, stream),
+                "record device work-plan consumer");
+    } catch (...) {
+      (void)cudaEventDestroy(fence.complete);
+      throw;
+    }
+    try {
+      consumerFences.push_back(fence);
+    } catch (...) {
+      (void)cudaEventDestroy(fence.complete);
+      throw;
+    }
   }
 
   std::size_t acquireUploadSlot() {
@@ -266,6 +324,7 @@ struct DeviceWorkPlan::Impl {
   std::size_t nextUpload = 0;
   std::size_t latestUpload = 0;
   bool hasUpload = false;
+  mutable std::vector<ConsumerFence> consumerFences;
 };
 
 DeviceWorkPlan::DeviceWorkPlan(const WorkPlan &plan, int deviceOrdinal)
@@ -306,6 +365,22 @@ void DeviceWorkPlan::waitOn(cudaStream_t stream) const {
                                   impl_->uploads[impl_->latestUpload].complete,
                                   0),
               "cudaStreamWaitEvent device work plan");
+  }
+}
+
+void DeviceWorkPlan::markConsumed(cudaStream_t stream) const {
+  if (impl_ == nullptr) {
+    throw std::logic_error("cannot mark a moved device work plan consumed");
+  }
+  detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
+  try {
+    impl_->recordConsumer(stream);
+  } catch (...) {
+    // If the fence cannot be recorded, the stream has already observed the
+    // plan through waitOn(). Quiesce only this exceptional recovery path so
+    // the caller cannot accidentally reuse or destroy live plan storage.
+    (void)cudaStreamSynchronize(stream);
+    throw;
   }
 }
 

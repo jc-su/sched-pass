@@ -258,7 +258,12 @@ def _preserve_decode_replay_view(original, *args, **kwargs):
     metadata = forward_metadata(forward_batch)
     if len(metadata.request_slots) != raw_bs:
         raise RuntimeError("SGLang graph replay omitted request-pool slots")
-    padded_metadata = metadata.pad(padded_bs)
+    padded_slots = getattr(view, "req_pool_indices", None)
+    if padded_slots is None:
+        raise RuntimeError("SGLang graph replay omitted padded request-pool slots")
+    padded_metadata = metadata.pad(padded_slots)
+    if len(padded_metadata.request_slots) != padded_bs:
+        raise RuntimeError("SGLang graph replay padded slot count disagrees with bs")
     view.rids = request_ids
     setattr(view, FORWARD_METADATA_ATTRIBUTE, padded_metadata)
     view._nta_raw_batch_size = raw_bs

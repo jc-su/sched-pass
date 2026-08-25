@@ -5,7 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 build=${NTA_BUILD_DIR:-"${root}/build"}
 iterations=${NTA_ITERATIONS:-50}
 requests=${NTA_REQUESTS:-32}
-results=${NTA_RESULTS_DIR:-"${root}/results"}
+results=${NTA_RESULTS_DIR:-"${TMPDIR:-/tmp}/nta-local-results"}
 mkdir -p "${results}"
 
 cmake -S "${root}" -B "${build}" -GNinja \

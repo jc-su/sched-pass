@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 35U
+#define NTA_RUNTIME_C_API_VERSION 36U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -359,6 +359,10 @@ nta_runtime_install_nvme_object(nta_runtime *runtime, uint32_t slot,
                                 uint64_t object_id, uint32_t version,
                                 uint64_t source_byte_offset, uint64_t bytes,
                                 uint64_t *destination_device_address_out);
+nta_status nta_runtime_install_nvme_object_async(
+    nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
+    uint64_t source_byte_offset, uint64_t bytes, uint64_t cuda_stream,
+    uint64_t prior_consumer_event, uint64_t *destination_device_address_out);
 nta_status nta_runtime_read_pending_count(const nta_runtime *runtime,
                                           uint32_t *pending_count);
 nta_status nta_runtime_read_epoch_status(const nta_runtime *runtime,
@@ -411,7 +415,9 @@ nta_status nta_device_work_plan_upload(
     uint32_t dependency_count, const nta_request_work_range *requests,
     uint32_t request_count, uint64_t cuda_stream);
 nta_status nta_device_work_plan_wait_on(const nta_device_work_plan *plan,
-                                        uint64_t cuda_stream);
+                                         uint64_t cuda_stream);
+nta_status nta_device_work_plan_mark_consumed(const nta_device_work_plan *plan,
+                                               uint64_t cuda_stream);
 nta_status
 nta_device_work_plan_synchronize_upload(const nta_device_work_plan *plan);
 uint64_t nta_device_work_plan_work_items(const nta_device_work_plan *plan);
@@ -521,7 +527,8 @@ nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        uint32_t issue_budget,
                                        uint32_t completion_budget,
                                        uint64_t cuda_stream);
-/* C API v35: typed tier ownership is exported with each descriptor; this
+/* C API v36: typed tier ownership is exported with each descriptor and
+ * NVMe object replacement has an event-ordered asynchronous form; this
  * retains the completion-driven NVMe progress API. One launch remains active until
  * both the acquisition intent queue and controller queue are idle, or the
  * device-side timeout expires. */

@@ -3,7 +3,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 build=${NTA_BUILD_DIR:-"${root}/build"}
-results=${NTA_RESULTS_DIR:-"${root}/results"}
+results=${NTA_RESULTS_DIR:-"${TMPDIR:-/tmp}/nta-results"}
 trials=${NTA_TRIALS:-10}
 iterations=${NTA_OVERHEAD_ITERATIONS:-200}
 requests=${NTA_OVERHEAD_REQUESTS:-96}

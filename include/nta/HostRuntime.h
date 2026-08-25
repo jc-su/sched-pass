@@ -189,11 +189,12 @@ public:
       cudaStream_t stream);
   // Replace an indexed directory after the caller has recorded an event on
   // the stream that consumed the previous entries. Borrowed registrations
-  // use a stream wait and therefore avoid a device-to-host lifetime probe on
-  // this steady-state reuse path. If a replaced slot owns a runtime
-  // allocation, the runtime synchronizes the event before freeing it. A
-  // missing event uses the conservative lifetime probe; an invalid event is
-  // rejected by CUDA.
+  // use a stream wait and runtime-owned destinations are retired by the same
+  // event-driven reclaimer as NVMe objects; steady-state replacement does not
+  // perform a device-wide or host event synchronization. A missing event is
+  // valid only for first installation; replacing an owned object then takes a
+  // conservative device-quiescence fallback. An invalid event is rejected by
+  // CUDA.
   void registerIndexedHostObjectsAsyncQuiesced(
       std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects,
       cudaStream_t stream, cudaEvent_t priorConsumerEvent);
@@ -209,6 +210,16 @@ public:
                                  std::uint64_t sourceByteOffset,
                                  std::size_t bytes,
                                  std::unique_ptr<NvmeBuffer> destination);
+  // Stream-ordered NVMe directory replacement.  ``priorConsumerEvent`` must
+  // cover every consumer of the old slot generation.  The new directory
+  // entry is published on ``stream`` and the old runtime-owned destination is
+  // retired by an event-driven reclaimer; the caller is never forced through
+  // a device-wide synchronization in the steady-state replacement path.
+  // Passing a null event is valid only when the slot has never been installed.
+  ObjectHandle installNvmeObjectAsync(
+      std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
+      std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
+      cudaEvent_t priorConsumerEvent);
   void bindTensorMaps(std::uint32_t objectSlot, std::uint32_t relativeReplica,
                       const void *replicaTensorMap,
                       const void *stagingTensorMap = nullptr);

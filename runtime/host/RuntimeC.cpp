@@ -756,6 +756,35 @@ nta_status nta_runtime_install_nvme_object(
   });
 }
 
+nta_status nta_runtime_install_nvme_object_async(
+    nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
+    std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
+    std::uint64_t cudaStream, std::uint64_t priorConsumerEvent,
+    std::uint64_t *destinationDeviceAddressOut) {
+  if (destinationDeviceAddressOut != nullptr) {
+    *destinationDeviceAddressOut = 0;
+  }
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (runtime->nvme == nullptr) {
+      throw std::invalid_argument(
+          "runtime was not created with an NVMe transport");
+    }
+    if (cudaStream == 0) {
+      throw std::invalid_argument(
+          "stream-ordered NVMe installation requires a CUDA stream");
+    }
+    const nta::ObjectHandle object = runtime->value->installNvmeObjectAsync(
+        slot, objectId, version, sourceByteOffset,
+        checkedSize(bytes, "NVMe object bytes"), stream(cudaStream),
+        event(priorConsumerEvent));
+    if (destinationDeviceAddressOut != nullptr) {
+      *destinationDeviceAddressOut =
+          reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
+    }
+  });
+}
+
 nta_status nta_runtime_read_pending_count(const nta_runtime *runtime,
                                           std::uint32_t *pendingCount) {
   return protect([&] {
@@ -1041,6 +1070,14 @@ nta_status nta_device_work_plan_wait_on(const nta_device_work_plan *plan,
   return protect([&] {
     requireHandle(plan, "device work plan");
     plan->value->waitOn(stream(cudaStream));
+  });
+}
+
+nta_status nta_device_work_plan_mark_consumed(const nta_device_work_plan *plan,
+                                              std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(plan, "device work plan");
+    plan->value->markConsumed(stream(cudaStream));
   });
 }
 

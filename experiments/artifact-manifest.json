@@ -5,6 +5,8 @@
     "include",
     "lib",
     "runtime",
+    "kernel",
+    "tools",
     "python/nta_runtime"
   ],
   "canonical_entrypoints": {

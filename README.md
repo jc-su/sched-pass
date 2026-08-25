@@ -16,6 +16,8 @@ must preserve the same numerical contract.
   architecture and ownership.
 - [docs/ENGINE_INTEGRATION.md](/home/jcsu/Dev/sched-pass/docs/ENGINE_INTEGRATION.md):
   SGLang/vLLM boundaries.
+- [docs/SUPPORT_MATRIX.md](/home/jcsu/Dev/sched-pass/docs/SUPPORT_MATRIX.md):
+  current engineering scope and qualification boundaries.
 - [docs/EXPERIMENT_DESIGN.md](/home/jcsu/Dev/sched-pass/docs/EXPERIMENT_DESIGN.md):
   redesigned evaluation.
 - [docs/DOCUMENT_STATUS.md](/home/jcsu/Dev/sched-pass/docs/DOCUMENT_STATUS.md):
@@ -48,6 +50,8 @@ The core modules are:
   attention launch;
 - `python/nta_runtime/execution_planner.py`: measured host/device planning;
 - `python/nta_runtime/adapters/`: engine-specific metadata projections;
+- `python/nta_runtime/engines/sglang_state.py`: engine-neutral forward state,
+  graph keys, plan ownership records, and asynchronous stats publication;
 - `python/nta_runtime/runtime.py`: semantic-to-native upload validation.
 
 The native tier contract covers HBM, mapped host memory, host-staged memory,

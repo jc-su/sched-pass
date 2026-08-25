@@ -44,6 +44,26 @@ def main() -> None:
     assert "cuMemAlloc(&allocation.base" in runtime
     assert "cuMemGetHandleForAddressRange" not in runtime
     assert "CU_GPU_DIRECT_RDMA_WRITES_ORDERING_OWNER" in runtime
+    release_mapping = runtime[
+        runtime.index("void releaseMapping(RetiredMapping mapping)") : runtime.index(
+            "int deviceOrdinal = 0"
+        )
+    ]
+    assert "cudaDeviceSynchronize" not in release_mapping
+    assert "retiredMappings" in release_mapping
+    host_runtime = (ROOT / "runtime" / "host" / "Runtime.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert "installNvmeObjectAsync" in host_runtime
+    assert "reapRetiredObjects" in host_runtime
+    assert "cudaStreamWaitEvent(stream, priorConsumerEvent, 0)" in host_runtime
+    retire_begin = host_runtime.index("void retireObject(")
+    retire_end = host_runtime.index("void reserveStaging(", retire_begin)
+    retirement = host_runtime[retire_begin:retire_end]
+    assert "const cudaError_t eventStatus" in retirement
+    assert "cudaStreamSynchronize(stream)" in retirement
+    assert "cudaDeviceSynchronize()" in retirement
+    assert "releaseObject(retired.object)" in retirement
     assert "ioctl" not in (
         ROOT / "runtime" / "device" / "Acquire.cuh"
     ).read_text(encoding="utf-8")
@@ -108,6 +128,7 @@ def main() -> None:
     )
     runtime_c = (ROOT / "include" / "nta" / "RuntimeC.h").read_text(encoding="utf-8")
     assert "nta_jit_phase_progress_nvme_until_idle" in runtime_c
+    assert "nta_runtime_install_nvme_object_async" in runtime_c
     runtime_c_impl = (ROOT / "runtime" / "host" / "RuntimeC.cpp").read_text(
         encoding="utf-8"
     )

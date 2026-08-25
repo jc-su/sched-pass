@@ -205,6 +205,27 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
+    NAME nta-tenant-policy
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/tenant_policy.py
+  )
+  set_tests_properties(
+    nta-tenant-policy PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-project-audit
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/experiments/project_audit.py
+      --root ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  set_tests_properties(
+    nta-project-audit PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
     NAME nta-experiment-matrix
     COMMAND
       ${Python3_EXECUTABLE}

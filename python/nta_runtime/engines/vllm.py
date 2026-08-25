@@ -47,9 +47,11 @@ from nta_runtime.flashinfer import (
     BIND_CURRENT_GENERATION,
     PREACQUIRED,
     attention_jit_args,
+    direct_requirement,
     request_ranges_for_schedule,
 )
 from nta_runtime.flashinfer_schedule import decode_schedule
+from nta_runtime.tenant import tenant_budget_specs, tenant_mapper_from_environment
 from nta_runtime.runtime import (
     AcquireRequirement,
     DeviceWorkPlan,
@@ -228,11 +230,21 @@ class VllmV1WorkerController:
         )
         if self._runtime is None:
             self._runtime = _build_runtime(runner, request_capacity, work_capacity)
+            tenant_specs = tenant_budget_specs()
+            tenant_capacity = int(self._runtime.config.tenant_capacity)
+            for tenant_id, max_bytes, weight in tenant_specs:
+                if tenant_id >= tenant_capacity:
+                    raise RuntimeError(
+                        f"tenant {tenant_id} exceeds NTA_TENANT_CAPACITY="
+                        f"{tenant_capacity}"
+                    )
+                self._runtime.set_tenant_budget(tenant_id, max_bytes, weight)
             self._hook = VllmV1Hook(
                 self._runtime,
                 request_capacity,
                 page_bytes=page_bytes,
                 expected_vllm_version=SUPPORTED_VLLM_VERSION,
+                tenant_for_request=tenant_mapper_from_environment(),
             )
         assert self._hook is not None
         batch = self._hook.bind_forward(
@@ -297,7 +309,12 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         self._nta_plan: DeviceWorkPlan | None = None
         self._nta_plan_capacity = 0
         self._nta_program: JitPhaseProgram | None = None
-        self._native_enabled = os.environ.get("NTA_VLLM_NATIVE", "1") == "1"
+        # Resident-only vLLM requests do not exercise a remote-tier
+        # dependency.  Keep the framework reference as the no-regression
+        # default; the native work-unit consumer is an explicit integration
+        # profile until an external KVConnector supplies the same exact
+        # demand/lifetime boundary.
+        self._native_enabled = os.environ.get("NTA_VLLM_NATIVE", "0") == "1"
 
     def _ensure_wrapper(self, query: torch.Tensor, kv_cache: torch.Tensor) -> None:
         if self._nta_wrapper is not None:
@@ -425,26 +442,8 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             begin = len(dependencies)
             dependencies.extend(
                 (
-                    AcquireRequirement(
-                        runtime.device_view,
-                        0,
-                        0x4E544100FFFFFFF0,
-                        0,
-                        0,
-                        1,
-                        1,
-                        0,
-                    ),
-                    AcquireRequirement(
-                        runtime.device_view,
-                        0,
-                        0x4E544100FFFFFFF1,
-                        0,
-                        1,
-                        1,
-                        1,
-                        0,
-                    ),
+                    direct_requirement(runtime.device_view, 1),
+                    direct_requirement(runtime.device_view, 1),
                 )
             )
             spans.append((begin, 2, 2, work_id))
@@ -553,6 +552,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             PREACQUIRED | BIND_CURRENT_GENERATION,
             out=output,
         )
+        plan.mark_consumed(torch.cuda.current_stream())
         execution.record_layer_completion(0)
         state.hook.record_native_launch()
         VLLM_STATS["native_decode_launches"] += 1

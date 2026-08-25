@@ -15,6 +15,9 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+RESULTS_ROOT = pathlib.Path(
+    os.environ.get("NTA_RESULTS_DIR", pathlib.Path(tempfile.gettempdir()) / "nta-results")
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=ROOT / "results" / "qualification" / "nvme-qualification.json",
+        default=RESULTS_ROOT / "qualification" / "nvme-qualification.json",
     )
     args = parser.parse_args()
     if min(

@@ -1664,6 +1664,16 @@ nta_acquire_set_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
                      std::uint32_t requirementCount,
                      std::uint32_t directRequirementCount,
                      std::uint32_t workTicket) {
+  // A fully direct work item has no external dependency graph to initialize.
+  // Keep the request/ticket identity check, but avoid the leader/shared-memory
+  // rendezvous used by the heterogeneous path.  The work-plan validator and
+  // the per-requirement address helper still provide the fail-closed checks;
+  // this branch only removes redundant dependency admission work.
+  if (requirementCount == directRequirementCount &&
+      (requirementCount == 0 || requirements != nullptr)) {
+    return nta_request_live_work_cta(runtime, requestSlot, generation,
+                                     workTicket);
+  }
   __shared__ std::uint32_t ctaReady;
   if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
     ctaReady = nta_acquire_set_leader(runtime, requestSlot, generation,

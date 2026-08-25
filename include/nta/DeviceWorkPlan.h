@@ -25,11 +25,17 @@ public:
   DeviceWorkPlan &operator=(DeviceWorkPlan &&) noexcept;
 
   // Reuses the fixed device allocation. Async updates rotate through two
-  // pinned host images; consumers on another stream must call waitOn(). Plans
-  // are structural graph inputs and must be uploaded before graph capture.
+  // pinned host images. waitOn() establishes visibility; markConsumed() then
+  // publishes a consumer fence, and a later upload on any stream waits for
+  // every consumer fence before overwriting the allocation. Plans are
+  // structural graph inputs and must be uploaded before graph capture.
   void upload(const WorkPlan &plan);
   void uploadAsync(const WorkPlan &plan, cudaStream_t stream);
+  // Enqueue the publication fence on a consumer stream before launching
+  // kernels that read this plan. Call markConsumed() after the last such
+  // kernel; the next upload then cannot overwrite the plan early.
   void waitOn(cudaStream_t stream) const;
+  void markConsumed(cudaStream_t stream) const;
   void synchronizeUpload() const;
 
   [[nodiscard]] const abi::WorkItem *workItems() const noexcept;

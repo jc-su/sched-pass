@@ -110,12 +110,29 @@ class SglangForwardMetadata:
             raise RuntimeError("SGLang forward metadata vectors do not match the batch")
         return cls(slots, raw_priorities, raw_tenants)
 
-    def pad(self, padded_size: int) -> "SglangForwardMetadata":
-        if padded_size < len(self.request_slots):
+    def pad(self, padded_request_slots: Any) -> "SglangForwardMetadata":
+        """Extend metadata using the slots from SGLang's padded view.
+
+        Graph replay may add masked rows, but those rows still need the same
+        slot vector that the framework will hand to attention.  Fabricating
+        slots here would make request identity disagree with the actual KV
+        page table, so the caller must supply the padded view explicitly.
+        """
+        if hasattr(padded_request_slots, "tolist"):
+            padded_request_slots = padded_request_slots.tolist()
+        try:
+            padded_slots = tuple(int(slot) for slot in padded_request_slots)
+        except (TypeError, ValueError) as error:
+            raise ValueError("padded SGLang request slots are not a sequence") from error
+        raw_size = len(self.request_slots)
+        padded_size = len(padded_slots)
+        if padded_size < raw_size:
             raise ValueError("cannot shrink SGLang forward metadata with pad()")
-        padding = padded_size - len(self.request_slots)
+        if padded_slots[:raw_size] != self.request_slots:
+            raise ValueError("padded SGLang request slots changed live request order")
+        padding = padded_size - raw_size
         return SglangForwardMetadata(
-            self.request_slots,
+            padded_slots,
             self.priorities + (0,) * padding,
             self.tenant_ids + (0,) * padding,
         )

@@ -106,7 +106,16 @@ def git_metadata() -> dict[str, Any]:
 
 def machine_metadata() -> dict[str, Any]:
     distributions = {}
-    for name in ("torch", "flashinfer-python", "sglang", "vllm", "setuptools"):
+    for name in (
+        "torch",
+        "flashinfer-python",
+        "sglang",
+        "sglang-kernel",
+        "vllm",
+        "apache-tvm-ffi",
+        "openai",
+        "setuptools",
+    ):
         try:
             distributions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:

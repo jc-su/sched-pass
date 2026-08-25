@@ -1,0 +1,30 @@
+# Support and qualification matrix
+
+This is the engineering scope of the current branch. “Implemented” means the
+path is wired and fail-closed in source and tests. “Qualified” additionally
+requires machine-specific hardware and the artifact gate; it is never inferred
+from a skipped test or a previous boot.
+
+| Boundary | HBM / resident | Host-staged | NVMe -> HBM | CXL-DAX | Multi-tenant |
+| --- | --- | --- | --- | --- | --- |
+| Native runtime/resource contract | implemented | implemented | implemented; physical qualification required | implemented; endpoint qualification required | typed budget/admission implemented |
+| SGLang + FlashInfer | exact resident and mixed external work | exact indexed path | exact catalog path, GPU-owned progress | exact direct-address path | sidecar tenant IDs plus startup budgets |
+| vLLM 0.26 V1 plugin | reference by default; opt-in exact eager single-token decode/FA2 NTA consumer | not a serving claim | fail-closed; external connector/consumer not implemented | fail-closed; external connector/consumer not implemented | request-prefix adapter plus startup budgets |
+| LLVM/compiler | typed marker lowering and contract checks | same | same | same | identity comes from typed binding, not guessing |
+
+The compiler's marker-free paged-signature discovery is diagnostic only. It
+does not authorize an unmarked raw pointer as a transport request. Likewise,
+the vLLM plugin's scheduler projection is not evidence of a numerical NTA
+consumer; artifact validation requires the `native_work_unit` contract.
+
+The physical NVMe implementation separates control-plane mapping/allocation
+from the steady-state GPU queue. It performs no per-request mapping ioctl and
+does not use host memory as a data proxy. CXL-DAX is consumed directly from a
+validated device-visible mapping. On a host without a qualified VFIO/IOMMU or
+devdax endpoint, those rows remain unavailable and the correct result is an
+explicit qualification skip.
+
+The matrix is deliberately narrower than the internal API surface. Prefill,
+mixed batches, CUDA graph replay, external vLLM tiers, multi-GPU physical
+routes, and storage fault recovery require their own correctness gates before
+they can be presented as supported evaluation claims.

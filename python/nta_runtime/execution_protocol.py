@@ -168,6 +168,16 @@ class WorkLedger:
         self.config = config
         self._units = {unit.work_id: unit for unit in batch.units}
         self._states = {unit.work_id: unit.availability for unit in batch.units}
+        # Keep insertion-ordered membership buckets instead of deriving every
+        # query by scanning ``_states``.  A forward may expose the ledger once
+        # per layer; the old representation made that O(layers * work_units)
+        # even when only a small ready/blocked frontier changed.  Dicts give
+        # deterministic iteration and O(1) state-count/membership updates.
+        self._state_members: dict[Availability, dict[int, None]] = {
+            state: {} for state in Availability
+        }
+        for unit in batch.units:
+            self._state_members[unit.availability][unit.work_id] = None
 
     def state(self, work_id: int) -> Availability:
         try:
@@ -202,6 +212,8 @@ class WorkLedger:
             raise ValueError(
                 "the selected execution protocol does not support partial work"
             )
+        self._state_members[current].pop(work_id)
+        self._state_members[target][work_id] = None
         self._states[work_id] = target
 
     def discover(
@@ -220,9 +232,19 @@ class WorkLedger:
         )
 
     def units_in(self, *states: Availability) -> tuple[int, ...]:
+        if not states:
+            return ()
+        if len(states) == 1:
+            return tuple(self._state_members[states[0]])
+        # Preserve the old set-like API semantics for callers that pass the
+        # same state twice, while retaining deterministic batch order.  The
+        # state buckets are insertion ordered, so a scan over the unit order
+        # is both bounded and duplicate-free.
         allowed = set(states)
         return tuple(
-            work_id for work_id, state in self._states.items() if state in allowed
+            work_id
+            for work_id, state in self._states.items()
+            if state in allowed
         )
 
     def runnable_groups(self) -> tuple[tuple[int, ...], ...]:
@@ -238,7 +260,7 @@ class WorkLedger:
             self._units
         ):
             return ()
-        in_flight = len(self.units_in(Availability.RUNNING))
+        in_flight = len(self._state_members[Availability.RUNNING])
         width = self.config.max_inflight_units - in_flight
         if width <= 0:
             return ()
@@ -248,14 +270,13 @@ class WorkLedger:
 
     @property
     def is_complete(self) -> bool:
-        return all(state is Availability.COMPLETE for state in self._states.values())
+        return len(self._state_members[Availability.COMPLETE]) == len(self._units)
 
     @property
     def state_counts(self) -> dict[Availability, int]:
-        counts = {state: 0 for state in Availability}
-        for state in self._states.values():
-            counts[state] += 1
-        return counts
+        return {
+            state: len(members) for state, members in self._state_members.items()
+        }
 
 
 @dataclass(frozen=True)

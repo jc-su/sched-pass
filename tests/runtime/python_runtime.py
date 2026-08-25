@@ -51,6 +51,7 @@ def main() -> None:
             )
             plan.wait_on(torch.cuda.current_stream())
             torch.cuda.synchronize()
+            plan.mark_consumed(torch.cuda.current_stream())
             assert plan.work_items_address != 0
             assert plan.dependencies_address != 0
             assert plan.work_item_count == 1

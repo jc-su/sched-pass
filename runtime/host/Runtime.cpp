@@ -352,6 +352,11 @@ struct HostRuntime::Impl {
     std::uint64_t accountedStagingBytes = 0;
   };
 
+  struct RetiredObject {
+    OwnedObject object;
+    cudaEvent_t complete = nullptr;
+  };
+
   struct DirectoryUpload {
     abi::ObjectEntry *objects = nullptr;
     abi::ReplicaEntry *replicas = nullptr;
@@ -697,6 +702,88 @@ struct HostRuntime::Impl {
     object = {nullptr, nullptr, {}, 0};
   }
 
+  void reapRetiredObjects() noexcept {
+    detail::NoexceptCudaDeviceGuard deviceGuard(config.deviceOrdinal);
+    auto retired = retiredObjects.begin();
+    while (retired != retiredObjects.end()) {
+      if (retired->complete == nullptr) {
+        releaseObject(retired->object);
+        retired = retiredObjects.erase(retired);
+        continue;
+      }
+      const cudaError_t status = cudaEventQuery(retired->complete);
+      if (status == cudaErrorNotReady) {
+        ++retired;
+        continue;
+      }
+      if (status != cudaSuccess) {
+        // Keep the allocation alive after an event-query error.  The owning
+        // runtime close path performs the final device quiescence and cleans
+        // the event; a transient query failure must never turn into a use-
+        // after-free on any runtime-owned tier destination.
+        (void)cudaGetLastError();
+        ++retired;
+        continue;
+      }
+      releaseObject(retired->object);
+      (void)cudaEventDestroy(retired->complete);
+      retired = retiredObjects.erase(retired);
+    }
+  }
+
+  void retireObject(OwnedObject object, cudaStream_t stream,
+                    cudaEvent_t priorConsumerEvent) {
+    if (object.nvmeBuffer == nullptr && object.stagingDevice == nullptr &&
+        object.replicas.empty()) {
+      releaseObject(object);
+      return;
+    }
+    if (stream == nullptr || priorConsumerEvent == nullptr) {
+      throw std::invalid_argument(
+          "runtime object retirement requires a stream and prior consumer event");
+    }
+    RetiredObject retired{std::move(object), nullptr};
+    const cudaError_t eventStatus =
+        cudaEventCreateWithFlags(&retired.complete, cudaEventDisableTiming);
+    if (eventStatus != cudaSuccess) {
+      // No retirement event exists to carry the lifetime edge.  Quiesce the
+      // known consumer stream before releasing the old object; if even that
+      // cannot be established, use the device-wide lifetime boundary.  This
+      // branch is exceptional and never participates in steady-state reuse.
+      if (cudaStreamWaitEvent(stream, priorConsumerEvent, 0) == cudaSuccess) {
+        (void)cudaStreamSynchronize(stream);
+      } else {
+        (void)cudaDeviceSynchronize();
+      }
+      releaseObject(retired.object);
+      checkCuda(eventStatus, "create runtime object retirement event");
+    }
+    bool recorded = false;
+    try {
+      checkCuda(cudaStreamWaitEvent(stream, priorConsumerEvent, 0),
+                "wait for previous runtime object consumers");
+      checkCuda(cudaEventRecord(retired.complete, stream),
+                "record runtime object retirement event");
+      recorded = true;
+      retiredObjects.push_back(std::move(retired));
+    } catch (...) {
+      // This is an exceptional CUDA/API failure path.  Make the lifetime
+      // boundary safe before releasing the old allocation; steady-state
+      // replacement never enters this synchronization.
+      if (recorded) {
+        (void)cudaEventSynchronize(retired.complete);
+      } else {
+        (void)cudaStreamSynchronize(stream);
+      }
+      if (retired.complete != nullptr) {
+        (void)cudaEventDestroy(retired.complete);
+        retired.complete = nullptr;
+      }
+      releaseObject(retired.object);
+      throw;
+    }
+  }
+
   void reserveStaging(std::uint64_t bytes, OwnedObject &object) {
     if (ownedStagingBytes > config.stagingByteCapacity ||
         bytes > config.stagingByteCapacity - ownedStagingBytes) {
@@ -710,6 +797,10 @@ struct HostRuntime::Impl {
 
   void release() noexcept {
     detail::NoexceptCudaDeviceGuard deviceGuard(config.deviceOrdinal);
+    // Destruction is the process/lifetime boundary.  The steady-state
+    // replacement path uses reapRetiredObjects() and CUDA events instead of
+    // entering this synchronous boundary.
+    (void)cudaDeviceSynchronize();
     for (RequestUpload &upload : requestUploads) {
       if (upload.pending && upload.complete != nullptr) {
         (void)cudaEventSynchronize(upload.complete);
@@ -746,6 +837,13 @@ struct HostRuntime::Impl {
         object.reset();
       }
     }
+    for (RetiredObject &retired : retiredObjects) {
+      releaseObject(retired.object);
+      if (retired.complete != nullptr) {
+        (void)cudaEventDestroy(retired.complete);
+      }
+    }
+    retiredObjects.clear();
     if (view != nullptr) {
       (void)cudaFree(view);
       view = nullptr;
@@ -972,6 +1070,7 @@ struct HostRuntime::Impl {
   std::vector<bool> requestInstalled;
   std::vector<bool> objectInstalled;
   std::vector<std::optional<OwnedObject>> objects;
+  std::vector<RetiredObject> retiredObjects;
   std::shared_ptr<NvmeTransport> nvme;
   std::shared_ptr<CxlDaxTransport> cxl;
   std::array<std::uint64_t, abi::BackendCount> tierLatencies{};
@@ -1474,26 +1573,23 @@ void HostRuntime::registerIndexedHostObjectsAsyncQuiesced(
       objects.size() > impl_->config.objectCapacity - firstSlot) {
     throw std::invalid_argument("indexed host object range exceeds capacity");
   }
+  impl_->reapRetiredObjects();
   if (priorConsumerEvent == nullptr) {
     impl_->ensureObjectRangeReplaceable(
         firstSlot, static_cast<std::uint32_t>(objects.size()));
-  } else {
-    bool ownsPreviousDestination = false;
+    bool replacingOwnedObject = false;
     for (std::size_t index = 0; index < objects.size(); ++index) {
-      if (impl_->objects[firstSlot + static_cast<std::uint32_t>(index)]
-              .has_value()) {
-        ownsPreviousDestination = true;
-        break;
-      }
+      replacingOwnedObject |= impl_->objects[firstSlot + index].has_value();
     }
-    if (ownsPreviousDestination) {
-      // Stream ordering protects device consumers, but host-side destruction
-      // of a runtime-owned CUDA allocation is not itself stream ordered.
-      // Synchronize only for this ownership case; borrowed engine buffers
-      // retain the nonblocking event-wait path.
-      checkCuda(cudaEventSynchronize(priorConsumerEvent),
-                "quiesce runtime-owned indexed destination");
+    if (replacingOwnedObject) {
+      // There is no stream event proving that the previous consumer stopped
+      // reading its runtime-owned destination. This is a deliberately loud,
+      // exceptional fallback; normal host-staged replacement supplies the
+      // event and remains stream ordered.
+      checkCuda(cudaDeviceSynchronize(),
+                "quiesce host object replacement without consumer event");
     }
+  } else {
     checkCuda(cudaStreamWaitEvent(stream, priorConsumerEvent, 0),
               "wait for indexed object consumers");
   }
@@ -1545,8 +1641,13 @@ void HostRuntime::registerIndexedHostObjectsAsyncQuiesced(
   for (std::size_t index = 0; index < objects.size(); ++index) {
     const std::uint32_t slot = firstSlot + static_cast<std::uint32_t>(index);
     if (impl_->objects[slot].has_value()) {
-      impl_->releaseObject(*impl_->objects[slot]);
+      Impl::OwnedObject old = std::move(*impl_->objects[slot]);
       impl_->objects[slot].reset();
+      if (priorConsumerEvent != nullptr) {
+        impl_->retireObject(std::move(old), stream, priorConsumerEvent);
+      } else {
+        impl_->releaseObject(old);
+      }
     }
     impl_->objectInstalled[slot] = true;
   }
@@ -1643,6 +1744,131 @@ ObjectHandle HostRuntime::installNvmeObject(
   return {slot, buffer->deviceAddress()};
 }
 
+ObjectHandle HostRuntime::installNvmeObjectAsync(
+    std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
+    std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
+    cudaEvent_t priorConsumerEvent) {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
+  impl_->checkObjectSlot(slot);
+  if (stream == nullptr) {
+    throw std::invalid_argument(
+        "stream-ordered NVMe installation requires a CUDA stream");
+  }
+  if (impl_->nvme == nullptr) {
+    throw std::invalid_argument("NVMe transport is required");
+  }
+  const NvmeCapabilities &capabilities = impl_->nvme->capabilities();
+  if (bytes == 0 || bytes % capabilities.lbaSize != 0 ||
+      sourceByteOffset % capabilities.lbaSize != 0 ||
+      sourceByteOffset > capabilities.namespaceBytes ||
+      bytes > capabilities.namespaceBytes - sourceByteOffset) {
+    throw std::invalid_argument("NVMe object range is invalid or unaligned");
+  }
+  impl_->reapRetiredObjects();
+
+  const bool hasCurrent = impl_->objects[slot].has_value();
+  if (hasCurrent && priorConsumerEvent == nullptr) {
+    throw std::invalid_argument(
+        "replacing an NVMe object asynchronously requires its prior consumer event");
+  }
+  if (hasCurrent && impl_->objects[slot]->nvmeBuffer == nullptr) {
+    throw std::logic_error(
+        "an asynchronous NVMe slot contains a non-NVMe object");
+  }
+
+  NvmeBuffer *buffer = nullptr;
+  std::unique_ptr<NvmeBuffer> destination;
+  bool reuseExisting = false;
+  if (hasCurrent && impl_->objects[slot]->nvmeBuffer != nullptr &&
+      impl_->objects[slot]->nvmeBuffer->bytes() >= bytes) {
+    buffer = impl_->objects[slot]->nvmeBuffer.get();
+    reuseExisting = true;
+  } else {
+    destination = impl_->nvme->allocate(bytes);
+    buffer = destination.get();
+  }
+  if (buffer == nullptr || bytes > buffer->bytes()) {
+    throw std::invalid_argument("NVMe destination is smaller than the object");
+  }
+
+  const abi::ReplicaEntry replica{
+      sourceByteOffset,
+      buffer->dmaPageListAddress(),
+      impl_->tierLatencies[static_cast<std::size_t>(abi::SourceKind::Nvme)],
+      impl_->tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Nvme)],
+      static_cast<std::uint32_t>(abi::SourceKind::Nvme),
+      buffer->dmaPageCount(),
+      static_cast<std::uint32_t>(abi::SourceKind::Nvme),
+      abi::ReplicaTransport |
+          (buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm
+                                                          : 0U),
+      0,
+      0,
+  };
+  const std::uint32_t replicaStart = slot * impl_->config.maxReplicasPerObject;
+  const abi::ObjectEntry entry{
+      objectId,
+      reinterpret_cast<std::uint64_t>(buffer->deviceAddress()),
+      bytes,
+      0,
+      version,
+      static_cast<std::uint32_t>(abi::ObjectState::New),
+      replicaStart,
+      1,
+      abi::InvalidIndex,
+      buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm : 0U,
+      0,
+  };
+
+  // Reuse the existing pinned directory ring.  The ring event, not a
+  // pageable stack temporary, owns the lifetime of the async source bytes.
+  Impl::DirectoryUpload &upload =
+      impl_->directoryUploads[impl_->nextDirectoryUpload++ %
+                              impl_->directoryUploads.size()];
+  if (upload.pending) {
+    checkCuda(cudaEventSynchronize(upload.complete),
+              "recycle directory upload staging");
+    upload.pending = false;
+  }
+  if (hasCurrent) {
+    // The old directory entry is still visible to the previous consumer until
+    // this event.  Queue the dependency before overwriting the entry; placing
+    // it after the H2D update would permit a directory/data race.
+    checkCuda(cudaStreamWaitEvent(stream, priorConsumerEvent, 0),
+              "wait before replacing NVMe directory entry");
+  }
+  upload.objects[slot] = entry;
+  upload.replicas[replicaStart] = replica;
+  checkCuda(cudaMemcpyAsync(impl_->replicaEntries + replicaStart,
+                            upload.replicas + replicaStart,
+                            sizeof(abi::ReplicaEntry),
+                            cudaMemcpyHostToDevice, stream),
+            "publish NVMe replica asynchronously");
+  checkCuda(cudaMemcpyAsync(impl_->objectEntries + slot, upload.objects + slot,
+                            sizeof(abi::ObjectEntry), cudaMemcpyHostToDevice,
+                            stream),
+            "publish NVMe object asynchronously");
+  checkCuda(cudaEventRecord(upload.complete, stream),
+            "record NVMe directory upload");
+  upload.pending = true;
+
+  if (!reuseExisting) {
+    Impl::OwnedObject allocation{
+        buffer->deviceAddress(), std::move(destination), {}, 0};
+    std::optional<Impl::OwnedObject> old;
+    if (impl_->objects[slot].has_value()) {
+      old = std::move(*impl_->objects[slot]);
+      impl_->objects[slot].reset();
+    }
+    impl_->objects[slot] = std::move(allocation);
+    if (old.has_value()) {
+      impl_->retireObject(std::move(*old), stream, priorConsumerEvent);
+    }
+  }
+  impl_->objectInstalled[slot] = true;
+  return {slot, buffer->deviceAddress()};
+}
+
 ObjectHandle HostRuntime::installNvmeObject(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::uint64_t sourceByteOffset, std::size_t bytes) {
@@ -1698,6 +1924,7 @@ TierDescriptor HostRuntime::tierDescriptor(abi::SourceKind kind) const {
 }
 
 StagingUsage HostRuntime::stagingUsage() const noexcept {
+  impl_->reapRetiredObjects();
   return {impl_->ownedStagingBytes, impl_->config.stagingByteCapacity,
           impl_->stagingHighWaterBytes};
 }

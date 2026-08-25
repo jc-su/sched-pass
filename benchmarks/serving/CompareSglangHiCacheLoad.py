@@ -19,6 +19,9 @@ from CompareSglangHiCache import require_clean_mechanism
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+RESULTS_ROOT = pathlib.Path(
+    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         "--workspace-root",
         type=pathlib.Path,
         default=pathlib.Path(
-            os.environ.get("NTA_SERVING_WORKSPACE_ROOT", ROOT / "results" / "serving")
+            os.environ.get("NTA_SERVING_WORKSPACE_ROOT", RESULTS_ROOT / "serving")
         ),
         help="external JIT/cache workspace root; defaults to results/serving for direct runs",
     )
@@ -117,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=ROOT / "results" / "serving" / "sglang-hicache-load.json",
+        default=RESULTS_ROOT / "serving" / "sglang-hicache-load.json",
     )
     args = parser.parse_args()
     if (

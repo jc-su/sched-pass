@@ -1,8 +1,11 @@
 # NVMe-to-HBM security and lifecycle contract
 
-Status: qualified on one dedicated controller/GPU platform; trusted-process
-transport, with logical serving-tenant quotas enforced above it. This is not a
-multi-tenant storage isolation API.
+The transport implementation has historical qualification evidence on one
+dedicated controller/GPU platform. Every new boot, kernel, NVIDIA driver, or
+controller binding must rerun the read-only qualification; source code and a
+previous report are not a current hardware qualification. The transport is a
+trusted-process path with logical serving-tenant quotas enforced above it. This
+is not a multi-tenant storage isolation API.
 
 ## What the path is
 
@@ -116,11 +119,15 @@ an intervening CPU CUDA flush.
 
 ## Teardown
 
-Destination release synchronizes its CUDA device, marks the queue inactive,
-deletes the I/O SQ/CQ, and only then releases peer mappings. A peer mapping
-release removes its PTEs from the still-attached IOMMUFD domain before NVIDIA
-DMA unmap and persistent page release. The mapper file also releases every
-remaining handle on close.
+Normal object replacement is stream/event ordered: the runtime retains the old
+HBM/DMA destination until its recorded consumer event completes, so the
+steady-state path does not call `cudaDeviceSynchronize()` or issue a per-request
+mapping ioctl. Whole-device synchronization is reserved for runtime/transport
+destruction and exceptional recovery. Destruction then marks the queue
+inactive, deletes the I/O SQ/CQ, and only then releases peer mappings. A peer
+mapping release removes its PTEs from the still-attached IOMMUFD domain before
+NVIDIA DMA unmap and persistent page release. The mapper file also releases
+every remaining handle on close.
 
 If queue deletion or an admin operation fails, the runtime disables bus
 mastering and resets the VFIO function before releasing mappings. Whole-queue
@@ -173,7 +180,7 @@ authorize media formatting, filesystem creation, writes, discard, sanitize,
 or deletion. The generated application path issues READ commands only, and
 `fio` is invoked with `--readonly --rw=read`.
 
-## Current qualified host (2026-08-25)
+## Historical qualification baseline
 
 The qualified platform runs Linux `7.0.0-30-generic`, NVIDIA driver `595.84`,
 CUDA `13.2`, an RTX PRO 6000 Blackwell GPU, and controller `0000:d8:00.0`

@@ -16,6 +16,9 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+RESULTS_ROOT = pathlib.Path(
+    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--flashinfer-workspace-base",
         type=pathlib.Path,
-        default=ROOT / "results" / "qualification" / "sglang-flashinfer",
+        default=RESULTS_ROOT / "qualification" / "sglang-flashinfer",
     )
     parser.add_argument("--cuda-host-cxx", type=pathlib.Path)
     args = parser.parse_args()

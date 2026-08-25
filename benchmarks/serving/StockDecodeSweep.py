@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -25,6 +26,9 @@ import time
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+RESULTS_ROOT = pathlib.Path(
+    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
+)
 sys.path.insert(0, str(ROOT / "benchmarks" / "serving"))
 
 
@@ -45,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--flashinfer-workspace-base",
         type=pathlib.Path,
-        default=ROOT / "results" / "analysis" / "stock-sweep-flashinfer",
+        default=RESULTS_ROOT / "analysis" / "stock-sweep-flashinfer",
     )
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()

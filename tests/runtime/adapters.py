@@ -132,6 +132,16 @@ def main() -> None:
     assert tuple(item.tenant_id for item in sglang_batch.bindings) == (3, 7)
     assert sglang_batch.tenant_ids == (3, 7)
     assert tuple(item.request_slot for item in sglang_batch.bindings) == (5, 7)
+    padded = FakeForward._nta_forward_metadata.pad((5, 7, 8, 9))
+    assert padded.request_slots == (5, 7, 8, 9)
+    assert padded.priorities == (2, 5, 0, 0)
+    assert padded.tenant_ids == (3, 7, 0, 0)
+    try:
+        FakeForward._nta_forward_metadata.pad((5, 6, 8, 9))
+    except ValueError as error:
+        assert "live request order" in str(error)
+    else:
+        raise AssertionError("graph replay accepted reordered live request slots")
     try:
         SglangForwardMetadata((5,), (2, 5), (3, 7))
     except ValueError as error:

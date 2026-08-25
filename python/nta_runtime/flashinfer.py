@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from .epoch import BoundedEpoch, EpochResult
-from .runtime import DeviceWorkPlan, JitPhaseProgram, Runtime
+from .runtime import AcquireRequirement, DeviceWorkPlan, JitPhaseProgram, Runtime
 from .runtime import RequestRange
 from .requests import RequestBinding
 
@@ -31,6 +31,45 @@ WORK_COUNT_MASK = (1 << 32) - 1
 
 _DEFAULT_ATTENTION_VARIANT = "DefaultAttention<false, false, false, false>"
 _DEFAULT_ATTENTION_DECL = "#include <flashinfer/attention/variants.cuh>"
+
+
+def _current_cuda_stream() -> Any:
+    import torch
+
+    return torch.cuda.current_stream()
+
+
+def direct_requirement(
+    direct_base: int,
+    bytes: int,
+    *,
+    direct_tensor_map: int = 0,
+) -> AcquireRequirement:
+    """Build an exact direct dependency with no object identity payload.
+
+    A direct dependency is already resident in the operator-owned address
+    space.  Its object ID, slot, and version are intentionally zero: those
+    fields are meaningful only for transport-backed requirements.  Keeping
+    construction here prevents framework adapters from inventing magic IDs
+    that look like ownership or generation metadata.
+    """
+    if (
+        direct_base <= 0
+        or bytes <= 0
+        or bytes > (1 << 32) - 1
+        or direct_tensor_map < 0
+    ):
+        raise ValueError("direct dependencies need positive addresses and bytes")
+    return AcquireRequirement(
+        int(direct_base),
+        int(direct_tensor_map),
+        0,
+        0,
+        0,
+        0,
+        int(bytes),
+        0,
+    )
 
 
 def request_ranges_for_schedule(
@@ -170,6 +209,7 @@ def enqueue_resident_attention(
         out=out,
         **options,
     )
+    plan.mark_consumed(_current_cuda_stream())
 
 
 class FlashInferLayerEpoch:
@@ -241,6 +281,7 @@ class FlashInferLayerEpoch:
             out=out,
             **options,
         )
+        self.plan.mark_consumed(_current_cuda_stream())
 
     def run_host(
         self,

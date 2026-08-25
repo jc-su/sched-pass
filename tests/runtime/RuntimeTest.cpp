@@ -6,12 +6,15 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -20,6 +23,11 @@ void require(bool condition, const char *message) {
   if (!condition) {
     throw std::runtime_error(message);
   }
+}
+
+void CUDART_CB markConsumerComplete(void *data) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  static_cast<std::atomic<bool> *>(data)->store(true);
 }
 
 } // namespace
@@ -445,9 +453,18 @@ int main() {
                 cudaStreamSynchronize(consumerStream) == cudaSuccess &&
                 asynchronouslyUploaded.logicalWork == 42,
             "cross-stream work-plan publication failed");
+    std::atomic<bool> consumerComplete = false;
+    reusablePlan.waitOn(consumerStream);
+    require(cudaLaunchHostFunc(consumerStream, markConsumerComplete,
+                               &consumerComplete) == cudaSuccess,
+            "consumer fence callback enqueue failed");
+    reusablePlan.markConsumed(consumerStream);
     nta::WorkPlan updatedPlan = hostPlan;
     updatedPlan.workItems[0].logicalWork = 77;
     reusablePlan.uploadAsync(updatedPlan, uploadStream);
+    reusablePlan.synchronizeUpload();
+    require(consumerComplete.load(),
+            "work-plan upload did not wait for the consumer fence");
     reusablePlan.waitOn(consumerStream);
     require(cudaMemcpyAsync(&asynchronouslyUploaded, reusablePlan.workItems(),
                             sizeof(asynchronouslyUploaded),

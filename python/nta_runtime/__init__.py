@@ -55,6 +55,8 @@ _EXPORTS = {
     "ResourceKind": ("resource_contract", "ResourceKind"),
     "ResourceOwner": ("resource_contract", "ResourceOwner"),
     "resource_contract": ("resource_contract", "resource_contract"),
+    "tenant_budget_specs": ("tenant", "tenant_budget_specs"),
+    "tenant_mapper_from_environment": ("tenant", "tenant_mapper_from_environment"),
     "Placement": ("runtime", "Placement"),
     "Replica": ("runtime", "Replica"),
     "RequestRange": ("runtime", "RequestRange"),

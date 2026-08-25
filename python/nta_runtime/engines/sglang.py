@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import atexit
 from collections import Counter
-from dataclasses import dataclass, field
-import json
 import logging
 import math
-import operator
 import os
 import pathlib
-import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -30,6 +26,7 @@ from nta_runtime.flashinfer import (
     FlashInferLayerEpoch,
     PREACQUIRED,
     attention_jit_args,
+    direct_requirement,
     enqueue_resident_attention,
     request_ranges_for_schedule,
     request_bound_attention_jit_args,
@@ -53,7 +50,20 @@ from nta_runtime.execution_planner import (
 )
 from nta_runtime.opportunity import OperatorArrival, TileArrival, append_json_line
 from nta_runtime.requests import RequestBinding
+from nta_runtime.tenant import tenant_budget_specs
 from nta_runtime.engines.sglang_hicache import PendingHostLoad, SglangHiCacheBridge
+from nta_runtime.engines.sglang_state import (
+    _ActiveBatch,
+    _DemandGraph,
+    _DemandGraphKey,
+    _FragmentLookahead,
+    _PagePair,
+    _PlanAllocation,
+    _PrefetchedLayer,
+    _StatsPublisher,
+    _demand_graph_key,
+    _graph_wrapper_metadata,
+)
 from nta_runtime.runtime_resources import (
     RuntimeResourceConfig,
     ServingRuntimeResources,
@@ -148,262 +158,6 @@ PREFILL_GRAPH_COUNTERS: dict[str, int] = {
     "prefill_graph_capture_batches": 0,
 }
 logger = logging.getLogger(__name__)
-_PagePair = tuple[tuple[int, ...], tuple[int, ...]]
-
-
-class _StatsPublisher:
-    """Coalesce evaluation snapshots and write them off the scheduler thread."""
-
-    def __init__(self, path: pathlib.Path) -> None:
-        self._path = path
-        self._condition = threading.Condition()
-        self._pending: tuple[int, dict[str, Any]] | None = None
-        self._submitted = 0
-        self._completed = 0
-        self._error: Exception | None = None
-        self._thread = threading.Thread(
-            target=self._run, name="nta-stats-publisher", daemon=True
-        )
-        self._thread.start()
-
-    def publish(self, report: dict[str, Any], *, wait: bool = False) -> None:
-        with self._condition:
-            self._submitted += 1
-            sequence = self._submitted
-            self._pending = (sequence, report)
-            self._condition.notify()
-            if wait:
-                self._condition.wait_for(
-                    lambda: self._completed >= sequence or self._error is not None
-                )
-                if self._error is not None:
-                    raise RuntimeError(
-                        "failed to publish NTA engine statistics"
-                    ) from self._error
-
-    def _run(self) -> None:
-        while True:
-            with self._condition:
-                self._condition.wait_for(lambda: self._pending is not None)
-                sequence, report = self._pending
-                self._pending = None
-            try:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = self._path.with_suffix(self._path.suffix + ".tmp")
-                temporary.write_text(
-                    json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
-                )
-                temporary.replace(self._path)
-            except Exception as error:
-                with self._condition:
-                    self._error = error
-                    self._condition.notify_all()
-                return
-            with self._condition:
-                self._completed = sequence
-                self._condition.notify_all()
-
-
-@dataclass(frozen=True)
-class _PrefetchedLayer:
-    key_slot: int
-    key_object_id: int
-    value_slot: int
-    value_object_id: int
-    version: int
-    key_bytes: int
-    value_bytes: int
-    ready_event: torch.cuda.Event
-    transfer_first_slot: int
-
-
-@dataclass(frozen=True)
-class _FragmentLookahead:
-    layer_id: int
-    wrapper_id: int
-    object_count: int
-    preloaded_object_count: int
-    key_source: int
-    key_staging: int
-    value_source: int
-    value_staging: int
-    ready_event: torch.cuda.Event
-
-
-@dataclass
-class _ActiveBatch:
-    bindings: tuple[RequestBinding, ...]
-    schedules: dict[int, Schedule]
-    pending_host_load: PendingHostLoad | None
-    page_pairs: dict[int, tuple[_PagePair, ...]]
-    index_maps: dict[_PagePair, tuple[torch.Tensor, torch.Tensor]]
-    prefetched_layers: dict[int, _PrefetchedLayer]
-    prefetch_tensors: tuple[torch.Tensor, ...]
-    host_execution: HostExecutionPlan | None = None
-    grouping: str = "request"
-    fragment_lookahead: dict[int, _FragmentLookahead] = field(default_factory=dict)
-    execution: ExecutionSession | None = None
-
-
-@dataclass
-class _PlanAllocation:
-    plan: DeviceWorkPlan
-    work_capacity: int
-    signature: tuple[Any, ...] | None = None
-    object_count: int = 0
-    index_tensors: tuple[torch.Tensor, ...] = ()
-    host_execution: HostExecutionPlan | None = None
-    object_version: int = 0
-    transfer_bytes: int = 0
-    indexed_geometry: tuple[int, ...] | None = None
-    max_object_fanout: int = 1
-    min_unresolved_dependencies: int = 1
-    direct_work_count: int = 0
-    external_object_slots: tuple[tuple[int, ...], ...] = ()
-
-
-@dataclass(frozen=True)
-class _DemandGraph:
-    graph: torch.cuda.CUDAGraph
-    query: torch.Tensor
-    output: torch.Tensor
-    retained_events: tuple[torch.cuda.Event, ...]
-    wrapper_metadata: tuple[tuple[str, torch.Tensor], ...]
-
-
-@dataclass(frozen=True)
-class _DemandGraphKey:
-    operator_family: str
-    wrapper_id: int
-    layer_id: int
-    work_items_address: int
-    dependencies_address: int
-    runtime_address: int
-    work_count: int
-    object_count: int
-    progress_blocks: tuple[int, ...]
-    ready_work_counts: tuple[int, ...]
-    initial_ready_work_count: int
-    indexed_copy_blocks_per_group: int
-    query_shape: tuple[int, ...]
-    query_stride: tuple[int, ...]
-    query_dtype: str
-    query_device: str
-    key_cache_address: int
-    value_cache_address: int
-    sm_scale: float
-    k_scale: float | None
-    v_scale: float | None
-    causal: bool
-    window_left: int
-    wrapper_plan: Any
-    wrapper_metadata_layout: tuple[
-        tuple[str, tuple[int, ...], tuple[int, ...], str, str], ...
-    ]
-
-
-_GRAPH_WRAPPER_METADATA = (
-    "_qo_indptr_buf",
-    "_paged_kv_indptr_buf",
-    "_paged_kv_indices_buf",
-    "_paged_kv_last_page_len_buf",
-    "_custom_mask_buf",
-    "_mask_indptr_buf",
-    "_prefix_len_ptr",
-    "_token_pos_in_items_ptr",
-    "_max_item_len_ptr",
-    "_block_tables",
-)
-
-
-def _freeze_graph_plan(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    try:
-        return operator.index(value)
-    except TypeError:
-        pass
-    if isinstance(value, Iterable):
-        return tuple(_freeze_graph_plan(item) for item in value)
-    raise RuntimeError(
-        f"FlashInfer graph plan contains unsupported {type(value).__name__} state"
-    )
-
-
-def _graph_wrapper_metadata(wrapper: Any) -> tuple[tuple[str, torch.Tensor], ...]:
-    return tuple(
-        (name, value)
-        for name in _GRAPH_WRAPPER_METADATA
-        if torch.is_tensor(value := getattr(wrapper, name, None))
-    )
-
-
-def _graph_wrapper_metadata_layout(
-    wrapper: Any,
-) -> tuple[tuple[str, tuple[int, ...], tuple[int, ...], str, str], ...]:
-    return tuple(
-        (
-            name,
-            tuple(int(extent) for extent in value.shape),
-            tuple(int(stride) for stride in value.stride()),
-            str(value.dtype),
-            str(value.device),
-        )
-        for name, value in _graph_wrapper_metadata(wrapper)
-    )
-
-
-def _demand_graph_key(
-    *,
-    operator_family: str,
-    wrapper: Any,
-    layer_id: int,
-    plan: DeviceWorkPlan,
-    runtime_tensor: torch.Tensor,
-    work_count: int,
-    object_count: int,
-    progress_blocks: tuple[int, ...],
-    ready_work_counts: tuple[int, ...],
-    initial_ready_work_count: int,
-    indexed_copy_blocks_per_group: int,
-    query: torch.Tensor,
-    kv_cache: tuple[torch.Tensor, torch.Tensor],
-    sm_scale: float,
-    k_scale: float | None,
-    v_scale: float | None,
-    causal: bool,
-    window_left: int,
-) -> _DemandGraphKey:
-    """Describe every dynamic value baked into a demand graph launch."""
-    if operator_family not in {"decode", "paged_prefill"}:
-        raise ValueError("unsupported demand graph operator family")
-    return _DemandGraphKey(
-        operator_family,
-        id(wrapper),
-        int(layer_id),
-        int(plan.work_items_address),
-        int(plan.dependencies_address),
-        int(runtime_tensor.data_ptr()),
-        int(work_count),
-        int(object_count),
-        tuple(int(count) for count in progress_blocks),
-        tuple(int(count) for count in ready_work_counts),
-        int(initial_ready_work_count),
-        int(indexed_copy_blocks_per_group),
-        tuple(int(extent) for extent in query.shape),
-        tuple(int(stride) for stride in query.stride()),
-        str(query.dtype),
-        str(query.device),
-        int(kv_cache[0].data_ptr()),
-        int(kv_cache[1].data_ptr()),
-        float(sm_scale),
-        None if k_scale is None else float(k_scale),
-        None if v_scale is None else float(v_scale),
-        bool(causal),
-        int(window_left),
-        _freeze_graph_plan(getattr(wrapper, "_plan_info", None)),
-        _graph_wrapper_metadata_layout(wrapper),
-    )
 
 
 def _positive_environment(name: str, default: int) -> int:
@@ -411,35 +165,6 @@ def _positive_environment(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive")
     return value
-
-
-def _tenant_budget_specs() -> tuple[tuple[int, int, int], ...]:
-    """Parse the optional process-level tenant quota policy once at startup.
-
-    The runtime keeps an unlimited, active default for tenants that are not
-    listed.  A deployment that needs isolation opts in with
-    ``NTA_TENANT_BUDGETS=id:bytes[:weight],...``.  This keeps policy out of the
-    per-forward path and makes a missing engine tenant annotation fail through
-    the normal tenant-0 contract instead of silently changing quotas.
-    """
-    raw = os.environ.get("NTA_TENANT_BUDGETS", "").strip()
-    if not raw:
-        return ()
-    specs: list[tuple[int, int, int]] = []
-    seen: set[int] = set()
-    for item in raw.split(","):
-        fields = tuple(field.strip() for field in item.split(":") if field.strip())
-        if len(fields) not in (2, 3):
-            raise ValueError("NTA_TENANT_BUDGETS entries must be id:bytes[:weight]")
-        tenant_id, max_bytes = (int(fields[0]), int(fields[1]))
-        weight = 1 if len(fields) == 2 else int(fields[2])
-        if tenant_id < 0 or max_bytes < 0 or weight <= 0:
-            raise ValueError("NTA_TENANT_BUDGETS contains an invalid value")
-        if tenant_id in seen:
-            raise ValueError("NTA_TENANT_BUDGETS repeats a tenant")
-        seen.add(tenant_id)
-        specs.append((tenant_id, max_bytes, weight))
-    return tuple(specs)
 
 
 def _nonnegative_environment(name: str, default: int) -> int:
@@ -612,7 +337,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._tenant_capacity = _positive_environment(
             "NTA_TENANT_CAPACITY", request_capacity
         )
-        tenant_specs = _tenant_budget_specs()
+        tenant_specs = tenant_budget_specs()
         for tenant_id, _, _ in tenant_specs:
             if tenant_id >= self._tenant_capacity:
                 raise RuntimeError(
@@ -672,6 +397,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # when a forward did not reach its normal completion edge.
         self._indexed_object_quiescence_event = torch.cuda.Event()
         self._indexed_object_quiescence_recorded = False
+        # NVMe object slots have the same ownership hazard as indexed host
+        # objects, but their old destination also owns a VFIO/IOMMU mapping.
+        # Keep replacement stream-ordered so a changing physical page set does
+        # not force the scheduler through a device-wide synchronization.
+        self._nvme_object_quiescence_event = torch.cuda.Event()
+        self._nvme_object_quiescence_recorded = False
         self._nvme_object_addresses: dict[int, int] = {}
         self._host_cost_model = HostCostModel.from_environment()
         self._indexed_copy_target_bytes = _positive_environment(
@@ -851,6 +582,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "indexed_object_lifetime_guard_fallbacks": 0,
                 "nvme_object_allocations": 0,
                 "nvme_object_reuses": 0,
+                "nvme_object_quiesced_replacements": 0,
+                "nvme_object_lifetime_guard_fallbacks": 0,
             }
         )
         configured_stats = os.environ.get("NTA_ENGINE_STATS_FILE")
@@ -1278,26 +1011,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             dependency_begin = len(dependencies)
             dependencies.extend(
                 (
-                    AcquireRequirement(
-                        self._runtime.device_view,
-                        0,
-                        _OBJECT_ID_BASE | 0xFFFFFFF0,
-                        0,
-                        0,
-                        1,
-                        1,
-                        0,
-                    ),
-                    AcquireRequirement(
-                        self._runtime.device_view,
-                        0,
-                        _OBJECT_ID_BASE | 0xFFFFFFF1,
-                        0,
-                        1,
-                        1,
-                        1,
-                        0,
-                    ),
+                    direct_requirement(self._runtime.device_view, 1),
+                    direct_requirement(self._runtime.device_view, 1),
                 )
             )
             dependency_spans.append((dependency_begin, 2, 2, work_ticket))
@@ -1325,7 +1040,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._stats.update(
             self._active_batch.execution.record_layer_completion(local_layer)
         )
-        if self._tier_service.is_host and final_layer:
+        if self._tier_service.is_nvme:
+            # NVMe object slots are reused between consecutive layers as well
+            # as between forwards.  Recording at every layer gives the next
+            # replacement the exact predecessor event; waiting for only the
+            # final layer would leave a same-forward slot replacement unsafe.
+            self._nvme_object_quiescence_event.record(torch.cuda.current_stream())
+            self._nvme_object_quiescence_recorded = True
+        elif self._tier_service.is_host and final_layer:
             self._indexed_object_quiescence_event.record(torch.cuda.current_stream())
             self._indexed_object_quiescence_recorded = True
 
@@ -2125,6 +1847,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 out=output,
                 **run_options,
             )
+            allocation.plan.mark_consumed(torch.cuda.current_stream())
         self._stats["transformed_direct_launches"] += 1
 
     def _ensure_plan(
@@ -2447,8 +2170,28 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 key_extent, value_extent = extents
                 key_slot = len(physical_object_bytes)
                 key_object_id = _OBJECT_ID_BASE | key_slot
-                key_address = self._runtime.install_nvme_object(
-                    key_slot, key_object_id, version, key_extent.offset, key_extent.bytes
+                install_stream = torch.cuda.current_stream()
+                quiescence_event = (
+                    self._nvme_object_quiescence_event
+                    if self._nvme_object_quiescence_recorded
+                    else None
+                )
+                if quiescence_event is None:
+                    self._stats["nvme_object_lifetime_guard_fallbacks"] = (
+                        self._stats.get("nvme_object_lifetime_guard_fallbacks", 0) + 1
+                    )
+                else:
+                    self._stats["nvme_object_quiesced_replacements"] = (
+                        self._stats.get("nvme_object_quiesced_replacements", 0) + 1
+                    )
+                key_address = self._runtime.install_nvme_object_async(
+                    key_slot,
+                    key_object_id,
+                    version,
+                    key_extent.offset,
+                    key_extent.bytes,
+                    install_stream,
+                    quiescence_event,
                 )
                 if key_address == 0:
                     raise RuntimeError("NVMe runtime returned a null HBM destination")
@@ -2460,12 +2203,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 physical_object_bytes.append(key_extent.bytes)
                 value_slot = len(physical_object_bytes)
                 value_object_id = _OBJECT_ID_BASE | value_slot
-                value_address = self._runtime.install_nvme_object(
+                value_address = self._runtime.install_nvme_object_async(
                     value_slot,
                     value_object_id,
                     version,
                     value_extent.offset,
                     value_extent.bytes,
+                    install_stream,
+                    quiescence_event,
                 )
                 if value_address == 0:
                     raise RuntimeError("NVMe runtime returned a null HBM destination")
@@ -2579,26 +2324,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     value_address = self._tier_service.device_address(value_extent)
                     dependencies.extend(
                         (
-                            AcquireRequirement(
-                                key_address,
-                                0,
-                                _OBJECT_ID_BASE | 0xFFFFFFF0,
-                                0,
-                                0,
-                                1,
-                                key_extent.bytes,
-                                0,
-                            ),
-                            AcquireRequirement(
-                                value_address,
-                                0,
-                                _OBJECT_ID_BASE | 0xFFFFFFF1,
-                                0,
-                                1,
-                                1,
-                                value_extent.bytes,
-                                0,
-                            ),
+                            direct_requirement(key_address, key_extent.bytes),
+                            direct_requirement(value_address, value_extent.bytes),
                         )
                     )
                     direct_work_count += 1
@@ -2650,26 +2377,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             else:
                 dependencies.extend(
                     (
-                        AcquireRequirement(
-                            self._runtime.device_view,
-                            0,
-                            _OBJECT_ID_BASE | 0xFFFFFFF0,
-                            0,
-                            0,
-                            1,
-                            1,
-                            0,
-                        ),
-                        AcquireRequirement(
-                            self._runtime.device_view,
-                            0,
-                            _OBJECT_ID_BASE | 0xFFFFFFF1,
-                            0,
-                            1,
-                            1,
-                            1,
-                            0,
-                        ),
+                        direct_requirement(self._runtime.device_view, 1),
+                        direct_requirement(self._runtime.device_view, 1),
                     )
                 )
                 direct_work_count += 1

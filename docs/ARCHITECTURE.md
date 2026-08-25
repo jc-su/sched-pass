@@ -21,6 +21,14 @@ SGLang and vLLM are adapters, not runtime implementations. The native ABI
 stores work and dependencies; the semantic layer validates generation, epoch,
 demand, and availability before native submission.
 
+`DeviceWorkPlan` has an explicit cross-stream lifetime protocol: `uploadAsync`
+publishes a plan, `waitOn` makes that publication visible to a consumer stream,
+and `markConsumed` records the point after the consumer's last read. Reuse of
+the fixed device allocation waits on those consumer fences; plan destruction is
+the only lifetime boundary allowed to quiesce the device. This prevents a
+structural plan upload from becoming an implicit data race or a hidden
+per-request synchronization point.
+
 Both frameworks can select FlashInfer, but FlashInfer is the shared numerical
 operator ABI, not a shared framework lifecycle. SGLang supplies
 `ForwardBatch`/HiCache metadata through its attention-backend and plugin

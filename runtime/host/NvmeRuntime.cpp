@@ -580,7 +580,6 @@ struct NvmeTransport::Impl {
       }
     }
     detail::NoexceptCudaDeviceGuard deviceGuard(deviceOrdinal);
-    (void)cudaDeviceSynchronize();
     std::scoped_lock lock(mappingMutex);
     auto mapping = retiredMappings.begin();
     while (mapping != retiredMappings.end()) {
@@ -595,7 +594,12 @@ struct NvmeTransport::Impl {
 
   void releaseMapping(RetiredMapping mapping) noexcept {
     detail::NoexceptCudaDeviceGuard deviceGuard(deviceOrdinal);
-    (void)cudaDeviceSynchronize();
+    // Do not turn destruction of a reusable buffer into a device-wide fence.
+    // ``mappingInFlight`` performs the narrow queue-context check needed to
+    // decide whether the lease can be cached.  If the buffer is still used by
+    // an NVMe command, it is retained in ``retiredMappings`` and reclaimed by
+    // a later allocation/statistics pass.  Transport shutdown remains the
+    // explicit whole-device quiescence boundary in ``release``.
     std::scoped_lock lock(mappingMutex);
     if (mappingInFlight(mapping.mappingKey)) {
       try {

@@ -4,7 +4,7 @@ The repository has an explicit source boundary:
 
 | Layer | Paths | Responsibility |
 | --- | --- | --- |
-| implementation | `include/`, `lib/`, `runtime/`, `kernel/`, `python/nta_runtime/` | compiler pass, native ABI, device/runtime transports, semantic execution core |
+| implementation | `include/`, `lib/`, `runtime/`, `kernel/`, `tools/`, `python/nta_runtime/` | compiler pass, native ABI, device/runtime transports, JIT/build integration, semantic execution core |
 | experiment drivers | `experiments/`, `benchmarks/`, `scripts/` | workloads, trial orchestration, measurements, artifact validation |
 | correctness tests | `tests/` | deterministic pass/runtime correctness gates; no experiment output is stored there |
 
@@ -168,8 +168,9 @@ This changes access control only; it does not create a CXL region, reconfigure
 a namespace, or initialize device media. A missing `/dev/daxX.Y` must therefore
 be fixed in the platform CXL enumeration path rather than hidden by permissions.
 
-On the current `7.0.0-30-generic` host, no `/dev/dax*` endpoint is enumerated.
-DAX tests therefore correctly remain skipped. The group/rule establishes
+The last recorded hardware inventory had no `/dev/dax*` endpoint, so its DAX
+tests were correctly skipped. Always use a fresh read-only hardware inventory
+for the machine and kernel used by an artifact; the group/rule establishes
 permission readiness only and must not be reported as tier qualification.
 
 ### Physical NVMe-to-HBM qualification

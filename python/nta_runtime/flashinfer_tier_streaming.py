@@ -15,6 +15,7 @@ from .bounded_staging import BoundedStagingPool
 from .flashinfer import (
     BIND_CURRENT_GENERATION,
     attention_jit_args,
+    direct_requirement,
     pack_work_metadata,
     request_bound_attention_jit_args,
 )
@@ -729,16 +730,7 @@ class FlashInferTierStreamingOperator:
                 dependency_count = 1
                 direct_dependency_count = 1
                 requirements = (
-                    AcquireRequirement(
-                        runtime.device_view,
-                        0,
-                        0x4E54415000000000 | work_ticket,
-                        0,
-                        0,
-                        1,
-                        1,
-                        0,
-                    ),
+                    direct_requirement(runtime.device_view, 1),
                 )
             dependencies.extend(requirements)
             self._compiled_completion_dependencies.extend(requirements)
@@ -1129,6 +1121,8 @@ class FlashInferTierStreamingOperator:
             lse=lse,
             return_lse=True,
         )
+        if form == OperatorForm.INCREMENTAL:
+            compiled.plan.mark_consumed(self.executor.compute_stream)
 
     def enqueue_base(
         self,
@@ -1259,6 +1253,7 @@ class FlashInferTierStreamingOperator:
                 self._compiled_completion_plan,
                 self.executor.compute_stream,
             )
+            self._compiled_completion_plan.mark_consumed(self.executor.compute_stream)
 
     def capture(
         self,

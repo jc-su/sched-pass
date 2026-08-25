@@ -121,11 +121,11 @@ def main() -> None:
         AcquisitionAdmission,
         AdmissionConfig,
     )
-    from nta_runtime.engines.sglang import _tenant_budget_specs
     from nta_runtime.engines.sglang_hicache import (
         HostLoadProgress,
         SglangHiCacheBridge,
     )
+    from nta_runtime.tenant import tenant_budget_specs
     from nta_runtime.requests import RequestBinding, stable_request_id
     from nta_runtime.runtime import RequestProgress
     from nta_runtime.fixed_range_pool import FixedRangePool
@@ -135,7 +135,7 @@ def main() -> None:
         {"NTA_TENANT_BUDGETS": "2:1048576:3,7:2097152"},
         clear=False,
     ):
-        assert _tenant_budget_specs() == ((2, 1048576, 3), (7, 2097152, 1))
+        assert tenant_budget_specs() == ((2, 1048576, 3), (7, 2097152, 1))
 
     ranges = FixedRangePool(128, 24, reserved_low=2)
     first = ranges.acquire(11)
@@ -702,6 +702,7 @@ def main() -> None:
         work_item_count=3,
         work_items_tensor=work_items_tensor,
         dependencies_tensor=dependencies_tensor,
+        mark_consumed=lambda stream: None,
     )
     backend._wrapper_modules[id(demand_wrapper)] = "instrumented_demand_acquire"
     backend._active_batch = _ActiveBatch(

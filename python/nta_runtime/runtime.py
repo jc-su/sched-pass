@@ -14,7 +14,7 @@ from typing import Any
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 35
+API_VERSION = 36
 
 
 class RuntimeError(Exception):
@@ -1018,6 +1018,19 @@ _runtime_install_nvme_object = _function(
     ctypes.c_uint64,
     ctypes.POINTER(ctypes.c_uint64),
 )
+_runtime_install_nvme_object_async = _function(
+    "nta_runtime_install_nvme_object_async",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint64),
+)
 _runtime_pending_count = _function(
     "nta_runtime_read_pending_count",
     ctypes.c_int,
@@ -1102,6 +1115,9 @@ _plan_upload = _function(
 )
 _plan_wait = _function(
     "nta_device_work_plan_wait_on", ctypes.c_int, _Handle, ctypes.c_uint64
+)
+_plan_mark_consumed = _function(
+    "nta_device_work_plan_mark_consumed", ctypes.c_int, _Handle, ctypes.c_uint64
 )
 _plan_sync = _function("nta_device_work_plan_synchronize_upload", ctypes.c_int, _Handle)
 _plan_work_items = _function(
@@ -1602,6 +1618,11 @@ class Runtime(_Owner):
     def device_ordinal(self) -> int:
         return int(_runtime_device_ordinal(self._handle))
 
+    @property
+    def config(self) -> RuntimeConfig:
+        """Return the immutable process-local runtime configuration."""
+        return self._config
+
     def tier_descriptor(self, tier: TierKind) -> TierDescriptor:
         native = _TierDescriptor()
         _check(_runtime_tier_descriptor(self._handle, int(tier), ctypes.byref(native)))
@@ -1840,6 +1861,40 @@ class Runtime(_Owner):
                 version,
                 source_byte_offset,
                 bytes,
+                ctypes.byref(destination),
+            )
+        )
+        return int(destination.value)
+
+    def install_nvme_object_async(
+        self,
+        slot: int,
+        object_id: int,
+        version: int,
+        source_byte_offset: int,
+        bytes: int,
+        stream: Any,
+        prior_consumer_event: Any = None,
+    ) -> int:
+        """Publish an NVMe range without a device-wide replacement fence.
+
+        The event must cover the previous forward's consumers when ``slot``
+        already owns a destination.  Native retirement keeps that destination
+        alive until the event-ordered replacement is safe.
+        """
+        if stream is None:
+            raise ValueError("asynchronous NVMe installation requires a stream")
+        destination = ctypes.c_uint64()
+        _check(
+            _runtime_install_nvme_object_async(
+                self._handle,
+                slot,
+                object_id,
+                version,
+                source_byte_offset,
+                bytes,
+                _stream_address(stream),
+                _event_address(prior_consumer_event),
                 ctypes.byref(destination),
             )
         )
@@ -2124,6 +2179,10 @@ class DeviceWorkPlan(_Owner):
 
     def wait_on(self, stream: Any) -> None:
         _check(_plan_wait(self._handle, _stream_address(stream)))
+
+    def mark_consumed(self, stream: Any) -> None:
+        """Fence the last consumer launch before a future upload can reuse it."""
+        _check(_plan_mark_consumed(self._handle, _stream_address(stream)))
 
     def synchronize_upload(self) -> None:
         _check(_plan_sync(self._handle))

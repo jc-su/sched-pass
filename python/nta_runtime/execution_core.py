@@ -69,6 +69,14 @@ class ExecutionSession:
     _units_by_work_id: dict[int, WorkUnit] = field(
         init=False, repr=False, compare=False
     )
+    _units_by_layer: dict[int, tuple[int, ...]] = field(
+        init=False, repr=False, compare=False
+    )
+    _request_count: int = field(init=False, repr=False, compare=False)
+    _selected_units: int = field(init=False, repr=False, compare=False)
+    _candidate_units: int = field(init=False, repr=False, compare=False)
+    _selected_bytes: int = field(init=False, repr=False, compare=False)
+    _candidate_bytes: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Native plan upload resolves every schedule ticket through this
@@ -76,6 +84,25 @@ class ExecutionSession:
         # heterogeneous schedule into an accidental O(work_units^2) Python
         # control-plane cost before the GPU can overlap any transfer.
         self._units_by_work_id = {unit.work_id: unit for unit in self.batch.units}
+        by_layer: dict[int, list[int]] = {}
+        for unit in self.batch.units:
+            by_layer.setdefault(unit.layer, []).append(unit.work_id)
+        self._units_by_layer = {
+            layer: tuple(work_ids) for layer, work_ids in by_layer.items()
+        }
+        self._request_count = len(self.batch.request_identities)
+        self._selected_units = sum(
+            unit.demand.selected_units for unit in self.batch.units
+        )
+        self._candidate_units = sum(
+            unit.demand.candidate_units for unit in self.batch.units
+        )
+        self._selected_bytes = sum(
+            unit.demand.selected_bytes for unit in self.batch.units
+        )
+        self._candidate_bytes = sum(
+            unit.demand.candidate_bytes for unit in self.batch.units
+        )
 
     @classmethod
     def from_tiles(
@@ -208,9 +235,7 @@ class ExecutionSession:
         its availability boundary, so the semantic ledger and native launch
         cannot diverge silently.
         """
-        layer_ids = tuple(
-            unit.work_id for unit in self.batch.units if unit.layer == layer
-        )
+        layer_ids = self._units_by_layer.get(layer, ())
         for work_id in layer_ids:
             state = self.ledger.state(work_id)
             if state is Availability.BLOCKED:
@@ -228,14 +253,10 @@ class ExecutionSession:
 
     def expose_stats(self) -> dict[str, int | float | bool]:
         counts = self.ledger.state_counts
-        selected = sum(unit.demand.selected_units for unit in self.batch.units)
-        candidates = sum(unit.demand.candidate_units for unit in self.batch.units)
-        selected_bytes = sum(unit.demand.selected_bytes for unit in self.batch.units)
-        candidate_bytes = sum(unit.demand.candidate_bytes for unit in self.batch.units)
         return {
             "work_epoch": self.epoch,
             "work_units": len(self.batch.units),
-            "work_requests": len(self.request_identities),
+            "work_requests": self._request_count,
             "work_ready": counts[Availability.READY],
             "work_blocked": counts[Availability.BLOCKED],
             "work_running": counts[Availability.RUNNING],
@@ -243,10 +264,10 @@ class ExecutionSession:
             "work_complete": counts[Availability.COMPLETE],
             "work_cancelled": counts[Availability.CANCELLED],
             "work_failed": counts[Availability.FAILED],
-            "work_selected_units": selected,
-            "work_candidate_units": candidates,
-            "work_selected_bytes": selected_bytes,
-            "work_candidate_bytes": candidate_bytes,
+            "work_selected_units": self._selected_units,
+            "work_candidate_units": self._candidate_units,
+            "work_selected_bytes": self._selected_bytes,
+            "work_candidate_bytes": self._candidate_bytes,
             "work_is_heterogeneous": self.batch.is_heterogeneous,
             "work_ready_fraction": self.batch.ready_fraction,
         }

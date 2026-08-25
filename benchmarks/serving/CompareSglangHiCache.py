@@ -14,6 +14,9 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+RESULTS_ROOT = pathlib.Path(
+    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=ROOT / "results" / "serving" / "sglang-hicache.json",
+        default=RESULTS_ROOT / "serving" / "sglang-hicache.json",
     )
     args = parser.parse_args()
     if (
@@ -269,7 +272,7 @@ def require_clean_mechanism(
 def run(
     args: argparse.Namespace, backend: str, *, verify_transfer: bool = False
 ) -> dict[str, Any]:
-    workspace = ROOT / "results" / "serving" / "sglang-hicache-cache" / backend
+    workspace = RESULTS_ROOT / "serving" / "sglang-hicache-cache" / backend
     command = [
         str(ROOT / "tools" / "jit" / "activate.py"),
         "--build-dir",
