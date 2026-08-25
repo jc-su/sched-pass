@@ -64,6 +64,22 @@ region, and an exposed devdax endpoint. It does not bind PCI devices, open
 block namespaces, create/delete CXL regions, or qualify a tier. Qualification
 remains an explicit, separately validated operation.
 
+If the kernel modules are not already loaded, the non-destructive software
+bring-up is:
+
+```bash
+sudo modprobe cxl_mem
+sudo modprobe dax_cxl
+cxl list -M -i
+cxl list -R
+daxctl list -u
+```
+
+These commands can expose an endpoint that firmware has already enumerated;
+they cannot create a CXL Type-3 device or safely invent a DAX region. An empty
+memdev/region list therefore remains a platform-capability result, not a
+permission problem that the test should bypass.
+
 Serving physical tiers also require an immutable exact page catalog. Validate
 it without opening the endpoint before launching the worker:
 
