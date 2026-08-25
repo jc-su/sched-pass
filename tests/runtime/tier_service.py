@@ -106,6 +106,20 @@ def main() -> None:
         raise AssertionError("tier close failure was silently accepted")
     assert close_log == ["nvme", "cxl"]
     assert partial_service.nvme is None and partial_service.cxl is None
+    resource_log: list[str] = []
+    partial_resources = runtime_resources.ServingRuntimeResources.__new__(
+        runtime_resources.ServingRuntimeResources
+    )
+    partial_resources.runtime = CloseProbe(resource_log, "runtime", fail=True)
+    partial_resources.tier = CloseProbe(resource_log, "tier", fail=True)
+    partial_resources._closed = False
+    try:
+        partial_resources.close()
+    except RuntimeError as error:
+        assert "resource teardown" in str(error)
+    else:
+        raise AssertionError("runtime resource close failure was silently accepted")
+    assert resource_log == ["runtime", "tier"]
 
     fake_tier = FakeTier()
     failing_runtime = FailingRuntime()

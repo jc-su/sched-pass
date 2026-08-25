@@ -179,10 +179,18 @@ class ServingRuntimeResources:
         if self._closed:
             return
         self._closed = True
+        first_error: BaseException | None = None
         try:
             self.runtime.close()
-        finally:
+        except BaseException as error:
+            first_error = error
+        try:
             self.tier.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise RuntimeError("serving runtime resource teardown failed") from first_error
 
     def __del__(self) -> None:
         # NtaFlashInferAttnBackend can fail during partially initialized
