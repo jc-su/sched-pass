@@ -20,6 +20,7 @@ from nta_runtime.tier import (  # noqa: E402
     _validate_nvme_extent,
 )
 from nta_runtime.resource_contract import (  # noqa: E402
+    ResourceCapability,
     ResourceKind,
     ResourceOwner,
     resource_contract,
@@ -44,6 +45,7 @@ def main() -> None:
     assert host_staged.uses_host_proxy and not host_staged.physical
     assert nvme.physical and not nvme.direct_device_visible
     assert cxl.physical and cxl.direct_device_visible
+    assert not (cxl.capabilities & ResourceCapability.PERSISTENT_STORAGE)
     assert host_staged.directory_owner is ResourceOwner.RUNTIME
     assert host_staged.protocol_owner is ResourceOwner.RUNTIME
     assert host_staged.payload_owner is ResourceOwner.ENGINE

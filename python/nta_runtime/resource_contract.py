@@ -204,8 +204,7 @@ _CONTRACTS = {
     ResourceKind.CXL_DAX: ResourceContract(
         ResourceKind.CXL_DAX,
         ResourceCapability.DIRECT_ADDRESS
-        | ResourceCapability.HOST_REGISTERED
-        | ResourceCapability.PERSISTENT_STORAGE,
+        | ResourceCapability.HOST_REGISTERED,
         ResourceOwner.TRANSPORT,
         ResourceOwner.TRANSPORT,
         None,
