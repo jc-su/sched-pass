@@ -5,10 +5,10 @@
 
 #include <cuda_runtime_api.h>
 
+#include <filesystem>
 #include <fcntl.h>
 #include <iterator>
 #include <map>
-#include <filesystem>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -304,6 +304,7 @@ std::unique_ptr<CxlDaxBuffer> CxlDaxTransport::allocate(std::size_t bytes,
         "CXL allocation alignment must be a page-sized power of two");
   }
   std::lock_guard lock(impl_->allocationMutex);
+  auto bufferImpl = std::make_shared<CxlDaxBuffer::Impl>();
   std::size_t offset = 0;
   std::size_t reservationOffset = 0;
   std::size_t reservationBytes = 0;
@@ -318,12 +319,21 @@ std::unique_ptr<CxlDaxBuffer> CxlDaxTransport::allocate(std::size_t bytes,
       const std::size_t prefixBytes = candidate - range->first;
       const std::size_t suffixBytes = rangeEnd - (candidate + bytes);
       const std::size_t rangeBegin = range->first;
-      impl_->freeRanges.erase(range);
-      if (prefixBytes != 0) {
-        impl_->freeRanges.emplace(rangeBegin, prefixBytes);
-      }
-      if (suffixBytes != 0) {
-        impl_->freeRanges.emplace(candidate + bytes, suffixBytes);
+      auto original = impl_->freeRanges.extract(range);
+      try {
+        if (prefixBytes != 0) {
+          impl_->freeRanges.emplace(rangeBegin, prefixBytes);
+        }
+        if (suffixBytes != 0) {
+          impl_->freeRanges.emplace(candidate + bytes, suffixBytes);
+        }
+      } catch (...) {
+        impl_->freeRanges.erase(rangeBegin);
+        if (suffixBytes != 0) {
+          impl_->freeRanges.erase(candidate + bytes);
+        }
+        impl_->freeRanges.insert(std::move(original));
+        throw;
       }
       break;
     }
@@ -339,7 +349,6 @@ std::unique_ptr<CxlDaxBuffer> CxlDaxTransport::allocate(std::size_t bytes,
     impl_->nextOffset = end;
   }
   impl_->allocatedBytes += bytes;
-  auto bufferImpl = std::make_shared<CxlDaxBuffer::Impl>();
   bufferImpl->owner = impl_;
   bufferImpl->offset = offset;
   bufferImpl->hostAddress =
