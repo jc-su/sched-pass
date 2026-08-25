@@ -823,6 +823,18 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(nta-moe-lowering PROPERTIES TIMEOUT 30)
   endif()
 
+  # CTest may be run once as root for physical tiers and later as the artifact
+  # user. Keep this small compiler-output fixture per Unix UID just like the
+  # runtime JIT cache, so a privileged run cannot poison a normal run.
+  execute_process(
+    COMMAND id -u
+    OUTPUT_VARIABLE NTA_JIT_UID
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(NOT NTA_JIT_UID)
+    set(NTA_JIT_UID unknown)
+  endif()
   add_test(
     NAME nta-clang-jit
     COMMAND
@@ -834,7 +846,7 @@ if(Python3_Interpreter_FOUND)
       ${CMAKE_CURRENT_SOURCE_DIR}
       ${NTA_CUDA_ARCH}
       ${LLVM_TOOLS_BINARY_DIR}/llvm-dis
-      ${CMAKE_CURRENT_BINARY_DIR}/jit-test
+      ${CMAKE_CURRENT_BINARY_DIR}/jit-test/uid-${NTA_JIT_UID}
   )
   if(NTA_HAVE_FLASHINFER AND Python3_Interpreter_FOUND)
     add_test(
