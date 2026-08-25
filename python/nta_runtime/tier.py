@@ -374,8 +374,8 @@ class ServingTierService:
             )
 
         if config.tier is ServingTier.NVME:
-            assert config.endpoint is not None
-            assert self.catalog is not None
+            if config.endpoint is None or self.catalog is None:
+                raise ValueError("NVMe service requires an endpoint and page catalog")
             self.nvme = NvmeTransport(
                 NvmeOptions(
                     endpoint=config.endpoint,
@@ -403,9 +403,14 @@ class ServingTierService:
                 self.nvme = None
                 raise RuntimeError("NVMe GPU doorbell mapping was not qualified")
         elif config.tier is ServingTier.CXL_DAX:
-            assert config.endpoint is not None
-            assert config.catalog_path is not None
-            assert config.window_bytes > 0
+            if (
+                config.endpoint is None
+                or config.catalog_path is None
+                or config.window_bytes <= 0
+            ):
+                raise ValueError(
+                    "CXL-DAX service requires an endpoint, catalog, and window"
+                )
             self.cxl = CxlDaxTransport(
                 CxlDaxOptions(
                     endpoint=config.endpoint,

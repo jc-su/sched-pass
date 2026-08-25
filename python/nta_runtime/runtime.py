@@ -1916,7 +1916,8 @@ class RequestProgressSnapshot:
         return self._consume()
 
     def _consume(self) -> tuple[RequestProgress, ...]:
-        assert self._pending is not None
+        if self._pending is None:
+            raise RuntimeError("request progress snapshot has not been captured")
         _, request_count = self._pending
         base = self._storage.data_ptr()
         stride = ctypes.sizeof(_RequestProgress)

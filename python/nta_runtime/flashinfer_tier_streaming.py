@@ -707,7 +707,8 @@ class FlashInferTierStreamingOperator:
             local_dependency_begin = len(dependencies)
             completion_dependency_begin = len(self._compiled_completion_dependencies)
             if self._gpu_initiated_host:
-                assert wave_index is not None
+                if wave_index is None:  # pragma: no cover - checked above
+                    raise RuntimeError("incremental wrapper has no host wave identity")
                 wave = self.executor.waves[wave_index]
                 dependency_count = 2
                 direct_dependency_count = 0

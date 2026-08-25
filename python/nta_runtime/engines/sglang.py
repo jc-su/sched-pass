@@ -649,7 +649,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError(
                 f"invalid NTA serving tier configuration: {error}"
             ) from error
-        assert resources is not None
+        if resources is None:  # pragma: no cover - guarded by open()
+            raise RuntimeError("serving runtime resources were not initialized")
         self._resources = resources
         self._tier_service = resources.tier
         self._runtime = resources.runtime
