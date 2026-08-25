@@ -177,8 +177,8 @@ completion-driven dependency round, the result was:
 
 - 640/640 measured commands completed, with zero failure or outstanding count;
 - exact destination checksums and zero verification failures;
-- 6,303.3 MiB/s GPU-controlled end-to-end throughput versus 6,199.1 MiB/s
-  matched `fio` throughput (`1.0168x`); and
+- 6,356.3 MiB/s GPU-controlled end-to-end throughput versus 6,155.0 MiB/s
+  matched `fio` throughput (`1.0327x`); and
 - target DMAR fault-line count unchanged at 9 before and after qualification.
 
 The nine pre-existing fault lines came from rejected development runs before

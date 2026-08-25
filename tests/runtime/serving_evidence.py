@@ -83,6 +83,25 @@ def main() -> None:
     )
     assert activation["compact_resume_cta_ratio"] == 0.5
 
+    physical = report(compact_ctas=1, canonical_ctas=1)
+    physical["engine_stats"][0].update(
+        {
+            "serving_tier": "nvme",
+            "tier_external_layers": 1,
+            "demand_host_layers": 0,
+            "compact_resume_launches": 0,
+            "compact_resume_cta_bound": 0,
+            "canonical_resume_cta_bound": 0,
+            "ticketed_incremental_launches": 1,
+        }
+    )
+    activation = module.require_clean_mechanism(
+        physical,
+        require_physical_compaction=True,
+    )
+    assert activation["external_attention_transformed"]
+    assert not activation["physical_compaction_applicable"]
+
     conventional = report(compact_ctas=1, canonical_ctas=1)
     conventional["engine_stats"][0].update(
         {"execution_protocol": "conventional", "mixed_dependency_layers": 0}

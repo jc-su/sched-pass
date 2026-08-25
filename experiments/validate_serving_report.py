@@ -90,6 +90,53 @@ def _validate_byte_accounting(report: dict[str, Any]) -> None:
              "serving byte accounting is inconsistent")
 
 
+def _validate_tier_provenance(report: dict[str, Any]) -> None:
+    """Validate tier metadata when the NTA engine publishes it.
+
+    Older stock/reference reports intentionally have no NTA engine stream.
+    Any NTA stream that does publish tier metadata must be self-consistent and
+    may not hide a physical-tier fallback behind a host label.
+    """
+    stats = report.get("engine_stats", [])
+    declarations = {
+        str(entry["serving_tier"])
+        for entry in stats
+        if isinstance(entry, dict) and "serving_tier" in entry
+    }
+    if not declarations:
+        return
+    _require(len(declarations) == 1, "serving engine stats disagree on serving tier")
+    tier = declarations.pop()
+    _require(tier in {"host_staged", "nvme", "cxl_dax"}, "serving report has an unknown tier")
+    for entry in stats:
+        if not isinstance(entry, dict) or "serving_tier" not in entry:
+            continue
+        _require(entry.get("tier_fallback") is False, "serving tier fallback was not fail-closed")
+        if tier in {"nvme", "cxl_dax"}:
+            expected_path = (
+                "gpu_owned_nvme_to_hbm"
+                if tier == "nvme"
+                else "cuda_visible_cxl_direct"
+            )
+            _require(
+                entry.get("tier_data_path") == expected_path,
+                "physical-tier serving report has an unexpected data path",
+            )
+            _require(
+                int(entry.get("tier_host_proxy_bytes", 0)) == 0,
+                "physical-tier serving report used host memory as a data proxy",
+            )
+            _require(
+                isinstance(entry.get("tier_catalog_digest"), str)
+                and entry["tier_catalog_digest"],
+                "physical-tier serving report has no catalog digest",
+            )
+            _require(
+                isinstance(entry.get("tier_capabilities"), dict),
+                "physical-tier serving report has no capability evidence",
+            )
+
+
 def _validate_single(report: dict[str, Any], *, require_engine_stats: bool = True) -> None:
     _require(report.get("schema") == 1, "unsupported serving report schema")
     _require(report.get("classification") == "sglang-hicache-load",
@@ -185,6 +232,7 @@ def _validate_single(report: dict[str, Any], *, require_engine_stats: bool = Tru
     _validate_littles_law(report)
     _validate_workload(report)
     _validate_byte_accounting(report)
+    _validate_tier_provenance(report)
 
 
 def validate(report: dict[str, Any]) -> dict[str, Any]:

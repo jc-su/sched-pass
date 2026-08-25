@@ -53,6 +53,21 @@ This records GPU visibility, NVMe driver/IOMMU ownership, and `/dev/dax*`
 visibility. It does not bind PCI devices, open block namespaces, or qualify a
 tier. Qualification remains an explicit, separately validated operation.
 
+Serving physical tiers also require an immutable exact page catalog. Validate
+it without opening the endpoint before launching the worker:
+
+```bash
+python3 experiments/validate_tier_catalog.py /path/catalog.json --tier nvme
+# or: --tier cxl_dax
+```
+
+Set `NTA_SERVING_TIER`, `NTA_TIER_CATALOG`, and the corresponding explicit
+endpoint in the serving environment. The worker records the catalog digest in
+its engine statistics; a physical-tier artifact is invalid if that digest or
+the transport capability evidence is missing. The catalog maps SGLang device
+page IDs to exact contiguous K/V byte ranges. It is not a sampling policy and
+does not approximate attention.
+
 The evaluation profile is self-contained with respect to normalized workload
 inputs: it copies `manifest.json` and `records.jsonl` into `workload/` and
 rewrites the copied trial specification to use them.  Physical NVMe/DAX

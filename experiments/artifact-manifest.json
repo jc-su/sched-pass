@@ -16,7 +16,8 @@
     ],
     "qualification": [
       "experiments/qualify_tiers.py",
-      "experiments/validate_tier_qualification.py"
+      "experiments/validate_tier_qualification.py",
+      "experiments/validate_tier_catalog.py"
     ],
     "evaluation": [
       "experiments/run_evaluation.py",
@@ -49,8 +50,10 @@
     "experiments/validate_workload.py",
     "experiments/analyze_workload.py",
     "experiments/validate_tier_qualification.py",
+    "experiments/validate_tier_catalog.py",
     "experiments/qualify_tiers.py",
-    "experiments/tier-qualification.schema.json"
+    "experiments/tier-qualification.schema.json",
+    "experiments/tier-catalog.schema.json"
   ],
   "evaluation_tools": [
     "experiments/run_evaluation.py",

@@ -122,6 +122,9 @@ def require_clean_mechanism(
             f"({sorted(protocols)})"
         )
     protocol = next(iter(protocols))
+    physical_tier = any(
+        entry.get("serving_tier") in {"nvme", "cxl_dax"} for entry in stats
+    )
 
     fallbacks = total("hicache_fallback_batches")
     external_batches = total("hicache_external_batches")
@@ -135,14 +138,17 @@ def require_clean_mechanism(
     stock_resident_launches = total("stock_resident_attention_launches")
     stock_external_launches = total("stock_prefetched_external_attention_launches")
     accounted_external_launches = external_launches + stock_external_launches
+    tier_external_layers = total("tier_external_layers")
+    acquisition_layers = prefetched_layers + demand_layers + tier_external_layers
     if fallbacks:
         raise RuntimeError(f"NTA HiCache trial used {fallbacks} fallback batches")
     if external_batches == 0 or accounted_external_launches == 0:
         raise RuntimeError("NTA HiCache trial did not execute an external batch")
-    if accounted_external_launches != prefetched_layers + demand_layers:
+    if accounted_external_launches != acquisition_layers:
         raise RuntimeError(
             "external attention layers do not match acquisition layers "
-            f"({accounted_external_launches} != {prefetched_layers} + {demand_layers})"
+            f"({accounted_external_launches} != {prefetched_layers} + "
+            f"{demand_layers} + {tier_external_layers})"
         )
     if (
         stock_launches != stock_resident_launches + stock_external_launches
@@ -181,7 +187,7 @@ def require_clean_mechanism(
     # A complete exact prefetch legitimately uses the stock consumer for the
     # external pages, so there is no resume grid to compact.  Compaction is a
     # gate for the incremental form, not for this stock-consumer control arm.
-    if require_physical_compaction and incremental > 0 and (
+    if require_physical_compaction and not physical_tier and incremental > 0 and (
         compact_launches == 0
         or compact_ctas == 0
         or canonical_ctas == 0
@@ -214,12 +220,12 @@ def require_clean_mechanism(
         "all_attention_transformed": stock_launches == 0,
         "external_attention_transformed": (
             fallbacks == 0
-            and external_launches == prefetched_layers + demand_layers
+            and external_launches == acquisition_layers
         ),
         "external_attention_stock_consumer": stock_external_launches > 0,
         "external_attention_accounted": (
             fallbacks == 0
-            and accounted_external_launches == prefetched_layers + demand_layers
+            and accounted_external_launches == acquisition_layers
         ),
         "resident_reference_attention_launches": stock_resident_launches,
         "active_forms": [
@@ -244,9 +250,10 @@ def require_clean_mechanism(
         "compact_resume_cta_ratio": (
             compact_ctas / canonical_ctas if canonical_ctas else None
         ),
-        "physical_compaction_applicable": incremental > 0,
+        "physical_compaction_applicable": incremental > 0 and not physical_tier,
         "physical_compaction_proven": (
-            incremental == 0
+            physical_tier
+            or incremental == 0
             or (
                 compact_launches > 0
                 and compact_ctas > 0

@@ -505,6 +505,7 @@ class FlashInferLayerEpoch:
         *,
         issue_budget: int,
         completion_budget: int,
+        timeout_ns: int = 100_000_000,
         sm_scale: float | None = None,
         stream: Any = None,
         run_options: dict[str, Any] | None = None,
@@ -516,6 +517,7 @@ class FlashInferLayerEpoch:
             out,
             issue_budget=issue_budget,
             completion_budget=completion_budget,
+            timeout_ns=timeout_ns,
             sm_scale=sm_scale,
             stream=stream,
             run_options=run_options,
@@ -531,6 +533,7 @@ class FlashInferLayerEpoch:
         *,
         issue_budget: int,
         completion_budget: int,
+        timeout_ns: int = 100_000_000,
         sm_scale: float | None = None,
         stream: Any = None,
         run_options: dict[str, Any] | None = None,
@@ -568,6 +571,7 @@ class FlashInferLayerEpoch:
             ready,
             issue_budget=issue_budget,
             completion_budget=completion_budget,
+            timeout_ns=timeout_ns,
             stream=stream,
         )
         return self.epoch.max_progress_rounds

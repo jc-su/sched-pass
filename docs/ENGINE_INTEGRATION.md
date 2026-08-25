@@ -32,6 +32,24 @@ the native contract. There is no virtual page-table or approximate attention
 fallback. The serving activation gate requires exact demand and zero silent
 fallbacks.
 
+### Tier attachment
+
+The serving process selects one `ServingTierService` from `NTA_SERVING_TIER`.
+`host_staged` is the default and retains the indexed host path. `nvme`
+requires `NTA_NVME_ENDPOINT` and an exact `NTA_TIER_CATALOG`; each requested
+device-page group is validated as one contiguous K/V extent, installed as an
+HBM object, and progressed by the GPU-owned NVMe queue. The host HiCache load
+is used only as a lifetime and request-metadata signal in this mode; its bytes
+never become a data proxy. `cxl_dax` requires an explicit devdax endpoint,
+matching window, and catalog; its K/V extents become direct device
+dependencies in the work plan.
+
+There is no physical-tier fallback. Endpoint, catalog, mapping, IOMMU, or
+device-visibility failure aborts the selected serving profile. Engine stats
+publish the tier, catalog digest, capability evidence, and
+`tier_fallback: false`, so an artifact validator can distinguish a real
+physical-tier result from a host run.
+
 ## vLLM
 
 The vLLM integration boundary is `VllmSchedulerProjection`. A pinned vLLM
@@ -49,7 +67,9 @@ current scheduler object; NTA deliberately does not import vLLM internals.
 That keeps version churn at one typed boundary while making missing identity a
 hard error. A vLLM hook may add block-table and cancellation extraction only at
 that boundary; it must not add a second generation tracker, policy taxonomy,
-or native work ABI.
+or native work ABI. The same `ServingTierService` is passed to a pinned vLLM
+consumer hook; the tier catalog and native transport are selected once per
+worker, not once per framework implementation.
 
 The current vLLM adapter is a tested structural seam, not a serving backend:
 it proves the common identity/epoch contract without importing vLLM internals.

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -33,11 +34,13 @@ try:
     from .hardware import validate as validate_hardware
     from .validate_workload import validate as validate_workload
     from .validate_tier_qualification import validate_file as validate_tier_qualification
+    from .validate_tier_catalog import validate as validate_tier_catalog
 except ImportError:  # Direct ``python experiments/reproduce.py`` execution.
     from artifact import ArtifactRun, ROOT, file_digest, git_metadata
     from hardware import validate as validate_hardware
     from validate_workload import validate as validate_workload
     from validate_tier_qualification import validate_file as validate_tier_qualification
+    from validate_tier_catalog import validate as validate_tier_catalog
 
 
 MANIFEST = ROOT / "experiments" / "artifact-manifest.json"
@@ -373,6 +376,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="normalized workload manifest to copy into a serving artifact",
     )
     parser.add_argument(
+        "--tier-catalog",
+        type=Path,
+        help="exact physical-tier catalog to copy into a serving artifact",
+    )
+    parser.add_argument(
         "--spec",
         type=Path,
         help="paired evaluation specification for --profile evaluation",
@@ -391,6 +399,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         parser.error("a command is only valid after --profile serving")
     if args.workload_manifest is not None and args.profile != "serving":
         parser.error("--workload-manifest is only valid for --profile serving")
+    if args.tier_catalog is not None and args.profile != "serving":
+        parser.error("--tier-catalog is only valid for --profile serving")
     if args.spec is not None and args.profile != "evaluation":
         parser.error("--spec is only valid for --profile evaluation")
     if args.result is not None and args.profile != "serving":
@@ -434,11 +444,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         repository_at_start=repository,
     )
     environment = {"PYTHONPATH": str(ROOT / "python"), **args.environment}
-    if args.profile == "serving":
-        environment.setdefault(
-            "NTA_SERVING_WORKSPACE_ROOT",
-            str(run.output / "serving-workspace"),
-        )
+    try:
+        if args.profile == "serving":
+            environment.setdefault(
+                "NTA_SERVING_WORKSPACE_ROOT",
+                str(run.output / "serving-workspace"),
+            )
+            if args.tier_catalog is not None:
+                source_catalog = args.tier_catalog.resolve()
+                if not source_catalog.is_file():
+                    raise RuntimeError(f"tier catalog does not exist: {source_catalog}")
+                selected_tier = environment.get(
+                    "NTA_SERVING_TIER",
+                    os.environ.get("NTA_SERVING_TIER", "host_staged"),
+                )
+                selected_tier = {"host": "host_staged", "cxl": "cxl_dax"}.get(
+                    selected_tier, selected_tier
+                )
+                if selected_tier not in {"nvme", "cxl_dax"}:
+                    raise RuntimeError(
+                        "--tier-catalog requires NTA_SERVING_TIER=nvme or cxl_dax"
+                    )
+                validate_tier_catalog(source_catalog, selected_tier)
+                catalog_destination = run.output / "tier" / "catalog.json"
+                catalog_destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_catalog, catalog_destination)
+                environment["NTA_TIER_CATALOG"] = str(catalog_destination)
+                run.update(
+                    tier_catalog="tier/catalog.json",
+                    tier_catalog_digest=file_digest(catalog_destination),
+                    serving_tier=selected_tier,
+                )
+    except (OSError, ValueError, RuntimeError) as error:
+        run.finish(status="failed", error=str(error))
+        print(f"artifact reproduction failed: {error}", file=sys.stderr)
+        return 2
     try:
         if args.profile == "core":
             _run_matrix(run, args, full=False, environment=environment)

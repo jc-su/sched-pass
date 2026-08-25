@@ -16,6 +16,7 @@ try:
     from .validate_matrix_artifact import validate as validate_matrix
     from .validate_serving_report import validate as validate_serving_report
     from .validate_tier_qualification import validate_file as validate_tier_qualification
+    from .validate_tier_catalog import validate as validate_tier_catalog
     from .validate_workload import validate as validate_workload
 except ImportError:  # Direct script execution.
     from artifact import file_digest
@@ -25,6 +26,7 @@ except ImportError:  # Direct script execution.
     from validate_matrix_artifact import validate as validate_matrix
     from validate_serving_report import validate as validate_serving_report
     from validate_tier_qualification import validate_file as validate_tier_qualification
+    from validate_tier_catalog import validate as validate_tier_catalog
     from validate_workload import validate as validate_workload
 
 
@@ -66,6 +68,19 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
         _require((bundle / log).is_file(), f"command log is missing: {log}")
     if metadata.get("profile") == "serving":
         _require(bool(metadata.get("result")), "serving bundle has no structured result")
+        if metadata.get("tier_catalog"):
+            catalog_name = Path(str(metadata["tier_catalog"]))
+            _require(
+                not catalog_name.is_absolute() and ".." not in catalog_name.parts,
+                "unsafe tier catalog path",
+            )
+            catalog_path = bundle / catalog_name
+            _require(catalog_path.is_file(), "serving tier catalog is missing")
+            _require(
+                file_digest(catalog_path) == metadata.get("tier_catalog_digest"),
+                "serving tier catalog digest does not match metadata",
+            )
+            validate_tier_catalog(catalog_path, str(metadata.get("serving_tier")))
     if metadata.get("profile") == "hardware":
         inventory_name = metadata.get("hardware_inventory")
         _require(isinstance(inventory_name, str) and bool(inventory_name), "hardware bundle has no inventory")

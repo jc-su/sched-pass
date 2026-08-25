@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NTA exact physical-tier page catalog",
+  "type": "object",
+  "required": ["schema", "tier", "pages"],
+  "properties": {
+    "schema": {"const": 1},
+    "tier": {"enum": ["nvme", "cxl_dax"]},
+    "alignment_bytes": {"type": "integer", "minimum": 1},
+    "window_bytes": {"type": "integer", "minimum": 1},
+    "pages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["layer", "page", "key", "value"],
+        "properties": {
+          "layer": {"type": "integer", "minimum": 0},
+          "page": {"type": "integer", "minimum": 0},
+          "key": {"$ref": "#/$defs/extent"},
+          "value": {"$ref": "#/$defs/extent"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "$defs": {
+    "extent": {
+      "type": "object",
+      "required": ["offset", "bytes"],
+      "properties": {
+        "offset": {"type": "integer", "minimum": 0},
+        "bytes": {"type": "integer", "exclusiveMinimum": 0}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+

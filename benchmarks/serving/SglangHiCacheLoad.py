@@ -704,6 +704,21 @@ def main() -> int:
         json.loads(path.read_text(encoding="utf-8"))
         for path in sorted(workspace.glob("nta-engine.*.json"))
     ]
+    tier_entries = {
+        str(entry["serving_tier"])
+        for entry in stats
+        if isinstance(entry, dict) and "serving_tier" in entry
+    }
+    if len(tier_entries) > 1:
+        raise RuntimeError("NTA worker processes disagree on the serving tier")
+    serving_tier = next(iter(tier_entries), "host_staged")
+    tier_catalog_digests = {
+        str(entry["tier_catalog_digest"])
+        for entry in stats
+        if isinstance(entry, dict) and entry.get("tier_catalog_digest")
+    }
+    if len(tier_catalog_digests) > 1:
+        raise RuntimeError("NTA worker processes disagree on the tier catalog")
     total_tokens = sum(record["completion_tokens"] for record in records)
     selected_tokens = sum(
         record["host_cached_tokens"] + record["device_cached_tokens"]
@@ -749,6 +764,8 @@ def main() -> int:
         "engine_version": importlib.metadata.version("sglang"),
         "flashinfer_version": importlib.metadata.version("flashinfer-python"),
         "attention_backend": args.attention_backend,
+        "serving_tier": serving_tier,
+        "tier_catalog_digest": next(iter(tier_catalog_digests), None),
         "model": str(args.model.resolve()),
         "seed": args.seed,
         "request_rate": args.request_rate,
