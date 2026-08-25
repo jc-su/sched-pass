@@ -16,6 +16,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+MIN_HICACHE_PREFIX_TOKENS = 64
 
 
 def git_value(*arguments: str) -> str:
@@ -75,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("token counts and iterations must be positive")
     if args.resident_tokens < 0:
         parser.error("resident token count cannot be negative")
+    if args.hot_tokens < MIN_HICACHE_PREFIX_TOKENS:
+        parser.error(
+            "hot token count must be at least "
+            f"{MIN_HICACHE_PREFIX_TOKENS} to form a promotable HiCache prefix"
+        )
     if args.hicache_ratio <= 1.0:
         parser.error("HiCache ratio must exceed the device-cache size")
     if args.max_attempts is None:
