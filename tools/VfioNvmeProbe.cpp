@@ -1,11 +1,10 @@
 #include "nta/NvmeRuntime.h"
+#include "nta/NvmeDiscovery.h"
 
 #include <cuda.h>
 
 #include <cstdint>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -37,68 +36,6 @@ const char *hbmBackendName(nta::NvmeHbmMappingBackend backend) {
   return "unknown";
 }
 
-std::optional<std::string> discoverVfioNvmeEndpoint() {
-  const std::filesystem::path devices("/sys/bus/pci/devices");
-  std::error_code error;
-  if (!std::filesystem::is_directory(devices, error) || error) {
-    return std::nullopt;
-  }
-  for (const auto &entry : std::filesystem::directory_iterator(devices, error)) {
-    if (error || !entry.is_directory(error)) {
-      continue;
-    }
-    const std::filesystem::path device = entry.path();
-    std::ifstream classFile(device / "class");
-    std::string classCode;
-    if (!(classFile >> classCode) || !classCode.starts_with("0x0108")) {
-      continue;
-    }
-    std::error_code driverError;
-    const std::filesystem::path driver =
-        std::filesystem::read_symlink(device / "driver", driverError);
-    if (driverError || driver.filename() != "vfio-pci") {
-      continue;
-    }
-    bool hasNamespace = false;
-    const std::filesystem::path controllerRoot = device / "nvme";
-    std::error_code namespaceError;
-    if (std::filesystem::is_directory(controllerRoot, namespaceError) &&
-        !namespaceError) {
-      for (const auto &controller : std::filesystem::directory_iterator(
-               controllerRoot, namespaceError)) {
-        if (namespaceError) {
-          break;
-        }
-        std::error_code entryError;
-        if (!std::filesystem::is_directory(controller, entryError) ||
-            entryError) {
-          continue;
-        }
-        for (const auto &namespaceEntry : std::filesystem::directory_iterator(
-                 controller.path(), entryError)) {
-          if (entryError) {
-            break;
-          }
-          const std::string name = namespaceEntry.path().filename().string();
-          if (name.starts_with("nvme") &&
-              name.find('n', std::string("nvme").size()) !=
-                  std::string::npos) {
-            hasNamespace = true;
-            break;
-          }
-        }
-        if (hasNamespace) {
-          break;
-        }
-      }
-    }
-    if (hasNamespace) {
-      return "vfio:" + device.filename().string();
-    }
-  }
-  return std::nullopt;
-}
-
 } // namespace
 
 int main(int argc, char **argv) {
@@ -122,7 +59,8 @@ int main(int argc, char **argv) {
                                ? configuredBdf
                                : "vfio:" + std::string(configuredBdf);
       } else {
-        options.endpoint = discoverVfioNvmeEndpoint().value_or(std::string{});
+        options.endpoint =
+            nta::qualification::discoverVfioNvmeEndpoint().value_or(std::string{});
       }
     }
     if (options.endpoint.empty()) {

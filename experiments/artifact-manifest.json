@@ -137,7 +137,7 @@
     "synthetic matrix timing is never labeled serving evidence",
     "serving commands must provide their own workload and validated output contract",
     "Bailian offline order is never treated as production arrival",
-    "DAX and NVMe evidence is capability-gated and skipped when hardware is absent",
+    "DAX and NVMe physical evidence is capability-gated and skipped when hardware is absent; contract tests remain always-on",
     "hardware inventory is read-only and never binds PCI devices or opens block namespaces",
     "performance regression checks compare captured baselines, never hardcoded machine timings"
   ],

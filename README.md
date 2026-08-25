@@ -62,6 +62,13 @@ auto-discover an already-qualified VFIO NVMe controller and CXL devdax
 endpoint (`nta-vfio-nvme-probe` and `nta-cxl-dax-probe`); without a qualified
 endpoint the corresponding backend stays inactive.
 
+The default test suite does not make absent hardware look like a pass, but it
+also does not make the tier implementation untestable: the CXL range
+allocator (`nta-cxl-dax-allocator`) and read-only NVMe candidate discovery
+(`nta-nvme-discovery`) run on every machine. The physical probes are separate
+qualification gates and are skipped only when their required device ownership
+is unavailable.
+
 The NVMe production target is a direct READ DMA into HBM, not host staging.
 `runtime/host/` owns VFIO/IOMMUFD administration, `kernel/nta_nvme_p2p/` is the
 narrow NVIDIA peer-page mapper for the attached translated domain, and the

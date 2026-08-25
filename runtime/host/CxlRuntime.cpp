@@ -1,5 +1,6 @@
 #include "nta/CxlRuntime.h"
 #include "nta/CxlDaxDiscovery.h"
+#include "nta/CxlDaxAllocator.h"
 
 #include "CudaDeviceGuard.h"
 
@@ -7,14 +8,10 @@
 
 #include <filesystem>
 #include <fcntl.h>
-#include <iterator>
-#include <map>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <limits>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -29,30 +26,17 @@ void checkCuda(cudaError_t status, const char *operation) {
   }
 }
 
-std::size_t roundUp(std::size_t value, std::size_t alignment) {
-  if (alignment == 0 || (alignment & (alignment - 1U)) != 0) {
-    throw std::invalid_argument(
-        "CXL allocation alignment must be a power of two");
-  }
-  if (value > std::numeric_limits<std::size_t>::max() - (alignment - 1U)) {
-    throw std::overflow_error("CXL allocation offset overflows size_t");
-  }
-  return (value + alignment - 1U) & ~(alignment - 1U);
-}
-
 } // namespace
 
 struct CxlDaxAllocationOwner {
   virtual ~CxlDaxAllocationOwner() = default;
-  virtual void release(std::size_t reservationOffset,
-                       std::size_t reservationBytes,
-                       std::size_t payloadBytes) noexcept = 0;
+  virtual void release(const detail::CxlDaxAllocation &allocation) noexcept = 0;
 };
 
 struct CxlDaxBuffer::Impl {
   ~Impl() {
-    if (owner != nullptr && reservationBytes != 0) {
-      owner->release(reservationOffset, reservationBytes, payloadBytes);
+    if (owner != nullptr && allocation.reservationBytes != 0) {
+      owner->release(allocation);
     }
   }
 
@@ -60,9 +44,7 @@ struct CxlDaxBuffer::Impl {
   std::size_t offset = 0;
   void *hostAddress = nullptr;
   void *deviceAddress = nullptr;
-  std::size_t reservationOffset = 0;
-  std::size_t reservationBytes = 0;
-  std::size_t payloadBytes = 0;
+  detail::CxlDaxAllocation allocation{};
 };
 
 struct CxlDaxTransport::Impl final : CxlDaxAllocationOwner {
@@ -85,6 +67,7 @@ struct CxlDaxTransport::Impl final : CxlDaxAllocationOwner {
     }
     windowBytes = options.windowBytes;
     this->pageSize = static_cast<std::size_t>(pageSize);
+    allocator = std::make_unique<detail::CxlDaxRangeAllocator>(windowBytes);
     struct stat endpointStat{};
     if (::fstat(fd, &endpointStat) != 0) {
       closeFd();
@@ -167,45 +150,9 @@ struct CxlDaxTransport::Impl final : CxlDaxAllocationOwner {
     closeFd();
   }
 
-  void release(std::size_t reservationOffset, std::size_t reservationBytes,
-               std::size_t payloadBytes) noexcept override {
-    if (reservationBytes == 0 || payloadBytes == 0) {
-      return;
-    }
-    std::lock_guard lock(allocationMutex);
-    if (payloadBytes > allocatedBytes) {
-      return;
-    }
-    try {
-      std::size_t begin = reservationOffset;
-      std::size_t end = reservationOffset + reservationBytes;
-      auto next = freeRanges.lower_bound(begin);
-      if (next != freeRanges.begin()) {
-        auto previous = std::prev(next);
-        if (previous->first + previous->second == begin) {
-          begin = previous->first;
-          freeRanges.erase(previous);
-        }
-      }
-      next = freeRanges.lower_bound(begin);
-      if (next != freeRanges.end() && end == next->first) {
-        end = next->first + next->second;
-        freeRanges.erase(next);
-      }
-      freeRanges.emplace(begin, end - begin);
-      allocatedBytes -= payloadBytes;
-      while (!freeRanges.empty()) {
-        auto tail = std::prev(freeRanges.end());
-        if (tail->first + tail->second != nextOffset) {
-          break;
-        }
-        nextOffset = tail->first;
-        freeRanges.erase(tail);
-      }
-    } catch (...) {
-      // Buffer destruction cannot throw. A failed bookkeeping allocation
-      // loses only reusable capacity; mapping ownership remains valid until
-      // transport teardown, which is still fail-safe.
+  void release(const detail::CxlDaxAllocation &allocation) noexcept override {
+    if (allocator != nullptr) {
+      allocator->release(allocation);
     }
   }
 
@@ -213,10 +160,7 @@ struct CxlDaxTransport::Impl final : CxlDaxAllocationOwner {
   int deviceOrdinal = -1;
   std::size_t windowBytes = 0;
   std::size_t pageSize = 0;
-  std::size_t nextOffset = 0;
-  std::size_t allocatedBytes = 0;
-  std::mutex allocationMutex;
-  std::map<std::size_t, std::size_t> freeRanges;
+  std::unique_ptr<detail::CxlDaxRangeAllocator> allocator;
   void *mappedHostAddress = nullptr;
   void *mappedDeviceAddress = nullptr;
   bool hostRegistered = false;
@@ -271,9 +215,11 @@ CxlDaxUsage CxlDaxTransport::usage() const noexcept {
   if (impl_ == nullptr) {
     return {};
   }
-  std::lock_guard lock(impl_->allocationMutex);
-  return {impl_->windowBytes, impl_->allocatedBytes,
-          impl_->windowBytes - impl_->allocatedBytes};
+  if (impl_->allocator == nullptr) {
+    return {impl_->windowBytes, 0, impl_->windowBytes};
+  }
+  return {impl_->allocator->capacity(), impl_->allocator->allocatedBytes(),
+          impl_->allocator->availableBytes()};
 }
 
 bool CxlDaxTransport::containsDeviceAddress(const void *address,
@@ -303,61 +249,20 @@ std::unique_ptr<CxlDaxBuffer> CxlDaxTransport::allocate(std::size_t bytes,
     throw std::invalid_argument(
         "CXL allocation alignment must be a page-sized power of two");
   }
-  std::lock_guard lock(impl_->allocationMutex);
+  if (impl_->allocator == nullptr) {
+    throw std::runtime_error("CXL DAX allocator is not initialized");
+  }
   auto bufferImpl = std::make_shared<CxlDaxBuffer::Impl>();
-  std::size_t offset = 0;
-  std::size_t reservationOffset = 0;
-  std::size_t reservationBytes = 0;
-  for (auto range = impl_->freeRanges.begin();
-       range != impl_->freeRanges.end(); ++range) {
-    const std::size_t candidate = roundUp(range->first, alignment);
-    const std::size_t rangeEnd = range->first + range->second;
-    if (candidate <= rangeEnd && bytes <= rangeEnd - candidate) {
-      offset = candidate;
-      reservationOffset = candidate;
-      reservationBytes = bytes;
-      const std::size_t prefixBytes = candidate - range->first;
-      const std::size_t suffixBytes = rangeEnd - (candidate + bytes);
-      const std::size_t rangeBegin = range->first;
-      auto original = impl_->freeRanges.extract(range);
-      try {
-        if (prefixBytes != 0) {
-          impl_->freeRanges.emplace(rangeBegin, prefixBytes);
-        }
-        if (suffixBytes != 0) {
-          impl_->freeRanges.emplace(candidate + bytes, suffixBytes);
-        }
-      } catch (...) {
-        impl_->freeRanges.erase(rangeBegin);
-        if (suffixBytes != 0) {
-          impl_->freeRanges.erase(candidate + bytes);
-        }
-        impl_->freeRanges.insert(std::move(original));
-        throw;
-      }
-      break;
-    }
-  }
-  if (reservationBytes == 0) {
-    reservationOffset = impl_->nextOffset;
-    offset = roundUp(reservationOffset, alignment);
-    if (offset > impl_->windowBytes || bytes > impl_->windowBytes - offset) {
-      throw std::runtime_error("CXL DAX window capacity exhausted");
-    }
-    const std::size_t end = offset + bytes;
-    reservationBytes = end - reservationOffset;
-    impl_->nextOffset = end;
-  }
-  impl_->allocatedBytes += bytes;
+  const detail::CxlDaxAllocation allocation =
+      impl_->allocator->allocate(bytes, alignment);
+  const std::size_t offset = allocation.offset;
   bufferImpl->owner = impl_;
   bufferImpl->offset = offset;
   bufferImpl->hostAddress =
       static_cast<std::byte *>(impl_->mappedHostAddress) + offset;
   bufferImpl->deviceAddress =
       static_cast<std::byte *>(impl_->mappedDeviceAddress) + offset;
-  bufferImpl->reservationOffset = reservationOffset;
-  bufferImpl->reservationBytes = reservationBytes;
-  bufferImpl->payloadBytes = bytes;
+  bufferImpl->allocation = allocation;
   return std::unique_ptr<CxlDaxBuffer>(
       new CxlDaxBuffer(std::move(bufferImpl), bytes));
 }

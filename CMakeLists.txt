@@ -86,6 +86,31 @@ if(NTA_WARNINGS_AS_ERRORS)
   )
 endif()
 
+add_library(nta-cxl-dax-allocator STATIC
+  runtime/host/CxlDaxAllocator.cpp
+)
+set_target_properties(nta-cxl-dax-allocator PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nta-cxl-dax-allocator PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+if(NTA_WARNINGS_AS_ERRORS)
+  target_compile_options(
+    nta-cxl-dax-allocator PRIVATE -Wall -Wextra -Wpedantic -Werror
+  )
+endif()
+
+add_executable(
+  nta-cxl-dax-allocator-test tests/runtime/CxlDaxAllocatorTest.cpp
+)
+target_link_libraries(nta-cxl-dax-allocator-test PRIVATE nta-cxl-dax-allocator)
+if(NTA_WARNINGS_AS_ERRORS)
+  target_compile_options(
+    nta-cxl-dax-allocator-test PRIVATE -Wall -Wextra -Wpedantic -Werror
+  )
+endif()
+add_test(NAME nta-cxl-dax-allocator COMMAND nta-cxl-dax-allocator-test)
+set_tests_properties(nta-cxl-dax-allocator PROPERTIES LABELS "contract;tier")
+
 add_library(nta-flashinfer-adapter STATIC
   runtime/host/FlashInferAdapter.cpp
 )
@@ -121,9 +146,21 @@ if(NTA_WARNINGS_AS_ERRORS)
 endif()
 add_test(NAME nta-work-plan COMMAND nta-work-plan-test)
 
+add_executable(nta-nvme-discovery-test tests/runtime/NvmeDiscoveryTest.cpp)
+target_include_directories(nta-nvme-discovery-test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+if(NTA_WARNINGS_AS_ERRORS)
+  target_compile_options(
+    nta-nvme-discovery-test PRIVATE -Wall -Wextra -Wpedantic -Werror
+  )
+endif()
+add_test(NAME nta-nvme-discovery COMMAND nta-nvme-discovery-test)
+set_tests_properties(nta-nvme-discovery PROPERTIES LABELS "contract;tier")
+
 install(DIRECTORY include/nta DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(
-  TARGETS nta-work-plan nta-flashinfer-adapter
+  TARGETS nta-work-plan nta-cxl-dax-allocator nta-flashinfer-adapter
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
@@ -438,7 +475,8 @@ if(NTA_ENABLE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(
-    nta-runtime-host PUBLIC nta-work-plan CUDA::cuda_driver CUDA::cudart
+    nta-runtime-host PUBLIC nta-work-plan nta-cxl-dax-allocator
+                             CUDA::cuda_driver CUDA::cudart
                              ${CMAKE_DL_LIBS}
   )
   if(NTA_WARNINGS_AS_ERRORS)
@@ -935,7 +973,7 @@ if(Python3_Interpreter_FOUND)
   endif()
   add_test(NAME nta-vfio-nvme-probe COMMAND nta-vfio-nvme-probe)
   set_tests_properties(nta-vfio-nvme-probe PROPERTIES
-    TIMEOUT 60 SKIP_RETURN_CODE 77
+    TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "physical;qualification;nvme"
   )
 
   add_executable(nta-cxl-dax-probe tools/CxlDaxProbe.cpp)
@@ -952,7 +990,7 @@ if(Python3_Interpreter_FOUND)
   endif()
   add_test(NAME nta-cxl-dax-probe COMMAND nta-cxl-dax-probe)
   set_tests_properties(nta-cxl-dax-probe PROPERTIES
-    TIMEOUT 60 SKIP_RETURN_CODE 77
+    TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "physical;qualification;cxl"
   )
   add_test(
     NAME nta-cxl-dax-rejects-pseudo-endpoint
@@ -960,7 +998,7 @@ if(Python3_Interpreter_FOUND)
   )
   set_tests_properties(
     nta-cxl-dax-rejects-pseudo-endpoint PROPERTIES
-    TIMEOUT 60 WILL_FAIL TRUE
+    TIMEOUT 60 WILL_FAIL TRUE LABELS "contract;qualification;cxl"
   )
 
   add_executable(

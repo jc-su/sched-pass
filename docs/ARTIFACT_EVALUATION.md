@@ -148,9 +148,15 @@ provided, `reproduce.py` prefers the validated packaged LLVM 22 CMake package
 unqualified development `opt` discovered under `/usr/local`; the selected
 package and every tool version remain recorded in the bundle.
 
-Capability-gated tests report explicit skips. A skipped CXL DAX test means no
-qualified devdax endpoint was supplied; it is not a passing CXL qualification.
-The same rule applies to multi-GPU and framework-specific serving tests.
+Capability-gated tests report explicit skips. A skipped physical CXL DAX test
+means no qualified devdax endpoint was supplied; it is not a passing CXL
+qualification. The always-on `nta-cxl-dax-allocator` test still verifies the
+bounded reservation ledger, reuse, coalescing, and input rejection without
+claiming that ordinary host memory is CXL. Likewise, `nta-nvme-discovery` and
+`nta-nvme-safety` verify the read-only candidate and ownership contracts on
+every machine, while only `nta-vfio-nvme-probe` and the qualification runner
+can qualify the GPU-controlled NVMe data path. The same rule applies to
+multi-GPU and framework-specific serving tests.
 
 For an already provisioned devdax endpoint, install
 `config/udev/99-nta-dax.rules`, create the system group `dax`, and add the

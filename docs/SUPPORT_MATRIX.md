@@ -24,6 +24,12 @@ validated device-visible mapping. On a host without a qualified VFIO/IOMMU or
 devdax endpoint, those rows remain unavailable and the correct result is an
 explicit qualification skip.
 
+This does not make the tier code untested: the default CTest suite always runs
+the CXL reservation-ledger test and the read-only NVMe discovery/safety tests.
+Only the physical probes and physical attention commands are capability-gated;
+they are the tests that may issue device traffic or require exclusive device
+ownership.
+
 The matrix is deliberately narrower than the internal API surface. Prefill,
 mixed batches, CUDA graph replay, external vLLM tiers, multi-GPU physical
 routes, and storage fault recovery require their own correctness gates before
