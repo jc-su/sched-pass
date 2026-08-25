@@ -61,7 +61,16 @@ static void nta_unmap_peer_iovas(struct nta_p2p_mapping *mapping)
 		return;
 	domain = iommu_get_domain_for_dev(&mapping->peer->dev);
 	page_size = nta_page_size(mapping->dma_mapping->page_size_type);
-	if (!domain || domain->cookie_type != IOMMU_COOKIE_IOMMUFD || !page_size)
+	/*
+	 * The domain is obtained from the VFIO-owned PCI function after the
+	 * userspace transport has explicitly attached its IOMMUFD page table.
+	 * iommu_domain::cookie_type is not a stable module-facing API (and was
+	 * removed from newer kernels), so the ownership proof is the combination
+	 * of the vfio-pci driver check, the translated paging-domain check below,
+	 * and the exact identity mapping validation.  Do not inspect private
+	 * IOMMUFD fields from this module.
+	 */
+	if (!domain || !(domain->type & __IOMMU_DOMAIN_PAGING) || !page_size)
 		return;
 	for (index = 0; index < mapping->iommu_entries; ++index) {
 		dma_addr_t iova = mapping->dma_mapping->dma_addresses[index];
@@ -81,8 +90,7 @@ static int nta_map_peer_iovas(struct nta_p2p_mapping *mapping)
 	int status;
 
 	domain = iommu_get_domain_for_dev(&mapping->peer->dev);
-	if (!domain || !(domain->type & __IOMMU_DOMAIN_PAGING) ||
-	    domain->cookie_type != IOMMU_COOKIE_IOMMUFD)
+	if (!domain || !(domain->type & __IOMMU_DOMAIN_PAGING))
 		return -EXDEV;
 	for (index = 0; index < dma->entries; ++index) {
 		dma_addr_t iova = dma->dma_addresses[index];
@@ -97,9 +105,10 @@ static int nta_map_peer_iovas(struct nta_p2p_mapping *mapping)
 			goto rollback;
 		}
 		/*
-		 * NVIDIA returns the PCI peer bus address. An IOMMUFD paging domain
-		 * does not consume the DMA-API mapping, so install the identity PTE in
-		 * that exact domain and retain ownership until the file mapping dies.
+		 * NVIDIA returns the PCI peer bus address. The explicitly attached
+		 * translated VFIO paging domain does not consume the DMA-API mapping,
+		 * so install the identity PTE in that exact domain and retain ownership
+		 * until the file mapping dies.
 		 */
 		status = iommu_map(domain, iova, iova, page_size,
 				   IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
@@ -111,11 +120,11 @@ static int nta_map_peer_iovas(struct nta_p2p_mapping *mapping)
 			goto rollback;
 		}
 	}
-	pr_info_once("installed peer PTEs in an IOMMUFD paging domain\n");
+	pr_info_once("installed peer PTEs in the VFIO paging domain\n");
 	return 0;
 
 rollback:
-	pr_warn_ratelimited("%s: IOMMUFD peer PTE install failed at %u/%u: %d\n",
+	pr_warn_ratelimited("%s: VFIO peer PTE install failed at %u/%u: %d\n",
 			    pci_name(mapping->peer), index, dma->entries, status);
 	nta_unmap_peer_iovas(mapping);
 	return status;

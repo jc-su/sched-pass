@@ -29,6 +29,13 @@ set(NTA_TEST_NVME_MEDIA_POLICY "$ENV{NTA_NVME_MEDIA_POLICY}" CACHE STRING
     "NVMe media policy for physical CTest")
 set(NTA_TEST_NVME_DMA_TARGET "$ENV{NTA_NVME_DMA_TARGET}" CACHE STRING
     "NVMe DMA destination for physical CTest")
+if(NTA_TEST_NVME_REFERENCE AND
+   NOT EXISTS "${NTA_TEST_NVME_REFERENCE}")
+  message(FATAL_ERROR
+    "NTA_TEST_NVME_REFERENCE is configured but does not exist: "
+    "${NTA_TEST_NVME_REFERENCE}. Capture a read-only reference or clear "
+    "the cache before configuring a non-physical build.")
+endif()
 set(NTA_TEST_NVME_ENVIRONMENT)
 set(NTA_TEST_NVME_PROBE_ARGUMENTS)
 if(NTA_TEST_NVME_ENDPOINT)
@@ -1055,7 +1062,8 @@ if(Python3_Interpreter_FOUND)
     COMMAND nta-vfio-nvme-probe ${NTA_TEST_NVME_PROBE_ARGUMENTS}
   )
   set_tests_properties(nta-vfio-nvme-probe PROPERTIES
-    TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "physical;qualification;nvme"
+    TIMEOUT 60 SKIP_RETURN_CODE 77 RESOURCE_LOCK nta_nvme_physical
+    LABELS "physical;qualification;nvme"
     ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
   )
 
@@ -1547,7 +1555,7 @@ if(Python3_Interpreter_FOUND)
   )
   set_tests_properties(
     nta-paged-attention-nvme-gpu PROPERTIES
-    TIMEOUT 120
+    TIMEOUT 120 RESOURCE_LOCK nta_nvme_physical
     SKIP_RETURN_CODE 77
     ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
   )

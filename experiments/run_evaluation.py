@@ -46,6 +46,7 @@ REQUIRED_STRATA = {
 }
 EVALUATION_PROFILES = {"contract", "osdi-complete"}
 CANONICAL_ARMS = {f"B{index}" for index in range(7)}
+FORMAL_CONSUMER_KINDS = {"native_work_unit", "framework_reference"}
 
 
 def _digest(path: Path) -> str:
@@ -85,6 +86,7 @@ def validate_spec(
     arms = {arm["id"] for arm in contract["arms"]}
     allowed_strata = contract["strata"]
     identities: dict[tuple[str, str], dict[str, Any]] = {}
+    consumer_kinds_by_arm: dict[str, set[str]] = {}
     for trial in trials:
         if not isinstance(trial, dict) or not trial.get("command"):
             raise ValueError("each evaluation trial needs a command")
@@ -98,6 +100,16 @@ def validate_spec(
             raise ValueError(f"trial uses an undeclared tier: {trial.get('tier')}")
         if trial.get("demand_semantics") != "exact":
             raise ValueError("evaluation trials must declare exact demand")
+        if evaluation_profile == "osdi-complete":
+            consumer_kind = trial.get("consumer_kind")
+            if consumer_kind not in FORMAL_CONSUMER_KINDS:
+                raise ValueError(
+                    "osdi-complete trials must declare a numerical consumer_kind "
+                    "of native_work_unit or framework_reference"
+                )
+            consumer_kinds_by_arm.setdefault(trial["arm"], set()).add(
+                consumer_kind
+            )
         if not isinstance(trial.get("stratum"), dict) or not REQUIRED_STRATA <= set(
             trial["stratum"]
         ):
@@ -187,6 +199,23 @@ def validate_spec(
         declared_arms = {trial["arm"] for trial in identities.values()}
         if declared_arms != CANONICAL_ARMS:
             raise ValueError("osdi-complete evaluation must contain exactly B0-B6")
+        if any(
+            consumer_kinds_by_arm.get(arm, set())
+            and len(consumer_kinds_by_arm[arm]) != 1
+            for arm in CANONICAL_ARMS
+        ):
+            raise ValueError(
+                "osdi-complete arms must use one declared consumer_kind across "
+                "all strata"
+            )
+        if any(
+            len(consumer_kinds_by_arm.get(arm, set())) != 1
+            for arm in CANONICAL_ARMS
+        ):
+            raise ValueError(
+                "osdi-complete evaluation must declare a consumer_kind for every "
+                "canonical arm"
+            )
         declared_tiers = {trial["tier"] for trial in identities.values()}
         if len(declared_tiers) != 1:
             raise ValueError(
@@ -323,6 +352,24 @@ def main(argv: list[str] | None = None) -> int:
                     "repetitions": spec["repetitions"],
                     "randomized_order": True,
                     "arm_set": sorted({trial["arm"] for trial in spec["experiments"]}),
+                    "consumer_kinds": {
+                        arm: sorted(
+                            {
+                                trial["consumer_kind"]
+                                for trial in spec["experiments"]
+                                if trial["arm"] == arm
+                                and isinstance(trial.get("consumer_kind"), str)
+                            }
+                        )[0]
+                        for arm in sorted(
+                            {trial["arm"] for trial in spec["experiments"]}
+                        )
+                        if any(
+                            isinstance(trial.get("consumer_kind"), str)
+                            for trial in spec["experiments"]
+                            if trial["arm"] == arm
+                        )
+                    },
                     "tier_set": sorted({trial["tier"] for trial in spec["experiments"]}),
                     "causal_pairs": sorted(
                         {

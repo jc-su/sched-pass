@@ -128,7 +128,6 @@ def main() -> None:
     for required in (
         "nvidia_p2p_get_pages_persistent",
         "nvidia_p2p_dma_map_pages",
-        "IOMMU_COOKIE_IOMMUFD",
         "__IOMMU_DOMAIN_PAGING",
         "iommu_map(domain, iova, iova",
         "iommu_unmap(domain, iova, page_size)",
@@ -136,6 +135,12 @@ def main() -> None:
         "PCI_CLASS_STORAGE_EXPRESS",
     ):
         assert required in bridge
+    # iommu_domain::cookie_type and IOMMU_COOKIE_IOMMUFD are private/removed
+    # kernel internals.  The module must remain buildable on the supported
+    # kernel while retaining the VFIO driver, paging-domain, and identity-PTE
+    # checks above as its public safety boundary.
+    assert "domain->cookie_type" not in bridge
+    assert "IOMMU_COOKIE_IOMMUFD" not in bridge
     release = bridge[
         bridge.index("static void nta_release_mapping") : bridge.index(
             "static bool nta_peer_is_vfio_nvme"

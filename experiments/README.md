@@ -52,7 +52,14 @@ python experiments/make_evaluation_spec.py \
   --tier host_mem --output /tmp/paired-evaluation.json \
   --arm-command 'B0=...' --arm-command 'B1=...' --arm-command 'B2=...' \
   --arm-command 'B3=...' --arm-command 'B4=...' --arm-command 'B5=...' \
-  --arm-command 'B6=...'
+  --arm-command 'B6=...' \
+  --arm-consumer-kind B0=framework_reference \
+  --arm-consumer-kind B1=native_work_unit \
+  --arm-consumer-kind B2=native_work_unit \
+  --arm-consumer-kind B3=native_work_unit \
+  --arm-consumer-kind B4=native_work_unit \
+  --arm-consumer-kind B5=native_work_unit \
+  --arm-consumer-kind B6=native_work_unit
 ```
 
 The generator expands the declared strata and the adjacent causal pairs plus
@@ -62,7 +69,8 @@ requires a concrete command for every arm and validates the resulting spec
 before writing it; no missing arm is silently treated as a baseline.
 Generated specifications carry `evaluation_profile=osdi-complete`. The runner
 requires all B0--B6 arms, every canonical causal boundary in every declared
-stratum, and at least six strata for that profile. The checked-in example spec
+stratum, at least six strata, and a machine-readable numerical consumer
+contract for every arm for that profile. The checked-in example spec
 is marked `evaluation_profile=contract` because it is only a minimal API
 fixture; it must not be used as an OSDI result.
 

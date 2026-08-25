@@ -182,6 +182,25 @@ def main() -> int:
         raise RuntimeError(
             "NTA vLLM generated output but no worker native_work_unit evidence"
         )
+    if args.backend == "nta":
+        consumer_contract = next(
+            contract
+            for contract in contracts
+            if isinstance(contract, dict)
+            and contract.get("kind") == "native_work_unit"
+        )
+    else:
+        consumer_contract = {
+            "schema": 1,
+            "engine": "vllm",
+            "backend": "flashinfer",
+            "kind": "framework_reference",
+            "exact_demand": True,
+            "typed_work_plan": False,
+            "native_submission": False,
+            "numerical_consumer": True,
+            "engine_version": importlib.metadata.version("vllm"),
+        }
     median_seconds = statistics.median(samples)
     report = {
         "schema": 1,
@@ -207,6 +226,7 @@ def main() -> int:
         "requests_per_second": args.requests / median_seconds,
         "generated_tokens_per_second": generated / median_seconds,
         "evidence": evidence,
+        "consumer_contract": consumer_contract,
         "flashinfer_workspace_base": str(workspace),
     }
     print(json.dumps(report, sort_keys=True))

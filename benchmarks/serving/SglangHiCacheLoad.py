@@ -725,6 +725,43 @@ def main() -> int:
         json.loads(path.read_text(encoding="utf-8"))
         for path in sorted(workspace.glob("nta-engine.*.json"))
     ]
+    engine_version = importlib.metadata.version("sglang")
+    consumer_contract: dict[str, Any] | None = None
+    if args.attention_backend == "nta_flashinfer":
+        contracts = [
+            entry.get("consumer_contract")
+            for entry in stats
+            if isinstance(entry, dict)
+            and entry.get("backend") == "nta_flashinfer"
+            and isinstance(entry.get("consumer_contract"), dict)
+        ]
+        # Prefer proof that the native work-unit consumer launched.  If the
+        # report only contains a projection/reference contract, preserve it so
+        # the formal evaluator can reject the trial with an actionable reason
+        # instead of silently manufacturing evidence.
+        consumer_contract = next(
+            (
+                contract
+                for contract in contracts
+                if contract.get("kind") == "native_work_unit"
+            ),
+            contracts[0] if contracts else None,
+        )
+    else:
+        # Stock FlashInfer is the numerical framework reference.  It is not a
+        # typed NTA work-unit consumer, but it still consumes the same exact
+        # demand and must be represented explicitly in a formal arm.
+        consumer_contract = {
+            "schema": 1,
+            "engine": "sglang",
+            "backend": "flashinfer",
+            "kind": "framework_reference",
+            "exact_demand": True,
+            "typed_work_plan": False,
+            "native_submission": False,
+            "numerical_consumer": True,
+            "engine_version": engine_version,
+        }
     tier_entries = {
         str(entry["serving_tier"])
         for entry in stats
@@ -782,7 +819,7 @@ def main() -> int:
         "dirty": bool(git_value("status", "--porcelain")),
         "engine": "sglang",
         "machine": _machine_metadata(),
-        "engine_version": importlib.metadata.version("sglang"),
+        "engine_version": engine_version,
         "flashinfer_version": importlib.metadata.version("flashinfer-python"),
         "attention_backend": args.attention_backend,
         "serving_tier": serving_tier,
@@ -872,6 +909,8 @@ def main() -> int:
         ),
         "engine_stats": stats,
     }
+    if consumer_contract is not None:
+        report["consumer_contract"] = consumer_contract
     print(json.dumps(report, sort_keys=True))
     return 0
 

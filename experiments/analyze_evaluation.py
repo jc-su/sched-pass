@@ -93,7 +93,44 @@ def _workload_digest(
     return evaluation_metadata.get("workload_demand_digest")
 
 
-def _validate_result(record: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+def _contract_values(result: dict[str, Any]) -> list[Any]:
+    """Collect contracts from the known report boundaries.
+
+    The evaluator must see evidence emitted by the numerical consumer, not
+    merely a scheduler selection flag.  Serving comparison reports nest the
+    stock and NTA reports, while direct engine trials place the contract at the
+    top level or in ``engine_stats``.  Keep this traversal explicit so an
+    arbitrary metric field cannot accidentally become execution evidence.
+    """
+
+    values: list[Any] = []
+    for key in ("consumer_contract",):
+        if key in result:
+            values.append(result[key])
+    contracts = result.get("consumer_contracts")
+    if contracts is not None:
+        if not isinstance(contracts, list):
+            raise ValueError("consumer_contracts must be a list when present")
+        values.extend(contracts)
+    stats = result.get("engine_stats")
+    if stats is not None:
+        if not isinstance(stats, list):
+            raise ValueError("engine_stats must be a list when present")
+        values.extend(
+            entry.get("consumer_contract")
+            for entry in stats
+            if isinstance(entry, dict) and "consumer_contract" in entry
+        )
+    for nested_name in ("stock", "nta"):
+        nested = result.get(nested_name)
+        if isinstance(nested, dict):
+            values.extend(_contract_values(nested))
+    return values
+
+
+def _validate_result(
+    record: dict[str, Any], *, required_consumer_kind: str | None = None
+) -> tuple[dict[str, Any], ...]:
     result = record.get("result")
     if not isinstance(result, dict):
         raise ValueError("trial result is not a JSON object")
@@ -108,21 +145,24 @@ def _validate_result(record: dict[str, Any]) -> tuple[dict[str, Any], ...]:
             f"trial {record.get('experiment')}/{record.get('variant')} "
             "does not prove zero verification failures"
         )
-    stats = result.get("engine_stats")
-    if stats is None:
-        return ()
-    if not isinstance(stats, list):
-        raise ValueError("engine_stats must be a list when present")
     contracts: list[dict[str, Any]] = []
-    for entry in stats:
-        if not isinstance(entry, dict) or entry.get("backend") != "nta_flashinfer":
-            continue
-        contracts.append(
-            validate_consumer_contract(
-                entry.get("consumer_contract"),
-                expected_kind="native_work_unit",
-                require_formal_execution=True,
-            )
+    for value in _contract_values(result):
+        contract = validate_consumer_contract(
+            value,
+            # projection_only is valid diagnostic metadata.  It is never
+            # returned as formal provenance; the required-kind check below
+            # still makes a formal trial fail when no numerical consumer is
+            # present.
+            require_formal_execution=False,
+        )
+        if contract["kind"] != "projection_only":
+            contracts.append(contract)
+    if required_consumer_kind is not None and not any(
+        contract["kind"] == required_consumer_kind for contract in contracts
+    ):
+        raise ValueError(
+            f"trial {record.get('experiment')}/{record.get('variant')} does not "
+            f"provide a {required_consumer_kind} consumer contract"
         )
     return tuple(contracts)
 
@@ -187,6 +227,13 @@ def analyze(output: Path) -> dict[str, Any]:
         raise ValueError(
             "evaluation specification has no defensible repetition contract"
         )
+    evaluation_profile = spec.get("evaluation_profile", "contract")
+    if evaluation_profile not in {"contract", "osdi-complete"}:
+        raise ValueError("unknown evaluation profile in trial specification")
+    if evaluation_metadata.get("evaluation_profile", "contract") != evaluation_profile:
+        raise ValueError(
+            "evaluation metadata profile diverges from the trial specification"
+        )
     declared = {(entry["name"], entry["variant"]): entry for entry in experiments}
     expected_count = repetitions * len(declared)
     if len(records) != expected_count:
@@ -235,7 +282,21 @@ def analyze(output: Path) -> dict[str, Any]:
             record["stratum"]
         ):
             raise ValueError("trial artifact is missing required strata")
-        for contract in _validate_result(record):
+        required_consumer_kind = (
+            declaration.get("consumer_kind")
+            if evaluation_profile == "osdi-complete"
+            else None
+        )
+        if evaluation_profile == "osdi-complete" and required_consumer_kind not in {
+            "native_work_unit",
+            "framework_reference",
+        }:
+            raise ValueError(
+                f"formal trial {identity[:2]} has no valid consumer_kind"
+            )
+        for contract in _validate_result(
+            record, required_consumer_kind=required_consumer_kind
+        ):
             consumer_contracts.add(
                 json.dumps(contract, sort_keys=True, separators=(",", ":"))
             )
@@ -271,6 +332,7 @@ def analyze(output: Path) -> dict[str, Any]:
                 "variant": key[1],
                 "arm": declaration["arm"],
                 "tier": declaration["tier"],
+                "consumer_kind": declaration.get("consumer_kind"),
                 "stratum": declaration["stratum"],
                 "repetitions": repetitions,
                 "metrics": {

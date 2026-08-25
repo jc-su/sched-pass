@@ -24,6 +24,14 @@ def validate(output: Path) -> dict[str, Any]:
     report = json.loads((output / "evaluation-report.json").read_text(encoding="utf-8"))
     strata = json.loads((output / "strata-report.json").read_text(encoding="utf-8"))
     causal = json.loads((output / "causal-report.json").read_text(encoding="utf-8"))
+    evaluation_metadata = json.loads(
+        (output / "evaluation-metadata.json").read_text(encoding="utf-8")
+    )
+    evaluation_profile = evaluation_metadata.get("evaluation_profile", "contract")
+    _require(
+        evaluation_profile in {"contract", "osdi-complete"},
+        "unknown evaluation profile",
+    )
     _require(
         report.get("classification") == "nta-osdi-evaluation-report",
         "invalid evaluation report",
@@ -59,8 +67,7 @@ def validate(output: Path) -> dict[str, Any]:
         try:
             validate_consumer_contract(
                 contract,
-                expected_kind="native_work_unit",
-                require_formal_execution=True,
+                require_formal_execution=evaluation_profile == "osdi-complete",
             )
         except ValueError as error:
             raise ValueError(f"invalid consumer contract provenance: {error}") from error
@@ -68,14 +75,6 @@ def validate(output: Path) -> dict[str, Any]:
         isinstance(provenance.get("workload_demand_digest"), str)
         and bool(provenance["workload_demand_digest"]),
         "report has no exact workload/demand digest",
-    )
-    evaluation_metadata = json.loads(
-        (output / "evaluation-metadata.json").read_text(encoding="utf-8")
-    )
-    evaluation_profile = evaluation_metadata.get("evaluation_profile", "contract")
-    _require(
-        evaluation_profile in {"contract", "osdi-complete"},
-        "unknown evaluation profile",
     )
     _require(
         provenance.get("evaluation_profile", "contract") == evaluation_profile,
@@ -109,6 +108,34 @@ def validate(output: Path) -> dict[str, Any]:
         _require(
             evaluation_metadata.get("causal_pairs") == expected_pairs,
             "osdi-complete artifact is missing a canonical causal boundary",
+        )
+        consumer_kinds = evaluation_metadata.get("consumer_kinds")
+        _require(
+            isinstance(consumer_kinds, dict)
+            and set(consumer_kinds) == set(expected_arms)
+            and all(
+                kind in {"native_work_unit", "framework_reference"}
+                for kind in consumer_kinds.values()
+            ),
+            "osdi-complete artifact has no complete consumer-kind declaration",
+        )
+        observed_kinds = {
+            str(entry.get("arm")): entry.get("consumer_kind")
+            for entry in report.get("strata", [])
+            if isinstance(entry, dict) and entry.get("arm") is not None
+        }
+        _require(
+            observed_kinds == consumer_kinds,
+            "strata consumer evidence diverges from evaluation metadata",
+        )
+        _require(
+            "native_work_unit"
+            in {
+                contract.get("kind")
+                for contract in contracts
+                if isinstance(contract, dict)
+            },
+            "osdi-complete artifact has no native numerical consumer evidence",
         )
     _require(
         provenance["workload_demand_digest"]

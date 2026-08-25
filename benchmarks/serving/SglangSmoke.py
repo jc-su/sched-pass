@@ -167,6 +167,33 @@ def main() -> int:
         except (OSError, json.JSONDecodeError):
             pass
     evidence = integration_evidence(args.attention_backend, engine_stats)
+    if args.attention_backend == "nta_flashinfer":
+        contracts = [
+            entry.get("consumer_contract")
+            for entry in engine_stats
+            if isinstance(entry, dict)
+            and isinstance(entry.get("consumer_contract"), dict)
+        ]
+        consumer_contract = next(
+            (
+                contract
+                for contract in contracts
+                if contract.get("kind") == "native_work_unit"
+            ),
+            contracts[0] if contracts else None,
+        )
+    else:
+        consumer_contract = {
+            "schema": 1,
+            "engine": "sglang",
+            "backend": "flashinfer",
+            "kind": "framework_reference",
+            "exact_demand": True,
+            "typed_work_plan": False,
+            "native_submission": False,
+            "numerical_consumer": True,
+            "engine_version": importlib.metadata.version("sglang"),
+        }
     report = {
         "schema": 1,
         "classification": "serving-integration-smoke",
@@ -195,6 +222,8 @@ def main() -> int:
         "generated_tokens_per_second": generated / elapsed,
         "engine_stats": engine_stats,
     }
+    if consumer_contract is not None:
+        report["consumer_contract"] = consumer_contract
     print(json.dumps(report, sort_keys=True))
     return 0
 

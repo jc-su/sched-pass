@@ -25,6 +25,9 @@ except ImportError:
 
 
 ARMS = tuple(f"B{index}" for index in range(7))
+FORMAL_CONSUMER_KINDS = frozenset(
+    {"native_work_unit", "framework_reference"}
+)
 # Adjacent pairs expose each boundary. The two cross-boundary pairs are
 # deliberate: B3/B1 seals the host-control round-trip effect, and B5/B3
 # tests the complete device-demand-to-heterogeneous-execution jump.
@@ -90,6 +93,27 @@ def _commands(values: list[str]) -> dict[str, str]:
     return result
 
 
+def _consumer_kinds(values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(
+                "--arm-consumer-kind must use ARM=KIND: " f"{value!r}"
+            )
+        arm, kind = value.split("=", 1)
+        if arm not in ARMS or kind not in FORMAL_CONSUMER_KINDS:
+            raise ValueError(f"invalid arm consumer kind: {value!r}")
+        if arm in result:
+            raise ValueError(f"duplicate consumer kind for {arm}")
+        result[arm] = kind
+    missing = [arm for arm in ARMS if arm not in result]
+    if missing:
+        raise ValueError(
+            "missing consumer kinds for: " + ", ".join(missing)
+        )
+    return result
+
+
 def _format_command_token(token: str, *, arm: str, values: Mapping[str, str]) -> str:
     """Substitute only the documented tokens; preserve literal command braces."""
 
@@ -105,6 +129,7 @@ def build_spec(
     workload_manifest: Path,
     tier: str,
     arm_commands: Mapping[str, str],
+    consumer_kinds: Mapping[str, str],
     strata: list[dict[str, str]],
     repetitions: int = 10,
     seed: int = 20260824,
@@ -117,6 +142,10 @@ def build_spec(
         raise ValueError("OSDI evaluation requires at least five repetitions")
     if set(arm_commands) != set(ARMS):
         raise ValueError("complete B0--B6 arm command set is required")
+    if set(consumer_kinds) != set(ARMS):
+        raise ValueError("complete B0--B6 consumer kind set is required")
+    if any(kind not in FORMAL_CONSUMER_KINDS for kind in consumer_kinds.values()):
+        raise ValueError("formal arms require a numerical consumer kind")
     validate_workload(workload_manifest.resolve())
     if tier in {"nvme", "dax"} and tier_qualification is None:
         raise ValueError("NVMe/DAX spec requires --tier-qualification")
@@ -144,6 +173,7 @@ def build_spec(
                         "arm": arm,
                         "tier": tier,
                         "demand_semantics": "exact",
+                        "consumer_kind": consumer_kinds[arm],
                         "stratum": fields,
                         "command": command,
                         "metrics": list(metrics),
@@ -198,6 +228,13 @@ def main() -> int:
     parser.add_argument(
         "--arm-command", action="append", required=True, metavar="ARM=COMMAND"
     )
+    parser.add_argument(
+        "--arm-consumer-kind",
+        action="append",
+        required=True,
+        metavar="ARM=KIND",
+        help="formal numerical consumer: native_work_unit or framework_reference",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     metrics = tuple(dict.fromkeys(args.metric))
@@ -208,6 +245,7 @@ def main() -> int:
             workload_manifest=args.workload_manifest,
             tier=args.tier,
             arm_commands=_commands(args.arm_command),
+            consumer_kinds=_consumer_kinds(args.arm_consumer_kind),
             strata=_load_strata(args.strata_file),
             repetitions=args.repetitions,
             seed=args.seed,

@@ -146,6 +146,7 @@ Build/load the kernel-specific bridge, run read-only preflight, and only then
 authorize a transactional bind:
 
 ```bash
+./scripts/nta-nvme-p2p-module.sh build
 ./scripts/nta-nvme-p2p-module.sh load
 
 NTA_NVME_BDF=0000:d8:00.0 \
@@ -180,9 +181,9 @@ authorize media formatting, filesystem creation, writes, discard, sanitize,
 or deletion. The generated application path issues READ commands only, and
 `fio` is invoked with `--readonly --rw=read`.
 
-## Historical qualification baseline
+## Tested qualification baseline
 
-The qualified platform runs Linux `7.0.0-30-generic`, NVIDIA driver `595.84`,
+The currently qualified platform runs Linux `6.14.0-1009-intel`, NVIDIA driver `595.84`,
 CUDA `13.2`, an RTX PRO 6000 Blackwell GPU, and controller `0000:d8:00.0`
 (Dell/KIOXIA CD8P, 1.92 TB). The controller lacks Namespace Write Protection
 (`NWPC=0`), so this run used the explicit trusted READ-only-code policy.
@@ -224,6 +225,13 @@ NTA_NVME_BDF=0000:d8:00.0 scripts/nta-vfio-device.sh restore
 This is one-platform transport/correctness/performance evidence. It does not
 by itself establish serving-level speedup, topology portability, multi-GPU
 support, or general NVMe-driver robustness.
+
+The peer bridge deliberately uses only module-facing IOMMU interfaces. It does
+not inspect private `iommu_domain` cookie fields that changed across kernel
+releases; the safety boundary is the explicit `vfio-pci` ownership check, a
+translated paging domain, and successful identity-PTE verification for every
+peer DMA address. `scripts/nta-nvme-p2p-module.sh build` is therefore a
+required kernel-header compatibility gate before loading the module.
 
 ## Deliberate limits
 

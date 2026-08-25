@@ -21,7 +21,10 @@ from experiments.make_evaluation_spec import (  # noqa: E402
     _load_strata,
     build_spec,
 )
-from experiments.analyze_evaluation import _workload_digest  # noqa: E402
+from experiments.analyze_evaluation import (  # noqa: E402
+    _validate_result,
+    _workload_digest,
+)
 from experiments.run_evaluation import validate_spec  # noqa: E402
 from experiments.hardware import collect, validate  # noqa: E402
 
@@ -69,6 +72,10 @@ def main() -> None:
             workload_manifest=manifest_path,
             tier="host_mem",
             arm_commands={arm: _fake_command() for arm in ARMS},
+            consumer_kinds={
+                arm: ("framework_reference" if arm == "B0" else "native_work_unit")
+                for arm in ARMS
+            },
             strata=strata,
             repetitions=5,
         )
@@ -110,6 +117,45 @@ def main() -> None:
             }
             for trial in spec["experiments"]
         )
+        try:
+            _validate_result(
+                {
+                    "experiment": "missing-evidence",
+                    "variant": "B5",
+                    "result": {
+                        "classification": "fixture",
+                        "verification_failures": 0,
+                    },
+                },
+                required_consumer_kind="native_work_unit",
+            )
+        except ValueError as error:
+            assert "consumer contract" in str(error)
+        else:
+            raise AssertionError("formal trial without a consumer contract was accepted")
+        native_contract = {
+            "schema": 1,
+            "engine": "fixture",
+            "backend": "nta_flashinfer",
+            "kind": "native_work_unit",
+            "exact_demand": True,
+            "typed_work_plan": True,
+            "native_submission": True,
+            "numerical_consumer": True,
+            "engine_version": "fixture",
+        }
+        assert _validate_result(
+            {
+                "experiment": "with-evidence",
+                "variant": "B5",
+                "result": {
+                    "classification": "fixture",
+                    "verification_failures": 0,
+                    "consumer_contract": native_contract,
+                },
+            },
+            required_consumer_kind="native_work_unit",
+        )[0]["kind"] == "native_work_unit"
         cli_output = root / "cli-spec.json"
         command = [
             sys.executable,
@@ -127,10 +173,20 @@ def main() -> None:
         ]
         for arm in ARMS:
             command.extend(("--arm-command", f"{arm}={_fake_command()}"))
+            command.extend(
+                (
+                    "--arm-consumer-kind",
+                    f"{arm}={'framework_reference' if arm == 'B0' else 'native_work_unit'}",
+                )
+            )
         subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         cli_spec = json.loads(cli_output.read_text(encoding="utf-8"))
         assert len(cli_spec["comparisons"]) == len(PAIRS) * len(strata)
         assert cli_spec["evaluation_profile"] == "osdi-complete"
+        assert cli_spec["experiments"][0]["consumer_kind"] in {
+            "native_work_unit",
+            "framework_reference",
+        }
 
         incomplete = json.loads(json.dumps(spec))
         incomplete["experiments"] = [
@@ -142,6 +198,15 @@ def main() -> None:
             pass
         else:
             raise AssertionError("incomplete osdi evaluation was accepted")
+
+        missing_consumer_kind = json.loads(json.dumps(spec))
+        missing_consumer_kind["experiments"][0].pop("consumer_kind")
+        try:
+            validate_spec(missing_consumer_kind, manifest_path)
+        except ValueError as error:
+            assert "consumer_kind" in str(error)
+        else:
+            raise AssertionError("formal evaluation without consumer evidence was accepted")
 
         sysfs = root / "sysfs"
         dev = root / "dev"
