@@ -81,6 +81,33 @@ def _tool_version(path: str | None) -> str | None:
     return completed.stdout.strip() if completed.returncode == 0 else None
 
 
+def _default_llvm_dir(cmake_args: Sequence[str]) -> str | None:
+    """Choose a stable system LLVM unless the artifact caller overrides it.
+
+    This host also has a clangir development LLVM under ``/usr/local``.  Its
+    debug ``opt`` currently corrupts LLVM value-handle state while optimizing
+    the dependency-set fixture, so letting CMake discover it implicitly makes
+    clean artifact builds fail even though the distro LLVM passes the same
+    test.  An explicit ``--cmake-arg=-DLLVM_DIR=...`` always wins, and hosts
+    without a packaged LLVM retain CMake's normal discovery behavior.
+    """
+    if any(argument.startswith("-DLLVM_DIR=") for argument in cmake_args):
+        return None
+    configured = os.environ.get("LLVM_DIR", "").strip()
+    if configured:
+        return configured
+    candidates = [Path("/usr/lib/llvm-22/lib/cmake/llvm")]
+    candidates.extend(
+        candidate
+        for candidate in sorted(
+            Path("/usr/lib").glob("llvm-*/lib/cmake/llvm"), reverse=True
+        )
+        if candidate not in candidates
+    )
+    candidates = [candidate for candidate in candidates if candidate.is_dir()]
+    return str(candidates[0]) if candidates else None
+
+
 def _require_clean(allow_dirty: bool) -> dict[str, object]:
     metadata = git_metadata()
     if metadata["dirty"] and not allow_dirty:
@@ -127,6 +154,9 @@ def _configure_and_build(
         args.generator,
         f"-DNTA_ENABLE_CUDA={'ON' if cuda == 'on' else 'OFF'}",
     ]
+    llvm_dir = _default_llvm_dir(args.cmake_arg)
+    if llvm_dir is not None:
+        configure.append(f"-DLLVM_DIR={llvm_dir}")
     configure.extend(args.cmake_arg)
     run.command(configure, name="cmake-configure", environment=environment)
     run.command(

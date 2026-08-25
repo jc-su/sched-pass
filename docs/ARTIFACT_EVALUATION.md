@@ -130,6 +130,13 @@ automatically selects the conservative `-O0` fallback only for the known
 clangir development toolchain whose optimizer currently asserts on these
 device ABI types.
 
+When no `--cmake-arg=-DLLVM_DIR=...` or `LLVM_DIR` environment override is
+provided, `reproduce.py` prefers the validated packaged LLVM 22 CMake package
+(`/usr/lib/llvm-22/`) and then falls back to another packaged
+`/usr/lib/llvm-*/` package. This avoids accidentally pairing the pass with an
+unqualified development `opt` discovered under `/usr/local`; the selected
+package and every tool version remain recorded in the bundle.
+
 Capability-gated tests report explicit skips. A skipped CXL DAX test means no
 qualified devdax endpoint was supplied; it is not a passing CXL qualification.
 The same rule applies to multi-GPU and framework-specific serving tests.
