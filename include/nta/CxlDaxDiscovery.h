@@ -4,7 +4,9 @@
 // node, but the serving runtime still requires an explicit endpoint in its
 // typed configuration.  Discovery never creates, deletes, or reconfigures a
 // CXL region; it only removes the needless environment-variable step after a
-// platform has already exposed a character device.
+// platform has already exposed a character device. The runtime repeats the
+// ancestry check for explicit endpoints, so an environment variable cannot
+// turn an arbitrary character device into a DAX qualification target.
 
 #include <filesystem>
 #include <optional>

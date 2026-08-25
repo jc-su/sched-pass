@@ -954,6 +954,14 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(nta-cxl-dax-probe PROPERTIES
     TIMEOUT 60 SKIP_RETURN_CODE 77
   )
+  add_test(
+    NAME nta-cxl-dax-rejects-pseudo-endpoint
+    COMMAND nta-cxl-dax-probe /dev/zero 1 0 --json=1
+  )
+  set_tests_properties(
+    nta-cxl-dax-rejects-pseudo-endpoint PROPERTIES
+    TIMEOUT 60 WILL_FAIL TRUE
+  )
 
   add_executable(
     nta-paged-attention benchmarks/attention/PagedAttention.cpp

@@ -54,9 +54,9 @@ struct CxlDaxUsage {
 
 // CUDA-visible CXL memory is a mapped host replica, not an NVMe-like queue.
 // The transport owns one explicitly supplied devdax mapping and hands out
-// bounded slices. Allocation is monotonic for the lifetime of the transport;
-// this is deliberate because recycling a DAX slice while a captured graph can
-// still reference it is unsafe without an engine completion fence.
+// bounded slices. A slice is reusable only after its owning buffer is
+// destroyed; the engine's retirement fence therefore remains the lifetime
+// boundary for captured graphs and in-flight consumers.
 class CxlDaxTransport {
 public:
   explicit CxlDaxTransport(CxlDaxOptions options);

@@ -95,6 +95,22 @@ int main(int argc, char **argv) {
     if (!capabilities.hostRegistered || !capabilities.directDeviceVisible) {
       throw std::runtime_error("CXL DAX mapping is not directly CUDA-visible");
     }
+    auto firstAllocation = transport.allocate(4096);
+    const std::size_t firstOffset = firstAllocation->offset();
+    if (transport.usage().allocatedBytes != 4096) {
+      throw std::runtime_error("CXL DAX allocation accounting is inconsistent");
+    }
+    firstAllocation.reset();
+    if (transport.usage().allocatedBytes != 0) {
+      throw std::runtime_error(
+          "CXL DAX buffer lifetime did not reclaim its slice");
+    }
+    auto secondAllocation = transport.allocate(4096);
+    if (secondAllocation->offset() != firstOffset) {
+      throw std::runtime_error(
+          "CXL DAX free-range allocator did not reuse a slice");
+    }
+    secondAllocation.reset();
     if (jsonOutput) {
       std::cout << "{\"schema\":1,\"classification\":\"nta-dax-qualification\","
                    "\"tier\":\"dax\",\"status\":\"qualified\","
@@ -104,7 +120,8 @@ int main(int argc, char **argv) {
                 << ",\"mapped_device_address\":\"0x" << std::hex
                 << reinterpret_cast<std::uintptr_t>(capabilities.mappedDeviceAddress)
                 << std::dec << "\",\"host_registered\":true,"
-                   "\"direct_device_visible\":true}\n";
+                   "\"direct_device_visible\":true,"
+                   "\"allocation_reuse\":true}\n";
     } else {
       std::cout << "cxl_dax_probe=passed"
                 << " device=" << capabilities.deviceOrdinal
@@ -112,7 +129,8 @@ int main(int argc, char **argv) {
                 << " mapped_device_address=0x" << std::hex
                 << reinterpret_cast<std::uintptr_t>(
                        capabilities.mappedDeviceAddress)
-                << std::dec << " host_registered=1 direct_device_visible=1\n";
+                << std::dec
+                << " host_registered=1 direct_device_visible=1 allocation_reuse=1\n";
     }
     return 0;
   } catch (const std::exception &error) {
