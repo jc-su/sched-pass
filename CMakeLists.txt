@@ -542,6 +542,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/stats_publisher.py
     )
     add_test(
+      NAME nta-vllm-lifecycle
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/vllm_lifecycle.py
+    )
+    add_test(
       NAME nta-opportunity-analysis
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/opportunity.py
@@ -581,7 +586,7 @@ if(NTA_ENABLE_CUDA)
       nta-bounded-staging
       nta-qualification-runner
       nta-serving-evidence nta-jit-operator-family
-      nta-stats-publisher
+      nta-stats-publisher nta-vllm-lifecycle
       nta-opportunity-analysis
       nta-opportunity-study nta-tier-qualification
       nta-evaluation-spec nta-evaluation-artifact nta-performance-gate
