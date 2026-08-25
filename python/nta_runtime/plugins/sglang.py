@@ -184,23 +184,15 @@ def _preserve_prefill_graph_request_metadata() -> None:
 def _preserve_prefill_load_batch(original, self, forward_batch, **kwargs):
     """Copy live request metadata into a static prefill graph batch."""
     from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+    from nta_runtime.adapters.sglang import (
+        FORWARD_METADATA_ATTRIBUTE,
+        forward_metadata,
+    )
 
     static_batch = original(self, forward_batch, **kwargs)
     static_batch.rids = getattr(forward_batch, "rids", None)
-    static_batch._nta_request_slots = getattr(
-        forward_batch, "_nta_request_slots", None
-    )
-    if static_batch._nta_request_slots is None:
-        slots = getattr(forward_batch, "req_pool_indices", None)
-        if slots is not None and hasattr(slots, "tolist"):
-            slots = slots.tolist()
-        static_batch._nta_request_slots = slots
-    priorities = getattr(forward_batch, "_nta_request_priorities", None)
-    if priorities is not None:
-        static_batch._nta_request_priorities = priorities
-    tenant_ids = getattr(forward_batch, "_nta_request_tenant_ids", None)
-    if tenant_ids is not None:
-        static_batch._nta_request_tenant_ids = tenant_ids
+    metadata = forward_metadata(forward_batch)
+    setattr(static_batch, FORWARD_METADATA_ATTRIBUTE, metadata)
     PREFILL_GRAPH_COUNTERS["prefill_graph_served_batches"] += 1
     return static_batch
 
@@ -208,6 +200,10 @@ def _preserve_prefill_load_batch(original, self, forward_batch, **kwargs):
 def _preserve_prefill_capture_prepare(original, self, num_tokens, *args, **kwargs):
     """Give graph-capture-only prefill batches stable placeholder identity."""
     from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+    from nta_runtime.adapters.sglang import (
+        FORWARD_METADATA_ATTRIBUTE,
+        SglangForwardMetadata,
+    )
 
     result = original(self, num_tokens, *args, **kwargs)
     PREFILL_GRAPH_COUNTERS["prefill_graph_capture_batches"] += 1
@@ -217,8 +213,16 @@ def _preserve_prefill_capture_prepare(original, self, num_tokens, *args, **kwarg
         forward_batch.rids = tuple(
             f"__nta_graph_padding_{index}" for index in range(batch_size)
         )
-        forward_batch._nta_request_priorities = (0,) * batch_size
-        forward_batch._nta_request_tenant_ids = (0,) * batch_size
+        forward_batch_metadata = SglangForwardMetadata(
+            tuple(range(batch_size)),
+            (0,) * batch_size,
+            (0,) * batch_size,
+        )
+        setattr(
+            forward_batch,
+            FORWARD_METADATA_ATTRIBUTE,
+            forward_batch_metadata,
+        )
     return result
 
 
@@ -237,6 +241,11 @@ def _preserve_graph_request_metadata() -> None:
 def _preserve_decode_replay_view(original, *args, **kwargs):
     """Carry live identity and tenant metadata through padded replay views."""
     view = original(*args, **kwargs)
+    from nta_runtime.adapters.sglang import (
+        FORWARD_METADATA_ATTRIBUTE,
+        forward_metadata,
+    )
+
     forward_batch = kwargs.get("forward_batch", args[0] if args else None)
     raw_bs = int(kwargs.get("raw_bs", args[3] if len(args) > 3 else 0))
     padded_bs = int(kwargs.get("bs", args[2] if len(args) > 2 else raw_bs))
@@ -246,25 +255,12 @@ def _preserve_decode_replay_view(original, *args, **kwargs):
     request_ids.extend(
         f"__nta_graph_padding_{index}" for index in range(raw_bs, padded_bs)
     )
-    request_slots = getattr(forward_batch, "_nta_request_slots", None)
-    if request_slots is None:
-        request_slots = getattr(forward_batch, "req_pool_indices", None)
-    if request_slots is not None and hasattr(request_slots, "tolist"):
-        request_slots = request_slots.tolist()
-    if request_slots is None or len(request_slots) != raw_bs:
+    metadata = forward_metadata(forward_batch)
+    if len(metadata.request_slots) != raw_bs:
         raise RuntimeError("SGLang graph replay omitted request-pool slots")
-    view._nta_request_slots = tuple(int(slot) for slot in request_slots)
-    priorities = list(getattr(forward_batch, "_nta_request_priorities", (0,) * raw_bs))
-    if len(priorities) != raw_bs:
-        raise RuntimeError("SGLang graph replay omitted request priorities")
-    priorities.extend(0 for _ in range(raw_bs, padded_bs))
-    tenant_ids = list(getattr(forward_batch, "_nta_request_tenant_ids", (0,) * raw_bs))
-    if len(tenant_ids) != raw_bs:
-        raise RuntimeError("SGLang graph replay omitted request tenants")
-    tenant_ids.extend(0 for _ in range(raw_bs, padded_bs))
+    padded_metadata = metadata.pad(padded_bs)
     view.rids = request_ids
-    view._nta_request_priorities = tuple(priorities)
-    view._nta_request_tenant_ids = tuple(int(tenant_id) for tenant_id in tenant_ids)
+    setattr(view, FORWARD_METADATA_ATTRIBUTE, padded_metadata)
     view._nta_raw_batch_size = raw_bs
     return view
 
@@ -366,6 +362,11 @@ def _retire_finished_request(processor, req, *args, **kwargs) -> None:
 
 def _attach_request_priorities(forward_batch, cls, batch, model_runner):
     del cls
+    from nta_runtime.adapters.sglang import (
+        FORWARD_METADATA_ATTRIBUTE,
+        SglangForwardMetadata,
+    )
+
     requests = tuple(getattr(batch, "reqs", ()))
     request_ids = tuple(getattr(forward_batch, "rids", ()) or ())
     if len(requests) != len(request_ids):
@@ -382,7 +383,28 @@ def _attach_request_priorities(forward_batch, cls, batch, model_runner):
         rank = {value: index for index, value in enumerate(ordered)}
         denominator = max(1, len(ordered) - 1)
         priorities = tuple(7 - round(rank[value] * 7 / denominator) for value in raw)
-    forward_batch._nta_request_priorities = priorities
+    request_slots = getattr(forward_batch, "req_pool_indices", None)
+    if request_slots is None:
+        raise RuntimeError("SGLang forward batch omitted request-pool slots")
+    if hasattr(request_slots, "tolist"):
+        request_slots = request_slots.tolist()
+    existing = getattr(forward_batch, FORWARD_METADATA_ATTRIBUTE, None)
+    if existing is not None and not isinstance(existing, SglangForwardMetadata):
+        raise RuntimeError("SGLang forward metadata has an invalid sidecar type")
+    tenant_ids = (
+        (0,) * len(requests)
+        if existing is None
+        else tuple(int(tenant_id) for tenant_id in existing.tenant_ids)
+    )
+    setattr(
+        forward_batch,
+        FORWARD_METADATA_ATTRIBUTE,
+        SglangForwardMetadata(
+            tuple(int(slot) for slot in request_slots),
+            priorities,
+            tenant_ids,
+        ),
+    )
 
 
 def register() -> None:

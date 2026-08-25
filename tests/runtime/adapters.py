@@ -1,4 +1,8 @@
-from nta_runtime.adapters.sglang import SglangAdapter, SglangExecutionConfig
+from nta_runtime.adapters.sglang import (
+    SglangAdapter,
+    SglangExecutionConfig,
+    SglangForwardMetadata,
+)
 from nta_runtime.adapters.base import ConsumerContract, ConsumerKind, EngineBoundary
 from nta_runtime.adapters.vllm import VllmAdapter, VllmSchedulerProjection
 from nta_runtime.adapters.vllm_v1 import VllmV1Hook
@@ -26,8 +30,7 @@ class FakeForward:
     batch_size = 2
     rids = ("sg-a", "sg-b")
     req_pool_indices = (5, 7)
-    _nta_request_priorities = (2, 5)
-    _nta_request_tenant_ids = (3, 7)
+    _nta_forward_metadata = SglangForwardMetadata((5, 7), (2, 5), (3, 7))
 
 
 class FakeVllmSchedulerOutput:
@@ -126,6 +129,12 @@ def main() -> None:
     assert tuple(item.tenant_id for item in sglang_batch.bindings) == (3, 7)
     assert sglang_batch.tenant_ids == (3, 7)
     assert tuple(item.request_slot for item in sglang_batch.bindings) == (5, 7)
+    try:
+        SglangForwardMetadata((5,), (2, 5), (3, 7))
+    except ValueError as error:
+        assert "aligned" in str(error)
+    else:
+        raise AssertionError("unaligned SGLang forward metadata was accepted")
     vllm_batch = adapter.bind_forward(
         FakeVllmSchedulerOutput(), epoch=5, granularity=Granularity.LAYER
     )

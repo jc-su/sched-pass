@@ -1446,12 +1446,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
-        request_slots = getattr(forward_batch, "_nta_request_slots", None)
-        if request_slots is None:
-            request_slots = getattr(forward_batch, "req_pool_indices", None)
-        if request_slots is not None and hasattr(request_slots, "tolist"):
-            request_slots = request_slots.tolist()
-        request_slots = tuple(int(slot) for slot in request_slots or ())
+        from nta_runtime.adapters.sglang import forward_metadata
+
+        request_slots = forward_metadata(forward_batch).request_slots
         contiguous_request_slots = bool(request_slots) and request_slots == tuple(
             range(request_slots[0], request_slots[0] + len(request_slots))
         )

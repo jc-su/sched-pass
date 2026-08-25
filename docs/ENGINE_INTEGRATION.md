@@ -20,7 +20,8 @@ The plugin is responsible for:
 
 - registering the pinned `nta_flashinfer` backend;
 - preserving request IDs and request-pool slots through graph views;
-- preserving an optional `_nta_request_tenant_ids` vector through graph views;
+- preserving one typed `_nta_forward_metadata` sidecar (slots, priorities, and
+  optional tenant IDs) through graph views;
 - routing HiCache host-load ownership, admission, cancellation, and release;
 - attaching priority metadata.
 
@@ -37,10 +38,10 @@ real FlashInfer attention launch. It does not use batch position as a
 persistent request slot when SGLang provides the actual pool slot.
 
 Tenant identity is an aligned, deployment-owned annotation: a plugin or
-serving gateway may attach `_nta_request_tenant_ids` to the forward batch, and
-the graph hooks copy it with `rids` and pool slots. Missing annotation means
-the explicit default tenant 0; it is never inferred from request text or
-batch position. Quotas are configured once at worker startup with
+serving gateway may populate the typed `_nta_forward_metadata` sidecar on the
+forward batch, and the graph hooks copy it with `rids` and pool slots. Missing
+annotation means the explicit default tenant 0; it is never inferred from
+request text or batch position. Quotas are configured once at worker startup with
 `NTA_TENANT_BUDGETS=id:bytes[:weight],...` and are enforced by native device
 admission counters.
 
