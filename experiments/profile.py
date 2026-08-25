@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Sequence
 
@@ -154,14 +156,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"tool": tool, "command": profiled}, sort_keys=True))
         return 0
     started = time.monotonic()
-    completed = subprocess.run(
-        profiled,
-        cwd=ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
+    profiler_tmp: Path | None = None
+    profiler_environment = os.environ.copy()
+    if tool == "nsys":
+        # Nsight Systems creates a session directory independently of the
+        # report output. A stale root-owned /tmp/nvidia directory must not
+        # force an otherwise unprivileged artifact run through sudo.
+        profiler_tmp = Path(
+            tempfile.mkdtemp(prefix="nta-nsys-", dir=str(output.parent))
+        )
+        profiler_environment["TMPDIR"] = str(profiler_tmp)
+    try:
+        completed = subprocess.run(
+            profiled,
+            cwd=ROOT,
+            env=profiler_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    finally:
+        if profiler_tmp is not None:
+            shutil.rmtree(profiler_tmp, ignore_errors=True)
     (output / "stdout.log").write_text(completed.stdout, encoding="utf-8")
     document.update(
         {

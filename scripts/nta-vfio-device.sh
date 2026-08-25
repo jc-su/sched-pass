@@ -13,13 +13,45 @@ media_policy=${NTA_NVME_MEDIA_POLICY:-hardware-write-protect}
 dma_target=${NTA_NVME_DMA_TARGET:-hbm-peer}
 probe=${NTA_VFIO_PROBE:-$root_dir/build/nta-vfio-nvme-probe}
 benchmark=${NTA_NVME_BENCHMARK:-$root_dir/build/nta-nvme-bench}
-state=/run/nta-vfio-${bdf}.driver
-partition_state=/run/nta-vfio-${bdf}.partitions
 
 die() {
   printf 'nta-vfio-device: %s\n' "$*" >&2
   exit 1
 }
+
+has_cuda_admin_capability() {
+  local executable=$1 capabilities
+  command -v getcap >/dev/null 2>&1 || return 1
+  [[ -x $executable ]] || return 1
+  capabilities=$(getcap "$executable" 2>/dev/null || true)
+  [[ $capabilities == *cap_sys_admin=ep* ||
+    $capabilities == *cap_sys_admin+ep* ]]
+}
+
+resolve_privilege_mode() {
+  local requested=$1 executable=$2
+  case $requested in
+  0|1)
+    printf '%s\n' "$requested"
+    ;;
+  auto)
+    if has_cuda_admin_capability "$executable"; then
+      printf '0\n'
+    else
+      printf '1\n'
+    fi
+    ;;
+  *)
+    die "privilege mode must be auto, 0, or 1"
+    ;;
+  esac
+}
+
+probe_as_root=$(resolve_privilege_mode "${NTA_VFIO_PROBE_SUDO:-auto}" "$probe")
+benchmark_as_root=$(resolve_privilege_mode \
+  "${NTA_VFIO_BENCHMARK_SUDO:-auto}" "$benchmark")
+state=/run/nta-vfio-${bdf}.driver
+partition_state=/run/nta-vfio-${bdf}.partitions
 
 [[ $bdf =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]] ||
   die "NTA_NVME_BDF must use DDDD:BB:SS.F syntax"
@@ -195,7 +227,7 @@ require_hbm_peer() {
     die "nta_nvme_p2p is not loaded; run scripts/nta-nvme-p2p-module.sh load"
   [[ -c /dev/nta_nvme_p2p ]] ||
     die "/dev/nta_nvme_p2p is unavailable"
-  if [[ ${NTA_VFIO_PROBE_SUDO:-1} == 1 ]]; then
+  if [[ $probe_as_root == 1 ]]; then
     if ! sudo test -r /dev/nta_nvme_p2p ||
       ! sudo test -w /dev/nta_nvme_p2p; then
       die "root cannot access /dev/nta_nvme_p2p"
@@ -310,7 +342,7 @@ bind)
 probe)
   [[ $(current_driver) == vfio-pci ]] || die "$bdf is not bound to vfio-pci"
   [[ -x $probe ]] || die "probe executable is absent; build nta-vfio-nvme-probe"
-  if [[ ${NTA_VFIO_PROBE_SUDO:-1} == 1 ]]; then
+  if [[ $probe_as_root == 1 ]]; then
     sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}" \
       "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy" \
       "$dma_target"
@@ -355,17 +387,25 @@ qualify)
     bind_vfio
   fi
   [[ -x $benchmark ]] || die "benchmark executable is absent; build nta-nvme-bench"
-  sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}" \
-    NTA_REVISION="${NTA_REVISION:-$(git -C "$root_dir" rev-parse HEAD)}" \
-    "$benchmark" \
-    --device="vfio:$bdf" \
-    --gpu="$gpu" \
-    --namespace="$nsid" \
-    --queue-depth="$depth" \
-    --media-policy="$media_policy" \
-    --dma-target="$dma_target" \
-    --reference="$reference" \
+  benchmark_command=(
+    env
+    "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}"
+    "NTA_REVISION=${NTA_REVISION:-$(git -C "$root_dir" rev-parse HEAD)}"
+    "$benchmark"
+    "--device=vfio:$bdf"
+    "--gpu=$gpu"
+    "--namespace=$nsid"
+    "--queue-depth=$depth"
+    "--media-policy=$media_policy"
+    "--dma-target=$dma_target"
+    "--reference=$reference"
     "${@:2}"
+  )
+  if [[ $benchmark_as_root == 1 ]]; then
+    sudo "${benchmark_command[@]}"
+  else
+    "${benchmark_command[@]}"
+  fi
   if [[ $keep_vfio == 1 ]]; then
     trap - EXIT
     printf 'persistent_vfio=1 bdf=%s driver=vfio-pci\n' "$bdf"

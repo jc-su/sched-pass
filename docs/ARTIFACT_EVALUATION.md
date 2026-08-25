@@ -272,6 +272,34 @@ The JIT launcher namespaces FlashInfer caches by Unix UID, so privileged
 physical tests cannot leave root-owned compilation outputs in a later user
 framework run.
 
+Install the project device rule once before using the physical path. It grants
+only the peer-page mapper to the dedicated `nta` group; it does not grant raw
+NVMe namespace access and does not change VFIO's existing `kvm` policy:
+
+```bash
+./scripts/install-nta-device-access.sh
+```
+
+The NVIDIA driver additionally requires `CAP_SYS_ADMIN` to register the VFIO
+BAR doorbell as CUDA IO memory. Install that capability only on the three
+physical NVMe executables after building; it is not needed by the compiler,
+runtime, SGLang/vLLM adapters, or resident serving path:
+
+```bash
+./scripts/install-nta-physical-capabilities.sh build
+```
+
+The physical runner detects these file capabilities and avoids sudo for the
+probe and steady-state benchmark. If they are absent, it deliberately falls
+back to sudo for those physical processes. Re-run the capability setup after
+an executable is rebuilt, and remove it with `sudo setcap -r` when the
+physical tier is no longer in use.
+
+Start a new login session after the group change. The physical probe and the
+steady-state NVMe benchmark then run as the artifact user. PCI rebinding,
+raw-block `fio`, and kernel-log inspection remain privileged setup/measurement
+operations and are invoked through `sudo` by the qualification runner.
+
 Use `hardware-write-protect` unless the controller reports no Namespace Write
 Protection support. `trusted-read-only-code` is an explicit weaker boundary for
 a dedicated experiment controller; it relies on the generated device program
@@ -279,12 +307,11 @@ emitting only NVMe READ commands. Neither policy authorizes formatting,
 filesystem changes, writes, discard, sanitize, or deletion.
 
 The native attention consumer can be checked after the transport qualification
-without changing the device policy.  Keep the controller bound to VFIO and
-run the benchmark as a user with access to `/dev/nta_nvme_p2p` (or through
-`sudo`):
+without changing the device policy. Keep the controller bound to VFIO and run
+the benchmark as the artifact user after installing the device rule above:
 
 ```bash
-sudo env LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64 \
+env LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64 \
   NTA_NVME_MEDIA_POLICY=trusted-read-only-code \
   build/nta-paged-attention \
   --mode=nvme --nvme-endpoint=vfio:0000:d8:00.0 \

@@ -1,0 +1,4 @@
+# The peer-page mapper is the only project device that can create a GPU/NVMe
+# mapping. Keep that capability in a dedicated group; do not broaden access to
+# raw NVMe namespaces or all VFIO devices.
+ACTION=="add|change", SUBSYSTEM=="nta_nvme_p2p", KERNEL=="nta_nvme_p2p", GROUP="nta", MODE="0660"
