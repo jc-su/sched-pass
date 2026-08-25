@@ -21,6 +21,7 @@ def main() -> None:
             "tool": "perf",
             "command": ["perf", "stat", "./trial"],
             "returncode": 0,
+            "outputs": ["perf-stat.csv"],
         }
         baseline = {
             "schema": 1,
@@ -54,6 +55,8 @@ def main() -> None:
                 json.dumps(document, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
+        (root / "perf-stat.csv").write_text("cycles,100\n", encoding="utf-8")
+        (root / "stdout.log").write_text("perf complete\n", encoding="utf-8")
         assert validate(root)["pass"] is True
         invalid = dict(regression)
         invalid["pass"] = False

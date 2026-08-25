@@ -15,6 +15,51 @@ option(NTA_ENABLE_FLASHINFER_VALIDATION
 set(NTA_FLASHINFER_INCLUDE_DIR "" CACHE PATH
     "Path containing flashinfer/page.cuh and flashinfer/attention/state.cuh")
 
+# Physical tests never guess a PCI function or bind one as a side effect of a
+# normal build. Once an operator has explicitly qualified and (optionally)
+# kept a controller on VFIO, these cache values let CTest exercise that same
+# endpoint instead of reporting an avoidable environment skip. They are empty
+# by default so a build cannot claim a physical tier merely because a machine
+# happens to have an NVMe device.
+set(NTA_TEST_NVME_ENDPOINT "$ENV{NTA_NVME_ENDPOINT}" CACHE STRING
+    "Explicit VFIO NVMe endpoint for physical CTest (e.g. vfio:0000:d8:00.0)")
+set(NTA_TEST_NVME_REFERENCE "$ENV{NTA_NVME_REFERENCE}" CACHE FILEPATH
+    "Read-only NVMe reference file for the physical attention CTest")
+set(NTA_TEST_NVME_MEDIA_POLICY "$ENV{NTA_NVME_MEDIA_POLICY}" CACHE STRING
+    "NVMe media policy for physical CTest")
+set(NTA_TEST_NVME_DMA_TARGET "$ENV{NTA_NVME_DMA_TARGET}" CACHE STRING
+    "NVMe DMA destination for physical CTest")
+set(NTA_TEST_NVME_ENVIRONMENT)
+set(NTA_TEST_NVME_PROBE_ARGUMENTS)
+if(NTA_TEST_NVME_ENDPOINT)
+  list(APPEND NTA_TEST_NVME_ENVIRONMENT
+       "NTA_NVME_ENDPOINT=${NTA_TEST_NVME_ENDPOINT}")
+  list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS
+       "${NTA_TEST_NVME_ENDPOINT}" "0" "1" "64")
+endif()
+if(NTA_TEST_NVME_REFERENCE)
+  list(APPEND NTA_TEST_NVME_ENVIRONMENT
+       "NTA_NVME_REFERENCE=${NTA_TEST_NVME_REFERENCE}")
+endif()
+if(NTA_TEST_NVME_MEDIA_POLICY)
+  list(APPEND NTA_TEST_NVME_ENVIRONMENT
+       "NTA_NVME_MEDIA_POLICY=${NTA_TEST_NVME_MEDIA_POLICY}")
+endif()
+if(NTA_TEST_NVME_DMA_TARGET)
+  list(APPEND NTA_TEST_NVME_ENVIRONMENT
+       "NTA_NVME_DMA_TARGET=${NTA_TEST_NVME_DMA_TARGET}")
+endif()
+if(NTA_TEST_NVME_ENDPOINT AND NTA_TEST_NVME_MEDIA_POLICY)
+  list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "${NTA_TEST_NVME_MEDIA_POLICY}")
+elseif(NTA_TEST_NVME_ENDPOINT)
+  list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "hardware-write-protect")
+endif()
+if(NTA_TEST_NVME_ENDPOINT AND NTA_TEST_NVME_DMA_TARGET)
+  list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "${NTA_TEST_NVME_DMA_TARGET}")
+elseif(NTA_TEST_NVME_ENDPOINT)
+  list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "hbm-peer")
+endif()
+
 find_package(LLVM REQUIRED CONFIG)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 message(STATUS "Building NTA against LLVM ${LLVM_PACKAGE_VERSION} in ${LLVM_DIR}")
@@ -993,9 +1038,13 @@ if(Python3_Interpreter_FOUND)
       nta-vfio-nvme-probe PRIVATE -Wall -Wextra -Wpedantic -Werror
     )
   endif()
-  add_test(NAME nta-vfio-nvme-probe COMMAND nta-vfio-nvme-probe)
+  add_test(
+    NAME nta-vfio-nvme-probe
+    COMMAND nta-vfio-nvme-probe ${NTA_TEST_NVME_PROBE_ARGUMENTS}
+  )
   set_tests_properties(nta-vfio-nvme-probe PROPERTIES
     TIMEOUT 60 SKIP_RETURN_CODE 77 LABELS "physical;qualification;nvme"
+    ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
   )
 
   add_executable(nta-cxl-dax-probe tools/CxlDaxProbe.cpp)
@@ -1488,6 +1537,7 @@ if(Python3_Interpreter_FOUND)
     nta-paged-attention-nvme-gpu PROPERTIES
     TIMEOUT 120
     SKIP_RETURN_CODE 77
+    ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
   )
   if(NTA_HAVE_FLASHINFER AND Python3_Interpreter_FOUND)
     add_test(

@@ -232,7 +232,7 @@ python3 scripts/run-nvme-qualification.py \
   --bdf 0000:d8:00.0 \
   --dma-target hbm-peer \
   --media-policy trusted-read-only-code \
-  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 20 \
+  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 100 \
   --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
   --allow-device-rebind --require-ready \
   --output /tmp/nta-artifacts/nvme/nvme-qualification.json
@@ -246,6 +246,31 @@ python3 experiments/validate_tier_qualification.py \
   --required-tier nvme \
   /tmp/nta-artifacts/nvme/tier-qualification.json
 ```
+
+When several physical tests will run and the dedicated controller is not being
+used by another process, add `--keep-vfio` to the qualification command. A
+successful run then retains the explicit VFIO ownership so later tests do not
+repeat the bind/restore cycle; a failed run still restores the previous driver.
+Configure CTest with the same endpoint and immutable reference file, then run
+only the root-required physical tests through `sudo` if the peer bridge device
+is root-only:
+
+```bash
+cmake -S . -B build \
+  -DNTA_TEST_NVME_ENDPOINT=vfio:0000:d8:00.0 \
+  -DNTA_TEST_NVME_REFERENCE=/tmp/nta-nvme-reference.bin \
+  -DNTA_TEST_NVME_MEDIA_POLICY=trusted-read-only-code \
+  -DNTA_TEST_NVME_DMA_TARGET=hbm-peer
+sudo -E env NTA_NVME_ENDPOINT=vfio:0000:d8:00.0 \
+  NTA_NVME_REFERENCE=/tmp/nta-nvme-reference.bin \
+  NTA_NVME_MEDIA_POLICY=trusted-read-only-code \
+  NTA_NVME_DMA_TARGET=hbm-peer \
+  ctest --test-dir build -R 'nta-(vfio-nvme-probe|paged-attention-nvme-gpu)'
+```
+
+The JIT launcher namespaces FlashInfer caches by Unix UID, so privileged
+physical tests cannot leave root-owned compilation outputs in a later user
+framework run.
 
 Use `hardware-write-protect` unless the controller reports no Namespace Write
 Protection support. `trusted-read-only-code` is an explicit weaker boundary for

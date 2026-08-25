@@ -39,6 +39,26 @@ def validate(output: Path) -> dict[str, Any]:
         isinstance(profile.get("command"), list) and profile["command"],
         "profiler command is missing",
     )
+    outputs = profile.get("outputs")
+    _require(
+        isinstance(outputs, list) and outputs,
+        "profiler produced no raw output artifact",
+    )
+    for name in outputs:
+        relative = Path(str(name))
+        _require(
+            not relative.is_absolute() and ".." not in relative.parts,
+            "profiler output path escapes the artifact directory",
+        )
+        output_path = output / relative
+        _require(
+            output_path.is_file() and output_path.stat().st_size > 0,
+            f"profiler output is missing or empty: {name}",
+        )
+    _require(
+        (output / "stdout.log").is_file(),
+        "profiler stdout log is missing",
+    )
 
     validate_baseline(baseline)
     _require(isinstance(measured, dict), "measured performance report is not an object")

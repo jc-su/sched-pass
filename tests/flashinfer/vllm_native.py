@@ -8,9 +8,12 @@ import math
 
 import numpy as np
 import torch
-from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+from flashinfer import (
+    BatchDecodeWithPagedKVCacheWrapper,
+    BatchPrefillWithPagedKVCacheWrapper,
+)
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.v1.attention.backends.flashinfer import FIDecode
+from vllm.v1.attention.backends.flashinfer import FIDecode, FIPrefill
 
 from nta_runtime.adapters.vllm_v1 import (
     VllmV1Hook,
@@ -76,6 +79,27 @@ def main() -> int:
         disable_split_kv=True,
     )
     expected = stock_wrapper.run(query, (key, value))
+    prefill_query = torch.randn(
+        (4, num_heads, head_size), device=device, dtype=torch.float16
+    )
+    stock_prefill = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
+    qo_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    stock_prefill.plan(
+        qo_indptr,
+        indptr,
+        indices,
+        last_page_len,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        page_size,
+        q_data_type=prefill_query.dtype,
+        kv_data_type=kv_cache.dtype,
+        sm_scale=scale,
+        causal=False,
+        disable_split_kv=True,
+    )
+    prefill_expected = stock_prefill.run(prefill_query, (key, value))
 
     runtime = Runtime(
         RuntimeConfig(
@@ -114,10 +138,24 @@ def main() -> int:
         metadata = SimpleNamespace(
             num_decodes=2,
             num_decode_tokens=2,
+            num_prefills=0,
             num_prefill_tokens=0,
+            num_actual_tokens=2,
+            causal=False,
             use_cascade=False,
             decode=FIDecode(wrapper=stock_wrapper),
             decode_use_trtllm=False,
+        )
+        prefill_metadata = SimpleNamespace(
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_prefills=2,
+            num_prefill_tokens=4,
+            num_actual_tokens=4,
+            causal=False,
+            use_cascade=False,
+            prefill=FIPrefill(wrapper=stock_prefill),
+            decode=None,
         )
 
         with set_current_vllm_config(VllmConfig()):
@@ -174,8 +212,47 @@ def main() -> int:
                 )
                 return (output - current_expected).abs().max().item()
 
-            maximum = run_batch(
-                scheduler_output, input_batch, query, expected, epoch=0
+            def run_prefill(epoch: int) -> float:
+                batch = hook.bind_forward(
+                    SimpleNamespace(
+                        num_scheduled_tokens={"a": 2, "b": 2},
+                        finished_req_ids=set(),
+                    ),
+                    input_batch,
+                    epoch=epoch,
+                    stream=torch.cuda.current_stream(),
+                )
+                output = torch.empty_like(prefill_expected)
+                with vllm_v1_forward_state(
+                    SimpleNamespace(
+                        num_scheduled_tokens={"a": 2, "b": 2},
+                        finished_req_ids=set(),
+                    )
+                ):
+                    state = current_vllm_v1_forward_state()
+                    assert state is not None
+                    state.batch = batch
+                    state.hook = hook
+                    state.page_size = page_size
+                    implementation._native_prefill_forward(
+                        None,
+                        prefill_query,
+                        kv_cache,
+                        prefill_metadata,
+                        output,
+                    )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    output, prefill_expected, rtol=2e-3, atol=2e-3
+                )
+                return (output - prefill_expected).abs().max().item()
+
+            maximum = run_prefill(epoch=0)
+            maximum = max(
+                maximum,
+                run_batch(
+                    scheduler_output, input_batch, query, expected, epoch=1
+                ),
             )
             # Rebind both rows to new request generations and run again.  This
             # catches stale runtime tickets/CTA counters that a one-shot
@@ -198,7 +275,7 @@ def main() -> int:
                     second_input,
                     second_query,
                     second_expected,
-                    epoch=1,
+                    epoch=2,
                 ),
             )
 

@@ -6,12 +6,12 @@ persistent input batch.  ``NtaVllmFlashInferImpl`` then consumes that batch
 through a real vLLM ``AttentionImpl`` call and submits the same typed NTA
 work-plan ABI used by the SGLang adapter.
 
-The qualified profile is one KV group, FA2 single-token decode, and no CUDA
-graph capture. Host-staged uses resident CUDA KV; NVMe and CXL-DAX use the
-same exact work-plan/phase protocol as SGLang. Unsupported features use
-vLLM's reference implementation only when explicitly enabled; the native path
-otherwise fails closed so an artifact cannot silently claim NTA execution for
-a stock launch.
+The qualified profile is one KV group, FA2 pure prefill or single-token
+decode, and no CUDA graph capture. Host-staged uses resident CUDA KV; NVMe and
+CXL-DAX use the same exact work-plan/phase protocol as SGLang. Mixed
+prefill/decode batches and unsupported features use vLLM's reference
+implementation only when explicitly enabled; the native path otherwise fails
+closed so an artifact cannot silently claim NTA execution for a stock launch.
 """
 
 from __future__ import annotations
@@ -27,9 +27,13 @@ from typing import Any
 import weakref
 
 import torch
-from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+from flashinfer import (
+    BatchDecodeWithPagedKVCacheWrapper,
+    BatchPrefillWithPagedKVCacheWrapper,
+)
 from vllm import envs
 from vllm.v1.attention.backends.flashinfer import (
+    FIPrefill,
     FlashInferBackend,
     FlashInferMetadataBuilder,
     FlashInferImpl,
@@ -60,7 +64,7 @@ from nta_runtime.flashinfer import (
     enqueue_resident_attention,
     request_ranges_for_schedule,
 )
-from nta_runtime.flashinfer_schedule import decode_schedule
+from nta_runtime.flashinfer_schedule import decode_schedule, paged_prefill_schedule
 from nta_runtime.tenant import tenant_budget_specs, tenant_mapper_from_environment
 from nta_runtime.runtime import (
     AcquireRequirement,
@@ -471,7 +475,7 @@ class NtaVllmFlashInferBackend(FlashInferBackend):
 
 
 class NtaVllmFlashInferImpl(FlashInferImpl):
-    """Native NTA consumer for resident single-token FlashInfer decode."""
+    """Native NTA consumer for exact FlashInfer prefill and decode."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         from nta_runtime.plugins.vllm import ensure_worker_bridge
@@ -479,6 +483,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         ensure_worker_bridge()
         super().__init__(*args, **kwargs)
         self._nta_wrapper: BatchDecodeWithPagedKVCacheWrapper | None = None
+        self._nta_prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = None
         self._nta_plan: DeviceWorkPlan | None = None
         self._nta_plan_capacity = 0
         self._nta_program: JitPhaseProgram | None = None
@@ -573,6 +578,64 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             get_kv_cache_layout(),
             backend="fa2",
             use_tensor_cores=True,
+            jit_args=jit_args,
+        )
+
+    def _ensure_prefill_wrapper(
+        self, query: torch.Tensor, kv_cache: torch.Tensor
+    ) -> None:
+        if self._nta_prefill_wrapper is not None:
+            return
+        if query.dtype not in _DEFAULT_MODULES or kv_cache.dtype != query.dtype:
+            raise RuntimeError(
+                "native vLLM NTA prefill requires matching float16 or "
+                "bfloat16 query and KV-cache dtypes"
+            )
+        if isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype not in {
+            "auto",
+            "float16",
+            "bfloat16",
+        }:
+            raise RuntimeError(
+                "native vLLM NTA prefill does not support quantized KV cache "
+                f"dtype {self.kv_cache_dtype!r}"
+            )
+        module_name = os.environ.get(
+            "NTA_VLLM_PREFILL_MODULE", _DEFAULT_MODULES[query.dtype]
+        )
+        if os.environ.get("NTA_VLLM_PREFILL_MODULE"):
+            module_path = _find_module(module_name)
+        else:
+            module_path = _ensure_default_attention_module(
+                module_name, query.dtype, self.head_size
+            )
+        self._nta_program = _phase_program(module_path)
+        jit_args = attention_jit_args(
+            module_name,
+            dtype_q=query.dtype,
+            dtype_kv=kv_cache.dtype,
+            dtype_o=query.dtype,
+            idtype=torch.int32,
+            head_dim_qk=self.head_size,
+            head_dim_vo=self.head_size,
+        )
+        workspace_bytes = _positive_env(
+            "NTA_VLLM_FLASHINFER_WORKSPACE_BYTES",
+            int(
+                getattr(
+                    envs,
+                    "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE",
+                    64 * 1024 * 1024,
+                )
+            ),
+        )
+        workspace = torch.zeros(
+            workspace_bytes, dtype=torch.uint8, device=query.device
+        )
+        self._nta_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            workspace,
+            get_kv_cache_layout(),
+            backend="fa2",
             jit_args=jit_args,
         )
 
@@ -821,6 +884,237 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         )
         return self._nta_plan
 
+    def _run_native_schedule(
+        self,
+        state: Any,
+        schedule: Any,
+        wrapper: Any,
+        stock_wrapper: Any,
+        layer: Any,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        kind: str,
+    ) -> torch.Tensor:
+        """Execute one exact FlashInfer schedule for either attention phase."""
+        physical = self._serving_tier != "host_staged"
+        raw_layer_id = getattr(layer, "layer_id", None)
+        if physical and raw_layer_id is None:
+            raise RuntimeError(
+                "vLLM physical attention requires a stable transformer layer_id"
+            )
+        layer_id = 0 if raw_layer_id is None else int(raw_layer_id)
+        execution = self._build_plan(
+            state,
+            schedule,
+            layer=layer_id if physical else 0,
+        )
+        if self._nta_program is None:
+            raise RuntimeError("vLLM NTA attention has no validated phase program")
+        batch = state.batch
+        if not isinstance(batch, EngineBatch) or batch.exact_demand is None:
+            raise RuntimeError("vLLM NTA attention has no exact engine batch")
+        if physical:
+            tier = getattr(state, "tier_service", None)
+            if tier is None or tier.tier.value != self._serving_tier:
+                raise RuntimeError(
+                    "vLLM forward tier does not match the worker resource owner"
+                )
+            if batch.exact_demand.unit_bytes % 2:
+                raise RuntimeError(
+                    "vLLM physical KV page bytes must split evenly into K/V"
+                )
+            plan, object_count, is_nvme = self._upload_physical_plan(
+                state,
+                schedule,
+                execution,
+                layer_id,
+                int(state.page_size),
+                batch.exact_demand.unit_bytes // 2,
+                batch.exact_demand.unit_bytes // 2,
+            )
+            self._nta_program.reset(
+                state.hook.runtime,
+                object_count=object_count,
+                work_ticket_count=schedule.work_count,
+                stream=torch.cuda.current_stream(),
+            )
+        else:
+            is_nvme = False
+            self._nta_program.reset(
+                state.hook.runtime,
+                object_count=0,
+                work_ticket_count=schedule.work_count,
+                stream=torch.cuda.current_stream(),
+            )
+            plan = self._upload_plan(
+                execution,
+                schedule,
+                state.hook.runtime,
+                batch.bindings,
+            )
+
+        kv_cache_permute = kv_cache.permute(
+            *FlashInferBackend.get_kv_cache_stride_order()
+        )
+        kv_cache_for_flashinfer = kv_cache_permute.split(self.head_size, dim=-1)
+        if physical and is_nvme:
+            epoch = FlashInferLayerEpoch(
+                state.hook.runtime,
+                plan,
+                self._nta_program,
+                object_count=object_count,
+                max_progress_rounds=tier.config.progress_rounds,
+                wait_for_plan=False,
+            )
+            progress_rounds = epoch.enqueue_nvme(
+                wrapper,
+                query,
+                kv_cache_for_flashinfer,
+                output,
+                issue_budget=tier.config.issue_budget,
+                completion_budget=tier.config.completion_budget,
+                timeout_ns=tier.config.progress_timeout_ns,
+                sm_scale=self.scale,
+                stream=torch.cuda.current_stream(),
+            )
+            if os.environ.get("NTA_VLLM_VERIFY_TRANSFER") == "1":
+                epoch.check(progress_rounds, torch.cuda.current_stream())
+        elif physical:
+            enqueue_resident_attention(
+                state.hook.runtime,
+                plan,
+                wrapper,
+                query,
+                kv_cache_for_flashinfer,
+                output,
+                sm_scale=self.scale,
+            )
+        else:
+            wrapper.run(
+                query,
+                kv_cache_for_flashinfer,
+                state.hook.runtime.device_view_tensor,
+                plan.work_items_tensor,
+                plan.dependencies_tensor,
+                self.scale,
+                schedule.work_count,
+                PREACQUIRED | BIND_CURRENT_GENERATION,
+                out=output,
+            )
+        if os.environ.get("NTA_VLLM_COMPARE_STOCK") == "1":
+            stock_output = torch.empty_like(output)
+            stock_wrapper.run(query, kv_cache_for_flashinfer, out=stock_output)
+            torch.cuda.synchronize()
+            difference = torch.nan_to_num(
+                (output.float() - stock_output.float()).abs(),
+                nan=float("inf"),
+            ).max().item()
+            VLLM_STATS["native_stock_diff_max_milli"] = max(
+                VLLM_STATS["native_stock_diff_max_milli"],
+                int(difference * 1000),
+            )
+        if physical and is_nvme:
+            if self._physical_quiescence_event is None:
+                self._physical_quiescence_event = torch.cuda.Event()
+            self._physical_quiescence_event.record(torch.cuda.current_stream())
+            self._physical_quiescence_recorded = True
+        elif not physical:
+            plan.mark_consumed(torch.cuda.current_stream())
+        execution.record_layer_completion(0)
+        state.hook.record_native_launch()
+        VLLM_STATS[f"native_{kind}_launches"] += 1
+        VLLM_STATS[f"physical_{kind}_launches"] += int(physical)
+        VLLM_STATS[f"native_{kind}_work_items"] += schedule.work_count
+        return output
+
+    def _native_prefill_forward(
+        self,
+        layer: Any,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashInferMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        state = current_vllm_v1_forward_state()
+        if state is None or state.batch is None or state.hook is None:
+            raise RuntimeError("vLLM NTA prefill ran without a worker sidecar")
+        if attn_metadata.num_decodes or attn_metadata.use_cascade:
+            raise RuntimeError("native vLLM prefill requires a pure prefill batch")
+        prefill_metadata = attn_metadata.prefill
+        if not isinstance(prefill_metadata, FIPrefill):
+            raise RuntimeError(
+                "native vLLM prefill requires the FlashInfer FA2 prefill metadata"
+            )
+        stock_wrapper = prefill_metadata.wrapper
+        buffers = tuple(
+            getattr(stock_wrapper, name, None)
+            for name in (
+                "_qo_indptr_buf",
+                "_paged_kv_indptr_buf",
+                "_paged_kv_indices_buf",
+                "_paged_kv_last_page_len_buf",
+            )
+        )
+        if not all(isinstance(tensor, torch.Tensor) for tensor in buffers):
+            raise RuntimeError(
+                "vLLM FlashInfer prefill metadata has no typed paged-KV buffers"
+            )
+        qo_indptr, indptr, indices, last_page_len = buffers
+        if any(
+            tensor.dtype != torch.int32
+            or not tensor.is_cuda
+            or not tensor.is_contiguous()
+            for tensor in buffers
+        ):
+            raise RuntimeError(
+                "vLLM FlashInfer prefill buffers must be contiguous CUDA int32 tensors"
+            )
+        if qo_indptr.numel() != attn_metadata.num_prefills + 1:
+            raise RuntimeError("vLLM FlashInfer prefill has the wrong request count")
+        batch = state.batch
+        if not isinstance(batch, EngineBatch):
+            raise RuntimeError("vLLM prefill has no engine batch")
+        if len(batch.bindings) != attn_metadata.num_prefills:
+            raise RuntimeError(
+                "native vLLM prefill requires one exact row per scheduled request"
+            )
+        page_size = int(getattr(state, "page_size", 0) or 0)
+        if page_size <= 0:
+            raise RuntimeError("vLLM forward sidecar has no token page size")
+        self._ensure_prefill_wrapper(query, kv_cache)
+        assert self._nta_prefill_wrapper is not None
+        self._nta_prefill_wrapper.plan(
+            qo_indptr,
+            indptr,
+            indices,
+            last_page_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            page_size,
+            q_data_type=query.dtype,
+            kv_data_type=kv_cache.dtype,
+            sm_scale=self.scale,
+            causal=attn_metadata.causal,
+            disable_split_kv=True,
+        )
+        schedule = paged_prefill_schedule(self._nta_prefill_wrapper)
+        if schedule.work_count <= 0:
+            raise RuntimeError("vLLM FlashInfer prefill produced no work units")
+        return self._run_native_schedule(
+            state,
+            schedule,
+            self._nta_prefill_wrapper,
+            stock_wrapper,
+            layer,
+            query,
+            kv_cache,
+            output,
+            kind="prefill",
+        )
+
     def _native_forward(
         self,
         layer: Any,
@@ -901,142 +1195,17 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             disable_split_kv=True,
         )
         schedule = decode_schedule(self._nta_wrapper)
-        physical = self._serving_tier != "host_staged"
-        raw_layer_id = getattr(layer, "layer_id", None)
-        if physical and raw_layer_id is None:
-            raise RuntimeError(
-                "vLLM physical attention requires a stable transformer layer_id"
-            )
-        layer_id = 0 if raw_layer_id is None else int(raw_layer_id)
-        execution = self._build_plan(
+        return self._run_native_schedule(
             state,
             schedule,
-            layer=layer_id if physical else 0,
+            self._nta_wrapper,
+            stock_wrapper,
+            layer,
+            query,
+            kv_cache,
+            output,
+            kind="decode",
         )
-        if self._nta_program is None:
-            raise RuntimeError("vLLM NTA attention has no validated phase program")
-        # vLLM reuses one worker-local Runtime across attention layers and
-        # forwards.  PREACQUIRED removes dependency discovery from the
-        # consumer launch; it does not retire the previous finite epoch's
-        # work-ticket, CTA-completion, reduction, or request-progress state.
-        # Reset on the same CUDA stream before uploading the next exact plan so
-        # a reused ticket index can never observe an older request generation.
-        if physical:
-            tier = getattr(state, "tier_service", None)
-            if tier is None or tier.tier.value != self._serving_tier:
-                raise RuntimeError(
-                    "vLLM forward tier does not match the worker resource owner"
-                )
-            if batch.exact_demand is None or batch.exact_demand.unit_bytes % 2:
-                raise RuntimeError(
-                    "vLLM physical KV page bytes must split evenly into K/V"
-                )
-            plan, object_count, is_nvme = self._upload_physical_plan(
-                state,
-                schedule,
-                execution,
-                layer_id,
-                page_size,
-                batch.exact_demand.unit_bytes // 2,
-                batch.exact_demand.unit_bytes // 2,
-            )
-            self._nta_program.reset(
-                state.hook.runtime,
-                object_count=object_count,
-                work_ticket_count=schedule.work_count,
-                stream=torch.cuda.current_stream(),
-            )
-        else:
-            is_nvme = False
-            self._nta_program.reset(
-                state.hook.runtime,
-                object_count=0,
-                work_ticket_count=schedule.work_count,
-                stream=torch.cuda.current_stream(),
-            )
-            plan = self._upload_plan(
-                execution,
-                schedule,
-                state.hook.runtime,
-                batch.bindings,
-            )
-        kv_cache_permute = kv_cache.permute(
-            *FlashInferBackend.get_kv_cache_stride_order()
-        )
-        kv_cache_for_flashinfer = kv_cache_permute.split(self.head_size, dim=-1)
-        if physical and is_nvme:
-            epoch = FlashInferLayerEpoch(
-                state.hook.runtime,
-                plan,
-                self._nta_program,
-                object_count=object_count,
-                max_progress_rounds=tier.config.progress_rounds,
-                wait_for_plan=False,
-            )
-            progress_rounds = epoch.enqueue_nvme(
-                self._nta_wrapper,
-                query,
-                kv_cache_for_flashinfer,
-                output,
-                issue_budget=tier.config.issue_budget,
-                completion_budget=tier.config.completion_budget,
-                timeout_ns=tier.config.progress_timeout_ns,
-                sm_scale=self.scale,
-                stream=torch.cuda.current_stream(),
-            )
-            if os.environ.get("NTA_VLLM_VERIFY_TRANSFER") == "1":
-                epoch.check(progress_rounds, torch.cuda.current_stream())
-        elif physical:
-            enqueue_resident_attention(
-                state.hook.runtime,
-                plan,
-                self._nta_wrapper,
-                query,
-                kv_cache_for_flashinfer,
-                output,
-                sm_scale=self.scale,
-            )
-        else:
-            self._nta_wrapper.run(
-                query,
-                kv_cache_for_flashinfer,
-                state.hook.runtime.device_view_tensor,
-                plan.work_items_tensor,
-                plan.dependencies_tensor,
-                self.scale,
-                schedule.work_count,
-                PREACQUIRED | BIND_CURRENT_GENERATION,
-                out=output,
-            )
-        if os.environ.get("NTA_VLLM_COMPARE_STOCK") == "1":
-            # Differential diagnosis is opt-in because the reference launch
-            # adds a synchronization and one extra attention kernel. It
-            # compares the exact query/cache view used by the native launch,
-            # so a mismatch cannot be hidden by token sampling or scheduling.
-            stock_output = torch.empty_like(output)
-            stock_wrapper.run(query, kv_cache_for_flashinfer, out=stock_output)
-            torch.cuda.synchronize()
-            difference = torch.nan_to_num(
-                (output.float() - stock_output.float()).abs(),
-                nan=float("inf"),
-            ).max().item()
-            VLLM_STATS["native_stock_diff_max_milli"] = max(
-                VLLM_STATS["native_stock_diff_max_milli"],
-                int(difference * 1000),
-            )
-        if physical and is_nvme:
-            if self._physical_quiescence_event is None:
-                self._physical_quiescence_event = torch.cuda.Event()
-            self._physical_quiescence_event.record(torch.cuda.current_stream())
-            self._physical_quiescence_recorded = True
-        elif not physical:
-            plan.mark_consumed(torch.cuda.current_stream())
-        execution.record_layer_completion(0)
-        state.hook.record_native_launch()
-        VLLM_STATS["native_decode_launches"] += 1
-        VLLM_STATS["physical_decode_launches"] += int(physical)
-        VLLM_STATS["native_decode_work_items"] += schedule.work_count
-        return output
 
     def forward(
         self,
@@ -1083,41 +1252,35 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 output_scale=output_scale,
                 output_block_scale=output_block_scale,
             )
-        if (
-            getattr(attn_metadata, "num_prefill_tokens", 0)
-            or getattr(attn_metadata, "num_decode_tokens", 0)
-            != getattr(attn_metadata, "num_decodes", 0)
-        ):
-            # The native consumer is intentionally decode-only.  Prefill still
-            # uses vLLM's exact framework implementation, including KV writes;
-            # this is a declared profile boundary, not an exception fallback.
-            VLLM_STATS["reference_prefill_launches"] += 1
-            return super().forward(
-                layer,
-                original_query,
-                original_key,
-                original_value,
-                kv_cache,
-                attn_metadata,
-                output=original_output,
-                output_scale=output_scale,
-                output_block_scale=output_block_scale,
-            )
         num_actual_tokens = attn_metadata.num_actual_tokens
-        query = query[:num_actual_tokens]
-        output = output[:num_actual_tokens]
-        key = key[:num_actual_tokens]
-        value = value[:num_actual_tokens]
         try:
-            self._native_forward(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-            )
+            if attn_metadata.num_prefill_tokens:
+                if attn_metadata.num_decodes:
+                    raise RuntimeError(
+                        "native vLLM attention requires a pure prefill or pure "
+                        "decode batch; mixed batches use the explicit reference"
+                    )
+                self._native_prefill_forward(
+                    layer,
+                    query[:num_actual_tokens],
+                    kv_cache,
+                    attn_metadata,
+                    output[:num_actual_tokens],
+                )
+            else:
+                if attn_metadata.num_decode_tokens != attn_metadata.num_decodes:
+                    raise RuntimeError(
+                        "native vLLM decode requires one query token per request"
+                    )
+                self._native_forward(
+                    layer,
+                    query[:num_actual_tokens],
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    kv_cache,
+                    attn_metadata,
+                    output[:num_actual_tokens],
+                )
             return original_output
         except RuntimeError:
             if os.environ.get("NTA_VLLM_ALLOW_STOCK_FALLBACK") != "1":
@@ -1138,7 +1301,9 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
 
 def consumer_contract() -> dict[str, Any]:
     """Return process-local evidence for artifact collectors."""
-    native = VLLM_STATS["native_decode_launches"]
+    native = VLLM_STATS["native_decode_launches"] + VLLM_STATS[
+        "native_prefill_launches"
+    ]
     if native:
         contract = ConsumerContract.native_work_unit(
             engine="vllm",
@@ -1149,8 +1314,15 @@ def consumer_contract() -> dict[str, Any]:
             {
                 "native_launches": native,
                 "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
-                "resident_only": VLLM_STATS["physical_decode_launches"] == 0,
+                "resident_only": (
+                    VLLM_STATS["physical_decode_launches"]
+                    + VLLM_STATS["physical_prefill_launches"]
+                    == 0
+                ),
                 "physical_decode_launches": VLLM_STATS["physical_decode_launches"],
+                "physical_prefill_launches": VLLM_STATS[
+                    "physical_prefill_launches"
+                ],
             }
         )
         return contract
@@ -1191,6 +1363,7 @@ def _publish_vllm_evidence() -> None:
         == "1",
         "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
         "physical_decode_launches": VLLM_STATS["physical_decode_launches"],
+        "physical_prefill_launches": VLLM_STATS["physical_prefill_launches"],
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

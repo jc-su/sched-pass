@@ -157,12 +157,18 @@ def main() -> int:
         )
     version_tag = f"-fi{flashinfer_version}" if flashinfer_version else ""
     tag = f"nta-abi{abi_version}{version_tag}-{fingerprint(integration_inputs)}"
-    cache_root = pathlib.Path(
+    cache_root_base = pathlib.Path(
         options.cache_root
         or os.environ.get(
             "NTA_JIT_CACHE_ROOT", pathlib.Path.home() / ".cache/flashinfer"
         )
     ).expanduser()
+    # Physical NVMe probes may be run through sudo while framework tests run
+    # as the experiment user. A shared JIT cache lets the privileged run leave
+    # root-owned CUDA objects in the normal user's build tree, turning a later
+    # framework test into an unrelated permission failure. Keep the cache
+    # content-addressed within each UID namespace.
+    cache_root = cache_root_base / f"uid-{os.getuid()}"
     workspace = (cache_root / tag).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     environment = {

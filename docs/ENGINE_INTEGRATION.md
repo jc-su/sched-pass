@@ -187,8 +187,8 @@ FlashInfer module (the defaults are the tensor-core
 `nta_batch_decode_default_v2_hooked*` artifacts are retained for the
 non-tensor-core decode profile).
 
-The native vLLM consumer is intentionally qualified first for one KV group,
-pure single-token decode, FA2 (non-TRTLLM), and eager mode. It is opt-in with
+The native vLLM consumer is qualified for one KV group, pure prefill or
+single-token decode, FA2 (non-TRTLLM), and eager mode. It is opt-in with
 `NTA_VLLM_NATIVE=1`; the default is vLLM's reference attention because a
 resident-only run does not exercise a remote-tier dependency and must not pay
 the NTA protocol overhead. When `NTA_SERVING_TIER=nvme` or `cxl_dax`, the same
@@ -200,12 +200,14 @@ boundary because the current project does not yet own vLLM's dynamic
 prefix-cache write-back/eviction lifecycle. The physical profile is still
 hardware-qualified separately and has no stock-attention fallback.
 The builder reports no CUDA-graph support until plan upload/replay has its own
-graph-stability gate. Prefill, mixed batches, TRTLLM, and external NVMe/CXL
-loads remain explicit fail-closed boundaries; `NTA_VLLM_ALLOW_STOCK_FALLBACK=1`
-is a debugging reference only and is invalid for native artifacts.
+graph-stability gate. Mixed batches and TRTLLM remain explicit fail-closed
+boundaries; pure prefill uses the same exact paged-work-unit contract as
+decode, while external NVMe/CXL loads additionally require the physical
+catalog and tier qualification. `NTA_VLLM_ALLOW_STOCK_FALLBACK=1` is a
+debugging reference only and is invalid for native artifacts.
 
 Consequently, a vLLM artifact can claim native NTA execution for the resident
-profile or for a catalog-backed physical decode profile only when its evidence
+profile or for a catalog-backed physical prefill/decode profile only when its evidence
 contains the corresponding native launches and tier capability proof. The
 shared vLLM/SGLang runtime and tenant contract are integrated. This direct
 attention path deliberately does not claim implementation of vLLM's upstream
@@ -229,7 +231,7 @@ consumer. A connector alone must never be reported as NTA execution. The
 current multi-tier vLLM path instead uses the exact block-table projection and
 NTA catalog contract; a future KVConnector must add its own exact
 request/prefix identity, eviction, and lifetime tests rather than silently
-sharing this decode-only catalog path.
+sharing this worker attention path.
 
 The distinction is machine-checked in engine statistics. A
 `consumer_contract.kind` of `projection_only` is valid for adapter tests but

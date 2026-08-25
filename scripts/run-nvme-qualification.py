@@ -34,7 +34,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="exact dependency/consumer rounds per replay; NVMe polling is completion-driven",
     )
-    parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=100,
+        help="measured GPU graph replays; 100 reduces clock/queue noise",
+    )
     parser.add_argument("--fio-runtime", type=int, default=10)
     parser.add_argument("--fio-size", default="2G")
     parser.add_argument(
@@ -48,13 +53,26 @@ def parse_args() -> argparse.Namespace:
         default="hbm-peer",
         help="NVMe data destination; host-mapped is an explicit baseline",
     )
-    parser.add_argument("--minimum-bandwidth-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--minimum-bandwidth-ratio",
+        type=float,
+        default=0.9,
+        help="minimum direct-HBM/fio bandwidth ratio for qualification",
+    )
     parser.add_argument("--cta-try-issue", action="store_true")
     parser.add_argument("--require-ready", action="store_true")
     parser.add_argument(
         "--allow-device-rebind",
         action="store_true",
         help="confirm that the selected NVMe controller may be rebound to VFIO",
+    )
+    parser.add_argument(
+        "--keep-vfio",
+        action="store_true",
+        help=(
+            "leave a successful qualification on VFIO for subsequent tests; "
+            "failures still restore the previous driver"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -215,6 +233,7 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
         "NTA_NVME_DMA_TARGET": args.dma_target,
         "NTA_NVME_REFERENCE_BYTES": str(args.bytes * args.requests),
         "NTA_ALLOW_DEVICE_REBIND": "1",
+        "NTA_NVME_KEEP_VFIO": "1" if args.keep_vfio else "0",
         "NTA_REVISION": git_revision,
     }
     run(

@@ -336,11 +336,24 @@ bind-and-probe)
   ;;
 qualify)
   require_rebind_confirmation
+  keep_vfio=${NTA_NVME_KEEP_VFIO:-0}
+  [[ $keep_vfio == 0 || $keep_vfio == 1 ]] ||
+    die "NTA_NVME_KEEP_VFIO must be 0 or 1"
   restore_on_exit() {
     "$0" restore >/dev/null 2>&1 || true
   }
   trap restore_on_exit EXIT
-  bind_vfio
+  if [[ $(current_driver) == vfio-pci ]]; then
+    # Reusing an explicitly owned controller avoids an unnecessary PCI
+    # unbind/rebind between qualification runs. The containment and peer-DMA
+    # checks remain mandatory for the persistent-session path.
+    require_containment
+    require_hbm_peer
+    [[ -r $state ]] ||
+      die "VFIO controller has no ownership state; use bind first"
+  else
+    bind_vfio
+  fi
   [[ -x $benchmark ]] || die "benchmark executable is absent; build nta-nvme-bench"
   sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}" \
     NTA_REVISION="${NTA_REVISION:-$(git -C "$root_dir" rev-parse HEAD)}" \
@@ -353,8 +366,13 @@ qualify)
     --dma-target="$dma_target" \
     --reference="$reference" \
     "${@:2}"
-  "$0" restore
-  trap - EXIT
+  if [[ $keep_vfio == 1 ]]; then
+    trap - EXIT
+    printf 'persistent_vfio=1 bdf=%s driver=vfio-pci\n' "$bdf"
+  else
+    "$0" restore
+    trap - EXIT
+  fi
   ;;
 restore)
   require_safe_device

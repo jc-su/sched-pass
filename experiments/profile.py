@@ -69,6 +69,23 @@ def _profile_command(tool: str, output: Path, command: Sequence[str]) -> list[st
     raise ValueError(f"unsupported profiler {tool}")
 
 
+def _outputs(output: Path, tool: str) -> list[str]:
+    """Return non-empty profiler outputs relative to the artifact directory."""
+    patterns = {
+        "nsys": ("profile*.nsys-rep", "profile*.qdrep"),
+        "ncu": ("profile*.ncu-rep",),
+        "perf": ("perf-stat.csv",),
+    }
+    found: set[Path] = set()
+    for pattern in patterns[tool]:
+        found.update(path for path in output.glob(pattern) if path.is_file())
+    return sorted(
+        str(path.relative_to(output))
+        for path in found
+        if path.stat().st_size > 0
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -105,6 +122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "status": "unavailable",
             "requested_tool": args.tool,
             "command": command,
+            "outputs": [],
             "revision": _git("rev-parse", "HEAD"),
         }
         output.mkdir(parents=True, exist_ok=True)
@@ -124,6 +142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tool_path": tool_path,
         "command": command,
         "profile_command": profiled,
+        "outputs": [],
         "revision": _git("rev-parse", "HEAD"),
         "dirty": bool(status),
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -149,6 +168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "status": "complete" if completed.returncode == 0 else "failed",
             "returncode": completed.returncode,
             "duration_seconds": time.monotonic() - started,
+            "outputs": _outputs(output, tool),
         }
     )
     (output / "profile.json").write_text(

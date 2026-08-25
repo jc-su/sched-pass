@@ -156,7 +156,7 @@ python3 scripts/run-nvme-qualification.py \
   --bdf 0000:d8:00.0 \
   --dma-target hbm-peer \
   --media-policy trusted-read-only-code \
-  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 20 \
+  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 100 \
   --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
   --allow-device-rebind --require-ready \
   --output /path/outside/checkout/nvme-qualification.json
@@ -200,6 +200,26 @@ The nine pre-existing fault lines came from rejected development runs before
 the explicit IOMMUFD peer PTE fix. Qualification requires the count to remain
 unchanged; it does not erase kernel history. The controller was restored to the
 kernel `nvme` driver after the run and its namespace returned live.
+
+For a sequence of physical tests on an otherwise unused dedicated controller,
+the qualification can deliberately retain the already-qualified VFIO
+attachment:
+
+```bash
+python3 scripts/run-nvme-qualification.py \
+  --bdf 0000:d8:00.0 --allow-device-rebind --keep-vfio \
+  --media-policy trusted-read-only-code --dma-target hbm-peer \
+  --output /tmp/nta-artifacts/nvme/qualification.json
+```
+
+`--keep-vfio` does not change namespace contents and still restores the prior
+driver if qualification fails. It only suppresses the final restore after a
+successful run, so subsequent CTest or attention runs can reuse the explicit
+VFIO ownership. Restore the controller when the session is over:
+
+```bash
+NTA_NVME_BDF=0000:d8:00.0 scripts/nta-vfio-device.sh restore
+```
 
 This is one-platform transport/correctness/performance evidence. It does not
 by itself establish serving-level speedup, topology portability, multi-GPU
