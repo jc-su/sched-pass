@@ -23,9 +23,27 @@ def main() -> None:
         pass
     else:
         raise AssertionError("duplicate tenant-prefix policy was accepted")
+    for value in (
+        f"{1 << 32}:1048576",
+        f"7:{1 << 64}",
+        f"7:1048576:{1 << 32}",
+    ):
+        try:
+            tenant_budget_specs({"NTA_TENANT_BUDGETS": value})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"out-of-range tenant budget was accepted: {value}")
+    try:
+        tenant_mapper_from_environment(
+            {"NTA_TENANT_REQUEST_PREFIXES": f"{1 << 32}:team/"}
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("out-of-range tenant prefix was accepted")
     print("tenant-policy=pass")
 
 
 if __name__ == "__main__":
     main()
-

@@ -81,10 +81,38 @@ def _unfinished_findings(root: Path) -> list[str]:
         except SyntaxError as error:
             findings.append(f"{path.relative_to(root)}: syntax error: {error}")
             continue
+        protocol_functions = {
+            child
+            for class_node in ast.walk(tree)
+            if isinstance(class_node, ast.ClassDef)
+            and any(
+                isinstance(base, ast.Name) and base.id == "Protocol"
+                for base in class_node.bases
+            )
+            for child in ast.walk(class_node)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
+            if node in protocol_functions:
+                continue
+            body = list(node.body)
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]
+            if len(body) == 1 and (
+                isinstance(body[0], ast.Pass)
+                or (
+                    isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and body[0].value.value is Ellipsis
+                )
+            ):
                 findings.append(
                     f"{path.relative_to(root)}:{node.lineno}: empty function {node.name}"
                 )

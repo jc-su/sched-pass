@@ -9,17 +9,33 @@ from nta_runtime import (
     AcquireRequirement,
     DeviceWorkPlan,
     IndexedHostObject,
+    CxlDaxOptions,
+    NvmeOptions,
     Placement,
     Replica,
     RequestRange,
     Runtime,
     RuntimeConfig,
+    RequestSpec,
     WorkItem,
     device_abi_version,
 )
 
 
 def main() -> None:
+    for factory in (
+        lambda: RuntimeConfig(1 << 32, 1, 1, 1),
+        lambda: RequestSpec(0, 1 << 64, 0),
+        lambda: Replica(1, Placement.HBM, estimated_latency_ns=1 << 64),
+        lambda: NvmeOptions("vfio:0000:00:00.0", queue_depth=1 << 32),
+        lambda: CxlDaxOptions("/dev/dax0.0", 1 << 64),
+    ):
+        try:
+            factory()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-range native ABI input was accepted")
     assert device_abi_version() > 0
     source = torch.empty(4096, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()

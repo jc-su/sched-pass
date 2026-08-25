@@ -95,8 +95,12 @@ class TierPageCatalog:
     ) -> None:
         if alignment_bytes <= 0 or alignment_bytes & (alignment_bytes - 1):
             raise ValueError("catalog alignment_bytes must be a positive power of two")
+        if alignment_bytes > _UINT64_MAX:
+            raise ValueError("catalog alignment_bytes exceeds the native uint64 limit")
         if window_bytes is not None and window_bytes <= 0:
             raise ValueError("catalog window_bytes must be positive")
+        if window_bytes is not None and window_bytes > _UINT64_MAX:
+            raise ValueError("catalog window_bytes exceeds the native uint64 limit")
         by_key: dict[tuple[int, int], _PageRecord] = {}
         ranges: list[tuple[int, int, tuple[int, int], str]] = []
         for record in records:
@@ -275,6 +279,8 @@ class ServingTierConfig:
             raise ValueError("queue_depth must be positive")
         if self.window_bytes < 0:
             raise ValueError("window_bytes cannot be negative")
+        if self.window_bytes > _UINT64_MAX:
+            raise ValueError("window_bytes exceeds the native uint64 limit")
         if self.device_ordinal < -1:
             raise ValueError("device_ordinal must be -1 or nonnegative")
         if self.issue_budget <= 0 or self.completion_budget <= 0:

@@ -6,6 +6,7 @@ import ctypes
 import ctypes.util
 import dataclasses
 import enum
+import numbers
 import os
 import pathlib
 from collections.abc import Iterable
@@ -15,6 +16,38 @@ from .resource_contract import ResourceCapability, ResourceOwner
 
 
 API_VERSION = 36
+_UINT32_MAX = (1 << 32) - 1
+_UINT64_MAX = (1 << 64) - 1
+_INT32_MAX = (1 << 31) - 1
+
+
+def _bounded_integer(
+    value: int, name: str, *, minimum: int, maximum: int
+) -> int:
+    """Validate a Python integer before it crosses the C ABI boundary."""
+
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ValueError(f"{name} must be an integer")
+    result = int(value)
+    if result < minimum or result > maximum:
+        raise ValueError(f"{name} is outside [{minimum}, {maximum}]")
+    return result
+
+
+def _u32(value: int, name: str, *, positive: bool = False) -> int:
+    return _bounded_integer(
+        value, name, minimum=1 if positive else 0, maximum=_UINT32_MAX
+    )
+
+
+def _u64(value: int, name: str, *, positive: bool = False) -> int:
+    return _bounded_integer(
+        value, name, minimum=1 if positive else 0, maximum=_UINT64_MAX
+    )
+
+
+def _device_ordinal(value: int, name: str = "device_ordinal") -> int:
+    return _bounded_integer(value, name, minimum=-1, maximum=_INT32_MAX)
 
 
 class RuntimeError(Exception):
@@ -556,14 +589,10 @@ class RuntimeConfig:
             "max_replicas_per_object",
             "max_dependencies_per_work_ticket",
         ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
-        if self.device_ordinal < -1:
-            raise ValueError("device_ordinal must be -1 or nonnegative")
-        if self.tenant_capacity < 0:
-            raise ValueError("tenant_capacity cannot be negative")
-        if not 0 <= self.staging_byte_capacity <= (1 << 64) - 1:
-            raise ValueError("staging_byte_capacity is outside uint64")
+            _u32(getattr(self, name), name, positive=True)
+        _device_ordinal(self.device_ordinal)
+        _u32(self.tenant_capacity, "tenant_capacity")
+        _u64(self.staging_byte_capacity, "staging_byte_capacity")
 
     def native(self) -> _RuntimeConfig:
         return _RuntimeConfig(
@@ -592,6 +621,15 @@ class RequestSpec:
     deadline_clock: int = 0
     max_outstanding_bytes: int = (1 << 64) - 1
 
+    def __post_init__(self) -> None:
+        _u32(self.slot, "request slot")
+        _u64(self.request_id, "request id")
+        _u32(self.generation, "request generation")
+        _u32(self.tenant_id, "request tenant")
+        _u32(self.priority, "request priority")
+        _u64(self.deadline_clock, "request deadline")
+        _u64(self.max_outstanding_bytes, "request max outstanding bytes")
+
     def native(self) -> _RequestSpec:
         return _RequestSpec(
             self.request_id,
@@ -611,6 +649,19 @@ class Replica:
     tensor_map_address: int = 0
     estimated_latency_ns: int = 0
     estimated_bandwidth_bytes_per_second: int = 0
+
+    def __post_init__(self) -> None:
+        _u64(self.source_device_address, "replica source address", positive=True)
+        _u64(self.tensor_map_address, "replica tensor-map address")
+        _u64(self.estimated_latency_ns, "replica latency")
+        _u64(
+            self.estimated_bandwidth_bytes_per_second,
+            "replica bandwidth",
+        )
+        try:
+            Placement(self.placement)
+        except (TypeError, ValueError) as error:
+            raise ValueError("replica placement is invalid") from error
 
     def native(self) -> _Replica:
         return _Replica(
@@ -639,6 +690,28 @@ class IndexedHostObject:
     staging_index_limit: int
     preacquired: bool = False
 
+    def __post_init__(self) -> None:
+        _u64(self.object_id, "indexed object id")
+        _u32(self.version, "indexed object version")
+        for name in (
+            "source_device_address",
+            "staging_device_address",
+            "source_indices_device_address",
+            "staging_indices_device_address",
+        ):
+            _u64(getattr(self, name), f"indexed {name}", positive=True)
+        for name in (
+            "index_count",
+            "element_bytes",
+            "source_stride_bytes",
+            "staging_stride_bytes",
+            "source_index_limit",
+            "staging_index_limit",
+        ):
+            _u32(getattr(self, name), f"indexed {name}", positive=True)
+        if not isinstance(self.preacquired, bool):
+            raise ValueError("indexed object preacquired must be boolean")
+
     def native(self) -> _IndexedHostObject:
         return _IndexedHostObject(
             self.object_id,
@@ -666,6 +739,20 @@ class NvmeOptions:
     admin_timeout_ms: int = 10_000
     trust_read_only_device_code: bool = False
     dma_target: NvmeDmaTarget = NvmeDmaTarget.HBM_PEER
+
+    def __post_init__(self) -> None:
+        if not self.endpoint:
+            raise ValueError("NVMe endpoint must be explicit")
+        _device_ordinal(self.device_ordinal)
+        _u32(self.namespace_id, "NVMe namespace", positive=True)
+        _u32(self.queue_depth, "NVMe queue depth", positive=True)
+        _u32(self.admin_timeout_ms, "NVMe admin timeout", positive=True)
+        if not isinstance(self.trust_read_only_device_code, bool):
+            raise ValueError("NVMe read-only trust policy must be boolean")
+        try:
+            NvmeDmaTarget(self.dma_target)
+        except (TypeError, ValueError) as error:
+            raise ValueError("NVMe DMA target is invalid") from error
 
 
 @dataclasses.dataclass(frozen=True)
@@ -709,10 +796,8 @@ class CxlDaxOptions:
     def __post_init__(self) -> None:
         if not self.endpoint:
             raise ValueError("CXL DAX endpoint must be explicit")
-        if self.window_bytes <= 0:
-            raise ValueError("CXL DAX window_bytes must be positive")
-        if self.device_ordinal < -1:
-            raise ValueError("CXL DAX device_ordinal must be -1 or nonnegative")
+        _u64(self.window_bytes, "CXL DAX window_bytes", positive=True)
+        _device_ordinal(self.device_ordinal, "CXL DAX device_ordinal")
 
 
 @dataclasses.dataclass(frozen=True)

@@ -86,6 +86,12 @@ def main() -> None:
         assert "endpoint" in str(error)
     else:
         raise AssertionError("invalid physical tier config was accepted")
+    try:
+        ServingTierConfig(window_bytes=1 << 64)
+    except ValueError as error:
+        assert "uint64" in str(error)
+    else:
+        raise AssertionError("an out-of-range tier window was accepted")
 
     document = {
         "schema": 1,
@@ -175,6 +181,16 @@ def main() -> None:
             assert "max transfer" in str(error)
         else:
             raise AssertionError("oversized NVMe extent was not rejected")
+        huge_window = json.loads(json.dumps(document))
+        huge_window["window_bytes"] = 1 << 64
+        huge_window_path = Path(directory) / "huge-window.json"
+        huge_window_path.write_text(json.dumps(huge_window), encoding="utf-8")
+        try:
+            TierPageCatalog.load(huge_window_path, expected_tier=ServingTier.NVME)
+        except ValueError as error:
+            assert "uint64" in str(error)
+        else:
+            raise AssertionError("an out-of-range catalog window was accepted")
     print("tier_service=pass")
 
 

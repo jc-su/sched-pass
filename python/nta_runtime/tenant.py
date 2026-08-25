@@ -13,6 +13,8 @@ import os
 
 
 TenantMapper = Callable[[str], int]
+_UINT32_MAX = (1 << 32) - 1
+_UINT64_MAX = (1 << 64) - 1
 
 
 def tenant_budget_specs(
@@ -34,7 +36,14 @@ def tenant_budget_specs(
             weight = 1 if len(fields) == 2 else int(fields[2])
         except ValueError as error:
             raise ValueError("NTA_TENANT_BUDGETS contains an invalid value") from error
-        if tenant_id < 0 or max_bytes < 0 or weight <= 0:
+        if (
+            tenant_id < 0
+            or tenant_id > _UINT32_MAX
+            or max_bytes < 0
+            or max_bytes > _UINT64_MAX
+            or weight <= 0
+            or weight > _UINT32_MAX
+        ):
             raise ValueError("NTA_TENANT_BUDGETS contains an invalid value")
         if tenant_id in seen:
             raise ValueError("NTA_TENANT_BUDGETS repeats a tenant")
@@ -73,7 +82,7 @@ def tenant_mapper_from_environment(
                 "NTA_TENANT_REQUEST_PREFIXES contains an invalid tenant"
             ) from error
         prefix = fields[1]
-        if tenant_id < 0 or not prefix:
+        if tenant_id < 0 or tenant_id > _UINT32_MAX or not prefix:
             raise ValueError("NTA_TENANT_REQUEST_PREFIXES contains an invalid value")
         if tenant_id in tenants or prefix in prefixes:
             raise ValueError("NTA_TENANT_REQUEST_PREFIXES repeats a tenant or prefix")
