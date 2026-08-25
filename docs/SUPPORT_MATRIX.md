@@ -9,7 +9,7 @@ from a skipped test or a previous boot.
 | --- | --- | --- | --- | --- | --- |
 | Native runtime/resource contract | implemented | implemented | implemented; physical qualification required | implemented; endpoint qualification required | typed budget/admission implemented |
 | SGLang + FlashInfer | exact resident and mixed external work | exact indexed path | exact catalog path, GPU-owned progress | exact direct-address path | sidecar tenant IDs plus startup budgets |
-| vLLM 0.26 V1 plugin | reference by default; opt-in exact eager single-token decode/FA2 NTA consumer | not a serving claim | fail-closed; external connector/consumer not implemented | fail-closed; external connector/consumer not implemented | request-prefix adapter plus startup budgets |
+| vLLM 0.26 v1 API / V2 model runner | reference by default; opt-in exact eager single-token decode/FA2 NTA consumer | not a serving claim | fail-closed; external connector/consumer not implemented | fail-closed; external connector/consumer not implemented | request-prefix adapter plus startup budgets |
 | LLVM/compiler | typed marker lowering and contract checks | same | same | same | identity comes from typed binding, not guessing |
 
 The compiler's marker-free paged-signature discovery is diagnostic only. It

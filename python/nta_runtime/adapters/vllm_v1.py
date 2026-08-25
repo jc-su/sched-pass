@@ -73,11 +73,12 @@ class VllmV1ForwardState:
     never replace ``batch`` after the first layer has entered.
     """
 
-    scheduler_output: Any
+    scheduler_output: Any | None = None
     input_batch: Any | None = None
     batch: EngineBatch | None = None
     hook: "VllmV1Hook | None" = None
     page_size: int = 0
+    reference_warmup: bool = False
 
 
 _FORWARD_STATE: contextvars.ContextVar[VllmV1ForwardState | None] = (
@@ -91,6 +92,24 @@ def vllm_v1_forward_state(
 ) -> Any:
     """Install one worker-forward sidecar for opaque vLLM attention ops."""
     state = VllmV1ForwardState(scheduler_output)
+    token = _FORWARD_STATE.set(state)
+    try:
+        yield state
+    finally:
+        _FORWARD_STATE.reset(token)
+
+
+@contextmanager
+def vllm_v1_reference_warmup_state() -> Any:
+    """Mark a framework-owned dummy forward as reference-only.
+
+    vLLM builds profiling and attention-workspace warmup batches directly in
+    ``GPUModelRunner._dummy_run``.  Those batches have no scheduler request
+    identity and must never be passed to the NTA work-unit path.  Keeping this
+    marker separate from :func:`vllm_v1_forward_state` prevents a missing real
+    worker sidecar from being mistaken for a harmless warmup.
+    """
+    state = VllmV1ForwardState(reference_warmup=True)
     token = _FORWARD_STATE.set(state)
     try:
         yield state
@@ -131,6 +150,7 @@ class VllmV1SchedulerProjection:
     request_ids: tuple[str, ...]
     block_tables: tuple[tuple[int, ...], ...]
     page_bytes: int
+    request_rows: tuple[int, ...] = ()
 
     @classmethod
     def from_forward(
@@ -231,6 +251,89 @@ class VllmV1SchedulerProjection:
     def exact_demand(self) -> ExactDemandProjection:
         return ExactDemandProjection(self.block_tables, self.page_bytes)
 
+    @classmethod
+    def from_v2_forward(
+        cls,
+        scheduler_output: Any,
+        input_batch: Any,
+        *,
+        block_tables: Sequence[Any],
+        num_blocks: Sequence[Any],
+        page_bytes: int,
+    ) -> "VllmV1SchedulerProjection":
+        """Project vLLM's V2 batch after its device table gather.
+
+        V2 intentionally removed the V1 CPU ``MultiGroupBlockTable`` object.
+        The worker bridge supplies an adapter-owned CPU mirror maintained from
+        vLLM's allocation writes, so this projection does not copy a GPU block
+        table back to the host on every forward.
+        """
+        if page_bytes <= 0:
+            raise ValueError("vLLM V2 page_bytes must be positive")
+        scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
+        if not isinstance(scheduled, Mapping) or not scheduled:
+            raise RuntimeError(
+                "vLLM V2 scheduler output must expose non-empty "
+                "num_scheduled_tokens"
+            )
+        request_ids_in_batch = getattr(input_batch, "req_ids", None)
+        row_indices = getattr(input_batch, "idx_mapping_np", None)
+        if not isinstance(request_ids_in_batch, Sequence) or isinstance(
+            request_ids_in_batch, (str, bytes)
+        ):
+            raise RuntimeError("vLLM V2 input batch has no request-id sequence")
+        if isinstance(row_indices, (str, bytes)):
+            raise RuntimeError("vLLM V2 input batch has no CPU request index map")
+        if len(request_ids_in_batch) != len(row_indices):
+            raise RuntimeError("vLLM V2 request IDs and row indices are misaligned")
+        scheduled_ids = {str(request_id) for request_id in scheduled}
+        request_ids = tuple(
+            str(request_id)
+            for request_id in request_ids_in_batch
+            if str(request_id) in scheduled_ids
+        )
+        if len(request_ids) != len(scheduled_ids) or set(request_ids) != scheduled_ids:
+            raise RuntimeError(
+                "vLLM V2 input batch and scheduler output disagree on scheduled "
+                "request IDs"
+            )
+        if len(block_tables) != 1 or len(num_blocks) != 1:
+            raise RuntimeError(
+                "vLLM V2 exact-demand hook currently requires exactly one KV group"
+            )
+        table = block_tables[0]
+        counts = num_blocks[0]
+        rows: list[tuple[int, ...]] = []
+        request_indices: dict[str, int] = {}
+        for request_id, row_index in zip(
+            request_ids_in_batch, row_indices, strict=True
+        ):
+            request_id = str(request_id)
+            if request_id not in scheduled_ids:
+                continue
+            row_index = int(row_index)
+            request_indices[request_id] = row_index
+            try:
+                row_count = int(counts[row_index])
+                if row_count <= 0:
+                    raise RuntimeError(
+                        f"vLLM V2 request {request_id!r} has no exact KV blocks"
+                    )
+                row = tuple(int(page) for page in table[row_index, :row_count].tolist())
+            except (AttributeError, IndexError, TypeError, ValueError):
+                raise RuntimeError(
+                    f"vLLM V2 block-table row is not readable for {request_id!r}"
+                ) from None
+            rows.append(row)
+        if set(request_indices) != set(request_ids):
+            raise RuntimeError("vLLM V2 scheduled request rows are incomplete")
+        return cls(
+            request_ids,
+            tuple(rows),
+            page_bytes,
+            tuple(request_indices[request_id] for request_id in request_ids),
+        )
+
 
 class _StableVllmSlots:
     """Bounded stable request-ID to NTA-slot mapping."""
@@ -239,11 +342,31 @@ class _StableVllmSlots:
         if capacity <= 0:
             raise ValueError("vLLM V1 request capacity must be positive")
         self._request_to_slot: dict[str, int] = {}
+        self._request_to_row: dict[str, int] = {}
+        self._row_to_request: dict[int, str] = {}
         self._free = list(range(capacity))
         heapq.heapify(self._free)
 
+    def replacements(
+        self, request_ids: Sequence[str], request_rows: Sequence[int]
+    ) -> tuple[str, ...]:
+        if len(request_ids) != len(request_rows):
+            raise RuntimeError("vLLM request IDs and allocation rows are misaligned")
+        current = set(request_ids)
+        replaced = {
+            previous
+            for request_id, row in zip(request_ids, request_rows, strict=True)
+            if (previous := self._row_to_request.get(int(row))) is not None
+            and previous != request_id
+            and previous not in current
+        }
+        return tuple(sorted(replaced))
+
     def assign(
-        self, request_ids: Sequence[str], finished_request_ids: Sequence[str]
+        self,
+        request_ids: Sequence[str],
+        finished_request_ids: Sequence[str],
+        request_rows: Sequence[int] | None = None,
     ) -> tuple[int, ...]:
         if len(set(request_ids)) != len(request_ids):
             raise RuntimeError("vLLM V1 scheduled request IDs are not unique")
@@ -253,18 +376,56 @@ class _StableVllmSlots:
             raise RuntimeError(
                 "vLLM V1 cannot reuse a request ID in the same finish/schedule step"
             )
-        for request_id in finished:
+        if request_rows is not None and len(request_rows) != len(request_ids):
+            raise RuntimeError("vLLM request IDs and allocation rows are misaligned")
+        if request_rows is not None:
+            request_rows = tuple(int(row) for row in request_rows)
+            if len(set(request_rows)) != len(request_rows):
+                raise RuntimeError("vLLM allocation rows are not unique")
+
+        def release(request_id: str) -> None:
             slot = self._request_to_slot.pop(request_id, None)
-            if slot is not None and request_id not in current:
+            row = self._request_to_row.pop(request_id, None)
+            if row is not None and self._row_to_request.get(row) == request_id:
+                self._row_to_request.pop(row, None)
+            if slot is not None:
                 heapq.heappush(self._free, slot)
+
+        for request_id in finished:
+            if request_id not in current:
+                release(request_id)
+        if request_rows is not None:
+            # vLLM may compact or swap persistent input-batch rows.  Detach
+            # every moving live request before resolving target-row owners;
+            # otherwise a two-way swap leaves a stale reverse entry and the
+            # next row replacement can leak a request slot.
+            targets = dict(zip(request_ids, request_rows, strict=True))
+            for request_id, target_row in targets.items():
+                previous_row = self._request_to_row.get(request_id)
+                if previous_row is not None and previous_row != target_row:
+                    if self._row_to_request.get(previous_row) == request_id:
+                        self._row_to_request.pop(previous_row, None)
+                    self._request_to_row.pop(request_id, None)
+            for request_id, row in targets.items():
+                previous = self._row_to_request.get(row)
+                if previous is not None and previous != request_id:
+                    if previous in current:
+                        self._request_to_row.pop(previous, None)
+                    else:
+                        release(previous)
+                    self._row_to_request.pop(row, None)
         result: list[int] = []
-        for request_id in request_ids:
+        for offset, request_id in enumerate(request_ids):
             slot = self._request_to_slot.get(request_id)
             if slot is None:
                 if not self._free:
                     raise RuntimeError("vLLM V1 request slot capacity is exhausted")
                 slot = heapq.heappop(self._free)
                 self._request_to_slot[request_id] = slot
+            if request_rows is not None:
+                row = int(request_rows[offset])
+                self._request_to_row[request_id] = row
+                self._row_to_request[row] = request_id
             result.append(slot)
         return tuple(result)
 
@@ -399,6 +560,78 @@ class VllmV1Hook:
             None
             if self._tenant_for_request is None
             else tuple(self._tenant_for_request(request_id) for request_id in projection.request_ids)
+        )
+        return self._adapter.bind_batch(
+            projection.request_ids,
+            slots,
+            epoch=epoch,
+            stream=stream,
+            priorities=priorities,
+            deadline_clocks=deadlines,
+            tenant_ids=tenants,
+            exact_demand=projection.exact_demand(),
+            granularity=granularity,
+        )
+
+    def bind_v2_forward(
+        self,
+        scheduler_output: Any,
+        input_batch: Any,
+        *,
+        block_tables: Sequence[Any],
+        num_blocks: Sequence[Any],
+        epoch: int,
+        stream: Any = None,
+        granularity: Granularity = Granularity.PAGE_GROUP,
+    ) -> EngineBatch:
+        """Bind vLLM V2's request batch through its typed CPU table mirror."""
+        self._check_version()
+        projection = VllmV1SchedulerProjection.from_v2_forward(
+            scheduler_output,
+            input_batch,
+            block_tables=block_tables,
+            num_blocks=num_blocks,
+            page_bytes=self._page_bytes,
+        )
+        finished = tuple(
+            str(request_id)
+            for request_id in getattr(scheduler_output, "finished_req_ids", ())
+        )
+        for request_id in finished:
+            self._adapter.retire_request(request_id)
+        replacements = self._slots.replacements(
+            projection.request_ids, projection.request_rows
+        )
+        for request_id in replacements:
+            self._adapter.retire_request(request_id)
+        slots = self._slots.assign(
+            projection.request_ids,
+            finished,
+            projection.request_rows,
+        )
+        priorities = (
+            None
+            if self._priority_for_request is None
+            else tuple(
+                self._priority_for_request(request_id)
+                for request_id in projection.request_ids
+            )
+        )
+        deadlines = (
+            None
+            if self._deadline_for_request is None
+            else tuple(
+                self._deadline_for_request(request_id)
+                for request_id in projection.request_ids
+            )
+        )
+        tenants = (
+            None
+            if self._tenant_for_request is None
+            else tuple(
+                self._tenant_for_request(request_id)
+                for request_id in projection.request_ids
+            )
         )
         return self._adapter.bind_batch(
             projection.request_ids,

@@ -162,18 +162,24 @@ using a `/usr/local/cuda` symlink from a different toolkit generation.
 The vLLM plugin has two distinct responsibilities:
 
 1. `nta_runtime.plugins.vllm:register` registers
-   `AttentionBackendEnum.CUSTOM` and installs a small V1 worker sidecar.
-2. `NtaVllmFlashInferImpl.forward` is the numerical consumer. It writes the
-   framework KV cache, reads exact `InputBatch.block_table[0]` demand, builds
-   an `ExecutionSession`/`DeviceWorkPlan`, and calls the instrumented
-   FlashInfer wrapper with the NTA runtime/work-plan ABI.
+   `AttentionBackendEnum.CUSTOM`. The backend class then installs the worker
+   bridge at the execution edge; registration does not import private GPU
+   worker modules in the frontend process.
+2. `NtaVllmFlashInferImpl.forward` is the numerical consumer. vLLM's enclosing
+   `Attention` layer owns the framework KV-cache update; this implementation
+   reads the resulting exact demand from the pinned worker projection, resets
+   one finite NTA epoch, builds an `ExecutionSession`/`DeviceWorkPlan`, and
+   calls the instrumented FlashInfer wrapper with the NTA runtime/work-plan
+   ABI. It never performs a duplicate cache write.
 
-The worker sidecar runs after `_update_states`, preserves vLLM's
-`InputBatch.req_ids` row order, and exposes one context-local typed
-`EngineBatch` to every opaque attention op in that forward. It owns the same
-bounded stable request-generation registry as SGLang; it does not perform
-per-request I/O or copy the GPU block table to the host. Select it with
-vLLM's `--attention-backend CUSTOM` and provide
+The pinned vLLM 0.26 profile uses the `vllm.v1` API with the V2 GPU model
+runner. Its bridge intercepts block-table allocation writes into an
+adapter-owned CPU mirror, then binds `req_ids`, scheduler output, and that
+mirror in `prepare_attn`. It never copies a GPU block table back to the host
+per forward. The bridge exposes one context-local typed `EngineBatch` to every
+opaque attention op in that forward, owns the same bounded stable
+request-generation registry as SGLang, and closes the runtime on runner
+shutdown. Select it with vLLM's `--attention-backend CUSTOM` and provide
 `FLASHINFER_WORKSPACE_BASE` containing the vLLM-compatible instrumented
 FlashInfer module (the defaults are the tensor-core
 `nta_batch_prefill_default_v2_hooked` for FP16 and
@@ -195,6 +201,13 @@ Consequently, a vLLM artifact can currently claim native NTA execution only for
 that resident decode profile. The shared vLLM/SGLang runtime and tenant
 contract are integrated, but that does not turn vLLM's resident projection into
 an external-tier implementation.
+
+`benchmarks/serving/VllmSmoke.py` is the reproducible resident integration gate:
+run it once with `--backend stock` and once with `--backend nta` using the same
+model, request count, seed, and limits. The NTA run requires the worker's
+`native_work_unit` evidence and reports both text and token-ID correctness
+digests. It is a correctness/integration gate, not a remote-tier performance
+claim.
 
 vLLM's V1 `KVConnector` remains the correct next seam for external tier
 ownership/readiness: scheduler metadata and worker load/fence lifecycle belong

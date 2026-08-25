@@ -32,6 +32,7 @@
     ],
     "serving": [
       "benchmarks/serving/CompareSglangHiCacheLoad.py",
+      "benchmarks/serving/VllmSmoke.py",
       "experiments/validate_serving_report.py"
     ],
     "artifact": [

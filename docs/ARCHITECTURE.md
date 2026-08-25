@@ -32,10 +32,11 @@ per-request synchronization point.
 Both frameworks can select FlashInfer, but FlashInfer is the shared numerical
 operator ABI, not a shared framework lifecycle. SGLang supplies
 `ForwardBatch`/HiCache metadata through its attention-backend and plugin
-registries; vLLM supplies V1 `SchedulerOutput`/`InputBatch` metadata through
-its worker sidecar and official `AttentionBackend` seam. The common layer
-begins only after those projections become an `EngineBatch`; no adapter reaches
-into the other framework's scheduler or cache metadata.
+registries; vLLM supplies its pinned `v1` `SchedulerOutput`/`InputBatch`
+metadata through the V2 model-runner bridge and official `AttentionBackend`
+seam. The common layer begins only after those projections become an
+`EngineBatch`; no adapter reaches into the other framework's scheduler or
+cache metadata.
 
 The serving path is exact. Selection is an input trace, not a hidden runtime
 policy. Conventional, late-bound, and exact-partial forms
@@ -45,7 +46,7 @@ In the SGLang HiCache path, resident-only forwards take the framework's
 reference FlashInfer wrapper. This is an intentional zero-regression boundary:
 the compiler/runtime mechanism is entered only when that forward has an
 external-tier dependency. A mixed SGLang forward still uses one NTA launch and
-carries resident and external work units together; the qualified vLLM V1
+carries resident and external work units together; the qualified vLLM
 consumer has its own resident eager path because vLLM's official
 `AttentionBackend` seam replaces the reference implementation for that
 profile.

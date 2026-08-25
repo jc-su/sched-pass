@@ -7,6 +7,7 @@ from nta_runtime.adapters.base import ConsumerContract, ConsumerKind, EngineBoun
 from nta_runtime.adapters.vllm import VllmAdapter, VllmSchedulerProjection
 from nta_runtime.adapters.vllm_v1 import (
     VllmV1Hook,
+    VllmV1SchedulerProjection,
     validate_vllm_attention_tier,
 )
 from nta_runtime.execution_protocol import ProtocolKind
@@ -88,6 +89,22 @@ class FakeVllmV1Consumer:
     def consume(self, batch, **attention_args):
         self.calls.append((batch, attention_args))
         return "attention-output"
+
+
+class FakeVllmV2Row:
+    def __init__(self, values):
+        self.values = tuple(values)
+
+    def tolist(self):
+        return list(self.values)
+
+
+class FakeVllmV2Table:
+    rows = ((0, 0, 0), (30, 31, 0), (40, 41, 42))
+
+    def __getitem__(self, key):
+        row, column = key
+        return FakeVllmV2Row(self.rows[row][column])
 
 
 def main() -> None:
@@ -184,6 +201,89 @@ def main() -> None:
         assert "exact block_tables" in str(error)
     else:
         raise AssertionError("vLLM identity-only projection was accepted")
+
+    v2_projection = VllmV1SchedulerProjection.from_v2_forward(
+        type(
+            "SchedulerOutput",
+            (),
+            {"num_scheduled_tokens": {"v2-b": 1, "v2-a": 1}},
+        )(),
+        type(
+            "InputBatch",
+            (),
+            {"req_ids": ("v2-a", "v2-b"), "idx_mapping_np": (2, 1)},
+        )(),
+        block_tables=(FakeVllmV2Table(),),
+        num_blocks=((3, 2, 3),),
+        page_bytes=4096,
+    )
+    assert v2_projection.request_ids == ("v2-a", "v2-b")
+    assert v2_projection.block_tables == ((40, 41, 42), (30, 31))
+    assert v2_projection.request_rows == (2, 1)
+    assert v2_projection.exact_demand().unit_bytes == 4096
+    v2_hook = VllmV1Hook(
+        runtime,
+        2,
+        page_bytes=4096,
+        version_provider=lambda: "0.26.0",
+    )
+    v2_hook.bind_v2_forward(
+        type("SchedulerOutput", (), {"num_scheduled_tokens": {"v2-a": 1, "v2-b": 1}})(),
+        type(
+            "InputBatch",
+            (),
+            {"req_ids": ("v2-a", "v2-b"), "idx_mapping_np": (2, 1)},
+        )(),
+        block_tables=(FakeVllmV2Table(),),
+        num_blocks=((3, 2, 3),),
+        epoch=10,
+    )
+    replacement_batch = v2_hook.bind_v2_forward(
+        type("SchedulerOutput", (), {"num_scheduled_tokens": {"v2-c": 1, "v2-d": 1}})(),
+        type(
+            "InputBatch",
+            (),
+            {"req_ids": ("v2-c", "v2-d"), "idx_mapping_np": (2, 1)},
+        )(),
+        block_tables=(FakeVllmV2Table(),),
+        num_blocks=((3, 2, 3),),
+        epoch=11,
+    )
+    assert len(replacement_batch.bindings) == 2
+
+    # Persistent vLLM rows can swap during compaction.  A two-way swap must
+    # preserve both live identities so the following replacement can reclaim
+    # both rows without exhausting the bounded adapter slots.
+    swap_hook = VllmV1Hook(
+        runtime,
+        2,
+        page_bytes=4096,
+        version_provider=lambda: "0.26.0",
+    )
+    def swap_input(ids, rows):
+        return type("InputBatch", (), {"req_ids": ids, "idx_mapping_np": rows})()
+    swap_hook.bind_v2_forward(
+        type("SchedulerOutput", (), {"num_scheduled_tokens": {"swap-a": 1, "swap-b": 1}})(),
+        swap_input(("swap-a", "swap-b"), (1, 2)),
+        block_tables=(FakeVllmV2Table(),),
+        num_blocks=((3, 2, 3),),
+        epoch=12,
+    )
+    swap_hook.bind_v2_forward(
+        type("SchedulerOutput", (), {"num_scheduled_tokens": {"swap-a": 1, "swap-b": 1}})(),
+        swap_input(("swap-a", "swap-b"), (2, 1)),
+        block_tables=(FakeVllmV2Table(),),
+        num_blocks=((3, 2, 3),),
+        epoch=13,
+    )
+    swap_replacement = swap_hook.bind_v2_forward(
+        type("SchedulerOutput", (), {"num_scheduled_tokens": {"swap-c": 1, "swap-d": 1}})(),
+        swap_input(("swap-c", "swap-d"), (2, 1)),
+        block_tables=(FakeVllmV2Table(),),
+        num_blocks=((3, 2, 3),),
+        epoch=14,
+    )
+    assert len(swap_replacement.bindings) == 2
 
     v1_hook = VllmV1Hook(
         runtime,

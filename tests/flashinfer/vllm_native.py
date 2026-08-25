@@ -111,12 +111,6 @@ def main() -> int:
             num_scheduled_tokens={"a": 1, "b": 1},
             finished_req_ids=set(),
         )
-        batch = hook.bind_forward(
-            scheduler_output,
-            input_batch,
-            epoch=0,
-            stream=torch.cuda.current_stream(),
-        )
         metadata = SimpleNamespace(
             num_decodes=2,
             num_decode_tokens=2,
@@ -136,34 +130,79 @@ def main() -> int:
                 None,
                 "auto",
             )
-            output = torch.empty_like(expected)
-            with vllm_v1_forward_state(scheduler_output):
-                state = current_vllm_v1_forward_state()
-                assert state is not None
-                state.batch = batch
-                state.hook = hook
-                state.page_size = page_size
-                implementation._native_forward(
-                    None,
-                    query,
-                    torch.empty(
-                        (2, num_kv_heads, head_size),
-                        device=device,
-                        dtype=query.dtype,
-                    ),
-                    torch.empty(
-                        (2, num_kv_heads, head_size),
-                        device=device,
-                        dtype=query.dtype,
-                    ),
-                    kv_cache,
-                    metadata,
-                    output,
+
+            def run_batch(
+                current_scheduler: object,
+                current_input: object,
+                current_query: torch.Tensor,
+                current_expected: torch.Tensor,
+                epoch: int,
+            ) -> float:
+                batch = hook.bind_forward(
+                    current_scheduler,
+                    current_input,
+                    epoch=epoch,
+                    stream=torch.cuda.current_stream(),
                 )
+                output = torch.empty_like(current_expected)
+                with vllm_v1_forward_state(current_scheduler):
+                    state = current_vllm_v1_forward_state()
+                    assert state is not None
+                    state.batch = batch
+                    state.hook = hook
+                    state.page_size = page_size
+                    implementation._native_forward(
+                        None,
+                        current_query,
+                        torch.empty(
+                            (2, num_kv_heads, head_size),
+                            device=device,
+                            dtype=current_query.dtype,
+                        ),
+                        torch.empty(
+                            (2, num_kv_heads, head_size),
+                            device=device,
+                            dtype=current_query.dtype,
+                        ),
+                        kv_cache,
+                        metadata,
+                        output,
+                    )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    output, current_expected, rtol=2e-3, atol=2e-3
+                )
+                return (output - current_expected).abs().max().item()
+
+            maximum = run_batch(
+                scheduler_output, input_batch, query, expected, epoch=0
+            )
+            # Rebind both rows to new request generations and run again.  This
+            # catches stale runtime tickets/CTA counters that a one-shot
+            # numerical smoke cannot observe.
+            second_query = torch.randn_like(query)
+            second_expected = stock_wrapper.run(second_query, (key, value))
+            second_input = SimpleNamespace(
+                req_ids=["c", "d"],
+                req_id_to_index={"c": 0, "d": 1},
+                block_table=_BlockTable(group),
+            )
+            second_scheduler = SimpleNamespace(
+                num_scheduled_tokens={"c": 1, "d": 1},
+                finished_req_ids={"a", "b"},
+            )
+            maximum = max(
+                maximum,
+                run_batch(
+                    second_scheduler,
+                    second_input,
+                    second_query,
+                    second_expected,
+                    epoch=1,
+                ),
+            )
 
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-3)
-        maximum = (output - expected).abs().max().item()
         print(
             "vllm_native_attention=pass",
             f"max_abs_error={maximum:.6g}",

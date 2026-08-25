@@ -204,10 +204,11 @@ The SGLang implementation is pinned to the tested framework version and FA2
 FlashInfer path. Its out-of-tree package uses the official general-plugin
 entry point, attention-backend registry, and HookRegistry; graph metadata
 preservation is part of that hook lifecycle rather than direct monkey
-patching. The vLLM boundary is a pinned V1 integration: `VllmV1Hook` projects
-the worker, `nta_runtime.plugins.vllm` registers the official custom backend,
-and `NtaVllmFlashInferImpl` consumes the resulting `EngineBatch` through the
-same engine-neutral execution core and native ABI. Framework-specific code can
+patching. The vLLM boundary is a pinned v1-API integration with the V2 model
+runner: `VllmV1Hook` projects the worker, `nta_runtime.plugins.vllm` registers
+the official custom backend and installs the bridge only in the worker, and
+`NtaVllmFlashInferImpl` consumes the resulting `EngineBatch` through the same
+engine-neutral execution core and native ABI. Framework-specific code can
 change that projection and transport binding, not the work-unit core or ABI.
 
 The vLLM general-plugin entry point is only bootstrap. The formal numerical
@@ -220,6 +221,9 @@ gated until the KVConnector source/lifetime path is implemented and tested.
 The vLLM projection is executable only when it supplies exact block tables and
 page bytes. An identity-only projection is intentionally rejected by
 `bind_forward`; it is a contract test seam, not end-to-end serving evidence.
+The resident native consumer resets the finite runtime epoch before each
+reused work plan, including CTA-completion and reduction state; `PREACQUIRED`
+removes dependency discovery but does not remove that lifecycle requirement.
 
 There is no selector-policy taxonomy in the active runtime. Exact dense and
 exact sparse demand are input semantics; conventional, late-bound, and

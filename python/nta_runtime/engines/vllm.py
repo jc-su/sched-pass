@@ -18,6 +18,7 @@ from __future__ import annotations
 import atexit
 from collections import Counter
 import contextlib
+import json
 import os
 import pathlib
 import threading
@@ -36,7 +37,7 @@ from vllm.v1.attention.backends.flashinfer import (
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
-from nta_runtime.adapters.base import EngineBatch
+from nta_runtime.adapters.base import ConsumerContract, EngineBatch
 from nta_runtime.adapters.vllm_v1 import (
     VllmV1Hook,
     current_vllm_v1_forward_state,
@@ -76,6 +77,8 @@ from nta_runtime.work_unit import Granularity
 
 SUPPORTED_VLLM_VERSION = "0.26.0"
 _DEFAULT_MODULES = {
+    # FlashInfer's tensor-core decode wrapper consumes a paged-prefill JIT
+    # module for its FA2 plan/run interface.
     torch.float16: "nta_batch_prefill_default_v2_hooked",
     torch.bfloat16: "nta_batch_prefill_default_v2_hooked_bf16",
 }
@@ -103,6 +106,51 @@ def _find_module(name: str) -> pathlib.Path:
             "run tools/jit/activate.py --flashinfer-hook first"
         )
     matches = tuple(pathlib.Path(workspace).rglob(f"{name}.so"))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"NTA vLLM native attention expected one {name}.so in {workspace}, "
+            f"found {len(matches)}"
+        )
+    return matches[0].resolve()
+
+
+def _ensure_default_attention_module(
+    name: str, dtype: torch.dtype, head_size: int
+) -> pathlib.Path:
+    """Build the pinned NTA tensor-core module during backend initialization."""
+    if head_size != 128:
+        raise RuntimeError(
+            "native vLLM NTA attention currently requires head_size=128; "
+            "provide NTA_VLLM_DECODE_MODULE for another qualified module"
+        )
+    workspace = os.environ.get("FLASHINFER_WORKSPACE_BASE")
+    if not workspace:
+        raise RuntimeError(
+            "NTA vLLM native attention requires FLASHINFER_WORKSPACE_BASE; "
+            "run tools/jit/activate.py --flashinfer-hook first"
+        )
+    matches = tuple(pathlib.Path(workspace).rglob(f"{name}.so"))
+    if not matches:
+        from flashinfer.jit.attention.modules import gen_customize_batch_prefill_module
+
+        specification = gen_customize_batch_prefill_module(
+            "fa2",
+            name,
+            dtype,
+            dtype,
+            dtype,
+            torch.int32,
+            head_size,
+            head_size,
+            ["nta_runtime", "nta_work_items", "nta_dependencies"],
+            ["uint8_t", "uint8_t", "uint8_t"],
+            ["sm_scale", "nta_work_count", "nta_skip_merge"],
+            ["double", "int64_t", "int64_t"],
+            "DefaultAttention<false, false, false, false>",
+            "#include <flashinfer/attention/variants.cuh>",
+        )
+        specification.build_and_load()
+        matches = tuple(pathlib.Path(workspace).rglob(f"{name}.so"))
     if len(matches) != 1:
         raise RuntimeError(
             f"NTA vLLM native attention expected one {name}.so in {workspace}, "
@@ -194,42 +242,52 @@ def _build_runtime(runner: Any, request_capacity: int, work_capacity: int) -> Ru
 
 
 class VllmV1WorkerController:
-    """Own the runtime and identity hook for one vLLM GPU model runner."""
+    """Own one worker-local runtime and identity hook.
+
+    The class name retains the vLLM ``v1`` API namespace distinction; the
+    current 0.26 profile uses the ``v1.worker.gpu.model_runner`` V2 runner.
+    The controller owns the native runtime for exactly that runner lifetime.
+    """
 
     def __init__(self, runner: Any) -> None:
         self._runner_ref = weakref.ref(runner)
         self._runtime: Runtime | None = None
         self._hook: VllmV1Hook | None = None
         self._page_size = 0
+        self._page_bytes = 0
+        self._request_capacity = 0
         self._epoch = 0
 
-    def bind(self, scheduler_output: Any) -> EngineBatch:
-        runner = self._runner_ref()
-        if runner is None:
-            raise RuntimeError("vLLM V1 model runner was destroyed")
-        input_batch = getattr(runner, "input_batch", None)
-        request_capacity = int(getattr(runner, "max_num_reqs", 0))
-        if input_batch is None or request_capacity <= 0:
-            raise RuntimeError("vLLM V1 runner is not initialized with InputBatch")
+    @staticmethod
+    def _cache_geometry(runner: Any) -> tuple[int, int]:
         groups = getattr(
             getattr(runner, "kv_cache_config", None), "kv_cache_groups", ()
         )
         if len(groups) != 1:
             raise RuntimeError(
-                "NTA vLLM V1 currently requires exactly one KV cache group"
+                "NTA vLLM currently requires exactly one KV cache group"
             )
         spec = groups[0].kv_cache_spec
-        self._page_size = int(getattr(spec, "block_size", 0))
-        if self._page_size <= 0:
-            raise RuntimeError("vLLM V1 KV cache spec has no positive block_size")
+        page_size = int(getattr(spec, "block_size", 0))
+        if page_size <= 0:
+            raise RuntimeError("vLLM KV cache spec has no positive block_size")
         page_bytes = int(getattr(spec, "page_size_bytes", 0))
         if page_bytes <= 0:
-            raise RuntimeError("vLLM V1 KV cache spec has no page_size_bytes")
-        work_capacity = _positive_env(
-            "NTA_VLLM_WORK_TICKET_CAPACITY",
-            max(request_capacity, 4 * request_capacity),
-        )
+            raise RuntimeError("vLLM KV cache spec has no page_size_bytes")
+        return page_size, page_bytes
+
+    def _ensure_hook(
+        self,
+        runner: Any,
+        request_capacity: int,
+        page_size: int,
+        page_bytes: int,
+    ) -> VllmV1Hook:
         if self._runtime is None:
+            work_capacity = _positive_env(
+                "NTA_VLLM_WORK_TICKET_CAPACITY",
+                max(request_capacity, 4 * request_capacity),
+            )
             self._runtime = _build_runtime(runner, request_capacity, work_capacity)
             tenant_specs = tenant_budget_specs()
             tenant_capacity = int(self._runtime.config.tenant_capacity)
@@ -247,8 +305,32 @@ class VllmV1WorkerController:
                 expected_vllm_version=SUPPORTED_VLLM_VERSION,
                 tenant_for_request=tenant_mapper_from_environment(),
             )
+            self._request_capacity = request_capacity
+            self._page_bytes = page_bytes
+        elif (
+            self._request_capacity != request_capacity
+            or self._page_bytes != page_bytes
+        ):
+            raise RuntimeError(
+                "vLLM KV cache geometry changed while the worker runtime was live"
+            )
+        self._page_size = page_size
         assert self._hook is not None
-        batch = self._hook.bind_forward(
+        return self._hook
+
+    def bind(self, scheduler_output: Any) -> EngineBatch:
+        runner = self._runner_ref()
+        if runner is None:
+            raise RuntimeError("vLLM V1 model runner was destroyed")
+        input_batch = getattr(runner, "input_batch", None)
+        request_capacity = int(getattr(runner, "max_num_reqs", 0))
+        if input_batch is None or request_capacity <= 0:
+            raise RuntimeError("vLLM V1 runner is not initialized with InputBatch")
+        page_size, page_bytes = self._cache_geometry(runner)
+        hook = self._ensure_hook(
+            runner, request_capacity, page_size, page_bytes
+        )
+        batch = hook.bind_forward(
             scheduler_output,
             input_batch,
             epoch=self._epoch,
@@ -257,6 +339,46 @@ class VllmV1WorkerController:
         )
         self._epoch += 1
         return batch
+
+    def bind_v2(
+        self,
+        scheduler_output: Any,
+        input_batch: Any,
+        *,
+        block_tables: Any,
+        num_blocks: Any,
+    ) -> EngineBatch:
+        runner = self._runner_ref()
+        if runner is None:
+            raise RuntimeError("vLLM V2 model runner was destroyed")
+        request_capacity = int(getattr(runner, "max_num_reqs", 0))
+        if request_capacity <= 0:
+            raise RuntimeError("vLLM V2 runner has no positive request capacity")
+        page_size, page_bytes = self._cache_geometry(runner)
+        hook = self._ensure_hook(
+            runner, request_capacity, page_size, page_bytes
+        )
+        batch = hook.bind_v2_forward(
+            scheduler_output,
+            input_batch,
+            block_tables=block_tables,
+            num_blocks=num_blocks,
+            epoch=self._epoch,
+            stream=torch.cuda.current_stream(),
+            granularity=Granularity.PAGE_GROUP,
+        )
+        self._epoch += 1
+        return batch
+
+    def close(self) -> None:
+        """Close the runtime after the framework has stopped using the runner."""
+        runtime, self._runtime = self._runtime, None
+        self._hook = None
+        self._page_size = 0
+        self._page_bytes = 0
+        self._request_capacity = 0
+        if runtime is not None:
+            runtime.close()
 
     @property
     def hook(self) -> VllmV1Hook:
@@ -294,6 +416,9 @@ class NtaVllmFlashInferBackend(FlashInferBackend):
 
     @staticmethod
     def get_impl_cls() -> type["NtaVllmFlashInferImpl"]:
+        from nta_runtime.plugins.vllm import ensure_worker_bridge
+
+        ensure_worker_bridge()
         return NtaVllmFlashInferImpl
 
     @staticmethod
@@ -305,6 +430,9 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
     """Native NTA consumer for resident single-token FlashInfer decode."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        from nta_runtime.plugins.vllm import ensure_worker_bridge
+
+        ensure_worker_bridge()
         super().__init__(*args, **kwargs)
         self._nta_wrapper: BatchDecodeWithPagedKVCacheWrapper | None = None
         self._nta_plan: DeviceWorkPlan | None = None
@@ -338,7 +466,12 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         module_name = os.environ.get(
             "NTA_VLLM_DECODE_MODULE", _DEFAULT_MODULES[query.dtype]
         )
-        module_path = _find_module(module_name)
+        if os.environ.get("NTA_VLLM_DECODE_MODULE"):
+            module_path = _find_module(module_name)
+        else:
+            module_path = _ensure_default_attention_module(
+                module_name, query.dtype, self.head_size
+            )
         self._nta_program = _phase_program(module_path)
         jit_args = attention_jit_args(
             module_name,
@@ -543,6 +676,20 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         )
         schedule = decode_schedule(self._nta_wrapper)
         execution = self._build_plan(state, schedule)
+        if self._nta_program is None:
+            raise RuntimeError("vLLM NTA attention has no validated phase program")
+        # vLLM reuses one worker-local Runtime across attention layers and
+        # forwards.  PREACQUIRED removes dependency discovery from the
+        # consumer launch; it does not retire the previous finite epoch's
+        # work-ticket, CTA-completion, reduction, or request-progress state.
+        # Reset on the same CUDA stream before uploading the next exact plan so
+        # a reused ticket index can never observe an older request generation.
+        self._nta_program.reset(
+            state.hook.runtime,
+            object_count=0,
+            work_ticket_count=schedule.work_count,
+            stream=torch.cuda.current_stream(),
+        )
         plan = self._upload_plan(
             execution,
             schedule,
@@ -564,6 +711,22 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             PREACQUIRED | BIND_CURRENT_GENERATION,
             out=output,
         )
+        if os.environ.get("NTA_VLLM_COMPARE_STOCK") == "1":
+            # Differential diagnosis is opt-in because the reference launch
+            # adds a synchronization and one extra attention kernel. It
+            # compares the exact query/cache view used by the native launch,
+            # so a mismatch cannot be hidden by token sampling or scheduling.
+            stock_output = torch.empty_like(output)
+            stock_wrapper.run(query, kv_cache_for_flashinfer, out=stock_output)
+            torch.cuda.synchronize()
+            difference = torch.nan_to_num(
+                (output.float() - stock_output.float()).abs(),
+                nan=float("inf"),
+            ).max().item()
+            VLLM_STATS["native_stock_diff_max_milli"] = max(
+                VLLM_STATS["native_stock_diff_max_milli"],
+                int(difference * 1000),
+            )
         plan.mark_consumed(torch.cuda.current_stream())
         execution.record_layer_completion(0)
         state.hook.record_native_launch()
@@ -589,6 +752,20 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         original_key = key
         original_value = value
         original_output = output
+        state = current_vllm_v1_forward_state()
+        if state is not None and state.reference_warmup:
+            VLLM_STATS["reference_warmup_launches"] += 1
+            return super().forward(
+                layer,
+                original_query,
+                original_key,
+                original_value,
+                kv_cache,
+                attn_metadata,
+                output=original_output,
+                output_scale=output_scale,
+                output_block_scale=output_block_scale,
+            )
         if attn_metadata is None or not self._native_enabled:
             VLLM_STATS["reference_attention_launches"] += 1
             return super().forward(
@@ -602,16 +779,25 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 output_scale=output_scale,
                 output_block_scale=output_block_scale,
             )
-        if self.kv_sharing_target_layer_name is None:
-            torch.ops._C_cache_ops.reshape_and_cache_flash(
-                key,
-                value,
-                kv_cache[:, 0],
-                kv_cache[:, 1],
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
+        if (
+            getattr(attn_metadata, "num_prefill_tokens", 0)
+            or getattr(attn_metadata, "num_decode_tokens", 0)
+            != getattr(attn_metadata, "num_decodes", 0)
+        ):
+            # The native consumer is intentionally decode-only.  Prefill still
+            # uses vLLM's exact framework implementation, including KV writes;
+            # this is a declared profile boundary, not an exception fallback.
+            VLLM_STATS["reference_prefill_launches"] += 1
+            return super().forward(
+                layer,
+                original_query,
+                original_key,
+                original_value,
+                kv_cache,
+                attn_metadata,
+                output=original_output,
+                output_scale=output_scale,
+                output_block_scale=output_block_scale,
             )
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
@@ -650,25 +836,63 @@ def consumer_contract() -> dict[str, Any]:
     """Return process-local evidence for artifact collectors."""
     native = VLLM_STATS["native_decode_launches"]
     if native:
-        return {
-            "engine": "vllm",
-            "backend": "nta_flashinfer",
-            "engine_version": SUPPORTED_VLLM_VERSION,
-            "kind": "native_work_unit",
-            "native_launches": native,
-            "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
-            "resident_only": True,
-        }
+        contract = ConsumerContract.native_work_unit(
+            engine="vllm",
+            backend="nta_flashinfer",
+            engine_version=SUPPORTED_VLLM_VERSION,
+        ).as_dict()
+        contract.update(
+            {
+                "native_launches": native,
+                "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
+                "resident_only": True,
+            }
+        )
+        return contract
     if VLLM_STATS["reference_attention_launches"]:
-        return {
-            "engine": "vllm",
-            "backend": "nta_flashinfer",
-            "engine_version": SUPPORTED_VLLM_VERSION,
-            "kind": "framework_reference",
-        }
-    return {
+        return ConsumerContract.framework_reference(
+            engine="vllm",
+            backend="nta_flashinfer",
+            engine_version=SUPPORTED_VLLM_VERSION,
+        ).as_dict()
+    return ConsumerContract.projection_only(
+        engine="vllm",
+        backend="nta_flashinfer",
+        engine_version=SUPPORTED_VLLM_VERSION,
+    ).as_dict()
+
+
+@atexit.register
+def _publish_vllm_evidence() -> None:
+    """Publish worker-local evidence for a parent-process serving harness."""
+    if not any(VLLM_STATS.values()):
+        return
+    workspace = os.environ.get("FLASHINFER_WORKSPACE_BASE")
+    if not workspace:
+        return
+    token = os.environ.get("NTA_VLLM_EVIDENCE_TOKEN", "default")
+    path = pathlib.Path(workspace) / f"nta-vllm-engine.{token}.{os.getpid()}.json"
+    report = {
+        "schema": 1,
         "engine": "vllm",
         "backend": "nta_flashinfer",
         "engine_version": SUPPORTED_VLLM_VERSION,
-        "kind": "projection_only",
+        "consumer_contract": consumer_contract(),
+        "stats": dict(VLLM_STATS),
+        "native_enabled": os.environ.get("NTA_VLLM_NATIVE", "0") == "1",
+        "stock_fallback_enabled": os.environ.get(
+            "NTA_VLLM_ALLOW_STOCK_FALLBACK", "0"
+        )
+        == "1",
+        "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
     }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        # Evidence publication cannot change inference correctness during
+        # interpreter teardown. The serving harness treats missing evidence as
+        # a failed native-verification gate.
+        return
