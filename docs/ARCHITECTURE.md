@@ -51,6 +51,15 @@ consumer has its own resident eager path because vLLM's official
 profile.
 the reference path is not used to hide external work or to change demand.
 
+The performance gate follows the same boundary. The request-bound direct form
+is measured against the stock wrapper and must stay within the checked-in
+5-percent acceptance budget (with paired confirmation on an apparent failure).
+The general incremental protocol has a measurable control cost on a bare
+all-resident dependency microbenchmark; that path is not the resident serving
+default and is not presented as a zero-overhead kernel. Remote-tier claims must
+therefore report both the direct/reference control and the mixed external
+mechanism path, including profiler evidence for overlap and transfer cost.
+
 The native runtime exposes one tier directory for HBM, mapped host memory,
 host-staged memory, NVMe, and CXL DAX. The same descriptor is consumed by
 host admission, device-visible backend metadata, and experiment telemetry.
