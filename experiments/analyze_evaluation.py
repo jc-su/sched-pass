@@ -67,7 +67,9 @@ def _metadata_key(record: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _workload_digest(record: dict[str, Any], evaluation_metadata: dict[str, Any]) -> str | None:
+def _workload_digest(
+    record: dict[str, Any], evaluation_metadata: dict[str, Any]
+) -> str | None:
     direct_record = record.get("workload_demand_digest")
     if isinstance(direct_record, str) and direct_record:
         return direct_record
@@ -76,7 +78,9 @@ def _workload_digest(record: dict[str, Any], evaluation_metadata: dict[str, Any]
     if isinstance(direct, str) and direct:
         return direct
     workload = result.get("workload")
-    if isinstance(workload, dict) and isinstance(workload.get("demand_trace_digest"), str):
+    if isinstance(workload, dict) and isinstance(
+        workload.get("demand_trace_digest"), str
+    ):
         return workload["demand_trace_digest"]
     # A file digest proves which manifest was used; it is not the identity of
     # the exact demand consumed by the engine. The only valid fallback is the
@@ -119,7 +123,11 @@ def _load(output: Path) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, 
         if not isinstance(value, dict):
             raise ValueError("trial record is not an object")
         records.append(value)
-    if not isinstance(metadata, dict) or not isinstance(evaluation, dict) or not records:
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(evaluation, dict)
+        or not records
+    ):
         raise ValueError("evaluation artifact has no metadata or trials")
     return metadata, evaluation, records
 
@@ -149,12 +157,20 @@ def analyze(output: Path) -> dict[str, Any]:
         raise ValueError("runner metadata does not contain the trial specification")
     repetitions = spec.get("repetitions")
     experiments = spec.get("experiments")
-    if not isinstance(repetitions, int) or repetitions < 5 or not isinstance(experiments, list):
-        raise ValueError("evaluation specification has no defensible repetition contract")
+    if (
+        not isinstance(repetitions, int)
+        or repetitions < 5
+        or not isinstance(experiments, list)
+    ):
+        raise ValueError(
+            "evaluation specification has no defensible repetition contract"
+        )
     declared = {(entry["name"], entry["variant"]): entry for entry in experiments}
     expected_count = repetitions * len(declared)
     if len(records) != expected_count:
-        raise ValueError(f"expected {expected_count} trial records, found {len(records)}")
+        raise ValueError(
+            f"expected {expected_count} trial records, found {len(records)}"
+        )
     physical_tiers = {
         str(entry["tier"])
         for entry in declared.values()
@@ -167,7 +183,11 @@ def analyze(output: Path) -> dict[str, Any]:
     seen: set[tuple[str, str, int]] = set()
     workload_digests: set[str] = set()
     for record in records:
-        identity = (record.get("experiment"), record.get("variant"), record.get("repetition"))
+        identity = (
+            record.get("experiment"),
+            record.get("variant"),
+            record.get("repetition"),
+        )
         if identity in seen:
             raise ValueError(f"duplicate trial identity: {identity}")
         seen.add(identity)
@@ -179,32 +199,44 @@ def analyze(output: Path) -> dict[str, Any]:
             or record.get("tier") != declaration.get("tier")
             or record.get("stratum") != declaration.get("stratum")
         ):
-            raise ValueError(f"trial metadata diverges from its declaration: {identity[:2]}")
+            raise ValueError(
+                f"trial metadata diverges from its declaration: {identity[:2]}"
+            )
         if not isinstance(identity[2], int) or not 0 <= identity[2] < repetitions:
             raise ValueError(f"invalid repetition for {identity[:2]}")
         if record.get("arm") not in {f"B{index}" for index in range(7)}:
             raise ValueError("trial has no canonical B0-B6 arm")
         if record.get("demand_semantics") != "exact":
             raise ValueError("trial artifact is not exact-demand")
-        if not isinstance(record.get("stratum"), dict) or not REQUIRED_STRATA <= set(record["stratum"]):
+        if not isinstance(record.get("stratum"), dict) or not REQUIRED_STRATA <= set(
+            record["stratum"]
+        ):
             raise ValueError("trial artifact is missing required strata")
         _validate_result(record)
         if physical_tiers:
             if record.get("tier_qualification_digest") != qualification_digest:
-                raise ValueError("trial qualification digest diverges from evaluation metadata")
+                raise ValueError(
+                    "trial qualification digest diverges from evaluation metadata"
+                )
         digest = _workload_digest(record, evaluation_metadata)
         if not isinstance(digest, str) or not digest:
             raise ValueError("trial has no exact workload/demand digest")
         workload_digests.add(digest)
         for metric in declaration.get("metrics", []):
             if not _finite(record["result"].get(metric)):
-                raise ValueError(f"metric {metric} is missing or non-finite in {identity[:2]}")
+                raise ValueError(
+                    f"metric {metric} is missing or non-finite in {identity[:2]}"
+                )
     if len(workload_digests) > 1:
         raise ValueError("paired trials use different workload/demand digests")
 
     strata: list[dict[str, Any]] = []
     for key, declaration in declared.items():
-        selected = [record for record in records if (record["experiment"], record["variant"]) == key]
+        selected = [
+            record
+            for record in records
+            if (record["experiment"], record["variant"]) == key
+        ]
         if len(selected) != repetitions:
             raise ValueError(f"incomplete repetitions for {key}")
         strata.append(
@@ -239,7 +271,10 @@ def analyze(output: Path) -> dict[str, Any]:
             for record in records
             if record["experiment"] == experiment and record["variant"] == denominator
         }
-        if set(numerator_records) != set(denominator_records) or len(numerator_records) != repetitions:
+        if (
+            set(numerator_records) != set(denominator_records)
+            or len(numerator_records) != repetitions
+        ):
             raise ValueError(f"comparison {name} does not contain complete pairs")
         deltas: list[float] = []
         ratios: list[float] = []
@@ -248,16 +283,26 @@ def analyze(output: Path) -> dict[str, Any]:
             left = numerator_records[repetition]
             right = denominator_records[repetition]
             if _metadata_key(left) != _metadata_key(right):
-                raise ValueError(f"comparison {name} is not metadata-matched at repetition {repetition}")
+                raise ValueError(
+                    f"comparison {name} is not metadata-matched at repetition {repetition}"
+                )
             left_value = float(left["result"][metric])
             right_value = float(right["result"][metric])
             if right_value == 0:
                 raise ValueError(f"comparison {name} has a zero denominator")
             deltas.append(left_value - right_value)
             ratios.append(left_value / right_value)
-            pair_rows.append({"repetition": repetition, "numerator": left_value, "denominator": right_value})
+            pair_rows.append(
+                {
+                    "repetition": repetition,
+                    "numerator": left_value,
+                    "denominator": right_value,
+                }
+            )
         seed_material = f"{evaluation_metadata.get('spec_digest', '')}:{name}:{index}"
-        seed = int.from_bytes(hashlib.sha256(seed_material.encode()).digest()[:8], "big")
+        seed = int.from_bytes(
+            hashlib.sha256(seed_material.encode()).digest()[:8], "big"
+        )
         causal.append(
             {
                 "name": name,
@@ -280,7 +325,9 @@ def analyze(output: Path) -> dict[str, Any]:
             "revision": metadata.get("revision"),
             "dirty": metadata.get("dirty"),
             "spec_digest": evaluation_metadata.get("spec_digest"),
-            "workload_manifest_digest": evaluation_metadata.get("workload_manifest_digest"),
+            "workload_manifest_digest": evaluation_metadata.get(
+                "workload_manifest_digest"
+            ),
             "workload_demand_digest": next(iter(workload_digests), None),
             "tier_qualification_digest": qualification_digest,
             "qualified_physical_tiers": sorted(physical_tiers),
@@ -303,11 +350,21 @@ def analyze(output: Path) -> dict[str, Any]:
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     (output / "strata-report.json").write_text(
-        json.dumps({"schema": 1, "classification": "nta-strata-report", "strata": strata}, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            {"schema": 1, "classification": "nta-strata-report", "strata": strata},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     (output / "causal-report.json").write_text(
-        json.dumps({"schema": 1, "classification": "nta-causal-report", "comparisons": causal}, indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            {"schema": 1, "classification": "nta-causal-report", "comparisons": causal},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return report

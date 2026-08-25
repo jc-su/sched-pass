@@ -202,7 +202,9 @@ def parse_args() -> argparse.Namespace:
             args.external_requests * args.external_tokens + args.churn_tokens
             <= args.max_total_tokens
         ):
-            parser.error("external contexts and churn must exceed the device token pool")
+            parser.error(
+                "external contexts and churn must exceed the device token pool"
+            )
     return args
 
 
@@ -221,7 +223,9 @@ def _tokenized_structure_prompt(tokenizer: Any, row: dict[str, Any]) -> tuple[st
         block_text = seed
         while len(tokenizer.encode(block_text, add_special_tokens=False)) < block_size:
             block_text += seed
-        block_tokens = tokenizer.encode(block_text, add_special_tokens=False)[:block_size]
+        block_tokens = tokenizer.encode(block_text, add_special_tokens=False)[
+            :block_size
+        ]
         token_ids.extend(block_tokens)
     token_ids = token_ids[:token_count]
     prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -232,7 +236,14 @@ def _tokenized_structure_prompt(tokenizer: Any, row: dict[str, Any]) -> tuple[st
 def _load_workload(
     path: pathlib.Path, tokenizer: Any
 ) -> tuple[
-    list[str], list[str], list[str], list[str], list[float], list[int], list[int], dict[str, Any]
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+    list[float],
+    list[int],
+    list[int],
+    dict[str, Any],
 ]:
     manifest = validate_workload(path.resolve())
     records_path = path.resolve().parent / str(manifest["records_file"])
@@ -241,7 +252,9 @@ def _load_workload(
         raise RuntimeError("normalized workload contains no requests")
     computed_demand_digest = demand_trace_digest(rows)
     if computed_demand_digest != manifest["demand_trace_digest"]:
-        raise RuntimeError("normalized workload demand digest does not match its records")
+        raise RuntimeError(
+            "normalized workload demand digest does not match its records"
+        )
     explicit_states = [row.get("request_state") for row in rows]
     if any(state is not None for state in explicit_states):
         resident_rows = [row for row in rows if row.get("request_state") == "resident"]
@@ -259,7 +272,9 @@ def _load_workload(
         )
 
     tokenization_errors = 0
-    structure_only = not bool(manifest["prompt"].get("semantic_representativeness_claim"))
+    structure_only = not bool(
+        manifest["prompt"].get("semantic_representativeness_claim")
+    )
 
     def prompt(row: dict[str, Any]) -> str:
         nonlocal tokenization_errors
@@ -274,9 +289,7 @@ def _load_workload(
     external_offsets = [float(row["arrival_seconds"]) for row in external_rows]
     origin = min(external_offsets)
     external_offsets = [offset - origin for offset in external_offsets]
-    request_arrival_offsets = {
-        str(row["request_id"]): 0.0 for row in resident_rows
-    }
+    request_arrival_offsets = {str(row["request_id"]): 0.0 for row in resident_rows}
     request_arrival_offsets.update(
         {
             str(row["request_id"]): offset
@@ -290,7 +303,9 @@ def _load_workload(
         "demand_trace_digest": str(manifest["demand_trace_digest"]),
         "arrival": manifest["arrival"],
         "prompt": manifest["prompt"],
-        "state_mapping": "explicit_request_state" if any(state is not None for state in explicit_states) else "first_row_resident_fallback",
+        "state_mapping": "explicit_request_state"
+        if any(state is not None for state in explicit_states)
+        else "first_row_resident_fallback",
         "request_count": len(rows),
         "request_id_order": [str(row["request_id"]) for row in rows],
         "request_arrival_offsets": request_arrival_offsets,
@@ -379,7 +394,9 @@ async def _stream_request(
         "admission_delay_seconds": max(
             0.0, submitted - (load_start_seconds + offset_seconds)
         ),
-        "system_time_seconds": max(0.0, finished - (load_start_seconds + offset_seconds)),
+        "system_time_seconds": max(
+            0.0, finished - (load_start_seconds + offset_seconds)
+        ),
         "tpot_seconds": (
             (finished - first) / (completion_tokens - 1)
             if completion_tokens > 1
@@ -428,7 +445,11 @@ async def _run_load(
             sampling,
             kind="resident",
             index=index,
-            request_id=(resident_request_ids[index] if resident_request_ids is not None else None),
+            request_id=(
+                resident_request_ids[index]
+                if resident_request_ids is not None
+                else None
+            ),
             gate=None,
             first_token_event=resident_started,
             offset_seconds=0.0,
@@ -468,7 +489,11 @@ async def _run_load(
                 },
                 kind="external",
                 index=index,
-                request_id=(external_request_ids[index] if external_request_ids is not None else None),
+                request_id=(
+                    external_request_ids[index]
+                    if external_request_ids is not None
+                    else None
+                ),
                 gate=None if external_offsets is not None else resident_started,
                 first_token_event=None,
                 offset_seconds=offsets[index],
@@ -489,9 +514,7 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
-def _latency_percentiles(
-    records: list[dict[str, Any]], field: str
-) -> dict[str, float]:
+def _latency_percentiles(records: list[dict[str, Any]], field: str) -> dict[str, float]:
     values = [float(record[field]) for record in records]
     return {
         "p50": _percentile(values, 0.50),
@@ -685,9 +708,7 @@ def main() -> int:
     resident = [record for record in records if record["kind"] == "resident"]
     if not all(record["host_cached_tokens"] > 0 for record in external):
         raise RuntimeError("a timed external request was not served from host cache")
-    minimum_host_prefix = min(
-        record["host_cached_tokens"] for record in external
-    )
+    minimum_host_prefix = min(record["host_cached_tokens"] for record in external)
     if not all(
         record["device_cached_tokens"] > 0 and record["host_cached_tokens"] == 0
         for record in resident

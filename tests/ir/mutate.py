@@ -20,6 +20,7 @@ import sys
 
 SOURCE = pathlib.Path(__file__).resolve().parent
 
+
 # (name, source fixture, legality condition, mutate(text) -> text|None,
 #  expected diagnostic regex)
 def _drop_call(symbol: str):
@@ -27,7 +28,8 @@ def _drop_call(symbol: str):
 
     def apply(text: str) -> str | None:
         pattern = re.compile(
-            r"^\s*(?:%[\w.]+ = )?call [^\n]*@" + re.escape(symbol)
+            r"^\s*(?:%[\w.]+ = )?call [^\n]*@"
+            + re.escape(symbol)
             + r"\((?:[^()]|\([^()]*\))*\)[^\n]*\n",
             re.MULTILINE,
         )
@@ -185,9 +187,7 @@ def main() -> int:
                 failures.append(f"{name}: taint site missing")
                 continue
             if "declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()" not in mutated:
-                mutated = (
-                    "declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n" + mutated
-                )
+                mutated = "declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n" + mutated
         path = out / f"mutant-{name}.ll"
         path.write_text(mutated)
         code, stderr = run_opt(plugin, opt, path)

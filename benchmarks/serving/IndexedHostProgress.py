@@ -174,12 +174,8 @@ def main() -> int:
                 }
             )
 
-        torch.testing.assert_close(
-            staging_key.cpu(), host_key, rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            staging_value.cpu(), host_value, rtol=0, atol=0
-        )
+        torch.testing.assert_close(staging_key.cpu(), host_key, rtol=0, atol=0)
+        torch.testing.assert_close(staging_value.cpu(), host_value, rtol=0, atol=0)
         best = min(measurements, key=lambda item: item["median_us"])
         report = {
             "schema": 1,

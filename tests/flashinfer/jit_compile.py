@@ -14,6 +14,7 @@ from flashinfer.jit.attention.modules import (
     gen_customize_batch_decode_module,
     gen_customize_batch_prefill_module,
 )
+
 TENSOR_NAMES = ["nta_runtime", "nta_work_items", "nta_dependencies"]
 TENSOR_DTYPES = ["uint8_t", "uint8_t", "uint8_t"]
 SCALAR_NAMES = ["sm_scale", "nta_work_count", "nta_skip_merge"]
@@ -114,12 +115,9 @@ def main() -> None:
         VARIANT_DECL,
     )
     print(
-        "flashinfer_baseline_module="
-        f"{check_module(baseline_name, baseline, ('run',))}"
+        f"flashinfer_baseline_module={check_module(baseline_name, baseline, ('run',))}"
     )
-    print(
-        f"flashinfer_decode_module={check_module(decode_name, decode, ('run',))}"
-    )
+    print(f"flashinfer_decode_module={check_module(decode_name, decode, ('run',))}")
     print(
         "flashinfer_prefill_module="
         f"{check_module(prefill_name, prefill, ('ragged_run', 'paged_run'))}"

@@ -29,13 +29,14 @@ def main() -> None:
     assert session.ledger.state(0) is Availability.COMPLETE
     session.make_ready((1,))
     assert session.runnable_groups() == ((1,),)
-    assert session.unit_for_ticket(
-        work_id=1, layer=0, logical_begin=0, request_index=1
-    ).work_id == 1
-    try:
+    assert (
         session.unit_for_ticket(
-            work_id=1, layer=0, logical_begin=1, request_index=1
-        )
+            work_id=1, layer=0, logical_begin=0, request_index=1
+        ).work_id
+        == 1
+    )
+    try:
+        session.unit_for_ticket(work_id=1, layer=0, logical_begin=1, request_index=1)
     except RuntimeError as error:
         assert "coordinates diverged" in str(error)
     else:

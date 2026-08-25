@@ -22,6 +22,10 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+
+_UINT64_MAX = (1 << 64) - 1
+
+
 class ServingTier(str, enum.Enum):
     HOST_STAGED = "host_staged"
     NVME = "nvme"
@@ -37,9 +41,13 @@ class PageExtent:
 
     def __post_init__(self) -> None:
         if self.offset < 0 or self.bytes <= 0:
-            raise ValueError("tier extents require a nonnegative offset and positive bytes")
+            raise ValueError(
+                "tier extents require a nonnegative offset and positive bytes"
+            )
         if self.bytes > (1 << 32) - 1:
             raise ValueError("tier extent exceeds the native dependency byte limit")
+        if self.offset > _UINT64_MAX or self.bytes > _UINT64_MAX - self.offset:
+            raise ValueError("tier extent exceeds the native address-space limit")
 
 
 @dataclass(frozen=True)
@@ -77,6 +85,7 @@ class TierPageCatalog:
         if window_bytes is not None and window_bytes <= 0:
             raise ValueError("catalog window_bytes must be positive")
         by_key: dict[tuple[int, int], _PageRecord] = {}
+        ranges: list[tuple[int, int, tuple[int, int], str]] = []
         for record in records:
             key = (record.layer, record.page)
             if key in by_key:
@@ -86,14 +95,35 @@ class TierPageCatalog:
                     raise ValueError(
                         f"catalog extent {key} is not aligned to {alignment_bytes} bytes"
                     )
-                if window_bytes is not None and extent.offset + extent.bytes > window_bytes:
+                if (
+                    window_bytes is not None
+                    and extent.offset + extent.bytes > window_bytes
+                ):
                     raise ValueError(f"catalog extent {key} exceeds its tier window")
             if (
                 record.key.offset < record.value.offset + record.value.bytes
                 and record.value.offset < record.key.offset + record.key.bytes
             ):
                 raise ValueError(f"catalog K/V extents overlap for page {key}")
+            ranges.extend(
+                (
+                    extent.offset,
+                    extent.offset + extent.bytes,
+                    key,
+                    kind,
+                )
+                for kind, extent in (("key", record.key), ("value", record.value))
+            )
             by_key[key] = record
+        previous: tuple[int, int, tuple[int, int], str] | None = None
+        for current in sorted(ranges):
+            if previous is not None and current[0] < previous[1]:
+                raise ValueError(
+                    "catalog extents overlap: "
+                    f"layer/page={previous[2]} {previous[3]} and "
+                    f"layer/page={current[2]} {current[3]}"
+                )
+            previous = current
         self.tier = tier
         self._records = by_key
         self.alignment_bytes = alignment_bytes
@@ -105,16 +135,26 @@ class TierPageCatalog:
         return len(self._records)
 
     @classmethod
-    def load(cls, path: str | os.PathLike[str], *, expected_tier: ServingTier) -> "TierPageCatalog":
+    def load(
+        cls, path: str | os.PathLike[str], *, expected_tier: ServingTier
+    ) -> "TierPageCatalog":
         catalog_path = Path(path)
         try:
             raw = catalog_path.read_bytes()
             document = json.loads(raw)
         except (OSError, json.JSONDecodeError) as error:
-            raise ValueError(f"cannot read tier catalog {catalog_path}: {error}") from error
+            raise ValueError(
+                f"cannot read tier catalog {catalog_path}: {error}"
+            ) from error
         if not isinstance(document, dict):
             raise ValueError("tier catalog root must be an object")
-        unknown = set(document) - {"schema", "tier", "alignment_bytes", "window_bytes", "pages"}
+        unknown = set(document) - {
+            "schema",
+            "tier",
+            "alignment_bytes",
+            "window_bytes",
+            "pages",
+        }
         if unknown:
             raise ValueError(f"tier catalog has unknown fields: {sorted(unknown)}")
         if document.get("schema") != cls.SCHEMA:
@@ -123,7 +163,9 @@ class TierPageCatalog:
             raise ValueError(
                 f"tier catalog declares {document.get('tier')!r}, expected {expected_tier.value!r}"
             )
-        alignment = _positive_int(document.get("alignment_bytes", 4096), "alignment_bytes")
+        alignment = _positive_int(
+            document.get("alignment_bytes", 4096), "alignment_bytes"
+        )
         window = document.get("window_bytes")
         if window is not None:
             window = _positive_int(window, "window_bytes")
@@ -136,7 +178,9 @@ class TierPageCatalog:
                 raise ValueError(f"tier catalog page {index} is not an object")
             unknown = set(item) - {"layer", "page", "key", "value"}
             if unknown:
-                raise ValueError(f"tier catalog page {index} has unknown fields: {sorted(unknown)}")
+                raise ValueError(
+                    f"tier catalog page {index} has unknown fields: {sorted(unknown)}"
+                )
             layer = _nonnegative_int(item.get("layer"), f"pages[{index}].layer")
             page = _nonnegative_int(item.get("page"), f"pages[{index}].page")
             records.append(
@@ -164,7 +208,9 @@ class TierPageCatalog:
         row_bytes: int,
     ) -> PageExtent:
         if layer < 0 or row_bytes <= 0:
-            raise ValueError("catalog span requires a nonnegative layer and positive row size")
+            raise ValueError(
+                "catalog span requires a nonnegative layer and positive row size"
+            )
         if kind not in {"key", "value"}:
             raise ValueError("catalog span kind must be key or value")
         if not pages:
@@ -214,8 +260,15 @@ class ServingTierConfig:
         cls, environ: Mapping[str, str] | None = None
     ) -> "ServingTierConfig":
         values = os.environ if environ is None else environ
-        raw_tier = values.get("NTA_SERVING_TIER", ServingTier.HOST_STAGED.value).strip().lower()
-        aliases = {"host": ServingTier.HOST_STAGED.value, "cxl": ServingTier.CXL_DAX.value}
+        raw_tier = (
+            values.get("NTA_SERVING_TIER", ServingTier.HOST_STAGED.value)
+            .strip()
+            .lower()
+        )
+        aliases = {
+            "host": ServingTier.HOST_STAGED.value,
+            "cxl": ServingTier.CXL_DAX.value,
+        }
         raw_tier = aliases.get(raw_tier, raw_tier)
         try:
             tier = ServingTier(raw_tier)
@@ -225,7 +278,9 @@ class ServingTierConfig:
             ) from error
         if tier is ServingTier.HOST_STAGED:
             return cls(tier=tier)
-        endpoint_name = "NTA_NVME_ENDPOINT" if tier is ServingTier.NVME else "NTA_CXL_DAX_DEVICE"
+        endpoint_name = (
+            "NTA_NVME_ENDPOINT" if tier is ServingTier.NVME else "NTA_CXL_DAX_DEVICE"
+        )
         endpoint = values.get(endpoint_name, "").strip()
         if not endpoint:
             raise ValueError(f"{endpoint_name} is required for {tier.value}")
@@ -243,17 +298,27 @@ class ServingTierConfig:
                     "NTA_CXL_DAX_WINDOW_MIB",
                 )
                 window_bytes = window_mib * 1024 * 1024
+        device_ordinal = int(values.get("NTA_TIER_DEVICE_ORDINAL", "-1"))
+        if device_ordinal < -1:
+            raise ValueError("NTA_TIER_DEVICE_ORDINAL must be -1 or nonnegative")
         return cls(
             tier=tier,
             endpoint=endpoint,
             catalog_path=Path(catalog_value),
-            namespace_id=_positive_int(values.get("NTA_NVME_NAMESPACE", "1"), "NTA_NVME_NAMESPACE"),
-            queue_depth=_positive_int(values.get("NTA_NVME_QUEUE_DEPTH", "64"), "NTA_NVME_QUEUE_DEPTH"),
+            namespace_id=_positive_int(
+                values.get("NTA_NVME_NAMESPACE", "1"), "NTA_NVME_NAMESPACE"
+            ),
+            queue_depth=_positive_int(
+                values.get("NTA_NVME_QUEUE_DEPTH", "64"), "NTA_NVME_QUEUE_DEPTH"
+            ),
             window_bytes=window_bytes,
-            device_ordinal=int(values.get("NTA_TIER_DEVICE_ORDINAL", "-1")),
-            issue_budget=_positive_int(values.get("NTA_NVME_ISSUE_BUDGET", "64"), "NTA_NVME_ISSUE_BUDGET"),
+            device_ordinal=device_ordinal,
+            issue_budget=_positive_int(
+                values.get("NTA_NVME_ISSUE_BUDGET", "64"), "NTA_NVME_ISSUE_BUDGET"
+            ),
             completion_budget=_positive_int(
-                values.get("NTA_NVME_COMPLETION_BUDGET", "64"), "NTA_NVME_COMPLETION_BUDGET"
+                values.get("NTA_NVME_COMPLETION_BUDGET", "64"),
+                "NTA_NVME_COMPLETION_BUDGET",
             ),
             progress_rounds=_positive_int(
                 values.get("NTA_NVME_PROGRESS_ROUNDS", "1"), "NTA_NVME_PROGRESS_ROUNDS"
@@ -281,6 +346,8 @@ class ServingTierService:
         )
         self.nvme: NvmeTransport | None = None
         self.cxl: CxlDaxTransport | None = None
+        self._nvme_lba_size: int | None = None
+        self._nvme_max_transfer_bytes: int | None = None
         # Keep catalog validation and experiment tooling independent of CUDA
         # and libnta-runtime.  Native bindings are loaded only when a serving
         # process explicitly opens a physical tier.
@@ -305,6 +372,8 @@ class ServingTierService:
                 )
             )
             capabilities = self.nvme.capabilities
+            self._nvme_lba_size = int(capabilities.lba_size)
+            self._nvme_max_transfer_bytes = int(capabilities.max_transfer_bytes)
             if not capabilities.supports_hbm_peer_dma:
                 self.nvme.close()
                 self.nvme = None
@@ -312,7 +381,9 @@ class ServingTierService:
             if not capabilities.translated_iommu:
                 self.nvme.close()
                 self.nvme = None
-                raise RuntimeError("NVMe endpoint is not attached through a translated IOMMU")
+                raise RuntimeError(
+                    "NVMe endpoint is not attached through a translated IOMMU"
+                )
             if not capabilities.gpu_doorbell_mapping_validated:
                 self.nvme.close()
                 self.nvme = None
@@ -329,9 +400,25 @@ class ServingTierService:
                 )
             )
             if self.catalog is None or self.catalog.window_bytes != config.window_bytes:
-                raise ValueError("CXL catalog window_bytes must match the configured DAX window")
+                self.cxl.close()
+                self.cxl = None
+                raise ValueError(
+                    "CXL catalog window_bytes must match the configured DAX window"
+                )
             if not self.cxl.capabilities.direct_device_visible:
+                self.cxl.close()
+                self.cxl = None
                 raise RuntimeError("CXL DAX endpoint is not CUDA device-visible")
+
+    def close(self) -> None:
+        """Release the selected transport after its consumer runtime is quiesced."""
+        nvme, cxl = self.nvme, self.cxl
+        self.nvme = None
+        self.cxl = None
+        if nvme is not None:
+            nvme.close()
+        if cxl is not None:
+            cxl.close()
 
     @property
     def tier(self) -> ServingTier:
@@ -353,17 +440,35 @@ class ServingTierService:
     def catalog_digest(self) -> str | None:
         return None if self.catalog is None else self.catalog.digest
 
-    def extent(self, layer: int, pages: tuple[int, ...], kind: str, row_bytes: int) -> PageExtent:
+    def extent(
+        self, layer: int, pages: tuple[int, ...], kind: str, row_bytes: int
+    ) -> PageExtent:
         if self.catalog is None:
             raise RuntimeError(f"{self.tier.value} has no page catalog")
-        return self.catalog.span(layer=layer, pages=pages, kind=kind, row_bytes=row_bytes)
+        extent = self.catalog.span(
+            layer=layer, pages=pages, kind=kind, row_bytes=row_bytes
+        )
+        if self.is_nvme:
+            lba_size = self._nvme_lba_size
+            max_transfer_bytes = self._nvme_max_transfer_bytes
+            if lba_size is None or max_transfer_bytes is None:
+                raise RuntimeError("NVMe tier has no cached controller capabilities")
+            _validate_nvme_extent(
+                extent,
+                lba_size=lba_size,
+                max_transfer_bytes=max_transfer_bytes,
+                kind=kind,
+            )
+        return extent
 
     def device_address(self, extent: PageExtent) -> int:
         if not self.is_cxl or self.cxl is None:
             raise RuntimeError("device_address is only valid for CXL direct mappings")
         address = self.cxl.device_address + extent.offset
-        if not self.cxl.capabilities.direct_device_visible or not (
-            extent.offset + extent.bytes <= self.cxl.capabilities.window_bytes
+        if (
+            not self.cxl.capabilities.direct_device_visible
+            or not (extent.offset + extent.bytes <= self.cxl.capabilities.window_bytes)
+            or address > _UINT64_MAX - extent.bytes
         ):
             raise RuntimeError("CXL catalog extent is outside the mapped device window")
         return address
@@ -389,6 +494,8 @@ class ServingTierService:
                 "gpu_doorbell_validated": capabilities.gpu_doorbell_mapping_validated,
                 "namespace_read_only": capabilities.namespace_read_only,
                 "mapping_backend": capabilities.hbm_mapping_backend.name.lower(),
+                "lba_size": capabilities.lba_size,
+                "max_transfer_bytes": capabilities.max_transfer_bytes,
             }
         elif self.cxl is not None:
             capabilities = self.cxl.capabilities
@@ -401,20 +508,28 @@ class ServingTierService:
 
 
 def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
     try:
         result = int(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{name} must be a positive integer") from error
+    if isinstance(value, float) and result != value:
+        raise ValueError(f"{name} must be a positive integer")
     if result <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return result
 
 
 def _nonnegative_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a nonnegative integer")
     try:
         result = int(value)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{name} must be a nonnegative integer") from error
+    if isinstance(value, float) and result != value:
+        raise ValueError(f"{name} must be a nonnegative integer")
     if result < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
     return result
@@ -430,3 +545,21 @@ def _parse_extent(value: Any, name: str) -> PageExtent:
         _nonnegative_int(value.get("offset"), f"{name}.offset"),
         _positive_int(value.get("bytes"), f"{name}.bytes"),
     )
+
+
+def _validate_nvme_extent(
+    extent: PageExtent, *, lba_size: int, max_transfer_bytes: int, kind: str
+) -> None:
+    if lba_size <= 0 or max_transfer_bytes <= 0:
+        raise RuntimeError("NVMe controller reported invalid transfer capabilities")
+    if extent.bytes % lba_size:
+        raise RuntimeError(
+            f"NVMe {kind} extent is not LBA aligned: {extent.bytes} bytes "
+            f"(LBA size {lba_size})"
+        )
+    if extent.bytes > max_transfer_bytes:
+        raise RuntimeError(
+            f"NVMe {kind} extent is {extent.bytes} bytes, exceeding the "
+            f"controller max transfer {max_transfer_bytes} bytes; "
+            "use a smaller exact FlashInfer KV chunk"
+        )

@@ -38,7 +38,10 @@ The serving process selects one `ServingTierService` from `NTA_SERVING_TIER`.
 `host_staged` is the default and retains the indexed host path. `nvme`
 requires `NTA_NVME_ENDPOINT` and an exact `NTA_TIER_CATALOG`; each requested
 device-page group is validated as one contiguous K/V extent, installed as an
-HBM object, and progressed by the GPU-owned NVMe queue. The host HiCache load
+HBM object no larger than the controller's advertised MDTS/PRP transfer limit,
+and progressed by the GPU-owned NVMe queue. The FlashInfer KV chunk therefore
+must be small enough for both K/V extents to satisfy that limit; an oversized
+exact group fails closed before any object is installed. The host HiCache load
 is used only as a lifetime and request-metadata signal in this mode; its bytes
 never become a data proxy. `cxl_dax` requires an explicit devdax endpoint,
 matching window, and catalog; its K/V extents become direct device

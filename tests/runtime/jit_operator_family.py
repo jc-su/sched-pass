@@ -23,22 +23,28 @@ def main() -> int:
         "batch_prefill_paged_kernel_mask_0.cu",
     ]
     assert MODULE.operator_family(decode_module_with_prefill_source) == 1
-    assert MODULE.operator_family(
-        [
-            "-c",
-            "/tmp/generated/nta_sglang_prefill_demand_acquire_v10_h128/"
-            "batch_prefill_paged_kernel_mask_0.cu",
-        ]
-    ) == 2
+    assert (
+        MODULE.operator_family(
+            [
+                "-c",
+                "/tmp/generated/nta_sglang_prefill_demand_acquire_v10_h128/"
+                "batch_prefill_paged_kernel_mask_0.cu",
+            ]
+        )
+        == 2
+    )
     assert MODULE.operator_family(["-c", "batch_decode_kernel.cu"]) == 1
-    assert MODULE.operator_family(["-c", "nta_batch_decode_default_v2_baseline/batch_decode_kernel.cu"]) == 0
+    assert (
+        MODULE.operator_family(
+            ["-c", "nta_batch_decode_default_v2_baseline/batch_decode_kernel.cu"]
+        )
+        == 0
+    )
     assert MODULE.operator_family(["-c", "unrelated.cu"]) == 0
     assert MODULE.has_typed_operator_kernel_source(
         ["-c", "batch_prefill_paged_kernel_mask_0.cu"]
     )
-    assert MODULE.has_typed_operator_kernel_source(
-        ["-c", "batch_decode_kernel.cu"]
-    )
+    assert MODULE.has_typed_operator_kernel_source(["-c", "batch_decode_kernel.cu"])
     assert not MODULE.has_typed_operator_kernel_source(
         ["-c", "batch_prefill_jit_binding.cu"]
     )

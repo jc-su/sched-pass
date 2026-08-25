@@ -87,6 +87,16 @@ class SglangHiCacheBridge:
     def set_prefetch_callback(self, callback: Any) -> None:
         self._prefetch_callback = callback
 
+    def close(self) -> None:
+        """Retire every outstanding lease during orderly engine teardown."""
+        with self._lock:
+            pending = tuple(self._owned.values())
+        if not pending:
+            return
+        stream = torch.cuda.current_stream()
+        for lease in pending:
+            self.retire(lease, stream=stream)
+
     @staticmethod
     def supports(controller: Any) -> bool:
         host_pool = controller.mem_pool_host
@@ -278,9 +288,7 @@ class SglangHiCacheBridge:
                 self._admission_stats.get("progress_feedback_published", 0) + 1
             )
 
-    def poll_critical_work(
-        self, request_ids: set[int]
-    ) -> CriticalWorkPlan | None:
+    def poll_critical_work(self, request_ids: set[int]) -> CriticalWorkPlan | None:
         """Consume current-generation compiler work for active engine requests."""
         if not request_ids:
             return None
@@ -323,9 +331,7 @@ class SglangHiCacheBridge:
                     incomplete.append(publication)
                     continue
                 if len(progress) != len(publication.bindings):
-                    raise RuntimeError(
-                        "request-progress snapshot changed row count"
-                    )
+                    raise RuntimeError("request-progress snapshot changed row count")
                 for binding, item in zip(publication.bindings, progress):
                     if (
                         item.request_id != binding.request_id
@@ -364,8 +370,7 @@ class SglangHiCacheBridge:
                 )
             if stale:
                 self._admission_stats["progress_feedback_stale_rows"] = (
-                    self._admission_stats.get("progress_feedback_stale_rows", 0)
-                    + stale
+                    self._admission_stats.get("progress_feedback_stale_rows", 0) + stale
                 )
 
     def complete_layer(self, pending: PendingHostLoad, local_layer: int) -> None:
@@ -422,9 +427,7 @@ class SglangHiCacheBridge:
         if ack is not None and stream is not None:
             finish_event = torch.cuda.Event()
             finish_event.record(stream)
-            pending.held_ack = type(ack)(
-                ack.start_event, finish_event, ack.node_ids
-            )
+            pending.held_ack = type(ack)(ack.start_event, finish_event, ack.node_ids)
             if pending.host_indices.is_cuda:
                 pending.host_indices.record_stream(stream)
             if pending.device_indices.is_cuda:

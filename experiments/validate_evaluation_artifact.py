@@ -19,14 +19,32 @@ def validate(output: Path) -> dict[str, Any]:
     report = json.loads((output / "evaluation-report.json").read_text(encoding="utf-8"))
     strata = json.loads((output / "strata-report.json").read_text(encoding="utf-8"))
     causal = json.loads((output / "causal-report.json").read_text(encoding="utf-8"))
-    _require(report.get("classification") == "nta-osdi-evaluation-report", "invalid evaluation report")
-    _require(strata.get("classification") == "nta-strata-report", "invalid strata report")
-    _require(causal.get("classification") == "nta-causal-report", "invalid causal report")
-    _require(report.get("strata") == strata.get("strata"), "strata report diverges from canonical report")
-    _require(report.get("causal_comparisons") == causal.get("comparisons"), "causal report diverges from canonical report")
-    _require(report.get("causal_comparisons"), "evaluation report has no causal comparisons")
+    _require(
+        report.get("classification") == "nta-osdi-evaluation-report",
+        "invalid evaluation report",
+    )
+    _require(
+        strata.get("classification") == "nta-strata-report", "invalid strata report"
+    )
+    _require(
+        causal.get("classification") == "nta-causal-report", "invalid causal report"
+    )
+    _require(
+        report.get("strata") == strata.get("strata"),
+        "strata report diverges from canonical report",
+    )
+    _require(
+        report.get("causal_comparisons") == causal.get("comparisons"),
+        "causal report diverges from canonical report",
+    )
+    _require(
+        report.get("causal_comparisons"), "evaluation report has no causal comparisons"
+    )
     provenance = report.get("provenance")
-    _require(isinstance(provenance, dict) and provenance.get("trial_count", 0) > 0, "report has no trial provenance")
+    _require(
+        isinstance(provenance, dict) and provenance.get("trial_count", 0) > 0,
+        "report has no trial provenance",
+    )
     _require(
         isinstance(provenance.get("workload_demand_digest"), str)
         and bool(provenance["workload_demand_digest"]),
@@ -58,20 +76,44 @@ def validate(output: Path) -> dict[str, Any]:
     for entry in report.get("strata", []):
         _require(entry.get("repetitions", 0) >= 5, "stratum has too few repetitions")
         for metric, summary in entry.get("metrics", {}).items():
-            _require(summary.get("count") == entry["repetitions"], f"incomplete metric summary: {metric}")
-            _require(all(math.isfinite(float(summary[name])) for name in ("mean", "median", "p95", "p99")), f"non-finite stratum metric: {metric}")
+            _require(
+                summary.get("count") == entry["repetitions"],
+                f"incomplete metric summary: {metric}",
+            )
+            _require(
+                all(
+                    math.isfinite(float(summary[name]))
+                    for name in ("mean", "median", "p95", "p99")
+                ),
+                f"non-finite stratum metric: {metric}",
+            )
     for comparison in report.get("causal_comparisons", []):
-        _require(comparison.get("matched_metadata") is True, "causal comparison is not matched")
-        _require(len(comparison.get("pairs", [])) >= 5, "causal comparison has too few pairs")
+        _require(
+            comparison.get("matched_metadata") is True,
+            "causal comparison is not matched",
+        )
+        _require(
+            len(comparison.get("pairs", [])) >= 5, "causal comparison has too few pairs"
+        )
         bootstrap = comparison.get("paired_bootstrap", {})
         interval = bootstrap.get("ci95", [])
-        _require(len(interval) == 2 and all(math.isfinite(float(value)) for value in interval), "invalid paired bootstrap interval")
+        _require(
+            len(interval) == 2
+            and all(math.isfinite(float(value)) for value in interval),
+            "invalid paired bootstrap interval",
+        )
     for entry in report.get("little_law", []):
         little = entry.get("report")
         if little is None:
             continue
-        _require(little.get("method") == "finite_window_arrival_departure_accounting", "unknown Little's Law method")
-        _require(math.isfinite(float(little.get("residual", math.nan))), "non-finite Little's Law residual")
+        _require(
+            little.get("method") == "finite_window_arrival_departure_accounting",
+            "unknown Little's Law method",
+        )
+        _require(
+            math.isfinite(float(little.get("residual", math.nan))),
+            "non-finite Little's Law residual",
+        )
     return report
 
 

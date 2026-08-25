@@ -17,7 +17,8 @@ def _require(condition: bool, message: str) -> None:
 
 def _finite(value: Any, name: str) -> float:
     _require(
-        isinstance(value, (int, float)) and not isinstance(value, bool)
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
         and math.isfinite(float(value)),
         f"serving report has no finite {name}",
     )
@@ -42,9 +43,14 @@ def _validate_workload(report: dict[str, Any]) -> None:
     for field in ("manifest_digest", "records_digest", "demand_trace_digest"):
         value = workload.get(field)
         _require(isinstance(value, str) and value, f"serving workload lacks {field}")
-    _require(workload.get("tokenization_errors") == 0, "serving workload changed tokenizer length")
-    _require(report.get("demand_trace_digest") == workload["demand_trace_digest"],
-             "serving demand digest diverges from workload provenance")
+    _require(
+        workload.get("tokenization_errors") == 0,
+        "serving workload changed tokenizer length",
+    )
+    _require(
+        report.get("demand_trace_digest") == workload["demand_trace_digest"],
+        "serving demand digest diverges from workload provenance",
+    )
     expected_ids = workload.get("request_id_order")
     actual_ids = [record.get("request_id") for record in report.get("records", [])]
     _require(
@@ -70,7 +76,10 @@ def _validate_workload(report: dict[str, Any]) -> None:
         _require(
             expected >= 0
             and math.isclose(
-                float(record["arrival_offset_seconds"]), expected, rel_tol=0.0, abs_tol=1e-9
+                float(record["arrival_offset_seconds"]),
+                expected,
+                rel_tol=0.0,
+                abs_tol=1e-9,
             ),
             f"serving record arrival diverges for {record['request_id']}",
         )
@@ -81,13 +90,17 @@ def _validate_byte_accounting(report: dict[str, Any]) -> None:
     physical = report.get("physical_bytes")
     status = report.get("byte_accounting_status")
     if selected is None or physical is None:
-        _require(status == "not exposed by SGLang engine metadata",
-                 "serving report hides byte accounting without an explicit status")
+        _require(
+            status == "not exposed by SGLang engine metadata",
+            "serving report hides byte accounting without an explicit status",
+        )
         return
     _finite(selected, "selected bytes")
     _finite(physical, "physical bytes")
-    _require(float(selected) >= 0 and float(physical) >= float(selected),
-             "serving byte accounting is inconsistent")
+    _require(
+        float(selected) >= 0 and float(physical) >= float(selected),
+        "serving byte accounting is inconsistent",
+    )
 
 
 def _validate_tier_provenance(report: dict[str, Any]) -> None:
@@ -107,16 +120,19 @@ def _validate_tier_provenance(report: dict[str, Any]) -> None:
         return
     _require(len(declarations) == 1, "serving engine stats disagree on serving tier")
     tier = declarations.pop()
-    _require(tier in {"host_staged", "nvme", "cxl_dax"}, "serving report has an unknown tier")
+    _require(
+        tier in {"host_staged", "nvme", "cxl_dax"}, "serving report has an unknown tier"
+    )
     for entry in stats:
         if not isinstance(entry, dict) or "serving_tier" not in entry:
             continue
-        _require(entry.get("tier_fallback") is False, "serving tier fallback was not fail-closed")
+        _require(
+            entry.get("tier_fallback") is False,
+            "serving tier fallback was not fail-closed",
+        )
         if tier in {"nvme", "cxl_dax"}:
             expected_path = (
-                "gpu_owned_nvme_to_hbm"
-                if tier == "nvme"
-                else "cuda_visible_cxl_direct"
+                "gpu_owned_nvme_to_hbm" if tier == "nvme" else "cuda_visible_cxl_direct"
             )
             _require(
                 entry.get("tier_data_path") == expected_path,
@@ -137,43 +153,73 @@ def _validate_tier_provenance(report: dict[str, Any]) -> None:
             )
 
 
-def _validate_single(report: dict[str, Any], *, require_engine_stats: bool = True) -> None:
+def _validate_single(
+    report: dict[str, Any], *, require_engine_stats: bool = True
+) -> None:
     _require(report.get("schema") == 1, "unsupported serving report schema")
-    _require(report.get("classification") == "sglang-hicache-load",
-             "serving result is not an SGLang load report")
-    _require(isinstance(report.get("revision"), str) and report["revision"],
-             "serving report has no revision")
-    _require(isinstance(report.get("machine"), dict) and report["machine"],
-             "serving report has no machine metadata")
+    _require(
+        report.get("classification") == "sglang-hicache-load",
+        "serving result is not an SGLang load report",
+    )
+    _require(
+        isinstance(report.get("revision"), str) and report["revision"],
+        "serving report has no revision",
+    )
+    _require(
+        isinstance(report.get("machine"), dict) and report["machine"],
+        "serving report has no machine metadata",
+    )
     _require(report.get("demand_semantics") == "exact", "serving demand is not exact")
     _require(report.get("placement_proven") is True, "serving placement was not proven")
-    _require(report.get("verification_failures") == 0, "serving report has verification failures")
+    _require(
+        report.get("verification_failures") == 0,
+        "serving report has verification failures",
+    )
     correctness = report.get("correctness")
-    _require(isinstance(correctness, dict) and correctness.get("verification_failures") == 0,
-             "serving correctness contract is incomplete")
-    _require(isinstance(correctness.get("generated_text_sha256"), str)
-             and correctness["generated_text_sha256"],
-             "serving report has no output correctness digest")
+    _require(
+        isinstance(correctness, dict) and correctness.get("verification_failures") == 0,
+        "serving correctness contract is incomplete",
+    )
+    _require(
+        isinstance(correctness.get("generated_text_sha256"), str)
+        and correctness["generated_text_sha256"],
+        "serving report has no output correctness digest",
+    )
     _require(
         isinstance(report.get("generated_text_sha256"), str)
         and report["generated_text_sha256"],
         "serving report has no aggregate output digest",
     )
     records = report.get("records")
-    _require(isinstance(records, list) and records, "serving report has no request records")
+    _require(
+        isinstance(records, list) and records, "serving report has no request records"
+    )
     for index, record in enumerate(records):
         _require(isinstance(record, dict), f"serving record {index} is not an object")
         for field in (
-            "kind", "arrival_offset_seconds", "submitted_offset_seconds",
-            "finished_offset_seconds", "ttft_seconds", "tpot_seconds",
-            "p99_itl_seconds", "admission_delay_seconds", "system_time_seconds",
-            "completion_tokens", "text_sha256", "request_id",
+            "kind",
+            "arrival_offset_seconds",
+            "submitted_offset_seconds",
+            "finished_offset_seconds",
+            "ttft_seconds",
+            "tpot_seconds",
+            "p99_itl_seconds",
+            "admission_delay_seconds",
+            "system_time_seconds",
+            "completion_tokens",
+            "text_sha256",
+            "request_id",
         ):
             _require(field in record, f"serving record {index} lacks {field}")
         for field in (
-            "arrival_offset_seconds", "submitted_offset_seconds",
-            "finished_offset_seconds", "ttft_seconds", "tpot_seconds",
-            "p99_itl_seconds", "admission_delay_seconds", "system_time_seconds",
+            "arrival_offset_seconds",
+            "submitted_offset_seconds",
+            "finished_offset_seconds",
+            "ttft_seconds",
+            "tpot_seconds",
+            "p99_itl_seconds",
+            "admission_delay_seconds",
+            "system_time_seconds",
         ):
             _require(
                 _finite(record[field], f"record {index} {field}") >= 0,
@@ -195,35 +241,59 @@ def _validate_single(report: dict[str, Any], *, require_engine_stats: bool = Tru
             and record["completion_tokens"] > 0,
             f"serving record {index} has invalid completion token count",
         )
-        _require(isinstance(record["text_sha256"], str) and record["text_sha256"],
-                 f"serving record {index} has no output digest")
+        _require(
+            isinstance(record["text_sha256"], str) and record["text_sha256"],
+            f"serving record {index} has no output digest",
+        )
     engine_stats = report.get("engine_stats")
-    _require(isinstance(engine_stats, list), "serving report engine statistics are not a list")
+    _require(
+        isinstance(engine_stats, list),
+        "serving report engine statistics are not a list",
+    )
     if require_engine_stats:
         _require(engine_stats, "serving report has no engine statistics")
     for field in (
-        "p50_ttft_seconds", "p95_ttft_seconds", "p99_ttft_seconds",
-        "p50_tpot_seconds", "p95_tpot_seconds", "p99_tpot_seconds",
-        "p99_itl_seconds", "slo_goodput",
+        "p50_ttft_seconds",
+        "p95_ttft_seconds",
+        "p99_ttft_seconds",
+        "p50_tpot_seconds",
+        "p95_tpot_seconds",
+        "p99_tpot_seconds",
+        "p99_itl_seconds",
+        "slo_goodput",
     ):
         _require(field in report, f"serving report lacks {field}")
     for field in (
-        "p50_ttft_seconds", "p95_ttft_seconds", "p99_ttft_seconds",
-        "p50_tpot_seconds", "p95_tpot_seconds", "p99_tpot_seconds",
+        "p50_ttft_seconds",
+        "p95_ttft_seconds",
+        "p99_ttft_seconds",
+        "p50_tpot_seconds",
+        "p95_tpot_seconds",
+        "p99_tpot_seconds",
         "p99_itl_seconds",
     ):
         _finite(report[field], field)
     _require(
-        report["p50_ttft_seconds"] <= report["p95_ttft_seconds"] <= report["p99_ttft_seconds"]
-        and report["p50_tpot_seconds"] <= report["p95_tpot_seconds"] <= report["p99_tpot_seconds"],
+        report["p50_ttft_seconds"]
+        <= report["p95_ttft_seconds"]
+        <= report["p99_ttft_seconds"]
+        and report["p50_tpot_seconds"]
+        <= report["p95_tpot_seconds"]
+        <= report["p99_tpot_seconds"],
         "serving latency percentiles are not monotonic",
     )
     goodput = report["slo_goodput"]
     _require(isinstance(goodput, dict), "serving report has no SLO goodput object")
-    for field in ("qualified_requests", "total_requests", "goodput_requests_per_second"):
+    for field in (
+        "qualified_requests",
+        "total_requests",
+        "goodput_requests_per_second",
+    ):
         _finite(goodput.get(field), f"SLO goodput {field}")
-    _require(int(goodput["total_requests"]) == len(records),
-             "SLO goodput request count diverges from records")
+    _require(
+        int(goodput["total_requests"]) == len(records),
+        "SLO goodput request count diverges from records",
+    )
     _require(
         0 <= int(goodput["qualified_requests"]) <= int(goodput["total_requests"])
         and goodput["goodput_requests_per_second"] >= 0,
@@ -240,28 +310,38 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
     if classification == "sglang-hicache-load":
         _validate_single(report)
         return report
-    _require(classification == "sglang-hicache-load-comparison",
-             "unsupported serving comparison classification")
-    _require(report.get("outputs_diverge") is False,
-             "serving comparison has divergent outputs")
+    _require(
+        classification == "sglang-hicache-load-comparison",
+        "unsupported serving comparison classification",
+    )
+    _require(
+        report.get("outputs_diverge") is False,
+        "serving comparison has divergent outputs",
+    )
     stock = report.get("stock")
     nta = report.get("nta")
-    _require(isinstance(stock, dict) and isinstance(nta, dict),
-             "serving comparison lacks stock or NTA report")
+    _require(
+        isinstance(stock, dict) and isinstance(nta, dict),
+        "serving comparison lacks stock or NTA report",
+    )
     # The stock arm intentionally has no NTA plugin statistics.  Its timing,
     # correctness, placement, and Little's Law fields remain mandatory; only
     # the implementation-specific engine-stat stream is absent.
     _validate_single(stock, require_engine_stats=False)
     _validate_single(nta)
-    _require(stock.get("demand_trace_digest") == nta.get("demand_trace_digest"),
-             "stock and NTA demand digests differ")
+    _require(
+        stock.get("demand_trace_digest") == nta.get("demand_trace_digest"),
+        "stock and NTA demand digests differ",
+    )
     _require(
         stock.get("generated_text_sha256") == nta.get("generated_text_sha256"),
         "stock and NTA output digests differ despite outputs_diverge=false",
     )
     activation = report.get("mechanism_activation")
-    _require(isinstance(activation, dict) and activation.get("external_launches", 0) > 0,
-             "serving comparison has no mechanism activation")
+    _require(
+        isinstance(activation, dict) and activation.get("external_launches", 0) > 0,
+        "serving comparison has no mechanism activation",
+    )
     _require(
         activation.get("external_attention_accounted") is True,
         "serving comparison did not account for exact external attention work",
@@ -282,8 +362,11 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         "serving comparison external attention accounting is not exact",
     )
     for field in (
-        "nta_slo_goodput", "stock_slo_goodput", "goodput_ratio",
-        "output_throughput_ratio", "external_p95_ttft_ratio",
+        "nta_slo_goodput",
+        "stock_slo_goodput",
+        "goodput_ratio",
+        "output_throughput_ratio",
+        "external_p95_ttft_ratio",
     ):
         _finite(report.get(field), field)
     return report

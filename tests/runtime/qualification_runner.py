@@ -77,9 +77,7 @@ def main() -> None:
         assert "spec_sha256" not in metadata
         assert all("log_sha256" not in json.loads(record) for record in records)
         metric = next(
-            item
-            for item in summary["summaries"]
-            if item["variant"] == "mechanism"
+            item for item in summary["summaries"] if item["variant"] == "mechanism"
         )["metrics"]["latency_ms"]
         assert metric["count"] == 2
         assert metric["mean"] == 2.5

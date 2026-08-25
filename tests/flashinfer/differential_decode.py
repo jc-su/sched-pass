@@ -40,9 +40,7 @@ def read_fixture(path: pathlib.Path):
     indices, offset = take(data, offset, np.int32, references)
     last_len, offset = take(data, offset, np.int32, requests)
     query, offset = take(data, offset, np.float16, requests * head_dim)
-    kv, offset = take(
-        data, offset, np.float16, pages * 2 * page_tokens * head_dim
-    )
+    kv, offset = take(data, offset, np.float16, pages * 2 * page_tokens * head_dim)
     nta_output, offset = take(data, offset, np.float32, requests * head_dim)
     if offset != len(data):
         raise RuntimeError("unexpected trailing data in NTA FlashInfer fixture")
@@ -102,9 +100,7 @@ def main() -> int:
     device = torch.device("cuda")
     q_tensor = torch.from_numpy(query).reshape(requests, 1, head_dim).to(device)
     kv_tensor = (
-        torch.from_numpy(kv)
-        .reshape(pages, 2, page_tokens, 1, head_dim)
-        .to(device)
+        torch.from_numpy(kv).reshape(pages, 2, page_tokens, 1, head_dim).to(device)
     )
     indptr_tensor = torch.from_numpy(indptr).to(device)
     indices_tensor = torch.from_numpy(indices).to(device)

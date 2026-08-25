@@ -31,7 +31,9 @@ class SglangExecutionConfig:
         )
 
     @classmethod
-    def from_environment(cls, environ: dict[str, str] | None = None) -> "SglangExecutionConfig":
+    def from_environment(
+        cls, environ: dict[str, str] | None = None
+    ) -> "SglangExecutionConfig":
         import os
 
         values = os.environ if environ is None else environ
@@ -61,7 +63,9 @@ class SglangAdapter(RequestIdentityAdapter):
                 raise RuntimeError(
                     "SGLang CUDA replay omitted request IDs from its metadata view"
                 )
-            request_ids = [f"__nta_graph_capture_{index}" for index in range(batch_size)]
+            request_ids = [
+                f"__nta_graph_capture_{index}" for index in range(batch_size)
+            ]
         request_ids = tuple(str(request_id) for request_id in request_ids)
         if len(request_ids) != batch_size:
             raise RuntimeError("SGLang request IDs do not match the graph batch")
@@ -72,9 +76,7 @@ class SglangAdapter(RequestIdentityAdapter):
             request_slots = request_slots.tolist()
         if request_slots is None:
             if not allow_capture_ids:
-                raise RuntimeError(
-                    "SGLang forward metadata omitted request-pool slots"
-                )
+                raise RuntimeError("SGLang forward metadata omitted request-pool slots")
             request_slots = tuple(range(batch_size))
         request_slots = tuple(int(slot) for slot in request_slots)
         if len(request_slots) != batch_size:

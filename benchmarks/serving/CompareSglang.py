@@ -95,15 +95,11 @@ def require_clean_mechanism(
         int(entry.get("verified_operator_modules", 0)) for entry in stats
     )
     contracts = [
-        contract
-        for entry in stats
-        for contract in entry.get("operator_contracts", [])
+        contract for entry in stats for contract in entry.get("operator_contracts", [])
     ]
     if verified_modules == 0 or not contracts:
         raise RuntimeError("NTA trial did not verify compiler operator contracts")
-    plans = [
-        plan for entry in stats for plan in entry.get("operator_plans", [])
-    ]
+    plans = [plan for entry in stats for plan in entry.get("operator_plans", [])]
     verified_pairs = sum(
         int(entry.get("verified_operator_pairs", 0)) for entry in stats
     )

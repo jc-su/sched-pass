@@ -331,7 +331,9 @@ def main() -> None:
         ),
         (0, 0, 1),
     )
-    assert [(item.work_begin, item.work_count, item.request_slot) for item in ranges] == [
+    assert [
+        (item.work_begin, item.work_count, item.request_slot) for item in ranges
+    ] == [
         (0, 2, 5),
         (2, 1, 9),
     ]
@@ -409,10 +411,7 @@ def main() -> None:
     graph_key = _demand_graph_key(**graph_key_arguments)
     same_graph_key = _demand_graph_key(**graph_key_arguments)
     changed_graph_key = _demand_graph_key(
-        **(
-            graph_key_arguments
-            | {"progress_blocks": (4,), "ready_work_counts": (8,)}
-        )
+        **(graph_key_arguments | {"progress_blocks": (4,), "ready_work_counts": (8,)})
     )
     assert graph_key == same_graph_key
     assert graph_key != changed_graph_key
@@ -651,9 +650,7 @@ def main() -> None:
     backend._active_batch = _ActiveBatch(
         (binding,), {id(demand_wrapper): demand_schedule}, object(), {}, {}, {}, ()
     )
-    backend._plans = {
-        (id(demand_wrapper), -1): types.SimpleNamespace(plan=demand_plan)
-    }
+    backend._plans = {(id(demand_wrapper), -1): types.SimpleNamespace(plan=demand_plan)}
     backend._run_preacquired_attention(
         demand_wrapper, object(), object(), object(), layer, {}
     )

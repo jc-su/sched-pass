@@ -11,18 +11,33 @@ from nta_runtime.execution_planner import (
 
 
 def main() -> None:
-    assert indexed_copy_blocks_per_group(transfer_bytes=4 * 1024 * 1024, object_count=2) == 4
+    assert (
+        indexed_copy_blocks_per_group(transfer_bytes=4 * 1024 * 1024, object_count=2)
+        == 4
+    )
     assert indexed_copy_blocks_per_group(transfer_bytes=64 * 1024, object_count=2) == 1
-    assert indexed_copy_blocks_per_group(transfer_bytes=128 * 1024 * 1024, object_count=2) == 32
+    assert (
+        indexed_copy_blocks_per_group(transfer_bytes=128 * 1024 * 1024, object_count=2)
+        == 32
+    )
     assert conservative_resume_counts(
-        block_counts=(8, 8), work_count=8, max_object_fanout=1, min_unresolved_dependencies=2
+        block_counts=(8, 8),
+        work_count=8,
+        max_object_fanout=1,
+        min_unresolved_dependencies=2,
     ) == (4, 8)
     assert conservative_resume_counts(
-        block_counts=(2, 2), work_count=32, max_object_fanout=32, min_unresolved_dependencies=2
+        block_counts=(2, 2),
+        work_count=32,
+        max_object_fanout=32,
+        min_unresolved_dependencies=2,
     ) == (32, 32)
     try:
         conservative_resume_counts(
-            block_counts=(0,), work_count=1, max_object_fanout=1, min_unresolved_dependencies=1
+            block_counts=(0,),
+            work_count=1,
+            max_object_fanout=1,
+            min_unresolved_dependencies=1,
         )
     except ValueError:
         pass
@@ -95,7 +110,9 @@ def main() -> None:
     else:
         raise AssertionError("zero forced host rounds were accepted")
     try:
-        plan_host_execution(object_count=0, transfer_bytes=1, runnable_tiles=1, model=model)
+        plan_host_execution(
+            object_count=0, transfer_bytes=1, runnable_tiles=1, model=model
+        )
     except ValueError:
         pass
     else:

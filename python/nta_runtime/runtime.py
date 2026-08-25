@@ -226,9 +226,7 @@ class OperatorContract:
             )
         missing = capabilities & ~self.capabilities
         if missing:
-            raise RuntimeError(
-                f"JIT operator contract lacks capabilities {missing!s}"
-            )
+            raise RuntimeError(f"JIT operator contract lacks capabilities {missing!s}")
         missing_instrumentation = instrumentation & ~self.instrumentation_flags
         if missing_instrumentation:
             raise RuntimeError(
@@ -236,7 +234,9 @@ class OperatorContract:
                 f"{missing_instrumentation!s}"
             )
         if identity_binding is not None and self.identity_binding != identity_binding:
-            raise RuntimeError("JIT operator contract has incompatible identity binding")
+            raise RuntimeError(
+                "JIT operator contract has incompatible identity binding"
+            )
         if demand_binding is not None and self.demand_binding != demand_binding:
             raise RuntimeError("JIT operator contract has incompatible demand binding")
         if access_proof is not None and self.access_proof != access_proof:
@@ -297,8 +297,7 @@ def require_operator_pair(
         direct_contract.form != OperatorForm.DIRECT
         or incremental_contract.form != OperatorForm.INCREMENTAL
         or direct_contract.family != incremental_contract.family
-        or direct_contract.source_fingerprint
-        != incremental_contract.source_fingerprint
+        or direct_contract.source_fingerprint != incremental_contract.source_fingerprint
         or direct.operator_plan != incremental.operator_plan
     ):
         raise RuntimeError(
@@ -1376,11 +1375,7 @@ def copy_host_to_device_async(
 ) -> None:
     if min(destination, source, bytes) <= 0:
         raise ValueError("host-to-device copy needs addresses and bytes")
-    _check(
-        _copy_host_to_device(
-            destination, source, bytes, _stream_address(stream)
-        )
-    )
+    _check(_copy_host_to_device(destination, source, bytes, _stream_address(stream)))
 
 
 def _device_byte_tensor(address: int, device_ordinal: int):
@@ -1554,11 +1549,7 @@ class Runtime(_Owner):
 
     def tier_descriptor(self, tier: TierKind) -> TierDescriptor:
         native = _TierDescriptor()
-        _check(
-            _runtime_tier_descriptor(
-                self._handle, int(tier), ctypes.byref(native)
-            )
-        )
+        _check(_runtime_tier_descriptor(self._handle, int(tier), ctypes.byref(native)))
         return TierDescriptor(
             TierKind(native.source_kind),
             TierCapability(native.capabilities),
@@ -1908,7 +1899,9 @@ class RequestProgressSnapshot:
         base = self._storage.data_ptr()
         stride = ctypes.sizeof(_RequestProgress)
         result = tuple(
-            _request_progress_value(_RequestProgress.from_address(base + index * stride))
+            _request_progress_value(
+                _RequestProgress.from_address(base + index * stride)
+            )
             for index in range(request_count)
         )
         self._pending = None
@@ -2153,9 +2146,7 @@ class JitPhaseProgram(_Owner):
             or self._operator_plan.plan_fingerprint == "0" * 32
         ):
             self.close()
-            raise RuntimeError(
-                "JIT operator plan does not match the module contract"
-            )
+            raise RuntimeError("JIT operator plan does not match the module contract")
 
     @property
     def operator_contract(self) -> OperatorContract:
@@ -2364,9 +2355,10 @@ class JitPhaseProgram(_Owner):
         if host_rows.numel() != token_count or device_rows.numel() != token_count:
             raise ValueError("selected row maps disagree with the token count")
         capacity = int(source_indices.numel())
-        if staging_indices.numel() != capacity or min(
-            object_count, page_tokens, token_count, capacity
-        ) <= 0:
+        if (
+            staging_indices.numel() != capacity
+            or min(object_count, page_tokens, token_count, capacity) <= 0
+        ):
             raise ValueError("selected indexed-row geometry is invalid")
         _check(
             _phase_prepare_selected_indexed_rows(
@@ -2518,9 +2510,7 @@ class JitPhaseProgram(_Owner):
             or not row_indices.is_contiguous()
             or row_indices.numel() < token_count
         ):
-            raise ValueError(
-                "mapped key reduction requires device int32 row indices"
-            )
+            raise ValueError("mapped key reduction requires device int32 row indices")
         pages = (token_count + page_tokens - 1) // page_tokens
         expected = (pages, int(source.shape[1]), int(source.shape[2]))
         if (

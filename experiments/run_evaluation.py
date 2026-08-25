@@ -20,7 +20,9 @@ from typing import Any
 try:
     from .validate_workload import validate as validate_workload
     from .analyze_evaluation import analyze as analyze_evaluation
-    from .validate_tier_qualification import validate_file as validate_tier_qualification
+    from .validate_tier_qualification import (
+        validate_file as validate_tier_qualification,
+    )
 except ImportError:
     from validate_workload import validate as validate_workload
     from analyze_evaluation import analyze as analyze_evaluation
@@ -59,7 +61,9 @@ def validate_spec(
     qualification_path: Path | None = None,
 ) -> dict[str, Any]:
     if spec.get("schema") != 1 or spec.get("classification") != "nta-paired-evaluation":
-        raise ValueError("evaluation trial spec must use nta-paired-evaluation schema 1")
+        raise ValueError(
+            "evaluation trial spec must use nta-paired-evaluation schema 1"
+        )
     repetitions = spec.get("repetitions")
     if not isinstance(repetitions, int) or repetitions < 5:
         raise ValueError("OSDI evaluation requires at least five repetitions")
@@ -74,7 +78,9 @@ def validate_spec(
     for trial in trials:
         if not isinstance(trial, dict) or not trial.get("command"):
             raise ValueError("each evaluation trial needs a command")
-        if not isinstance(trial.get("name"), str) or not isinstance(trial.get("variant"), str):
+        if not isinstance(trial.get("name"), str) or not isinstance(
+            trial.get("variant"), str
+        ):
             raise ValueError("each evaluation trial needs a name and variant")
         if trial.get("arm") not in arms:
             raise ValueError(f"trial uses an undeclared arm: {trial.get('arm')}")
@@ -82,8 +88,12 @@ def validate_spec(
             raise ValueError(f"trial uses an undeclared tier: {trial.get('tier')}")
         if trial.get("demand_semantics") != "exact":
             raise ValueError("evaluation trials must declare exact demand")
-        if not isinstance(trial.get("stratum"), dict) or not REQUIRED_STRATA <= set(trial["stratum"]):
-            raise ValueError("each trial needs the complete request/tier/load/arrival strata")
+        if not isinstance(trial.get("stratum"), dict) or not REQUIRED_STRATA <= set(
+            trial["stratum"]
+        ):
+            raise ValueError(
+                "each trial needs the complete request/tier/load/arrival strata"
+            )
         for stratum_name in REQUIRED_STRATA:
             if trial["stratum"][stratum_name] not in allowed_strata[stratum_name]:
                 raise ValueError(
@@ -91,11 +101,17 @@ def validate_spec(
                     f"{trial['stratum'][stratum_name]!r}"
                 )
         metrics = trial.get("metrics")
-        if not isinstance(metrics, list) or not metrics or not all(isinstance(metric, str) and metric for metric in metrics):
+        if (
+            not isinstance(metrics, list)
+            or not metrics
+            or not all(isinstance(metric, str) and metric for metric in metrics)
+        ):
             raise ValueError("each evaluation trial needs a non-empty metric contract")
         identity = (trial["name"], trial["variant"])
         if identity in identities:
-            raise ValueError(f"duplicate evaluation variant: {identity[0]}/{identity[1]}")
+            raise ValueError(
+                f"duplicate evaluation variant: {identity[0]}/{identity[1]}"
+            )
         identities[identity] = trial
     by_name: dict[str, list[dict[str, Any]]] = {}
     for trial in identities.values():
@@ -116,7 +132,9 @@ def validate_spec(
                 json.dumps(variant["stratum"], sort_keys=True, separators=(",", ":")),
             )
             if key != reference_key:
-                raise ValueError(f"paired variants in {name} do not share tier/demand/stratum")
+                raise ValueError(
+                    f"paired variants in {name} do not share tier/demand/stratum"
+                )
     comparisons = spec.get("comparisons")
     if not isinstance(comparisons, list) or not comparisons:
         raise ValueError("evaluation specification needs causal comparisons")
@@ -130,7 +148,9 @@ def validate_spec(
         denominator = comparison.get("denominator_variant")
         metric = comparison.get("metric")
         if (
-            not isinstance(name, str) or not name or name in comparison_names
+            not isinstance(name, str)
+            or not name
+            or name in comparison_names
             or not isinstance(experiment, str)
             or not isinstance(numerator, str)
             or not isinstance(denominator, str)
@@ -140,14 +160,18 @@ def validate_spec(
             raise ValueError("causal comparison has invalid identity")
         variants = {variant["variant"] for variant in by_name.get(experiment, [])}
         if numerator not in variants or denominator not in variants:
-            raise ValueError(f"causal comparison {name} references an undeclared variant")
+            raise ValueError(
+                f"causal comparison {name} references an undeclared variant"
+            )
         declared_metrics = {
             metric_name
             for variant in by_name[experiment]
             for metric_name in variant.get("metrics", [])
         }
         if metric not in declared_metrics:
-            raise ValueError(f"causal comparison {name} references an unmeasured metric")
+            raise ValueError(
+                f"causal comparison {name} references an unmeasured metric"
+            )
         comparison_names.add(name)
     required_qualification_tiers = _required_qualification_tiers(spec)
     if required_qualification_tiers and qualification_path is None:
@@ -204,7 +228,9 @@ def main(argv: list[str] | None = None) -> int:
         if completed.returncode:
             return completed.returncode
         output.mkdir(parents=True, exist_ok=True)
-        (output / "evaluation-contract.json").write_bytes(EVALUATION_MANIFEST.read_bytes())
+        (output / "evaluation-contract.json").write_bytes(
+            EVALUATION_MANIFEST.read_bytes()
+        )
         (output / "evaluation-metadata.json").write_text(
             json.dumps(
                 {
@@ -214,16 +240,14 @@ def main(argv: list[str] | None = None) -> int:
                     "spec_digest": _digest(spec_path),
                     "workload_manifest": str(workload_path),
                     "workload_manifest_digest": _digest(workload_path),
-                    "workload_demand_digest": workload_manifest[
-                        "demand_trace_digest"
-                    ],
-                    "tier_qualification": str(qualification_path) if qualification_path else None,
+                    "workload_demand_digest": workload_manifest["demand_trace_digest"],
+                    "tier_qualification": str(qualification_path)
+                    if qualification_path
+                    else None,
                     "tier_qualification_digest": (
                         _digest(qualification_path) if qualification_path else None
                     ),
-                    "qualified_tiers": sorted(
-                        _required_qualification_tiers(spec)
-                    ),
+                    "qualified_tiers": sorted(_required_qualification_tiers(spec)),
                     "evaluation_contract_digest": _digest(EVALUATION_MANIFEST),
                     "repetitions": spec["repetitions"],
                     "randomized_order": True,

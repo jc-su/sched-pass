@@ -126,7 +126,7 @@ def test_conventional_protocol_has_a_readiness_boundary() -> None:
         ),
     )
     for unit in units[:2]:
-        ledger.discover( unit.work_id, ready=True, binding=unit.binding, epoch=7)
+        ledger.discover(unit.work_id, ready=True, binding=unit.binding, epoch=7)
     assert ledger.runnable_groups() == ()
     ledger.discover(2, ready=True, binding=units[2].binding, epoch=7)
     assert ledger.runnable_groups() == ((0, 1), (2,))

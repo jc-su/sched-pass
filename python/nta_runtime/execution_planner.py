@@ -31,7 +31,9 @@ class HostCostModel:
         values = os.environ if environ is None else environ
         return cls(
             bandwidth_bytes_per_second=int(
-                values.get(f"{prefix}_HOST_BANDWIDTH_BPS", cls.bandwidth_bytes_per_second)
+                values.get(
+                    f"{prefix}_HOST_BANDWIDTH_BPS", cls.bandwidth_bytes_per_second
+                )
             ),
             round_overhead_ns=int(
                 values.get(f"{prefix}_ROUND_OVERHEAD_NS", cls.round_overhead_ns)
@@ -49,12 +51,15 @@ class HostCostModel:
         )
 
     def validate(self) -> None:
-        if min(
-            self.bandwidth_bytes_per_second,
-            self.tile_compute_ns,
-            self.max_rounds,
-            self.dependency_width,
-        ) <= 0:
+        if (
+            min(
+                self.bandwidth_bytes_per_second,
+                self.tile_compute_ns,
+                self.max_rounds,
+                self.dependency_width,
+            )
+            <= 0
+        ):
             raise ValueError("host execution cost parameters must be positive")
         if (
             min(self.round_overhead_ns, self.incremental_setup_ns) < 0
@@ -91,10 +96,13 @@ class DeviceDemandCostModel:
     minimum_predicted_gain: float = 1.10
 
     def validate(self) -> None:
-        if min(
-            self.bulk_bandwidth_bytes_per_second,
-            self.indexed_bandwidth_bytes_per_second,
-        ) <= 0:
+        if (
+            min(
+                self.bulk_bandwidth_bytes_per_second,
+                self.indexed_bandwidth_bytes_per_second,
+            )
+            <= 0
+        ):
             raise ValueError("device-demand bandwidths must be positive")
         if (
             min(
@@ -135,7 +143,9 @@ def indexed_copy_blocks_per_group(
         raise ValueError("indexed copy geometry must be positive")
     object_groups = math.ceil(object_count / 2)
     bytes_per_group = math.ceil(transfer_bytes / object_groups)
-    return min(maximum_blocks, max(1, math.ceil(bytes_per_group / target_bytes_per_block)))
+    return min(
+        maximum_blocks, max(1, math.ceil(bytes_per_group / target_bytes_per_block))
+    )
 
 
 def plan_device_demand(
@@ -189,7 +199,9 @@ def conservative_resume_counts(
         result.append(
             min(
                 work_count,
-                math.ceil(cumulative_objects * max_object_fanout / min_unresolved_dependencies),
+                math.ceil(
+                    cumulative_objects * max_object_fanout / min_unresolved_dependencies
+                ),
             )
         )
     return tuple(result)
@@ -259,7 +271,10 @@ def plan_host_execution(
             + deferred_compute_ns
             + model.incremental_setup_ns
         )
-        if force_rounds is not None or atomic_ns / one_wave_ns >= model.minimum_predicted_gain:
+        if (
+            force_rounds is not None
+            or atomic_ns / one_wave_ns >= model.minimum_predicted_gain
+        ):
             best_ns = one_wave_ns
             overlap_initial = True
 

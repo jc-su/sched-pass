@@ -21,9 +21,7 @@ class Runtime:
         priority: int,
         deadline_clock: int,
     ) -> None:
-        self.updates.append(
-            (slot, request_id, generation, priority, deadline_clock)
-        )
+        self.updates.append((slot, request_id, generation, priority, deadline_clock))
 
     def publish_requests_async(self, requests, stream) -> None:
         self.async_updates.append((tuple(requests), stream))
@@ -47,9 +45,7 @@ assert same == first
 assert registry.last_publish_count == 0
 assert len(runtime.updates) == 2
 
-reprioritized = registry.bind(
-    ["request-a", "request-b"], [2, 0], priorities=[7, 2]
-)
+reprioritized = registry.bind(["request-a", "request-b"], [2, 0], priorities=[7, 2])
 assert [binding.priority for binding in reprioritized] == [7, 2]
 assert registry.last_publish_count == 0
 assert registry.last_metadata_publish_count == 2
@@ -71,9 +67,7 @@ assert registry.cancel_matching(all=True) == 2
 
 async_runtime = Runtime()
 async_tracker = RequestIdentityRegistry(async_runtime, 4)
-async_bindings = async_tracker.bind(
-    ["request-z", "request-y"], [1, 0], stream=1234
-)
+async_bindings = async_tracker.bind(["request-z", "request-y"], [1, 0], stream=1234)
 assert [binding.request_slot for binding in async_bindings] == [1, 0]
 assert async_runtime.updates == []
 assert len(async_runtime.async_updates) == 1

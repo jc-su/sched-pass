@@ -174,9 +174,7 @@ def main() -> int:
     ]
     if args.resident_tokens:
         shape_warmup.append(
-            make_prompt(
-                tokenizer, "shape-warmup-resident", args.resident_tokens
-            )
+            make_prompt(tokenizer, "shape-warmup-resident", args.resident_tokens)
         )
     eviction_rounds = args.max_total_tokens // args.churn_tokens + 1
     churn = [
@@ -245,8 +243,7 @@ def main() -> int:
             attempt_seconds.append(elapsed)
             attempt_metadata.append(result_metadata)
             hot_is_external = all(
-                host_cached_tokens(value) > 0
-                for value in values[: args.hot_requests]
+                host_cached_tokens(value) > 0 for value in values[: args.hot_requests]
             )
             peer_is_resident = not resident or (
                 device_cached_tokens(values[args.hot_requests]) > 0
@@ -288,9 +285,7 @@ def main() -> int:
         float(values[args.hot_requests]["e2e_latency"])
         for values in metadata
         if len(values) > args.hot_requests
-        and isinstance(
-            values[args.hot_requests].get("e2e_latency"), (int, float)
-        )
+        and isinstance(values[args.hot_requests].get("e2e_latency"), (int, float))
     ]
     peer_delay_seconds = [
         max(0.0, peer - hot)
@@ -328,9 +323,7 @@ def main() -> int:
         "attempt_seconds_samples": attempt_seconds,
         "median_promotion_seconds": median,
         "promotions_per_second": 1.0 / median,
-        "completed_requests_per_second": (
-            args.hot_requests + (1 if resident else 0)
-        )
+        "completed_requests_per_second": (args.hot_requests + (1 if resident else 0))
         / median,
         "generated_text_sha256": digest.hexdigest(),
         "generated_text_samples": generated_samples,
@@ -340,18 +333,12 @@ def main() -> int:
     }
     if len(hot_request_seconds) == len(samples):
         report["hot_request_seconds_samples"] = hot_request_seconds
-        report["median_hot_request_seconds"] = statistics.median(
-            hot_request_seconds
-        )
+        report["median_hot_request_seconds"] = statistics.median(hot_request_seconds)
     if len(peer_request_seconds) == len(samples):
         report["peer_request_seconds_samples"] = peer_request_seconds
         report["peer_delay_seconds_samples"] = peer_delay_seconds
-        report["median_peer_request_seconds"] = statistics.median(
-            peer_request_seconds
-        )
-        report["median_peer_delay_seconds"] = statistics.median(
-            peer_delay_seconds
-        )
+        report["median_peer_request_seconds"] = statistics.median(peer_request_seconds)
+        report["median_peer_delay_seconds"] = statistics.median(peer_delay_seconds)
     print(json.dumps(report, sort_keys=True))
     return 0
 

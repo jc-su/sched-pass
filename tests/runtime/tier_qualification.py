@@ -106,15 +106,17 @@ def main() -> None:
             raise AssertionError("skipped DAX qualification was accepted")
 
         host_proxy = json.loads(json.dumps(document))
-        host_proxy["entries"][2]["report"]["gpu_controlled"][
-            "destination"
-        ] = "host-mapped"
+        host_proxy["entries"][2]["report"]["gpu_controlled"]["destination"] = (
+            "host-mapped"
+        )
         try:
             validate(host_proxy)
         except ValueError as error:
             assert "direct-HBM" in str(error)
         else:
-            raise AssertionError("host-mapped NVMe baseline passed direct-HBM admission")
+            raise AssertionError(
+                "host-mapped NVMe baseline passed direct-HBM admission"
+            )
 
         iommu_fault = json.loads(json.dumps(document))
         iommu_fault["entries"][2]["report"]["iommu_fault_free"] = False

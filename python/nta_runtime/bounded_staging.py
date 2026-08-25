@@ -103,8 +103,10 @@ class BoundedStagingPool:
         )
         with self._lock:
             return (
-                len(self._active) + len(self._retired)
-            ) * self.rows_per_lease * row_bytes
+                (len(self._active) + len(self._retired))
+                * self.rows_per_lease
+                * row_bytes
+            )
 
     @property
     def high_water_bytes(self) -> int:

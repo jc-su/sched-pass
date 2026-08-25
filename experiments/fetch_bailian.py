@@ -52,9 +52,7 @@ def _digest(path: Path) -> tuple[int, str]:
 def _verify(path: Path, metadata: dict[str, object]) -> None:
     size, digest = _digest(path)
     if size != metadata["size"] or digest != metadata["sha256"]:
-        raise ValueError(
-            f"checksum mismatch for {path}: size={size}, sha256={digest}"
-        )
+        raise ValueError(f"checksum mismatch for {path}: size={size}, sha256={digest}")
 
 
 def fetch(name: str, output_dir: Path, *, replace: bool = False) -> Path:
@@ -102,7 +100,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     names = args.files or list(DATASETS)
     try:
-        paths = [fetch(name, args.output_dir.resolve(), replace=args.replace) for name in names]
+        paths = [
+            fetch(name, args.output_dir.resolve(), replace=args.replace)
+            for name in names
+        ]
     except (OSError, ValueError) as error:
         print(f"fetch_bailian failed: {error}", file=sys.stderr)
         return 2

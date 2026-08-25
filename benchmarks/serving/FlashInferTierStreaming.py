@@ -649,12 +649,8 @@ def main() -> int:
         fixture.streaming.bind_external(replacement_key, replacement_value)
         fixture.streaming_call()
         torch.cuda.synchronize()
-        graph_dynamic_max_abs_error = float(
-            (graph_output - fixture.output).abs().max()
-        )
-        torch.testing.assert_close(
-            graph_output, fixture.output, rtol=2e-3, atol=2e-3
-        )
+        graph_dynamic_max_abs_error = float((graph_output - fixture.output).abs().max())
+        torch.testing.assert_close(graph_output, fixture.output, rtol=2e-3, atol=2e-3)
         fixture.streaming.bind_external(fixture.external_key, fixture.external_value)
         graph_replay_verified = True
         graph_dynamic_source_verified = True
@@ -663,7 +659,9 @@ def main() -> int:
     cancellation_isolation_verified = False
     if arguments.verify_lifecycle:
         if not fixture.streaming.compiler_transformed:
-            raise RuntimeError("lifecycle verification requires compiler transformation")
+            raise RuntimeError(
+                "lifecycle verification requires compiler transformation"
+            )
         request = fixture.requests[0]
         generation = request.generation + 1
         fixture.streaming.rebind_request(0, request.request_id + 10_000, generation)
@@ -673,9 +671,7 @@ def main() -> int:
             captured.replay()
         torch.cuda.synchronize()
         fixture.streaming.verify_compiler_epoch()
-        torch.testing.assert_close(
-            fixture.output, direct_output, rtol=2e-3, atol=2e-3
-        )
+        torch.testing.assert_close(fixture.output, direct_output, rtol=2e-3, atol=2e-3)
         generation_reuse_verified = True
 
         fixture.streaming.cancel_request(0, generation)
@@ -703,9 +699,7 @@ def main() -> int:
             captured.replay()
         torch.cuda.synchronize()
         fixture.streaming.verify_compiler_epoch()
-        torch.testing.assert_close(
-            fixture.output, direct_output, rtol=2e-3, atol=2e-3
-        )
+        torch.testing.assert_close(fixture.output, direct_output, rtol=2e-3, atol=2e-3)
 
     completion_times = fixture.completion_times_us()
     direct_median = statistics.median(samples["direct"].values_us)
@@ -719,9 +713,7 @@ def main() -> int:
     )
     external_bytes = fixture.kv_bytes(fixture.total_external_tokens)
     bulk_staging_bytes = external_bytes
-    streaming_staging_bytes = fixture.kv_bytes(
-        fixture.streaming.staging_tokens
-    )
+    streaming_staging_bytes = fixture.kv_bytes(fixture.streaming.staging_tokens)
     primary_median = {
         "direct": direct_median,
         "atomic": atomic_median,
@@ -774,9 +766,7 @@ def main() -> int:
                 "source_fingerprint": (
                     fixture.streaming.operator_plan.source_fingerprint
                 ),
-                "plan_fingerprint": (
-                    fixture.streaming.operator_plan.plan_fingerprint
-                ),
+                "plan_fingerprint": (fixture.streaming.operator_plan.plan_fingerprint),
             }
         ),
         "graph_replay_verified": graph_replay_verified,

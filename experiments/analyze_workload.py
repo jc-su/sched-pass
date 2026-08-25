@@ -34,7 +34,11 @@ def analyze(path: Path) -> dict[str, Any]:
     arrivals = [float(row["arrival_seconds"]) for row in rows]
     gaps = [right - left for left, right in zip(arrivals, arrivals[1:])]
     positive_gaps = [gap for gap in gaps if gap > 0]
-    states = [str(row["request_state"]) for row in rows if row.get("request_state") is not None]
+    states = [
+        str(row["request_state"])
+        for row in rows
+        if row.get("request_state") is not None
+    ]
     state_counts = {state: states.count(state) for state in sorted(set(states))}
     entropy = 0.0
     if states:
@@ -106,7 +110,9 @@ def analyze(path: Path) -> dict[str, Any]:
             ),
             "measured_in": ["native_tier_report", "serving_profile"],
         },
-        "semantic_prompt_claim": manifest["prompt"]["semantic_representativeness_claim"],
+        "semantic_prompt_claim": manifest["prompt"][
+            "semantic_representativeness_claim"
+        ],
     }
     return report
 

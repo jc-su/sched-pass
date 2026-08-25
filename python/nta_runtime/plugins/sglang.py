@@ -75,9 +75,7 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
 
     backend = getattr(runner.model_runner, "attn_backend", None)
     active_batch = getattr(backend, "_active_batch", None)
-    staging = int(
-        getattr(active_batch, "pending_host_load", None) is not None
-    )
+    staging = int(getattr(active_batch, "pending_host_load", None) is not None)
     mode = getattr(forward_batch, "forward_mode", None)
     is_mixed = bool(mode is not None and mode.is_mixed())
     if staging and is_mixed:
@@ -108,6 +106,8 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
             record_forward(kind, start.elapsed_time(end))
         except Exception as error:
             _observability_degraded("forward_profile", error)
+
+
 def _preserve_prefill_graph_request_metadata() -> None:
     """Carry request identity through the prefill BCG static batch.
 
@@ -161,8 +161,7 @@ def _preserve_prefill_graph_request_metadata() -> None:
             if not getattr(forward_batch, "rids", None):
                 batch_size = int(getattr(forward_batch, "batch_size", 1) or 1)
                 forward_batch.rids = tuple(
-                    f"__nta_graph_padding_{index}"
-                    for index in range(batch_size)
+                    f"__nta_graph_padding_{index}" for index in range(batch_size)
                 )
                 forward_batch._nta_request_priorities = (0,) * batch_size
             return result
@@ -282,9 +281,7 @@ def _attach_request_priorities(forward_batch, cls, batch, model_runner):
         ordered = sorted(set(raw), reverse=not low_first)
         rank = {value: index for index, value in enumerate(ordered)}
         denominator = max(1, len(ordered) - 1)
-        priorities = tuple(
-            7 - round(rank[value] * 7 / denominator) for value in raw
-        )
+        priorities = tuple(7 - round(rank[value] * 7 / denominator) for value in raw)
     forward_batch._nta_request_priorities = priorities
 
 
@@ -323,9 +320,7 @@ def register() -> None:
     for forward_target in (_EXECUTE_EXTEND_TARGET, _EXECUTE_DECODE_TARGET):
         forward_hooks = HookRegistry._hooks[forward_target]
         if not any(hook is _profile_forward for _, hook, _ in forward_hooks):
-            HookRegistry.register(
-                forward_target, _profile_forward, HookType.AROUND
-            )
+            HookRegistry.register(forward_target, _profile_forward, HookType.AROUND)
     abort_hooks = HookRegistry._hooks[_ABORT_TARGET]
     if not any(hook is _cancel_backend_requests for _, hook, _ in abort_hooks):
         HookRegistry.register(_ABORT_TARGET, _cancel_backend_requests, HookType.BEFORE)

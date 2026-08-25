@@ -6,7 +6,13 @@ import dataclasses
 from collections.abc import Callable
 from typing import Any
 
-from .runtime import EpochStatus, JitPhaseProgram, Runtime, RuntimeError, synchronize_stream
+from .runtime import (
+    EpochStatus,
+    JitPhaseProgram,
+    Runtime,
+    RuntimeError,
+    synchronize_stream,
+)
 
 
 @dataclasses.dataclass(frozen=True)

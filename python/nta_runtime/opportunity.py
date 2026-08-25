@@ -29,9 +29,7 @@ class TileArrival:
             int(value["tile_id"]),
             int(value["available_ns"]),
             int(value["compute_ns"]),
-            None
-            if value.get("logical_tile") is None
-            else int(value["logical_tile"]),
+            None if value.get("logical_tile") is None else int(value["logical_tile"]),
             str(value.get("availability_source", "gpu_globaltimer")),
             str(value.get("compute_source", "calibrated")),
         )
@@ -168,11 +166,7 @@ def _incremental_makespan(
             wave_end += 1
         wave = remaining[:wave_end]
         del remaining[:wave_end]
-        cursor = (
-            cutoff
-            + launch_overhead_ns
-            + _parallel_makespan(wave, parallel_slots)
-        )
+        cursor = cutoff + launch_overhead_ns + _parallel_makespan(wave, parallel_slots)
     return cursor
 
 
@@ -225,9 +219,7 @@ def summarize(
             grouping_window_ns,
             parallel_slots,
         )
-        ideal_incremental = _incremental_makespan(
-            record.tiles, 0, 0, parallel_slots
-        )
+        ideal_incremental = _incremental_makespan(record.tiles, 0, 0, parallel_slots)
         atomic_total += atomic
         incremental_total += incremental
         ideal_incremental_total += ideal_incremental
@@ -259,9 +251,7 @@ def summarize(
         material_available_before_atomic_launch=(
             material_available_before / tile_count
         ),
-        operators_with_material_opportunity=(
-            material_operators / len(materialized)
-        ),
+        operators_with_material_opportunity=(material_operators / len(materialized)),
         operators_with_speedup=speedup_operators / len(materialized),
         blocked_compute_ns=blocked_compute,
         blocked_compute_area_ns2=blocked_area,

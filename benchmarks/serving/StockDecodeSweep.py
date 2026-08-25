@@ -69,9 +69,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def measure_point(
-    args: argparse.Namespace, batch: int, context: int
-) -> dict[str, Any]:
+def measure_point(args: argparse.Namespace, batch: int, context: int) -> dict[str, Any]:
     """One engine per point: context length and pool sizing differ."""
     import sglang as sgl
 

@@ -32,11 +32,14 @@ def _fake_command() -> str:
 
 
 def main() -> None:
-    assert _format_command_token(
-        "python -c '{\"arm\": \"{arm}\"}'",
-        arm="B5",
-        values={"tier": "host_mem"},
-    ) == "python -c '{\"arm\": \"B5\"}'"
+    assert (
+        _format_command_token(
+            'python -c \'{"arm": "{arm}"}\'',
+            arm="B5",
+            values={"tier": "host_mem"},
+        )
+        == 'python -c \'{"arm": "B5"}\''
+    )
     with tempfile.TemporaryDirectory(prefix="nta-evaluation-contract-") as directory:
         root = Path(directory)
         workload_manifest, rows = normalize(
@@ -58,7 +61,9 @@ def main() -> None:
             synthesize_prompts=True,
         )
         manifest_path = root / "manifest.json"
-        write_workload(root / "manifest.json", root / "records.jsonl", workload_manifest, rows)
+        write_workload(
+            root / "manifest.json", root / "records.jsonl", workload_manifest, rows
+        )
         strata = _load_strata(ROOT / "experiments" / "strata.example.json")
         spec = build_spec(
             workload_manifest=manifest_path,
@@ -68,33 +73,56 @@ def main() -> None:
             repetitions=5,
         )
         validated_manifest = validate_spec(spec, manifest_path)
-        assert validated_manifest["demand_trace_digest"] == workload_manifest[
-            "demand_trace_digest"
-        ]
-        assert _workload_digest(
-            {"result": {}},
-            {"workload_demand_digest": "exact-demand", "workload_manifest_digest": "file"},
-        ) == "exact-demand"
-        assert _workload_digest(
-            {"result": {}}, {"workload_manifest_digest": "file"}
-        ) is None
+        assert (
+            validated_manifest["demand_trace_digest"]
+            == workload_manifest["demand_trace_digest"]
+        )
+        assert (
+            _workload_digest(
+                {"result": {}},
+                {
+                    "workload_demand_digest": "exact-demand",
+                    "workload_manifest_digest": "file",
+                },
+            )
+            == "exact-demand"
+        )
+        assert (
+            _workload_digest({"result": {}}, {"workload_manifest_digest": "file"})
+            is None
+        )
         assert len(spec["experiments"]) == len(PAIRS) * len(strata) * 2
         assert len(spec["comparisons"]) == len(PAIRS) * len(strata)
         assert {trial["arm"] for trial in spec["experiments"]} == set(ARMS)
-        assert all(trial["demand_semantics"] == "exact" for trial in spec["experiments"])
-        assert all(set(trial["stratum"]) == {
-            "request_state", "granularity", "load_ratio", "availability_skew",
-            "staging_pressure", "arrival",
-        } for trial in spec["experiments"])
+        assert all(
+            trial["demand_semantics"] == "exact" for trial in spec["experiments"]
+        )
+        assert all(
+            set(trial["stratum"])
+            == {
+                "request_state",
+                "granularity",
+                "load_ratio",
+                "availability_skew",
+                "staging_pressure",
+                "arrival",
+            }
+            for trial in spec["experiments"]
+        )
         cli_output = root / "cli-spec.json"
         command = [
             sys.executable,
             str(ROOT / "experiments" / "make_evaluation_spec.py"),
-            "--workload-manifest", str(manifest_path),
-            "--strata-file", str(ROOT / "experiments" / "strata.example.json"),
-            "--tier", "host_mem",
-            "--repetitions", "5",
-            "--output", str(cli_output),
+            "--workload-manifest",
+            str(manifest_path),
+            "--strata-file",
+            str(ROOT / "experiments" / "strata.example.json"),
+            "--tier",
+            "host_mem",
+            "--repetitions",
+            "5",
+            "--output",
+            str(cli_output),
         ]
         for arm in ARMS:
             command.extend(("--arm-command", f"{arm}={_fake_command()}"))

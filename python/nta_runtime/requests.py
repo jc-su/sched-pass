@@ -20,7 +20,10 @@ class RequestBinding:
     deadline_clock: int = 0
 
     def __post_init__(self) -> None:
-        if min(self.request_index, self.request_slot, self.generation, self.request_id) < 0:
+        if (
+            min(self.request_index, self.request_slot, self.generation, self.request_id)
+            < 0
+        ):
             raise ValueError("request binding identity fields must be nonnegative")
         if self.generation == 0:
             raise ValueError("request generation must be positive")
@@ -72,9 +75,12 @@ class RequestIdentityRegistry:
         bindings: list[RequestBinding] = []
         updates: list[RequestSpec] = []
         slot_updates: list[tuple[int, tuple[str, int, int, int]]] = []
-        for request_index, (request_id, request_slot, priority, deadline_clock) in enumerate(
-            zip(request_ids, request_slots, priorities, deadline_clocks)
-        ):
+        for request_index, (
+            request_id,
+            request_slot,
+            priority,
+            deadline_clock,
+        ) in enumerate(zip(request_ids, request_slots, priorities, deadline_clocks)):
             if not isinstance(request_id, str) or not request_id:
                 raise ValueError("serving request IDs must be non-empty strings")
             if request_slot < 0 or request_slot >= self._capacity:

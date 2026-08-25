@@ -315,9 +315,7 @@ class FlashInferLayerEpoch:
         )
         if next_indexed_object is not None and next_indexed_object < 0:
             raise ValueError("indexed host object offset must be nonnegative")
-        indexed_host_copy_blocks_per_group = int(
-            indexed_host_copy_blocks_per_group
-        )
+        indexed_host_copy_blocks_per_group = int(indexed_host_copy_blocks_per_group)
         if not 1 <= indexed_host_copy_blocks_per_group <= 64:
             raise ValueError(
                 "indexed host copy blocks per group must be between 1 and 64"

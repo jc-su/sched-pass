@@ -1,6 +1,11 @@
 from nta_runtime.requests import RequestBinding
 from nta_runtime.runtime import AcquireRequirement, DeviceWorkPlan, RequestRange
-from nta_runtime.work_unit import DemandDescriptor, DemandSemantics, Granularity, WorkUnit
+from nta_runtime.work_unit import (
+    DemandDescriptor,
+    DemandSemantics,
+    Granularity,
+    WorkUnit,
+)
 
 
 def main() -> None:

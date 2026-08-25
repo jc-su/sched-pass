@@ -26,9 +26,13 @@ class EngineBatch:
             raise ValueError("engine batch epoch cannot be negative")
         if not self.bindings:
             raise ValueError("engine batch must contain at least one request")
-        if len({binding.request_slot for binding in self.bindings}) != len(self.bindings):
+        if len({binding.request_slot for binding in self.bindings}) != len(
+            self.bindings
+        ):
             raise ValueError("engine batch cannot reuse a request slot")
-        if len({binding.request_index for binding in self.bindings}) != len(self.bindings):
+        if len({binding.request_index for binding in self.bindings}) != len(
+            self.bindings
+        ):
             raise ValueError("engine batch cannot reuse a request index")
 
     @property
@@ -58,13 +62,11 @@ class EngineBoundary(Protocol):
         stream: Any = None,
         granularity: Granularity = Granularity.PAGE_GROUP,
         **kwargs: Any,
-    ) -> EngineBatch:
-        ...
+    ) -> EngineBatch: ...
 
     def cancel_matching(
         self, request_id_prefix: str = "", *, all: bool = False
-    ) -> int:
-        ...
+    ) -> int: ...
 
 
 class RequestIdentityAdapter:

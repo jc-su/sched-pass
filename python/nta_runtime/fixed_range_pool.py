@@ -79,4 +79,3 @@ class FixedRangePool:
             self._by_slot.pop(lease.slot)
             self._by_owner.pop(lease.owner)
             self._free.append(lease.slot)
-

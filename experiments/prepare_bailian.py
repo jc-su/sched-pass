@@ -24,7 +24,9 @@ def main(argv: list[str] | None = None) -> int:
         default="batch_release",
     )
     parser.add_argument("--arrival-reference", type=Path)
-    parser.add_argument("--timestamp-unit", choices=("auto", "seconds", "milliseconds"), default="auto")
+    parser.add_argument(
+        "--timestamp-unit", choices=("auto", "seconds", "milliseconds"), default="auto"
+    )
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--target-rate", type=float)
     parser.add_argument("--seed", type=int, default=20260824)
@@ -56,7 +58,9 @@ def main(argv: list[str] | None = None) -> int:
             rows = rows[: args.max_requests]
             if not rows:
                 raise ValueError("--max-requests selected no source rows")
-        reference = read_jsonl(args.arrival_reference) if args.arrival_reference else None
+        reference = (
+            read_jsonl(args.arrival_reference) if args.arrival_reference else None
+        )
         manifest, records = normalize(
             rows,
             arrival_mode=args.arrival_mode,
@@ -69,7 +73,9 @@ def main(argv: list[str] | None = None) -> int:
             state_policy=args.state_policy,
         )
         manifest["source_file"] = str(args.input.resolve())
-        manifest["source_digest"] = __import__("hashlib").sha256(args.input.read_bytes()).hexdigest()
+        manifest["source_digest"] = (
+            __import__("hashlib").sha256(args.input.read_bytes()).hexdigest()
+        )
         manifest["selection"] = {
             "mode": "source_prefix" if args.max_requests is not None else "all_rows",
             "max_requests": args.max_requests,

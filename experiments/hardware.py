@@ -140,9 +140,7 @@ def collect(
             "controllers": nvme,
             "vfio_controller_count": len(vfio_nvme),
             "status": (
-                "qualification_candidate_present"
-                if vfio_nvme
-                else "no_vfio_controller"
+                "qualification_candidate_present" if vfio_nvme else "no_vfio_controller"
             ),
         },
         "dax": {
@@ -163,7 +161,10 @@ def collect(
 
 
 def validate(document: dict[str, Any]) -> dict[str, Any]:
-    if document.get("schema") != SCHEMA or document.get("classification") != CLASSIFICATION:
+    if (
+        document.get("schema") != SCHEMA
+        or document.get("classification") != CLASSIFICATION
+    ):
         raise ValueError("unsupported hardware inventory")
     for section in ("machine", "gpu", "nvme", "dax", "safety"):
         if not isinstance(document.get(section), dict):
@@ -171,15 +172,22 @@ def validate(document: dict[str, Any]) -> dict[str, Any]:
     safety = document["safety"]
     if safety.get("read_only_inventory") is not True:
         raise ValueError("hardware inventory is not marked read-only")
-    if any(safety.get(field) is not False for field in (
-        "pci_binding_performed", "block_namespace_opened", "qualification_performed"
-    )):
+    if any(
+        safety.get(field) is not False
+        for field in (
+            "pci_binding_performed",
+            "block_namespace_opened",
+            "qualification_performed",
+        )
+    ):
         raise ValueError("hardware inventory is not read-only")
     controllers = document["nvme"].get("controllers")
     if not isinstance(controllers, list):
         raise ValueError("hardware inventory has no NVMe controller list")
     for controller in controllers:
-        if not isinstance(controller, dict) or not isinstance(controller.get("bdf"), str):
+        if not isinstance(controller, dict) or not isinstance(
+            controller.get("bdf"), str
+        ):
             raise ValueError("invalid NVMe controller entry")
     dax = document["dax"].get("devices")
     if not isinstance(dax, list):
@@ -192,5 +200,7 @@ def write_inventory(output: Path) -> dict[str, Any]:
     validate(document)
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return document

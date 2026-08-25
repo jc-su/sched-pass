@@ -161,9 +161,7 @@ def require_clean_mechanism(
             f"incremental={incremental}, total={attention})"
         )
     contracts = [
-        contract
-        for entry in stats
-        for contract in entry.get("operator_contracts", [])
+        contract for entry in stats for contract in entry.get("operator_contracts", [])
     ]
     verified_modules = total("verified_operator_modules")
     if verified_modules == 0 or not contracts:
@@ -187,11 +185,16 @@ def require_clean_mechanism(
     # A complete exact prefetch legitimately uses the stock consumer for the
     # external pages, so there is no resume grid to compact.  Compaction is a
     # gate for the incremental form, not for this stock-consumer control arm.
-    if require_physical_compaction and not physical_tier and incremental > 0 and (
-        compact_launches == 0
-        or compact_ctas == 0
-        or canonical_ctas == 0
-        or compact_ctas >= canonical_ctas
+    if (
+        require_physical_compaction
+        and not physical_tier
+        and incremental > 0
+        and (
+            compact_launches == 0
+            or compact_ctas == 0
+            or canonical_ctas == 0
+            or compact_ctas >= canonical_ctas
+        )
     ):
         raise RuntimeError(
             "incremental trial did not physically compact resume work "
@@ -219,13 +222,11 @@ def require_clean_mechanism(
     return {
         "all_attention_transformed": stock_launches == 0,
         "external_attention_transformed": (
-            fallbacks == 0
-            and external_launches == acquisition_layers
+            fallbacks == 0 and external_launches == acquisition_layers
         ),
         "external_attention_stock_consumer": stock_external_launches > 0,
         "external_attention_accounted": (
-            fallbacks == 0
-            and accounted_external_launches == acquisition_layers
+            fallbacks == 0 and accounted_external_launches == acquisition_layers
         ),
         "resident_reference_attention_launches": stock_resident_launches,
         "active_forms": [
@@ -263,6 +264,8 @@ def require_clean_mechanism(
         "demand_graph": demand_graph,
         "execution_protocol": protocol,
     }
+
+
 def run(
     args: argparse.Namespace, backend: str, *, verify_transfer: bool = False
 ) -> dict[str, Any]:

@@ -33,7 +33,9 @@ def validate(path: Path, tier: str) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("catalog", type=Path)
-    parser.add_argument("--tier", required=True, choices=[tier.value for tier in ServingTier])
+    parser.add_argument(
+        "--tier", required=True, choices=[tier.value for tier in ServingTier]
+    )
     args = parser.parse_args()
     report = validate(args.catalog, args.tier)
     print(f"tier_catalog=valid pages={report['pages']} digest={report['digest']}")

@@ -115,11 +115,15 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
     if path.suffix.lower() == ".json":
         value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        if not isinstance(value, list) or not all(
+            isinstance(row, dict) for row in value
+        ):
             raise ValueError("JSON workload input must be an array of objects")
         return [dict(row) for row in value]
     rows: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
         if not line.strip():
             continue
         try:
@@ -132,10 +136,28 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _normalize_row(row: Mapping[str, Any], index: int, timestamp_unit: str) -> dict[str, Any]:
-    request_id = str(_first(row, "request_id", "id", "chat_id", default=f"request-{index:08d}"))
-    input_length = int(_number(_first(row, "input_length", "prompt_tokens", "input_tokens"), "input_length", integer=True))
-    output_length = int(_number(_first(row, "output_length", "completion_tokens", "output_tokens", default=0), "output_length", integer=True))
+def _normalize_row(
+    row: Mapping[str, Any], index: int, timestamp_unit: str
+) -> dict[str, Any]:
+    request_id = str(
+        _first(row, "request_id", "id", "chat_id", default=f"request-{index:08d}")
+    )
+    input_length = int(
+        _number(
+            _first(row, "input_length", "prompt_tokens", "input_tokens"),
+            "input_length",
+            integer=True,
+        )
+    )
+    output_length = int(
+        _number(
+            _first(
+                row, "output_length", "completion_tokens", "output_tokens", default=0
+            ),
+            "output_length",
+            integer=True,
+        )
+    )
     hashes = _hash_ids(_first(row, "hash_ids", "prefix_hashes", default=[]))
     timestamp = _first(row, "timestamp", "arrival", "arrival_seconds", default=None)
     normalized: dict[str, Any] = {
@@ -173,12 +195,12 @@ def _prefix_reuse(rows: list[dict[str, Any]]) -> None:
             else:
                 seen[prefix] = row["source_row"]
         row["shared_prefix_blocks"] = longest
-        row["unique_blocks"] = max(0, math.ceil(row["input_length"] / row["block_size"]) - longest)
+        row["unique_blocks"] = max(
+            0, math.ceil(row["input_length"] / row["block_size"]) - longest
+        )
 
 
-def _assign_serving_states(
-    rows: list[dict[str, Any]], policy: str
-) -> dict[str, Any]:
+def _assign_serving_states(rows: list[dict[str, Any]], policy: str) -> dict[str, Any]:
     """Attach an explicit serving-state construction policy to a trace.
 
     Bailian exports describe session structure but do not label whether a
@@ -248,8 +270,7 @@ def _normalize_arrivals(
             if target_rate <= 0:
                 raise ValueError("target_rate must be positive")
             raw_gaps = [
-                max(0.0, right - left) * time_scale
-                for left, right in zip(raw, raw[1:])
+                max(0.0, right - left) * time_scale for left, right in zip(raw, raw[1:])
             ]
             positive = [gap for gap in raw_gaps if gap > 0]
             if positive:
@@ -274,7 +295,10 @@ def _normalize_arrivals(
             shuffled = list(positive)
             rng.shuffle(shuffled)
             scale = (1.0 / target_rate) / mean(positive)
-            gaps = [shuffled[index % len(shuffled)] * scale for index in range(max(0, len(rows) - 1))]
+            gaps = [
+                shuffled[index % len(shuffled)] * scale
+                for index in range(max(0, len(rows) - 1))
+            ]
             offsets = [0.0]
             for gap in gaps:
                 offsets.append(offsets[-1] + gap)
@@ -318,7 +342,9 @@ def _token_for(block_id: str, position: int) -> int:
     return 1000 + int.from_bytes(digest[:4], "big") % 900_000
 
 
-def synthesize_prompt(row: Mapping[str, Any], *, block_size: int = DEFAULT_BLOCK_SIZE) -> dict[str, Any]:
+def synthesize_prompt(
+    row: Mapping[str, Any], *, block_size: int = DEFAULT_BLOCK_SIZE
+) -> dict[str, Any]:
     """Create structure-preserving token IDs and a tokenizer-independent text form."""
 
     if block_size <= 0:
@@ -327,7 +353,9 @@ def synthesize_prompt(row: Mapping[str, Any], *, block_size: int = DEFAULT_BLOCK
     hashes = list(row.get("hash_ids", ()))
     block_count = math.ceil(token_count / block_size)
     ids = hashes[:block_count]
-    ids.extend(f"{row['request_id']}:unique:{index}" for index in range(len(ids), block_count))
+    ids.extend(
+        f"{row['request_id']}:unique:{index}" for index in range(len(ids), block_count)
+    )
     token_ids: list[int] = []
     for block_index, block_id in enumerate(ids):
         for position in range(block_size):
@@ -359,17 +387,24 @@ def normalize(
     synthesize_prompts: bool = False,
     state_policy: str = "preserve",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    normalized = [_normalize_row(row, index, timestamp_unit) for index, row in enumerate(rows)]
+    normalized = [
+        _normalize_row(row, index, timestamp_unit) for index, row in enumerate(rows)
+    ]
     if not normalized:
         raise ValueError("workload input contains no requests")
     _prefix_reuse(normalized)
     state = _assign_serving_states(normalized, state_policy)
     reference = None
     if reference_rows is not None:
-        reference = [_normalize_row(row, index, timestamp_unit) for index, row in enumerate(reference_rows)]
+        reference = [
+            _normalize_row(row, index, timestamp_unit)
+            for index, row in enumerate(reference_rows)
+        ]
         _prefix_reuse(reference)
         reference_timestamps = [row.get("timestamp_seconds") for row in reference]
-        if not reference_timestamps or any(value is None for value in reference_timestamps):
+        if not reference_timestamps or any(
+            value is None for value in reference_timestamps
+        ):
             raise ValueError("arrival reference must contain timestamps on every row")
         for row, timestamp in zip(reference, reference_timestamps):
             row["arrival_seconds"] = float(timestamp) - float(reference_timestamps[0])
@@ -420,12 +455,22 @@ def normalize(
                 "max": max(row["output_length"] for row in normalized),
                 "mean": mean(row["output_length"] for row in normalized),
             },
-            "shared_prefix_blocks": sum(row["shared_prefix_blocks"] for row in normalized),
-            "requests_with_shared_prefix": sum(row["shared_prefix_blocks"] > 0 for row in normalized),
+            "shared_prefix_blocks": sum(
+                row["shared_prefix_blocks"] for row in normalized
+            ),
+            "requests_with_shared_prefix": sum(
+                row["shared_prefix_blocks"] > 0 for row in normalized
+            ),
             "modalities": sorted({row["modality"] for row in normalized}),
             "request_state_counts": {
                 str(state): sum(row["request_state"] == state for row in normalized)
-                for state in sorted({row["request_state"] for row in normalized if row["request_state"] is not None})
+                for state in sorted(
+                    {
+                        row["request_state"]
+                        for row in normalized
+                        if row["request_state"] is not None
+                    }
+                )
             },
             "interarrival_seconds": {
                 "min": min(arrival_gaps) if arrival_gaps else 0.0,
@@ -466,4 +511,6 @@ def write_workload(
     manifest["records_file"] = records_path.name
     manifest["records_digest"] = file_digest(records_path)
     manifest["demand_trace_digest"] = demand_trace_digest(records)
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )

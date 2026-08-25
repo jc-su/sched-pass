@@ -75,16 +75,19 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.model.is_dir():
         parser.error(f"model directory does not exist: {args.model}")
-    if min(
-        args.external_tokens,
-        args.task_count,
-        args.max_new_tokens,
-        args.resident_tokens,
-        args.resident_output_tokens,
-        args.churn_tokens,
-        args.max_total_tokens,
-        args.context_length,
-    ) <= 0:
+    if (
+        min(
+            args.external_tokens,
+            args.task_count,
+            args.max_new_tokens,
+            args.resident_tokens,
+            args.resident_output_tokens,
+            args.churn_tokens,
+            args.max_total_tokens,
+            args.context_length,
+        )
+        <= 0
+    ):
         parser.error("token counts must be positive")
     if args.external_tokens + args.churn_tokens <= args.max_total_tokens:
         parser.error("external prefix and churn must exceed the device token pool")
@@ -172,13 +175,14 @@ def build_tasks(tokenizer: Any, args: argparse.Namespace) -> list[QualityTask]:
                     f"task {index}? Answer with only the key.\nAnswer:"
                 )
                 prefix, offset = _assemble_prefix(
-                    tokenizer, args, label,
-                    [(fractions[index % len(fractions)], needle)], question,
+                    tokenizer,
+                    args,
+                    label,
+                    [(fractions[index % len(fractions)], needle)],
+                    question,
                 )
             elif kind == "multikey":
-                parts = [
-                    f"P{part}X{rng.randrange(100, 999)}" for part in range(6)
-                ]
+                parts = [f"P{part}X{rng.randrange(100, 999)}" for part in range(6)]
                 segments = [
                     (
                         [0.15, 0.28, 0.41, 0.54, 0.67, 0.80][part],
@@ -201,8 +205,7 @@ def build_tasks(tokenizer: Any, args: argparse.Namespace) -> list[QualityTask]:
                 segments = [
                     (
                         [0.12, 0.22, 0.34, 0.46, 0.58, 0.66, 0.74, 0.84][hit],
-                        f"\nThe audit marker {marker} appears at this "
-                        f"checkpoint.\n",
+                        f"\nThe audit marker {marker} appears at this checkpoint.\n",
                     )
                     for hit in range(8)
                 ]
@@ -407,9 +410,7 @@ def main() -> int:
                     "resident_device_cached_tokens": device_cached_tokens(
                         resident_result
                     ),
-                    "resident_host_cached_tokens": host_cached_tokens(
-                        resident_result
-                    ),
+                    "resident_host_cached_tokens": host_cached_tokens(resident_result),
                     "passed": passed,
                     "elapsed_seconds": elapsed,
                     "generated_text": text,

@@ -15,7 +15,9 @@ try:
     from .validate_evaluation_artifact import validate as validate_evaluation_artifact
     from .validate_matrix_artifact import validate as validate_matrix
     from .validate_serving_report import validate as validate_serving_report
-    from .validate_tier_qualification import validate_file as validate_tier_qualification
+    from .validate_tier_qualification import (
+        validate_file as validate_tier_qualification,
+    )
     from .validate_tier_catalog import validate as validate_tier_catalog
     from .validate_workload import validate as validate_workload
 except ImportError:  # Direct script execution.
@@ -67,7 +69,9 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
         _require(not log.is_absolute() and ".." not in log.parts, "unsafe log path")
         _require((bundle / log).is_file(), f"command log is missing: {log}")
     if metadata.get("profile") == "serving":
-        _require(bool(metadata.get("result")), "serving bundle has no structured result")
+        _require(
+            bool(metadata.get("result")), "serving bundle has no structured result"
+        )
         if metadata.get("tier_catalog"):
             catalog_name = Path(str(metadata["tier_catalog"]))
             _require(
@@ -83,9 +87,15 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             validate_tier_catalog(catalog_path, str(metadata.get("serving_tier")))
     if metadata.get("profile") == "hardware":
         inventory_name = metadata.get("hardware_inventory")
-        _require(isinstance(inventory_name, str) and bool(inventory_name), "hardware bundle has no inventory")
+        _require(
+            isinstance(inventory_name, str) and bool(inventory_name),
+            "hardware bundle has no inventory",
+        )
         inventory_path = Path(inventory_name)
-        _require(not inventory_path.is_absolute() and ".." not in inventory_path.parts, "unsafe hardware inventory path")
+        _require(
+            not inventory_path.is_absolute() and ".." not in inventory_path.parts,
+            "unsafe hardware inventory path",
+        )
         inventory_file = bundle / inventory_path
         _require(inventory_file.is_file(), "hardware inventory is missing")
         _require(
@@ -95,7 +105,9 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
         validate_hardware(json.loads(inventory_file.read_text(encoding="utf-8")))
     if metadata.get("result"):
         result = Path(metadata["result"])
-        _require(not result.is_absolute() and ".." not in result.parts, "unsafe result path")
+        _require(
+            not result.is_absolute() and ".." not in result.parts, "unsafe result path"
+        )
         result_path = bundle / result
         _require(result_path.is_file(), f"result file is missing: {result}")
         _require(
@@ -109,10 +121,11 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
                 workload_file = bundle / Path(metadata["workload_replay_manifest"])
                 workload_records = workload_file.parent / "records.jsonl"
                 reports = [serving_report]
-                if serving_report.get("classification") == "sglang-hicache-load-comparison":
-                    reports.extend(
-                        [serving_report["stock"], serving_report["nta"]]
-                    )
+                if (
+                    serving_report.get("classification")
+                    == "sglang-hicache-load-comparison"
+                ):
+                    reports.extend([serving_report["stock"], serving_report["nta"]])
                 for report in reports:
                     workload = report.get("workload")
                     if workload is None:
@@ -134,7 +147,8 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
         workload_path = bundle / workload_manifest
         _require(workload_path.is_file(), "workload replay manifest is missing")
         _require(
-            file_digest(workload_path) == metadata.get("workload_replay_manifest_digest"),
+            file_digest(workload_path)
+            == metadata.get("workload_replay_manifest_digest"),
             "workload replay manifest digest does not match metadata",
         )
         records_path = workload_path.parent / "records.jsonl"
@@ -165,9 +179,14 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             "RQ0 opportunity report digest does not match metadata",
         )
         rq0 = json.loads(rq0_path.read_text(encoding="utf-8"))
-        _require(rq0.get("classification") == "bailian-rq0-opportunity-report", "invalid RQ0 opportunity report")
+        _require(
+            rq0.get("classification") == "bailian-rq0-opportunity-report",
+            "invalid RQ0 opportunity report",
+        )
         evaluation_output = bundle / "evaluation"
-        _require(evaluation_output.is_dir(), "evaluation bundle has no evaluation output")
+        _require(
+            evaluation_output.is_dir(), "evaluation bundle has no evaluation output"
+        )
         validate_evaluation_artifact(evaluation_output)
         spec_path = bundle / "evaluation-spec.json"
         _require(spec_path.is_file(), "evaluation bundle has no copied trial spec")

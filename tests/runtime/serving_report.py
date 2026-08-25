@@ -120,7 +120,9 @@ def main() -> None:
     except ValueError as error:
         assert "request identities" in str(error)
     else:
-        raise AssertionError("serving report with an unknown request identity was accepted")
+        raise AssertionError(
+            "serving report with an unknown request identity was accepted"
+        )
     comparison["stock"]["engine_stats"] = []
     validate(comparison)
     with tempfile.TemporaryDirectory(prefix="nta-serving-artifact-") as directory:

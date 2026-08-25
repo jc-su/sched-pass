@@ -132,7 +132,9 @@ class ExecutionSession:
 
     def _binding(self, work_id: int) -> RequestBinding:
         try:
-            return next(unit.binding for unit in self.batch.units if unit.work_id == work_id)
+            return next(
+                unit.binding for unit in self.batch.units if unit.work_id == work_id
+            )
         except StopIteration as error:
             raise KeyError(f"unknown work unit {work_id}") from error
 

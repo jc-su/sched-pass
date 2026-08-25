@@ -59,9 +59,7 @@ def report(*, compact_ctas: int, canonical_ctas: int) -> dict:
 def main() -> None:
     module = load_comparison_module()
     one_cta = report(compact_ctas=1, canonical_ctas=1)
-    activation = module.require_clean_mechanism(
-        one_cta, require_demand_graph=True
-    )
+    activation = module.require_clean_mechanism(one_cta, require_demand_graph=True)
     assert activation["compact_resume_cta_ratio"] == 1.0
 
     try:

@@ -200,9 +200,7 @@ class FlashInferTierStreamingExecutor:
         candidate = (self._event_cursor + 1) % len(self._event_sets)
         events = self._event_sets[candidate]
         if self._event_set_used[candidate] and not events.finished.query():
-            raise RuntimeError(
-                "tier-streaming in-flight epoch capacity was exhausted"
-            )
+            raise RuntimeError("tier-streaming in-flight epoch capacity was exhausted")
         if previous is not None:
             self.copy_stream.wait_event(previous.finished)
         self._event_cursor = candidate
@@ -254,8 +252,14 @@ class FlashInferTierStreamingExecutor:
         *,
         run_base: Callable[[], None],
         run_partial: Callable[
-            [FlashInferHostWave, torch.Tensor, torch.Tensor, torch.Tensor,
-             torch.Tensor, torch.Tensor],
+            [
+                FlashInferHostWave,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
             None,
         ]
         | None = None,
@@ -469,7 +473,9 @@ class FlashInferTierStreamingOperator:
 
     @property
     def compiler_runtime_protocol_active(self) -> bool:
-        return self._compiler_programs is not None and self._last_compiled_work_count > 0
+        return (
+            self._compiler_programs is not None and self._last_compiled_work_count > 0
+        )
 
     @property
     def gpu_initiated_host(self) -> bool:
@@ -538,9 +544,7 @@ class FlashInferTierStreamingOperator:
             f"{str(self.dtype).replace('torch.', '')}"
         )
         direct_name = f"nta_sglang_prefill_request_bound_tier_v4_{signature}"
-        incremental_name = (
-            f"nta_sglang_prefill_demand_acquire_tier_v4_{signature}"
-        )
+        incremental_name = f"nta_sglang_prefill_demand_acquire_tier_v4_{signature}"
         self._compiler_module_names = (direct_name, incremental_name)
         self._direct_jit_args = request_bound_attention_jit_args(
             direct_name,
@@ -583,9 +587,7 @@ class FlashInferTierStreamingOperator:
                 object_capacity=self._compiled_object_count,
                 intent_capacity=max(capacity, self._compiled_object_count),
                 work_ticket_capacity=capacity,
-                max_dependencies_per_work_ticket=(
-                    2 if self._gpu_initiated_host else 1
-                ),
+                max_dependencies_per_work_ticket=(2 if self._gpu_initiated_host else 1),
                 device_ordinal=self.workspace.device.index
                 if self.workspace.device.index is not None
                 else -1,
@@ -703,9 +705,7 @@ class FlashInferTierStreamingOperator:
             slot = request_slots[request_index]
             request = self.schedule.requests[slot]
             local_dependency_begin = len(dependencies)
-            completion_dependency_begin = len(
-                self._compiled_completion_dependencies
-            )
+            completion_dependency_begin = len(self._compiled_completion_dependencies)
             if self._gpu_initiated_host:
                 assert wave_index is not None
                 wave = self.executor.waves[wave_index]
@@ -787,7 +787,9 @@ class FlashInferTierStreamingOperator:
         for request_index, count in enumerate(counts):
             slot = request_slots[request_index]
             request_ranges.append(
-                RequestRange(cursor, count, slot, self.schedule.requests[slot].generation)
+                RequestRange(
+                    cursor, count, slot, self.schedule.requests[slot].generation
+                )
             )
             self._compiled_completion_ranges.append(
                 RequestRange(
@@ -936,9 +938,7 @@ class FlashInferTierStreamingOperator:
             plan.require(
                 family=OperatorFamily.FLASHINFER_PAGED_PREFILL,
                 forms=(OperatorForm.DIRECT, OperatorForm.INCREMENTAL),
-                coordinate_map=(
-                    OperatorCoordinateMap.FLASHINFER_REQUEST_CONTIGUOUS
-                ),
+                coordinate_map=(OperatorCoordinateMap.FLASHINFER_REQUEST_CONTIGUOUS),
                 partial_state=OperatorPartialState.ONLINE_SOFTMAX_VALUE_LSE,
                 reduction=OperatorReduction.ORDERED_MERGE_STATE,
                 flags=_COMPILED_PLAN_FLAGS,
@@ -955,8 +955,7 @@ class FlashInferTierStreamingOperator:
         begin = 0
         while begin < len(self.resident_lengths):
             while (
-                begin < len(self.resident_lengths)
-                and self.resident_lengths[begin] == 0
+                begin < len(self.resident_lengths) and self.resident_lengths[begin] == 0
             ):
                 begin += 1
             if begin == len(self.resident_lengths):
@@ -1040,9 +1039,7 @@ class FlashInferTierStreamingOperator:
             or external_value.dtype != self.dtype
         ):
             raise ValueError("external KV does not match the captured operator plan")
-        for planned, wave in zip(
-            self.schedule.waves, self.executor.waves, strict=True
-        ):
+        for planned, wave in zip(self.schedule.waves, self.executor.waves, strict=True):
             destination = 0
             for segment in planned.segments:
                 source = (
@@ -1107,13 +1104,13 @@ class FlashInferTierStreamingOperator:
             if compiled is None:
                 raise RuntimeError("incremental FlashInfer wrapper has no work plan")
             if self._compiler_programs is None:
-                raise RuntimeError("incremental FlashInfer wrapper has no phase program")
+                raise RuntimeError(
+                    "incremental FlashInfer wrapper has no phase program"
+                )
             work_items = compiled.plan.work_items_tensor
             dependencies = compiled.plan.dependencies_tensor
             work_count = compiled.plan.work_item_count
-            flags = BIND_CURRENT_GENERATION | (
-                compiled.reduction_group_begin << 32
-            )
+            flags = BIND_CURRENT_GENERATION | (compiled.reduction_group_begin << 32)
         request_count = self._wrapper_request_counts.get(id(wrapper))
         if request_count is None:
             raise RuntimeError("compiled FlashInfer wrapper has no request count")
@@ -1146,7 +1143,10 @@ class FlashInferTierStreamingOperator:
     ) -> None:
         """Enqueue every resident and local contributor in fixed merge order."""
 
-        if resident_key.shape != resident_value.shape or local_key.shape != local_value.shape:
+        if (
+            resident_key.shape != resident_value.shape
+            or local_key.shape != local_value.shape
+        ):
             raise ValueError("FlashInfer resident/local K/V geometry must match")
         if resident_key.shape[0] != self.resident_offsets[-1]:
             raise ValueError("resident KV disagrees with the operator plan")
@@ -1250,7 +1250,9 @@ class FlashInferTierStreamingOperator:
         )
         if self._compiler_programs is not None:
             if self._compiled_runtime is None or self._compiled_completion_plan is None:
-                raise RuntimeError("compiled FlashInfer operator has no completion plan")
+                raise RuntimeError(
+                    "compiled FlashInfer operator has no completion plan"
+                )
             self._compiler_programs[1].complete_stream_ordered(
                 self._compiled_runtime,
                 self._compiled_completion_plan,

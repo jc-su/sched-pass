@@ -46,13 +46,16 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.model.is_dir():
         parser.error(f"model directory does not exist: {args.model}")
-    if min(
-        args.requests,
-        args.max_new_tokens,
-        args.iterations,
-        args.warmup_iterations,
-        args.context_length,
-    ) <= 0:
+    if (
+        min(
+            args.requests,
+            args.max_new_tokens,
+            args.iterations,
+            args.warmup_iterations,
+            args.context_length,
+        )
+        <= 0
+    ):
         parser.error("request, token, iteration, and context values must be positive")
     if not 0.0 < args.mem_fraction_static < 1.0:
         parser.error("--mem-fraction-static must be between zero and one")
@@ -98,13 +101,10 @@ def configure_jit_environment(args: argparse.Namespace) -> pathlib.Path:
     # (a C++ compiler breaks them), while FlashInfer's ninja passes $CC to
     # nvcc as -ccbin (a CUDA-incompatible GCC breaks that). The CUDA-matched
     # C driver paired with the chosen host C++ compiler satisfies both.
-    host_cc = os.environ.get("CC") or shutil.which(
-        host_cxx.name.replace("g++", "gcc")
-    )
+    host_cc = os.environ.get("CC") or shutil.which(host_cxx.name.replace("g++", "gcc"))
     if host_cc is None:
         raise RuntimeError(
-            f"no CUDA-compatible C compiler matches {host_cxx.name}; "
-            "set CC explicitly"
+            f"no CUDA-compatible C compiler matches {host_cxx.name}; set CC explicitly"
         )
     os.environ["CC"] = str(host_cc)
     os.environ["CXX"] = str(host_cxx)

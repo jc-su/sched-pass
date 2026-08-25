@@ -120,7 +120,11 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "results" / "serving" / "sglang-hicache-load.json",
     )
     args = parser.parse_args()
-    if args.slo_scale <= 0 or args.slo_ttft_seconds <= 0 or args.slo_p99_itl_seconds <= 0:
+    if (
+        args.slo_scale <= 0
+        or args.slo_ttft_seconds <= 0
+        or args.slo_p99_itl_seconds <= 0
+    ):
         parser.error("SLO scale and thresholds must be positive")
     if args.admission_lead_layers <= 0 or args.admission_max_delay_us < 0:
         parser.error("admission bounds are invalid")
@@ -165,9 +169,7 @@ def _wait_for_free_gpu(limit_mib: int = 8000, timeout_s: float = 600.0) -> None:
             check=False,
         )
         try:
-            used_mib = max(
-                int(line) for line in probe.stdout.split() if line.strip()
-            )
+            used_mib = max(int(line) for line in probe.stdout.split() if line.strip())
         except ValueError:
             used_mib = None
         apps = subprocess.run(
@@ -203,7 +205,6 @@ def _report(output: str) -> dict[str, Any]:
         if value.get("classification") == "sglang-hicache-load":
             return value
     raise RuntimeError("load trial emitted no JSON report")
-
 
 
 class _CotenantSampler:
@@ -249,13 +250,13 @@ class _CotenantSampler:
         while not self._stop.wait(5.0):
             try:
                 out = subprocess.run(
-                    ["nvidia-smi", "--query-compute-apps=pid",
-                     "--format=csv,noheader"],
-                    capture_output=True, text=True, timeout=10,
+                    ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
                 )
                 apps = {
-                    int(line) for line in out.stdout.split()
-                    if line.strip().isdigit()
+                    int(line) for line in out.stdout.split() if line.strip().isdigit()
                 }
             except (OSError, subprocess.TimeoutExpired, ValueError):
                 continue
@@ -278,9 +279,7 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     # Kernel-byte-forking toggles (e.g. NTA_STAGING_STREAMING) require a
     # variant-tagged cache so the shim's fail-closed guard can prove a
     # toggled env never reuses the other variant's compiled kernels.
-    cache_name = os.environ.get(
-        "NTA_COMPARE_CACHE_NAME", "sglang-hicache-load-cache"
-    )
+    cache_name = os.environ.get("NTA_COMPARE_CACHE_NAME", "sglang-hicache-load-cache")
     workspace = args.workspace_root.resolve() / cache_name / backend
     command = [
         str(ROOT / "tools" / "jit" / "activate.py"),
@@ -346,7 +345,9 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     environment = os.environ.copy()
     environment["NTA_EXECUTION_ADMISSION"] = "1"
     environment["NTA_EXECUTION_ADMISSION_LEAD_LAYERS"] = str(args.admission_lead_layers)
-    environment["NTA_EXECUTION_ADMISSION_MAX_DELAY_US"] = str(args.admission_max_delay_us)
+    environment["NTA_EXECUTION_ADMISSION_MAX_DELAY_US"] = str(
+        args.admission_max_delay_us
+    )
     if backend == "nta_flashinfer" and args.batch_mode == "coalesced":
         # Exercise the actual request-aware finite-kernel path. One transfer
         # wave isolates overlap from deeper transfer pipelining: resident CTAs
@@ -503,9 +504,7 @@ def main() -> int:
             {"activation_error": str(error)},
         )
         raise
-    if not stock.get("load_warmup_excluded") or not nta.get(
-        "load_warmup_excluded"
-    ):
+    if not stock.get("load_warmup_excluded") or not nta.get("load_warmup_excluded"):
         _write_failed_comparison(
             args.output, reports, order, "mixed-arrival warmup was not excluded"
         )
@@ -525,7 +524,9 @@ def main() -> int:
             )
             raise RuntimeError(f"{backend} reported verification failures")
         little = report.get("littles_law")
-        if not isinstance(little, dict) or not math.isfinite(float(little.get("residual", float("nan")))):
+        if not isinstance(little, dict) or not math.isfinite(
+            float(little.get("residual", float("nan")))
+        ):
             _write_failed_comparison(
                 args.output,
                 reports,
@@ -546,18 +547,19 @@ def main() -> int:
                 args.output, reports, order, "normalized workload was not replayed"
             )
             raise RuntimeError("normalized workload was not replayed")
-        if (
-            stock_workload.get("manifest_digest") != nta_workload.get("manifest_digest")
-            or stock_workload.get("demand_trace_digest")
-            != nta_workload.get("demand_trace_digest")
+        if stock_workload.get("manifest_digest") != nta_workload.get(
+            "manifest_digest"
+        ) or stock_workload.get("demand_trace_digest") != nta_workload.get(
+            "demand_trace_digest"
         ):
             _write_failed_comparison(
-                args.output, reports, order, "paired arms used different workload manifests"
+                args.output,
+                reports,
+                order,
+                "paired arms used different workload manifests",
             )
             raise RuntimeError("paired arms used different workload manifests")
-    outputs_diverge = (
-        stock["generated_text_sha256"] != nta["generated_text_sha256"]
-    )
+    outputs_diverge = stock["generated_text_sha256"] != nta["generated_text_sha256"]
     if outputs_diverge and not args.allow_output_divergence:
         _write_failed_comparison(
             args.output,
@@ -669,12 +671,8 @@ def main() -> int:
         "nta": nta,
         "stock_goodput": stock_goodput,
         "nta_goodput": nta_goodput,
-        "stock_slo_goodput": float(
-            stock["slo_goodput"]["goodput_requests_per_second"]
-        ),
-        "nta_slo_goodput": float(
-            nta["slo_goodput"]["goodput_requests_per_second"]
-        ),
+        "stock_slo_goodput": float(stock["slo_goodput"]["goodput_requests_per_second"]),
+        "nta_slo_goodput": float(nta["slo_goodput"]["goodput_requests_per_second"]),
         "stock_p50_ttft_seconds": float(stock["p50_ttft_seconds"]),
         "stock_p95_ttft_seconds": float(stock["p95_ttft_seconds"]),
         "stock_p99_ttft_seconds": float(stock["p99_ttft_seconds"]),

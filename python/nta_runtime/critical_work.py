@@ -169,9 +169,7 @@ def _acquisition_ns(request: RequestWork, model: ServiceModel) -> int:
     if request.pending_work == 0:
         return 0
     transfer_ns = math.ceil(
-        request.unavailable_bytes
-        * 1_000_000_000
-        / model.bandwidth_bytes_per_second
+        request.unavailable_bytes * 1_000_000_000 / model.bandwidth_bytes_per_second
     )
     return model.fixed_latency_ns + model.queue_delay_ns + transfer_ns
 

@@ -33,7 +33,9 @@ try:
     from .artifact import ArtifactRun, ROOT, file_digest, git_metadata
     from .hardware import validate as validate_hardware
     from .validate_workload import validate as validate_workload
-    from .validate_tier_qualification import validate_file as validate_tier_qualification
+    from .validate_tier_qualification import (
+        validate_file as validate_tier_qualification,
+    )
     from .validate_tier_catalog import validate as validate_tier_catalog
 except ImportError:  # Direct ``python experiments/reproduce.py`` execution.
     from artifact import ArtifactRun, ROOT, file_digest, git_metadata
@@ -101,14 +103,20 @@ def _configure_and_build(
     except ValueError:
         pass
     else:
-        raise RuntimeError(f"artifact build directory must be outside the source tree: {build}")
+        raise RuntimeError(
+            f"artifact build directory must be outside the source tree: {build}"
+        )
     if build.exists() and any(build.iterdir()):
         raise RuntimeError(
             f"artifact build directory is not empty; use a fresh directory: {build}"
         )
     cuda = args.cuda
     if cuda == "auto":
-        cuda = "on" if shutil.which("nvcc") or Path("/usr/local/cuda/bin/nvcc").exists() else "off"
+        cuda = (
+            "on"
+            if shutil.which("nvcc") or Path("/usr/local/cuda/bin/nvcc").exists()
+            else "off"
+        )
     configure = [
         "cmake",
         "-S",
@@ -130,10 +138,14 @@ def _configure_and_build(
     llvm_tools = cache.get("LLVM_TOOLS_BINARY_DIR")
     if not llvm_tools and cache.get("NTA_CLANG_CUDA"):
         llvm_tools = str(Path(cache["NTA_CLANG_CUDA"]).parent)
-    selected_tools = {
-        name: str(Path(llvm_tools) / name)
-        for name in ("clang++", "opt", "llc", "llvm-dis")
-    } if llvm_tools else {}
+    selected_tools = (
+        {
+            name: str(Path(llvm_tools) / name)
+            for name in ("clang++", "opt", "llc", "llvm-dis")
+        }
+        if llvm_tools
+        else {}
+    )
     selected_tools.update(
         {
             "cuda_frontend": cache.get("NTA_CLANG_CUDA", ""),
@@ -204,8 +216,7 @@ def _replace_path(value: object, source: Path, destination: Path) -> object:
         return [_replace_path(item, source, destination) for item in value]
     if isinstance(value, dict):
         return {
-            key: _replace_path(item, source, destination)
-            for key, item in value.items()
+            key: _replace_path(item, source, destination) for key, item in value.items()
         }
     return value
 
@@ -248,7 +259,9 @@ def _run_evaluation(
         spec_document = json.loads(spec.read_text(encoding="utf-8"))
         workload = Path(spec_document["workload_manifest"]).resolve()
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"evaluation specification has no readable workload manifest: {error}") from error
+        raise RuntimeError(
+            f"evaluation specification has no readable workload manifest: {error}"
+        ) from error
     copied_workload = _copy_workload(run, workload)
     rewritten_spec = _replace_path(spec_document, workload, copied_workload)
     qualification = spec_document.get("tier_qualification")
@@ -342,7 +355,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--profile",
-        choices=("core", "matrix", "build", "test", "evaluation", "hardware", "serving"),
+        choices=(
+            "core",
+            "matrix",
+            "build",
+            "test",
+            "evaluation",
+            "hardware",
+            "serving",
+        ),
         required=True,
     )
     parser.add_argument("--output", type=Path, required=True)
@@ -433,7 +454,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     (run.output / "artifact-manifest.json").write_bytes(MANIFEST.read_bytes())
     (run.output / "workload-manifest.json").write_bytes(workload_manifest.read_bytes())
     evaluation_manifest = ROOT / EVALUATION_MANIFEST
-    (run.output / "evaluation-manifest.json").write_bytes(evaluation_manifest.read_bytes())
+    (run.output / "evaluation-manifest.json").write_bytes(
+        evaluation_manifest.read_bytes()
+    )
     run.update(
         artifact_manifest=str(MANIFEST.relative_to(ROOT)),
         artifact_manifest_digest=file_digest(MANIFEST),
@@ -490,9 +513,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.build_dir is not None
                 else run.output.parent / f"{run.output.name}.build"
             )
-            _configure_and_build(
-                run, args, build=build, environment=environment
-            )
+            _configure_and_build(run, args, build=build, environment=environment)
             if args.profile == "test":
                 run.command(
                     ["ctest", "--test-dir", str(build), "--output-on-failure"],
@@ -508,19 +529,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.workload_manifest is not None:
                 source_manifest = args.workload_manifest.resolve()
                 if not source_manifest.is_file():
-                    raise RuntimeError(f"workload manifest does not exist: {source_manifest}")
+                    raise RuntimeError(
+                        f"workload manifest does not exist: {source_manifest}"
+                    )
                 validate_workload(source_manifest)
-                source_records = source_manifest.parent / json.loads(
-                    source_manifest.read_text(encoding="utf-8")
-                )["records_file"]
+                source_records = (
+                    source_manifest.parent
+                    / json.loads(source_manifest.read_text(encoding="utf-8"))[
+                        "records_file"
+                    ]
+                )
                 destination = run.output / "workload"
                 destination.mkdir()
                 shutil.copy2(source_manifest, destination / "manifest.json")
                 shutil.copy2(source_records, destination / "records.jsonl")
                 run.update(
                     workload_replay_manifest="workload/manifest.json",
-                    workload_replay_manifest_digest=file_digest(destination / "manifest.json"),
-                    workload_replay_records_digest=file_digest(destination / "records.jsonl"),
+                    workload_replay_manifest_digest=file_digest(
+                        destination / "manifest.json"
+                    ),
+                    workload_replay_records_digest=file_digest(
+                        destination / "records.jsonl"
+                    ),
                 )
             if args.result is not None:
                 result = args.result.resolve()

@@ -20,8 +20,22 @@ from experiments.validate_workload import validate  # noqa: E402
 
 
 ONLINE = [
-    {"chat_id": "a", "timestamp": 10.0, "input_length": 32, "output_length": 4, "hash_ids": ["x", "y"], "turn": 0},
-    {"chat_id": "b", "timestamp": 10.5, "input_length": 48, "output_length": 5, "hash_ids": ["x", "y", "z"], "turn": 0},
+    {
+        "chat_id": "a",
+        "timestamp": 10.0,
+        "input_length": 32,
+        "output_length": 4,
+        "hash_ids": ["x", "y"],
+        "turn": 0,
+    },
+    {
+        "chat_id": "b",
+        "timestamp": 10.5,
+        "input_length": 48,
+        "output_length": 5,
+        "hash_ids": ["x", "y", "z"],
+        "turn": 0,
+    },
 ]
 
 
@@ -66,7 +80,9 @@ def main() -> None:
         "external",
     ]
 
-    offline = [{"request_id": "one", "input_length": 16, "output_length": 1, "hash_ids": ["a"]}]
+    offline = [
+        {"request_id": "one", "input_length": 16, "output_length": 1, "hash_ids": ["a"]}
+    ]
     offline_manifest, offline_rows = normalize(offline, arrival_mode="batch_release")
     assert offline_manifest["claims"]["offline_row_order_is_arrival"] is False
     assert offline_rows[0]["arrival_source"] == "batch_release_no_arrival_claim"
@@ -75,22 +91,32 @@ def main() -> None:
     except ValueError as error:
         assert "timestamps" in str(error)
     else:
-        raise AssertionError("offline trace was incorrectly accepted as production arrival")
+        raise AssertionError(
+            "offline trace was incorrectly accepted as production arrival"
+        )
 
     with tempfile.TemporaryDirectory(prefix="nta-bailian-") as directory:
         root = Path(directory)
-        manifest, rows = normalize(ONLINE, arrival_mode="trace", synthesize_prompts=True)
+        manifest, rows = normalize(
+            ONLINE, arrival_mode="trace", synthesize_prompts=True
+        )
         write_workload(root / "manifest.json", root / "records.jsonl", manifest, rows)
         validate(root / "manifest.json")
         document = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         assert document["request_count"] == 2
-        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "bailian-online.jsonl"
+        fixture = (
+            Path(__file__).resolve().parents[1] / "fixtures" / "bailian-online.jsonl"
+        )
         cli_manifest = root / "cli-manifest.json"
         cli_records = root / "cli-records.jsonl"
         subprocess.run(
             [
                 sys.executable,
-                str(Path(__file__).resolve().parents[2] / "experiments" / "prepare_bailian.py"),
+                str(
+                    Path(__file__).resolve().parents[2]
+                    / "experiments"
+                    / "prepare_bailian.py"
+                ),
                 "--input",
                 str(fixture),
                 "--arrival-mode",
@@ -117,7 +143,11 @@ def main() -> None:
         subprocess.run(
             [
                 sys.executable,
-                str(Path(__file__).resolve().parents[2] / "experiments" / "analyze_workload.py"),
+                str(
+                    Path(__file__).resolve().parents[2]
+                    / "experiments"
+                    / "analyze_workload.py"
+                ),
                 str(cli_manifest),
                 "--output",
                 str(opportunity),
@@ -127,9 +157,17 @@ def main() -> None:
         )
         opportunity_report = json.loads(opportunity.read_text(encoding="utf-8"))
         assert opportunity_report["classification"] == "bailian-rq0-opportunity-report"
-        assert opportunity_report["provenance"]["demand_trace_digest"] == cli_document["demand_trace_digest"]
-        assert opportunity_report["compute_transfer_regime"]["status"] == "trace_only_not_identifiable"
-        assert opportunity_report["exact_demand_shape"]["candidate_kv_blocks"]["total"] > 0
+        assert (
+            opportunity_report["provenance"]["demand_trace_digest"]
+            == cli_document["demand_trace_digest"]
+        )
+        assert (
+            opportunity_report["compute_transfer_regime"]["status"]
+            == "trace_only_not_identifiable"
+        )
+        assert (
+            opportunity_report["exact_demand_shape"]["candidate_kv_blocks"]["total"] > 0
+        )
         validate_spec(
             {
                 "schema": 1,
@@ -146,12 +184,16 @@ def main() -> None:
                         "stratum": {
                             "request_state": "mixed",
                             "granularity": "page_group",
-                        "load_ratio": "balanced",
-                        "availability_skew": "medium",
-                        "staging_pressure": "near_capacity",
-                        "arrival": "trace_timestamp",
+                            "load_ratio": "balanced",
+                            "availability_skew": "medium",
+                            "staging_pressure": "near_capacity",
+                            "arrival": "trace_timestamp",
                         },
-                        "command": [sys.executable, "-c", "import json; print(json.dumps({'classification':'nta-evaluation-fixture','verification_failures':0,'slo_goodput':1.0}))"],
+                        "command": [
+                            sys.executable,
+                            "-c",
+                            "import json; print(json.dumps({'classification':'nta-evaluation-fixture','verification_failures':0,'slo_goodput':1.0}))",
+                        ],
                         "metrics": ["slo_goodput"],
                     },
                     {
@@ -168,7 +210,11 @@ def main() -> None:
                             "staging_pressure": "near_capacity",
                             "arrival": "trace_timestamp",
                         },
-                        "command": [sys.executable, "-c", "import json; print(json.dumps({'classification':'nta-evaluation-fixture','verification_failures':0,'slo_goodput':0.9}))"],
+                        "command": [
+                            sys.executable,
+                            "-c",
+                            "import json; print(json.dumps({'classification':'nta-evaluation-fixture','verification_failures':0,'slo_goodput':0.9}))",
+                        ],
                         "metrics": ["slo_goodput"],
                     },
                 ],
@@ -203,10 +249,10 @@ def main() -> None:
                             "stratum": {
                                 "request_state": "mixed",
                                 "granularity": "page_group",
-                        "load_ratio": "balanced",
-                        "availability_skew": "medium",
-                        "staging_pressure": "near_capacity",
-                        "arrival": "trace_timestamp",
+                                "load_ratio": "balanced",
+                                "availability_skew": "medium",
+                                "staging_pressure": "near_capacity",
+                                "arrival": "trace_timestamp",
                             },
                             "command": [
                                 sys.executable,
@@ -235,7 +281,7 @@ def main() -> None:
                                 "import json; print(json.dumps({'classification':'nta-evaluation-fixture','verification_failures':0,'slo_goodput': 0.9}))",
                             ],
                             "metrics": ["slo_goodput"],
-                        }
+                        },
                     ],
                     "comparisons": [
                         {
@@ -254,7 +300,11 @@ def main() -> None:
         subprocess.run(
             [
                 sys.executable,
-                str(Path(__file__).resolve().parents[2] / "experiments" / "run_evaluation.py"),
+                str(
+                    Path(__file__).resolve().parents[2]
+                    / "experiments"
+                    / "run_evaluation.py"
+                ),
                 "--spec",
                 str(spec_path),
                 "--output-dir",
@@ -267,7 +317,11 @@ def main() -> None:
         subprocess.run(
             [
                 sys.executable,
-                str(Path(__file__).resolve().parents[2] / "experiments" / "validate_evaluation_artifact.py"),
+                str(
+                    Path(__file__).resolve().parents[2]
+                    / "experiments"
+                    / "validate_evaluation_artifact.py"
+                ),
                 str(evaluation_output),
             ],
             cwd=Path(__file__).resolve().parents[2],
@@ -277,7 +331,9 @@ def main() -> None:
         subprocess.run(
             [
                 sys.executable,
-                str(Path(__file__).resolve().parents[2] / "experiments" / "reproduce.py"),
+                str(
+                    Path(__file__).resolve().parents[2] / "experiments" / "reproduce.py"
+                ),
                 "--profile",
                 "evaluation",
                 "--spec",
@@ -292,13 +348,19 @@ def main() -> None:
         subprocess.run(
             [
                 sys.executable,
-                str(Path(__file__).resolve().parents[2] / "experiments" / "validate_bundle.py"),
+                str(
+                    Path(__file__).resolve().parents[2]
+                    / "experiments"
+                    / "validate_bundle.py"
+                ),
                 str(artifact_output),
             ],
             cwd=Path(__file__).resolve().parents[2],
             check=True,
         )
-        record = json.loads((evaluation_output / "trials.jsonl").read_text().splitlines()[0])
+        record = json.loads(
+            (evaluation_output / "trials.jsonl").read_text().splitlines()[0]
+        )
         assert record["tier"] == "host_mem"
         assert record["demand_semantics"] == "exact"
         baseline = {
@@ -315,7 +377,9 @@ def main() -> None:
             ],
         }
         assert compare(baseline, {"verification_failures": 0, "graph_ms": 1.01})["pass"]
-        assert not compare(baseline, {"verification_failures": 0, "graph_ms": 1.2})["pass"]
+        assert not compare(baseline, {"verification_failures": 0, "graph_ms": 1.2})[
+            "pass"
+        ]
     print("bailian_workload=pass")
 
 

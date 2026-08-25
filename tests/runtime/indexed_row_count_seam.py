@@ -69,7 +69,11 @@ def locate_module() -> pathlib.Path | None:
             [root]
             if root.name.startswith(abi_prefix)
             else sorted(
-                (candidate for candidate in root.glob(f"{abi_prefix}*") if candidate.is_dir()),
+                (
+                    candidate
+                    for candidate in root.glob(f"{abi_prefix}*")
+                    if candidate.is_dir()
+                ),
                 key=lambda candidate: candidate.stat().st_mtime,
                 reverse=True,
             )
@@ -100,6 +104,7 @@ def main() -> int:
     # Phase modules link against TVM-FFI, whose symbols the serving process
     # provides by importing flashinfer before loading any module.
     import flashinfer  # noqa: F401
+
     phases = JitPhaseProgram(module)
     runtime = Runtime(
         RuntimeConfig(
@@ -112,16 +117,14 @@ def main() -> int:
     )
 
     def patterned(offset: float) -> torch.Tensor:
-        base = torch.arange(
-            ROWS * HEADS * DIM, dtype=torch.float32
-        ).view(ROWS, HEADS, DIM)
+        base = torch.arange(ROWS * HEADS * DIM, dtype=torch.float32).view(
+            ROWS, HEADS, DIM
+        )
         return (base * 1e-3 + offset).to(torch.float16)
 
     host_k = patterned(1.0).pin_memory()
     host_v = patterned(2.0).pin_memory()
-    device_k = torch.zeros(
-        (ROWS, HEADS, DIM), dtype=torch.float16, device="cuda"
-    )
+    device_k = torch.zeros((ROWS, HEADS, DIM), dtype=torch.float16, device="cuda")
     device_v = torch.zeros_like(device_k)
 
     capacity = 16
@@ -154,12 +157,8 @@ def main() -> int:
     source_rows = [3, 41, 7, 22, 58]
     staging_rows = [10, 4, 33, 60, 21]
     count = len(source_rows)
-    source_index[:count] = torch.tensor(
-        source_rows, dtype=torch.int32, device="cuda"
-    )
-    staging_index[:count] = torch.tensor(
-        staging_rows, dtype=torch.int32, device="cuda"
-    )
+    source_index[:count] = torch.tensor(source_rows, dtype=torch.int32, device="cuda")
+    staging_index[:count] = torch.tensor(staging_rows, dtype=torch.int32, device="cuda")
     phases.set_indexed_row_counts(runtime, 0, 2, count, stream=stream)
     phases.progress_validated_indexed_host_range(runtime, 0, 2, stream=stream)
     torch.cuda.synchronize()
@@ -174,9 +173,7 @@ def main() -> int:
         ].cpu()
         expected = host[torch.tensor(source_rows, dtype=torch.long)]
         if not torch.equal(staged, expected):
-            mismatch = (
-                staged.view(count, -1) != expected.view(count, -1)
-            ).any(dim=1)
+            mismatch = (staged.view(count, -1) != expected.view(count, -1)).any(dim=1)
             first = int(mismatch.nonzero()[0])
             print(
                 f"{name}: DIVERGED at pair {first} "
@@ -205,9 +202,7 @@ def main() -> int:
     if not torch.equal(device_k[1:3].cpu(), host_k[11:13]):
         print("K: shrunken-count prefix copy diverged")
         failures += 1
-    if not bool((device_k[3:] == 0).all()) or not bool(
-        (device_k[0] == 0).all()
-    ):
+    if not bool((device_k[3:] == 0).all()) or not bool((device_k[0] == 0).all()):
         print("K: shrunken count copied beyond its prefix")
         failures += 1
 
@@ -216,9 +211,7 @@ def main() -> int:
     summary_first = 5
     summary_tokens = 19
     summary_page_tokens = 4
-    summary_pages = (
-        summary_tokens + summary_page_tokens - 1
-    ) // summary_page_tokens
+    summary_pages = (summary_tokens + summary_page_tokens - 1) // summary_page_tokens
     for dtype in (torch.float16, torch.bfloat16):
         summary_source = patterned(3.0).to(dtype).pin_memory()
         summary_min = torch.empty(
@@ -256,12 +249,8 @@ def main() -> int:
     device_v.zero_()
     token_count = 32
     page_tokens = 4
-    logical_host_rows = torch.arange(
-        token_count, dtype=torch.int32, device="cuda"
-    )
-    logical_device_rows = torch.arange(
-        token_count, dtype=torch.int32, device="cuda"
-    )
+    logical_host_rows = torch.arange(token_count, dtype=torch.int32, device="cuda")
+    logical_device_rows = torch.arange(token_count, dtype=torch.int32, device="cuda")
     staged_pages = torch.zeros(
         token_count // page_tokens, dtype=torch.int32, device="cuda"
     )
@@ -313,9 +302,7 @@ def main() -> int:
     )
     phases.progress_validated_indexed_host_range(runtime, 0, 2, stream=stream)
     torch.cuda.synchronize()
-    if int(copied_rows) != 12 or not torch.equal(
-        device_k[20:24].cpu(), host_k[20:24]
-    ):
+    if int(copied_rows) != 12 or not torch.equal(device_k[20:24].cpu(), host_k[20:24]):
         print("device selection: hit filtering or incremental copy diverged")
         failures += 1
 
@@ -327,9 +314,7 @@ def main() -> int:
     device_v.zero_()
     bounded_tokens = 30
     bounded_capacity = 16
-    bounded_host_rows = torch.arange(
-        bounded_tokens, dtype=torch.int32, device="cuda"
-    )
+    bounded_host_rows = torch.arange(bounded_tokens, dtype=torch.int32, device="cuda")
     bounded_device_rows = torch.arange(
         40,
         40 + bounded_capacity,
@@ -342,13 +327,9 @@ def main() -> int:
         dtype=torch.int64,
         device="cuda",
     )
-    selected_rows = torch.empty(
-        bounded_capacity, dtype=torch.int32, device="cuda"
-    )
+    selected_rows = torch.empty(bounded_capacity, dtype=torch.int32, device="cuda")
     copied_rows.zero_()
-    first_selection = torch.tensor(
-        [1, 3, 7], dtype=torch.int64, device="cuda"
-    )
+    first_selection = torch.tensor([1, 3, 7], dtype=torch.int64, device="cuda")
     phases.prepare_bounded_selected_indexed_rows(
         runtime,
         0,
@@ -365,27 +346,23 @@ def main() -> int:
         copied_rows,
         stream=stream,
     )
-    phases.progress_validated_indexed_host_range(
-        runtime, 0, 2, stream=stream
-    )
+    phases.progress_validated_indexed_host_range(runtime, 0, 2, stream=stream)
     torch.cuda.synchronize()
     first_physical = torch.tensor(
         [40, 41, 42, 43, 44, 45, 46, 47, 48, 49],
         dtype=torch.long,
         device="cuda",
     )
-    first_source = torch.tensor(
-        [4, 5, 6, 7, 12, 13, 14, 15, 28, 29], dtype=torch.long
-    )
-    if int(copied_rows) != 10 or not torch.equal(
-        selected_rows[:10].to(torch.long), first_physical
-    ) or not torch.equal(device_k[first_physical].cpu(), host_k[first_source]):
+    first_source = torch.tensor([4, 5, 6, 7, 12, 13, 14, 15, 28, 29], dtype=torch.long)
+    if (
+        int(copied_rows) != 10
+        or not torch.equal(selected_rows[:10].to(torch.long), first_physical)
+        or not torch.equal(device_k[first_physical].cpu(), host_k[first_source])
+    ):
         print("bounded selection: initial placement or copy diverged")
         failures += 1
 
-    second_selection = torch.tensor(
-        [1, 5, 7], dtype=torch.int64, device="cuda"
-    )
+    second_selection = torch.tensor([1, 5, 7], dtype=torch.int64, device="cuda")
     phases.prepare_bounded_selected_indexed_rows(
         runtime,
         0,
@@ -402,16 +379,14 @@ def main() -> int:
         copied_rows,
         stream=stream,
     )
-    phases.progress_validated_indexed_host_range(
-        runtime, 0, 2, stream=stream
-    )
+    phases.progress_validated_indexed_host_range(runtime, 0, 2, stream=stream)
     torch.cuda.synchronize()
-    second_source = torch.tensor(
-        [4, 5, 6, 7, 20, 21, 22, 23, 28, 29], dtype=torch.long
-    )
-    if int(copied_rows) != 14 or not torch.equal(
-        selected_rows[:10].to(torch.long), first_physical
-    ) or not torch.equal(device_k[first_physical].cpu(), host_k[second_source]):
+    second_source = torch.tensor([4, 5, 6, 7, 20, 21, 22, 23, 28, 29], dtype=torch.long)
+    if (
+        int(copied_rows) != 14
+        or not torch.equal(selected_rows[:10].to(torch.long), first_physical)
+        or not torch.equal(device_k[first_physical].cpu(), host_k[second_source])
+    ):
         print("bounded selection: replacement copied hits or wrong rows")
         failures += 1
 
@@ -431,9 +406,7 @@ def main() -> int:
         copied_rows,
         stream=stream,
     )
-    phases.progress_validated_indexed_host_range(
-        runtime, 0, 2, stream=stream
-    )
+    phases.progress_validated_indexed_host_range(runtime, 0, 2, stream=stream)
     torch.cuda.synchronize()
     if int(copied_rows) != 14:
         print("bounded selection: all-hit replay performed a copy")
@@ -503,13 +476,12 @@ def main() -> int:
         staging_index[0] = invalid_destination
         sticky_before = runtime.sticky_failed_count
         phases.set_indexed_row_counts(runtime, 0, 2, 1, stream=stream)
-        phases.progress_validated_indexed_host_range(
-            runtime, 0, 2, stream=stream
-        )
+        phases.progress_validated_indexed_host_range(runtime, 0, 2, stream=stream)
         torch.cuda.synchronize()
-        if torch.count_nonzero(device_k).item() != 0 or torch.count_nonzero(
-            device_v
-        ).item() != 0:
+        if (
+            torch.count_nonzero(device_k).item() != 0
+            or torch.count_nonzero(device_v).item() != 0
+        ):
             print(f"{name}: invalid indexed prefix modified staging")
             failures += 1
         if runtime.sticky_failed_count <= sticky_before:

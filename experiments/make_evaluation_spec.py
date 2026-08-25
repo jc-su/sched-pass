@@ -58,14 +58,18 @@ def _load_strata(path: Path) -> list[dict[str, str]]:
     for index, entry in enumerate(value):
         if not isinstance(entry, dict):
             raise ValueError(f"stratum {index} is not an object")
-        missing = [field for field in STRATUM_FIELDS if not isinstance(entry.get(field), str)]
+        missing = [
+            field for field in STRATUM_FIELDS if not isinstance(entry.get(field), str)
+        ]
         if missing:
             raise ValueError(f"stratum {index} lacks fields: {', '.join(missing)}")
         label = str(entry.get("id", f"stratum-{index}"))
         if re.fullmatch(r"[A-Za-z0-9_.-]+", label) is None or label in seen:
             raise ValueError(f"stratum id is invalid or duplicated: {label!r}")
         seen.add(label)
-        result.append({field: str(entry[field]) for field in STRATUM_FIELDS} | {"id": label})
+        result.append(
+            {field: str(entry[field]) for field in STRATUM_FIELDS} | {"id": label}
+        )
     return result
 
 
@@ -178,13 +182,21 @@ def build_spec(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workload-manifest", type=Path, required=True)
-    parser.add_argument("--strata-file", type=Path, default=Path(__file__).with_name("strata.example.json"))
-    parser.add_argument("--tier", choices=("hbm", "host_mem", "nvme", "dax"), default="host_mem")
+    parser.add_argument(
+        "--strata-file",
+        type=Path,
+        default=Path(__file__).with_name("strata.example.json"),
+    )
+    parser.add_argument(
+        "--tier", choices=("hbm", "host_mem", "nvme", "dax"), default="host_mem"
+    )
     parser.add_argument("--tier-qualification", type=Path)
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260824)
     parser.add_argument("--metric", action="append", default=list(DEFAULT_METRICS))
-    parser.add_argument("--arm-command", action="append", required=True, metavar="ARM=COMMAND")
+    parser.add_argument(
+        "--arm-command", action="append", required=True, metavar="ARM=COMMAND"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     metrics = tuple(dict.fromkeys(args.metric))
@@ -205,7 +217,9 @@ def main() -> int:
         parser.error(str(error))
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(spec, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(output)
     return 0
 

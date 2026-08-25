@@ -66,7 +66,9 @@ ARM_DEFINITIONS = {
         ProtocolKind.PARTIAL, "device_demand", "work_unit", "typed", True, True
     ),
 }
-ARM_PROTOCOLS = {arm: definition.protocol for arm, definition in ARM_DEFINITIONS.items()}
+ARM_PROTOCOLS = {
+    arm: definition.protocol for arm, definition in ARM_DEFINITIONS.items()
+}
 
 
 @dataclass(frozen=True)
@@ -204,9 +206,7 @@ def _trace(case: dict[str, Any], seed: int) -> tuple[ExecutionTile, ...]:
             request_id=request_index + 1000,
         )
         category_scale = (1.0, 1.5, 0.5, 0.75)[category]
-        selected_for_request = max(
-            1, min(candidates, round(selected * category_scale))
-        )
+        selected_for_request = max(1, min(candidates, round(selected * category_scale)))
         selected_ids = (
             tuple(range(candidates))
             if selected_for_request == candidates
@@ -345,7 +345,8 @@ def _run_arm(
             epoch_rejections += 1
         try:
             session.ledger.transition(
-                blocked[0], Availability.READY,
+                blocked[0],
+                Availability.READY,
                 binding=RequestBinding(
                     stale.request_index,
                     stale.request_slot,
@@ -385,14 +386,10 @@ def _run_arm(
         group_width = max(selected_units, 1)
     group_count = max(1, (selected_units + group_width - 1) // group_width)
     host_round_trips = (
-        len(tiles)
-        if mode["demand_source"] in ("host_promotion", "host_demand")
-        else 0
+        len(tiles) if mode["demand_source"] in ("host_promotion", "host_demand") else 0
     )
     host_demand_materializations = (
-        len(tiles)
-        if mode["demand_source"] in ("host_promotion", "host_demand")
-        else 0
+        len(tiles) if mode["demand_source"] in ("host_promotion", "host_demand") else 0
     )
     device_demand_discoveries = (
         len(tiles) if mode["demand_source"] == "device_demand" else 0
@@ -412,7 +409,9 @@ def _run_arm(
     )
     admission_decisions = len(tiles) if mode["admission_feedback"] else 0
     bounded_decisions = 1 if mode["bounded_staging"] else 0
-    selection_us = host_demand_materializations * 0.12 + device_demand_discoveries * 0.02
+    selection_us = (
+        host_demand_materializations * 0.12 + device_demand_discoveries * 0.02
+    )
     control_us = (
         host_round_trips * 0.65
         + batch_barriers * (0.45 + availability_skew / 10_000)
@@ -450,16 +449,19 @@ def _run_arm(
     )
     elapsed_us = max(
         0.001,
-        compute_us + transfer_us + selection_us + control_us + barrier_us + tier_latency_ns / 1_000,
+        compute_us
+        + transfer_us
+        + selection_us
+        + control_us
+        + barrier_us
+        + tier_latency_ns / 1_000,
     )
     initial_blocked = len(blocked)
     pending_window_us = max(availability_skew, 1.0)
     mean_pending_units = initial_blocked / 2.0
     mean_pending_us = pending_window_us / 2.0 if initial_blocked else 0.0
     pending_arrival_rate = (
-        mean_pending_units / mean_pending_us * 1_000_000
-        if mean_pending_us > 0
-        else 0.0
+        mean_pending_units / mean_pending_us * 1_000_000 if mean_pending_us > 0 else 0.0
     )
     littles_law_residual = abs(
         mean_pending_units - pending_arrival_rate * mean_pending_us / 1_000_000
@@ -501,7 +503,9 @@ def _run_arm(
                 "host_control_round_trips": host_round_trips,
                 "batch_readiness_barriers": batch_barriers,
                 "work_unit_ready_events": work_unit_ready_events,
-                "work_unit_groups": group_count if mode["readiness"] == "work_unit" else 0,
+                "work_unit_groups": group_count
+                if mode["readiness"] == "work_unit"
+                else 0,
                 "bounded_staging_decisions": bounded_decisions,
                 "admission_feedback_decisions": admission_decisions,
                 "partial_publications": partial_units,
@@ -571,12 +575,19 @@ def _run_arm(
 def _cases(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     axes = manifest["axes"]
     names = tuple(axes)
-    return [dict(zip(names, values)) for values in itertools.product(*(axes[name] for name in names))]
+    return [
+        dict(zip(names, values))
+        for values in itertools.product(*(axes[name] for name in names))
+    ]
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, default=Path("experiments/heterogeneous-work-unit.json"))
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path("experiments/heterogeneous-work-unit.json"),
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--max-cases", type=int, default=128)
     parser.add_argument("--repetitions", type=int)

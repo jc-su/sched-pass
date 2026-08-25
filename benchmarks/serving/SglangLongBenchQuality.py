@@ -185,8 +185,9 @@ def rouge_l(prediction: str, answers: tuple[str, ...]) -> float:
         for x in a:
             previous = 0
             for j, y in enumerate(b, 1):
-                previous, table[j] = table[j], (
-                    previous + 1 if x == y else max(table[j], table[j - 1])
+                previous, table[j] = (
+                    table[j],
+                    (previous + 1 if x == y else max(table[j], table[j - 1])),
                 )
         return table[-1]
 
@@ -250,9 +251,7 @@ def build_tasks(tokenizer: Any, args: argparse.Namespace) -> list[LongBenchTask]
                 # LongBench's own convention: keep head and tail halves.
                 keep = budget // 2
                 context_ids = context_ids[:keep] + context_ids[-keep:]
-            prefix = tokenizer.decode(
-                head_ids + context_ids, skip_special_tokens=True
-            )
+            prefix = tokenizer.decode(head_ids + context_ids, skip_special_tokens=True)
             tasks.append(
                 LongBenchTask(
                     name=f"{dataset}-{taken}",
@@ -346,16 +345,14 @@ def main() -> int:
                 raise RuntimeError(
                     f"resident request lost device residency at task {index}"
                 )
-            (resident_result, _), (result, elapsed) = (
-                engine.loop.run_until_complete(
-                    run_quality_pair(
-                        engine,
-                        resident_prompt=resident_prompt,
-                        resident_sampling=resident_sampling,
-                        external_prompt=task.prompt,
-                        external_sampling=task_sampling,
-                        index=index,
-                    )
+            (resident_result, _), (result, elapsed) = engine.loop.run_until_complete(
+                run_quality_pair(
+                    engine,
+                    resident_prompt=resident_prompt,
+                    resident_sampling=resident_sampling,
+                    external_prompt=task.prompt,
+                    external_sampling=task_sampling,
+                    index=index,
                 )
             )
             text = generated_text(result)

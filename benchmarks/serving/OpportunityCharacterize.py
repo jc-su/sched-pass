@@ -60,9 +60,7 @@ def token_points(value: str) -> tuple[int, ...]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=pathlib.Path, required=True)
-    parser.add_argument(
-        "--flashinfer-workspace-base", type=pathlib.Path, required=True
-    )
+    parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument(
         "--external-token-points", type=token_points, default=(4096, 16384, 65536)
     )
@@ -89,9 +87,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("blocked threshold must be inside (0, 1)")
     largest = max(args.external_token_points)
     if point_max_total_tokens(largest, args) >= args.context_length:
-        parser.error(
-            "context length must exceed the largest point's KV pool size"
-        )
+        parser.error("context length must exceed the largest point's KV pool size")
     return args
 
 
@@ -100,8 +96,7 @@ def point_max_total_tokens(external_tokens: int, args: argparse.Namespace) -> in
     still evict to host before its measured promotion."""
     return (
         args.external_requests * external_tokens
-        + args.resident_requests
-        * (args.resident_tokens + args.resident_output_tokens)
+        + args.resident_requests * (args.resident_tokens + args.resident_output_tokens)
         + 1024
     )
 
@@ -228,9 +223,7 @@ def characterize_point(
             f"barrier profiling recorded zero waits at {external_tokens} tokens"
         )
     operator_ms = sum(
-        value
-        for key, value in profiles.items()
-        if key.endswith("_operator_gpu_ms")
+        value for key, value in profiles.items() if key.endswith("_operator_gpu_ms")
     )
     if operator_ms <= 0:
         raise RuntimeError(
@@ -244,9 +237,7 @@ def characterize_point(
     return {
         "external_tokens": external_tokens,
         "barrier_waits": waits,
-        "barrier_stalled_waits": int(
-            profiles.get("profiled_barrier_stalled_waits", 0)
-        ),
+        "barrier_stalled_waits": int(profiles.get("profiled_barrier_stalled_waits", 0)),
         "barrier_stall_gpu_ms": stall_ms,
         "barrier_max_stall_gpu_ms": float(
             profiles.get("profiled_barrier_max_stall_gpu_ms", 0.0)

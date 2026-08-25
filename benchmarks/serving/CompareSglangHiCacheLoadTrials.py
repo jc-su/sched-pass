@@ -44,10 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=ROOT
-        / "results"
-        / "serving"
-        / "sglang-hicache-load-qualification.json",
+        default=ROOT / "results" / "serving" / "sglang-hicache-load-qualification.json",
     )
     parser.add_argument(
         "--allow-mixed-revisions",
@@ -212,8 +209,7 @@ def main() -> int:
                     )
             if (
                 args_match
-                and report.get("classification")
-                == "sglang-hicache-load-comparison"
+                and report.get("classification") == "sglang-hicache-load-comparison"
                 and int(arm_seed) == seed
                 and report.get("execution_order", [None])[0] == first
             ):
@@ -327,9 +323,7 @@ def main() -> int:
         "resident_p99_itl": {
             "bar": 1.05,
             "geometric_mean": resident_geomean,
-            "passes": bool(
-                resident_geomean is not None and resident_geomean <= 1.05
-            ),
+            "passes": bool(resident_geomean is not None and resident_geomean <= 1.05),
         },
         "outputs": {
             # With divergence reporting armed, a recorded divergence is
@@ -353,9 +347,7 @@ def main() -> int:
             # bar and must be regenerated rather than waived.
             "recorded_trials": sum(
                 1
-                for value in (
-                    report.get("nta_staged_bytes") for report in reports
-                )
+                for value in (report.get("nta_staged_bytes") for report in reports)
                 if isinstance(value, int) and value > 0
             ),
             "passes": all(

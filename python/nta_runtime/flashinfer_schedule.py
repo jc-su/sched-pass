@@ -71,15 +71,10 @@ def _extract(
         if mask_offset < 0 or mask_offset + padded > workspace.numel():
             raise RuntimeError("FlashInfer block-valid mask is out of bounds")
         active = [
-            bool(value)
-            for value in workspace[mask_offset : mask_offset + padded].cpu()
+            bool(value) for value in workspace[mask_offset : mask_offset + padded].cpu()
         ]
-    request_indices = tuple(
-        value for value, valid in zip(requests, active) if valid
-    )
-    kv_tile_indices = tuple(
-        value for value, valid in zip(kv_tiles, active) if valid
-    )
+    request_indices = tuple(value for value, valid in zip(requests, active) if valid)
+    kv_tile_indices = tuple(value for value, valid in zip(kv_tiles, active) if valid)
     chunk_tokens = _read_i32(workspace, int(plan[chunk_offset_index]), 1)[0]
     if allow_zero_chunk and not bool(plan[split_index]):
         chunk_tokens = 0
@@ -97,6 +92,4 @@ def decode_schedule(wrapper: object) -> Schedule:
 def paged_prefill_schedule(wrapper: object) -> Schedule:
     # With split-K disabled, 0.6.12 narrows INT64_MAX * page_size to IdType
     # zero. The scheduler still emits one KV tile for each Q tile.
-    return _extract(
-        wrapper, 15, 4, 6, 9, 12, 13, 14, allow_zero_chunk=True
-    )
+    return _extract(wrapper, 15, 4, 6, 9, 12, 13, 14, allow_zero_chunk=True)

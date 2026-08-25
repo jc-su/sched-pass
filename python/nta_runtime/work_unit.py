@@ -80,7 +80,10 @@ class DemandDescriptor:
                 raise ValueError("selected_ids must match selected_units")
             if len(set(self.selected_ids)) != len(self.selected_ids):
                 raise ValueError("selected_ids must be unique")
-            if min(self.selected_ids) < 0 or max(self.selected_ids) >= self.candidate_units:
+            if (
+                min(self.selected_ids) < 0
+                or max(self.selected_ids) >= self.candidate_units
+            ):
                 raise ValueError("selected_ids must be candidate-relative indices")
         if self.semantics is DemandSemantics.EXACT_SPARSE and not self.selected_ids:
             raise ValueError("exact sparse demand must identify its selected units")
@@ -181,7 +184,9 @@ class WorkBatch:
             identity = unit.identity
             previous = request_indices.setdefault(unit.binding.request_index, identity)
             if previous != identity:
-                raise ValueError("one request index cannot change generation in a batch")
+                raise ValueError(
+                    "one request index cannot change generation in a batch"
+                )
 
     @property
     def request_identities(self) -> tuple[tuple[int, int], ...]:
@@ -189,18 +194,19 @@ class WorkBatch:
 
     @property
     def ready_fraction(self) -> float:
-        return sum(unit.availability is Availability.READY for unit in self.units) / len(
-            self.units
-        )
+        return sum(
+            unit.availability is Availability.READY for unit in self.units
+        ) / len(self.units)
 
     @property
     def blocked_fraction(self) -> float:
-        return sum(unit.availability is Availability.BLOCKED for unit in self.units) / len(
-            self.units
-        )
+        return sum(
+            unit.availability is Availability.BLOCKED for unit in self.units
+        ) / len(self.units)
 
     @property
     def is_heterogeneous(self) -> bool:
-        return len({unit.availability for unit in self.units}) > 1 or len(
-            {unit.demand.selected_units for unit in self.units}
-        ) > 1
+        return (
+            len({unit.availability for unit in self.units}) > 1
+            or len({unit.demand.selected_units for unit in self.units}) > 1
+        )

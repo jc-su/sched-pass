@@ -38,14 +38,15 @@ def assemble(
         qualified = report.get("qualified", report.get("ready"))
         if qualified is None and isinstance(report.get("qualification"), dict):
             qualified = report["qualification"].get("qualified")
-        entries.append({
-            "tier": tier,
-            "status": "qualified" if qualified is True
-            else "not_qualified",
-            "qualified": qualified is True,
-            "source": {"path": str(path), "sha256": _digest(path)},
-            "report": report,
-        })
+        entries.append(
+            {
+                "tier": tier,
+                "status": "qualified" if qualified is True else "not_qualified",
+                "qualified": qualified is True,
+                "source": {"path": str(path), "sha256": _digest(path)},
+                "report": report,
+            }
+        )
     document: dict[str, Any] = {
         "schema": 1,
         "classification": "nta-tier-qualification",
@@ -62,7 +63,9 @@ def assemble(
     validate(document, required_tiers=required_tiers)
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return document
 
 
@@ -71,7 +74,9 @@ def main() -> int:
     for tier in ALL_TIERS:
         parser.add_argument(f"--{tier.replace('_', '-')}-report", type=Path)
     parser.add_argument(
-        "--required-tier", action="append", choices=ALL_TIERS,
+        "--required-tier",
+        action="append",
+        choices=ALL_TIERS,
         help="required tier (repeatable; default: all four tiers)",
     )
     parser.add_argument("--output", type=Path, required=True)

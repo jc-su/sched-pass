@@ -513,8 +513,7 @@ def _request_ranges(
             cursor += 1
         if cursor == begin:
             raise RuntimeError(
-                "FlashInfer schedule has no work for request "
-                f"{binding.request_index}"
+                f"FlashInfer schedule has no work for request {binding.request_index}"
             )
         ranges.append(
             RequestRange(
@@ -525,9 +524,7 @@ def _request_ranges(
             )
         )
     if cursor != len(request_indices):
-        raise RuntimeError(
-            "FlashInfer schedule is not grouped contiguously by request"
-        )
+        raise RuntimeError("FlashInfer schedule is not grouped contiguously by request")
     return ranges
 
 
@@ -590,7 +587,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 ServingTierConfig.from_environment()
             )
         except (OSError, ValueError, RuntimeError) as error:
-            raise RuntimeError(f"invalid NTA serving tier configuration: {error}") from error
+            raise RuntimeError(
+                f"invalid NTA serving tier configuration: {error}"
+            ) from error
         if not self._tier_service.is_host and not self._hicache_enabled:
             raise RuntimeError(
                 "a physical serving tier requires SGLang hierarchical cache metadata"
@@ -609,6 +608,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             nvme=self._tier_service.nvme,
             cxl=self._tier_service.cxl,
         )
+        self._closed = False
+        self._resources_closed = False
         self._runtime.set_tenant_budget(0, (1 << 64) - 1)
         self._request_adapter = SglangAdapter(self._runtime, request_capacity)
         self._hicache = SglangHiCacheBridge(self.token_to_kv_pool)
@@ -676,7 +677,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._demand_graphs: dict[_DemandGraphKey, _DemandGraph] = {}
         self._demand_graph_warmups: dict[_DemandGraphKey, None] = {}
         self._demand_graph_enabled = (
-            self._tier_service.is_host and os.environ.get("NTA_EXECUTION_GRAPH", "1") != "0"
+            self._tier_service.is_host
+            and os.environ.get("NTA_EXECUTION_GRAPH", "1") != "0"
         )
         self._demand_graph_capacity = _positive_environment(
             "NTA_EXECUTION_GRAPH_CAPACITY", max(64, 4 * self._model_layer_count)
@@ -848,7 +850,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         elif self._frontier_enabled and self._model_layer_count > 1:
             self._hicache.set_prefetch_callback(self._publish_cross_layer_frontier)
         atexit.register(self._write_stats)
-        atexit.register(self.close)
 
     def cancel_requests(self, request_id_prefix: str, *, all: bool = False) -> int:
         cancelled = self._request_adapter.cancel_matching(request_id_prefix, all=all)
@@ -856,9 +857,35 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         return cancelled
 
     def close(self) -> None:
-        """Flush exact-backend observations before worker teardown."""
+        """Flush observations and release CUDA/native tier resources."""
+        if self._closed:
+            return
         self._collect_transfer_profiles()
         self._collect_barrier_profiles()
+        self._write_stats()
+
+    def _close_resources(self) -> None:
+        if self._resources_closed:
+            return
+        # Plans, graphs, and native runtime buffers all contain device pointers.
+        # Quiesce every stream before releasing them, including direct NVMe HBM
+        # destinations and CXL-backed mappings.
+        torch.cuda.synchronize()
+        self._hicache.close()
+        self._demand_graphs.clear()
+        self._demand_graph_warmups.clear()
+        for allocation in tuple(self._plans.values()):
+            allocation.plan.close()
+        self._plans.clear()
+        for program in tuple(self._phase_programs.values()):
+            program.close()
+        self._phase_programs.clear()
+        for program in tuple(self._operator_programs.values()):
+            program.close()
+        self._operator_programs.clear()
+        self._runtime.close()
+        self._tier_service.close()
+        self._resources_closed = True
 
     def _install_instrumented_wrappers(
         self, model_runner: Any, skip_prefill: bool
@@ -1070,7 +1097,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     candidate_units=candidate_units,
                     selected_ids=tuple(range(candidate_units)),
                     unit_bytes=unit_bytes,
-                    ready=not host_pages,
+                    # CXL dependencies are already device-visible direct
+                    # addresses.  The HiCache mapping is still used to prove
+                    # exact page identity, but it is not a readiness barrier
+                    # or a host-data ownership signal for this tier.
+                    ready=not host_pages or self._tier_service.is_cxl,
                     estimated_compute_ns=self._host_cost_model.tile_compute_ns,
                     reduction_group=request_index,
                     contributor_index=contributor_indices[request_index],
@@ -1350,9 +1381,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     "request_bind_cpu_ns", 0
                 ) + (time.perf_counter_ns() - bind_started)
             if pending is None:
-                self._active_batch = _ActiveBatch(
-                    bindings, {}, None, {}, {}, {}, ()
-                )
+                self._active_batch = _ActiveBatch(bindings, {}, None, {}, {}, {}, ())
                 self._stats["batches"] += 1
                 self._stats["resident_reference_batches"] += 1
                 self._stats["stock_resident_batches"] += 1
@@ -1694,9 +1723,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                             ready_event,
                             transfer_first_slot + 2 * ready_layer,
                         )
-                    self._stats["lookahead_copy_waves"] = self._stats.get(
-                        "lookahead_copy_waves", 0
-                    ) + 1
+                    self._stats["lookahead_copy_waves"] = (
+                        self._stats.get("lookahead_copy_waves", 0) + 1
+                    )
                     local_layer = wave_end
         except Exception:
             self._prefetch_stream.synchronize()
@@ -1710,8 +1739,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         frontier_geometry = layer_geometry[first_local_layer:]
         if profile_start is not None and profile_finish is not None:
             transfer_bytes = sum(
-                key_bytes + value_bytes
-                for key_bytes, value_bytes in frontier_geometry
+                key_bytes + value_bytes for key_bytes, value_bytes in frontier_geometry
             )
             self._transfer_profiles.append(
                 (profile_start, profile_finish, transfer_bytes, "pipeline")
@@ -1724,8 +1752,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._stats["lookahead_acquisition_objects"] += 2 * acquired_layer_count
         if paired_copy:
             self._stats["paired_lookahead_layers"] = (
-                self._stats.get("paired_lookahead_layers", 0)
-                + acquired_layer_count
+                self._stats.get("paired_lookahead_layers", 0) + acquired_layer_count
             )
         if self._profile_cpu:
             self._stats["pipeline_cpu_ns"] = self._stats.get("pipeline_cpu_ns", 0) + (
@@ -1744,12 +1771,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
     def _publish_cross_layer_frontier(self, pending: PendingHostLoad) -> None:
         transfer_bytes = _frontier_transfer_bytes(pending)
         self._prepare_cross_layer_frontier(pending)
-        self._stats["frontier_proactive_batches"] = self._stats.get(
-            "frontier_proactive_batches", 0
-        ) + 1
-        self._stats["frontier_published_bytes"] = self._stats.get(
-            "frontier_published_bytes", 0
-        ) + transfer_bytes
+        self._stats["frontier_proactive_batches"] = (
+            self._stats.get("frontier_proactive_batches", 0) + 1
+        )
+        self._stats["frontier_published_bytes"] = (
+            self._stats.get("frontier_published_bytes", 0) + transfer_bytes
+        )
 
     def _wrapper_layout(
         self, wrapper: Any
@@ -1873,7 +1900,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         if self._execution_config.protocol.kind is ProtocolKind.CONVENTIONAL:
             transfer_ns = math.ceil(
-                transfer_bytes * 1_000_000_000
+                transfer_bytes
+                * 1_000_000_000
                 / self._host_cost_model.bandwidth_bytes_per_second
             )
             compute_ns = schedule.work_count * self._host_cost_model.tile_compute_ns
@@ -1916,7 +1944,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             batch.prefetched_layers.update(pending.prefetched_layers)
         prefetched = pending.prefetched_layers.get(local_layer)
         if prefetched is None:
-                raise RuntimeError(f"bulk host plan omitted layer {layer.layer_id}")
+            raise RuntimeError(f"bulk host plan omitted layer {layer.layer_id}")
         if self._profile_barrier:
             arrive = torch.cuda.Event(enable_timing=True)
             arrive.record(stream)
@@ -2107,7 +2135,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         int,
         torch.cuda.Event | None,
         int,
-        HostExecutionPlan,
+        HostExecutionPlan | None,
     ]:
         profile_started = time.perf_counter_ns() if self._profile_cpu else 0
         batch = self._active_batch
@@ -2164,8 +2192,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         allocation = self._plans[(id(wrapper), -1)]
         rebuild_plan = allocation.signature != signature
         if not self._tier_service.is_host and not rebuild_plan:
-            if allocation.host_execution is None:
-                raise RuntimeError("cached physical-tier plan is incomplete")
             self._stats["cta_work_items"] += schedule.work_count
             if self._profile_cpu:
                 self._stats["plan_cpu_ns"] = self._stats.get("plan_cpu_ns", 0) + (
@@ -2177,7 +2203,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 allocation.object_count,
                 None,
                 0,
-                allocation.host_execution,
+                None,
             )
         if prefetched is not None and not rebuild_plan:
             if allocation.host_execution is None or allocation.object_count != 2:
@@ -2303,6 +2329,27 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         index_tensors: list[torch.Tensor] = []
         physical_object_bytes: list[int] = []
         pair_objects: dict[_PagePair, tuple[int, int, int, int]] = {}
+        physical_extents: dict[_PagePair, tuple[Any, Any]] = {}
+        if self._tier_service.is_nvme and prefetched is None:
+            unique_physical_pairs = tuple(
+                dict.fromkeys(pair for pair in page_pairs if pair[0])
+            )
+            if 2 * len(unique_physical_pairs) > self._object_capacity:
+                raise RuntimeError(
+                    "NVMe layer needs more HBM object slots than the runtime capacity"
+                )
+            # Resolve the complete catalog before installing any HBM object.
+            # This keeps catalog/geometry errors transactional from the
+            # engine's perspective and avoids partially publishing a layer.
+            for pair in unique_physical_pairs:
+                physical_extents[pair] = (
+                    self._tier_service.extent(
+                        layer_id, tuple(pair[1]), "key", key_element_bytes
+                    ),
+                    self._tier_service.extent(
+                        layer_id, tuple(pair[1]), "value", value_element_bytes
+                    ),
+                )
 
         def objects_for(pair: _PagePair) -> tuple[int, int, int, int]:
             if prefetched is not None:
@@ -2317,12 +2364,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 return existing
             host_pages, device_pages = pair
             if self._tier_service.is_nvme:
-                key_extent = self._tier_service.extent(
-                    layer_id, tuple(device_pages), "key", key_element_bytes
-                )
-                value_extent = self._tier_service.extent(
-                    layer_id, tuple(device_pages), "value", value_element_bytes
-                )
+                extents = physical_extents.get(pair)
+                if extents is None:
+                    raise RuntimeError("NVMe page pair was not catalog-validated")
+                key_extent, value_extent = extents
                 key_slot = len(physical_object_bytes)
                 key_object_id = _OBJECT_ID_BASE | key_slot
                 self._runtime.install_nvme_object(
@@ -2429,7 +2474,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 request_index=request_index,
             )
             if semantic.binding != binding:
-                raise RuntimeError("native work-plan identity diverged from semantic batch")
+                raise RuntimeError(
+                    "native work-plan identity diverged from semantic batch"
+                )
             dependency_begin = len(dependencies)
             if pair[0]:
                 if self._tier_service.is_cxl:
@@ -2469,7 +2516,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     external_object_slots.append(())
                     direct_dependencies = 2
                 else:
-                    key_slot, key_object_id, value_slot, value_object_id = objects_for(pair)
+                    key_slot, key_object_id, value_slot, value_object_id = objects_for(
+                        pair
+                    )
                     key_transfer_bytes = (
                         prefetched.key_bytes
                         if prefetched is not None
@@ -2567,9 +2616,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 for layer in pending.prefetched_layers.values()
             )
             if object_count > pipeline_first_slot:
-                raise RuntimeError(
-                    "demand and proactive HiCache object ranges overlap"
-                )
+                raise RuntimeError("demand and proactive HiCache object ranges overlap")
         transfer_bytes = (
             prefetched.key_bytes + prefetched.value_bytes
             if prefetched is not None
@@ -2585,21 +2632,18 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 object_count=object_count,
                 transfer_bytes=transfer_bytes,
                 runnable_tiles=schedule.work_count,
-                initial_runnable_tiles=(direct_work_count if self._overlap_enabled else 0),
+                initial_runnable_tiles=(
+                    direct_work_count if self._overlap_enabled else 0
+                ),
                 model=self._host_cost_model,
                 force_rounds=(
-                    self._host_cost_model.max_rounds if self._incremental_enabled else None
+                    self._host_cost_model.max_rounds
+                    if self._incremental_enabled
+                    else None
                 ),
             )
-        elif self._tier_service.is_nvme:
-            rounds = self._tier_service.config.progress_rounds
-            host_execution = HostExecutionPlan(
-                (schedule.work_count,) * rounds,
-                transfer_bytes,
-                transfer_bytes,
-            )
         else:
-            host_execution = HostExecutionPlan((schedule.work_count,), 0, 0)
+            host_execution = None
         stream = torch.cuda.current_stream()
         if self._tier_service.is_host and prefetched is None:
             self._runtime.register_indexed_host_objects(
@@ -2608,16 +2652,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._phase_program(wrapper).validate_indexed_host_range(
                 self._runtime, 0, object_count, stream
             )
-        incremental = (
-            self._tier_service.is_host
-            and (
-                host_execution.rounds > 1
+        incremental = self._tier_service.is_host and (
+            host_execution.rounds > 1
             or host_execution.overlap_initial
             or self._incremental_enabled
             or (self._frontier_enabled and local_layer == 0)
-            )
         )
-        needs_plan = not self._tier_service.is_host or prefetched is not None or incremental
+        needs_plan = (
+            not self._tier_service.is_host or prefetched is not None or incremental
+        )
         if needs_plan and rebuild_plan:
             upload_started = time.perf_counter_ns() if self._profile_cpu else 0
             plan.upload_work_units(
@@ -3119,7 +3162,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._upload_plan(wrapper, int(layer.layer_id), kv_cache)
             )
             if plan.has_external or object_count != 0:
-                raise RuntimeError("CXL direct plan unexpectedly contains staged objects")
+                raise RuntimeError(
+                    "CXL direct plan unexpectedly contains staged objects"
+                )
             enqueue_resident_attention(
                 self._runtime,
                 plan,
@@ -3139,7 +3184,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._upload_plan(wrapper, int(layer.layer_id), kv_cache)
             )
             if not plan.has_external or object_count <= 0:
-                raise RuntimeError("NVMe plan unexpectedly contains no external objects")
+                raise RuntimeError(
+                    "NVMe plan unexpectedly contains no external objects"
+                )
             epoch = FlashInferLayerEpoch(
                 self._runtime,
                 plan,
@@ -3167,7 +3214,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             allocation = self._plans[(id(wrapper), -1)]
             if 0 < allocation.direct_work_count < schedule.work_count:
                 self._stats["mixed_dependency_layers"] += 1
-            if final_layer or verify_execution or os.environ.get("NTA_VERIFY_TRANSFER") == "1":
+            if (
+                final_layer
+                or verify_execution
+                or os.environ.get("NTA_VERIFY_TRANSFER") == "1"
+            ):
                 epoch.check(progress_rounds, stream)
             if final_layer and self._runtime.sticky_failed_count != 0:
                 raise RuntimeError("an asynchronous NVMe acquisition epoch failed")
@@ -3190,9 +3241,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     stream,
                 )
                 self._stats["bulk_host_batches"] += 1
-                self._stats["predicted_atomic_ns"] += (
-                    execution_plan.predicted_atomic_ns
-                )
+                self._stats["predicted_atomic_ns"] += execution_plan.predicted_atomic_ns
                 self._stats["predicted_incremental_ns"] += (
                     execution_plan.predicted_incremental_ns
                 )
@@ -3265,16 +3314,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         torch.cuda.Event(enable_timing=True),
                     )
                 on_discovered = None
-                if (
-                    local_layer == 0
-                    and self._hicache.progress_publication_available()
-                ):
+                if local_layer == 0 and self._hicache.progress_publication_available():
                     request_slots = tuple(
                         binding.request_slot for binding in batch.bindings
                     )
                     first_request_slot = min(request_slots)
                     contiguous = request_slots == tuple(
-                        range(first_request_slot, first_request_slot + len(request_slots))
+                        range(
+                            first_request_slot, first_request_slot + len(request_slots)
+                        )
                     )
                     if contiguous:
                         progress_snapshot = self._runtime.request_progress_snapshot(
@@ -3302,7 +3350,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         on_discovered = publish_progress
                     else:
                         self._stats["progress_feedback_skipped_noncontiguous"] = (
-                            self._stats.get("progress_feedback_skipped_noncontiguous", 0)
+                            self._stats.get(
+                                "progress_feedback_skipped_noncontiguous", 0
+                            )
                             + 1
                         )
                 copy_blocks_per_group = indexed_copy_blocks_per_group(
@@ -3315,9 +3365,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 def enqueue_demand(
                     query: torch.Tensor,
                     destination: torch.Tensor,
-                    sync_events: tuple[
-                        torch.cuda.Event, tuple[torch.cuda.Event, ...]
-                    ],
+                    sync_events: tuple[torch.cuda.Event, tuple[torch.cuda.Event, ...]],
                     discovery_callback: Callable[[Any], None] | None,
                 ) -> None:
                     epoch.enqueue_host(
@@ -3409,8 +3457,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     and host_execution.rounds == 1
                     and not pending.prefetched_layers
                 ):
-                        self._prepare_cross_layer_frontier(pending)
-                        batch.prefetched_layers.update(pending.prefetched_layers)
+                    self._prepare_cross_layer_frontier(pending)
+                    batch.prefetched_layers.update(pending.prefetched_layers)
                 self._enqueue_fragment_lookahead(
                     wrapper,
                     int(layer.layer_id),
@@ -3542,15 +3590,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     )
         if self._profile_cpu:
             elapsed_ns = time.perf_counter_ns() - enqueue_started
-            self._stats["phase_enqueue_cpu_ns"] = self._stats.get(
-                "phase_enqueue_cpu_ns", 0
-            ) + elapsed_ns
-            self._stats[f"{attention_form}_enqueue_cpu_ns"] = self._stats.get(
-                f"{attention_form}_enqueue_cpu_ns", 0
-            ) + elapsed_ns
-            self._stats[f"{attention_form}_enqueue_layers"] = self._stats.get(
-                f"{attention_form}_enqueue_layers", 0
-            ) + 1
+            self._stats["phase_enqueue_cpu_ns"] = (
+                self._stats.get("phase_enqueue_cpu_ns", 0) + elapsed_ns
+            )
+            self._stats[f"{attention_form}_enqueue_cpu_ns"] = (
+                self._stats.get(f"{attention_form}_enqueue_cpu_ns", 0) + elapsed_ns
+            )
+            self._stats[f"{attention_form}_enqueue_layers"] = (
+                self._stats.get(f"{attention_form}_enqueue_layers", 0) + 1
+            )
         if gpu_profile is not None:
             gpu_profile[1].record(stream)
             self._operator_profiles.append((*gpu_profile, attention_form))
@@ -4026,18 +4074,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     / (1 << 30)
                     / (kind_milliseconds / 1_000.0)
                 )
-        pending_operators: list[
-            tuple[torch.cuda.Event, torch.cuda.Event, str]
-        ] = []
+        pending_operators: list[tuple[torch.cuda.Event, torch.cuda.Event, str]] = []
         for start, finish, kind in self._operator_profiles:
             if not finish.query():
                 pending_operators.append((start, finish, kind))
                 continue
             milliseconds = start.elapsed_time(finish)
             prefix = f"profiled_{kind}_operator"
-            self._stats[f"{prefix}_layers"] = (
-                self._stats.get(f"{prefix}_layers", 0) + 1
-            )
+            self._stats[f"{prefix}_layers"] = self._stats.get(f"{prefix}_layers", 0) + 1
             self._stats[f"{prefix}_gpu_ms"] = (
                 self._stats.get(f"{prefix}_gpu_ms", 0.0) + milliseconds
             )
@@ -4118,7 +4162,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             }
             for plan in sorted(
                 self._operator_plans.values(),
-                key=lambda candidate: (int(candidate.family), candidate.plan_fingerprint),
+                key=lambda candidate: (
+                    int(candidate.family),
+                    candidate.plan_fingerprint,
+                ),
             )
         ]
         report["tier_descriptors"] = [
@@ -4131,9 +4178,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "active": descriptor.active,
                 "flags": descriptor.flags,
             }
-            for descriptor in (
-                self._runtime.tier_descriptor(tier) for tier in TierKind
-            )
+            for descriptor in (self._runtime.tier_descriptor(tier) for tier in TierKind)
         ]
         families = {contract.family for contract in contracts}
         report["verified_operator_pairs"] = sum(
@@ -4160,5 +4205,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._stats_publisher.publish(self._stats_report())
 
     def _write_stats(self) -> None:
+        if self._closed:
+            return
         if self._stats_publisher is not None:
             self._stats_publisher.publish(self._stats_report(), wait=True)
+        self._close_resources()
+        self._closed = True

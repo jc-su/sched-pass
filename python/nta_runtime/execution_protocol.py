@@ -58,9 +58,7 @@ class ExecutionProtocolConfig:
                 f"{prefix}_GRANULARITY must be request, layer, page_group, or cta_tile"
             ) from error
         try:
-            max_inflight = int(
-                values.get(f"{prefix}_MAX_INFLIGHT_UNITS", "4096")
-            )
+            max_inflight = int(values.get(f"{prefix}_MAX_INFLIGHT_UNITS", "4096"))
         except ValueError as error:
             raise ValueError(
                 f"{prefix}_MAX_INFLIGHT_UNITS must be an integer"
@@ -70,12 +68,8 @@ class ExecutionProtocolConfig:
                 granularity=granularity, max_inflight_units=max_inflight
             )
         if kind is ProtocolKind.PARTIAL:
-            return cls.partial(
-                granularity=granularity, max_inflight_units=max_inflight
-            )
-        return cls.late_bound(
-            granularity=granularity, max_inflight_units=max_inflight
-        )
+            return cls.partial(granularity=granularity, max_inflight_units=max_inflight)
+        return cls.late_bound(granularity=granularity, max_inflight_units=max_inflight)
 
     def __post_init__(self) -> None:
         if self.max_inflight_units <= 0:
@@ -90,7 +84,9 @@ class ExecutionProtocolConfig:
             raise ValueError("only the partial protocol may resume partial work")
 
     @classmethod
-    def conventional(cls, *, granularity: Granularity, max_inflight_units: int) -> "ExecutionProtocolConfig":
+    def conventional(
+        cls, *, granularity: Granularity, max_inflight_units: int
+    ) -> "ExecutionProtocolConfig":
         return cls(
             ProtocolKind.CONVENTIONAL,
             granularity,
@@ -100,7 +96,9 @@ class ExecutionProtocolConfig:
         )
 
     @classmethod
-    def late_bound(cls, *, granularity: Granularity, max_inflight_units: int) -> "ExecutionProtocolConfig":
+    def late_bound(
+        cls, *, granularity: Granularity, max_inflight_units: int
+    ) -> "ExecutionProtocolConfig":
         return cls(
             ProtocolKind.LATE_BOUND,
             granularity,
@@ -110,7 +108,9 @@ class ExecutionProtocolConfig:
         )
 
     @classmethod
-    def partial(cls, *, granularity: Granularity, max_inflight_units: int) -> "ExecutionProtocolConfig":
+    def partial(
+        cls, *, granularity: Granularity, max_inflight_units: int
+    ) -> "ExecutionProtocolConfig":
         return cls(
             ProtocolKind.PARTIAL,
             granularity,
@@ -122,7 +122,12 @@ class ExecutionProtocolConfig:
 
 _TRANSITIONS: Mapping[Availability, frozenset[Availability]] = {
     Availability.UNBOUND: frozenset(
-        {Availability.BLOCKED, Availability.READY, Availability.CANCELLED, Availability.FAILED}
+        {
+            Availability.BLOCKED,
+            Availability.READY,
+            Availability.CANCELLED,
+            Availability.FAILED,
+        }
     ),
     Availability.BLOCKED: frozenset(
         {Availability.READY, Availability.CANCELLED, Availability.FAILED}
@@ -131,10 +136,21 @@ _TRANSITIONS: Mapping[Availability, frozenset[Availability]] = {
         {Availability.RUNNING, Availability.CANCELLED, Availability.FAILED}
     ),
     Availability.RUNNING: frozenset(
-        {Availability.PARTIAL, Availability.COMPLETE, Availability.CANCELLED, Availability.FAILED}
+        {
+            Availability.PARTIAL,
+            Availability.COMPLETE,
+            Availability.CANCELLED,
+            Availability.FAILED,
+        }
     ),
     Availability.PARTIAL: frozenset(
-        {Availability.READY, Availability.RUNNING, Availability.COMPLETE, Availability.CANCELLED, Availability.FAILED}
+        {
+            Availability.READY,
+            Availability.RUNNING,
+            Availability.COMPLETE,
+            Availability.CANCELLED,
+            Availability.FAILED,
+        }
     ),
     Availability.COMPLETE: frozenset(),
     Availability.CANCELLED: frozenset(),
@@ -172,13 +188,20 @@ class WorkLedger:
             raise KeyError(f"unknown work unit {work_id}")
         if epoch != self.batch.epoch or epoch != unit.demand.epoch:
             raise ValueError("stale execution epoch")
-        if binding.request_slot != unit.binding.request_slot or binding.generation != unit.binding.generation:
+        if (
+            binding.request_slot != unit.binding.request_slot
+            or binding.generation != unit.binding.generation
+        ):
             raise ValueError("stale request generation cannot advance work")
         current = self._states[work_id]
         if target not in _TRANSITIONS[current]:
-            raise ValueError(f"invalid work transition {current.value} -> {target.value}")
+            raise ValueError(
+                f"invalid work transition {current.value} -> {target.value}"
+            )
         if target is Availability.PARTIAL and not self.config.allow_partial:
-            raise ValueError("the selected execution protocol does not support partial work")
+            raise ValueError(
+                "the selected execution protocol does not support partial work"
+            )
         self._states[work_id] = target
 
     def discover(
@@ -198,7 +221,9 @@ class WorkLedger:
 
     def units_in(self, *states: Availability) -> tuple[int, ...]:
         allowed = set(states)
-        return tuple(work_id for work_id, state in self._states.items() if state in allowed)
+        return tuple(
+            work_id for work_id, state in self._states.items() if state in allowed
+        )
 
     def runnable_groups(self) -> tuple[tuple[int, ...], ...]:
         """Return bounded groups that the selected protocol may launch now.
@@ -217,7 +242,9 @@ class WorkLedger:
         width = self.config.max_inflight_units - in_flight
         if width <= 0:
             return ()
-        return tuple(ready[start : start + width] for start in range(0, len(ready), width))
+        return tuple(
+            ready[start : start + width] for start in range(0, len(ready), width)
+        )
 
     @property
     def is_complete(self) -> bool:
@@ -242,7 +269,9 @@ class GranularityEstimate:
 
     @property
     def total_ns(self) -> int:
-        return self.transfer_ns + self.compute_ns + self.control_ns + self.availability_ns
+        return (
+            self.transfer_ns + self.compute_ns + self.control_ns + self.availability_ns
+        )
 
 
 @dataclass(frozen=True)
@@ -279,7 +308,9 @@ class GranularityCostModel:
             raise ValueError("availability skew cannot be negative")
         groups = math.ceil(selected_units / units_per_group)
         transfer_ns = math.ceil(
-            selected_units * unit_bytes * 1_000_000_000
+            selected_units
+            * unit_bytes
+            * 1_000_000_000
             / self.bandwidth_bytes_per_second
         )
         compute_ns = selected_units * self.compute_per_unit_ns
