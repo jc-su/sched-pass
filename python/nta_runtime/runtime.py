@@ -971,6 +971,16 @@ _runtime_register_indexed_host_objects_async = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_runtime_register_indexed_host_objects_async_quiesced = _function(
+    "nta_runtime_register_indexed_host_objects_async_quiesced",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.POINTER(_IndexedHostObject),
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
 _runtime_bind_tensor_maps = _function(
     "nta_runtime_bind_tensor_maps",
     ctypes.c_int,
@@ -1388,6 +1398,12 @@ def _stream_address(value: Any) -> int:
     return int(getattr(value, "cuda_stream", value))
 
 
+def _event_address(value: Any) -> int:
+    if value is None:
+        return 0
+    return int(getattr(value, "cuda_event", value))
+
+
 def synchronize_stream(stream: Any = None) -> None:
     _check(_stream_synchronize(_stream_address(stream)))
 
@@ -1716,16 +1732,30 @@ class Runtime(_Owner):
         first_slot: int,
         objects: Iterable[IndexedHostObject],
         stream: Any = None,
+        quiescence_event: Any = None,
     ) -> None:
         """Bulk-publish a contiguous layer's indexed host objects."""
         values = [object_.native() for object_ in objects]
         if not values:
             raise ValueError("indexed host object batch cannot be empty")
         array = (_IndexedHostObject * len(values))(*values)
+        if quiescence_event is not None and stream is None:
+            raise ValueError("quiescence_event requires an asynchronous stream")
         if stream is None:
             _check(
                 _runtime_register_indexed_host_objects(
                     self._handle, first_slot, array, len(values)
+                )
+            )
+        elif quiescence_event is not None:
+            _check(
+                _runtime_register_indexed_host_objects_async_quiesced(
+                    self._handle,
+                    first_slot,
+                    array,
+                    len(values),
+                    _stream_address(stream),
+                    _event_address(quiescence_event),
                 )
             )
         else:
@@ -1764,6 +1794,7 @@ class Runtime(_Owner):
         source_byte_offset: int,
         bytes: int,
     ) -> int:
+        """Republish an exact NVMe range, reusing the slot buffer when possible."""
         destination = ctypes.c_uint64()
         _check(
             _runtime_install_nvme_object(

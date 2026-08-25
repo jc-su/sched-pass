@@ -187,6 +187,23 @@ public:
   void registerIndexedHostObjectsAsync(
       std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects,
       cudaStream_t stream);
+  // Replace an indexed directory after the caller has recorded an event on
+  // the stream that consumed the previous entries. Borrowed registrations
+  // use a stream wait and therefore avoid a device-to-host lifetime probe on
+  // this steady-state reuse path. If a replaced slot owns a runtime
+  // allocation, the runtime synchronizes the event before freeing it. A
+  // missing event uses the conservative lifetime probe; an invalid event is
+  // rejected by CUDA.
+  void registerIndexedHostObjectsAsyncQuiesced(
+      std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects,
+      cudaStream_t stream, cudaEvent_t priorConsumerEvent);
+  // Install an NVMe object using a runtime-owned destination. When the slot
+  // already owns a large-enough NVMe buffer, only the source-range directory
+  // entry is republished; the HBM allocation and DMA mapping remain alive.
+  ObjectHandle installNvmeObject(std::uint32_t slot, std::uint64_t objectId,
+                                 std::uint32_t version,
+                                 std::uint64_t sourceByteOffset,
+                                 std::size_t bytes);
   ObjectHandle installNvmeObject(std::uint32_t slot, std::uint64_t objectId,
                                  std::uint32_t version,
                                  std::uint64_t sourceByteOffset,

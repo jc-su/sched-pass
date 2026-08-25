@@ -21,14 +21,47 @@ def _get(document: dict[str, Any], path: str) -> float:
     return float(value)
 
 
-def compare(baseline: dict[str, Any], measured: dict[str, Any]) -> dict[str, Any]:
+def validate_baseline(baseline: dict[str, Any]) -> None:
+    """Validate the portable shape of a captured machine-specific baseline."""
+    if not isinstance(baseline, dict):
+        raise ValueError("performance baseline must be an object")
     if (
         baseline.get("schema") != 1
         or baseline.get("classification") != "nta-performance-baseline"
     ):
         raise ValueError("baseline is not a captured NTA performance baseline")
-    if int(baseline["report"].get("verification_failures", 0)) != 0:
+    report = baseline.get("report")
+    metrics = baseline.get("metrics")
+    if not isinstance(report, dict) or not isinstance(metrics, list) or not metrics:
+        raise ValueError("baseline must contain a report and at least one metric")
+    if int(report.get("verification_failures", 0)) != 0:
         raise ValueError("baseline contains correctness failures")
+    for metric in metrics:
+        if not isinstance(metric, dict) or not metric.get("name") or not metric.get(
+            "path"
+        ):
+            raise ValueError("baseline metric must have a name and path")
+        direction = metric.get("direction", "lower_is_better")
+        if direction not in {"lower_is_better", "higher_is_better"}:
+            raise ValueError(f"unsupported performance direction: {direction}")
+        tolerance = float(metric.get("relative_tolerance", 0.05))
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError(
+                "performance relative tolerance must be finite and nonnegative"
+            )
+        if "absolute_tolerance" in metric:
+            absolute_tolerance = float(metric["absolute_tolerance"])
+            if not math.isfinite(absolute_tolerance) or absolute_tolerance < 0:
+                raise ValueError(
+                    "performance absolute tolerance must be finite and nonnegative"
+                )
+        _get(report, str(metric["path"]))
+
+
+def compare(baseline: dict[str, Any], measured: dict[str, Any]) -> dict[str, Any]:
+    validate_baseline(baseline)
+    if not isinstance(measured, dict):
+        raise ValueError("measured performance report must be an object")
     if int(measured.get("verification_failures", 0)) != 0:
         raise ValueError("measured report contains correctness failures")
     checks = []
@@ -39,18 +72,30 @@ def compare(baseline: dict[str, Any], measured: dict[str, Any]) -> dict[str, Any
         current = _get(measured, str(metric["path"]))
         tolerance = float(metric.get("relative_tolerance", 0.05))
         direction = metric.get("direction", "lower_is_better")
-        relative_change = (current - base) / base if base else 0.0
-        violation = (
-            relative_change > tolerance
-            if direction == "lower_is_better"
-            else relative_change < -tolerance
-        )
+        if direction not in {"lower_is_better", "higher_is_better"}:
+            raise ValueError(f"unsupported performance direction: {direction}")
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError(
+                "performance relative tolerance must be finite and nonnegative"
+            )
+        if base == 0.0:
+            absolute_tolerance = float(metric.get("absolute_tolerance", 0.0))
+            relative_change = None
+            violation = abs(current - base) > absolute_tolerance
+        else:
+            relative_change = (current - base) / base
+            violation = (
+                relative_change > tolerance
+                if direction == "lower_is_better"
+                else relative_change < -tolerance
+            )
         item = {
             "name": name,
             "baseline": base,
             "measured": current,
             "relative_change": relative_change,
             "relative_tolerance": tolerance,
+            "absolute_tolerance": float(metric.get("absolute_tolerance", 0.0)),
             "direction": direction,
             "pass": not violation,
         }
@@ -65,6 +110,8 @@ def compare(baseline: dict[str, Any], measured: dict[str, Any]) -> dict[str, Any
         "checks": checks,
         "baseline_revision": baseline.get("revision"),
         "measured_revision": measured.get("revision"),
+        "baseline_machine": baseline.get("machine"),
+        "measured_machine": measured.get("machine"),
     }
 
 

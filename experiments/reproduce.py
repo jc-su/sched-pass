@@ -33,6 +33,7 @@ try:
     from .artifact import ArtifactRun, ROOT, file_digest, git_metadata
     from .hardware import validate as validate_hardware
     from .validate_workload import validate as validate_workload
+    from .validate_performance_artifact import validate as validate_performance_artifact
     from .validate_tier_qualification import (
         validate_file as validate_tier_qualification,
     )
@@ -41,6 +42,7 @@ except ImportError:  # Direct ``python experiments/reproduce.py`` execution.
     from artifact import ArtifactRun, ROOT, file_digest, git_metadata
     from hardware import validate as validate_hardware
     from validate_workload import validate as validate_workload
+    from validate_performance_artifact import validate as validate_performance_artifact
     from validate_tier_qualification import validate_file as validate_tier_qualification
     from validate_tier_catalog import validate as validate_tier_catalog
 
@@ -292,6 +294,12 @@ def _run_evaluation(
         raise RuntimeError(
             f"evaluation specification has no readable workload manifest: {error}"
         ) from error
+    evaluation_profile = spec_document.get("evaluation_profile", "contract")
+    if evaluation_profile == "osdi-complete" and args.performance_evidence is None:
+        raise RuntimeError(
+            "osdi-complete evaluation requires --performance-evidence with "
+            "successful profiler, baseline, measured report, and regression gate"
+        )
     copied_workload = _copy_workload(run, workload)
     rewritten_spec = _replace_path(spec_document, workload, copied_workload)
     qualification = spec_document.get("tier_qualification")
@@ -333,6 +341,19 @@ def _run_evaluation(
         name="workload-rq0",
         environment=environment,
     )
+    if args.performance_evidence is not None:
+        source_evidence = args.performance_evidence.resolve()
+        if not source_evidence.is_dir():
+            raise RuntimeError(
+                f"performance evidence is not a directory: {source_evidence}"
+            )
+        evidence_destination = run.output / "performance"
+        shutil.copytree(source_evidence, evidence_destination)
+        validate_performance_artifact(evidence_destination)
+        run.update(
+            performance_evidence="performance",
+            performance_evidence_profile=evaluation_profile,
+        )
     command = [
         sys.executable,
         "experiments/run_evaluation.py",
@@ -436,6 +457,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         type=Path,
         help="paired evaluation specification for --profile evaluation",
     )
+    parser.add_argument(
+        "--performance-evidence",
+        type=Path,
+        help="external profiler/baseline/measured/regression bundle for evaluation",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.max_cases <= 0 or args.jobs <= 0:
@@ -454,6 +480,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         parser.error("--tier-catalog is only valid for --profile serving")
     if args.spec is not None and args.profile != "evaluation":
         parser.error("--spec is only valid for --profile evaluation")
+    if args.performance_evidence is not None and args.profile != "evaluation":
+        parser.error("--performance-evidence is only valid for --profile evaluation")
     if args.result is not None and args.profile != "serving":
         parser.error("--result is only valid for --profile serving")
     if args.command and args.command[0] == "--":

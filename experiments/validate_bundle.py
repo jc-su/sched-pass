@@ -15,6 +15,7 @@ try:
     from .validate_evaluation_artifact import validate as validate_evaluation_artifact
     from .run_evaluation import validate_spec
     from .validate_matrix_artifact import validate as validate_matrix
+    from .validate_performance_artifact import validate as validate_performance_artifact
     from .validate_serving_report import validate as validate_serving_report
     from .validate_tier_qualification import (
         validate_file as validate_tier_qualification,
@@ -28,6 +29,7 @@ except ImportError:  # Direct script execution.
     from validate_evaluation_artifact import validate as validate_evaluation_artifact
     from run_evaluation import validate_spec
     from validate_matrix_artifact import validate as validate_matrix
+    from validate_performance_artifact import validate as validate_performance_artifact
     from validate_serving_report import validate as validate_serving_report
     from validate_tier_qualification import validate_file as validate_tier_qualification
     from validate_tier_catalog import validate as validate_tier_catalog
@@ -209,6 +211,25 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             "evaluation workload digest is not the bundled workload",
         )
         copied_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        performance_name = metadata.get("performance_evidence")
+        if copied_spec.get("evaluation_profile", "contract") == "osdi-complete":
+            _require(
+                isinstance(performance_name, str) and bool(performance_name),
+                "osdi-complete evaluation bundle has no performance evidence",
+            )
+        if performance_name:
+            performance_relative = Path(str(performance_name))
+            _require(
+                not performance_relative.is_absolute()
+                and ".." not in performance_relative.parts,
+                "unsafe performance evidence path",
+            )
+            performance_path = bundle / performance_relative
+            _require(
+                performance_path.is_dir(),
+                "performance evidence directory is missing",
+            )
+            validate_performance_artifact(performance_path)
         physical_tiers = {
             str(trial["tier"])
             for trial in copied_spec.get("experiments", [])

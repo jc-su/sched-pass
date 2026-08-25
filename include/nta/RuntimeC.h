@@ -334,6 +334,10 @@ nta_status nta_runtime_register_indexed_host_objects_async(
     nta_runtime *runtime, uint32_t first_slot,
     const nta_indexed_host_object *objects, uint32_t object_count,
     uint64_t cuda_stream);
+nta_status nta_runtime_register_indexed_host_objects_async_quiesced(
+    nta_runtime *runtime, uint32_t first_slot,
+    const nta_indexed_host_object *objects, uint32_t object_count,
+    uint64_t cuda_stream, uint64_t prior_consumer_event);
 nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
                                         uint32_t object_slot,
                                         uint32_t relative_replica,

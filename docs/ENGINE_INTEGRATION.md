@@ -47,8 +47,11 @@ The serving process selects one `ServingTierService` from `NTA_SERVING_TIER`.
 `host_staged` is the default and retains the indexed host path. `nvme`
 requires `NTA_NVME_ENDPOINT` and an exact `NTA_TIER_CATALOG`; each requested
 device-page group is validated as one contiguous K/V extent, installed as an
-HBM object no larger than the controller's advertised MDTS/PRP transfer limit,
-and progressed by the GPU-owned NVMe queue. The FlashInfer KV chunk therefore
+HBM object no larger than the controller's advertised MDTS/PRP transfer limit.
+The runtime reuses a slot's HBM/DMA buffer when the next exact extent fits, so
+mapping and allocation stay in the setup/lifetime path rather than recurring
+for every steady-state I/O. Transfers are progressed by the GPU-owned NVMe
+queue. The FlashInfer KV chunk therefore
 must be small enough for both K/V extents to satisfy that limit; an oversized
 exact group fails closed before any object is installed. The host HiCache load
 is used only as a lifetime and request-metadata signal in this mode; its bytes
@@ -71,32 +74,33 @@ be governed by the framework allocator's own quota.
 
 ## vLLM
 
-The vLLM integration boundary is `VllmSchedulerProjection`. A pinned vLLM
-adapter supplies:
+The vLLM integration boundary is `VllmV1Hook` for the pinned vLLM 0.13.0 V1
+worker. The dependency-free `VllmSchedulerProjection` remains useful for
+contract fixtures, while the real hook extracts:
 
 - request IDs;
-- scheduler/request slots;
-- optional priorities;
-- optional deadline clocks.
+- the scheduler's request IDs;
+- exact block tables from `InputBatch.block_table[0]`'s CPU mirror;
+- optional tenant, priority, and deadline annotations supplied by deployment.
 
-`VllmAdapter.bind_forward` binds the projection to the same
-`RequestIdentityRegistry` and produces the same `EngineBatch` as SGLang. The
-framework-specific hook is responsible for creating the projection from its
-current scheduler object; NTA deliberately does not import vLLM internals.
-That keeps version churn at one typed boundary while making missing identity a
-hard error. A vLLM hook may add block-table and cancellation extraction only at
-that boundary; it must not add a second generation tracker, policy taxonomy,
-or native work ABI. The same `ServingTierService` is passed to a pinned vLLM
-consumer hook; the tier catalog and native transport are selected once per
-worker, not once per framework implementation.
+`VllmV1Hook.bind_forward` owns a bounded stable request-ID slot table, so a
+mutable vLLM input-batch row is never treated as long-lived identity. It binds
+the same `RequestIdentityRegistry` and produces the same `EngineBatch` as
+SGLang. The hook checks the installed vLLM version, rejects missing rows,
+multiple KV groups, empty exact demand, and finish/reschedule ID ambiguity. It
+must be called after vLLM's `_update_states` and before the attention launch;
+that call is control-plane metadata publication, not a per-request I/O path.
+The hook must not add a second generation tracker, policy taxonomy, or native
+work ABI. The same `ServingTierService` is passed to a pinned consumer hook;
+the tier catalog and native transport are selected once per worker.
 
-The current vLLM adapter is a tested structural seam, not a serving backend:
-it proves the common identity/epoch contract without importing vLLM internals.
-`bind_forward` additionally requires a normalized `block_tables` projection
-and `kv_page_bytes`; request identity alone is not an executable exact demand.
-An artifact may not label vLLM results as end-to-end evidence until a pinned
-vLLM hook supplies that projection and passes the same exact-demand,
-correctness, tier-placement, and performance gates used by SGLang.
+`VllmV1Hook` is now a real pinned worker projection, but it is not by itself a
+complete vLLM serving backend: a vLLM model-runner/attention consumer still
+has to pass the returned `EngineBatch` into the NTA execution core. An artifact
+may not label vLLM results as end-to-end evidence until that consumer is wired
+and passes the same exact-demand, correctness, tier-placement, and performance
+gates used by SGLang. Version drift is an intentional hard failure, not a
+best-effort field guess.
 
 ## Common contract
 

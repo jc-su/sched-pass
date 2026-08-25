@@ -223,6 +223,70 @@ std::uint64_t configuredTierBandwidth(abi::SourceKind kind) {
                              false);
 }
 
+void validateIndexedHostObject(const IndexedHostObjectSpec &object,
+                               int deviceOrdinal) {
+  if (object.sourceDeviceAddress == nullptr ||
+      object.stagingDeviceAddress == nullptr ||
+      object.sourceIndicesDevice == nullptr ||
+      object.stagingIndicesDevice == nullptr || object.indexCount == 0 ||
+      object.elementBytes == 0 ||
+      object.sourceStrideBytes < object.elementBytes ||
+      object.stagingStrideBytes < object.elementBytes ||
+      object.sourceIndexLimit == 0 || object.stagingIndexLimit == 0 ||
+      object.indexCount > std::numeric_limits<std::uint32_t>::max() /
+                              object.elementBytes) {
+    throw std::invalid_argument("invalid indexed host transfer geometry");
+  }
+  validateDeviceVisiblePointer(object.sourceDeviceAddress, deviceOrdinal,
+                               "indexed source");
+  validateDeviceAllocation(object.stagingDeviceAddress, deviceOrdinal,
+                           "indexed staging destination");
+  validateDeviceAllocation(object.sourceIndicesDevice, deviceOrdinal,
+                           "indexed source indices");
+  validateDeviceAllocation(object.stagingIndicesDevice, deviceOrdinal,
+                           "indexed staging indices");
+}
+
+abi::ReplicaEntry makeIndexedHostReplica(const IndexedHostObjectSpec &object,
+                                         std::uint64_t latencyNs,
+                                         std::uint64_t bandwidthBytes) {
+  return {
+      reinterpret_cast<std::uint64_t>(object.sourceDeviceAddress),
+      reinterpret_cast<std::uint64_t>(object.sourceIndicesDevice),
+      latencyNs,
+      bandwidthBytes,
+      static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
+      object.indexCount,
+      static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
+      abi::ReplicaTransport | abi::ReplicaIndexed,
+      abi::packTransferIndexLimits(object.sourceIndexLimit,
+                                   object.stagingIndexLimit),
+      abi::packTransferStrides(object.sourceStrideBytes,
+                               object.stagingStrideBytes),
+  };
+}
+
+abi::ObjectEntry makeIndexedHostObject(const IndexedHostObjectSpec &object,
+                                       std::uint32_t replicaStart) {
+  return {
+      object.objectId,
+      reinterpret_cast<std::uint64_t>(object.stagingDeviceAddress),
+      static_cast<std::uint64_t>(object.indexCount) * object.elementBytes,
+      0,
+      object.version,
+      static_cast<std::uint32_t>(object.preacquired
+                                     ? abi::ObjectState::Ready
+                                     : abi::ObjectState::New),
+      replicaStart,
+      1,
+      object.preacquired ? 0U : abi::InvalidIndex,
+      // For indexed objects, flags carries the registered index-array
+      // capacity so a device-side row-count update can validate against it.
+      object.indexCount,
+      reinterpret_cast<std::uint64_t>(object.stagingIndicesDevice),
+  };
+}
+
 template <typename T> T *deviceAllocate(std::size_t count) {
   T *pointer = nullptr;
   checkCuda(cudaMalloc(reinterpret_cast<void **>(&pointer), sizeof(T) * count),
@@ -1352,64 +1416,18 @@ void HostRuntime::registerIndexedHostObjects(
   entries.reserve(objects.size());
   for (std::size_t index = 0; index < objects.size(); ++index) {
     const IndexedHostObjectSpec &object = objects[index];
-    if (object.sourceDeviceAddress == nullptr ||
-        object.stagingDeviceAddress == nullptr ||
-        object.sourceIndicesDevice == nullptr ||
-        object.stagingIndicesDevice == nullptr || object.indexCount == 0 ||
-        object.elementBytes == 0 ||
-        object.sourceStrideBytes < object.elementBytes ||
-        object.stagingStrideBytes < object.elementBytes ||
-        object.sourceIndexLimit == 0 || object.stagingIndexLimit == 0 ||
-        object.indexCount > std::numeric_limits<std::uint32_t>::max() /
-                                object.elementBytes) {
-      throw std::invalid_argument("invalid indexed host transfer geometry");
-    }
-    validateDeviceVisiblePointer(object.sourceDeviceAddress,
-                                 impl_->config.deviceOrdinal,
-                                 "indexed source");
-    validateDeviceAllocation(object.stagingDeviceAddress,
-                             impl_->config.deviceOrdinal,
-                             "indexed staging destination");
-    validateDeviceAllocation(object.sourceIndicesDevice,
-                             impl_->config.deviceOrdinal,
-                             "indexed source indices");
-    validateDeviceAllocation(object.stagingIndicesDevice,
-                             impl_->config.deviceOrdinal,
-                             "indexed staging indices");
+    validateIndexedHostObject(object, impl_->config.deviceOrdinal);
     const std::uint32_t slot = firstSlot + static_cast<std::uint32_t>(index);
     const std::uint32_t replicaStart =
         slot * impl_->config.maxReplicasPerObject;
-    replicas[index * impl_->config.maxReplicasPerObject] = {
-        reinterpret_cast<std::uint64_t>(object.sourceDeviceAddress),
-        reinterpret_cast<std::uint64_t>(object.sourceIndicesDevice),
-        impl_->tierLatencies[static_cast<std::size_t>(abi::SourceKind::HostStaged)],
-        impl_->tierBandwidths[static_cast<std::size_t>(abi::SourceKind::HostStaged)],
-        static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
-        object.indexCount,
-        static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
-        abi::ReplicaTransport | abi::ReplicaIndexed,
-        abi::packTransferIndexLimits(object.sourceIndexLimit,
-                                     object.stagingIndexLimit),
-        abi::packTransferStrides(object.sourceStrideBytes,
-                                 object.stagingStrideBytes),
-    };
-    entries.push_back({
-        object.objectId,
-        reinterpret_cast<std::uint64_t>(object.stagingDeviceAddress),
-        static_cast<std::uint64_t>(object.indexCount) * object.elementBytes,
-        0,
-        object.version,
-        static_cast<std::uint32_t>(object.preacquired
-                                       ? abi::ObjectState::Ready
-                                       : abi::ObjectState::New),
-        replicaStart,
-        1,
-        object.preacquired ? 0U : abi::InvalidIndex,
-        // For indexed objects, flags carries the registered index-array
-        // capacity so a device-side row-count update can validate against it.
-        object.indexCount,
-        reinterpret_cast<std::uint64_t>(object.stagingIndicesDevice),
-    });
+    replicas[index * impl_->config.maxReplicasPerObject] =
+        makeIndexedHostReplica(
+            object,
+            impl_->tierLatencies[
+                static_cast<std::size_t>(abi::SourceKind::HostStaged)],
+            impl_->tierBandwidths[
+                static_cast<std::size_t>(abi::SourceKind::HostStaged)]);
+    entries.push_back(makeIndexedHostObject(object, replicaStart));
   }
   const std::uint32_t firstReplica =
       firstSlot * impl_->config.maxReplicasPerObject;
@@ -1434,13 +1452,40 @@ void HostRuntime::registerIndexedHostObjects(
 void HostRuntime::registerIndexedHostObjectsAsync(
     std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects,
     cudaStream_t stream) {
+  registerIndexedHostObjectsAsyncQuiesced(firstSlot, objects, stream, nullptr);
+}
+
+void HostRuntime::registerIndexedHostObjectsAsyncQuiesced(
+    std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects,
+    cudaStream_t stream, cudaEvent_t priorConsumerEvent) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (objects.empty() || firstSlot > impl_->config.objectCapacity ||
       objects.size() > impl_->config.objectCapacity - firstSlot) {
     throw std::invalid_argument("indexed host object range exceeds capacity");
   }
-  impl_->ensureObjectRangeReplaceable(
-      firstSlot, static_cast<std::uint32_t>(objects.size()));
+  if (priorConsumerEvent == nullptr) {
+    impl_->ensureObjectRangeReplaceable(
+        firstSlot, static_cast<std::uint32_t>(objects.size()));
+  } else {
+    bool ownsPreviousDestination = false;
+    for (std::size_t index = 0; index < objects.size(); ++index) {
+      if (impl_->objects[firstSlot + static_cast<std::uint32_t>(index)]
+              .has_value()) {
+        ownsPreviousDestination = true;
+        break;
+      }
+    }
+    if (ownsPreviousDestination) {
+      // Stream ordering protects device consumers, but host-side destruction
+      // of a runtime-owned CUDA allocation is not itself stream ordered.
+      // Synchronize only for this ownership case; borrowed engine buffers
+      // retain the nonblocking event-wait path.
+      checkCuda(cudaEventSynchronize(priorConsumerEvent),
+                "quiesce runtime-owned indexed destination");
+    }
+    checkCuda(cudaStreamWaitEvent(stream, priorConsumerEvent, 0),
+              "wait for indexed object consumers");
+  }
 
   Impl::DirectoryUpload &upload =
       impl_->directoryUploads[impl_->nextDirectoryUpload++ %
@@ -1457,64 +1502,18 @@ void HostRuntime::registerIndexedHostObjectsAsync(
 
   for (std::size_t index = 0; index < objects.size(); ++index) {
     const IndexedHostObjectSpec &object = objects[index];
-    if (object.sourceDeviceAddress == nullptr ||
-        object.stagingDeviceAddress == nullptr ||
-        object.sourceIndicesDevice == nullptr ||
-        object.stagingIndicesDevice == nullptr || object.indexCount == 0 ||
-        object.elementBytes == 0 ||
-        object.sourceStrideBytes < object.elementBytes ||
-        object.stagingStrideBytes < object.elementBytes ||
-        object.sourceIndexLimit == 0 || object.stagingIndexLimit == 0 ||
-        object.indexCount > std::numeric_limits<std::uint32_t>::max() /
-                                object.elementBytes) {
-      throw std::invalid_argument("invalid indexed host transfer geometry");
-    }
-    validateDeviceVisiblePointer(object.sourceDeviceAddress,
-                                 impl_->config.deviceOrdinal,
-                                 "indexed source");
-    validateDeviceAllocation(object.stagingDeviceAddress,
-                             impl_->config.deviceOrdinal,
-                             "indexed staging destination");
-    validateDeviceAllocation(object.sourceIndicesDevice,
-                             impl_->config.deviceOrdinal,
-                             "indexed source indices");
-    validateDeviceAllocation(object.stagingIndicesDevice,
-                             impl_->config.deviceOrdinal,
-                             "indexed staging indices");
+    validateIndexedHostObject(object, impl_->config.deviceOrdinal);
     const std::uint32_t slot = firstSlot + static_cast<std::uint32_t>(index);
     const std::uint32_t replicaStart =
         slot * impl_->config.maxReplicasPerObject;
-    upload.replicas[index * impl_->config.maxReplicasPerObject] = {
-        reinterpret_cast<std::uint64_t>(object.sourceDeviceAddress),
-        reinterpret_cast<std::uint64_t>(object.sourceIndicesDevice),
-        2'000,
-        30'000'000'000ULL,
-        static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
-        object.indexCount,
-        static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
-        abi::ReplicaTransport | abi::ReplicaIndexed,
-        abi::packTransferIndexLimits(object.sourceIndexLimit,
-                                     object.stagingIndexLimit),
-        abi::packTransferStrides(object.sourceStrideBytes,
-                                 object.stagingStrideBytes),
-    };
-    upload.objects[index] = {
-        object.objectId,
-        reinterpret_cast<std::uint64_t>(object.stagingDeviceAddress),
-        static_cast<std::uint64_t>(object.indexCount) * object.elementBytes,
-        0,
-        object.version,
-        static_cast<std::uint32_t>(object.preacquired
-                                       ? abi::ObjectState::Ready
-                                       : abi::ObjectState::New),
-        replicaStart,
-        1,
-        object.preacquired ? 0U : abi::InvalidIndex,
-        // flags carries the registered index-array capacity; see the
-        // synchronous registration path.
-        object.indexCount,
-        reinterpret_cast<std::uint64_t>(object.stagingIndicesDevice),
-    };
+    upload.replicas[index * impl_->config.maxReplicasPerObject] =
+        makeIndexedHostReplica(
+            object,
+            impl_->tierLatencies[
+                static_cast<std::size_t>(abi::SourceKind::HostStaged)],
+            impl_->tierBandwidths[
+                static_cast<std::size_t>(abi::SourceKind::HostStaged)]);
+    upload.objects[index] = makeIndexedHostObject(object, replicaStart);
   }
 
   const std::uint32_t firstReplica =
@@ -1548,32 +1547,52 @@ ObjectHandle HostRuntime::installNvmeObject(
     std::unique_ptr<NvmeBuffer> destination) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
-  if (impl_->nvme == nullptr || destination == nullptr) {
-    throw std::invalid_argument(
-        "NVMe transport and destination buffer are required");
+  if (impl_->nvme == nullptr) {
+    throw std::invalid_argument("NVMe transport is required");
   }
   impl_->ensureObjectReplaceable(slot);
   const NvmeCapabilities &capabilities = impl_->nvme->capabilities();
-  if (bytes == 0 || bytes > destination->bytes() ||
-      bytes % capabilities.lbaSize != 0 ||
+  if (bytes == 0 || bytes % capabilities.lbaSize != 0 ||
       sourceByteOffset % capabilities.lbaSize != 0 ||
       sourceByteOffset > capabilities.namespaceBytes ||
       bytes > capabilities.namespaceBytes - sourceByteOffset) {
     throw std::invalid_argument("NVMe object range is invalid or unaligned");
   }
 
-  Impl::OwnedObject allocation{
-      destination->deviceAddress(), std::move(destination), {}, 0};
+  // A null destination selects the runtime-owned reuse path. This is the
+  // steady-state serving path: replacing an object changes only its source
+  // byte range and generation, while the mapped HBM/DMA resources stay
+  // owned by the existing slot. A caller that supplies a destination keeps
+  // the explicit setup-time allocation path used by standalone benchmarks.
+  NvmeBuffer *buffer = destination.get();
+  bool reuseExisting = false;
+  if (destination == nullptr) {
+    if (!impl_->objects[slot].has_value() ||
+        impl_->objects[slot]->nvmeBuffer == nullptr ||
+        impl_->objects[slot]->nvmeBuffer->bytes() < bytes) {
+      destination = impl_->nvme->allocate(bytes);
+    } else {
+      buffer = impl_->objects[slot]->nvmeBuffer.get();
+      reuseExisting = true;
+    }
+  }
+  if (destination != nullptr) {
+    buffer = destination.get();
+  }
+  if (buffer == nullptr || bytes > buffer->bytes()) {
+    throw std::invalid_argument("NVMe destination is smaller than the object");
+  }
+
   const abi::ReplicaEntry replica{
       sourceByteOffset,
-      allocation.nvmeBuffer->dmaPageListAddress(),
+      buffer->dmaPageListAddress(),
       impl_->tierLatencies[static_cast<std::size_t>(abi::SourceKind::Nvme)],
       impl_->tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Nvme)],
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
-      allocation.nvmeBuffer->dmaPageCount(),
+      buffer->dmaPageCount(),
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
       abi::ReplicaTransport |
-          (allocation.nvmeBuffer->dmaTarget() == NvmeDmaTarget::HbmPeer
+          (buffer->dmaTarget() == NvmeDmaTarget::HbmPeer
                ? abi::ReplicaDmaHbm
                : 0U),
       0,
@@ -1582,7 +1601,7 @@ ObjectHandle HostRuntime::installNvmeObject(
   const std::uint32_t replicaStart = slot * impl_->config.maxReplicasPerObject;
   abi::ObjectEntry entry{
       objectId,
-      reinterpret_cast<std::uint64_t>(allocation.stagingDevice),
+      reinterpret_cast<std::uint64_t>(buffer->deviceAddress()),
       bytes,
       0,
       version,
@@ -1590,19 +1609,34 @@ ObjectHandle HostRuntime::installNvmeObject(
       replicaStart,
       1,
       abi::InvalidIndex,
-      allocation.nvmeBuffer->dmaTarget() == NvmeDmaTarget::HbmPeer
+      buffer->dmaTarget() == NvmeDmaTarget::HbmPeer
           ? abi::ReplicaDmaHbm
           : 0U,
       0,
   };
   uploadOne(impl_->replicaEntries, replicaStart, replica);
   uploadOne(impl_->objectEntries, slot, entry);
+  if (reuseExisting) {
+    // The old slot continues to own the reused buffer. Only its device
+    // directory metadata was replaced above.
+    impl_->objectInstalled[slot] = true;
+    return {slot, buffer->deviceAddress()};
+  }
+  Impl::OwnedObject allocation{
+      buffer->deviceAddress(), std::move(destination), {}, 0};
   if (impl_->objects[slot].has_value()) {
     impl_->releaseObject(*impl_->objects[slot]);
   }
   impl_->objects[slot] = std::move(allocation);
   impl_->objectInstalled[slot] = true;
-  return {slot, nullptr};
+  return {slot, buffer->deviceAddress()};
+}
+
+ObjectHandle HostRuntime::installNvmeObject(
+    std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
+    std::uint64_t sourceByteOffset, std::size_t bytes) {
+  return installNvmeObject(slot, objectId, version, sourceByteOffset, bytes,
+                           std::unique_ptr<NvmeBuffer>{});
 }
 
 void HostRuntime::bindTensorMaps(std::uint32_t objectSlot,

@@ -174,6 +174,10 @@ cudaStream_t stream(std::uint64_t address) noexcept {
   return reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(address));
 }
 
+cudaEvent_t event(std::uint64_t address) noexcept {
+  return reinterpret_cast<cudaEvent_t>(static_cast<std::uintptr_t>(address));
+}
+
 void checkCuda(cudaError_t status, const char *operation) {
   if (status != cudaSuccess) {
     throw std::runtime_error(std::string(operation) + ": " +
@@ -663,6 +667,49 @@ nta_status nta_runtime_register_indexed_host_objects_async(
   });
 }
 
+nta_status nta_runtime_register_indexed_host_objects_async_quiesced(
+    nta_runtime *runtime, std::uint32_t firstSlot,
+    const nta_indexed_host_object *objects, std::uint32_t objectCount,
+    std::uint64_t cudaStream, std::uint64_t priorConsumerEvent) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (objects == nullptr || objectCount == 0 || priorConsumerEvent == 0) {
+      throw std::invalid_argument(
+          "quiesced indexed host registration requires objects and an event");
+    }
+    std::vector<nta::IndexedHostObjectSpec> native;
+    native.reserve(objectCount);
+    for (std::uint32_t index = 0; index < objectCount; ++index) {
+      const nta_indexed_host_object &object = objects[index];
+      if ((object.flags & ~NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0) {
+        throw std::invalid_argument(
+            "indexed host object flags are unsupported");
+      }
+      native.push_back({
+          object.object_id,
+          object.version,
+          reinterpret_cast<const void *>(
+              static_cast<std::uintptr_t>(object.source_device_address)),
+          reinterpret_cast<void *>(
+              static_cast<std::uintptr_t>(object.staging_device_address)),
+          reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
+              object.source_indices_device_address)),
+          reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
+              object.staging_indices_device_address)),
+          object.index_count,
+          object.element_bytes,
+          object.source_stride_bytes,
+          object.staging_stride_bytes,
+          object.source_index_limit,
+          object.staging_index_limit,
+          (object.flags & NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0,
+      });
+    }
+    runtime->value->registerIndexedHostObjectsAsyncQuiesced(
+        firstSlot, native, stream(cudaStream), event(priorConsumerEvent));
+  });
+}
+
 nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
                                         std::uint32_t objectSlot,
                                         std::uint32_t relativeReplica,
@@ -696,13 +743,11 @@ nta_status nta_runtime_install_nvme_object(
           "runtime was not created with an NVMe transport");
     }
     const std::size_t nativeBytes = checkedSize(bytes, "NVMe object bytes");
-    auto destination = runtime->nvme->allocate(nativeBytes);
-    const std::uint64_t address =
-        reinterpret_cast<std::uintptr_t>(destination->deviceAddress());
-    runtime->value->installNvmeObject(slot, objectId, version, sourceByteOffset,
-                                      nativeBytes, std::move(destination));
+    const nta::ObjectHandle object = runtime->value->installNvmeObject(
+        slot, objectId, version, sourceByteOffset, nativeBytes);
     if (destinationDeviceAddressOut != nullptr) {
-      *destinationDeviceAddressOut = address;
+      *destinationDeviceAddressOut =
+          reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
     }
   });
 }

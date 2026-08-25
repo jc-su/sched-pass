@@ -149,7 +149,9 @@ their release. They share only an explicit mapping context; mapping teardown
 occurs after queue quiescence and before the IOMMU domain is destroyed. Mapping
 and page-list publication are setup operations. The GPU queue consumes the
 immutable page list in steady state and does not issue a per-request mapping
-operation.
+operation. Physical replacement may republish only the source-range directory
+entry; the runtime reuses a slot-owned HBM/DMA allocation whenever the new
+exact extent fits, and allocates/maps only when capacity is insufficient.
 
 Non-owning HostRuntime registrations are setup-time validated CUDA views, not
 untyped lifetime claims: HBM, mapped-host, device-visible staged sources, HBM

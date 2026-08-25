@@ -335,6 +335,49 @@ int main() {
                     static_cast<std::uint32_t>(nta::abi::ObjectState::Ready) &&
                 preacquiredEntry.selectedReplica == 0,
             "preacquired indexed object was not published ready");
+    cudaStream_t indexedStream = nullptr;
+    require(cudaStreamCreateWithFlags(&indexedStream, cudaStreamNonBlocking) ==
+                cudaSuccess,
+            "indexed registration stream creation failed");
+    runtime.registerIndexedHostObjectsAsync(
+        3, std::span<const nta::IndexedHostObjectSpec>(&preacquired, 1),
+        indexedStream);
+    require(cudaStreamSynchronize(indexedStream) == cudaSuccess,
+            "indexed asynchronous registration did not complete");
+    const nta::abi::ReplicaEntry asyncReplica = runtime.readReplica(3);
+    require(asyncReplica.estimatedLatencyNs == 4321 &&
+                asyncReplica.estimatedBandwidthBytesPerSecond == 123456789,
+            "indexed asynchronous registration ignored calibrated tier costs");
+    cudaEvent_t priorConsumerEvent = nullptr;
+    require(cudaEventCreateWithFlags(&priorConsumerEvent, cudaEventDisableTiming) ==
+                cudaSuccess,
+            "indexed quiescence event creation failed");
+    require(cudaEventRecord(priorConsumerEvent, indexedStream) == cudaSuccess,
+            "indexed quiescence event record failed");
+    nta::IndexedHostObjectSpec quiesced = preacquired;
+    quiesced.version = 6;
+    runtime.registerIndexedHostObjectsAsyncQuiesced(
+        3, std::span<const nta::IndexedHostObjectSpec>(&quiesced, 1),
+        indexedStream, priorConsumerEvent);
+    require(cudaStreamSynchronize(indexedStream) == cudaSuccess &&
+                runtime.readObject(3).version == 6,
+            "indexed quiesced registration did not publish after its event");
+    const std::size_t ownedStagingBeforeQuiesced = runtime.stagingUsage().bytes;
+    require(ownedStagingBeforeQuiesced >= contents.size(),
+            "runtime-owned indexed lifetime fixture was not installed");
+    quiesced.version = 7;
+    runtime.registerIndexedHostObjectsAsyncQuiesced(
+        2, std::span<const nta::IndexedHostObjectSpec>(&quiesced, 1),
+        indexedStream, priorConsumerEvent);
+    require(cudaStreamSynchronize(indexedStream) == cudaSuccess &&
+                runtime.readObject(2).version == 7 &&
+                runtime.stagingUsage().bytes ==
+                    ownedStagingBeforeQuiesced - contents.size(),
+            "quiesced registration did not safely retire an owned destination");
+    require(cudaEventDestroy(priorConsumerEvent) == cudaSuccess,
+            "indexed quiescence event destruction failed");
+    require(cudaStreamDestroy(indexedStream) == cudaSuccess,
+            "indexed registration stream destruction failed");
     require(cudaFree(indexedDestination) == cudaSuccess &&
                 cudaFree(indexedSource) == cudaSuccess &&
                 cudaFree(indexedStaging) == cudaSuccess &&

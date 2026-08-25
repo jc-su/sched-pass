@@ -531,6 +531,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/evaluation_artifact.py
     )
     add_test(
+      NAME nta-performance-gate
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/performance_gate.py
+    )
+    add_test(
       NAME nta-nvme-safety
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/nvme_safety.py
@@ -542,7 +547,7 @@ if(NTA_ENABLE_CUDA)
       nta-serving-evidence nta-jit-operator-family
       nta-opportunity-analysis
       nta-opportunity-study nta-tier-qualification
-      nta-evaluation-spec nta-evaluation-artifact
+      nta-evaluation-spec nta-evaluation-artifact nta-performance-gate
       nta-nvme-safety
       PROPERTIES TIMEOUT 60
     )
@@ -553,6 +558,9 @@ if(NTA_ENABLE_CUDA)
     )
     set_tests_properties(nta-request-slots PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    )
+    set_tests_properties(nta-performance-gate PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}"
     )
     set_tests_properties(nta-bounded-staging PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"

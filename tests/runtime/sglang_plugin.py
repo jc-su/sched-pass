@@ -312,9 +312,17 @@ def main() -> None:
         (binding,),
         bandwidth_bytes_per_second=10_000_000_000,
     )
+    newer = replace(blocked, generation=5, unavailable_bytes=2048)
+    newer_binding = replace(binding, generation=5)
+    progress_bridge.publish_request_progress(
+        Snapshot((newer,)),
+        (newer_binding,),
+        bandwidth_bytes_per_second=10_000_000_000,
+    )
     critical = progress_bridge.poll_critical_work({resident_id})
     assert critical is not None
-    assert critical.data_order == ((resident_id, 4),)
+    assert critical.data_order == ((resident_id, 5),)
+    assert critical.requests[0].request.generation == 5
     assert critical.compute_order == ()
     assert progress_bridge.poll_critical_work({resident_id}) is None
     assert progress_bridge.admission_stats()["progress_feedback_consumed"] == 1

@@ -85,6 +85,7 @@ class SglangHiCacheBridge:
         self._latest_request_work: dict[
             tuple[int, int], tuple[RequestWork, ServiceModel]
         ] = {}
+        self._latest_request_key: dict[int, tuple[int, int]] = {}
         _register_bridge(device_pool, self)
 
     def set_prefetch_callback(self, callback: Any) -> None:
@@ -302,7 +303,11 @@ class SglangHiCacheBridge:
                 for key, (work, _) in self._latest_request_work.items()
                 if work.request_id in request_ids
             ]
-            selected = [self._latest_request_work.pop(key) for key in selected_keys]
+            selected = []
+            for key in selected_keys:
+                selected.append(self._latest_request_work.pop(key))
+                if self._latest_request_key.get(key[0]) == key:
+                    self._latest_request_key.pop(key[0], None)
         if not selected:
             return None
         models = {model for _, model in selected}
@@ -371,19 +376,24 @@ class SglangHiCacheBridge:
                 # advisory admission state, not an ownership record; stale
                 # generations must not accumulate until a long-lived server
                 # exhausts memory.
-                for key in tuple(self._latest_request_work):
-                    if key[0] == work.request_id:
-                        self._latest_request_work.pop(key, None)
+                previous_key = self._latest_request_key.pop(work.request_id, None)
+                if previous_key is not None:
+                    self._latest_request_work.pop(previous_key, None)
                 if len(self._latest_request_work) >= self._work_capacity:
-                    self._latest_request_work.pop(next(iter(self._latest_request_work)))
+                    evicted_key = next(iter(self._latest_request_work))
+                    self._latest_request_work.pop(evicted_key)
+                    if self._latest_request_key.get(evicted_key[0]) == evicted_key:
+                        self._latest_request_key.pop(evicted_key[0], None)
                     self._admission_stats["progress_feedback_evictions"] = (
                         self._admission_stats.get("progress_feedback_evictions", 0)
                         + 1
                     )
-                self._latest_request_work[(work.request_id, work.generation)] = (
+                key = (work.request_id, work.generation)
+                self._latest_request_work[key] = (
                     work,
                     model,
                 )
+                self._latest_request_key[work.request_id] = key
             if stale:
                 self._admission_stats["progress_feedback_stale_rows"] = (
                     self._admission_stats.get("progress_feedback_stale_rows", 0) + stale

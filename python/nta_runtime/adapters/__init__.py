@@ -8,6 +8,11 @@ from .base import (
 )
 from .sglang import SglangAdapter, SglangExecutionConfig
 from .vllm import VllmAdapter, VllmSchedulerProjection
+from .vllm_v1 import (
+    SUPPORTED_VLLM_V1_VERSION,
+    VllmV1Hook,
+    VllmV1SchedulerProjection,
+)
 
 __all__ = [
     "EngineBatch",
@@ -18,4 +23,7 @@ __all__ = [
     "SglangExecutionConfig",
     "VllmAdapter",
     "VllmSchedulerProjection",
+    "SUPPORTED_VLLM_V1_VERSION",
+    "VllmV1Hook",
+    "VllmV1SchedulerProjection",
 ]

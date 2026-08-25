@@ -13,7 +13,7 @@ it does not define a second runtime state machine or native ABI.
 | Physical tier capability | `qualify_tiers.py`, `validate_tier_qualification.py` | exact HBM/host/NVMe/DAX qualification; missing hardware is skip |
 | Hardware preflight | `inspect_hardware.py` | read-only GPU/NVMe/DAX capability inventory; never binds devices |
 | RQ1--RQ3 paired execution | `run_evaluation.py`, `analyze_evaluation.py` | exact demand, paired metadata, six strata, causal comparisons, bootstrap CI, Little's Law |
-| RQ4 cost and regression | `profile.py`, `check_regression.py` | profiler artifact and captured machine-specific baseline |
+| RQ4 cost and regression | `profile.py`, `check_regression.py`, `validate_performance_artifact.py` | complete profiler + baseline + measured report + passing regression gate |
 | Reproduction packaging | `reproduce.py`, `validate_bundle.py` | self-contained external bundle with command and digest provenance |
 
 Fetch the public Bailian objects without cloning Git LFS and verify their
@@ -105,3 +105,8 @@ runtime.
 - Require a real tier qualification artifact before any NVMe/DAX trial.
 - Treat modeled matrix timing, missing profilers, and unavailable hardware as
   contract/status evidence, never as serving speedup evidence.
+- An `osdi-complete` artifact must include a `performance/` directory with
+  `profile.json`, `baseline.json`, `measured.json`, and `regression.json`.
+  Build it outside the checkout and pass it with
+  `--performance-evidence`; the bundle validator rejects a missing or
+  unavailable profiler instead of silently downgrading the claim.

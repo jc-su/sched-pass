@@ -1,6 +1,7 @@
 from nta_runtime.adapters.sglang import SglangAdapter, SglangExecutionConfig
 from nta_runtime.adapters.base import EngineBoundary
 from nta_runtime.adapters.vllm import VllmAdapter, VllmSchedulerProjection
+from nta_runtime.adapters.vllm_v1 import VllmV1Hook
 from nta_runtime.execution_protocol import ProtocolKind
 from nta_runtime.work_unit import Granularity
 
@@ -37,6 +38,33 @@ class FakeVllmSchedulerOutput:
     tenant_ids = (4, 6)
     block_tables = ((10, 11), (20, 21, 22))
     kv_page_bytes = 4096
+
+
+class FakeVllmV1SchedulerOutput:
+    num_scheduled_tokens = {"v1-a": 1, "v1-b": 1}
+    finished_req_ids = set()
+
+
+class FakeVllmV1BlockGroup:
+    num_blocks_per_row = (0, 2, 0, 3)
+
+    def get_numpy_array(self):
+        return __import__("numpy").array(
+            [[0, 0, 0], [10, 11, 0], [0, 0, 0], [20, 21, 22]],
+            dtype="int32",
+        )
+
+
+class FakeVllmV1BlockTable:
+    block_tables = (FakeVllmV1BlockGroup(),)
+
+    def __getitem__(self, index):
+        return self.block_tables[index]
+
+
+class FakeVllmV1InputBatch:
+    req_id_to_index = {"v1-a": 1, "v1-b": 3}
+    block_table = FakeVllmV1BlockTable()
 
 
 def main() -> None:
@@ -107,6 +135,32 @@ def main() -> None:
         assert "exact block_tables" in str(error)
     else:
         raise AssertionError("vLLM identity-only projection was accepted")
+
+    v1_hook = VllmV1Hook(
+        runtime,
+        4,
+        page_bytes=4096,
+        version_provider=lambda: "0.13.0",
+        tenant_for_request=lambda request_id: 9 if request_id == "v1-a" else 11,
+    )
+    v1_batch = v1_hook.bind_forward(
+        FakeVllmV1SchedulerOutput(),
+        FakeVllmV1InputBatch(),
+        epoch=6,
+    )
+    assert tuple(item.request_slot for item in v1_batch.bindings) == (0, 1)
+    assert v1_batch.exact_demand is not None
+    assert v1_batch.exact_demand.request_unit_ids == ((10, 11), (20, 21, 22))
+    assert v1_batch.tenant_ids == (9, 11)
+    try:
+        v1_hook.bind_forward(
+            FakeVllmV1SchedulerOutput(),
+            FakeVllmV1InputBatch(),
+            epoch=7,
+        )
+    except RuntimeError:
+        raise AssertionError("stable vLLM V1 requests were not rebindable")
+    print("vllm_v1_hook=pass")
     print("adapters=pass")
 
 

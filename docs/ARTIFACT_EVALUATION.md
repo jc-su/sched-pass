@@ -40,6 +40,14 @@ The machine-readable profile contract is
 Every completed bundle can be checked independently with
 `python experiments/validate_bundle.py /path/to/bundle`.
 
+An `osdi-complete` evaluation additionally requires a separately captured
+performance evidence directory. It contains the successful `profile.json`,
+the same-machine `baseline.json`, the measured correctness report
+`measured.json`, and the machine-generated `regression.json`. Validate it with
+`experiments/validate_performance_artifact.py`, then pass it to
+`reproduce.py --performance-evidence`; a missing profiler is not a passing
+performance gate.
+
 Before selecting a physical tier, capture a read-only capability inventory:
 
 ```bash

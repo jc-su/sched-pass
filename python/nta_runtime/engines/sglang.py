@@ -666,6 +666,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         mover_priority = _mover_stream_priority()
         self._prefetch_stream = torch.cuda.Stream(priority=mover_priority)
         self._progress_stream = torch.cuda.Stream(priority=mover_priority)
+        # The host-staged directory is reused across forwards.  After the
+        # final attention layer records this event, the next registration can
+        # wait on it in the CUDA stream instead of downloading every object
+        # state to the CPU.  The conservative state probe remains the fallback
+        # when a forward did not reach its normal completion edge.
+        self._indexed_object_quiescence_event = torch.cuda.Event()
+        self._indexed_object_quiescence_recorded = False
+        self._nvme_object_addresses: dict[int, int] = {}
         self._host_cost_model = HostCostModel.from_environment()
         self._indexed_copy_target_bytes = _positive_environment(
             "NTA_EXECUTION_INDEXED_COPY_BYTES_PER_CTA", 1024 * 1024
@@ -835,6 +843,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "tier_external_layers": 0,
                 "cxl_direct_work_items": 0,
                 "tier_host_proxy_bytes": 0,
+                "indexed_object_quiesced_registrations": 0,
+                "indexed_object_lifetime_guard_fallbacks": 0,
+                "nvme_object_allocations": 0,
+                "nvme_object_reuses": 0,
             }
         )
         configured_stats = os.environ.get("NTA_ENGINE_STATS_FILE")
@@ -1301,7 +1313,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         allocation.external_object_slots = tuple(() for _ in range(schedule.work_count))
         return plan
 
-    def _record_execution_layer(self, layer: Any) -> None:
+    def _record_execution_layer(self, layer: Any, *, final_layer: bool) -> None:
         """Commit the semantic work boundary after native attention returns."""
         if self._active_batch is None or self._active_batch.execution is None:
             raise RuntimeError("attention returned without an execution session")
@@ -1309,6 +1321,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._stats.update(
             self._active_batch.execution.record_layer_completion(local_layer)
         )
+        if self._tier_service.is_host and final_layer:
+            self._indexed_object_quiescence_event.record(torch.cuda.current_stream())
+            self._indexed_object_quiescence_recorded = True
 
     def _bind_forward_requests(
         self, forward_batch: Any, *, allow_capture_ids: bool
@@ -2431,23 +2446,33 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 key_extent, value_extent = extents
                 key_slot = len(physical_object_bytes)
                 key_object_id = _OBJECT_ID_BASE | key_slot
-                self._runtime.install_nvme_object(
-                    key_slot,
-                    key_object_id,
-                    version,
-                    key_extent.offset,
-                    key_extent.bytes,
+                key_address = self._runtime.install_nvme_object(
+                    key_slot, key_object_id, version, key_extent.offset, key_extent.bytes
                 )
+                if key_address == 0:
+                    raise RuntimeError("NVMe runtime returned a null HBM destination")
+                if self._nvme_object_addresses.get(key_slot) == key_address:
+                    self._stats["nvme_object_reuses"] += 1
+                else:
+                    self._stats["nvme_object_allocations"] += 1
+                self._nvme_object_addresses[key_slot] = key_address
                 physical_object_bytes.append(key_extent.bytes)
                 value_slot = len(physical_object_bytes)
                 value_object_id = _OBJECT_ID_BASE | value_slot
-                self._runtime.install_nvme_object(
+                value_address = self._runtime.install_nvme_object(
                     value_slot,
                     value_object_id,
                     version,
                     value_extent.offset,
                     value_extent.bytes,
                 )
+                if value_address == 0:
+                    raise RuntimeError("NVMe runtime returned a null HBM destination")
+                if self._nvme_object_addresses.get(value_slot) == value_address:
+                    self._stats["nvme_object_reuses"] += 1
+                else:
+                    self._stats["nvme_object_allocations"] += 1
+                self._nvme_object_addresses[value_slot] = value_address
                 physical_object_bytes.append(value_extent.bytes)
                 result = (key_slot, key_object_id, value_slot, value_object_id)
                 pair_objects[pair] = result
@@ -2709,9 +2734,24 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             host_execution = None
         stream = torch.cuda.current_stream()
         if self._tier_service.is_host and prefetched is None:
-            self._runtime.register_indexed_host_objects(
-                0, indexed_objects, stream=stream
+            quiescence_event = (
+                self._indexed_object_quiescence_event
+                if self._indexed_object_quiescence_recorded
+                else None
             )
+            if quiescence_event is None:
+                self._stats["indexed_object_lifetime_guard_fallbacks"] += 1
+            else:
+                self._stats["indexed_object_quiesced_registrations"] += 1
+            self._runtime.register_indexed_host_objects(
+                0,
+                indexed_objects,
+                stream=stream,
+                quiescence_event=quiescence_event,
+            )
+            # The token is single-use: a new token is recorded only after the
+            # just-published directory has completed its consumer forward.
+            self._indexed_object_quiescence_recorded = False
             self._phase_program(wrapper).validate_indexed_host_range(
                 self._runtime, 0, object_count, stream
             )
@@ -3688,7 +3728,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 causal=causal,
                 window_left=window_left,
             )
-        self._record_execution_layer(layer)
+        self._record_execution_layer(layer, final_layer=final_layer)
         if pending is not None:
             self._stats["external_launches"] += 1
             self._hicache.complete_layer(pending, local_layer)
@@ -3791,7 +3831,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
-        self._record_execution_layer(layer)
+        self._record_execution_layer(
+            layer, final_layer=local_layer + 1 == self._model_layer_count
+        )
         self._stats["transformed_direct_launches"] += 1
         if local_layer + 1 == self._model_layer_count:
             self._publish_stats()

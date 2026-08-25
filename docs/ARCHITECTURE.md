@@ -36,7 +36,8 @@ host-staged memory, NVMe, and CXL DAX. The same descriptor is consumed by
 host admission, device-visible backend metadata, and experiment telemetry.
 The engine-neutral `ServingTierService` is the only serving attachment point:
 host-staged uses indexed host objects, NVMe installs catalog-validated HBM
-objects and runs the finite device progress loop, and CXL emits catalog-
+objects and runs the finite device progress loop, reusing a slot's mapped HBM
+destination when its capacity is sufficient, and CXL emits catalog-
 validated direct dependencies. The Python resource contract makes protocol
 ownership, allocation ownership, and runtime directory ownership explicit;
 physical-tier configuration never silently

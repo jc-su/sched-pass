@@ -99,6 +99,16 @@ def main() -> None:
     )
     runtime_c = (ROOT / "include" / "nta" / "RuntimeC.h").read_text(encoding="utf-8")
     assert "nta_jit_phase_progress_nvme_until_idle" in runtime_c
+    runtime_c_impl = (ROOT / "runtime" / "host" / "RuntimeC.cpp").read_text(
+        encoding="utf-8"
+    )
+    install_begin = runtime_c_impl.index("nta_runtime_install_nvme_object")
+    install_end = runtime_c_impl.index(
+        "nta_runtime_read_pending_count", install_begin
+    )
+    install_body = runtime_c_impl[install_begin:install_end]
+    assert "runtime->nvme->allocate" not in install_body
+    assert "sourceByteOffset, nativeBytes);" in install_body
     epoch = (ROOT / "python" / "nta_runtime" / "epoch.py").read_text(encoding="utf-8")
     assert "self.phases.progress_nvme_until_idle(" in epoch
     devices = sorted((Path("/sys/bus/pci/devices")).glob("*:*:*.*"))

@@ -129,6 +129,10 @@ class RequestIdentityAdapter:
     def cancel_matching(self, request_id_prefix: str = "", *, all: bool = False) -> int:
         return self._identity.cancel_matching(request_id_prefix, all=all)
 
+    def retire_request(self, request_id: str) -> bool:
+        """Retire one engine-confirmed request at the lifecycle boundary."""
+        return self._identity.cancel(request_id)
+
     @property
     def last_publish_count(self) -> int:
         return self._identity.last_publish_count
