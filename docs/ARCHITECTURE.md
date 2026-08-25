@@ -33,6 +33,9 @@ the reference path is not used to hide external work or to change demand.
 The native runtime exposes one tier directory for HBM, mapped host memory,
 host-staged memory, NVMe, and CXL DAX. The same descriptor is consumed by
 host admission, device-visible backend metadata, and experiment telemetry.
+The NVMe production backend is GPU-controlled READ DMA directly into HBM
+through a translated VFIO/IOMMUFD domain; host-mapped DMA is only its matched
+baseline.
 The LLVM pass uses structural pointer/load proofs only for access shape; the
 typed operator contract supplies request-generation identity, exact demand,
 and tier ownership. An unmarked or incomplete contract never authorizes a

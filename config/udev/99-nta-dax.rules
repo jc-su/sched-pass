@@ -1,0 +1,4 @@
+# Allow members of the dedicated dax group to map devdax endpoints.
+# The group is intentionally narrower than disk or root because these devices
+# expose persistent or device memory directly to userspace.
+ACTION=="add|change", SUBSYSTEM=="dax", KERNEL=="dax[0-9]*.[0-9]*", GROUP="dax", MODE="0660"

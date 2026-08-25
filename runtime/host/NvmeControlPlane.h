@@ -27,7 +27,20 @@ struct NvmeQueueResources {
 };
 
 struct NvmeDmaMapping {
-  std::uint64_t handle = 0;
+  enum class Kind : std::uint32_t {
+    None = 0,
+    HostIoas = 1,
+    NvidiaPeerPages = 2,
+  };
+
+  struct Handle {
+    Kind kind = Kind::None;
+    std::uint64_t value = 0;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+      return kind != Kind::None && value != 0;
+    }
+  } handle;
   std::vector<std::uint64_t> pages;
 };
 
@@ -42,7 +55,11 @@ public:
   resources() const noexcept = 0;
   [[nodiscard]] virtual NvmeDmaMapping mapHost(void *address,
                                                std::size_t bytes) = 0;
-  virtual void unmapHost(std::uint64_t handle) noexcept = 0;
+  // Pin a CUDA device allocation through NVIDIA's persistent peer-memory API
+  // and return DMA addresses valid for this VFIO-owned NVMe function.
+  [[nodiscard]] virtual NvmeDmaMapping mapHbm(std::uint64_t gpuAddress,
+                                              std::size_t bytes) = 0;
+  virtual void unmap(NvmeDmaMapping::Handle handle) noexcept = 0;
   virtual void quiesce() noexcept = 0;
 
 protected:

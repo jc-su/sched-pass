@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 
-API_VERSION = 32
+API_VERSION = 34
 
 
 class RuntimeError(Exception):
@@ -33,6 +33,16 @@ class TierKind(enum.IntEnum):
     NVME = 3
     CXL = 4
     RDMA = 5
+
+
+class NvmeDmaTarget(enum.IntEnum):
+    HBM_PEER = 0
+    HOST_MAPPED = 1
+
+
+class NvmeHbmMappingBackend(enum.IntEnum):
+    UNAVAILABLE = 0
+    NVIDIA_PEER_PAGES = 1
 
 
 class TierCapability(enum.IntFlag):
@@ -379,6 +389,7 @@ class _NvmeOptions(ctypes.Structure):
         ("queue_depth", ctypes.c_uint32),
         ("admin_timeout_ms", ctypes.c_uint32),
         ("media_policy", ctypes.c_uint32),
+        ("dma_target", ctypes.c_uint32),
     ]
 
 
@@ -392,7 +403,8 @@ class _NvmeCapabilities(ctypes.Structure):
         ("queue_id", ctypes.c_uint32),
         ("queue_count", ctypes.c_uint32),
         ("device_ordinal", ctypes.c_int32),
-        ("supports_hbm_peer", ctypes.c_uint32),
+        ("supports_hbm_peer_dma", ctypes.c_uint32),
+        ("hbm_mapping_backend", ctypes.c_uint32),
         ("translated_iommu", ctypes.c_uint32),
         ("namespace_read_only", ctypes.c_uint32),
         ("gpu_doorbell_mapping_validated", ctypes.c_uint32),
@@ -628,6 +640,7 @@ class NvmeOptions:
     queue_depth: int = 64
     admin_timeout_ms: int = 10_000
     trust_read_only_device_code: bool = False
+    dma_target: NvmeDmaTarget = NvmeDmaTarget.HBM_PEER
 
 
 @dataclasses.dataclass(frozen=True)
@@ -640,7 +653,8 @@ class NvmeCapabilities:
     queue_id: int
     queue_count: int
     device_ordinal: int
-    supports_hbm_peer: bool
+    supports_hbm_peer_dma: bool
+    hbm_mapping_backend: NvmeHbmMappingBackend
     translated_iommu: bool
     namespace_read_only: bool
     gpu_doorbell_mapping_validated: bool
@@ -1298,6 +1312,16 @@ _phase_nvme = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_phase_nvme_until_idle = _function(
+    "nta_jit_phase_progress_nvme_until_idle",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
 _phase_publish = _function(
     "nta_jit_phase_publish",
     ctypes.c_int,
@@ -1415,6 +1439,7 @@ class NvmeTransport(_Owner):
             options.queue_depth,
             options.admin_timeout_ms,
             int(options.trust_read_only_device_code),
+            int(options.dma_target),
         )
         _check(_nvme_create(ctypes.byref(native), ctypes.byref(self._handle)))
 
@@ -1431,7 +1456,8 @@ class NvmeTransport(_Owner):
             value.queue_id,
             value.queue_count,
             value.device_ordinal,
-            bool(value.supports_hbm_peer),
+            bool(value.supports_hbm_peer_dma),
+            NvmeHbmMappingBackend(value.hbm_mapping_backend),
             bool(value.translated_iommu),
             bool(value.namespace_read_only),
             bool(value.gpu_doorbell_mapping_validated),
@@ -2676,6 +2702,27 @@ class JitPhaseProgram(_Owner):
                 runtime._handle,
                 issue_budget,
                 completion_budget,
+                _stream_address(stream),
+            )
+        )
+
+    def progress_nvme_until_idle(
+        self,
+        runtime: Runtime,
+        issue_budget: int,
+        completion_budget: int,
+        timeout_ns: int,
+        stream: Any = None,
+    ) -> None:
+        if timeout_ns <= 0:
+            raise ValueError("NVMe progress timeout must be positive")
+        _check(
+            _phase_nvme_until_idle(
+                self._handle,
+                runtime._handle,
+                issue_budget,
+                completion_budget,
+                timeout_ns,
                 _stream_address(stream),
             )
         )

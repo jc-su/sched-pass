@@ -117,7 +117,7 @@ fi
   -o "${output_dir}/dependency-set.lowered.ll"
 rg -q 'call i1 @nta_acquire_set_slow' \
   "${output_dir}/dependency-set.lowered.ll"
-rg -Fq '!{!"request-bound", i32 28, !"dependency-set", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 29, !"dependency-set", !"split-phase-cta"}' \
   "${output_dir}/dependency-set.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
   "${output_dir}/dependency-set.lowered.ll"; then
@@ -147,7 +147,7 @@ fi
   -o "${output_dir}/tensor-map.lowered.ll"
 rg -q 'call ptr @nta_acquire_tensor_map_slow' \
   "${output_dir}/tensor-map.lowered.ll"
-rg -Fq '!{!"request-bound", i32 28, !"tensor-map", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 29, !"tensor-map", !"split-phase-cta"}' \
   "${output_dir}/tensor-map.lowered.ll"
 rg -q 'phi ptr \[ null, %entry \], \[ %direct.map, %nta.acquire.direct \]' \
   "${output_dir}/tensor-map.lowered.ll"
@@ -164,7 +164,7 @@ fi
   -o "${output_dir}/late-bound.lowered.ll"
 rg -q 'call ptr @nta_acquire_slow' "${output_dir}/late-bound.lowered.ll"
 rg -q 'and i32 %cta, %catalog.mask' "${output_dir}/late-bound.lowered.ll"
-rg -Fq '!{!"request-bound", i32 28, !"byte-address", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 29, !"byte-address", !"split-phase-cta"}' \
   "${output_dir}/late-bound.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
   "${output_dir}/late-bound.lowered.ll"; then

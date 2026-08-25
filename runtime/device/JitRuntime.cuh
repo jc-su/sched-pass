@@ -1135,6 +1135,21 @@ nta_jit_progress_nvme(void *runtime, std::uint32_t issueBudget,
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_progress_nvme_until_idle(void *runtime, std::uint32_t issueBudget,
+                                 std::uint32_t completionBudget,
+                                 std::uint64_t timeoutNs,
+                                 cudaStream_t stream) {
+  if (runtime == nullptr || issueBudget == 0 || completionBudget == 0 ||
+      timeoutNs == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_progress_nvme_until_idle<<<1, 32, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), issueBudget,
+      completionBudget, timeoutNs);
+  return nta::jit::launchStatus();
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_publish_ready(void *runtime, std::uint32_t pendingBudget,
                       cudaStream_t stream) {
   constexpr std::uint32_t threads = 256;

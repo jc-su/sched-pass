@@ -141,7 +141,7 @@ class FlashInferLayerEpoch:
         phases: JitPhaseProgram,
         *,
         object_count: int,
-        max_progress_passes: int,
+        max_progress_rounds: int,
         wait_for_plan: bool = True,
     ) -> None:
         if runtime.device_ordinal != plan.device_ordinal:
@@ -155,7 +155,7 @@ class FlashInferLayerEpoch:
             runtime,
             object_count=object_count,
             work_ticket_count=plan.work_item_count,
-            max_progress_passes=max_progress_passes,
+            max_progress_rounds=max_progress_rounds,
         )
         self._runtime_tensor = runtime.device_view_tensor
         self._work_items_tensor = plan.work_items_tensor
@@ -278,10 +278,10 @@ class FlashInferLayerEpoch:
         if isinstance(progress_blocks, int):
             if progress_blocks <= 0:
                 raise ValueError("host progress block count must be positive")
-            block_counts = (progress_blocks,) * self.epoch.max_progress_passes
+            block_counts = (progress_blocks,) * self.epoch.max_progress_rounds
         else:
             block_counts = tuple(int(count) for count in progress_blocks)
-            if len(block_counts) != self.epoch.max_progress_passes or any(
+            if len(block_counts) != self.epoch.max_progress_rounds or any(
                 count <= 0 for count in block_counts
             ):
                 raise ValueError(
@@ -383,7 +383,7 @@ class FlashInferLayerEpoch:
             launch()
             return 0
 
-        def ready(progress_pass: int, _final_pass: bool) -> None:
+        def ready(progress_round: int, _final_round: bool) -> None:
             # The merge kernel is request-gated: completed requests publish now
             # while incomplete requests retain their split-K scratch state.
             self._launch(
@@ -395,7 +395,7 @@ class FlashInferLayerEpoch:
                 BIND_CURRENT_GENERATION
                 | RUNNABLE_WORK
                 | (initial_ready_work_count << RUNNABLE_OFFSET_SHIFT),
-                launch_counts[progress_pass - 1],
+                launch_counts[progress_round - 1],
                 run_options,
             )
 
@@ -416,9 +416,9 @@ class FlashInferLayerEpoch:
             launch()
             if on_discovered is not None:
                 on_discovered(stream)
-            for progress_pass, blocks in enumerate(block_counts, 1):
+            for progress_round, blocks in enumerate(block_counts, 1):
                 progress(blocks, stream)
-                ready(progress_pass, progress_pass == len(block_counts))
+                ready(progress_round, progress_round == len(block_counts))
             if progress_profile is not None:
                 progress_profile[1].record(stream)
             return len(block_counts)
@@ -453,18 +453,18 @@ class FlashInferLayerEpoch:
                 initial_ready_work_count,
                 run_options,
             )
-        for progress_pass, blocks in enumerate(block_counts, 1):
+        for progress_round, blocks in enumerate(block_counts, 1):
             progress(blocks, progress_stream)
-            arrival = arrival_events[progress_pass - 1]
+            arrival = arrival_events[progress_round - 1]
             arrival.record(progress_stream)
             stream.wait_event(arrival)
-            ready(progress_pass, progress_pass == len(block_counts))
+            ready(progress_round, progress_round == len(block_counts))
             events.append(arrival)
         if progress_profile is not None:
             progress_profile[1].record(progress_stream)
         # Retain event wrappers through at least the next call on this epoch.
         self._inflight_events = tuple(events)
-        return self.epoch.max_progress_passes
+        return self.epoch.max_progress_rounds
 
     def enqueue_preloaded_host(
         self,
@@ -509,7 +509,7 @@ class FlashInferLayerEpoch:
         stream: Any = None,
         run_options: dict[str, Any] | None = None,
     ) -> EpochResult:
-        passes = self.enqueue_nvme(
+        rounds = self.enqueue_nvme(
             wrapper,
             q,
             paged_kv_cache,
@@ -520,7 +520,7 @@ class FlashInferLayerEpoch:
             stream=stream,
             run_options=run_options,
         )
-        return self.epoch.check(passes, stream)
+        return self.epoch.check(rounds, stream)
 
     def enqueue_nvme(
         self,
@@ -551,7 +551,7 @@ class FlashInferLayerEpoch:
                 run_options,
             )
 
-        def ready(_progress_pass: int, _final_pass: bool) -> None:
+        def ready(_progress_round: int, _final_round: bool) -> None:
             self._launch(
                 wrapper,
                 q,
@@ -570,7 +570,7 @@ class FlashInferLayerEpoch:
             completion_budget=completion_budget,
             stream=stream,
         )
-        return self.epoch.max_progress_passes
+        return self.epoch.max_progress_rounds
 
-    def check(self, progress_passes: int, stream: Any = None) -> EpochResult:
-        return self.epoch.check(progress_passes, stream)
+    def check(self, progress_rounds: int, stream: Any = None) -> EpochResult:
+        return self.epoch.check(progress_rounds, stream)

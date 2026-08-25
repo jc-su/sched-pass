@@ -57,6 +57,14 @@ used by device admission and experiments. CXL qualification is explicit via
 `nta-cxl-dax-probe`; without a qualified endpoint the CXL backend stays
 inactive.
 
+The NVMe production target is a direct READ DMA into HBM, not host staging.
+`runtime/host/` owns VFIO/IOMMUFD administration, `kernel/nta_nvme_p2p/` is the
+narrow NVIDIA peer-page mapper for the attached translated domain, and the
+instrumented GPU owns application SQ publication and CQ progress. The
+host-mapped destination remains an explicit baseline and cannot satisfy the
+direct-HBM artifact gate. See `docs/NVME_SECURITY.md` for the threat model and
+transactional qualification procedure.
+
 JIT modules carry a typed operator contract. The LLVM pass validates the
 compiled contract and lowers typed acquisition markers; structural discovery
 of raw pointer cones remains diagnostic and never authorizes an unmarked

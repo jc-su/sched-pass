@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 28;
+inline constexpr std::uint32_t Version = 29;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 6;
 inline constexpr std::uint32_t UrgencyBucketCount = 8;
@@ -31,6 +31,10 @@ enum ReplicaFlags : std::uint32_t {
   // stream-ordered validation kernel. Address rebinding does not invalidate
   // this bit because the index arrays and transfer geometry are unchanged.
   ReplicaIndicesValidated = 1U << 3,
+  // The transport target is CUDA HBM pinned through NVIDIA's persistent
+  // peer-memory API and mapped for the VFIO-owned NVMe function. Consumers can
+  // use normal HBM loads in this mode.
+  ReplicaDmaHbm = 1U << 4,
 };
 
 enum BackendFlags : std::uint32_t {

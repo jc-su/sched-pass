@@ -59,6 +59,9 @@ using ReduceMappedKeyPages = cudaError_t (*)(const void *, std::uint32_t,
                                              cudaStream_t);
 using ProgressNvme = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                                      cudaStream_t);
+using ProgressNvmeUntilIdle = cudaError_t (*)(void *, std::uint32_t,
+                                              std::uint32_t, std::uint64_t,
+                                              cudaStream_t);
 using Publish = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using Complete = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using CompleteStreamOrdered = cudaError_t (*)(void *, const void *,
@@ -153,6 +156,8 @@ struct JitPhaseProgram::Impl {
       reduceMappedIndexedKeyPages = load<ReduceMappedIndexedKeyPages>(
           library, "nta_jit_reduce_mapped_indexed_key_pages");
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
+      progressNvmeUntilIdle = load<ProgressNvmeUntilIdle>(
+          library, "nta_jit_progress_nvme_until_idle");
       publish = load<Publish>(library, "nta_jit_publish_ready");
       complete = load<Complete>(library, "nta_jit_complete_launched");
       completeStreamOrdered = load<CompleteStreamOrdered>(
@@ -190,6 +195,7 @@ struct JitPhaseProgram::Impl {
   ReduceMappedKeyPages reduceMappedKeyPages = nullptr;
   ReduceMappedIndexedKeyPages reduceMappedIndexedKeyPages = nullptr;
   ProgressNvme progressNvme = nullptr;
+  ProgressNvmeUntilIdle progressNvmeUntilIdle = nullptr;
   Publish publish = nullptr;
   Complete complete = nullptr;
   CompleteStreamOrdered completeStreamOrdered = nullptr;
@@ -479,6 +485,19 @@ void JitPhaseProgram::progressNvme(cudaStream_t stream,
   }
   check(impl_->progressNvme(runtime, issueBudget, completionBudget, stream),
         "nta_jit_progress_nvme");
+}
+
+void JitPhaseProgram::progressNvmeUntilIdle(
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t issueBudget,
+    std::uint32_t completionBudget, std::uint64_t timeoutNs) const {
+  if (runtime == nullptr || issueBudget == 0 || completionBudget == 0 ||
+      timeoutNs == 0) {
+    throw std::invalid_argument(
+        "JIT NVMe progress-until-idle needs a runtime, budgets, and timeout");
+  }
+  check(impl_->progressNvmeUntilIdle(runtime, issueBudget, completionBudget,
+                                     timeoutNs, stream),
+        "nta_jit_progress_nvme_until_idle");
 }
 
 void JitPhaseProgram::publish(cudaStream_t stream, abi::RuntimeView *runtime,

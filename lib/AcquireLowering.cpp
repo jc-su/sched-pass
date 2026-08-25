@@ -21,7 +21,6 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
-#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
@@ -85,10 +84,10 @@ bool hasDeviceKernel(const Module &module) {
   });
 }
 
-void validateTypedInstrumentationContract(const Module &module) {
+bool validateTypedInstrumentationContract(Module &module) {
   std::uint64_t flags = 0;
   if (!readTypedContractWord(module, "nta_jit_instrumentation_flags", flags)) {
-    return;
+    return true;
   }
   std::uint64_t identity = 0;
   std::uint64_t demand = 0;
@@ -98,8 +97,9 @@ void validateTypedInstrumentationContract(const Module &module) {
       !readTypedContractWord(module, "nta_jit_demand_binding", demand) ||
       !readTypedContractWord(module, "nta_jit_access_proof", proof) ||
       !readTypedContractWord(module, "nta_jit_tier_mask", tierMask)) {
-    report_fatal_error(
+    module.getContext().emitError(
         "NTA typed operator contract is incomplete; refusing unverified code");
+    return false;
   }
   constexpr std::uint64_t requiredFlags =
       operator_contract::TypedAccessLowering |
@@ -114,8 +114,9 @@ void validateTypedInstrumentationContract(const Module &module) {
       proof != static_cast<std::uint64_t>(
                    operator_contract::AccessProof::TypedFrontend) ||
       tierMask == 0) {
-    report_fatal_error(
+    module.getContext().emitError(
         "NTA typed operator contract lacks exact identity/demand/tier proofs");
+    return false;
   }
   // JIT emits the contract constants into every translation unit because the
   // runtime ABI symbol is shared by kernels and binding helpers.  Only a
@@ -126,9 +127,11 @@ void validateTypedInstrumentationContract(const Module &module) {
        (!hasMarkerCall(module, ir::AcquireMarker) &&
         !hasMarkerCall(module, ir::AcquireTensorMapMarker) &&
         !hasMarkerCall(module, ir::AcquireSetMarker)))) {
-    report_fatal_error(
+    module.getContext().emitError(
         "NTA typed operator contract has no typed acquisition markers");
+    return false;
   }
+  return true;
 }
 
 MDNode *acquisitionMetadata(LLVMContext &context, bool tensorMap) {
@@ -359,7 +362,9 @@ void removeUnusedMarker(Module &module, StringRef name) {
 PreservedAnalyses
 AcquireLoweringPass::run(Module &module,
                          ModuleAnalysisManager &analysisManager) {
-  validateTypedInstrumentationContract(module);
+  if (!validateTypedInstrumentationContract(module)) {
+    return PreservedAnalyses::all();
+  }
   std::vector<FunctionPlan> plans;
   plans.reserve(module.size());
 
@@ -412,7 +417,8 @@ AcquireLoweringPass::run(Module &module,
   // linker error and allows JIT callers to miss the actual cause. Reject the
   // module before applying any partial lowering.
   if (rejectedAny) {
-    report_fatal_error("NTA acquisition verification failed", false);
+    module.getContext().emitError("NTA acquisition verification failed");
+    return PreservedAnalyses::all();
   }
 
   for (FunctionPlan &plan : plans) {

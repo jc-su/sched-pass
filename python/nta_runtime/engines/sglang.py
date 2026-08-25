@@ -2752,18 +2752,18 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
     def _layer_sync_events(
         self,
         layer_id: int,
-        progress_passes: int,
+        progress_rounds: int,
         stream: torch.cuda.Stream,
     ) -> tuple[torch.cuda.Event, tuple[torch.cuda.Event, ...]]:
         stream_address = int(stream.cuda_stream)
         progress_address = int(self._progress_stream.cuda_stream)
         key = (layer_id, stream_address, progress_address)
         existing = self._demand_sync_events.get(key)
-        if existing is not None and len(existing[1]) == progress_passes:
+        if existing is not None and len(existing[1]) == progress_rounds:
             return existing
         events = (
             torch.cuda.Event(),
-            tuple(torch.cuda.Event() for _ in range(progress_passes)),
+            tuple(torch.cuda.Event() for _ in range(progress_rounds)),
         )
         self._demand_sync_events[key] = events
         return events
@@ -2924,7 +2924,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             gpu_profile[0].record(stream)
         attention_form = "direct"
         epoch = None
-        progress_passes = 0
+        progress_rounds = 0
         if pending is None:
             self._run_preacquired_attention(
                 wrapper, q, kv_cache, output, layer, run_options
@@ -3036,10 +3036,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     plan,
                     self._phase_program(wrapper),
                     object_count=object_count,
-                    max_progress_passes=len(progress_blocks),
+                    max_progress_rounds=len(progress_blocks),
                     wait_for_plan=False,
                 )
-                progress_passes = len(progress_blocks)
+                progress_rounds = len(progress_blocks)
                 transfer_profile = None
                 if self._profile_transfer:
                     transfer_profile = (
@@ -3206,7 +3206,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 )
                 verify_transfer = os.environ.get("NTA_VERIFY_TRANSFER") == "1"
                 if final_layer or collect_progress or verify_transfer:
-                    epoch.check(progress_passes, stream)
+                    epoch.check(progress_rounds, stream)
                 if final_layer and self._runtime.sticky_failed_count != 0:
                     raise RuntimeError(
                         "an earlier asynchronous acquisition epoch failed"

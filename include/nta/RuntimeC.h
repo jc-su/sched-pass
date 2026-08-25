@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 32U
+#define NTA_RUNTIME_C_API_VERSION 34U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -38,6 +38,16 @@ typedef enum nta_nvme_media_policy {
   NTA_NVME_REQUIRE_HARDWARE_WRITE_PROTECTION = 0,
   NTA_NVME_TRUST_READ_ONLY_DEVICE_CODE = 1,
 } nta_nvme_media_policy;
+
+typedef enum nta_nvme_dma_target {
+  NTA_NVME_DMA_HBM_PEER = 0,
+  NTA_NVME_DMA_HOST_MAPPED = 1,
+} nta_nvme_dma_target;
+
+typedef enum nta_nvme_hbm_mapping_backend {
+  NTA_NVME_HBM_MAPPING_UNAVAILABLE = 0,
+  NTA_NVME_HBM_MAPPING_NVIDIA_PEER_PAGES = 1,
+} nta_nvme_hbm_mapping_backend;
 
 typedef struct nta_runtime_config {
   uint32_t struct_size;
@@ -125,6 +135,7 @@ typedef struct nta_nvme_transport_options {
   uint32_t queue_depth;
   uint32_t admin_timeout_ms;
   uint32_t media_policy;
+  uint32_t dma_target;
 } nta_nvme_transport_options;
 
 typedef struct nta_nvme_capabilities {
@@ -136,7 +147,8 @@ typedef struct nta_nvme_capabilities {
   uint32_t queue_id;
   uint32_t queue_count;
   int32_t device_ordinal;
-  uint32_t supports_hbm_peer;
+  uint32_t supports_hbm_peer_dma;
+  uint32_t hbm_mapping_backend;
   uint32_t translated_iommu;
   uint32_t namespace_read_only;
   uint32_t gpu_doorbell_mapping_validated;
@@ -494,6 +506,13 @@ nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        uint32_t issue_budget,
                                        uint32_t completion_budget,
                                        uint64_t cuda_stream);
+/* C API v34: completion-driven NVMe progress. One launch remains active until
+ * both the acquisition intent queue and controller queue are idle, or the
+ * device-side timeout expires. */
+nta_status nta_jit_phase_progress_nvme_until_idle(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t issue_budget, uint32_t completion_budget, uint64_t timeout_ns,
+    uint64_t cuda_stream);
 nta_status nta_jit_phase_publish(const nta_jit_phase_program *program,
                                  nta_runtime *runtime, uint32_t pending_budget,
                                  uint64_t cuda_stream);

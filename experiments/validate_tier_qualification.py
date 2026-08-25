@@ -92,6 +92,8 @@ def _validate_entry(entry: dict[str, Any], tier: str) -> None:
         return
     _require(classification == "nta-vfio-nvme-qualification",
              "NVMe report is not the VFIO qualification report")
+    _require(report.get("demand_semantics") == "exact",
+             "NVMe report is not exact-demand")
     _require(
         report.get("transport_ready", report.get("ready")) is True
         and report.get("qualified") is True,
@@ -99,8 +101,20 @@ def _validate_entry(entry: dict[str, Any], tier: str) -> None:
     )
     gpu = report.get("gpu_controlled")
     _require(isinstance(gpu, dict), "NVMe report has no GPU-controlled result")
-    for field in ("verified", "translated_iommu", "gpu_doorbell_mapping_validated"):
+    for field in (
+        "verified",
+        "selected_data_path_verified",
+        "translated_iommu",
+        "gpu_doorbell_mapping_validated",
+        "hbm_peer_dma_supported",
+    ):
         _require(gpu.get(field) is True, f"NVMe report does not prove {field}")
+    _require(gpu.get("destination") == "hbm-peer",
+             "NVMe qualification is not the direct-HBM data path")
+    _require(gpu.get("hbm_mapping_backend") == "nvidia-peer-pages",
+             "NVMe report does not prove the peer-page mapping backend")
+    _require(report.get("iommu_fault_free") is True,
+             "NVMe qualification observed a new target IOMMU fault")
     _require(gpu.get("verification_failures") == 0 and gpu.get("failed") == 0,
              "NVMe GPU-controlled run has failures")
     _require(gpu.get("outstanding") == 0,
@@ -113,6 +127,11 @@ def _validate_entry(entry: dict[str, Any], tier: str) -> None:
     if "performance_qualified" in report:
         _require(isinstance(report["performance_qualified"], bool),
                  "NVMe performance qualification flag is not boolean")
+        _require(
+            report["performance_qualified"]
+            == (float(ratio) >= float(threshold)),
+            "NVMe performance qualification contradicts its matched ratio",
+        )
 
 
 def validate(document: dict[str, Any], *, required_tiers: Iterable[str] = ALL_TIERS) -> dict[str, Any]:

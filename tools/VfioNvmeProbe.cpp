@@ -24,14 +24,25 @@ std::uint32_t parse(std::string_view value, const char *name, bool allowZero) {
   return static_cast<std::uint32_t>(parsed);
 }
 
+const char *hbmBackendName(nta::NvmeHbmMappingBackend backend) {
+  switch (backend) {
+  case nta::NvmeHbmMappingBackend::Unavailable:
+    return "unavailable";
+  case nta::NvmeHbmMappingBackend::NvidiaPeerPages:
+    return "nvidia-peer-pages";
+  }
+  return "unknown";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
-    if (argc < 2 || argc > 6) {
+    if (argc < 2 || argc > 7) {
       throw std::invalid_argument(
           "usage: nta-vfio-nvme-probe vfio:DDDD:BB:SS.F [gpu] [nsid] [depth] "
-          "[hardware-write-protect|trusted-read-only-code]");
+          "[hardware-write-protect|trusted-read-only-code] "
+          "[hbm-peer|host-mapped]");
     }
     nta::NvmeTransportOptions options;
     options.endpoint = argv[1];
@@ -59,17 +70,39 @@ int main(int argc, char **argv) {
         throw std::invalid_argument("invalid media policy");
       }
     }
+    if (argc > 6) {
+      const std::string_view target = argv[6];
+      if (target == "hbm-peer") {
+        options.dmaTarget = nta::NvmeDmaTarget::HbmPeer;
+      } else if (target == "host-mapped") {
+        options.dmaTarget = nta::NvmeDmaTarget::HostMapped;
+      } else {
+        throw std::invalid_argument("invalid DMA target");
+      }
+    }
     CUresult result = cuInit(0);
     if (result != CUDA_SUCCESS) {
       throw std::runtime_error("cuInit failed");
     }
 
+    const nta::NvmeDmaTarget dmaTarget = options.dmaTarget;
     nta::NvmeTransport transport(std::move(options));
     const nta::NvmeCapabilities &capabilities = transport.capabilities();
     if (!capabilities.translatedIommu ||
         !capabilities.gpuDoorbellMappingValidated) {
       throw std::runtime_error(
           "VFIO NVMe containment/compatibility gate failed");
+    }
+    // Exercise the selected data-plane mapping without issuing an application
+    // I/O command. HbmPeer covers CUDA HBM -> NVIDIA peer pages -> NVMe PRP;
+    // HostMapped is the matched pinned-host baseline. Transport construction
+    // has already performed its bounded bootstrap READ into control-plane host
+    // memory. End-to-end I/O into the selected destination is deliberately a
+    // stronger gate and belongs to nta-nvme-bench / the qualification runner.
+    auto probeBuffer = transport.allocate(capabilities.lbaSize);
+    if (probeBuffer->dmaTarget() != dmaTarget ||
+        probeBuffer->dmaPageCount() == 0) {
+      throw std::runtime_error("NVMe DMA mapping qualification failed");
     }
     std::cout << "vfio_nvme_probe=passed"
               << " gpu=" << capabilities.deviceOrdinal
@@ -81,7 +114,21 @@ int main(int argc, char **argv) {
               << " iommu=translated namespace_policy="
               << (capabilities.namespaceReadOnly ? "hardware-write-protected"
                                                  : "trusted-read-only-code")
-              << " gpu_nvme_path=validated\n";
+              << " destination="
+              << (dmaTarget == nta::NvmeDmaTarget::HbmPeer
+                      ? "hbm-peer"
+                      : "host-mapped")
+              << " hbm_peer_dma="
+              << (capabilities.supportsHbmPeerDma ? "available"
+                                                     : "unavailable")
+              << " hbm_mapping_backend="
+              << hbmBackendName(capabilities.hbmMappingBackend)
+              << " hbm_dma_map="
+              << (dmaTarget == nta::NvmeDmaTarget::HbmPeer
+                      ? "validated"
+                      : "not-applicable")
+              << " gpu_control_path=validated"
+              << " selected_data_io=not-exercised\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "nta-vfio-nvme-probe failed: " << error.what() << '\n';

@@ -49,7 +49,7 @@ for copy in global tma; do
       --min-pages=4 \
       --max-pages=16 \
       --iterations="${iterations}" \
-      --progress-passes=1 | tee -a "${matrix_log}"
+      --progress-rounds=1 | tee -a "${matrix_log}"
   done
 done
 
@@ -60,7 +60,7 @@ done
   --max-pages=16 \
   --sparse-top-k=2 \
   --iterations="${iterations}" \
-  --progress-passes=1 \
+  --progress-rounds=1 \
   --request-credit-pages=2 | tee "${results}/sparse-late-bound.log"
 
 "${build}/nta-paged-attention" \
@@ -71,7 +71,7 @@ done
   --sparse-top-k=2 \
   --sparse-policy=overfetch \
   --iterations="${iterations}" \
-  --progress-passes=1 \
+  --progress-rounds=1 \
   --request-credit-pages=2 | tee "${results}/sparse-overfetch.log"
 
 ptxas=${NTA_PTXAS:-/usr/local/cuda-12.9/bin/ptxas}
@@ -95,19 +95,19 @@ if [[ ${NTA_SANITIZE:-0} == 1 ]]; then
     "${sanitizer}" --tool "${tool}" --error-exitcode 99 \
       "${build}/nta-paged-attention" \
       --mode=mixed --copy=tma --requests=3 --min-pages=2 --max-pages=3 \
-      --iterations=1 --progress-passes=3 \
+      --iterations=1 --progress-rounds=3 \
       2>&1 | tee "${results}/${tool}.log"
     "${sanitizer}" --tool "${tool}" --error-exitcode 99 \
       "${build}/nta-paged-attention" \
       --mode=host-staged --requests=3 --min-pages=4 --max-pages=6 \
-      --sparse-top-k=2 --iterations=1 --progress-passes=1 \
+      --sparse-top-k=2 --iterations=1 --progress-rounds=1 \
       --request-credit-pages=2 \
       2>&1 | tee "${results}/sparse-${tool}.log"
     "${sanitizer}" --tool "${tool}" --error-exitcode 99 \
       "${build}/nta-paged-attention" \
       --mode=host-staged --requests=3 --min-pages=4 --max-pages=6 \
       --sparse-top-k=2 --sparse-policy=overfetch --iterations=1 \
-      --progress-passes=1 --request-credit-pages=2 \
+      --progress-rounds=1 --request-credit-pages=2 \
       2>&1 | tee "${results}/sparse-overfetch-${tool}.log"
     "${sanitizer}" --tool "${tool}" --error-exitcode 99 \
       "${build}/nta-kv-bench" \

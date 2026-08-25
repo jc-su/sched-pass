@@ -1730,9 +1730,9 @@ nta_requirement_tensor_map(nta::abi::RuntimeView *runtime,
 }
 
 #if NTA_DEVICE_PHASE_KERNELS
-extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
-                                             std::uint32_t issueBudget,
-                                             std::uint32_t completionBudget) {
+__device__ __forceinline__ void
+progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
+                 std::uint32_t completionBudget) {
   using namespace nta;
   if (runtime == nullptr || blockIdx.x != 0 || threadIdx.x >= warpSize) {
     return;
@@ -1980,6 +1980,58 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
   if (lane == 0) {
     __threadfence();
     atomicExch(&queue.ownerLock, 0U);
+  }
+}
+
+extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
+                                             std::uint32_t issueBudget,
+                                             std::uint32_t completionBudget) {
+  progressNvmeOnce(runtime, issueBudget, completionBudget);
+}
+
+extern "C" __global__ void nta_progress_nvme_until_idle(
+    nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
+    std::uint32_t completionBudget, std::uint64_t timeoutNs) {
+  using namespace nta;
+  if (runtime == nullptr || blockIdx.x != 0 || threadIdx.x >= warpSize ||
+      timeoutNs == 0) {
+    return;
+  }
+  const std::uint32_t lane = threadIdx.x;
+  const std::uint64_t start = device::globalTimerNs();
+  for (;;) {
+    progressNvmeOnce(runtime, issueBudget, completionBudget);
+    __syncwarp();
+
+    bool finished = false;
+    bool timedOut = false;
+    if (lane == 0) {
+      abi::NvmeQueueView *queue = device::nvmeQueue(runtime);
+      abi::BackendView *entry =
+          device::backend(runtime, abi::SourceKind::Nvme);
+      const std::uint64_t pending =
+          entry == nullptr
+              ? 0
+              : atomicAdd(reinterpret_cast<unsigned long long *>(
+                              &entry->pendingAcquisitions),
+                          0ULL);
+      finished = queue == nullptr || queue->error != 0 ||
+                 (queue->outstanding == 0 && pending == 0);
+      timedOut = !finished && device::globalTimerNs() - start >= timeoutNs;
+    }
+    finished = __shfl_sync(0xffffffffU, finished, 0);
+    timedOut = __shfl_sync(0xffffffffU, timedOut, 0);
+    if (finished) {
+      return;
+    }
+    if (timedOut) {
+      abi::NvmeQueueView *queue = device::nvmeQueue(runtime);
+      if (queue != nullptr) {
+        device::failNvmeQueue(runtime, *queue, lane, 0xfffffff9U);
+      }
+      return;
+    }
+    __nanosleep(1000U);
   }
 }
 #endif

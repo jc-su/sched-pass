@@ -10,6 +10,7 @@ nsid=${NTA_NVME_NSID:-1}
 depth=${NTA_NVME_QUEUE_DEPTH:-64}
 gpu=${NTA_GPU:-0}
 media_policy=${NTA_NVME_MEDIA_POLICY:-hardware-write-protect}
+dma_target=${NTA_NVME_DMA_TARGET:-hbm-peer}
 probe=${NTA_VFIO_PROBE:-$root_dir/build/nta-vfio-nvme-probe}
 benchmark=${NTA_NVME_BENCHMARK:-$root_dir/build/nta-nvme-bench}
 state=/run/nta-vfio-${bdf}.driver
@@ -19,12 +20,45 @@ die() {
   exit 1
 }
 
+[[ $bdf =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]] ||
+  die "NTA_NVME_BDF must use DDDD:BB:SS.F syntax"
+
 current_driver() {
   if [[ -L $device/driver ]]; then
     basename "$(readlink "$device/driver")"
   else
     printf 'none\n'
   fi
+}
+
+wait_for_driver() {
+  local expected=$1
+  local _
+  for _ in {1..100}; do
+    [[ $(current_driver) == "$expected" ]] && return 0
+    sleep 0.1
+  done
+  die "$bdf did not bind back to $expected"
+}
+
+wait_for_nvme_namespace() {
+  local _ controller block
+  command -v udevadm >/dev/null 2>&1 && sudo udevadm settle --timeout=10 || true
+  for _ in {1..100}; do
+    for controller in "$device"/nvme/nvme*; do
+      [[ -d $controller ]] || continue
+      [[ $(<"$controller/state") == live ]] || continue
+      for block in "$controller"/nvme*n*; do
+        [[ -e $block ]] || continue
+        [[ $(<"$block/nsid") == "$nsid" ]] || continue
+        [[ -b /dev/$(basename "$block") ]] || continue
+        printf 'restored_namespace=/dev/%s\n' "$(basename "$block")"
+        return 0
+      done
+    done
+    sleep 0.1
+  done
+  die "$bdf returned to the nvme driver but no live namespace appeared"
 }
 
 vfio_cdev() {
@@ -39,7 +73,8 @@ vfio_cdev() {
 
 check_block_device() {
   local sysfs_block=$1
-  local block_device=/dev/$(basename "$sysfs_block")
+  local block_device
+  block_device=/dev/$(basename "$sysfs_block")
   [[ -b $block_device ]] || die "$block_device has no block device node"
   if findmnt -rn -S "$block_device" >/dev/null; then
     die "$block_device is mounted"
@@ -59,7 +94,8 @@ require_safe_device() {
   for block in "$device"/nvme/nvme*/nvme*n*; do
     [[ -e $block ]] || continue
     namespace_found=1
-    local class_block=/sys/class/block/$(basename "$block")
+    local class_block
+    class_block=/sys/class/block/$(basename "$block")
     local hidden
     hidden=$(cat "$class_block/hidden" 2>/dev/null || true)
     if [[ $hidden == 1 ]]; then
@@ -102,6 +138,8 @@ require_containment() {
   [[ $media_policy == hardware-write-protect ||
     $media_policy == trusted-read-only-code ]] ||
     die "NTA_NVME_MEDIA_POLICY must be hardware-write-protect or trusted-read-only-code"
+  [[ $dma_target == hbm-peer || $dma_target == host-mapped ]] ||
+    die "NTA_NVME_DMA_TARGET must be hbm-peer or host-mapped"
 }
 
 require_rebind_confirmation() {
@@ -114,7 +152,7 @@ require_media_policy() {
   command -v nvme >/dev/null 2>&1 ||
     die "hardware-write-protect requires nvme-cli for a read-only capability preflight"
 
-  local block controller controller_output nwpc nsid feature_output
+  local block controller controller_output nwpc nsid
   local checked=0
   for block in "$device"/nvme/nvme*/nvme*n*; do
     [[ -e $block ]] || continue
@@ -128,17 +166,35 @@ require_media_policy() {
     if (( nwpc == 0 )); then
       die "/dev/$controller namespace $nsid lacks NVMe Namespace Write Protection"
     fi
-    feature_output=$(sudo nvme get-feature "/dev/$controller" -f 0x84 -n "$nsid" -H 2>&1) ||
+    sudo nvme get-feature "/dev/$controller" -f 0x84 -n "$nsid" -H >/dev/null 2>&1 ||
       die "read-only Namespace Write Protection Get Feature failed for /dev/$controller namespace $nsid"
     checked=$((checked + 1))
   done
   [[ $checked -gt 0 ]] || die "no active namespace available for media-policy preflight"
 }
 
+require_hbm_peer() {
+  [[ $dma_target == hbm-peer ]] || return 0
+  [[ -d /sys/module/nta_nvme_p2p ]] ||
+    die "nta_nvme_p2p is not loaded; run scripts/nta-nvme-p2p-module.sh load"
+  [[ -c /dev/nta_nvme_p2p ]] ||
+    die "/dev/nta_nvme_p2p is unavailable"
+  if [[ ${NTA_VFIO_PROBE_SUDO:-1} == 1 ]]; then
+    if ! sudo test -r /dev/nta_nvme_p2p ||
+      ! sudo test -w /dev/nta_nvme_p2p; then
+      die "root cannot access /dev/nta_nvme_p2p"
+    fi
+  else
+    [[ -r /dev/nta_nvme_p2p && -w /dev/nta_nvme_p2p ]] ||
+      die "current user cannot access /dev/nta_nvme_p2p"
+  fi
+}
+
 capture_reference() {
   local block
   for block in "$device"/nvme/nvme*/nvme*n*; do
     [[ -e $block ]] || continue
+    [[ $(<"$block/nsid") == "$nsid" ]] || continue
     sudo dd if="/dev/$(basename "$block")" bs=4096 \
       count="$((reference_bytes / 4096))" \
       iflag=direct status=none | dd of="$reference" bs=4096 status=none
@@ -159,6 +215,7 @@ bind_vfio() {
   require_safe_device
   require_containment
   require_media_policy
+  require_hbm_peer
   capture_reference
   sudo modprobe iommufd
   sudo modprobe vfio-pci
@@ -188,8 +245,10 @@ status)
 preflight)
   require_safe_device
   require_containment
-  printf 'VFIO preflight passed: bdf=%s nsid=%s depth=%s gpu=%s media_policy=%s\n' \
-    "$bdf" "$nsid" "$depth" "$gpu" "$media_policy"
+  require_media_policy
+  require_hbm_peer
+  printf 'VFIO preflight passed: bdf=%s nsid=%s depth=%s gpu=%s media_policy=%s dma_target=%s\n' \
+    "$bdf" "$nsid" "$depth" "$gpu" "$media_policy" "$dma_target"
   ;;
 bind)
   require_rebind_confirmation
@@ -201,9 +260,11 @@ probe)
   [[ -x $probe ]] || die "probe executable is absent; build nta-vfio-nvme-probe"
   if [[ ${NTA_VFIO_PROBE_SUDO:-1} == 1 ]]; then
     sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}" \
-      "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy"
+      "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy" \
+      "$dma_target"
   else
-    "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy"
+    "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy" \
+      "$dma_target"
   fi
   ;;
 bind-and-probe)
@@ -237,6 +298,7 @@ qualify)
     --namespace="$nsid" \
     --queue-depth="$depth" \
     --media-policy="$media_policy" \
+    --dma-target="$dma_target" \
     --reference="$reference" \
     "${@:2}"
   "$0" restore
@@ -247,13 +309,18 @@ restore)
   if [[ $(current_driver) == vfio-pci ]]; then
     printf '%s' "$bdf" | sudo tee "$device/driver/unbind" >/dev/null
   fi
-  driver=nvmex
+  driver=nvme
   if [[ -r $state ]]; then
     driver=$(<"$state")
   fi
   [[ $driver != none && -d /sys/bus/pci/drivers/$driver ]] || driver=nvme
   printf '%s' "$driver" | sudo tee "$device/driver_override" >/dev/null
   printf '%s' "$bdf" | sudo tee /sys/bus/pci/drivers_probe >/dev/null
+  wait_for_driver "$driver"
+  # driver_override is only a transactional bind aid. Leaving it set makes
+  # later hotplug and recovery depend on stale experiment state.
+  printf '\n' | sudo tee "$device/driver_override" >/dev/null
+  [[ $driver != nvme ]] || wait_for_nvme_namespace
   sudo rm -f "$state"
   "$0" status
   ;;

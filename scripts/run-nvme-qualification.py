@@ -26,10 +26,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bytes", type=int, default=2 * 1024 * 1024)
     parser.add_argument("--requests", type=int, default=32)
     parser.add_argument(
-        "--progress-passes",
+        "--progress-rounds",
         type=int,
-        default=1024,
-        help="bounded GPU completion/issue passes per replay; 1024 is the safe exact default",
+        default=1,
+        help="exact dependency/consumer rounds per replay; NVMe polling is completion-driven",
     )
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--fio-runtime", type=int, default=10)
@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
         "--media-policy",
         choices=("hardware-write-protect", "trusted-read-only-code"),
         default="hardware-write-protect",
+    )
+    parser.add_argument(
+        "--dma-target",
+        choices=("hbm-peer", "host-mapped"),
+        default="hbm-peer",
+        help="NVMe data destination; host-mapped is an explicit baseline",
     )
     parser.add_argument("--minimum-bandwidth-ratio", type=float, default=0.5)
     parser.add_argument("--cta-try-issue", action="store_true")
@@ -57,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         args.queue_depth,
         args.bytes,
         args.requests,
-        args.progress_passes,
+        args.progress_rounds,
         args.iterations,
         args.fio_runtime,
     ) <= 0:
@@ -102,6 +108,7 @@ def revision() -> tuple[str, bool]:
 
 
 def namespace_block_device(bdf: str, namespace: int) -> pathlib.Path:
+    run(["sudo", "udevadm", "settle"])
     directory = pathlib.Path("/sys/bus/pci/devices") / bdf / "nvme"
     candidates = []
     for controller in directory.glob("nvme[0-9]*"):
@@ -109,7 +116,6 @@ def namespace_block_device(bdf: str, namespace: int) -> pathlib.Path:
             nsid = entry / "nsid"
             if nsid.is_file() and int(nsid.read_text(encoding="utf-8")) == namespace:
                 candidates.append(pathlib.Path("/dev") / entry.name)
-    run(["sudo", "udevadm", "settle"])
     candidates = [path for path in candidates if path.is_block_device()]
     if len(candidates) != 1:
         raise RuntimeError(
@@ -140,6 +146,7 @@ def read_only_preflight(args: argparse.Namespace) -> None:
             "NTA_NVME_QUEUE_DEPTH": str(args.queue_depth),
             "NTA_GPU": str(args.gpu),
             "NTA_NVME_MEDIA_POLICY": args.media_policy,
+            "NTA_NVME_DMA_TARGET": args.dma_target,
             "NTA_NVME_REFERENCE_BYTES": str(args.bytes * args.requests),
         },
     )
@@ -186,6 +193,13 @@ def fio_baseline(args: argparse.Namespace, block: pathlib.Path) -> dict[str, Any
     }
 
 
+def iommu_fault_count(bdf: str) -> int:
+    requester = bdf.split(":", 1)[1]
+    output = run(["sudo", "dmesg", "--color=never"])
+    marker = f"Request device [{requester}] fault"
+    return sum(marker in line for line in output.splitlines())
+
+
 def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     raw_output = args.output.with_name(f"{args.output.stem}-gpu.json")
@@ -195,6 +209,7 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
         "NTA_NVME_QUEUE_DEPTH": str(args.queue_depth),
         "NTA_GPU": str(args.gpu),
         "NTA_NVME_MEDIA_POLICY": args.media_policy,
+        "NTA_NVME_DMA_TARGET": args.dma_target,
         "NTA_NVME_REFERENCE_BYTES": str(args.bytes * args.requests),
         "NTA_ALLOW_DEVICE_REBIND": "1",
         "NTA_REVISION": git_revision,
@@ -205,9 +220,10 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
             "qualify",
             f"--bytes={args.bytes}",
             f"--requests={args.requests}",
-            f"--progress-passes={args.progress_passes}",
+            f"--progress-rounds={args.progress_rounds}",
             f"--iterations={args.iterations}",
             f"--cta-try-issue={int(args.cta_try_issue)}",
+            f"--dma-target={args.dma_target}",
             f"--output={raw_output}",
         ],
         environment=environment,
@@ -261,15 +277,29 @@ def main() -> int:
         block = namespace_block_device(args.bdf, args.namespace)
         baseline = fio_baseline(args, block)
         phase = "gpu-qualification"
+        faults_before = iommu_fault_count(args.bdf)
         gpu = gpu_read(args, git_revision)
-        ratio = float(gpu["physical_mib_per_second"]) / float(
+        faults_after = iommu_fault_count(args.bdf)
+        iommu_fault_free = faults_after == faults_before
+        ratio = float(gpu["end_to_end_mib_per_second"]) / float(
             baseline["bandwidth_mib_per_second"]
         )
         transport_ready = (
             gpu.get("revision") == git_revision
             and gpu.get("verified") is True
+            and gpu.get("selected_data_path_verified") is True
+            and gpu.get("destination") == args.dma_target
+            and (
+                args.dma_target != "hbm-peer"
+                or (
+                    gpu.get("hbm_peer_dma_supported") is True
+                    and gpu.get("hbm_mapping_backend")
+                    == "nvidia-peer-pages"
+                )
+            )
             and gpu.get("translated_iommu") is True
             and gpu.get("gpu_doorbell_mapping_validated") is True
+            and iommu_fault_free
             and int(gpu.get("verification_failures", 1)) == 0
             and int(gpu.get("failed", 1)) == 0
             and int(gpu.get("outstanding", 1)) == 0
@@ -289,6 +319,9 @@ def main() -> int:
                 "minimum_bandwidth_ratio": args.minimum_bandwidth_ratio,
                 "matched_bandwidth_ratio": ratio,
                 "performance_qualified": performance_qualified,
+                "iommu_fault_free": iommu_fault_free,
+                "iommu_fault_count_before": faults_before,
+                "iommu_fault_count_after": faults_after,
                 "baseline": baseline,
                 "gpu_controlled": gpu,
                 "raw_gpu_result": str(raw_output.resolve()),

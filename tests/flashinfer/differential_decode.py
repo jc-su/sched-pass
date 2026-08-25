@@ -74,7 +74,7 @@ def main() -> int:
             "--min-pages=2",
             "--max-pages=5",
             "--iterations=1",
-            "--progress-passes=5",
+            "--progress-rounds=5",
             f"--dump-output={fixture}",
         ]
         result = subprocess.run(command, check=False, text=True, capture_output=True)

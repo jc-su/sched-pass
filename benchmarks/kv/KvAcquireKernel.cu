@@ -119,10 +119,16 @@ runNvmeHash(nta::abi::RuntimeView *runtime,
 
   const auto *values = static_cast<const std::uint32_t *>(address);
   const std::uint32_t count = task.bytes / sizeof(std::uint32_t);
+  const bool directHbm =
+      (runtime->objects[task.objectSlot].flags & nta::abi::ReplicaDmaHbm) != 0;
   std::uint64_t partial = 0;
   for (std::uint32_t element = threadIdx.x; element < count;
        element += blockDim.x) {
-    const std::uint32_t value = nta::device::loadIoCoherent(values + element);
+    // Host-mapped DMA requires the uncached/coherent load. Direct NVMe-to-HBM
+    // data is ordinary CUDA global memory and should use the normal cache path.
+    const std::uint32_t value =
+        directHbm ? values[element]
+                  : nta::device::loadIoCoherent(values + element);
     partial += static_cast<std::uint64_t>(value) * (element + 1ULL);
   }
 

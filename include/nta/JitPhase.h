@@ -108,6 +108,10 @@ public:
   void progressNvme(cudaStream_t stream, abi::RuntimeView *runtime,
                     std::uint32_t issueBudget,
                     std::uint32_t completionBudget) const;
+  void progressNvmeUntilIdle(cudaStream_t stream, abi::RuntimeView *runtime,
+                             std::uint32_t issueBudget,
+                             std::uint32_t completionBudget,
+                             std::uint64_t timeoutNs) const;
   void publish(cudaStream_t stream, abi::RuntimeView *runtime,
                std::uint32_t pendingBudget) const;
   void complete(cudaStream_t stream, abi::RuntimeView *runtime,
@@ -123,7 +127,7 @@ public:
     reset(stream, runtime, config.objectCount, config.workTicketCount);
     initial();
     complete(stream, runtime, config.workTicketCount);
-    for (std::uint32_t pass = 0; pass < config.progressPasses; ++pass) {
+    for (std::uint32_t round = 0; round < config.progressRounds; ++round) {
       progressHost(stream, runtime, config.progressBlocks);
       ready();
       complete(stream, runtime, config.workTicketCount);
@@ -137,9 +141,10 @@ public:
     reset(stream, runtime, config.objectCount, config.workTicketCount);
     initial();
     complete(stream, runtime, config.workTicketCount);
-    for (std::uint32_t pass = 0; pass < config.progressPasses; ++pass) {
-      progressNvme(stream, runtime, config.issueBudget,
-                   config.completionBudget);
+    for (std::uint32_t round = 0; round < config.progressRounds; ++round) {
+      progressNvmeUntilIdle(stream, runtime, config.issueBudget,
+                            config.completionBudget,
+                            config.progressTimeoutNs);
       ready();
       complete(stream, runtime, config.workTicketCount);
     }

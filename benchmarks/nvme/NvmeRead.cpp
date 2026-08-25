@@ -43,15 +43,30 @@ struct Options {
   std::uint64_t sourceOffset = 0;
   std::uint32_t bytes = 64U * 1024U;
   std::uint32_t requests = 16;
-  std::uint32_t progressPasses = 64;
+  std::uint32_t progressRounds = 1;
   std::uint32_t iterations = 20;
   std::uint32_t namespaceId = 1;
   std::uint32_t queueDepth = 64;
   std::uint32_t adminTimeoutMs = 10'000;
   nta::NvmeMediaPolicy mediaPolicy =
       nta::NvmeMediaPolicy::RequireHardwareWriteProtection;
-  bool ctaTryIssue = true;
+  nta::NvmeDmaTarget dmaTarget = nta::NvmeDmaTarget::HbmPeer;
+  bool ctaTryIssue = false;
 };
+
+const char *dmaTargetName(nta::NvmeDmaTarget target) {
+  return target == nta::NvmeDmaTarget::HbmPeer ? "hbm-peer" : "host-mapped";
+}
+
+const char *hbmBackendName(nta::NvmeHbmMappingBackend backend) {
+  switch (backend) {
+  case nta::NvmeHbmMappingBackend::Unavailable:
+    return "unavailable";
+  case nta::NvmeHbmMappingBackend::NvidiaPeerPages:
+    return "nvidia-peer-pages";
+  }
+  return "unknown";
+}
 
 std::uint64_t parseInteger(std::string_view text, std::string_view option,
                            bool allowZero) {
@@ -106,12 +121,12 @@ Options parseOptions(int argc, char **argv) {
         throw std::invalid_argument("--requests exceeds uint32_t");
       }
       options.requests = static_cast<std::uint32_t>(parsed);
-    } else if (name == "--progress-passes") {
+    } else if (name == "--progress-rounds") {
       const std::uint64_t parsed = parseInteger(value, name, false);
       if (parsed > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument("--progress-passes exceeds uint32_t");
+        throw std::invalid_argument("--progress-rounds exceeds uint32_t");
       }
-      options.progressPasses = static_cast<std::uint32_t>(parsed);
+      options.progressRounds = static_cast<std::uint32_t>(parsed);
     } else if (name == "--iterations") {
       const std::uint64_t parsed = parseInteger(value, name, false);
       if (parsed > std::numeric_limits<std::uint32_t>::max()) {
@@ -144,6 +159,15 @@ Options parseOptions(int argc, char **argv) {
         options.mediaPolicy = nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode;
       } else {
         throw std::invalid_argument("unknown --media-policy value");
+      }
+    } else if (name == "--dma-target") {
+      if (value == "hbm-peer") {
+        options.dmaTarget = nta::NvmeDmaTarget::HbmPeer;
+      } else if (value == "host-mapped") {
+        options.dmaTarget = nta::NvmeDmaTarget::HostMapped;
+      } else {
+        throw std::invalid_argument(
+            "--dma-target must be hbm-peer or host-mapped");
       }
     } else if (name == "--cta-try-issue") {
       const std::uint64_t parsed = parseInteger(value, name, true);
@@ -182,7 +206,8 @@ std::vector<std::byte> readReference(const Options &options) {
   std::vector<std::byte> bytes(static_cast<std::size_t>(total));
   input.read(reinterpret_cast<char *>(bytes.data()), bytes.size());
   if (input.gcount() != static_cast<std::streamsize>(bytes.size())) {
-    throw std::runtime_error("reference file is shorter than --bytes");
+    throw std::runtime_error(
+        "reference file is shorter than --bytes times --requests");
   }
   return bytes;
 }
@@ -324,6 +349,7 @@ int main(int argc, char **argv) {
     transportOptions.queueDepth = options.queueDepth;
     transportOptions.adminTimeoutMs = options.adminTimeoutMs;
     transportOptions.mediaPolicy = options.mediaPolicy;
+    transportOptions.dmaTarget = options.dmaTarget;
     auto transport =
         std::make_shared<nta::NvmeTransport>(std::move(transportOptions));
     // Keep BAR qualification and queue setup ahead of benchmark allocations so
@@ -398,7 +424,7 @@ int main(int argc, char **argv) {
     kernels.invalidate(driverStream, runtime.deviceView(), options.requests);
     phases.enqueueNvme(
         driverStream, runtime.deviceView(),
-        {options.requests, options.requests, options.progressPasses, 32, 32},
+        {options.requests, options.requests, options.progressRounds, 32, 32},
         [&] {
           checkCuda(cudaMemsetAsync(output.get(), 0,
                                     sizeof(std::uint64_t) * options.requests,
@@ -431,7 +457,7 @@ int main(int argc, char **argv) {
           << std::hex << warmupStats.nextCompletionDword3 << std::dec
           << " direct_submitted=" << warmupStats.directSubmitted
           << " direct_fallbacks=" << warmupStats.directFallbacks
-          << "; increase --progress-passes only when outstanding is nonzero";
+          << "; the device progress deadline expired";
       throw std::runtime_error(message.str());
     }
     for (std::uint32_t request = 0; request < options.requests; ++request) {
@@ -477,6 +503,10 @@ int main(int argc, char **argv) {
       if (actual[request] != expected[request] ||
           workTicket.state !=
               static_cast<std::uint32_t>(nta::abi::WorkTicketState::Done)) {
+        std::cerr << "verification_mismatch request=" << request
+                  << " expected_checksum=0x" << std::hex << expected[request]
+                  << " actual_checksum=0x" << actual[request] << std::dec
+                  << " ticket_state=" << workTicket.state << '\n';
         ++verificationFailures;
       }
     }
@@ -493,7 +523,10 @@ int main(int argc, char **argv) {
                                  options.requests / (1024.0 * 1024.0)) /
                                 (milliseconds / 1000.0);
 
-    std::cout << "destination=host-mapped backend=vfio-iommufd"
+    std::cout << "destination=" << dmaTargetName(options.dmaTarget)
+              << " hbm_mapping_backend="
+              << hbmBackendName(capabilities.hbmMappingBackend)
+              << " backend=vfio-iommufd"
               << " media_policy="
               << (options.mediaPolicy ==
                           nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode
@@ -501,7 +534,7 @@ int main(int argc, char **argv) {
                       : "hardware-write-protect")
               << " requests=" << options.requests << " bytes=" << options.bytes
               << " cta_try_issue=" << (options.ctaTryIssue ? 1 : 0)
-              << " progress_passes=" << options.progressPasses
+              << " progress_rounds=" << options.progressRounds
               << " graph_ms=" << std::fixed << std::setprecision(3)
               << milliseconds << " MiB/s=" << std::setprecision(2)
               << mibPerSecond << " measured_submitted=" << measuredSubmitted
@@ -512,6 +545,7 @@ int main(int argc, char **argv) {
               << " direct_submitted=" << stats.directSubmitted
               << " direct_fallbacks=" << stats.directFallbacks
               << " completed=" << stats.completed << " failed=" << stats.failed
+              << " selected_data_path_verified=" << (verified ? 1 : 0)
               << " verification_failures=" << verificationFailures << '\n';
 
     if (!options.output.empty()) {
@@ -520,7 +554,7 @@ int main(int argc, char **argv) {
         throw std::runtime_error("cannot open result file " + options.output);
       }
       artifact << "{\n"
-               << "  \"schema\": 1,\n"
+               << "  \"schema\": 2,\n"
                << "  \"classification\": \"nta-vfio-nvme-read\",\n"
                << "  \"revision\": " << jsonString(options.revision) << ",\n"
                << "  \"device\": " << jsonString(options.device) << ",\n"
@@ -540,24 +574,31 @@ int main(int argc, char **argv) {
                << (capabilities.gpuDoorbellMappingValidated ? "true"
                                                             : "false")
                << ",\n"
+               << "  \"hbm_peer_dma_supported\": "
+               << (capabilities.supportsHbmPeerDma ? "true" : "false")
+               << ",\n"
+               << "  \"hbm_mapping_backend\": "
+               << jsonString(hbmBackendName(capabilities.hbmMappingBackend))
+               << ",\n"
                << "  \"media_policy\": "
                << jsonString(options.mediaPolicy ==
                                      nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode
                                  ? "trusted-read-only-code"
                                  : "hardware-write-protect")
                << ",\n"
-               << "  \"destination\": \"host-mapped\",\n"
+               << "  \"destination\": "
+               << jsonString(dmaTargetName(options.dmaTarget)) << ",\n"
                << "  \"requests\": " << options.requests << ",\n"
                << "  \"bytes_per_request\": " << options.bytes << ",\n"
                << "  \"iterations\": " << options.iterations << ",\n"
-               << "  \"progress_passes\": " << options.progressPasses
+               << "  \"progress_rounds\": " << options.progressRounds
                << ",\n"
                << "  \"cta_try_issue\": "
                << (options.ctaTryIssue ? "true" : "false") << ",\n"
                << "  \"graph_ms\": " << std::setprecision(9) << milliseconds
                << ",\n"
-               << "  \"logical_mib_per_second\": " << mibPerSecond << ",\n"
-               << "  \"physical_mib_per_second\": " << mibPerSecond << ",\n"
+               << "  \"end_to_end_mib_per_second\": " << mibPerSecond
+               << ",\n"
                << "  \"expected_commands\": " << expectedCommands << ",\n"
                << "  \"measured_submitted\": " << measuredSubmitted
                << ",\n"
@@ -577,6 +618,8 @@ int main(int argc, char **argv) {
                << "  \"outstanding\": " << stats.outstanding << ",\n"
                << "  \"verification_failures\": " << verificationFailures
                << ",\n"
+               << "  \"selected_data_path_verified\": "
+               << (verified ? "true" : "false") << ",\n"
                << "  \"verified\": " << (verified ? "true" : "false")
                << "\n}\n";
       if (!artifact) {

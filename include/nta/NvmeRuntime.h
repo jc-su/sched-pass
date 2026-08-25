@@ -14,6 +14,21 @@ enum class NvmeMediaPolicy {
   TrustReadOnlyDeviceCode,
 };
 
+// The instrumented GPU owns the NVMe queue in either mode. This selects where
+// the controller's data DMA lands; host-mapped memory is an explicit baseline,
+// while HbmPeer is the production direct-data-plane path.
+enum class NvmeDmaTarget {
+  HbmPeer,
+  HostMapped,
+};
+
+// Concrete mapping backend used to make an HBM allocation addressable by the
+// VFIO-owned NVMe function. This is a setup-plane property, not a data path.
+enum class NvmeHbmMappingBackend : std::uint32_t {
+  Unavailable = 0,
+  NvidiaPeerPages = 1,
+};
+
 struct NvmeTransportOptions {
   // The transport exclusively owns this PCI function through VFIO/IOMMUFD.
   // No implicit controller is selected because binding a device is destructive.
@@ -23,6 +38,7 @@ struct NvmeTransportOptions {
   std::uint32_t queueDepth = 64;
   std::uint32_t adminTimeoutMs = 10'000;
   NvmeMediaPolicy mediaPolicy = NvmeMediaPolicy::RequireHardwareWriteProtection;
+  NvmeDmaTarget dmaTarget = NvmeDmaTarget::HbmPeer;
 };
 
 struct NvmeCapabilities {
@@ -34,7 +50,8 @@ struct NvmeCapabilities {
   std::uint32_t queueId;
   std::uint32_t queueCount;
   int deviceOrdinal;
-  bool supportsHbmPeer;
+  bool supportsHbmPeerDma;
+  NvmeHbmMappingBackend hbmMappingBackend;
   bool translatedIommu;
   bool namespaceReadOnly;
   bool gpuDoorbellMappingValidated;
@@ -67,6 +84,7 @@ public:
   [[nodiscard]] std::uint64_t dmaPageListAddress() const noexcept;
   [[nodiscard]] std::uint32_t dmaPageCount() const noexcept;
   [[nodiscard]] std::size_t bytes() const noexcept;
+  [[nodiscard]] NvmeDmaTarget dmaTarget() const noexcept;
 
 private:
   struct Impl;

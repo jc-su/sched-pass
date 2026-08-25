@@ -1334,7 +1334,10 @@ ObjectHandle HostRuntime::installNvmeObject(
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
       allocation.nvmeBuffer->dmaPageCount(),
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
-      abi::ReplicaTransport,
+      abi::ReplicaTransport |
+          (allocation.nvmeBuffer->dmaTarget() == NvmeDmaTarget::HbmPeer
+               ? abi::ReplicaDmaHbm
+               : 0U),
       0,
       0,
   };
@@ -1349,7 +1352,9 @@ ObjectHandle HostRuntime::installNvmeObject(
       replicaStart,
       1,
       abi::InvalidIndex,
-      0,
+      allocation.nvmeBuffer->dmaTarget() == NvmeDmaTarget::HbmPeer
+          ? abi::ReplicaDmaHbm
+          : 0U,
       0,
   };
   uploadOne(impl_->replicaEntries, replicaStart, replica);

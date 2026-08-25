@@ -268,6 +268,16 @@ nta_status nta_nvme_transport_create(const nta_nvme_transport_options *options,
     default:
       throw std::invalid_argument("NVMe media policy is invalid");
     }
+    switch (options->dma_target) {
+    case NTA_NVME_DMA_HBM_PEER:
+      native.dmaTarget = nta::NvmeDmaTarget::HbmPeer;
+      break;
+    case NTA_NVME_DMA_HOST_MAPPED:
+      native.dmaTarget = nta::NvmeDmaTarget::HostMapped;
+      break;
+    default:
+      throw std::invalid_argument("NVMe DMA target is invalid");
+    }
     auto handle = std::make_unique<nta_nvme_transport>();
     handle->value = std::make_shared<nta::NvmeTransport>(std::move(native));
     *transportOut = handle.release();
@@ -296,7 +306,8 @@ nta_nvme_transport_get_capabilities(const nta_nvme_transport *transport,
         source.queueId,
         source.queueCount,
         source.deviceOrdinal,
-        source.supportsHbmPeer ? 1U : 0U,
+        source.supportsHbmPeerDma ? 1U : 0U,
+        static_cast<std::uint32_t>(source.hbmMappingBackend),
         source.translatedIommu ? 1U : 0U,
         source.namespaceReadOnly ? 1U : 0U,
         source.gpuDoorbellMappingValidated ? 1U : 0U,
@@ -1379,6 +1390,19 @@ nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
     program->value->progressNvme(stream(cudaStream),
                                  runtime->value->deviceView(), issueBudget,
                                  completionBudget);
+  });
+}
+
+nta_status nta_jit_phase_progress_nvme_until_idle(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t issueBudget, std::uint32_t completionBudget,
+    std::uint64_t timeoutNs, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->progressNvmeUntilIdle(
+        stream(cudaStream), runtime->value->deviceView(), issueBudget,
+        completionBudget, timeoutNs);
   });
 }
 

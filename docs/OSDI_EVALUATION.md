@@ -135,11 +135,13 @@ structured serving artifact with the same demand trace and correctness digest.
 The mandatory tiers are HBM reference, host memory, VFIO NVMe, and CXL DAX.
 Host memory can be direct mapped or bounded staged memory, but the distinction
 is recorded. NVMe requires the explicit read-only VFIO/IOMMU qualification;
-its admission gate proves exact GPU-controlled reads, translated-IOMMU
-containment, and zero outstanding work, while the matched fio ratio remains a
-separate performance result. DAX requires an explicit CUDA-visible `devdax`
-mapping. Missing hardware is a capability-gated `SKIP`, never a fabricated
-result.
+its admission gate proves exact GPU-controlled reads directly into HBM through
+the NVIDIA peer-page backend, translated-IOMMU containment, no new target DMAR
+fault, and zero outstanding work. A host-mapped destination is a baseline and
+cannot satisfy direct-HBM admission. The matched fio ratio remains a separate
+performance result, and its Boolean classification must agree with the recorded
+ratio and threshold. DAX requires an explicit CUDA-visible `devdax` mapping.
+Missing hardware is a capability-gated `SKIP`, never a fabricated result.
 
 The native tier commands use the same paged-attention workload and correctness
 checks:

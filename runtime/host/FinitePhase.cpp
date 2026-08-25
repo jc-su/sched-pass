@@ -47,6 +47,7 @@ FinitePhaseProgram::FinitePhaseProgram(CUmodule module)
     : reset_(load(module, "nta_reset_epoch")),
       progressHost_(load(module, "nta_progress_host_staging")),
       progressNvme_(load(module, "nta_progress_nvme")),
+      progressNvmeUntilIdle_(load(module, "nta_progress_nvme_until_idle")),
       publish_(load(module, "nta_publish_ready")),
       complete_(load(module, "nta_complete_launched")) {}
 
@@ -63,6 +64,21 @@ void FinitePhaseProgram::reset(CUstream stream, abi::RuntimeView *runtime,
   CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
   void *arguments[] = {&runtimeAddress, &objectCount, &workTicketCount};
   launch(reset_, blocks, Threads, stream, arguments, "nta_reset_epoch");
+}
+
+void FinitePhaseProgram::progressNvmeUntilIdle(
+    CUstream stream, abi::RuntimeView *runtime, std::uint32_t issueBudget,
+    std::uint32_t completionBudget, std::uint64_t timeoutNs) const {
+  if (runtime == nullptr || issueBudget == 0 || completionBudget == 0 ||
+      timeoutNs == 0) {
+    throw std::invalid_argument(
+        "NVMe progress-until-idle needs a runtime, budgets, and timeout");
+  }
+  CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+  void *arguments[] = {&runtimeAddress, &issueBudget, &completionBudget,
+                       &timeoutNs};
+  launch(progressNvmeUntilIdle_, 1, 32, stream, arguments,
+         "nta_progress_nvme_until_idle");
 }
 
 void FinitePhaseProgram::progressHost(CUstream stream,

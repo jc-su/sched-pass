@@ -78,7 +78,7 @@ int main() {
                     nta::encodeTierCapabilities(nta::TierDirectAddress |
                                                  nta::TierHostRegistered)) ==
                 (nta::TierDirectAddress | nta::TierHostRegistered));
-  if (Version != 28 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
+  if (Version != 29 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

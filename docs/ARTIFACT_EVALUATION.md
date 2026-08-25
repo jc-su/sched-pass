@@ -4,7 +4,7 @@ The repository has an explicit source boundary:
 
 | Layer | Paths | Responsibility |
 | --- | --- | --- |
-| implementation | `include/`, `lib/`, `runtime/`, `python/nta_runtime/` | compiler pass, native ABI, runtime, semantic execution core |
+| implementation | `include/`, `lib/`, `runtime/`, `kernel/`, `python/nta_runtime/` | compiler pass, native ABI, device/runtime transports, semantic execution core |
 | experiment drivers | `experiments/`, `benchmarks/`, `scripts/` | workloads, trial orchestration, measurements, artifact validation |
 | correctness tests | `tests/` | deterministic pass/runtime correctness gates; no experiment output is stored there |
 
@@ -118,6 +118,77 @@ device ABI types.
 Capability-gated tests report explicit skips. A skipped CXL DAX test means no
 qualified devdax endpoint was supplied; it is not a passing CXL qualification.
 The same rule applies to multi-GPU and framework-specific serving tests.
+
+For an already provisioned devdax endpoint, install
+`config/udev/99-nta-dax.rules`, create the system group `dax`, and add the
+artifact user to that group. Reload udev rules (or reboot) before qualification.
+For example:
+
+```bash
+sudo groupadd --system --force dax
+sudo usermod --append --groups dax "$USER"
+sudo install -m 0644 config/udev/99-nta-dax.rules \
+  /etc/udev/rules.d/99-nta-dax.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=dax --action=change
+```
+
+Start a new login session after changing group membership.
+This changes access control only; it does not create a CXL region, reconfigure
+a namespace, or initialize device media. A missing `/dev/daxX.Y` must therefore
+be fixed in the platform CXL enumeration path rather than hidden by permissions.
+
+On the current `7.0.0-30-generic` host, no `/dev/dax*` endpoint is enumerated.
+DAX tests therefore correctly remain skipped. The group/rule establishes
+permission readiness only and must not be reported as tier qualification.
+
+### Physical NVMe-to-HBM qualification
+
+The direct NVMe path needs the kernel-specific NVIDIA peer-page bridge in
+addition to the native build. Build and load it against the exact running
+kernel and NVIDIA driver:
+
+```bash
+./scripts/nta-nvme-p2p-module.sh load
+./scripts/nta-nvme-p2p-module.sh status
+```
+
+Then qualify one dedicated, unmounted controller. This operation temporarily
+rebinds the selected PCI function to `vfio-pci`, issues READ commands only, and
+restores the original driver even when the benchmark fails:
+
+```bash
+python3 scripts/run-nvme-qualification.py \
+  --bdf 0000:d8:00.0 \
+  --dma-target hbm-peer \
+  --media-policy trusted-read-only-code \
+  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 20 \
+  --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
+  --allow-device-rebind --require-ready \
+  --output /tmp/nta-artifacts/nvme/nvme-qualification.json
+
+python3 experiments/qualify_tiers.py \
+  --required-tier nvme \
+  --nvme-report /tmp/nta-artifacts/nvme/nvme-qualification.json \
+  --output /tmp/nta-artifacts/nvme/tier-qualification.json
+
+python3 experiments/validate_tier_qualification.py \
+  --required-tier nvme \
+  /tmp/nta-artifacts/nvme/tier-qualification.json
+```
+
+Use `hardware-write-protect` unless the controller reports no Namespace Write
+Protection support. `trusted-read-only-code` is an explicit weaker boundary for
+a dedicated experiment controller; it relies on the generated device program
+emitting only NVMe READ commands. Neither policy authorizes formatting,
+filesystem changes, writes, discard, sanitize, or deletion.
+
+The machine-readable report separates transport qualification from matched
+performance qualification. It records exact checksums, queue counters, HBM
+mapping backend, translated-IOMMU and GPU-doorbell evidence, target DMAR fault
+counts, a kernel-owned read-only `fio` baseline, the bandwidth ratio, revision,
+and dirty-worktree state. See `docs/NVME_SECURITY.md` for the complete threat
+model and teardown contract.
 
 ### Serving experiments
 

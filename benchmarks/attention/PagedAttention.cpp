@@ -55,7 +55,7 @@ struct Options {
   std::uint32_t minPages = 4;
   std::uint32_t maxPages = 16;
   std::uint32_t iterations = 20;
-  std::uint32_t progressPasses = 1;
+  std::uint32_t progressRounds = 1;
   std::uint32_t requestCreditPages = 0;
   std::uint32_t sparseTopK = 0;
   SparsePolicy sparsePolicy = SparsePolicy::LateBound;
@@ -323,8 +323,8 @@ Options parseOptions(int argc, char **argv) {
       options.maxPages = parsePositive(value, name);
     } else if (name == "--iterations") {
       options.iterations = parsePositive(value, name);
-    } else if (name == "--progress-passes") {
-      options.progressPasses = parsePositive(value, name);
+    } else if (name == "--progress-rounds") {
+      options.progressRounds = parsePositive(value, name);
     } else if (name == "--request-credit-pages") {
       options.requestCreditPages = parsePositive(value, name);
     } else if (name == "--sparse-top-k") {
@@ -419,9 +419,9 @@ Options parseOptions(int argc, char **argv) {
       options.mode == Mode::Nvme;
   if (finiteProgressMode && options.sparseTopK == 0 &&
       options.requestCreditPages != 0 &&
-      options.progressPasses < options.maxPages) {
+      options.progressRounds < options.maxPages) {
     throw std::invalid_argument(
-        "exact tier attention requires --progress-passes >= --max-pages "
+        "exact tier attention requires --progress-rounds >= --max-pages "
         "when --request-credit-pages is bounded");
   }
   return options;
@@ -780,17 +780,17 @@ int runSparseAttention(
   const CUstream overfetchDriverStream =
       reinterpret_cast<CUstream>(overfetchStream);
   const bool preacquired = options.sparsePolicy == SparsePolicy::Overfetch;
-  const std::uint32_t progressPasses =
+  const std::uint32_t progressRounds =
       !preacquired &&
               (options.mode == Mode::HostStaged || options.mode == Mode::Mixed)
-          ? options.progressPasses
+          ? options.progressRounds
           : 0;
 
   checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
             "cudaStreamBeginCapture sparse attention");
   phases.enqueueHost(
       driverStream, runtime.deviceView(),
-      {candidateCount, requestCount, candidateCount, progressPasses},
+      {candidateCount, requestCount, candidateCount, progressRounds},
       [&] {
         checkCuda(cudaMemsetAsync(deviceSelections.get(), 0xff,
                                   static_cast<std::size_t>(requestCount) *
@@ -967,7 +967,7 @@ int runSparseAttention(
             << " max_abs_error=" << std::scientific << maximumError
             << " intents_enqueued=" << pool.enqueued
             << " intents_consumed=" << pool.consumed
-            << " progress_passes=" << options.progressPasses
+            << " progress_rounds=" << options.progressRounds
             << " verification_failures=" << failures << '\n';
   if (options.json) {
     std::cout << "{\"schema\":1,\"policy\":\""
@@ -1282,10 +1282,10 @@ int main(int argc, char **argv) {
 
     checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
               "cudaStreamBeginCapture");
-    const std::uint32_t progressPasses =
+    const std::uint32_t progressRounds =
         options.mode == Mode::HostStaged || options.mode == Mode::Mixed ||
                 options.mode == Mode::Nvme
-            ? options.progressPasses
+            ? options.progressRounds
             : 0;
     auto initialPhase = [&] {
       checkCuda(cudaMemsetAsync(devicePartials.get(), 0,
@@ -1318,11 +1318,11 @@ int main(int argc, char **argv) {
     };
     if (options.mode == Mode::Nvme) {
       phases.enqueueNvme(driverStream, runtime.deviceView(),
-                         {taskCount, taskCount, progressPasses, 32, 32},
+                         {taskCount, taskCount, progressRounds, 32, 32},
                          initialPhase, readyPhase);
     } else {
       phases.enqueueHost(driverStream, runtime.deviceView(),
-                         {taskCount, taskCount, taskCount, progressPasses},
+                         {taskCount, taskCount, taskCount, progressRounds},
                          initialPhase, readyPhase);
     }
     kernels.reduce(driverStream, runtime.deviceView(), deviceRequests.get(),
@@ -1434,7 +1434,7 @@ int main(int argc, char **argv) {
               << " intents_enqueued=" << intentPool.enqueued
               << " intents_consumed=" << intentPool.consumed
               << " intent_overflow=" << intentPool.overflow
-              << " progress_passes=" << options.progressPasses
+              << " progress_rounds=" << options.progressRounds
               << " request_credit_pages=" << options.requestCreditPages
               << " verification_failures=" << failures << '\n';
     if (options.json) {

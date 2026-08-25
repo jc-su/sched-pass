@@ -1204,7 +1204,7 @@ if(NTA_ENABLE_CUDA)
       --min-pages=2
       --max-pages=4
       --iterations=2
-      --progress-passes=4
+      --progress-rounds=4
       --request-credit-pages=1
   )
   set_tests_properties(nta-paged-attention-gpu PROPERTIES TIMEOUT 60)
@@ -1218,7 +1218,7 @@ if(NTA_ENABLE_CUDA)
       --max-pages=6
       --sparse-top-k=2
       --iterations=2
-      --progress-passes=1
+      --progress-rounds=1
       --request-credit-pages=2
   )
   set_tests_properties(
@@ -1238,7 +1238,7 @@ if(NTA_ENABLE_CUDA)
       --sparse-top-k=2
       --sparse-policy=overfetch
       --iterations=2
-      --progress-passes=1
+      --progress-rounds=1
       --request-credit-pages=2
   )
   set_tests_properties(
@@ -1257,7 +1257,7 @@ if(NTA_ENABLE_CUDA)
       --min-pages=2
       --max-pages=4
       --iterations=2
-      --progress-passes=4
+      --progress-rounds=4
       --request-credit-pages=1
   )
   set_tests_properties(nta-paged-attention-tma-gpu PROPERTIES TIMEOUT 60)
@@ -1270,7 +1270,7 @@ if(NTA_ENABLE_CUDA)
       --min-pages=2
       --max-pages=4
       --iterations=1
-      --progress-passes=1
+      --progress-rounds=1
       --request-credit-pages=1
   )
   set_tests_properties(
@@ -1287,7 +1287,7 @@ if(NTA_ENABLE_CUDA)
       --min-pages=2
       --max-pages=4
       --iterations=2
-      --progress-passes=1
+      --progress-rounds=1
   )
   set_tests_properties(
     nta-paged-attention-dax-gpu PROPERTIES
@@ -1303,7 +1303,7 @@ if(NTA_ENABLE_CUDA)
       --min-pages=2
       --max-pages=4
       --iterations=2
-      --progress-passes=32
+      --progress-rounds=1
   )
   set_tests_properties(
     nta-paged-attention-nvme-gpu PROPERTIES

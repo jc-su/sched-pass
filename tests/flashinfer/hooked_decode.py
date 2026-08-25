@@ -648,7 +648,7 @@ def main() -> None:
         mixed.plan,
         phases.program,
         object_count=1,
-        max_progress_passes=1,
+        max_progress_rounds=1,
     )
     mixed_result = mixed_epoch.run_host(
         hooked,
@@ -658,7 +658,7 @@ def main() -> None:
         progress_blocks=1,
         stream=torch.cuda.current_stream(),
     )
-    if mixed_result.progress_passes != 1:
+    if mixed_result.progress_rounds != 1:
         raise RuntimeError(f"unexpected heterogeneous progress rounds: {mixed_result}")
     mixed.assert_all_states(3)
     torch.testing.assert_close(mixed_output, mixed_expected, rtol=2e-3, atol=2e-3)
@@ -677,7 +677,7 @@ def main() -> None:
         pipelined.plan,
         phases.program,
         object_count=2,
-        max_progress_passes=2,
+        max_progress_rounds=2,
     )
     progress_stream = torch.cuda.Stream(priority=0)
     passes = pipelined_epoch.enqueue_host(
@@ -690,7 +690,7 @@ def main() -> None:
         progress_stream=progress_stream,
     )
     pipelined_result = pipelined_epoch.check(passes, torch.cuda.current_stream())
-    if pipelined_result.progress_passes != 2:
+    if pipelined_result.progress_rounds != 2:
         raise RuntimeError(f"unexpected pipelined host rounds: {pipelined_result}")
     pipelined.assert_all_states(3)
     torch.testing.assert_close(pipelined_staging_kv, mixed_reference_kv, rtol=0, atol=0)
@@ -715,7 +715,7 @@ def main() -> None:
         lookahead.plan,
         phases.program,
         object_count=2,
-        max_progress_passes=1,
+        max_progress_rounds=1,
     )
     passes = lookahead_epoch.enqueue_host(
         hooked,
@@ -730,7 +730,7 @@ def main() -> None:
         initial_ready_work_count=1,
     )
     lookahead_result = lookahead_epoch.check(passes, torch.cuda.current_stream())
-    if lookahead_result.progress_passes != 1:
+    if lookahead_result.progress_rounds != 1:
         raise RuntimeError(f"unexpected fragment-lookahead rounds: {lookahead_result}")
     lookahead.assert_all_states(3)
     torch.testing.assert_close(lookahead_staging_kv, mixed_reference_kv, rtol=0, atol=0)
@@ -926,7 +926,7 @@ def main() -> None:
         split.plan,
         phases.program,
         object_count=1,
-        max_progress_passes=1,
+        max_progress_rounds=1,
     )
     split_result = split_epoch.run_host(
         hooked,
@@ -936,7 +936,7 @@ def main() -> None:
         progress_blocks=1,
         stream=torch.cuda.current_stream(),
     )
-    if split_result.progress_passes != 1:
+    if split_result.progress_rounds != 1:
         raise RuntimeError(f"unexpected host progress rounds: {split_result}")
     split.assert_all_states(3)
     torch.testing.assert_close(split_staging_kv, split_reference_kv, rtol=0, atol=0)
@@ -1017,7 +1017,7 @@ def main() -> None:
         fragmented.plan,
         phases.program,
         object_count=split_work,
-        max_progress_passes=2,
+        max_progress_rounds=2,
     )
     fragmented_result = fragmented_epoch.run_host(
         hooked,
@@ -1027,7 +1027,7 @@ def main() -> None:
         progress_blocks=(split_work // 2, split_work // 2),
         stream=torch.cuda.current_stream(),
     )
-    if fragmented_result.progress_passes != 2:
+    if fragmented_result.progress_rounds != 2:
         raise RuntimeError(f"unexpected fragmented host rounds: {fragmented_result}")
     fragmented.assert_all_states(3)
     torch.testing.assert_close(fragmented_output, split_expected, rtol=2e-3, atol=2e-3)
@@ -1112,7 +1112,7 @@ def main() -> None:
         compact.plan,
         phases.program,
         object_count=1,
-        max_progress_passes=1,
+        max_progress_rounds=1,
     )
     compact_progress_stream = torch.cuda.Stream(priority=0)
     compact_passes = compact_epoch.enqueue_host(
@@ -1127,7 +1127,7 @@ def main() -> None:
         initial_ready_work_count=len(resident_work),
     )
     compact_result = compact_epoch.check(compact_passes, torch.cuda.current_stream())
-    if compact_result.progress_passes != 1:
+    if compact_result.progress_rounds != 1:
         raise RuntimeError(f"unexpected compact progress rounds: {compact_result}")
     compact.assert_all_states(3)
     torch.testing.assert_close(compact_staging_kv, mixed_reference_kv, rtol=0, atol=0)

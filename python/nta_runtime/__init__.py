@@ -20,6 +20,8 @@ _EXPORTS = {
     "JitPhaseProgram": ("runtime", "JitPhaseProgram"),
     "IndexedHostObject": ("runtime", "IndexedHostObject"),
     "NvmeCapabilities": ("runtime", "NvmeCapabilities"),
+    "NvmeDmaTarget": ("runtime", "NvmeDmaTarget"),
+    "NvmeHbmMappingBackend": ("runtime", "NvmeHbmMappingBackend"),
     "CxlDaxCapabilities": ("runtime", "CxlDaxCapabilities"),
     "OperatorCapability": ("runtime", "OperatorCapability"),
     "OperatorAccessProof": ("runtime", "OperatorAccessProof"),
