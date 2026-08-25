@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 import functools
 import importlib.metadata
-import logging
 from typing import Any
 
 from nta_runtime.adapters.vllm_v1 import (
@@ -23,7 +22,6 @@ from nta_runtime.adapters.vllm_v1 import (
 SUPPORTED_VLLM_VERSION = "0.26.0"
 _REGISTERED = False
 _PATCHED = False
-logger = logging.getLogger(__name__)
 
 
 def _check_version() -> None:
@@ -93,10 +91,9 @@ def register() -> None:
         class_path="nta_runtime.engines.vllm.NtaVllmFlashInferBackend",
     )
     _REGISTERED = True
-    try:
-        _patch_worker()
-    except Exception:
-        # Engine-core processes may intentionally avoid importing CUDA worker
-        # modules.  Registration is still valid there; the worker process
-        # repeats plugin loading and installs the sidecar at its boundary.
-        logger.exception("vLLM worker sidecar was not installed in this process")
+    # The vLLM general-plugin loader runs in every engine process that can
+    # execute a worker.  Do not swallow an import or patching error here:
+    # without the sidecar, CUSTOM backend selection would leave identity and
+    # exact demand unbound and fail much later inside attention.  Version
+    # checking above makes this strict patch safe for the pinned profile.
+    _patch_worker()

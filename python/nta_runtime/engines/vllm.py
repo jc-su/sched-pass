@@ -40,6 +40,7 @@ from nta_runtime.adapters.base import EngineBatch
 from nta_runtime.adapters.vllm_v1 import (
     VllmV1Hook,
     current_vllm_v1_forward_state,
+    validate_vllm_attention_tier,
 )
 from nta_runtime.execution_core import ExecutionSession, ExecutionTile
 from nta_runtime.execution_protocol import ExecutionProtocolConfig
@@ -315,6 +316,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         # profile until an external KVConnector supplies the same exact
         # demand/lifetime boundary.
         self._native_enabled = os.environ.get("NTA_VLLM_NATIVE", "0") == "1"
+        validate_vllm_attention_tier()
 
     def _ensure_wrapper(self, query: torch.Tensor, kv_cache: torch.Tensor) -> None:
         if self._nta_wrapper is not None:
@@ -504,12 +506,22 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             )
         if indptr.numel() != attn_metadata.num_decodes + 1:
             raise RuntimeError("vLLM FlashInfer page indptr has the wrong request count")
-        page_count = int(indptr[-1].item())
-        if page_count <= 0 or indices.numel() < page_count:
+        if any(
+            tensor.dtype != torch.int32 or not tensor.is_cuda or not tensor.is_contiguous()
+            for tensor in (indptr, indices, last_page_len)
+        ):
+            raise RuntimeError(
+                "vLLM FlashInfer paged-KV buffers must be contiguous CUDA int32 tensors"
+            )
+        # The non-graph FlashInfer wrapper stores exactly the ``indices`` tensor
+        # supplied to ``plan``.  Use its host-known length instead of reading
+        # ``indptr[-1]`` back to Python, which would add a synchronization to
+        # every attention layer.  The wrapper itself has already validated the
+        # indptr/indices geometry while planning.
+        page_count = indices.numel()
+        if page_count <= 0:
             raise RuntimeError("vLLM FlashInfer page-index buffer is incomplete")
-        indptr = indptr.to(dtype=torch.int32)
-        indices = indices[:page_count].to(dtype=torch.int32)
-        last_page_len = last_page_len[: attn_metadata.num_decodes].to(dtype=torch.int32)
+        last_page_len = last_page_len[: attn_metadata.num_decodes]
         page_size = int(getattr(state, "page_size", 0) or 0)
         if page_size <= 0:
             raise RuntimeError("vLLM forward sidecar has no token page size")
@@ -644,6 +656,8 @@ def consumer_contract() -> dict[str, Any]:
             "engine_version": SUPPORTED_VLLM_VERSION,
             "kind": "native_work_unit",
             "native_launches": native,
+            "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
+            "resident_only": True,
         }
     if VLLM_STATS["reference_attention_launches"]:
         return {

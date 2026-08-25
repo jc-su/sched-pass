@@ -137,13 +137,14 @@ matrix.
 The framework distributions must be installed only after the deployment has
 resolved their non-conflicting serving dependencies. `tests/runtime/engine_environment.py`
 and the native CTest gate then verify the actual interpreter, imports, and
-framework/plugin versions; artifact metadata records those versions. Never
-expect `pip install -e '.[sglang,vllm]'` to resolve this profile: pip currently
-rejects the upstream `numba` and `apache-tvm-ffi` pin conflict. After the
-framework environment is provisioned as above, the editable project install
-can be expressed as `pip install -e '.[sglang,vllm]' --no-deps`; the environment
-gate remains mandatory and prevents an unqualified combination from becoming
-an artifact claim.
+framework/plugin versions; artifact metadata records those versions. The
+supported project entry point is `pip install -e '.[sglang,vllm]'`. On the
+current pinned SGLang/vLLM profile, pip may need the framework dependencies
+pre-provisioned because their upstream `numba` and `apache-tvm-ffi` pins
+conflict; in that already-provisioned environment the equivalent editable
+install is `pip install -e '.[sglang,vllm]' --no-deps`. The environment gate
+remains mandatory and prevents an unqualified combination from becoming an
+artifact claim.
 
 Serving harnesses share `benchmarks/serving/cuda_environment.py`. They select
 the toolkit matching `torch.version.cuda` (or an explicit `--cuda-home`), pass

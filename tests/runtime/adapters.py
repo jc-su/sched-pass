@@ -5,7 +5,10 @@ from nta_runtime.adapters.sglang import (
 )
 from nta_runtime.adapters.base import ConsumerContract, ConsumerKind, EngineBoundary
 from nta_runtime.adapters.vllm import VllmAdapter, VllmSchedulerProjection
-from nta_runtime.adapters.vllm_v1 import VllmV1Hook
+from nta_runtime.adapters.vllm_v1 import (
+    VllmV1Hook,
+    validate_vllm_attention_tier,
+)
 from nta_runtime.execution_protocol import ProtocolKind
 from nta_runtime.work_unit import Granularity
 
@@ -88,6 +91,16 @@ class FakeVllmV1Consumer:
 
 
 def main() -> None:
+    assert validate_vllm_attention_tier({}) == "host_staged"
+    assert validate_vllm_attention_tier({"NTA_SERVING_TIER": "host"}) == "host_staged"
+    for value in ("nvme", "cxl", "cxl_dax"):
+        try:
+            validate_vllm_attention_tier({"NTA_SERVING_TIER": value})
+        except RuntimeError as error:
+            assert "physical tier" in str(error)
+        else:
+            raise AssertionError("vLLM resident consumer accepted a physical tier")
+
     config = SglangExecutionConfig.from_environment(
         {
             "NTA_EXECUTION_PROTOCOL": "partial",

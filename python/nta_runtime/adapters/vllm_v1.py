@@ -19,6 +19,7 @@ import contextvars
 from dataclasses import dataclass
 import heapq
 import importlib.metadata
+import os
 from typing import Any, Protocol
 
 from .base import ConsumerContract, ExactDemandProjection, EngineBatch
@@ -27,6 +28,37 @@ from ..work_unit import Granularity
 
 
 SUPPORTED_VLLM_V1_VERSION = "0.26.0"
+
+
+def validate_vllm_attention_tier(
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Validate the tier visible to the vLLM numerical consumer.
+
+    The current vLLM ``AttentionImpl`` consumes resident KV pages.  A
+    physical tier must therefore be rejected before construction; otherwise
+    an operator could set ``NTA_SERVING_TIER=nvme`` while the framework still
+    served the resident cache and produce a misleading artifact.  The
+    framework-neutral host-staged default remains allowed for the reference
+    and resident qualification profiles; it is not treated as proof of an
+    external vLLM transfer.
+    """
+    values = os.environ if environ is None else environ
+    selected = values.get("NTA_SERVING_TIER", "host_staged").strip().lower()
+    if selected == "host":
+        selected = "host_staged"
+    if selected == "cxl":
+        selected = "cxl_dax"
+    if selected not in {"host_staged", "nvme", "cxl_dax"}:
+        raise RuntimeError(
+            "NTA_SERVING_TIER must be host_staged, nvme, or cxl_dax for vLLM"
+        )
+    if selected in {"nvme", "cxl_dax"}:
+        raise RuntimeError(
+            "vLLM resident attention cannot consume a physical tier; configure "
+            "a tested V1 KVConnector/data-lifetime adapter first"
+        )
+    return selected
 
 
 @dataclass
