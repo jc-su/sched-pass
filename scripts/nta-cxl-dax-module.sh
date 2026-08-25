@@ -10,6 +10,22 @@ die() {
   exit 1
 }
 
+# Keep the complete, read-only CXL-to-devdax plumbing in one place.  Loading a
+# module does not create a CXL endpoint; firmware and a Type-3 device must
+# still enumerate the topology.  cxl_pci is included explicitly because a
+# PCIe CXL.mem endpoint will otherwise remain invisible even when cxl_mem is
+# available as a module.
+CXL_MODULES=(
+  cxl_core
+  cxl_port
+  cxl_pci
+  cxl_mem
+  cxl_acpi
+  cxl_pmem
+  dax_cxl
+  device_dax
+)
+
 as_root() {
   if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
     "$@"
@@ -28,30 +44,44 @@ module_state() {
 }
 
 inventory() {
-  command -v cxl >/dev/null 2>&1 || die "cxl utility is not installed"
-  command -v daxctl >/dev/null 2>&1 || die "daxctl utility is not installed"
   printf 'cxl_memdevs=\n'
-  cxl list -M -i 2>&1 || true
+  if command -v cxl >/dev/null 2>&1; then
+    cxl list -M -i 2>&1 || true
+  else
+    printf 'unavailable (cxl utility is not installed)\n'
+  fi
   printf 'cxl_regions=\n'
-  cxl list -R 2>&1 || true
+  if command -v cxl >/dev/null 2>&1; then
+    cxl list -R 2>&1 || true
+  else
+    printf 'unavailable (cxl utility is not installed)\n'
+  fi
   printf 'devdax=\n'
-  daxctl list -u 2>&1 || true
+  if command -v daxctl >/dev/null 2>&1; then
+    daxctl list -u 2>&1 || true
+  else
+    printf 'unavailable (daxctl utility is not installed)\n'
+  fi
+}
+
+print_module_state() {
+  printf 'kernel=%s' "$(uname -r)"
+  for module in "${CXL_MODULES[@]}"; do
+    printf ' %s' "$(module_state "$module")"
+  done
+  printf '\n'
 }
 
 case ${1:-status} in
 load)
-  for module in cxl_mem dax_cxl device_dax; do
+  for module in "${CXL_MODULES[@]}"; do
     as_root modprobe "$module"
   done
-  printf 'kernel=%s %s %s %s\n' "$(uname -r)" \
-    "$(module_state cxl_mem)" "$(module_state dax_cxl)" \
-    "$(module_state device_dax)"
+  print_module_state
   inventory
   ;;
 status)
-  printf 'kernel=%s %s %s %s\n' "$(uname -r)" \
-    "$(module_state cxl_mem)" "$(module_state dax_cxl)" \
-    "$(module_state device_dax)"
+  print_module_state
   inventory
   ;;
 *)

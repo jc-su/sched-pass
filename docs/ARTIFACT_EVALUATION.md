@@ -177,6 +177,11 @@ multi-GPU and framework-specific serving tests.
 `nta-cxl-dax-discovery` and `nta-nvme-discovery` always execute the read-only
 capability-discovery path, including a temporary sysfs/devdax fixture, and
 report `candidate=none` for the live platform when it has no usable endpoint.
+`nta-physical-tier-capability` also executes the live, read-only CXL module and
+CLI inventory on every host; it records whether the plumbing is loaded and
+whether a devdax inventory is visible without treating that state as physical
+qualification. The module bring-up loads `cxl_pci` in addition to the CXL
+memory and DAX modules, which is required for PCIe CXL.mem enumeration.
 The physical mapping probes remain capability-gated because turning an absent
 endpoint into a passing result would invalidate the artifact. On a new host,
 `./scripts/nta-cxl-dax-module.sh load` loads the read-only kernel plumbing and

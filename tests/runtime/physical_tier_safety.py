@@ -22,7 +22,18 @@ def main() -> None:
         "nvme format",
     ):
         assert forbidden not in cxl_script
-    for required in ("cxl_mem", "dax_cxl", "device_dax", "cxl list -M -i", "daxctl list -u"):
+    for required in (
+        "cxl_core",
+        "cxl_port",
+        "cxl_pci",
+        "cxl_mem",
+        "cxl_acpi",
+        "cxl_pmem",
+        "dax_cxl",
+        "device_dax",
+        "cxl list -M -i",
+        "daxctl list -u",
+    ):
         assert required in cxl_script
 
     cxl_runtime = (ROOT / "runtime" / "host" / "CxlRuntime.cpp").read_text(
