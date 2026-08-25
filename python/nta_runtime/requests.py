@@ -46,10 +46,12 @@ class RequestIdentityRegistry:
         self._runtime = runtime
         self._capacity = capacity
         self._slots: dict[int, tuple[str, int, int, int, int]] = {}
-        # The native ABI intentionally carries a compact uint64 identity.  Keep
-        # the source spelling for every identity ever observed so a collision
-        # fails closed instead of aliasing two tenants/requests after reuse.
-        self._stable_ids: dict[int, str] = {}
+        # The native ABI intentionally carries a compact uint64 identity.  The
+        # collision table is bounded by the number of active slots: generation
+        # checks protect retired work, so retaining every historical spelling
+        # would only create an unbounded control-plane leak in a long-running
+        # server.
+        self._active_ids: dict[int, tuple[str, int]] = {}
         self._active_slots: set[int] = set()
         self.last_publish_count = 0
         self.last_metadata_publish_count = 0
@@ -86,6 +88,13 @@ class RequestIdentityRegistry:
         updates: list[RequestSpec] = []
         slot_updates: list[tuple[int, tuple[str, int, int, int, int]]] = []
         batch_request_slots: dict[str, int] = {}
+        target_slots = set(request_slots)
+        prospective_active_ids = {
+            stable_id: identity
+            for stable_id, identity in self._active_ids.items()
+            if identity[1] not in target_slots
+        }
+        batch_stable_ids: dict[int, str] = {}
         for request_index, (
             request_id,
             request_slot,
@@ -108,16 +117,29 @@ class RequestIdentityRegistry:
             if previous_slot is not None and previous_slot != request_slot:
                 raise ValueError(
                     "a serving batch cannot bind one request ID to multiple slots"
-                )
+            )
             batch_request_slots[request_id] = request_slot
             stable_id = stable_request_id(request_id)
-            previous_id = self._stable_ids.get(stable_id)
-            if previous_id is not None and previous_id != request_id:
+            previous_batch_id = batch_stable_ids.get(stable_id)
+            if previous_batch_id is not None and previous_batch_id != request_id:
                 raise ValueError(
                     "request ID hash collision for native uint64 identity: "
-                    f"{previous_id!r} and {request_id!r}"
+                    f"{previous_batch_id!r} and {request_id!r}"
                 )
-            self._stable_ids.setdefault(stable_id, request_id)
+            previous_active = prospective_active_ids.get(stable_id)
+            if previous_active is not None:
+                previous_active_id, previous_active_slot = previous_active
+                if previous_active_id != request_id:
+                    raise ValueError(
+                        "request ID hash collision for native uint64 identity: "
+                        f"{previous_active_id!r} and {request_id!r}"
+                    )
+                if previous_active_slot != request_slot:
+                    raise ValueError(
+                        "a serving request ID cannot be active in multiple slots"
+                    )
+            batch_stable_ids[stable_id] = request_id
+            prospective_active_ids[stable_id] = (request_id, request_slot)
             if request_slot < 0 or request_slot >= self._capacity:
                 raise ValueError(
                     f"request slot {request_slot} exceeds capacity {self._capacity}"
@@ -177,6 +199,7 @@ class RequestIdentityRegistry:
             for request_slot, current in slot_updates:
                 self._slots[request_slot] = current
                 self._active_slots.add(request_slot)
+        self._active_ids = prospective_active_ids
         return tuple(bindings)
 
     def cancel(self, request_id: str) -> bool:
@@ -184,6 +207,7 @@ class RequestIdentityRegistry:
             if request_slot in self._active_slots and active_id == request_id:
                 self._runtime.cancel_request(request_slot, generation)
                 self._active_slots.remove(request_slot)
+                self._active_ids.pop(stable_request_id(active_id), None)
                 return True
         return False
 
@@ -192,12 +216,13 @@ class RequestIdentityRegistry:
         if not all and not request_id_prefix:
             return 0
         matches = [
-            (request_slot, generation)
+            (request_slot, request_id, generation)
             for request_slot, (request_id, generation, _, _, _) in self._slots.items()
             if request_slot in self._active_slots
             and (all or request_id.startswith(request_id_prefix))
         ]
-        for request_slot, generation in matches:
+        for request_slot, request_id, generation in matches:
             self._runtime.cancel_request(request_slot, generation)
             self._active_slots.remove(request_slot)
+            self._active_ids.pop(stable_request_id(request_id), None)
         return len(matches)

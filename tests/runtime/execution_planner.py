@@ -11,6 +11,10 @@ from nta_runtime.execution_planner import (
 
 
 def main() -> None:
+    calibrated = HostCostModel.from_environment(
+        {"NTA_TIER_HOST_STAGED_BANDWIDTH_BPS": "123456789"}
+    )
+    assert calibrated.bandwidth_bytes_per_second == 123456789
     assert (
         indexed_copy_blocks_per_group(transfer_bytes=4 * 1024 * 1024, object_count=2)
         == 4

@@ -106,6 +106,8 @@ bool validateTypedInstrumentationContract(Module &module) {
       operator_contract::ExactDemand |
       operator_contract::GenerationSafeIdentity |
       operator_contract::TierOwnership;
+  constexpr std::uint64_t knownTierMask =
+      (std::uint64_t{1} << abi::BackendCount) - 1U;
   if ((flags & requiredFlags) != requiredFlags ||
       identity != static_cast<std::uint64_t>(
                       operator_contract::IdentityBinding::RequestSlotGeneration) ||
@@ -113,7 +115,7 @@ bool validateTypedInstrumentationContract(Module &module) {
                     operator_contract::DemandBinding::ExactWorkUnit) ||
       proof != static_cast<std::uint64_t>(
                    operator_contract::AccessProof::TypedFrontend) ||
-      tierMask == 0) {
+      tierMask == 0 || (tierMask & ~knownTierMask) != 0) {
     module.getContext().emitError(
         "NTA typed operator contract lacks exact identity/demand/tier proofs");
     return false;

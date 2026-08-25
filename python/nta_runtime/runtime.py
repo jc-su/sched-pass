@@ -207,6 +207,11 @@ class OperatorContract:
     granularity_bytes: int = 0
     tier_mask: int = 0
 
+    def __post_init__(self) -> None:
+        known_tiers = (1 << 6) - 1
+        if self.tier_mask < 0 or self.tier_mask & ~known_tiers:
+            raise ValueError("JIT operator contract names an unknown tier")
+
     def require(
         self,
         *,

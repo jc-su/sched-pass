@@ -34,6 +34,7 @@ public:
 
   [[nodiscard]] void *hostAddress() const noexcept;
   [[nodiscard]] void *deviceAddress() const noexcept;
+  [[nodiscard]] std::size_t offset() const noexcept;
   [[nodiscard]] std::size_t bytes() const noexcept;
 
 private:
@@ -43,6 +44,12 @@ private:
   std::size_t bytes_ = 0;
 
   friend class CxlDaxTransport;
+};
+
+struct CxlDaxUsage {
+  std::size_t windowBytes = 0;
+  std::size_t allocatedBytes = 0;
+  std::size_t availableBytes = 0;
 };
 
 // CUDA-visible CXL memory is a mapped host replica, not an NVMe-like queue.
@@ -63,6 +70,7 @@ public:
   [[nodiscard]] CxlDaxCapabilities capabilities() const noexcept;
   [[nodiscard]] int deviceOrdinal() const noexcept;
   [[nodiscard]] void *deviceAddress() const noexcept;
+  [[nodiscard]] CxlDaxUsage usage() const noexcept;
   [[nodiscard]] bool containsDeviceAddress(const void *address,
                                            std::size_t bytes) const noexcept;
   [[nodiscard]] std::unique_ptr<CxlDaxBuffer>

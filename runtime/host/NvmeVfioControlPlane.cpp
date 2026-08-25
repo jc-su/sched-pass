@@ -257,59 +257,26 @@ void setPrp1(Submission &command, std::uint64_t address) {
   std::memcpy(&command.dword[6], &little, sizeof(little));
 }
 
-class VfioNvmeControlPlane final : public NvmeControlPlane,
-                                   public NvmeMappingBackend {
+struct VfioNvmeMappingContext {
+  const std::string &bdf;
+  FileDescriptor &iommufd;
+  std::uint32_t &ioasId;
+  std::size_t pageSize;
+  std::mutex &mutex;
+  bool &quiesced;
+  bool &fatal;
+};
+
+class VfioNvmeMappingBackend final : public NvmeMappingBackend {
 public:
-  explicit VfioNvmeControlPlane(const NvmeTransportOptions &options)
-      : bdf_(parseBdf(options.endpoint)), namespaceId_(options.namespaceId),
-        requestedQueueDepth_(options.queueDepth),
-        adminTimeout_(options.adminTimeoutMs),
-        mediaPolicy_(options.mediaPolicy) {
-    if (namespaceId_ == 0 || requestedQueueDepth_ < 2 ||
-        requestedQueueDepth_ > MaximumQueueDepth ||
-        options.adminTimeoutMs == 0) {
-      throw std::invalid_argument(
-          "VFIO namespace, queue depth, and admin timeout must be valid");
-    }
-    const long systemPage = ::sysconf(_SC_PAGESIZE);
-    if (systemPage != static_cast<long>(NvmeIdentifyBytes)) {
-      throw std::runtime_error(
-          "VFIO NVMe requires 4 KiB host pages to isolate doorbells");
-    }
-    pageSize_ = static_cast<std::size_t>(systemPage);
+  explicit VfioNvmeMappingBackend(VfioNvmeMappingContext context)
+      : context_(context) {}
 
-    try {
-      openAndAttach();
-      mapBarAndReset();
-      inspectCapabilities();
-      allocateAdminMemory();
-      enableController();
-      identifyControllerAndNamespace();
-      protectActiveNamespaces();
-      configureIoQueues();
-      allocateAndCreateIoQueue();
-      publishResources(options.deviceOrdinal);
-    } catch (...) {
-      cleanup();
-      throw;
-    }
-  }
-
-  ~VfioNvmeControlPlane() override { cleanup(); }
-
-  [[nodiscard]] const NvmeQueueResources &resources() const noexcept override {
-    return resources_;
-  }
-
-  [[nodiscard]] NvmeMappingBackend &mappingBackend() noexcept override {
-    return *this;
-  }
+  ~VfioNvmeMappingBackend() override { shutdown(); }
 
   [[nodiscard]] NvmeMapping mapHost(void *address, std::size_t bytes) override {
-    std::scoped_lock lock(mutex_);
-    if (quiesced_ || fatal_) {
-      throw std::runtime_error("VFIO NVMe queue is not accepting DMA mappings");
-    }
+    std::scoped_lock lock(context_.mutex);
+    ensureAvailable("VFIO NVMe queue is not accepting DMA mappings");
     // Peer PTEs are installed directly in the attached IOMMU domain and are
     // intentionally outside IOMMUFD's userspace IOVA allocator. All ordinary
     // IOAS mappings must therefore be complete before the first peer map so a
@@ -318,8 +285,8 @@ public:
       throw std::runtime_error(
           "VFIO host mappings must precede every HBM peer mapping");
     }
-    if (reinterpret_cast<std::uintptr_t>(address) % pageSize_ != 0 ||
-        bytes == 0 || bytes % pageSize_ != 0) {
+    if (reinterpret_cast<std::uintptr_t>(address) % context_.pageSize != 0 ||
+        bytes == 0 || bytes % context_.pageSize != 0) {
       throw std::invalid_argument("VFIO DMA mapping must be page aligned");
     }
     return publishHostMapping(mapIoas(address, bytes), bytes);
@@ -327,14 +294,11 @@ public:
 
   [[nodiscard]] NvmeMapping mapHbm(std::uint64_t gpuAddress,
                                    std::size_t bytes) override {
-    std::scoped_lock lock(mutex_);
-    if (quiesced_ || fatal_) {
-      throw std::runtime_error(
-          "VFIO NVMe queue is not accepting HBM peer mappings");
-    }
+    std::scoped_lock lock(context_.mutex);
+    ensureAvailable("VFIO NVMe queue is not accepting HBM peer mappings");
     constexpr std::size_t peerAlignment = 64U * 1024U;
     if (gpuAddress == 0 || gpuAddress % peerAlignment != 0 || bytes == 0 ||
-        bytes % peerAlignment != 0 || bytes % pageSize_ != 0) {
+        bytes % peerAlignment != 0 || bytes % context_.pageSize != 0) {
       throw std::invalid_argument(
           "NVMe HBM peer mapping must be 64 KiB aligned");
     }
@@ -345,9 +309,9 @@ public:
     if (!token) {
       return;
     }
-    std::scoped_lock lock(mutex_);
+    std::scoped_lock lock(context_.mutex);
     if (token.kind == NvmeMappingToken::Kind::HostIoas) {
-      if (iommufd_.get() < 0) {
+      if (context_.iommufd.get() < 0) {
         return;
       }
       const auto mapping = dmaMappings_.find(token.value);
@@ -361,14 +325,32 @@ public:
     }
   }
 
-  void quiesce() noexcept override {
-    std::scoped_lock lock(mutex_);
-    quiesceLocked();
+  void shutdown() noexcept override {
+    std::scoped_lock lock(context_.mutex);
+    for (const std::uint64_t handle : peerMappings_) {
+      if (peerMapper_.get() >= 0) {
+        nta_nvme_p2p_unmap request{sizeof(request), NTA_NVME_P2P_ABI_VERSION,
+                                   handle};
+        (void)::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_UNMAP, &request);
+      }
+    }
+    peerMappings_.clear();
+    for (const auto &[iova, bytes] : dmaMappings_) {
+      unmapIoas(iova, bytes);
+    }
+    dmaMappings_.clear();
+    peerMapper_.reset();
   }
 
 private:
+  void ensureAvailable(const char *message) const {
+    if (context_.quiesced || context_.fatal) {
+      throw std::runtime_error(message);
+    }
+  }
+
   NvmeMapping publishHostMapping(std::uint64_t iova, std::size_t bytes) {
-    if (iova == 0 || bytes == 0 || bytes % pageSize_ != 0 ||
+    if (iova == 0 || bytes == 0 || bytes % context_.pageSize != 0 ||
         bytes > std::numeric_limits<std::uint64_t>::max() - iova) {
       if (iova != 0) {
         unmapIoas(iova, bytes);
@@ -382,8 +364,9 @@ private:
       }
       (void)mapping;
       std::vector<std::uint64_t> pages;
-      pages.reserve(bytes / pageSize_);
-      for (std::size_t offset = 0; offset < bytes; offset += pageSize_) {
+      pages.reserve(bytes / context_.pageSize);
+      for (std::size_t offset = 0; offset < bytes;
+           offset += context_.pageSize) {
         pages.push_back(iova + offset);
       }
       return makeMapping({NvmeMappingToken::Kind::HostIoas, iova},
@@ -404,7 +387,7 @@ private:
         throwSystem("open " NTA_NVME_P2P_DEVICE_PATH);
       }
     }
-    const std::size_t maximumEntries = bytes / pageSize_;
+    const std::size_t maximumEntries = bytes / context_.pageSize;
     if (maximumEntries == 0 ||
         maximumEntries > std::numeric_limits<std::uint32_t>::max()) {
       throw std::overflow_error("NVMe HBM peer page count overflows UAPI");
@@ -415,16 +398,15 @@ private:
     request.abi_version = NTA_NVME_P2P_ABI_VERSION;
     request.gpu_address = gpuAddress;
     request.bytes = bytes;
-    request.pci_domain =
-        static_cast<std::uint32_t>(std::stoul(bdf_.substr(0, 4), nullptr, 16));
-    request.pci_bus =
-        static_cast<std::uint32_t>(std::stoul(bdf_.substr(5, 2), nullptr, 16));
-    request.pci_device =
-        static_cast<std::uint32_t>(std::stoul(bdf_.substr(8, 2), nullptr, 16));
-    request.pci_function =
-        static_cast<std::uint32_t>(std::stoul(bdf_.substr(11, 1), nullptr, 16));
-    request.dma_addresses =
-        reinterpret_cast<std::uint64_t>(nativeAddresses.data());
+    request.pci_domain = static_cast<std::uint32_t>(
+        std::stoul(context_.bdf.substr(0, 4), nullptr, 16));
+    request.pci_bus = static_cast<std::uint32_t>(
+        std::stoul(context_.bdf.substr(5, 2), nullptr, 16));
+    request.pci_device = static_cast<std::uint32_t>(
+        std::stoul(context_.bdf.substr(8, 2), nullptr, 16));
+    request.pci_function = static_cast<std::uint32_t>(
+        std::stoul(context_.bdf.substr(11, 1), nullptr, 16));
+    request.dma_addresses = reinterpret_cast<std::uint64_t>(nativeAddresses.data());
     request.dma_capacity = static_cast<std::uint32_t>(maximumEntries);
     if (::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_MAP, &request) != 0) {
       throwSystem("NTA_NVME_P2P_IOCTL_MAP");
@@ -435,8 +417,9 @@ private:
       (void)::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_UNMAP, &unmapRequest);
     };
     if (request.handle == 0 || request.entry_count == 0 ||
-        request.entry_count > maximumEntries || request.page_size < pageSize_ ||
-        request.page_size % pageSize_ != 0 ||
+        request.entry_count > maximumEntries ||
+        request.page_size < context_.pageSize ||
+        request.page_size % context_.pageSize != 0 ||
         static_cast<std::uint64_t>(request.entry_count) * request.page_size !=
             bytes) {
       rollback();
@@ -445,21 +428,21 @@ private:
     }
     try {
       std::vector<std::uint64_t> pages;
-      pages.reserve(bytes / pageSize_);
+      pages.reserve(bytes / context_.pageSize);
       for (std::uint32_t index = 0; index < request.entry_count; ++index) {
         const std::uint64_t base = nativeAddresses[index];
-        if (base == 0 || base % pageSize_ != 0 ||
+        if (base == 0 || base % context_.pageSize != 0 ||
             base > std::numeric_limits<std::uint64_t>::max() -
-                       (request.page_size - pageSize_)) {
+                       (request.page_size - context_.pageSize)) {
           throw std::runtime_error(
               "NVIDIA peer mapper returned a misaligned DMA address");
         }
         for (std::uint32_t offset = 0; offset < request.page_size;
-             offset += static_cast<std::uint32_t>(pageSize_)) {
+             offset += static_cast<std::uint32_t>(context_.pageSize)) {
           pages.push_back(base + offset);
         }
       }
-      if (pages.size() != bytes / pageSize_) {
+      if (pages.size() != bytes / context_.pageSize) {
         throw std::runtime_error(
             "expanded NVIDIA peer vector does not cover the HBM range");
       }
@@ -487,6 +470,99 @@ private:
     (void)::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_UNMAP, &request);
   }
 
+  std::uint64_t mapIoas(void *address, std::size_t bytes) {
+    iommu_ioas_map request{};
+    request.size = sizeof(request);
+    request.flags = IOMMU_IOAS_MAP_READABLE | IOMMU_IOAS_MAP_WRITEABLE;
+    request.ioas_id = context_.ioasId;
+    request.user_va = reinterpret_cast<std::uint64_t>(address);
+    request.length = bytes;
+    if (::ioctl(context_.iommufd.get(), IOMMU_IOAS_MAP, &request) != 0) {
+      throwSystem("IOMMU_IOAS_MAP");
+    }
+    if (request.iova == 0 || request.iova % context_.pageSize != 0) {
+      if (request.iova != 0) {
+        unmapIoas(request.iova, bytes);
+      }
+      throw std::runtime_error("IOMMUFD returned an invalid IOVA");
+    }
+    return request.iova;
+  }
+
+  void unmapIoas(std::uint64_t iova, std::size_t bytes) noexcept {
+    if (context_.iommufd.get() < 0 || context_.ioasId == 0 || bytes == 0) {
+      return;
+    }
+    iommu_ioas_unmap request{};
+    request.size = sizeof(request);
+    request.ioas_id = context_.ioasId;
+    request.iova = iova;
+    request.length = bytes;
+    (void)::ioctl(context_.iommufd.get(), IOMMU_IOAS_UNMAP, &request);
+  }
+
+  VfioNvmeMappingContext context_;
+  FileDescriptor peerMapper_;
+  std::unordered_map<std::uint64_t, std::size_t> dmaMappings_;
+  std::unordered_set<std::uint64_t> peerMappings_;
+};
+
+class VfioNvmeControlPlane final : public NvmeControlPlane {
+public:
+  explicit VfioNvmeControlPlane(const NvmeTransportOptions &options)
+      : bdf_(parseBdf(options.endpoint)), namespaceId_(options.namespaceId),
+        requestedQueueDepth_(options.queueDepth),
+        adminTimeout_(options.adminTimeoutMs),
+        mediaPolicy_(options.mediaPolicy) {
+    if (namespaceId_ == 0 || requestedQueueDepth_ < 2 ||
+        requestedQueueDepth_ > MaximumQueueDepth ||
+        options.adminTimeoutMs == 0) {
+      throw std::invalid_argument(
+          "VFIO namespace, queue depth, and admin timeout must be valid");
+    }
+    const long systemPage = ::sysconf(_SC_PAGESIZE);
+    if (systemPage != static_cast<long>(NvmeIdentifyBytes)) {
+      throw std::runtime_error(
+          "VFIO NVMe requires 4 KiB host pages to isolate doorbells");
+    }
+    pageSize_ = static_cast<std::size_t>(systemPage);
+    mappingBackend_ = std::make_unique<VfioNvmeMappingBackend>(
+        VfioNvmeMappingContext{bdf_, iommufd_, ioasId_, pageSize_, mutex_,
+                               quiesced_, fatal_});
+
+    try {
+      openAndAttach();
+      mapBarAndReset();
+      inspectCapabilities();
+      allocateAdminMemory();
+      enableController();
+      identifyControllerAndNamespace();
+      protectActiveNamespaces();
+      configureIoQueues();
+      allocateAndCreateIoQueue();
+      publishResources(options.deviceOrdinal);
+    } catch (...) {
+      cleanup();
+      throw;
+    }
+  }
+
+  ~VfioNvmeControlPlane() override { cleanup(); }
+
+  [[nodiscard]] const NvmeQueueResources &resources() const noexcept override {
+    return resources_;
+  }
+
+  [[nodiscard]] NvmeMappingBackend &mappingBackend() noexcept override {
+    return *mappingBackend_;
+  }
+
+  void quiesce() noexcept override {
+    std::scoped_lock lock(mutex_);
+    quiesceLocked();
+  }
+
+private:
   struct DmaRegion {
     void *host = nullptr;
     std::size_t bytes = 0;
@@ -1106,6 +1182,16 @@ private:
     {
       std::scoped_lock lock(mutex_);
       quiesceLocked();
+    }
+    // Queue teardown must precede DMA unmapping.  The mapping backend is a
+    // separate lifecycle owner, but it shares the IOMMU domain with the
+    // control plane and therefore must be shut down before that domain is
+    // destroyed.
+    if (mappingBackend_ != nullptr) {
+      mappingBackend_->shutdown();
+    }
+    {
+      std::scoped_lock lock(mutex_);
       if (controllerEnabled_ && bar_ != nullptr) {
         const std::uint32_t config = readMmio32(NvmeRegisterControllerConfig);
         writeMmio32(NvmeRegisterControllerConfig,
@@ -1117,20 +1203,9 @@ private:
       if (vfioDevice_.get() >= 0 && resetPerformed_) {
         (void)::ioctl(vfioDevice_.get(), VFIO_DEVICE_RESET);
       }
-      for (const std::uint64_t handle : peerMappings_) {
-        nta_nvme_p2p_unmap request{sizeof(request), NTA_NVME_P2P_ABI_VERSION,
-                                   handle};
-        (void)::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_UNMAP, &request);
-      }
-      peerMappings_.clear();
-      for (const auto &[iova, bytes] : dmaMappings_) {
-        unmapIoas(iova, bytes);
-      }
-      dmaMappings_.clear();
       releaseDma(queueMemory_);
       releaseDma(adminMemory_);
     }
-    peerMapper_.reset();
     if (doorbellBar_ != nullptr) {
       (void)::munmap(doorbellBar_, pageSize_);
       doorbellBar_ = nullptr;
@@ -1250,7 +1325,6 @@ private:
   std::size_t pageSize_ = 0;
   FileDescriptor iommufd_;
   FileDescriptor vfioDevice_;
-  FileDescriptor peerMapper_;
   std::uint32_t ioasId_ = 0;
   bool attached_ = false;
   vfio_region_info barRegion_{};
@@ -1291,9 +1365,8 @@ private:
   bool quiesced_ = false;
   bool fatal_ = false;
   NvmeQueueResources resources_{};
-  std::unordered_map<std::uint64_t, std::size_t> dmaMappings_;
-  std::unordered_set<std::uint64_t> peerMappings_;
   std::mutex mutex_;
+  std::unique_ptr<VfioNvmeMappingBackend> mappingBackend_;
 };
 
 } // namespace

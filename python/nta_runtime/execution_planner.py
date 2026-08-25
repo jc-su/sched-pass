@@ -29,10 +29,13 @@ class HostCostModel:
         import os
 
         values = os.environ if environ is None else environ
+        calibrated_bandwidth = values.get(
+            "NTA_TIER_HOST_STAGED_BANDWIDTH_BPS", cls.bandwidth_bytes_per_second
+        )
         return cls(
             bandwidth_bytes_per_second=int(
                 values.get(
-                    f"{prefix}_HOST_BANDWIDTH_BPS", cls.bandwidth_bytes_per_second
+                    f"{prefix}_HOST_BANDWIDTH_BPS", calibrated_bandwidth
                 )
             ),
             round_overhead_ns=int(

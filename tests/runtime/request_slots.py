@@ -84,6 +84,27 @@ assert registry.cancel_matching("agent/") == 2
 assert runtime.cancellations[-2:] == [(0, 2), (1, 1)]
 assert registry.cancel_matching(all=True) == 2
 
+# Collision tracking is bounded by active capacity rather than by the total
+# number of requests served over the process lifetime.
+bounded_runtime = Runtime()
+bounded_registry = RequestIdentityRegistry(bounded_runtime, 2)
+for index in range(32):
+    slot = index % 2
+    request_id = f"short-lived-{index}"
+    bounded_registry.bind([request_id], [slot])
+    assert bounded_registry.cancel(request_id)
+assert bounded_registry._active_ids == {}
+
+active_runtime = Runtime()
+active_registry = RequestIdentityRegistry(active_runtime, 4)
+active_registry.bind(["active-request"], [0])
+try:
+    active_registry.bind(["active-request"], [1])
+except ValueError as error:
+    assert "multiple slots" in str(error)
+else:
+    raise AssertionError("an active request ID was accepted in multiple slots")
+
 collision_runtime = Runtime()
 collision_registry = RequestIdentityRegistry(collision_runtime, 2)
 original_stable_request_id = requests_module.stable_request_id

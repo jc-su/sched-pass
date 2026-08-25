@@ -40,6 +40,7 @@ std::size_t roundUp(std::size_t value, std::size_t alignment) {
 
 struct CxlDaxBuffer::Impl {
   std::shared_ptr<void> owner;
+  std::size_t offset = 0;
   void *hostAddress = nullptr;
   void *deviceAddress = nullptr;
 };
@@ -63,6 +64,7 @@ struct CxlDaxTransport::Impl {
                                options.endpoint);
     }
     windowBytes = options.windowBytes;
+    this->pageSize = static_cast<std::size_t>(pageSize);
     struct stat endpointStat{};
     if (::fstat(fd, &endpointStat) != 0) {
       closeFd();
@@ -142,6 +144,7 @@ struct CxlDaxTransport::Impl {
   int fd = -1;
   int deviceOrdinal = -1;
   std::size_t windowBytes = 0;
+  std::size_t pageSize = 0;
   std::size_t nextOffset = 0;
   std::mutex allocationMutex;
   void *mappedHostAddress = nullptr;
@@ -163,6 +166,10 @@ void *CxlDaxBuffer::hostAddress() const noexcept {
 
 void *CxlDaxBuffer::deviceAddress() const noexcept {
   return impl_ == nullptr ? nullptr : impl_->deviceAddress;
+}
+
+std::size_t CxlDaxBuffer::offset() const noexcept {
+  return impl_ == nullptr ? 0 : impl_->offset;
 }
 
 std::size_t CxlDaxBuffer::bytes() const noexcept { return bytes_; }
@@ -190,6 +197,15 @@ void *CxlDaxTransport::deviceAddress() const noexcept {
   return impl_ == nullptr ? nullptr : impl_->mappedDeviceAddress;
 }
 
+CxlDaxUsage CxlDaxTransport::usage() const noexcept {
+  if (impl_ == nullptr) {
+    return {};
+  }
+  std::lock_guard lock(impl_->allocationMutex);
+  return {impl_->windowBytes, impl_->nextOffset,
+          impl_->windowBytes - impl_->nextOffset};
+}
+
 bool CxlDaxTransport::containsDeviceAddress(const void *address,
                                             std::size_t bytes) const noexcept {
   if (impl_ == nullptr || address == nullptr || bytes == 0 ||
@@ -212,6 +228,11 @@ std::unique_ptr<CxlDaxBuffer> CxlDaxTransport::allocate(std::size_t bytes,
     throw std::invalid_argument(
         "CXL allocation needs a live non-empty transport");
   }
+  if (alignment < impl_->pageSize ||
+      (alignment & (alignment - 1U)) != 0) {
+    throw std::invalid_argument(
+        "CXL allocation alignment must be a page-sized power of two");
+  }
   std::lock_guard lock(impl_->allocationMutex);
   const std::size_t offset = roundUp(impl_->nextOffset, alignment);
   if (offset > impl_->windowBytes || bytes > impl_->windowBytes - offset) {
@@ -220,6 +241,7 @@ std::unique_ptr<CxlDaxBuffer> CxlDaxTransport::allocate(std::size_t bytes,
   impl_->nextOffset = offset + bytes;
   auto bufferImpl = std::make_shared<CxlDaxBuffer::Impl>();
   bufferImpl->owner = impl_;
+  bufferImpl->offset = offset;
   bufferImpl->hostAddress =
       static_cast<std::byte *>(impl_->mappedHostAddress) + offset;
   bufferImpl->deviceAddress =

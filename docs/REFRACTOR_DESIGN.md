@@ -134,6 +134,35 @@ policies. NVMe is device-initiated transport; CXL DAX is a bounded
 device-visible mapped replica. Hardware-specific qualification is explicit
 and fail-closed.
 
+The NVMe implementation has two separate lifecycle owners. The control plane
+owns VFIO attachment, controller reset, queue creation, BAR/doorbell state, and
+queue quiescence. `VfioNvmeMappingBackend` owns IOMMUFD/peer mapping tokens and
+their release. They share only an explicit mapping context; mapping teardown
+occurs after queue quiescence and before the IOMMU domain is destroyed. Mapping
+and page-list publication are setup operations. The GPU queue consumes the
+immutable page list in steady state and does not issue a per-request mapping
+operation.
+
+Non-owning HostRuntime registrations are setup-time validated CUDA views, not
+untyped lifetime claims: HBM, mapped-host, device-visible staged sources, HBM
+staging destinations, and indexed arrays are checked against the selected CUDA
+device before their addresses enter the device directory. The caller still
+owns their storage until the documented acquisition/stream completion edge.
+
+The native request identity uses a compact uint64 value, but collision
+provenance is retained only for active slots. Retired spellings are removed on
+cancellation or replacement; slot generations reject stale device work. This
+keeps collision defense fail-closed without making long-running serving memory
+grow with historical request cardinality.
+
+Tier latency and bandwidth are startup calibration inputs rather than hidden
+compile-time truths. Native descriptors accept
+`NTA_TIER_<HBM|HOST_MAPPED|HOST_STAGED|NVME|CXL|RDMA>_LATENCY_NS` and
+`NTA_TIER_<...>_BANDWIDTH_BPS`; absent values use conservative defaults. A
+qualification artifact should export the measured values for the same machine
+and tier, so the planner and native admission directory are not silently using
+different hardware assumptions.
+
 The JIT `OperatorContract` carries four non-inferable semantic obligations:
 request-slot/generation identity, exact work-unit demand, typed access proof,
 and tier ownership. `TypedInstrumentation.cuh` anchors those values in the

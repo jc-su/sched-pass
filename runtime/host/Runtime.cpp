@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -36,6 +37,90 @@ void checkCuda(cudaError_t result, const char *operation) {
     throw std::runtime_error(std::string(operation) + ": " +
                              cudaGetErrorString(result));
   }
+}
+
+void validateDeviceVisiblePointer(const void *address, int deviceOrdinal,
+                                  const char *description) {
+  if (address == nullptr) {
+    throw std::invalid_argument(std::string(description) + " is null");
+  }
+  cudaPointerAttributes attributes{};
+  const cudaError_t status = cudaPointerGetAttributes(&attributes, address);
+  if (status != cudaSuccess) {
+    (void)cudaGetLastError();
+    throw std::invalid_argument(std::string(description) +
+                                " is not a live CUDA allocation");
+  }
+  const bool deviceAllocation =
+      attributes.type == cudaMemoryTypeDevice ||
+      attributes.type == cudaMemoryTypeManaged;
+  const bool mappedHostAllocation =
+      attributes.type == cudaMemoryTypeHost &&
+      attributes.devicePointer != nullptr;
+  if ((!deviceAllocation && !mappedHostAllocation) ||
+      attributes.device != deviceOrdinal) {
+    throw std::invalid_argument(std::string(description) +
+                                " is not visible on the runtime CUDA device");
+  }
+}
+
+void validateDeviceAllocation(const void *address, int deviceOrdinal,
+                              const char *description) {
+  if (address == nullptr) {
+    throw std::invalid_argument(std::string(description) + " is null");
+  }
+  cudaPointerAttributes attributes{};
+  const cudaError_t status = cudaPointerGetAttributes(&attributes, address);
+  if (status != cudaSuccess) {
+    (void)cudaGetLastError();
+    throw std::invalid_argument(std::string(description) +
+                                " is not a live CUDA allocation");
+  }
+  if ((attributes.type != cudaMemoryTypeDevice &&
+       attributes.type != cudaMemoryTypeManaged) ||
+      attributes.device != deviceOrdinal) {
+    throw std::invalid_argument(std::string(description) +
+                                " must be HBM allocated on the runtime CUDA device");
+  }
+}
+
+void validateMappedHostPointer(const void *address, int deviceOrdinal,
+                               const char *description) {
+  if (address == nullptr) {
+    throw std::invalid_argument(std::string(description) + " is null");
+  }
+  cudaPointerAttributes attributes{};
+  const cudaError_t status = cudaPointerGetAttributes(&attributes, address);
+  if (status != cudaSuccess) {
+    (void)cudaGetLastError();
+    throw std::invalid_argument(std::string(description) +
+                                " is not a live CUDA host mapping");
+  }
+  if (attributes.type != cudaMemoryTypeHost ||
+      attributes.device != deviceOrdinal || attributes.devicePointer == nullptr) {
+    throw std::invalid_argument(std::string(description) +
+                                " must be a device-visible mapped host allocation");
+  }
+}
+
+void validateReplicaAddress(const RegisteredReplicaSpec &replica,
+                            int deviceOrdinal) {
+  switch (replica.placement) {
+  case Placement::Hbm:
+    validateDeviceAllocation(replica.sourceDeviceAddress, deviceOrdinal,
+                             "registered HBM replica source");
+    return;
+  case Placement::HostMapped:
+    validateMappedHostPointer(replica.sourceDeviceAddress, deviceOrdinal,
+                              "registered host-mapped replica source");
+    return;
+  case Placement::HostStaged:
+  case Placement::CxlMapped:
+    validateDeviceVisiblePointer(replica.sourceDeviceAddress, deviceOrdinal,
+                                 "registered replica source");
+    return;
+  }
+  throw std::invalid_argument("unknown registered replica placement");
 }
 
 abi::SourceKind sourceKindFor(Placement placement) {
@@ -86,6 +171,56 @@ std::uint64_t defaultBandwidth(abi::SourceKind kind) {
     return 25'000'000'000ULL;
   }
   return 1;
+}
+
+const char *tierEnvironmentName(abi::SourceKind kind) {
+  switch (kind) {
+  case abi::SourceKind::Hbm:
+    return "HBM";
+  case abi::SourceKind::HostMapped:
+    return "HOST_MAPPED";
+  case abi::SourceKind::HostStaged:
+    return "HOST_STAGED";
+  case abi::SourceKind::Nvme:
+    return "NVME";
+  case abi::SourceKind::Cxl:
+    return "CXL";
+  case abi::SourceKind::Rdma:
+    return "RDMA";
+  }
+  return "UNKNOWN";
+}
+
+std::uint64_t configuredTierValue(abi::SourceKind kind, const char *suffix,
+                                  std::uint64_t fallback,
+                                  bool allowZero) {
+  std::string name = "NTA_TIER_";
+  name += tierEnvironmentName(kind);
+  name += suffix;
+  const char *raw = std::getenv(name.c_str());
+  if (raw == nullptr || *raw == '\0') {
+    return fallback;
+  }
+  if (*raw == '-') {
+    throw std::invalid_argument(name + " must be an unsigned integer");
+  }
+  errno = 0;
+  char *end = nullptr;
+  const unsigned long long value = std::strtoull(raw, &end, 10);
+  if (errno == ERANGE || end == raw || end == nullptr || *end != '\0' ||
+      (!allowZero && value == 0)) {
+    throw std::invalid_argument(name + " is invalid");
+  }
+  return static_cast<std::uint64_t>(value);
+}
+
+std::uint64_t configuredTierLatency(abi::SourceKind kind) {
+  return configuredTierValue(kind, "_LATENCY_NS", defaultLatency(kind), true);
+}
+
+std::uint64_t configuredTierBandwidth(abi::SourceKind kind) {
+  return configuredTierValue(kind, "_BANDWIDTH_BPS", defaultBandwidth(kind),
+                             false);
 }
 
 template <typename T> T *deviceAllocate(std::size_t count) {
@@ -202,6 +337,11 @@ struct HostRuntime::Impl {
     replicaCapacity = config.objectCapacity * config.maxReplicasPerObject;
     dependencyCapacity =
         config.workTicketCapacity * config.maxDependenciesPerWorkTicket;
+    for (std::uint32_t index = 0; index < abi::BackendCount; ++index) {
+      const auto kind = static_cast<abi::SourceKind>(index);
+      tierLatencies[index] = configuredTierLatency(kind);
+      tierBandwidths[index] = configuredTierBandwidth(kind);
+    }
 
     cudaError_t flagsResult = cudaSetDeviceFlags(cudaDeviceMapHost);
     if (flagsResult != cudaSuccess &&
@@ -335,15 +475,21 @@ struct HostRuntime::Impl {
         };
       };
       const std::array<abi::BackendView, abi::BackendCount> hostBackends{
-          backend(abi::SourceKind::Hbm, true, 0, 0, 1'000'000'000'000ULL),
-          backend(abi::SourceKind::HostMapped, true, 0, 300, 50'000'000'000ULL),
-          backend(abi::SourceKind::HostStaged, true, 0, 2'000,
-                  30'000'000'000ULL),
+          backend(abi::SourceKind::Hbm, true, 0,
+                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::Hbm)],
+                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Hbm)]),
+          backend(abi::SourceKind::HostMapped, true, 0,
+                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::HostMapped)],
+                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::HostMapped)]),
+          backend(abi::SourceKind::HostStaged, true, 0,
+                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::HostStaged)],
+                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::HostStaged)]),
           backend(abi::SourceKind::Nvme, nvme != nullptr,
                   nvme == nullptr
                       ? 0
                       : reinterpret_cast<std::uint64_t>(nvme->deviceQueue()),
-                  80'000, 7'000'000'000ULL,
+                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::Nvme)],
+                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Nvme)],
                   nvme != nullptr && config.enableCtaNvmeTryIssue
                       ? abi::BackendCtaTryIssue
                       : 0U),
@@ -351,9 +497,12 @@ struct HostRuntime::Impl {
                   cxl == nullptr
                       ? 0
                       : reinterpret_cast<std::uint64_t>(cxl->deviceAddress()),
-                  1'500, 20'000'000'000ULL,
+                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::Cxl)],
+                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Cxl)],
                   cxl != nullptr ? abi::BackendDeviceVisible : 0U),
-          backend(abi::SourceKind::Rdma, false, 0, 5'000, 25'000'000'000ULL),
+          backend(abi::SourceKind::Rdma, false, 0,
+                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::Rdma)],
+                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Rdma)]),
       };
       checkCuda(cudaMemcpy(backendEntries, hostBackends.data(),
                            sizeof(hostBackends), cudaMemcpyHostToDevice),
@@ -701,6 +850,8 @@ struct HostRuntime::Impl {
   std::vector<std::optional<OwnedObject>> objects;
   std::shared_ptr<NvmeTransport> nvme;
   std::shared_ptr<CxlDaxTransport> cxl;
+  std::array<std::uint64_t, abi::BackendCount> tierLatencies{};
+  std::array<std::uint64_t, abi::BackendCount> tierBandwidths{};
   std::vector<DirectoryUpload> directoryUploads =
       std::vector<DirectoryUpload>(directoryUploadDepth());
   std::size_t nextDirectoryUpload = 0;
@@ -948,8 +1099,8 @@ ObjectHandle HostRuntime::installReplicatedObject(
       replicaEntries.push_back({
           reinterpret_cast<std::uint64_t>(owned.sourceDevice),
           0,
-          defaultLatency(sourceKind),
-          defaultBandwidth(sourceKind),
+          impl_->tierLatencies[static_cast<std::size_t>(sourceKind)],
+          impl_->tierBandwidths[static_cast<std::size_t>(sourceKind)],
           static_cast<std::uint32_t>(sourceKind),
           0,
           static_cast<std::uint32_t>(sourceKind),
@@ -1033,6 +1184,7 @@ HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
       throw std::invalid_argument(
           "registered replica needs a device-visible source address");
     }
+    validateReplicaAddress(replica, impl_->config.deviceOrdinal);
     const bool direct = replica.placement != Placement::HostStaged;
     hasTransport |= !direct;
     const abi::SourceKind sourceKind = sourceKindFor(replica.placement);
@@ -1043,8 +1195,10 @@ HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
       throw std::invalid_argument(
           "CXL replica must belong to the active mapped CXL window");
     }
-    const std::uint64_t defaultLatencyNs = defaultLatency(sourceKind);
-    const std::uint64_t defaultBandwidthBytes = defaultBandwidth(sourceKind);
+    const std::uint64_t defaultLatencyNs =
+        impl_->tierLatencies[static_cast<std::size_t>(sourceKind)];
+    const std::uint64_t defaultBandwidthBytes =
+        impl_->tierBandwidths[static_cast<std::size_t>(sourceKind)];
     const std::uint64_t latency = replica.estimatedLatencyNs == 0
                                       ? defaultLatencyNs
                                       : replica.estimatedLatencyNs;
@@ -1074,6 +1228,10 @@ HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
   if (hasTransport && stagingDeviceAddress == nullptr) {
     throw std::invalid_argument(
         "registered staged replicas need an HBM staging address");
+  }
+  if (hasTransport) {
+    validateDeviceAllocation(stagingDeviceAddress, impl_->config.deviceOrdinal,
+                             "registered staging destination");
   }
 
   const std::uint32_t replicaStart = slot * impl_->config.maxReplicasPerObject;
@@ -1153,14 +1311,26 @@ void HostRuntime::registerIndexedHostObjects(
                                 object.elementBytes) {
       throw std::invalid_argument("invalid indexed host transfer geometry");
     }
+    validateDeviceVisiblePointer(object.sourceDeviceAddress,
+                                 impl_->config.deviceOrdinal,
+                                 "indexed source");
+    validateDeviceAllocation(object.stagingDeviceAddress,
+                             impl_->config.deviceOrdinal,
+                             "indexed staging destination");
+    validateDeviceAllocation(object.sourceIndicesDevice,
+                             impl_->config.deviceOrdinal,
+                             "indexed source indices");
+    validateDeviceAllocation(object.stagingIndicesDevice,
+                             impl_->config.deviceOrdinal,
+                             "indexed staging indices");
     const std::uint32_t slot = firstSlot + static_cast<std::uint32_t>(index);
     const std::uint32_t replicaStart =
         slot * impl_->config.maxReplicasPerObject;
     replicas[index * impl_->config.maxReplicasPerObject] = {
         reinterpret_cast<std::uint64_t>(object.sourceDeviceAddress),
         reinterpret_cast<std::uint64_t>(object.sourceIndicesDevice),
-        2'000,
-        30'000'000'000ULL,
+        impl_->tierLatencies[static_cast<std::size_t>(abi::SourceKind::HostStaged)],
+        impl_->tierBandwidths[static_cast<std::size_t>(abi::SourceKind::HostStaged)],
         static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
         object.indexCount,
         static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
@@ -1244,6 +1414,18 @@ void HostRuntime::registerIndexedHostObjectsAsync(
                                 object.elementBytes) {
       throw std::invalid_argument("invalid indexed host transfer geometry");
     }
+    validateDeviceVisiblePointer(object.sourceDeviceAddress,
+                                 impl_->config.deviceOrdinal,
+                                 "indexed source");
+    validateDeviceAllocation(object.stagingDeviceAddress,
+                             impl_->config.deviceOrdinal,
+                             "indexed staging destination");
+    validateDeviceAllocation(object.sourceIndicesDevice,
+                             impl_->config.deviceOrdinal,
+                             "indexed source indices");
+    validateDeviceAllocation(object.stagingIndicesDevice,
+                             impl_->config.deviceOrdinal,
+                             "indexed staging indices");
     const std::uint32_t slot = firstSlot + static_cast<std::uint32_t>(index);
     const std::uint32_t replicaStart =
         slot * impl_->config.maxReplicasPerObject;
@@ -1329,8 +1511,8 @@ ObjectHandle HostRuntime::installNvmeObject(
   const abi::ReplicaEntry replica{
       sourceByteOffset,
       allocation.nvmeBuffer->dmaPageListAddress(),
-      80'000,
-      7'000'000'000ULL,
+      impl_->tierLatencies[static_cast<std::size_t>(abi::SourceKind::Nvme)],
+      impl_->tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Nvme)],
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
       allocation.nvmeBuffer->dmaPageCount(),
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),

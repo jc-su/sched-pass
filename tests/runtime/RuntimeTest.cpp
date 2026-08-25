@@ -8,8 +8,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace {
@@ -66,7 +68,35 @@ int main() {
     require(dependencyCapacityRejected,
             "dependency capacity must be finite and non-zero");
 
+    const char *previousTierBandwidth =
+        std::getenv("NTA_TIER_HOST_STAGED_BANDWIDTH_BPS");
+    const char *previousTierLatency =
+        std::getenv("NTA_TIER_HOST_STAGED_LATENCY_NS");
+    const std::string savedTierBandwidth =
+        previousTierBandwidth == nullptr ? "" : previousTierBandwidth;
+    const std::string savedTierLatency =
+        previousTierLatency == nullptr ? "" : previousTierLatency;
+    require(setenv("NTA_TIER_HOST_STAGED_BANDWIDTH_BPS", "123456789", 1) == 0 &&
+                setenv("NTA_TIER_HOST_STAGED_LATENCY_NS", "4321", 1) == 0,
+            "tier calibration environment setup failed");
     nta::HostRuntime runtime({4, 4, 4, 4, 2});
+    if (previousTierBandwidth == nullptr) {
+      unsetenv("NTA_TIER_HOST_STAGED_BANDWIDTH_BPS");
+    } else {
+      setenv("NTA_TIER_HOST_STAGED_BANDWIDTH_BPS", savedTierBandwidth.c_str(),
+             1);
+    }
+    if (previousTierLatency == nullptr) {
+      unsetenv("NTA_TIER_HOST_STAGED_LATENCY_NS");
+    } else {
+      setenv("NTA_TIER_HOST_STAGED_LATENCY_NS", savedTierLatency.c_str(), 1);
+    }
+    const nta::TierDescriptor calibratedHostStaged =
+        runtime.tierDescriptor(nta::abi::SourceKind::HostStaged);
+    require(calibratedHostStaged.estimatedBandwidthBytesPerSecond ==
+                    123456789 &&
+                calibratedHostStaged.estimatedLatencyNs == 4321,
+            "native tier descriptors ignored calibration inputs");
     require(runtime.deviceOrdinal() == originalDevice,
             "runtime did not retain its CUDA device owner");
     bool uninitializedCancelRejected = false;
