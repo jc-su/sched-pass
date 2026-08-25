@@ -353,19 +353,21 @@ def main() -> None:
         _group_external_pages_by_request,
         _pipeline_object_range,
         _plan_cache_signature,
-        _request_ranges,
+    )
+    from nta_runtime.flashinfer import (
+        request_ranges_for_schedule as _request_ranges,
     )
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
     assert (
-        _consumer_contract_for_stats({}, engine_version="0.5.14").kind.value
+        _consumer_contract_for_stats({}, engine_version="0.5.16").kind.value
         == "projection_only"
     )
     assert (
         _consumer_contract_for_stats(
             {"stock_prefetched_external_attention_launches": 1},
-            engine_version="0.5.14",
+            engine_version="0.5.16",
         ).kind.value
         == "framework_reference"
     )
@@ -375,7 +377,7 @@ def main() -> None:
                 "stock_prefetched_external_attention_launches": 1,
                 "ticketed_incremental_launches": 1,
             },
-            engine_version="0.5.14",
+            engine_version="0.5.16",
         ).kind.value
         == "native_work_unit"
     )

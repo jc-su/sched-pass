@@ -6,7 +6,7 @@ import importlib.metadata
 import os
 
 
-SUPPORTED_SGLANG_VERSION = "0.5.14"
+SUPPORTED_SGLANG_VERSION = "0.5.16"
 BACKEND_NAME = "nta_flashinfer"
 _RELEASE_TARGET = "sglang.srt.managers.scheduler.Scheduler.release_host_resources"
 _HICACHE_LOAD_TARGET = (
@@ -287,7 +287,7 @@ def _register_hook(registry, target, hook, hook_type) -> None:
 def _require_hooks_installed(registry) -> None:
     """Reject construction after SGLang skipped a required hook.
 
-    SGLang 0.5.14 exposes registration publicly but has no public query for
+    SGLang 0.5.16 exposes registration publicly but has no public query for
     whether ``apply_hooks`` succeeded; its loader also logs-and-continues on
     application errors.  The pinned adapter therefore reads only the
     version-qualified applied-target set here, and fails closed if that

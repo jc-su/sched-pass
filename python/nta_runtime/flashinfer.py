@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from .epoch import BoundedEpoch, EpochResult
 from .runtime import DeviceWorkPlan, JitPhaseProgram, Runtime
+from .runtime import RequestRange
+from .requests import RequestBinding
 
 
 TENSOR_NAMES = ["nta_runtime", "nta_work_items", "nta_dependencies"]
@@ -29,6 +31,45 @@ WORK_COUNT_MASK = (1 << 32) - 1
 
 _DEFAULT_ATTENTION_VARIANT = "DefaultAttention<false, false, false, false>"
 _DEFAULT_ATTENTION_DECL = "#include <flashinfer/attention/variants.cuh>"
+
+
+def request_ranges_for_schedule(
+    bindings: Sequence[RequestBinding], request_indices: Sequence[int]
+) -> list[RequestRange]:
+    """Build the native contiguous request ranges for a CTA schedule.
+
+    FlashInfer emits contributors grouped by request.  Keeping this check in
+    the engine-neutral FlashInfer boundary makes SGLang and vLLM share the
+    same O(work-items) validation and prevents either adapter from silently
+    assigning a contributor to the wrong request generation.
+    """
+    ranges: list[RequestRange] = []
+    cursor = 0
+    for binding in bindings:
+        begin = cursor
+        while (
+            cursor < len(request_indices)
+            and int(request_indices[cursor]) == binding.request_index
+        ):
+            cursor += 1
+        if cursor == begin:
+            raise RuntimeError(
+                f"FlashInfer schedule has no work for request "
+                f"{binding.request_index}"
+            )
+        ranges.append(
+            RequestRange(
+                begin,
+                cursor - begin,
+                binding.request_slot,
+                binding.generation,
+            )
+        )
+    if cursor != len(request_indices):
+        raise RuntimeError(
+            "FlashInfer schedule is not grouped contiguously by request"
+        )
+    return ranges
 
 
 def pack_work_metadata(work_count: int, request_count: int) -> int:

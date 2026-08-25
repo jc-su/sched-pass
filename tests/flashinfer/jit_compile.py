@@ -97,13 +97,12 @@ def main() -> None:
         VARIANT_NAME,
         VARIANT_DECL,
     )
-    prefill_name = "nta_batch_prefill_default_v2_hooked"
-    prefill = gen_customize_batch_prefill_module(
-        "fa2",
-        prefill_name,
-        torch.float16,
-        torch.float16,
-        torch.float16,
+    decode_bf16_name = "nta_batch_decode_default_v2_hooked_bf16"
+    decode_bf16 = gen_customize_batch_decode_module(
+        decode_bf16_name,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
         torch.int32,
         128,
         128,
@@ -114,13 +113,43 @@ def main() -> None:
         VARIANT_NAME,
         VARIANT_DECL,
     )
+    def prefill_specification(name: str, dtype: torch.dtype) -> object:
+        return gen_customize_batch_prefill_module(
+            "fa2",
+            name,
+            dtype,
+            dtype,
+            dtype,
+            torch.int32,
+            128,
+            128,
+            TENSOR_NAMES,
+            TENSOR_DTYPES,
+            SCALAR_NAMES,
+            SCALAR_DTYPES,
+            VARIANT_NAME,
+            VARIANT_DECL,
+        )
+
+    prefill_name = "nta_batch_prefill_default_v2_hooked"
+    prefill = prefill_specification(prefill_name, torch.float16)
+    prefill_bf16_name = "nta_batch_prefill_default_v2_hooked_bf16"
+    prefill_bf16 = prefill_specification(prefill_bf16_name, torch.bfloat16)
     print(
         f"flashinfer_baseline_module={check_module(baseline_name, baseline, ('run',))}"
     )
     print(f"flashinfer_decode_module={check_module(decode_name, decode, ('run',))}")
     print(
+        "flashinfer_decode_bf16_module="
+        f"{check_module(decode_bf16_name, decode_bf16, ('run',))}"
+    )
+    print(
         "flashinfer_prefill_module="
         f"{check_module(prefill_name, prefill, ('ragged_run', 'paged_run'))}"
+    )
+    print(
+        "flashinfer_prefill_bf16_module="
+        f"{check_module(prefill_bf16_name, prefill_bf16, ('ragged_run', 'paged_run'))}"
     )
 
 

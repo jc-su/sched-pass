@@ -104,6 +104,24 @@ def has_typed_operator_kernel_source(arguments: list[str]) -> bool:
     )
 
 
+def prefill_has_cta_tile_32(arguments: list[str]) -> bool:
+    """Return whether this generated FA2 module instantiates CTA_TILE_Q=32."""
+    source = next(
+        (
+            pathlib.Path(argument)
+            for argument in arguments
+            if argument.endswith("/batch_prefill.cu")
+        ),
+        None,
+    )
+    if source is None:
+        return True
+    instantiation = source.with_name("batch_prefill_ragged_kernel_mask_0.cu")
+    if not instantiation.is_file():
+        return True
+    return "/*CTA_TILE_Q=*/32" in instantiation.read_text(encoding="utf-8")
+
+
 def translate(arguments: list[str], instrument: bool) -> list[str]:
     command = [
         CLANG,
@@ -224,6 +242,8 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
                     )
                 ),
             ])
+            if family == 2 and not prefill_has_cta_tile_32(arguments):
+                command.append("-DNTA_FLASHINFER_SKIP_CTA_TILE_32=1")
 
     have_standard = False
     index = 0

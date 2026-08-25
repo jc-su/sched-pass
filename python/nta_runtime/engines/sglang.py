@@ -1,4 +1,4 @@
-"""SGLang 0.5.14 adapter for compiler-instrumented FlashInfer attention."""
+"""SGLang 0.5.16 adapter for compiler-instrumented FlashInfer attention."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from nta_runtime.flashinfer import (
     PREACQUIRED,
     attention_jit_args,
     enqueue_resident_attention,
+    request_ranges_for_schedule,
     request_bound_attention_jit_args,
 )
 from nta_runtime.flashinfer_schedule import (
@@ -76,7 +77,6 @@ from nta_runtime.runtime import (
     OperatorPlan,
     OperatorPlanFlag,
     OperatorReduction,
-    RequestRange,
     TierKind,
     require_operator_pair,
 )
@@ -558,42 +558,6 @@ def _group_external_pages_by_request(
     )
 
 
-def _request_ranges(
-    bindings: tuple[RequestBinding, ...], request_indices: tuple[int, ...]
-) -> list[RequestRange]:
-    """Build native ranges only for schedules grouped by request.
-
-    ``DeviceWorkPlan`` requires one contiguous range per request because the
-    reduction metadata and contributor ordinals are request-relative. A
-    malformed or future FlashInfer schedule must fail closed here instead of
-    producing zero-length or misbound ranges.
-    """
-    ranges: list[RequestRange] = []
-    cursor = 0
-    for binding in bindings:
-        begin = cursor
-        while (
-            cursor < len(request_indices)
-            and request_indices[cursor] == binding.request_index
-        ):
-            cursor += 1
-        if cursor == begin:
-            raise RuntimeError(
-                f"FlashInfer schedule has no work for request {binding.request_index}"
-            )
-        ranges.append(
-            RequestRange(
-                begin,
-                cursor - begin,
-                binding.request_slot,
-                binding.generation,
-            )
-        )
-    if cursor != len(request_indices):
-        raise RuntimeError("FlashInfer schedule is not grouped contiguously by request")
-    return ranges
-
-
 class NtaFlashInferAttnBackend(FlashInferAttnBackend):
     """FA2 backend carrying request semantics into every attention CTA."""
 
@@ -789,7 +753,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "consumer_contract": ConsumerContract.native_work_unit(
                 engine="sglang",
                 backend="nta_flashinfer",
-                engine_version=os.environ.get("NTA_SGLANG_VERSION", "0.5.14"),
+                engine_version=os.environ.get("NTA_SGLANG_VERSION", "0.5.16"),
             ).as_dict(),
             "revision": os.environ.get("NTA_REVISION", "unknown"),
             "pid": os.getpid(),
@@ -1338,7 +1302,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
             dependency_spans.append((dependency_begin, 2, 2, work_ticket))
 
-        ranges = _request_ranges(batch.bindings, schedule.request_indices)
+        ranges = request_ranges_for_schedule(batch.bindings, schedule.request_indices)
         plan.upload_work_units(
             semantic_units,
             dependency_spans,
@@ -2716,7 +2680,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 (dependency_begin, 2, direct_dependencies, work_ticket)
             )
 
-        ranges = _request_ranges(batch.bindings, schedule.request_indices)
+        ranges = request_ranges_for_schedule(batch.bindings, schedule.request_indices)
 
         object_count = (
             2
@@ -4265,7 +4229,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         report = dict(self._stats)
         consumer_contract = _consumer_contract_for_stats(
             report,
-            engine_version=os.environ.get("NTA_SGLANG_VERSION", "0.5.14"),
+            engine_version=os.environ.get("NTA_SGLANG_VERSION", "0.5.16"),
         )
         report["consumer_contract"] = consumer_contract.as_dict()
         report["execution_protocol_status"] = consumer_contract.kind.value

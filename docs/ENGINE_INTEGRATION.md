@@ -10,9 +10,10 @@ entry point. Registration is performed during SGLang's plugin-loading phase;
 attention selection goes through SGLang's `ATTENTION_BACKENDS` registry, and
 metadata/lifecycle interception goes through `HookRegistry`.
 
-The supported environment is installable as `pip install -e '.[sglang]'`.
-The extra pins the tested SGLang and FlashInfer versions; the base package
-does not import either framework. This is important because SGLang's general
+The supported single-engine environment is installable as
+`pip install -e '.[sglang]'`. The extra pins the tested SGLang and FlashInfer
+versions; the base package does not import either framework. This is important
+because SGLang's general
 plugin entry point is discovered process-wide and its hook targets are not a
 stable cross-version ABI.
 
@@ -45,7 +46,7 @@ request text or batch position. Quotas are configured once at worker startup wit
 `NTA_TENANT_BUDGETS=id:bytes[:weight],...` and are enforced by native device
 admission counters.
 
-The SGLang implementation currently requires the tested 0.5.14 API, FA2
+The SGLang implementation currently requires the tested 0.5.16 API, FA2
 FlashInfer kernels, full-attention page geometry, and valid request identity.
 Unsupported metadata or graph layouts fail closed.
 
@@ -96,56 +97,64 @@ only until the explicit CUDA completion fence.
 
 ## vLLM
 
-The projection/adapter contract can be tested with `pip install -e '.[vllm]'`,
-which pins the vLLM V1 layout used by this repository. This extra does not
-make the projection a completed vLLM serving backend; the numerical consumer
-gate below remains mandatory.
+vLLM 0.26.0 and SGLang 0.5.16 share the tested runtime core: Torch 2.11.0,
+FlashInfer 0.6.14, and the same CUDA/ABI build. Their published wheels do not
+currently form a resolver-clean combined extra: vLLM pins
+`apache-tvm-ffi==0.1.10`, while SGLang pins `==0.1.11` (and they also differ
+on several auxiliary helper pins). This is an upstream packaging conflict,
+not an NTA runtime fallback. The project therefore treats the dual-engine
+profile as an explicit, no-dependency framework install on top of a validated
+core environment:
 
-The vLLM integration boundary is `VllmV1Hook` for the pinned vLLM 0.13.0 V1
-worker. The dependency-free `VllmSchedulerProjection` remains useful for
-contract fixtures, while the real hook extracts:
+```bash
+python -m pip install torch==2.11.0 torchaudio==2.11.0 torchvision==0.26.0 \
+  flashinfer-python==0.6.14 sglang-kernel==0.4.5
+python -m pip install --no-deps vllm==0.26.0 sglang==0.5.16
+python -m pip install -e .
+```
 
-- request IDs;
-- the scheduler's request IDs;
-- exact block tables from `InputBatch.block_table[0]`'s CPU mirror;
-- optional tenant, priority, and deadline annotations supplied by deployment.
+The framework distributions must be installed only after the deployment has
+resolved their non-conflicting serving dependencies. `tests/runtime/engine_environment.py`
+and the native CTest gate then verify the actual interpreter, imports, and
+framework/plugin versions; artifact metadata records those versions. Never
+use `pip install -e '.[sglang,vllm]'` as the dual-engine command until the
+upstream pins converge.
 
-`VllmV1Hook.bind_forward` owns a bounded stable request-ID slot table, so a
-mutable vLLM input-batch row is never treated as long-lived identity. It binds
-the same `RequestIdentityRegistry` and produces the same `EngineBatch` as
-SGLang. The hook checks the installed vLLM version, rejects missing rows,
-multiple KV groups, empty exact demand, and finish/reschedule ID ambiguity. It
-must be called after vLLM's `_update_states` and before the attention launch;
-that call is control-plane metadata publication, not a per-request I/O path.
-`VllmV1Hook.consume_forward` is the typed handoff to the concrete V1
-`AttentionImpl`: it refuses to execute when only the projection exists, and
-passes the exact `EngineBatch` plus framework attention arguments to the
-delegate. This is a real seam for the backend implementation, not a fake
-numerical plugin.
-The hook must not add a second generation tracker, policy taxonomy, or native
-work ABI. The concrete consumer owns the same `ServingTierService` and the
-tier catalog/native transport is selected once per worker; the projection hook
-only hands it the typed batch.
+The vLLM plugin has two distinct responsibilities:
 
-vLLM's `vllm.general_plugins` entry point is a process/bootstrap extension
-point; it is not a substitute for the numerical `AttentionBackend`/
-`AttentionImpl` path. vLLM's V1 `KVConnector` lifecycle is useful for
-transport preparation and readiness, but a connector alone is not an NTA
-attention consumer. A complete vLLM integration therefore needs a pinned V1
-`AttentionBackend`/`AttentionImpl` implementation that supplies the
-`VllmV1NumericalConsumer` delegate and calls the same engine-neutral execution
-core after the projection and before the stock FlashInfer numerical result is
-accepted.
-The vLLM and SGLang adapters may share the FlashInfer operator ABI, but they
-must not share framework metadata or lifecycle code.
+1. `nta_runtime.plugins.vllm:register` registers
+   `AttentionBackendEnum.CUSTOM` and installs a small V1 worker sidecar.
+2. `NtaVllmFlashInferImpl.forward` is the numerical consumer. It writes the
+   framework KV cache, reads exact `InputBatch.block_table[0]` demand, builds
+   an `ExecutionSession`/`DeviceWorkPlan`, and calls the instrumented
+   FlashInfer wrapper with the NTA runtime/work-plan ABI.
 
-`VllmV1Hook` is now a real pinned worker projection, but it is not by itself a
-complete vLLM serving backend: a vLLM model-runner/attention consumer still
-has to pass the returned `EngineBatch` into the NTA execution core. An artifact
-may not label vLLM results as end-to-end evidence until that consumer is wired
-and passes the same exact-demand, correctness, tier-placement, and performance
-gates used by SGLang. Version drift is an intentional hard failure, not a
-best-effort field guess.
+The worker sidecar runs after `_update_states`, preserves vLLM's
+`InputBatch.req_ids` row order, and exposes one context-local typed
+`EngineBatch` to every opaque attention op in that forward. It owns the same
+bounded stable request-generation registry as SGLang; it does not perform
+per-request I/O or copy the GPU block table to the host. Select it with
+vLLM's `--attention-backend CUSTOM` and provide
+`FLASHINFER_WORKSPACE_BASE` containing the vLLM-compatible instrumented
+FlashInfer module (the defaults are the tensor-core
+`nta_batch_prefill_default_v2_hooked` for FP16 and
+`nta_batch_prefill_default_v2_hooked_bf16` for BF16; the separate
+`nta_batch_decode_default_v2_hooked*` artifacts are retained for the
+non-tensor-core decode profile).
+
+The native vLLM consumer is intentionally qualified first for resident CUDA
+KV, one KV group, pure single-token decode, FA2 (non-TRTLLM), and eager mode.
+The builder reports no CUDA-graph support until plan upload/replay has its own
+graph-stability gate. Prefill, mixed batches, TRTLLM, and external NVMe/CXL
+loads remain explicit fail-closed boundaries; `NTA_VLLM_ALLOW_STOCK_FALLBACK=1`
+is a debugging reference only and is invalid for native artifacts.
+
+vLLM's V1 `KVConnector` remains the correct next seam for external tier
+ownership/readiness: scheduler metadata and worker load/fence lifecycle belong
+there, while `AttentionImpl` remains the numerical consumer. A connector alone
+must never be reported as NTA execution. The project is no longer blocked on
+vLLM's attention path, but multi-tier vLLM evidence is gated on a concrete
+KVConnector implementation and its exact correctness/ownership tests.
 
 The distinction is machine-checked in engine statistics. A
 `consumer_contract.kind` of `projection_only` is valid for adapter tests but

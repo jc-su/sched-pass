@@ -649,9 +649,25 @@ if(NTA_ENABLE_CUDA)
   )
   add_custom_target(nta-kv-kernel ALL DEPENDS "${NTA_KV_CUBIN}")
 
-  if(Python3_Interpreter_FOUND)
+if(Python3_Interpreter_FOUND)
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c
+      "import importlib.util; raise SystemExit(0 if all(importlib.util.find_spec(name) for name in ('sglang', 'vllm')) else 1)"
+    RESULT_VARIABLE NTA_HAVE_COMMON_ENGINES
+    OUTPUT_QUIET
+    ERROR_QUIET
+  )
+  if(NTA_HAVE_COMMON_ENGINES EQUAL 0)
     add_test(
-      NAME nta-moe-lowering
+      NAME nta-engine-environment
+      COMMAND
+        ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/engine_environment.py
+    )
+    set_tests_properties(nta-engine-environment PROPERTIES TIMEOUT 60)
+  endif()
+  add_test(
+    NAME nta-moe-lowering
       COMMAND
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/ir/moe_lowering.py
@@ -677,6 +693,7 @@ if(NTA_ENABLE_CUDA)
     add_test(
       NAME nta-flashinfer-jit-compile
       COMMAND
+        ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
         --build-dir ${CMAKE_CURRENT_BINARY_DIR}
         --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
@@ -691,6 +708,7 @@ if(NTA_ENABLE_CUDA)
     add_test(
       NAME nta-flashinfer-hooked-decode
       COMMAND
+        ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
         --build-dir ${CMAKE_CURRENT_BINARY_DIR}
         --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
@@ -709,6 +727,35 @@ if(NTA_ENABLE_CUDA)
       nta-indexed-row-count-seam
       PROPERTIES DEPENDS nta-flashinfer-jit-compile
     )
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" -c
+        "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('vllm') else 1)"
+      RESULT_VARIABLE NTA_HAVE_VLLM
+      OUTPUT_QUIET
+      ERROR_QUIET
+    )
+    if(NTA_HAVE_VLLM EQUAL 0)
+      add_test(
+        NAME nta-vllm-native
+        COMMAND
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
+          --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
+          --clang ${NTA_CLANG_CUDA}
+          --cuda-path ${NTA_CUDA_ROOT}
+          --flashinfer-hook
+          --
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/flashinfer/vllm_native.py
+      )
+      set_tests_properties(
+        nta-vllm-native
+        PROPERTIES DEPENDS nta-flashinfer-jit-compile
+                   RUN_SERIAL TRUE
+                   TIMEOUT 300
+      )
+    endif()
   endif()
 
   set(NTA_ATTENTION_RAW_BC

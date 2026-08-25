@@ -11,19 +11,27 @@ requires-python = ">=3.10"
 [project.optional-dependencies]
 # The adapters are deliberately version-pinned.  They bind framework-private
 # batch layouts and therefore must not silently run against an unqualified
-# distribution.  Keep the base package engine-neutral and install only the
-# framework extra used by a deployment or artifact.
+# distribution.  Keep the base package engine-neutral and install one
+# framework extra for a single-engine deployment.  The validated dual-engine
+# profile is documented separately because the upstream wheels currently pin
+# incompatible transitive helper versions.
 sglang = [
-    "sglang==0.5.14",
-    "flashinfer-python==0.6.12",
+    "sglang==0.5.16",
+    "flashinfer-python==0.6.14",
 ]
 vllm = [
-    "vllm==0.13.0",
-    "flashinfer-python==0.6.12",
+    "vllm==0.26.0",
+    # vLLM 0.26.0 is tested with the same Torch/FlashInfer core as the
+    # SGLang profile below; see docs/ENGINE_INTEGRATION.md for dual-engine
+    # provisioning and its explicit upstream dependency conflict.
+    "flashinfer-python==0.6.14",
 ]
 
 [project.entry-points."sglang.srt.plugins"]
 nta = "nta_runtime.plugins.sglang:register"
+
+[project.entry-points."vllm.general_plugins"]
+nta = "nta_runtime.plugins.vllm:register"
 
 [tool.setuptools]
 package-dir = {"" = "python"}

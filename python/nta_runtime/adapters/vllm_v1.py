@@ -1,6 +1,6 @@
 """Pinned vLLM V1 worker boundary.
 
-This module is the only place where the vLLM 0.13 V1 worker object layout is
+This module is the only place where the vLLM 0.26 V1 worker object layout is
 known.  It intentionally keeps the vLLM import optional: contract tests can
 use small structural doubles, while a real worker hook verifies the installed
 distribution before accepting a forward.
@@ -14,6 +14,8 @@ block-table mirror as an exact-demand source, never as a policy decision.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+import contextvars
 from dataclasses import dataclass
 import heapq
 import importlib.metadata
@@ -24,7 +26,49 @@ from .vllm import VllmAdapter
 from ..work_unit import Granularity
 
 
-SUPPORTED_VLLM_V1_VERSION = "0.13.0"
+SUPPORTED_VLLM_V1_VERSION = "0.26.0"
+
+
+@dataclass
+class VllmV1ForwardState:
+    """Per-forward sidecar shared by the worker hook and attention layers.
+
+    vLLM deliberately keeps ``SchedulerOutput`` out of ``AttentionImpl``.
+    The sidecar is therefore the narrow control-plane bridge: the worker
+    publishes one exact :class:`EngineBatch` after ``_update_states`` and
+    every attention layer consumes the same immutable batch.  It is mutable
+    only while the worker is establishing the sidecar; attention code must
+    never replace ``batch`` after the first layer has entered.
+    """
+
+    scheduler_output: Any
+    input_batch: Any | None = None
+    batch: EngineBatch | None = None
+    hook: "VllmV1Hook | None" = None
+    page_size: int = 0
+
+
+_FORWARD_STATE: contextvars.ContextVar[VllmV1ForwardState | None] = (
+    contextvars.ContextVar("nta_vllm_v1_forward_state", default=None)
+)
+
+
+@contextmanager
+def vllm_v1_forward_state(
+    scheduler_output: Any,
+) -> Any:
+    """Install one worker-forward sidecar for opaque vLLM attention ops."""
+    state = VllmV1ForwardState(scheduler_output)
+    token = _FORWARD_STATE.set(state)
+    try:
+        yield state
+    finally:
+        _FORWARD_STATE.reset(token)
+
+
+def current_vllm_v1_forward_state() -> VllmV1ForwardState | None:
+    """Return the active sidecar, if execution is inside a vLLM forward."""
+    return _FORWARD_STATE.get()
 
 
 class VllmV1NumericalConsumer(Protocol):
@@ -72,7 +116,25 @@ class VllmV1SchedulerProjection:
                 "vLLM V1 scheduler output must expose non-empty "
                 "num_scheduled_tokens"
             )
-        request_ids = tuple(str(request_id) for request_id in scheduled)
+        scheduled_ids = {str(request_id) for request_id in scheduled}
+        input_request_ids = getattr(input_batch, "req_ids", None)
+        if not isinstance(input_request_ids, Sequence) or isinstance(
+            input_request_ids, (str, bytes)
+        ):
+            raise RuntimeError(
+                "vLLM V1 hook requires InputBatch.req_ids to preserve the "
+                "attention row order"
+            )
+        request_ids = tuple(
+            str(request_id)
+            for request_id in input_request_ids
+            if str(request_id) in scheduled_ids
+        )
+        if len(request_ids) != len(scheduled_ids) or set(request_ids) != scheduled_ids:
+            raise RuntimeError(
+                "vLLM V1 input batch and scheduler output disagree on scheduled "
+                "request IDs or contain duplicate attention rows"
+            )
         if any(not request_id for request_id in request_ids):
             raise RuntimeError("vLLM V1 scheduled request IDs must be non-empty")
         finished = getattr(scheduler_output, "finished_req_ids", frozenset())
@@ -202,6 +264,7 @@ class VllmV1Hook:
             raise ValueError("vLLM V1 page_bytes must be positive")
         if not expected_vllm_version:
             raise ValueError("expected vLLM version must be non-empty")
+        self._runtime = runtime
         self._adapter = VllmAdapter(runtime, request_capacity)
         self._slots = _StableVllmSlots(request_capacity)
         self._page_bytes = page_bytes
@@ -211,10 +274,20 @@ class VllmV1Hook:
         self._priority_for_request = priority_for_request
         self._deadline_for_request = deadline_for_request
         self._consumer = consumer
+        self._native_launches = 0
 
     @property
     def adapter(self) -> VllmAdapter:
         return self._adapter
+
+    @property
+    def runtime(self) -> Any:
+        """Return the runtime shared by the worker and attention consumer."""
+        return self._runtime
+
+    def record_native_launch(self) -> None:
+        """Promote evidence only after an NTA attention launch completed."""
+        self._native_launches += 1
 
     def projection_contract(self) -> ConsumerContract:
         """Describe this hook without overstating what it executes.
@@ -232,6 +305,12 @@ class VllmV1Hook:
 
     def consumer_contract(self) -> ConsumerContract:
         """Return the contract of the numerical delegate, if one is wired."""
+        if self._native_launches:
+            return ConsumerContract.native_work_unit(
+                engine="vllm",
+                backend="nta_flashinfer",
+                engine_version=self._expected_version,
+            )
         if self._consumer is None:
             return self.projection_contract()
         contract = self._consumer.consumer_contract()

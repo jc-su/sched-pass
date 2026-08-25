@@ -7,7 +7,7 @@ import importlib.metadata
 from typing import Any
 
 
-SUPPORTED_VERSION = "0.6.12"
+SUPPORTED_VERSIONS = frozenset(("0.5.3", "0.6.12", "0.6.14"))
 
 
 @dataclass(frozen=True)
@@ -24,9 +24,10 @@ class Schedule:
 
 def require_supported_version() -> None:
     version = importlib.metadata.version("flashinfer-python")
-    if version != SUPPORTED_VERSION:
+    if version not in SUPPORTED_VERSIONS:
         raise RuntimeError(
-            f"unsupported FlashInfer {version}; expected {SUPPORTED_VERSION}"
+            f"unsupported FlashInfer {version}; expected one of "
+            f"{sorted(SUPPORTED_VERSIONS)}"
         )
 
 
@@ -90,6 +91,7 @@ def decode_schedule(wrapper: object) -> Schedule:
 
 
 def paged_prefill_schedule(wrapper: object) -> Schedule:
-    # With split-K disabled, 0.6.12 narrows INT64_MAX * page_size to IdType
-    # zero. The scheduler still emits one KV tile for each Q tile.
+    # With split-K disabled, current FlashInfer 0.6.x narrows INT64_MAX * page
+    # size to IdType zero. The scheduler still emits one KV tile for each Q
+    # tile.
     return _extract(wrapper, 15, 4, 6, 9, 12, 13, 14, allow_zero_chunk=True)

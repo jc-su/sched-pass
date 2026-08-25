@@ -44,7 +44,9 @@ class FakeVllmSchedulerOutput:
 
 
 class FakeVllmV1SchedulerOutput:
-    num_scheduled_tokens = {"v1-a": 1, "v1-b": 1}
+    # Deliberately differ from InputBatch.req_ids: scheduler mapping order is
+    # not the attention row order after vLLM compacts its persistent batch.
+    num_scheduled_tokens = {"v1-b": 1, "v1-a": 1}
     finished_req_ids = set()
 
 
@@ -66,6 +68,7 @@ class FakeVllmV1BlockTable:
 
 
 class FakeVllmV1InputBatch:
+    req_ids = ("v1-a", "v1-b")
     req_id_to_index = {"v1-a": 1, "v1-b": 3}
     block_table = FakeVllmV1BlockTable()
 
@@ -76,7 +79,7 @@ class FakeVllmV1Consumer:
 
     def consumer_contract(self):
         return ConsumerContract.native_work_unit(
-            engine="vllm", backend="nta_flashinfer", engine_version="0.13.0"
+            engine="vllm", backend="nta_flashinfer", engine_version="0.26.0"
         )
 
     def consume(self, batch, **attention_args):
@@ -163,7 +166,7 @@ def main() -> None:
         runtime,
         4,
         page_bytes=4096,
-        version_provider=lambda: "0.13.0",
+        version_provider=lambda: "0.26.0",
         tenant_for_request=lambda request_id: 9 if request_id == "v1-a" else 11,
     )
     v1_batch = v1_hook.bind_forward(
@@ -193,7 +196,7 @@ def main() -> None:
         runtime,
         4,
         page_bytes=4096,
-        version_provider=lambda: "0.13.0",
+        version_provider=lambda: "0.26.0",
         consumer=consumer,
     )
     assert consuming_hook.consumer_contract().kind is ConsumerKind.NATIVE_WORK_UNIT
@@ -210,7 +213,7 @@ def main() -> None:
     assert consumer.calls[0][0].exact_demand is not None
     assert consumer.calls[0][1] == {"attention_metadata": "typed-metadata"}
     native_contract = ConsumerContract.native_work_unit(
-        engine="sglang", backend="nta_flashinfer", engine_version="0.5.14"
+        engine="sglang", backend="nta_flashinfer", engine_version="0.5.16"
     )
     assert native_contract.as_dict()["numerical_consumer"] is True
     try:

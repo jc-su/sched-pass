@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Run the pinned vLLM V1 attention consumer against a real GPU batch."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+import math
+
+import numpy as np
+import torch
+from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.v1.attention.backends.flashinfer import FIDecode
+
+from nta_runtime.adapters.vllm_v1 import (
+    VllmV1Hook,
+    current_vllm_v1_forward_state,
+    vllm_v1_forward_state,
+)
+from nta_runtime.engines.vllm import NtaVllmFlashInferImpl
+from nta_runtime.runtime import Runtime, RuntimeConfig
+
+
+class _BlockTable:
+    def __init__(self, group: object) -> None:
+        self.block_tables = (group,)
+        self._group = group
+
+    def __getitem__(self, index: int) -> object:
+        del index
+        return self._group
+
+
+def main() -> int:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for the vLLM native consumer test")
+
+    device = torch.device("cuda")
+    page_size = 16
+    num_pages = 4
+    num_kv_heads = 2
+    num_heads = 4
+    head_size = 128
+    scale = 1.0 / math.sqrt(head_size)
+
+    key = torch.randn(
+        (num_pages, page_size, num_kv_heads, head_size),
+        device=device,
+        dtype=torch.float16,
+    )
+    value = torch.randn_like(key)
+    # vLLM 0.26's packed NHD cache is (blocks, kv_heads, page, 2*head_size).
+    kv_cache = torch.cat((key, value), dim=-1).permute(0, 2, 1, 3).contiguous()
+    query = torch.randn(
+        (2, num_heads, head_size), device=device, dtype=torch.float16
+    )
+
+    workspace = torch.empty(
+        64 * 1024 * 1024, dtype=torch.uint8, device=device
+    )
+    stock_wrapper = BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
+    indptr = torch.tensor([0, 2, 4], dtype=torch.int32)
+    indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    last_page_len = torch.tensor([page_size, page_size], dtype=torch.int32)
+    stock_wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        page_size,
+        q_data_type=query.dtype,
+        kv_data_type=kv_cache.dtype,
+        sm_scale=scale,
+        disable_split_kv=True,
+    )
+    expected = stock_wrapper.run(query, (key, value))
+
+    runtime = Runtime(
+        RuntimeConfig(
+            request_capacity=2,
+            object_capacity=4,
+            intent_capacity=4,
+            work_ticket_capacity=8,
+            max_dependencies_per_work_ticket=2,
+            device_ordinal=0,
+            tenant_capacity=2,
+        )
+    )
+    try:
+        hook = VllmV1Hook(
+            runtime,
+            2,
+            page_bytes=page_size * num_kv_heads * 2 * head_size * 2,
+            expected_vllm_version="0.26.0",
+            version_provider=lambda: "0.26.0",
+        )
+        group = SimpleNamespace(
+            get_numpy_array=lambda: np.asarray(
+                [[0, 1], [2, 3]], dtype=np.int32
+            ),
+            num_blocks_per_row=np.asarray([2, 2], dtype=np.int32),
+        )
+        input_batch = SimpleNamespace(
+            req_ids=["a", "b"],
+            req_id_to_index={"a": 0, "b": 1},
+            block_table=_BlockTable(group),
+        )
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"a": 1, "b": 1},
+            finished_req_ids=set(),
+        )
+        batch = hook.bind_forward(
+            scheduler_output,
+            input_batch,
+            epoch=0,
+            stream=torch.cuda.current_stream(),
+        )
+        metadata = SimpleNamespace(
+            num_decodes=2,
+            num_decode_tokens=2,
+            num_prefill_tokens=0,
+            use_cascade=False,
+            decode=FIDecode(wrapper=stock_wrapper),
+            decode_use_trtllm=False,
+        )
+
+        with set_current_vllm_config(VllmConfig()):
+            implementation = NtaVllmFlashInferImpl(
+                num_heads,
+                head_size,
+                scale,
+                num_kv_heads,
+                None,
+                None,
+                "auto",
+            )
+            output = torch.empty_like(expected)
+            with vllm_v1_forward_state(scheduler_output):
+                state = current_vllm_v1_forward_state()
+                assert state is not None
+                state.batch = batch
+                state.hook = hook
+                state.page_size = page_size
+                implementation._native_forward(
+                    None,
+                    query,
+                    torch.empty(
+                        (2, num_kv_heads, head_size),
+                        device=device,
+                        dtype=query.dtype,
+                    ),
+                    torch.empty(
+                        (2, num_kv_heads, head_size),
+                        device=device,
+                        dtype=query.dtype,
+                    ),
+                    kv_cache,
+                    metadata,
+                    output,
+                )
+
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-3)
+        maximum = (output - expected).abs().max().item()
+        print(
+            "vllm_native_attention=pass",
+            f"max_abs_error={maximum:.6g}",
+            f"contract={hook.consumer_contract().kind.value}",
+        )
+        return 0
+    finally:
+        runtime.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

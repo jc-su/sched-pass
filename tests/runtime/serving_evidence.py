@@ -36,7 +36,7 @@ def report(*, compact_ctas: int, canonical_ctas: int) -> dict:
                     "typed_work_plan": True,
                     "native_submission": True,
                     "numerical_consumer": True,
-                    "engine_version": "0.5.14",
+                    "engine_version": "0.5.16",
                 },
                 "hicache_fallback_batches": 0,
                 "hicache_external_batches": 1,

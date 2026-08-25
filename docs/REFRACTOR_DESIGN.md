@@ -204,16 +204,18 @@ The SGLang implementation is pinned to the tested framework version and FA2
 FlashInfer path. Its out-of-tree package uses the official general-plugin
 entry point, attention-backend registry, and HookRegistry; graph metadata
 preservation is part of that hook lifecycle rather than direct monkey
-patching. The vLLM boundary is intentionally structural and dependency-free:
-`VllmV1Hook` projects the pinned V1 worker, while `EngineBoundary` is the
-common lifecycle interface. Framework-specific code can change that
-projection and transport binding, not the work-unit core or native ABI.
+patching. The vLLM boundary is a pinned V1 integration: `VllmV1Hook` projects
+the worker, `nta_runtime.plugins.vllm` registers the official custom backend,
+and `NtaVllmFlashInferImpl` consumes the resulting `EngineBatch` through the
+same engine-neutral execution core and native ABI. Framework-specific code can
+change that projection and transport binding, not the work-unit core or ABI.
 
-The vLLM general-plugin entry point is only a bootstrap seam. The formal
-numerical consumer must be a pinned V1 `AttentionBackend`/`AttentionImpl`
-integration. A V1 `KVConnector` can stage or fence cache data, but it cannot be
-reported as the NTA numerical consumer by itself. Until that attention seam is
-implemented and verified, vLLM artifacts remain projection-only.
+The vLLM general-plugin entry point is only bootstrap. The formal numerical
+consumer is the V1 `AttentionBackend`/`AttentionImpl`; a V1 `KVConnector` is
+reserved for external tier loading and fences and cannot be reported as the
+NTA consumer by itself. The native vLLM qualification currently covers
+resident eager single-token decode. External NVMe/CXL vLLM artifacts remain
+gated until the KVConnector source/lifetime path is implemented and tested.
 
 The vLLM projection is executable only when it supplies exact block tables and
 page bytes. An identity-only projection is intentionally rejected by

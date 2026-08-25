@@ -58,7 +58,7 @@ def single() -> dict[str, object]:
                     "typed_work_plan": True,
                     "native_submission": True,
                     "numerical_consumer": True,
-                    "engine_version": "0.5.14",
+                    "engine_version": "0.5.16",
                 },
             }
         ],
@@ -122,7 +122,7 @@ def main() -> None:
         "typed_work_plan": False,
         "native_submission": False,
         "numerical_consumer": True,
-        "engine_version": "0.5.14",
+        "engine_version": "0.5.16",
     }
     framework_reference["engine_stats"][0][
         "stock_prefetched_external_attention_launches"

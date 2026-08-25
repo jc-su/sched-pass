@@ -38,7 +38,7 @@ def fixture(*, heterogeneous: bool) -> dict:
         "revision": "revision",
         "dirty": False,
         "gpu": "gpu",
-        "flashinfer_version": "0.6.12",
+        "flashinfer_version": "0.6.14",
         "torch_version": "2.11",
         "cuda_version": "13.0",
         "real_flashinfer_attention": True,
