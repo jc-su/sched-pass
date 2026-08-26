@@ -73,7 +73,9 @@ def _unfinished_findings(root: Path) -> list[str]:
             continue
         for line_number, line in enumerate(lines, 1):
             if _UNFINISHED.search(line):
-                findings.append(f"{path.relative_to(root)}:{line_number}: {line.strip()}")
+                findings.append(
+                    f"{path.relative_to(root)}:{line_number}: {line.strip()}"
+                )
         if path.suffix != ".py":
             continue
         try:
@@ -187,10 +189,70 @@ def _api_versions(root: Path) -> dict[str, int]:
     python_match = re.search(r"^API_VERSION\s*=\s*(\d+)$", python, re.MULTILINE)
     if native_match is None or python_match is None:
         raise RuntimeError("could not locate native/Python runtime API versions")
-    versions = {"native": int(native_match.group(1)), "python": int(python_match.group(1))}
+    versions = {
+        "native": int(native_match.group(1)),
+        "python": int(python_match.group(1)),
+    }
     if len(set(versions.values())) != 1:
         raise RuntimeError(f"native/Python API versions diverge: {versions}")
     return versions
+
+
+def _module_assignment(path: Path, name: str) -> ast.expr:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == name
+            for target in node.targets
+        ):
+            return node.value
+    raise RuntimeError(f"{path.name} has no module-level {name}")
+
+
+def _string_literals(node: ast.expr) -> set[str]:
+    if isinstance(node, ast.Call) and len(node.args) == 1:
+        return _string_literals(node.args[0])
+    if isinstance(node, ast.Dict):
+        elements: list[ast.expr | None] = list(node.keys)
+    elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        elements = list(node.elts)
+    else:
+        raise RuntimeError("expression is not a literal string collection")
+    values = {
+        element.value
+        for element in elements
+        if isinstance(element, ast.Constant) and isinstance(element.value, str)
+    }
+    if len(values) != len(elements):
+        raise RuntimeError("expression contains a non-string literal")
+    return values
+
+
+def _flashinfer_versions(root: Path) -> set[str]:
+    """Return the FlashInfer releases both integration layers agree on.
+
+    The runtime schedule extractor reads a version-specific PlanInfo layout,
+    while the overlay preparer owns that version's kernel source hashes. An
+    instrumented launch needs both, so a release named by only one of them is
+    either a runtime claim nothing can instrument or an overlay nothing can
+    schedule. Keep the two sets identical.
+    """
+    schedule = _string_literals(
+        _module_assignment(
+            root / "python/nta_runtime/flashinfer_schedule.py", "SUPPORTED_VERSIONS"
+        )
+    )
+    overlay = _string_literals(
+        _module_assignment(
+            root / "tools/flashinfer/prepare_overlay.py", "SOURCE_PROFILES"
+        )
+    )
+    if schedule != overlay:
+        raise RuntimeError(
+            "FlashInfer schedule and overlay versions diverge: "
+            f"schedule={sorted(schedule)} overlay={sorted(overlay)}"
+        )
+    return schedule
 
 
 def _resource_kinds(root: Path) -> set[str]:
@@ -204,18 +266,23 @@ def _resource_kinds(root: Path) -> set[str]:
     )
     if enum_block is None:
         raise RuntimeError("ResourceKind enum is missing")
-    return set(re.findall(r"^\s+([A-Z][A-Z0-9_]*)\s*=", enum_block.group("body"), re.MULTILINE))
+    return set(
+        re.findall(r"^\s+([A-Z][A-Z0-9_]*)\s*=", enum_block.group("body"), re.MULTILINE)
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument(
+        "--root", type=Path, default=Path(__file__).resolve().parents[1]
+    )
     args = parser.parse_args()
     root = args.root.resolve()
     findings = _unfinished_findings(root)
     findings.extend(_python_syntax_findings(root))
     findings.extend(_boundary_findings(root))
     versions = _api_versions(root)
+    flashinfer_versions = _flashinfer_versions(root)
     resource_kinds = _resource_kinds(root)
     missing = sorted(_REQUIRED_RESOURCE_KINDS - resource_kinds)
     if missing:
@@ -235,6 +302,7 @@ def main() -> int:
     print(
         "project-audit=pass "
         f"api_version={versions['native']} "
+        f"flashinfer_versions={','.join(sorted(flashinfer_versions))} "
         f"resource_kinds={','.join(sorted(resource_kinds))} "
         "source_boundaries=pass"
     )

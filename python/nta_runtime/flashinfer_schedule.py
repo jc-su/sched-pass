@@ -7,7 +7,11 @@ import importlib.metadata
 from typing import Any
 
 
-SUPPORTED_VERSIONS = frozenset(("0.5.3", "0.6.12", "0.6.14"))
+# Every release named here must also carry an overlay source profile in
+# tools/flashinfer/prepare_overlay.py: an instrumented launch needs both this
+# PlanInfo layout and the patched kernel source. project_audit.py enforces
+# that the two sets stay identical.
+SUPPORTED_VERSIONS = frozenset(("0.6.12", "0.6.14"))
 
 
 @dataclass(frozen=True)
