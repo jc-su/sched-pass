@@ -18,12 +18,22 @@ import time
 from typing import Any
 
 try:
-    from experiments.bailian import demand_trace_digest, read_jsonl
+    from experiments.bailian import (
+        demand_trace_digest,
+        input_page_ids,
+        read_jsonl,
+        unique_input_page_ids,
+    )
     from experiments.queueing import finite_window_littles_law
     from experiments.validate_workload import validate as validate_workload
 except ModuleNotFoundError:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-    from experiments.bailian import demand_trace_digest, read_jsonl
+    from experiments.bailian import (
+        demand_trace_digest,
+        input_page_ids,
+        read_jsonl,
+        unique_input_page_ids,
+    )
     from experiments.queueing import finite_window_littles_law
     from experiments.validate_workload import validate as validate_workload
 
@@ -31,6 +41,7 @@ from SglangHiCache import (
     configure_environment,
     device_cached_tokens,
     generated_text,
+    generation_results,
     git_value,
     host_cached_tokens,
     make_prompt,
@@ -106,6 +117,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hicache-ratio", type=float, default=8.0)
     parser.add_argument("--max-running-requests", type=int, default=16)
     parser.add_argument(
+        "--eviction-rounds",
+        type=int,
+        help=(
+            "explicit cache-churn rounds; zero disables churn for a capacity-fit "
+            "workload, while the default derives rounds from max_total_tokens"
+        ),
+    )
+    parser.add_argument(
         "--batch-mode",
         choices=("coalesced", "separate"),
         default="coalesced",
@@ -176,8 +195,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("request and token counts must be positive")
     if args.external_suffix_tokens < 0:
         parser.error("external suffix token count cannot be negative")
+    if args.churn_tokens > args.context_length:
+        parser.error("churn token count cannot exceed context length")
     if args.load_warmup_iterations < 0:
         parser.error("load warmup iterations cannot be negative")
+    if args.eviction_rounds is not None and args.eviction_rounds < 0:
+        parser.error("eviction rounds cannot be negative")
     if args.slo_ttft_seconds <= 0 or args.slo_p99_itl_seconds <= 0:
         parser.error("SLO thresholds must be positive")
     if args.request_rate <= 0:
@@ -211,12 +234,7 @@ def parse_args() -> argparse.Namespace:
 def _tokenized_structure_prompt(tokenizer: Any, row: dict[str, Any]) -> tuple[str, int]:
     block_size = int(row.get("block_size", 16))
     token_count = int(row["input_length"])
-    block_count = (token_count + block_size - 1) // block_size
-    block_ids = list(row.get("hash_ids", ()))
-    block_ids.extend(
-        f"{row['request_id']}:unique:{index}"
-        for index in range(len(block_ids), block_count)
-    )
+    block_ids = input_page_ids(row, block_size=block_size)
     token_ids: list[int] = []
     for block_id in block_ids:
         seed = f"nta-bailian-block-{block_id} "
@@ -296,11 +314,21 @@ def _load_workload(
             for row, offset in zip(external_rows, external_offsets)
         }
     )
+    block_size = int(manifest["block_size"])
+    resident_page_ids = unique_input_page_ids(
+        resident_rows, block_size=block_size
+    )
+    external_page_ids = unique_input_page_ids(
+        external_rows, block_size=block_size
+    )
+    resident_prompt_text = [prompt(row) for row in resident_rows]
+    external_prompt_text = [prompt(row) for row in external_rows]
     metadata = {
         "manifest": str(path.resolve()),
         "manifest_digest": hashlib.sha256(path.resolve().read_bytes()).hexdigest(),
         "records_digest": str(manifest["records_digest"]),
         "demand_trace_digest": str(manifest["demand_trace_digest"]),
+        "block_size": block_size,
         "arrival": manifest["arrival"],
         "prompt": manifest["prompt"],
         "state_mapping": "explicit_request_state"
@@ -314,12 +342,18 @@ def _load_workload(
         "external_input_tokens": [int(row["input_length"]) for row in external_rows],
         "resident_output_tokens": [int(row["output_length"]) for row in resident_rows],
         "external_output_tokens": [int(row["output_length"]) for row in external_rows],
+        # These are logical page counts, not raw request-length sums.  Shared
+        # Bailian prefix pages occur once in the combined pressure budget.
+        "resident_input_cache_pages": len(resident_page_ids),
+        "external_input_cache_pages": len(external_page_ids),
+        "combined_input_cache_pages": len(resident_page_ids | external_page_ids),
+        "shared_input_cache_pages": len(resident_page_ids & external_page_ids),
     }
     return (
         [str(row["request_id"]) for row in resident_rows],
         [str(row["request_id"]) for row in external_rows],
-        [prompt(row) for row in resident_rows],
-        [prompt(row) for row in external_rows],
+        resident_prompt_text,
+        external_prompt_text,
         external_offsets,
         metadata["resident_output_tokens"],
         metadata["external_output_tokens"],
@@ -421,23 +455,24 @@ async def _run_load(
     external_output_tokens: list[int] | None = None,
     resident_request_ids: list[str] | None = None,
     external_request_ids: list[str] | None = None,
+    warmup: bool = False,
 ) -> tuple[list[dict[str, Any]], float]:
     started = time.perf_counter()
     resident_started = asyncio.Event()
     resident_sampling = {
         "temperature": 0,
-        "max_new_tokens": args.resident_output_tokens,
+        "max_new_tokens": 1 if warmup else args.resident_output_tokens,
         "ignore_eos": True,
     }
     external_sampling = {
         "temperature": 0,
-        "max_new_tokens": args.external_output_tokens,
+        "max_new_tokens": 1 if warmup else args.external_output_tokens,
         "ignore_eos": True,
     }
 
     async def resident(index: int, prompt: str) -> dict[str, Any]:
         sampling = dict(resident_sampling)
-        if resident_output_tokens is not None:
+        if resident_output_tokens is not None and not warmup:
             sampling["max_new_tokens"] = max(1, resident_output_tokens[index])
         record = await _stream_request(
             engine,
@@ -484,6 +519,7 @@ async def _run_load(
                         1,
                         external_output_tokens[index]
                         if external_output_tokens is not None
+                        and not warmup
                         else args.external_output_tokens,
                     ),
                 },
@@ -614,12 +650,63 @@ def main() -> int:
             for index in range(args.resident_requests)
         ]
         shape_prompt = make_prompt(tokenizer, "load-shape", args.external_tokens)
-    eviction_rounds = args.max_total_tokens // args.churn_tokens + 1
+    eviction_rounds = (
+        args.eviction_rounds
+        if args.eviction_rounds is not None
+        else args.max_total_tokens // args.churn_tokens + 1
+    )
     churn_prompts = [
         make_prompt(tokenizer, f"load-churn-{index}", args.churn_tokens)
         for index in range((2 + args.load_warmup_iterations) * eviction_rounds)
     ]
     setup_sampling = {"temperature": 0, "max_new_tokens": 1}
+    resident_cache_tokens = 0
+    external_cache_tokens = 0
+    combined_cache_tokens = 0
+    shared_cache_tokens = 0
+    required_placement_pressure = 0
+    placement_eviction_prompts: list[str] = []
+    if workload_metadata is not None:
+        block_size = int(workload_metadata["block_size"])
+        resident_cache_tokens = (
+            int(workload_metadata["resident_input_cache_pages"]) * block_size
+        )
+        external_cache_tokens = (
+            int(workload_metadata["external_input_cache_pages"]) * block_size
+        )
+        combined_cache_tokens = (
+            int(workload_metadata["combined_input_cache_pages"]) * block_size
+        )
+        shared_cache_tokens = (
+            int(workload_metadata["shared_input_cache_pages"]) * block_size
+        )
+        if resident_cache_tokens > args.max_total_tokens:
+            raise RuntimeError(
+                "resident input working set cannot fit in the configured SGLang "
+                f"KV pool ({resident_cache_tokens} > {args.max_total_tokens} tokens)"
+            )
+        # SGLang's reusable radix/HiCache prefix is the request input. The
+        # generated completion is not itself a prefix of the next request, so
+        # it does not provide reliable pressure for this placement phase.
+        # Force at least one page beyond the combined logical working set when
+        # it fits.  If it already exceeds the pool, one churn request is still
+        # retained as an explicit placement perturbation; the subsequent
+        # resident warmup establishes the final device/host split.
+        required_placement_pressure = max(
+            block_size,
+            args.max_total_tokens - combined_cache_tokens + block_size,
+        )
+        remaining = max(args.churn_tokens, required_placement_pressure)
+        while remaining > 0:
+            token_count = min(args.context_length, remaining)
+            placement_eviction_prompts.append(
+                make_prompt(
+                    tokenizer,
+                    f"load-placement-eviction-{len(placement_eviction_prompts)}",
+                    token_count,
+                )
+            )
+            remaining -= token_count
 
     load_started = time.perf_counter()
     with sgl.Engine(
@@ -644,23 +731,42 @@ def main() -> int:
         hicache_io_backend="kernel",
         hicache_mem_layout="page_first",
     ) as engine:
+        def warm_residents() -> None:
+            """Materialize and verify the resident working set in bounded batches."""
+
+            for begin in range(0, len(resident_prompts), args.max_running_requests):
+                end = begin + args.max_running_requests
+                results = generation_results(
+                    engine.generate(
+                        resident_prompts[begin:end],
+                        [dict(setup_sampling)] * len(resident_prompts[begin:end]),
+                    )
+                )
+                for result in results:
+                    if device_cached_tokens(result) <= 0:
+                        raise RuntimeError(
+                            "resident warmup did not remain in device cache"
+                        )
+
         load_seconds = time.perf_counter() - load_started
         generated_text(engine.generate(shape_prompt, setup_sampling))
         generated_text(engine.generate(shape_prompt, setup_sampling))
-        for prompt in external_prefixes:
-            generated_text(engine.generate(prompt, setup_sampling))
+        generation_results(
+            engine.generate(external_prefixes, [dict(setup_sampling)] * len(external_prefixes))
+        )
         for prompt in churn_prompts[:eviction_rounds]:
             generated_text(engine.generate(prompt, setup_sampling))
-        external_probe = engine.generate(external_prefixes[0], setup_sampling)
-        if host_cached_tokens(external_probe) <= 0:
-            raise RuntimeError("external JIT warmup did not load from host cache")
+        if workload_metadata is None:
+            external_probe = engine.generate(external_prefixes[0], setup_sampling)
+            if host_cached_tokens(external_probe) <= 0:
+                raise RuntimeError("external JIT warmup did not load from host cache")
         for prompt in churn_prompts[eviction_rounds:]:
             generated_text(engine.generate(prompt, setup_sampling))
-        for prompt in resident_prompts:
+        warm_residents()
+        for prompt in placement_eviction_prompts:
             generated_text(engine.generate(prompt, setup_sampling))
-            resident_probe = engine.generate(prompt, setup_sampling)
-            if device_cached_tokens(resident_probe) <= 0:
-                raise RuntimeError("resident warmup did not remain in device cache")
+        if placement_eviction_prompts:
+            warm_residents()
 
         for warmup in range(args.load_warmup_iterations):
             # Demand graphs warm on the first occurrence and capture on the
@@ -676,19 +782,15 @@ def main() -> int:
                     external_output_tokens,
                     resident_request_ids,
                     external_request_ids,
+                    warmup=True,
                 )
             )
             begin = (2 + warmup) * eviction_rounds
             end = begin + eviction_rounds
             for prompt in churn_prompts[begin:end]:
                 generated_text(engine.generate(prompt, setup_sampling))
-            for prompt in resident_prompts:
-                generated_text(engine.generate(prompt, setup_sampling))
-                resident_probe = engine.generate(prompt, setup_sampling)
-                if device_cached_tokens(resident_probe) <= 0:
-                    raise RuntimeError(
-                        "resident request was not restored after load warmup"
-                    )
+            if eviction_rounds:
+                warm_residents()
 
         records, elapsed = engine.loop.run_until_complete(
             _run_load(
@@ -706,14 +808,35 @@ def main() -> int:
 
     external = [record for record in records if record["kind"] == "external"]
     resident = [record for record in records if record["kind"] == "resident"]
-    if not all(record["host_cached_tokens"] > 0 for record in external):
-        raise RuntimeError("a timed external request was not served from host cache")
-    minimum_host_prefix = min(record["host_cached_tokens"] for record in external)
-    if not all(
-        record["device_cached_tokens"] > 0 and record["host_cached_tokens"] == 0
+    missing_external = [
+        {
+            "index": record["index"],
+            "device": record["device_cached_tokens"],
+            "host": record["host_cached_tokens"],
+        }
+        for record in external
+        if record["host_cached_tokens"] <= 0
+    ]
+    if missing_external:
+        raise RuntimeError(
+            "a timed external request was not served from host cache: "
+            + json.dumps(missing_external, sort_keys=True)
+        )
+    missing_resident = [
+        {
+            "index": record["index"],
+            "device": record["device_cached_tokens"],
+            "host": record["host_cached_tokens"],
+        }
         for record in resident
-    ):
-        raise RuntimeError("a timed resident request was not device-resident")
+        if record["device_cached_tokens"] <= 0 or record["host_cached_tokens"] != 0
+    ]
+    minimum_host_prefix = min(record["host_cached_tokens"] for record in external)
+    if missing_resident:
+        raise RuntimeError(
+            "a timed resident request was not device-resident: "
+            + json.dumps(missing_resident, sort_keys=True)
+        )
 
     digest = hashlib.sha256()
     for record in sorted(records, key=lambda value: (value["kind"], value["index"])):
@@ -836,6 +959,16 @@ def main() -> int:
         "resident_output_tokens": args.resident_output_tokens,
         "external_output_tokens": args.external_output_tokens,
         "eviction_rounds": eviction_rounds,
+        "placement_eviction_rounds": len(placement_eviction_prompts),
+        "placement_eviction_tokens": sum(
+            len(tokenizer.encode(prompt, add_special_tokens=False))
+            for prompt in placement_eviction_prompts
+        ),
+        "resident_input_cache_tokens": resident_cache_tokens,
+        "external_input_cache_tokens": external_cache_tokens,
+        "combined_input_cache_tokens": combined_cache_tokens,
+        "shared_input_cache_tokens": shared_cache_tokens,
+        "required_placement_pressure_tokens": required_placement_pressure,
         "churn_tokens": args.churn_tokens,
         "max_total_tokens": args.max_total_tokens,
         "batch_mode": args.batch_mode,

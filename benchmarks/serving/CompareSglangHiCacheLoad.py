@@ -52,6 +52,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hicache-ratio", type=float, default=8.0)
     parser.add_argument("--max-running-requests", type=int, default=16)
     parser.add_argument(
+        "--eviction-rounds",
+        type=int,
+        help=(
+            "explicit cache-churn rounds forwarded to both arms; zero disables "
+            "churn for a capacity-fit workload"
+        ),
+    )
+    parser.add_argument("--load-warmup-iterations", type=int, default=2)
+    parser.add_argument(
         "--batch-mode",
         choices=("coalesced", "separate"),
         default="coalesced",
@@ -131,6 +140,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("SLO scale and thresholds must be positive")
     if args.admission_lead_layers <= 0 or args.admission_max_delay_us < 0:
         parser.error("admission bounds are invalid")
+    if args.eviction_rounds is not None and args.eviction_rounds < 0:
+        parser.error("eviction rounds cannot be negative")
+    if args.load_warmup_iterations < 0:
+        parser.error("load warmup iterations cannot be negative")
     if args.incremental_setup_ns < 0:
         parser.error("incremental setup cost must be nonnegative")
     if args.external_suffix_tokens < 0:
@@ -216,13 +229,17 @@ class _CotenantSampler:
     The pre-run wait-gate only proves the GPU was free at launch; on this
     shared box co-tenant jobs can land mid-trial and arbitrarily inflate
     whichever arm they overlap. Every report therefore carries the number
-    of 5-second samples that saw a compute app outside our process tree,
+    of one-second samples that saw a compute app outside our process tree,
     so contaminated trials are identifiable by an objective environmental
     criterion instead of by their metric values.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, interval_seconds: float = 1.0) -> None:
+        if interval_seconds <= 0:
+            raise ValueError("co-tenant sampling interval must be positive")
+        self.interval_seconds = interval_seconds
         self.samples = 0
+        self.sampling_errors = 0
         self.foreign_samples = 0
         self.foreign_pids: set[int] = set()
         self._stop = threading.Event()
@@ -249,25 +266,36 @@ class _CotenantSampler:
             pass
         return pids
 
+    def _sample_once(self) -> None:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if out.returncode != 0:
+                self.sampling_errors += 1
+                return
+            apps = {
+                int(line) for line in out.stdout.split() if line.strip().isdigit()
+            }
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            self.sampling_errors += 1
+            return
+        self.samples += 1
+        foreign = apps - self._descendants()
+        if foreign:
+            self.foreign_samples += 1
+            self.foreign_pids |= foreign
+
     def _loop(self) -> None:
-        while not self._stop.wait(5.0):
-            try:
-                out = subprocess.run(
-                    ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                apps = {
-                    int(line) for line in out.stdout.split() if line.strip().isdigit()
-                }
-            except (OSError, subprocess.TimeoutExpired, ValueError):
-                continue
-            self.samples += 1
-            foreign = apps - self._descendants()
-            if foreign:
-                self.foreign_samples += 1
-                self.foreign_pids |= foreign
+        # Sample immediately so a co-tenant that arrived during the launch
+        # gate cannot hide inside the first sampling interval.
+        while not self._stop.is_set():
+            self._sample_once()
+            if self._stop.wait(self.interval_seconds):
+                return
 
     def __enter__(self) -> "_CotenantSampler":
         self._thread.start()
@@ -275,7 +303,11 @@ class _CotenantSampler:
 
     def __exit__(self, *exc: object) -> None:
         self._stop.set()
-        self._thread.join(timeout=12)
+        self._thread.join(timeout=7)
+
+    @property
+    def complete(self) -> bool:
+        return not self._thread.is_alive()
 
 
 def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
@@ -341,6 +373,9 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         "--flashinfer-workspace-base",
         str(workspace / "flashinfer"),
     ]
+    if args.eviction_rounds is not None:
+        command.extend(("--eviction-rounds", str(args.eviction_rounds)))
+    command.extend(("--load-warmup-iterations", str(args.load_warmup_iterations)))
     if args.workload_manifest is not None:
         command.extend(("--workload-manifest", str(args.workload_manifest.resolve())))
     if args.allow_oversubscribed_pool:
@@ -385,14 +420,26 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     log_path = workspace.parent / f"{workspace.name}.{backend}.stdout.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(completed.stdout, encoding="utf-8")
+    failures: list[str] = []
+    if not sampler.complete:
+        failures.append("co-tenant sampler did not terminate cleanly")
+    if sampler.sampling_errors:
+        failures.append(
+            "co-tenant sampler lost environmental samples: "
+            f"{sampler.sampling_errors} errors"
+        )
     if completed.returncode:
+        failures.append(f"worker exited with status {completed.returncode}")
+    if failures:
         raise RuntimeError(
-            f"{backend} load trial failed:\n"
+            f"{backend} load trial failed ({'; '.join(failures)}):\n"
             + "\n".join(completed.stdout.splitlines()[-120:])
         )
     report = _report(completed.stdout)
     report["cotenant_gpu_samples"] = sampler.foreign_samples
     report["gpu_samples"] = sampler.samples
+    report["gpu_sampling_errors"] = sampler.sampling_errors
+    report["gpu_sampling_complete"] = sampler.complete
     report["cotenant_pids_seen"] = sorted(sampler.foreign_pids)
     return report
 
@@ -491,6 +538,26 @@ def main() -> int:
     reports = {backend: run(args, backend) for backend in order}
     stock = reports["flashinfer"]
     nta = reports["nta_flashinfer"]
+    contaminated = {
+        backend: {
+            "foreign_samples": int(report.get("cotenant_gpu_samples", 0)),
+            "foreign_pids": report.get("cotenant_pids_seen", []),
+        }
+        for backend, report in reports.items()
+        if int(report.get("cotenant_gpu_samples", 0)) > 0
+    }
+    if contaminated:
+        _write_failed_comparison(
+            args.output,
+            reports,
+            order,
+            "co-tenant GPU activity contaminated a serving arm",
+            {"contaminated_arms": contaminated},
+        )
+        raise RuntimeError(
+            "serving comparison was contaminated by a foreign GPU process: "
+            + json.dumps(contaminated, sort_keys=True)
+        )
     try:
         activation = require_clean_mechanism(
             nta,

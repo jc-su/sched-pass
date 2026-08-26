@@ -42,6 +42,11 @@ def single() -> dict[str, object]:
         "machine": {"hostname": "test"},
         "demand_semantics": "exact",
         "placement_proven": True,
+        "cotenant_gpu_samples": 0,
+        "gpu_samples": 1,
+        "gpu_sampling_errors": 0,
+        "gpu_sampling_complete": True,
+        "cotenant_pids_seen": [],
         "verification_failures": 0,
         "correctness": {"verification_failures": 0, "generated_text_sha256": "all"},
         "generated_text_sha256": "all",
@@ -185,6 +190,15 @@ def main() -> None:
         assert "divergent" in str(error)
     else:
         raise AssertionError("divergent serving output was accepted")
+    invalid_environment = copy.deepcopy(comparison)
+    invalid_environment["nta"]["cotenant_gpu_samples"] = 1
+    invalid_environment["nta"]["cotenant_pids_seen"] = [12345]
+    try:
+        validate(invalid_environment)
+    except ValueError as error:
+        assert "contaminated" in str(error)
+    else:
+        raise AssertionError("co-tenant-contaminated serving evidence was accepted")
     invalid_single = copy.deepcopy(stock)
     invalid_single["records"][0]["request_id"] = "duplicate"
     invalid_single["workload"] = {

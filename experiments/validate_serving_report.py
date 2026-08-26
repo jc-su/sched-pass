@@ -30,6 +30,74 @@ def _finite(value: Any, name: str) -> float:
     return float(value)
 
 
+def _nonnegative_integer(value: Any, name: str) -> int:
+    _require(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+        f"serving report has invalid {name}",
+    )
+    return value
+
+
+def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> None:
+    """Validate run-level GPU occupancy evidence.
+
+    A direct worker report may be used for debugging without the comparison
+    driver's sampler. A formal paired result cannot: it must show at least one
+    successful sample, zero sampler errors, and no foreign compute PID.
+    """
+
+    fields = {
+        "cotenant_gpu_samples",
+        "gpu_samples",
+        "gpu_sampling_errors",
+        "gpu_sampling_complete",
+        "cotenant_pids_seen",
+    }
+    if not fields & report.keys():
+        _require(
+            not require_complete,
+            "formal serving evidence has no GPU environment sampler",
+        )
+        return
+    _require(
+        fields <= report.keys(),
+        "serving environment sampler evidence is incomplete",
+    )
+    foreign_samples = _nonnegative_integer(
+        report["cotenant_gpu_samples"], "co-tenant GPU sample count"
+    )
+    samples = _nonnegative_integer(report["gpu_samples"], "GPU sample count")
+    errors = _nonnegative_integer(
+        report["gpu_sampling_errors"], "GPU sampler error count"
+    )
+    pids = report["cotenant_pids_seen"]
+    _require(
+        isinstance(pids, list)
+        and all(
+            isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+            for pid in pids
+        )
+        and len(set(pids)) == len(pids),
+        "serving report has invalid co-tenant PID evidence",
+    )
+    _require(foreign_samples <= samples, "co-tenant samples exceed total samples")
+    _require(
+        (foreign_samples == 0) == (len(pids) == 0),
+        "co-tenant sample and PID evidence disagree",
+    )
+    if require_complete:
+        _require(samples > 0, "formal serving evidence has no successful GPU sample")
+        _require(errors == 0, "formal serving evidence lost GPU samples")
+        _require(
+            report["gpu_sampling_complete"] is True,
+            "formal serving evidence has incomplete GPU sampling",
+        )
+        _require(
+            foreign_samples == 0,
+            "formal serving evidence was contaminated by a foreign GPU process",
+        )
+
+
 def _validate_littles_law(report: dict[str, Any]) -> None:
     little = report.get("littles_law")
     _require(isinstance(little, dict), "serving report has no Little's Law report")
@@ -217,6 +285,7 @@ def _validate_single(
     )
     _require(report.get("demand_semantics") == "exact", "serving demand is not exact")
     _require(report.get("placement_proven") is True, "serving placement was not proven")
+    _validate_environment(report, require_complete=require_engine_stats)
     _require(
         report.get("verification_failures") == 0,
         "serving report has verification failures",
@@ -373,6 +442,8 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         isinstance(stock, dict) and isinstance(nta, dict),
         "serving comparison lacks stock or NTA report",
     )
+    _validate_environment(stock, require_complete=True)
+    _validate_environment(nta, require_complete=True)
     # The stock arm intentionally has no NTA plugin statistics.  Its timing,
     # correctness, placement, and Little's Law fields remain mandatory; only
     # the implementation-specific engine-stat stream is absent.

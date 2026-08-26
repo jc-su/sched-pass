@@ -200,6 +200,46 @@ def _prefix_reuse(rows: list[dict[str, Any]]) -> None:
         )
 
 
+def input_page_ids(
+    row: Mapping[str, Any], *, block_size: int = DEFAULT_BLOCK_SIZE
+) -> tuple[str, ...]:
+    """Return the exact logical input-page identities for one normalized row.
+
+    Bailian may expose only the shared prefix hashes.  The remaining pages are
+    deterministic request-local identities, matching :func:`synthesize_prompt`.
+    Keeping this rule in the workload layer prevents serving harnesses from
+    estimating cache pressure by summing request lengths and accidentally
+    counting shared pages multiple times.
+    """
+
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    token_count = int(row["input_length"])
+    if token_count <= 0:
+        raise ValueError("input_length must be positive")
+    page_count = math.ceil(token_count / block_size)
+    page_ids = [str(value) for value in row.get("hash_ids", ())]
+    if len(page_ids) > page_count:
+        raise ValueError("hash prefix is longer than the request")
+    page_ids.extend(
+        f"{row['request_id']}:unique:{index}"
+        for index in range(len(page_ids), page_count)
+    )
+    return tuple(page_ids)
+
+
+def unique_input_page_ids(
+    rows: Iterable[Mapping[str, Any]], *, block_size: int = DEFAULT_BLOCK_SIZE
+) -> frozenset[str]:
+    """Return the deduplicated input-page set for a request collection."""
+
+    return frozenset(
+        page_id
+        for row in rows
+        for page_id in input_page_ids(row, block_size=block_size)
+    )
+
+
 def _assign_serving_states(rows: list[dict[str, Any]], policy: str) -> dict[str, Any]:
     """Attach an explicit serving-state construction policy to a trace.
 
@@ -350,12 +390,7 @@ def synthesize_prompt(
     if block_size <= 0:
         raise ValueError("block_size must be positive")
     token_count = int(row["input_length"])
-    hashes = list(row.get("hash_ids", ()))
-    block_count = math.ceil(token_count / block_size)
-    ids = hashes[:block_count]
-    ids.extend(
-        f"{row['request_id']}:unique:{index}" for index in range(len(ids), block_count)
-    )
+    ids = input_page_ids(row, block_size=block_size)
     token_ids: list[int] = []
     for block_index, block_id in enumerate(ids):
         for position in range(block_size):

@@ -12,11 +12,18 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "python"))
+sys.path.insert(0, str(ROOT / "benchmarks" / "serving"))
 
-from experiments.bailian import normalize, write_workload  # noqa: E402
+from experiments.bailian import (  # noqa: E402
+    input_page_ids,
+    normalize,
+    unique_input_page_ids,
+    write_workload,
+)
 from experiments.check_regression import compare  # noqa: E402
 from experiments.run_evaluation import validate_spec  # noqa: E402
 from experiments.validate_workload import validate  # noqa: E402
+from SglangHiCacheLoad import _load_workload  # noqa: E402
 
 
 ONLINE = [
@@ -46,6 +53,8 @@ def main() -> None:
     assert rows[1]["arrival_seconds"] == 0.5
     assert rows[1]["shared_prefix_blocks"] == 2
     assert len(rows[1]["prompt_token_ids"]) == 48
+    assert input_page_ids(rows[1]) == ("x", "y", "z")
+    assert len(unique_input_page_ids(rows)) == 3
 
     scaled_manifest, _ = normalize(ONLINE, arrival_mode="trace", time_scale=0.5)
     assert scaled_manifest["arrival"]["production_arrival_claim"] is False
@@ -102,6 +111,18 @@ def main() -> None:
         )
         write_workload(root / "manifest.json", root / "records.jsonl", manifest, rows)
         validate(root / "manifest.json")
+
+        class LossyTokenizer:
+            def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+                del add_special_tokens
+                return list(range(len(text.split())))
+
+            def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+                del skip_special_tokens
+                return " ".join(f"token-{value}" for value in token_ids[:-1])
+
+        loaded = _load_workload(root / "manifest.json", LossyTokenizer())
+        assert loaded[-1]["tokenization_errors"] == len(rows)
         document = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         assert document["request_count"] == 2
         fixture = (

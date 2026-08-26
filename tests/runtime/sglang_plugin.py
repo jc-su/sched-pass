@@ -558,6 +558,7 @@ def main() -> None:
             enqueue_graph,
             eager_events,
             callback,
+            None,
         )
         is eager_output
     )
@@ -588,6 +589,7 @@ def main() -> None:
             enqueue_graph,
             eager_events,
             callback,
+            None,
         )
     assert graph_backend._stats["demand_graph_captures"] == 1
     assert enqueue_calls[-1][3] is None
@@ -606,6 +608,7 @@ def main() -> None:
         enqueue_graph,
         eager_events,
         callback,
+        None,
     )
     assert replay_output is captured.output
     assert captured.graph.replays == 2
