@@ -19,6 +19,27 @@ die() {
   exit 1
 }
 
+cuda_library_path() {
+  if [[ -n ${LD_LIBRARY_PATH:-} ]]; then
+    printf '%s\n' "$LD_LIBRARY_PATH"
+    return
+  fi
+  local python_bin=${NTA_PYTHON:-python3}
+  local requested=${NTA_CUDA_ROOT:-${NTA_CUDA_PATH:-${CUDAToolkit_ROOT:-}}}
+  local cuda_home
+  if [[ -n $requested ]]; then
+    cuda_home=$(
+      "$python_bin" "$root_dir/tools/jit/cuda_toolkit.py" \
+        --cuda-path "$requested" --print-root
+    )
+  else
+    cuda_home=$(
+      "$python_bin" "$root_dir/tools/jit/cuda_toolkit.py" --print-root
+    )
+  fi
+  printf '%s/lib64\n' "$cuda_home"
+}
+
 has_cuda_admin_capability() {
   local executable=$1 capabilities
   command -v getcap >/dev/null 2>&1 || return 1
@@ -343,7 +364,7 @@ probe)
   [[ $(current_driver) == vfio-pci ]] || die "$bdf is not bound to vfio-pci"
   [[ -x $probe ]] || die "probe executable is absent; build nta-vfio-nvme-probe"
   if [[ $probe_as_root == 1 ]]; then
-    sudo env LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}" \
+    sudo env LD_LIBRARY_PATH="$(cuda_library_path)" \
       "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy" \
       "$dma_target"
   else
@@ -389,7 +410,7 @@ qualify)
   [[ -x $benchmark ]] || die "benchmark executable is absent; build nta-nvme-bench"
   benchmark_command=(
     env
-    "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/usr/local/cuda-12.9/lib64}"
+    "LD_LIBRARY_PATH=$(cuda_library_path)"
     "NTA_REVISION=${NTA_REVISION:-$(git -C "$root_dir" rev-parse HEAD)}"
     "$benchmark"
     "--device=vfio:$bdf"

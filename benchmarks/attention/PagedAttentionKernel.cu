@@ -2,7 +2,13 @@
 #include "nta/KernelPolicy.cuh"
 #include "runtime/device/Acquire.cuh"
 
+#if __has_include(<cuda/barrier>)
 #include <cuda/barrier>
+#elif __has_include(<cccl/cuda/barrier>)
+#include <cccl/cuda/barrier>
+#else
+#error "the selected CUDA toolkit has no supported barrier header"
+#endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 

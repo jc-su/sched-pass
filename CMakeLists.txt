@@ -524,6 +524,29 @@ if(NTA_ENABLE_CUDA)
   if(NOT EXISTS "${NTA_CUDA_ROOT}/include/cuda_runtime.h")
     get_filename_component(NTA_CUDA_ROOT "${CUDAToolkit_BIN_DIR}/.." ABSOLUTE)
   endif()
+  # CUDA 12.x keeps CUDA C++ headers below <root>/include, while CUDA 13.x
+  # places them in the target sysroot.  All raw-clang device commands must see
+  # the same complete header view as the JIT shim; otherwise a CUDA 13 build
+  # fails on headers such as <cuda/barrier> even though nvcc itself is valid.
+  set(NTA_CUDA_INCLUDE_DIRS "${NTA_CUDA_ROOT}/include")
+  file(GLOB NTA_CUDA_TARGET_INCLUDE_DIRS LIST_DIRECTORIES true
+    "${NTA_CUDA_ROOT}/targets/*-linux/include")
+  foreach(NTA_CUDA_TARGET_INCLUDE_DIR IN LISTS NTA_CUDA_TARGET_INCLUDE_DIRS)
+    if(IS_DIRECTORY "${NTA_CUDA_TARGET_INCLUDE_DIR}")
+      list(APPEND NTA_CUDA_INCLUDE_DIRS
+        "${NTA_CUDA_TARGET_INCLUDE_DIR}")
+      if(IS_DIRECTORY "${NTA_CUDA_TARGET_INCLUDE_DIR}/cccl")
+        list(APPEND NTA_CUDA_INCLUDE_DIRS
+          "${NTA_CUDA_TARGET_INCLUDE_DIR}/cccl")
+      endif()
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES NTA_CUDA_INCLUDE_DIRS)
+  set(NTA_CUDA_INCLUDE_FLAGS)
+  foreach(NTA_CUDA_INCLUDE_DIR IN LISTS NTA_CUDA_INCLUDE_DIRS)
+    list(APPEND NTA_CUDA_INCLUDE_FLAGS
+      -isystem "${NTA_CUDA_INCLUDE_DIR}")
+  endforeach()
 
   add_library(nta-runtime-host STATIC
     runtime/host/CxlRuntime.cpp
@@ -764,6 +787,7 @@ if(NTA_ENABLE_CUDA)
       --cuda-path=${NTA_CUDA_ROOT}
       --cuda-gpu-arch=${NTA_CUDA_ARCH}
       -Wno-unknown-cuda-version
+      ${NTA_CUDA_INCLUDE_FLAGS}
       -I${CMAKE_CURRENT_SOURCE_DIR}/include
       -I${CMAKE_CURRENT_SOURCE_DIR}
       -emit-llvm
@@ -949,6 +973,7 @@ if(Python3_Interpreter_FOUND)
       --cuda-path=${NTA_CUDA_ROOT}
       --cuda-gpu-arch=${NTA_CUDA_ARCH}
       -Wno-unknown-cuda-version
+      ${NTA_CUDA_INCLUDE_FLAGS}
       -I${CMAKE_CURRENT_SOURCE_DIR}/include
       -I${CMAKE_CURRENT_SOURCE_DIR}
       ${NTA_FLASHINFER_DEVICE_FLAGS}
@@ -1141,6 +1166,7 @@ if(Python3_Interpreter_FOUND)
       --cuda-path=${NTA_CUDA_ROOT}
       --cuda-gpu-arch=${NTA_CUDA_ARCH}
       -Wno-unknown-cuda-version
+      ${NTA_CUDA_INCLUDE_FLAGS}
       -I${CMAKE_CURRENT_SOURCE_DIR}/include
       -I${CMAKE_CURRENT_SOURCE_DIR}
       -S

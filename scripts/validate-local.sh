@@ -8,12 +8,22 @@ requests=${NTA_REQUESTS:-32}
 results=${NTA_RESULTS_DIR:-"${TMPDIR:-/tmp}/nta-local-results"}
 mkdir -p "${results}"
 
+python_bin=${NTA_PYTHON:-python3}
+cuda_request=${NTA_CUDA_ROOT:-${CUDAToolkit_ROOT:-}}
+if [[ -n ${cuda_request} ]]; then
+  cuda_root=$("${python_bin}" "${root}/tools/jit/cuda_toolkit.py" \
+    --cuda-path "${cuda_request}" --print-root)
+else
+  cuda_root=$("${python_bin}" "${root}/tools/jit/cuda_toolkit.py" --print-root)
+fi
+ptxas=${NTA_PTXAS:-${cuda_root}/bin/ptxas}
+
 cmake -S "${root}" -B "${build}" -GNinja \
   -DCMAKE_BUILD_TYPE="${NTA_BUILD_TYPE:-Release}" \
   -DLLVM_DIR="${LLVM_DIR:-/usr/lib/llvm-22/lib/cmake/llvm}" \
   -DNTA_CLANG_CUDA="${NTA_CLANG_CUDA:-/usr/bin/clang++-22}" \
-  -DCUDAToolkit_ROOT="${CUDAToolkit_ROOT:-/usr/local/cuda-12.9}" \
-  -DNTA_CUDA_ROOT="${NTA_CUDA_ROOT:-/usr/local/cuda-12.9}" \
+  -DCUDAToolkit_ROOT="${cuda_root}" \
+  -DNTA_CUDA_ROOT="${cuda_root}" \
   -DNTA_CUDA_ARCH="${NTA_CUDA_ARCH:-sm_120}"
 cmake --build "${build}" -j"${NTA_BUILD_JOBS:-2}"
 ctest --test-dir "${build}" --output-on-failure
@@ -74,7 +84,6 @@ done
   --progress-rounds=1 \
   --request-credit-pages=2 | tee "${results}/sparse-overfetch.log"
 
-ptxas=${NTA_PTXAS:-/usr/local/cuda-12.9/bin/ptxas}
 "${ptxas}" -v -arch="${NTA_CUDA_ARCH:-sm_120}" -O3 \
   "${build}/kernel/PagedAttention.ptx" \
   -o "${results}/PagedAttention.cubin" \
@@ -85,10 +94,9 @@ ptxas=${NTA_PTXAS:-/usr/local/cuda-12.9/bin/ptxas}
   2>"${results}/kv-ptxas.log"
 
 if [[ ${NTA_SANITIZE:-0} == 1 ]]; then
-  sanitizer=${NTA_COMPUTE_SANITIZER:-/usr/local/cuda-12.9/bin/compute-sanitizer}
-  python=${NTA_PYTHON:-python3}
+  sanitizer=${NTA_COMPUTE_SANITIZER:-${cuda_root}/bin/compute-sanitizer}
   have_flashinfer=0
-  if "${python}" -c 'import flashinfer' >/dev/null 2>&1; then
+  if "${python_bin}" -c 'import flashinfer' >/dev/null 2>&1; then
     have_flashinfer=1
   fi
   for tool in memcheck racecheck synccheck; do
@@ -132,10 +140,10 @@ if [[ ${NTA_SANITIZE:-0} == 1 ]]; then
         --build-dir "${build}" \
         --cache-root "${build}/flashinfer-jit-cache" \
         --clang "${NTA_CLANG_CUDA:-/usr/bin/clang++-22}" \
-        --cuda-path "${NTA_CUDA_ROOT:-/usr/local/cuda-12.9}" \
+        --cuda-path "${cuda_root}" \
         --flashinfer-hook -- \
         "${sanitizer}" --tool "${tool}" --error-exitcode 99 \
-        "${python}" "${root}/tests/flashinfer/hooked_decode.py" --sanitizer \
+        "${python_bin}" "${root}/tests/flashinfer/hooked_decode.py" --sanitizer \
         2>&1 | tee "${results}/flashinfer-${tool}.log"
     fi
   done

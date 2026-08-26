@@ -11,10 +11,20 @@ import subprocess
 import sys
 
 try:
-    from cuda_toolkit import cuda_release, filter_cuda_include_args, resolve_cuda_home
+    from cuda_toolkit import (
+        cuda_include_dirs,
+        cuda_release,
+        filter_cuda_include_args,
+        resolve_cuda_home,
+    )
 except ModuleNotFoundError:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from cuda_toolkit import cuda_release, filter_cuda_include_args, resolve_cuda_home
+    from cuda_toolkit import (
+        cuda_include_dirs,
+        cuda_release,
+        filter_cuda_include_args,
+        resolve_cuda_home,
+    )
 
 
 ROOT = pathlib.Path(
@@ -139,13 +149,13 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
         "cuda",
         f"--cuda-path={CUDA_PATH}",
         "-Wno-unknown-cuda-version",
-        "-isystem",
-        str(pathlib.Path(CUDA_PATH) / "include"),
         "-I",
         str(ROOT / "include"),
         "-I",
         str(ROOT),
     ]
+    for include_dir in cuda_include_dirs(pathlib.Path(CUDA_PATH)):
+        command.extend(("-isystem", str(include_dir)))
     overlay = os.environ.get("NTA_FLASHINFER_OVERLAY", "")
     if overlay:
         command[1:1] = ["-I", overlay]

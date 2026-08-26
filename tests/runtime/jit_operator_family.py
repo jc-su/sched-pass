@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import tempfile
 
 
 ROOT = pathlib.Path(__file__).parents[2]
@@ -48,6 +49,28 @@ def main() -> int:
     assert not MODULE.has_typed_operator_kernel_source(
         ["-c", "batch_prefill_jit_binding.cu"]
     )
+    filtered = MODULE.filter_cuda_include_args(
+        [
+            "-I",
+            "/usr/local/cuda-13.0/targets/x86_64-linux/include",
+            "-isystem",
+            "/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl",
+            "-isystem/usr/local/cuda-12.9/include",
+            "-I",
+            "/tmp/project/include",
+        ]
+    )
+    assert filtered == ["-I", "/tmp/project/include"]
+    with tempfile.TemporaryDirectory() as temporary:
+        cuda_root = pathlib.Path(temporary)
+        (cuda_root / "include").mkdir()
+        target_include = cuda_root / "targets" / "aarch64-linux" / "include"
+        (target_include / "cccl").mkdir(parents=True)
+        assert MODULE.cuda_include_dirs(cuda_root) == (
+            cuda_root / "include",
+            target_include,
+            target_include / "cccl",
+        )
 
     try:
         MODULE.operator_family(
