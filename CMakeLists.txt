@@ -14,6 +14,10 @@ option(NTA_ENABLE_FLASHINFER_VALIDATION
        ON)
 set(NTA_FLASHINFER_INCLUDE_DIR "" CACHE PATH
     "Path containing flashinfer/page.cuh and flashinfer/attention/state.cuh")
+set(NTA_TEST_JIT_CACHE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache"
+    CACHE PATH
+    "Writable external root for FlashInfer/JIT CTest artifacts")
 
 # Physical tests never guess a PCI function or bind one as a side effect of a
 # normal build. Once an operator has explicitly qualified and (optionally)
@@ -919,7 +923,7 @@ if(Python3_Interpreter_FOUND)
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
         --build-dir ${CMAKE_CURRENT_BINARY_DIR}
-        --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
+        --cache-root ${NTA_TEST_JIT_CACHE_ROOT}
         --clang ${NTA_CLANG_CUDA}
         --cuda-path ${NTA_CUDA_ROOT}
         --flashinfer-hook
@@ -934,7 +938,7 @@ if(Python3_Interpreter_FOUND)
         ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
         --build-dir ${CMAKE_CURRENT_BINARY_DIR}
-        --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
+        --cache-root ${NTA_TEST_JIT_CACHE_ROOT}
         --clang ${NTA_CLANG_CUDA}
         --cuda-path ${NTA_CUDA_ROOT}
         --flashinfer-hook
@@ -964,7 +968,7 @@ if(Python3_Interpreter_FOUND)
           ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
           --build-dir ${CMAKE_CURRENT_BINARY_DIR}
-          --cache-root ${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache
+          --cache-root ${NTA_TEST_JIT_CACHE_ROOT}
           --clang ${NTA_CLANG_CUDA}
           --cuda-path ${NTA_CUDA_ROOT}
           --flashinfer-hook
@@ -1660,7 +1664,7 @@ if(Python3_Interpreter_FOUND)
         "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py"
         --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
-        --cache-root "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache"
+        --cache-root "${NTA_TEST_JIT_CACHE_ROOT}"
         --cuda-path "${NTA_CUDA_ROOT}"
         --flashinfer-hook
         --
@@ -1691,7 +1695,7 @@ if(Python3_Interpreter_FOUND)
         "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py"
         --build-dir "${CMAKE_CURRENT_BINARY_DIR}"
-        --cache-root "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache"
+        --cache-root "${NTA_TEST_JIT_CACHE_ROOT}"
         --cuda-path "${NTA_CUDA_ROOT}"
         --flashinfer-hook
         --

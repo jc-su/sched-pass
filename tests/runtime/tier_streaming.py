@@ -52,7 +52,7 @@ def main() -> int:
     ]
     assert [wave.completed_request_keys for wave in schedule.waves] == [
         ((40, 4),),
-        ((30, 0),),
+        ((30, 1),),
         (),
         ((10, 7),),
     ]

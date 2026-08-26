@@ -104,6 +104,15 @@ cmake --build build -j2
 ctest --test-dir build --output-on-failure
 ```
 
+FlashInfer JIT artifacts can be large.  Keep them outside a constrained root
+filesystem by setting `NTA_TEST_JIT_CACHE_ROOT` (the local validation script
+passes it through to CTest and its sanitizer launcher):
+
+```bash
+NTA_TEST_JIT_CACHE_ROOT=/mnt/disk0/$USER/nta-jit-cache/sched-pass \
+  scripts/validate-local.sh
+```
+
 GPU- and framework-dependent tests remain capability-gated. The dependency-free
 contract tests can run with:
 

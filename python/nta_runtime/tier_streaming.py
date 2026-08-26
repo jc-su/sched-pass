@@ -6,6 +6,14 @@ from dataclasses import dataclass
 import math
 from typing import Literal
 
+from .abi import bounded_integer as _bounded_integer
+from .abi import u32 as _u32
+from .abi import u64 as _u64
+
+
+_INT32_MAX = (1 << 31) - 1
+_MAX_REQUEST_PRIORITY = 7
+
 
 @dataclass(frozen=True)
 class TierStreamingRequest:
@@ -17,19 +25,73 @@ class TierStreamingRequest:
     resident_tokens: int
     priority: int = 0
     deadline_ns: int = 0
-    generation: int = 0
+    generation: int = 1
     tenant_id: int = 0
     cancelled: bool = False
 
     def __post_init__(self) -> None:
-        if self.request_id < 0:
-            raise ValueError("request ID must be nonnegative")
-        if self.query_tokens <= 0 or self.context_tokens <= 0:
-            raise ValueError("query and context token counts must be positive")
-        if not 0 <= self.resident_tokens <= self.context_tokens:
+        object.__setattr__(
+            self,
+            "request_id",
+            _u64(self.request_id, "tier-streaming request ID"),
+        )
+        object.__setattr__(
+            self,
+            "query_tokens",
+            _bounded_integer(
+                self.query_tokens,
+                "tier-streaming query tokens",
+                minimum=1,
+                maximum=_INT32_MAX,
+            ),
+        )
+        context_tokens = _bounded_integer(
+            self.context_tokens,
+            "tier-streaming context tokens",
+            minimum=1,
+            maximum=_INT32_MAX,
+        )
+        object.__setattr__(self, "context_tokens", context_tokens)
+        resident_tokens = _bounded_integer(
+            self.resident_tokens,
+            "tier-streaming resident tokens",
+            minimum=0,
+            maximum=context_tokens,
+        )
+        if resident_tokens > context_tokens:
             raise ValueError("resident tokens must be within the context")
-        if min(self.priority, self.deadline_ns, self.generation, self.tenant_id) < 0:
-            raise ValueError("request policy and identity fields must be nonnegative")
+        object.__setattr__(self, "resident_tokens", resident_tokens)
+        object.__setattr__(
+            self,
+            "priority",
+            _bounded_integer(
+                self.priority,
+                "tier-streaming priority",
+                minimum=0,
+                maximum=_MAX_REQUEST_PRIORITY,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "deadline_ns",
+            _u64(self.deadline_ns, "tier-streaming deadline"),
+        )
+        object.__setattr__(
+            self,
+            "generation",
+            _u32(
+                self.generation,
+                "tier-streaming generation",
+                positive=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tenant_id",
+            _u32(self.tenant_id, "tier-streaming tenant"),
+        )
+        if not isinstance(self.cancelled, bool):
+            raise ValueError("tier-streaming cancelled flag must be boolean")
 
     @property
     def external_tokens(self) -> int:

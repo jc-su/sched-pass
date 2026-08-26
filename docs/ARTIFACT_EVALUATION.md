@@ -261,9 +261,14 @@ cmake -S . -B build \
   -DNTA_TEST_NVME_REFERENCE=/tmp/nta-nvme-reference.bin \
   -DNTA_TEST_NVME_MEDIA_POLICY=trusted-read-only-code \
   -DNTA_TEST_NVME_DMA_TARGET=hbm-peer \
-  -DNTA_TEST_NVME_USE_SUDO=ON
+  -DNTA_TEST_NVME_USE_SUDO=ON \
+  -DNTA_TEST_JIT_CACHE_ROOT=/mnt/disk0/$USER/nta-jit-cache/sched-pass
 ctest --test-dir build -R 'nta-(vfio-nvme-probe|paged-attention-nvme-gpu)'
 ```
+
+`NTA_TEST_JIT_CACHE_ROOT` is optional, but recommended on hosts whose root
+filesystem is reserved or shared.  It is a generated, UID-namespaced cache;
+the source tree and physical NVMe namespace remain untouched.
 
 The JIT launcher namespaces FlashInfer caches by Unix UID, so privileged
 physical tests cannot leave root-owned compilation outputs in a later user

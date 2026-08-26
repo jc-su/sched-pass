@@ -6,6 +6,7 @@ build=${NTA_BUILD_DIR:-"${root}/build"}
 iterations=${NTA_ITERATIONS:-50}
 requests=${NTA_REQUESTS:-32}
 results=${NTA_RESULTS_DIR:-"${TMPDIR:-/tmp}/nta-local-results"}
+jit_cache_root=${NTA_TEST_JIT_CACHE_ROOT:-"${build}/flashinfer-jit-cache"}
 mkdir -p "${results}"
 
 python_bin=${NTA_PYTHON:-python3}
@@ -24,7 +25,8 @@ cmake -S "${root}" -B "${build}" -GNinja \
   -DNTA_CLANG_CUDA="${NTA_CLANG_CUDA:-/usr/bin/clang++-22}" \
   -DCUDAToolkit_ROOT="${cuda_root}" \
   -DNTA_CUDA_ROOT="${cuda_root}" \
-  -DNTA_CUDA_ARCH="${NTA_CUDA_ARCH:-sm_120}"
+  -DNTA_CUDA_ARCH="${NTA_CUDA_ARCH:-sm_120}" \
+  -DNTA_TEST_JIT_CACHE_ROOT="${jit_cache_root}"
 cmake --build "${build}" -j"${NTA_BUILD_JOBS:-2}"
 ctest --test-dir "${build}" --output-on-failure
 
@@ -138,7 +140,7 @@ if [[ ${NTA_SANITIZE:-0} == 1 ]]; then
     if [[ ${have_flashinfer} == 1 ]]; then
       "${root}/tools/jit/activate.py" \
         --build-dir "${build}" \
-        --cache-root "${build}/flashinfer-jit-cache" \
+        --cache-root "${jit_cache_root}" \
         --clang "${NTA_CLANG_CUDA:-/usr/bin/clang++-22}" \
         --cuda-path "${cuda_root}" \
         --flashinfer-hook -- \
