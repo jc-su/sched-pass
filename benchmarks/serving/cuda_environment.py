@@ -18,7 +18,9 @@ import sys
 try:
     from tools.jit.cuda_toolkit import cuda_release, resolve_cuda_home
 except ModuleNotFoundError:
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools" / "jit"))
+    sys.path.insert(
+        0, str(pathlib.Path(__file__).resolve().parents[2] / "tools" / "jit")
+    )
     from cuda_toolkit import cuda_release, resolve_cuda_home
 
 
@@ -84,7 +86,9 @@ def configure_jit_environment(
         )
     compat_header = root / "benchmarks" / "serving" / "pthread_clock_compat.h"
     if not compat_header.is_file():
-        raise RuntimeError(f"serving CUDA compatibility header is missing: {compat_header}")
+        raise RuntimeError(
+            f"serving CUDA compatibility header is missing: {compat_header}"
+        )
     nvcc_flags = [f"-ccbin={resolved_host_cxx}"]
     if cuda_release(resolved_cuda_home)[0] < 13:
         nvcc_flags.extend(
@@ -139,8 +143,7 @@ def configure_jit_environment(
         if activation_result.returncode != 0:
             detail = activation_result.stderr.strip()
             raise RuntimeError(
-                "NTA JIT activation failed"
-                + (f": {detail}" if detail else "")
+                "NTA JIT activation failed" + (f": {detail}" if detail else "")
             )
         activated: dict[str, str] = {}
         for line in activation_result.stdout.splitlines():

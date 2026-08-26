@@ -414,8 +414,7 @@ class SglangHiCacheBridge:
                     if self._latest_request_key.get(evicted_key[0]) == evicted_key:
                         self._latest_request_key.pop(evicted_key[0], None)
                     self._admission_stats["progress_feedback_evictions"] = (
-                        self._admission_stats.get("progress_feedback_evictions", 0)
-                        + 1
+                        self._admission_stats.get("progress_feedback_evictions", 0) + 1
                     )
                 key = (work.request_id, work.generation)
                 self._latest_request_work[key] = (

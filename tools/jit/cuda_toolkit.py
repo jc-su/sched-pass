@@ -119,7 +119,9 @@ def cuda_release(cuda_home: pathlib.Path) -> tuple[int, int]:
         raise RuntimeError(f"cannot query CUDA toolkit version: {cuda_home}") from error
     match = re.search(r"release\s+(\d+)\.(\d+)", result)
     if match is None:
-        raise RuntimeError(f"cannot parse CUDA toolkit version from {cuda_home / 'bin' / 'nvcc'}")
+        raise RuntimeError(
+            f"cannot parse CUDA toolkit version from {cuda_home / 'bin' / 'nvcc'}"
+        )
     return int(match.group(1)), int(match.group(2))
 
 

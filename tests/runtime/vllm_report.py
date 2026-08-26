@@ -100,6 +100,12 @@ def main() -> None:
     assert validate_serving_result(nta)["classification"] == (
         "vllm-serving-integration-smoke"
     )
+    try:
+        validate_serving_result({"classification": "unknown-serving-report"})
+    except ValueError as error:
+        assert "unsupported serving result classification" in str(error)
+    else:
+        raise AssertionError("unknown serving result classification was dispatched")
 
     invalid = copy.deepcopy(nta)
     invalid["stock_fallback_enabled"] = True

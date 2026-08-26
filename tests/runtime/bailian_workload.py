@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "benchmarks" / "serving"))
 from experiments.bailian import (  # noqa: E402
     input_page_ids,
     normalize,
+    read_jsonl_selection,
     unique_input_page_ids,
     write_workload,
 )
@@ -60,9 +61,24 @@ def main() -> None:
     # than rebuilding every tuple prefix for every request.
     trie_manifest, trie_rows = normalize(
         [
-            {"chat_id": "p0", "input_length": 64, "output_length": 1, "hash_ids": ["a", "b", "c", "d"]},
-            {"chat_id": "p1", "input_length": 48, "output_length": 1, "hash_ids": ["a", "b", "x"]},
-            {"chat_id": "p2", "input_length": 32, "output_length": 1, "hash_ids": ["a", "z"]},
+            {
+                "chat_id": "p0",
+                "input_length": 64,
+                "output_length": 1,
+                "hash_ids": ["a", "b", "c", "d"],
+            },
+            {
+                "chat_id": "p1",
+                "input_length": 48,
+                "output_length": 1,
+                "hash_ids": ["a", "b", "x"],
+            },
+            {
+                "chat_id": "p2",
+                "input_length": 32,
+                "output_length": 1,
+                "hash_ids": ["a", "z"],
+            },
         ]
     )
     assert trie_manifest["statistics"]["shared_prefix_blocks"] == 3
@@ -174,6 +190,18 @@ def main() -> None:
             "max_requests": 2,
             "source_request_count": 3,
         }
+        selected, source_count, source_digest = read_jsonl_selection(fixture, 2)
+        assert len(selected) == 2
+        assert source_count == 3
+        assert source_digest == cli_document["source_digest"]
+        malformed = root / "malformed.jsonl"
+        malformed.write_bytes(b'{"input_length": 1}\nnot-json\n')
+        try:
+            read_jsonl_selection(malformed, 1)
+        except ValueError as error:
+            assert "line 2" in str(error)
+        else:
+            raise AssertionError("malformed suffix was silently ignored")
         opportunity = root / "rq0.json"
         subprocess.run(
             [

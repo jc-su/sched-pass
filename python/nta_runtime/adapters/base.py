@@ -52,9 +52,7 @@ def _integer_vector(
 def _nested_integer_vector(values: Any, name: str) -> tuple[tuple[int, ...], ...]:
     try:
         rows = _sequence(values, name)
-        return tuple(
-            _integer_vector(row, f"{name} row") for row in rows
-        )
+        return tuple(_integer_vector(row, f"{name} row") for row in rows)
     except ValueError as error:
         raise ValueError(f"{name} must be a sequence of integer rows") from error
 
@@ -112,7 +110,12 @@ class ConsumerContract:
             if type(getattr(self, field)) is not bool:
                 raise TypeError(f"consumer contract {field} must be bool")
         if self.kind is ConsumerKind.NATIVE_WORK_UNIT and not all(
-            (self.exact_demand, self.typed_work_plan, self.native_submission, self.numerical_consumer)
+            (
+                self.exact_demand,
+                self.typed_work_plan,
+                self.native_submission,
+                self.numerical_consumer,
+            )
         ):
             raise ValueError(
                 "native work-unit consumer requires exact demand, typed plan, "
@@ -328,9 +331,7 @@ class EngineBatch:
                 deadline_clock=binding.deadline_clock,
                 tenant_id=binding.tenant_id,
             )
-            for local_index, binding in enumerate(
-                self.bindings[start : start + count]
-            )
+            for local_index, binding in enumerate(self.bindings[start : start + count])
         )
         return EngineBatch(
             self.engine,

@@ -127,9 +127,7 @@ def _cxl_decoders(cxl_sysfs_root: Path) -> list[dict[str, Any]]:
                 "size": _cxl_attr(path, "size"),
                 "target_list": _cxl_attr(path, "target_list"),
                 "interleave_ways": _cxl_attr(path, "interleave_ways"),
-                "interleave_granularity": _cxl_attr(
-                    path, "interleave_granularity"
-                ),
+                "interleave_granularity": _cxl_attr(path, "interleave_granularity"),
                 "locked": _cxl_attr(path, "locked"),
                 "cap_ram": _cxl_attr(path, "cap_ram"),
                 "cap_pmem": _cxl_attr(path, "cap_pmem"),
@@ -140,14 +138,12 @@ def _cxl_decoders(cxl_sysfs_root: Path) -> list[dict[str, Any]]:
     return decoders
 
 
-def _cxl_inventory(
-    dev_root: Path, cxl_sysfs_root: Path
-) -> dict[str, Any]:
-    names = sorted(
-        path.name
-        for path in cxl_sysfs_root.iterdir()
-        if path.is_dir()
-    ) if cxl_sysfs_root.is_dir() else []
+def _cxl_inventory(dev_root: Path, cxl_sysfs_root: Path) -> dict[str, Any]:
+    names = (
+        sorted(path.name for path in cxl_sysfs_root.iterdir() if path.is_dir())
+        if cxl_sysfs_root.is_dir()
+        else []
+    )
     memdevs = [name for name in names if name.startswith("mem")]
     endpoints = [name for name in names if name.startswith("endpoint")]
     regions = [name for name in names if name.startswith("region")]

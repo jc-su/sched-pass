@@ -113,6 +113,7 @@ def main() -> None:
         VARIANT_NAME,
         VARIANT_DECL,
     )
+
     def prefill_specification(name: str, dtype: torch.dtype) -> object:
         return gen_customize_batch_prefill_module(
             "fa2",

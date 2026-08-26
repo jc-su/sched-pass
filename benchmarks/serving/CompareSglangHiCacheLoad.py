@@ -19,9 +19,7 @@ from CompareSglangHiCache import require_clean_mechanism
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RESULTS_ROOT = pathlib.Path(
-    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
-)
+RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -277,9 +275,7 @@ class _CotenantSampler:
             if out.returncode != 0:
                 self.sampling_errors += 1
                 return
-            apps = {
-                int(line) for line in out.stdout.split() if line.strip().isdigit()
-            }
+            apps = {int(line) for line in out.stdout.split() if line.strip().isdigit()}
         except (OSError, subprocess.TimeoutExpired, ValueError):
             self.sampling_errors += 1
             return

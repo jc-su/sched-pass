@@ -291,9 +291,7 @@ def analyze(output: Path) -> dict[str, Any]:
             "native_work_unit",
             "framework_reference",
         }:
-            raise ValueError(
-                f"formal trial {identity[:2]} has no valid consumer_kind"
-            )
+            raise ValueError(f"formal trial {identity[:2]} has no valid consumer_kind")
         for contract in _validate_result(
             record, required_consumer_kind=required_consumer_kind
         ):

@@ -49,9 +49,7 @@ def main() -> None:
         encoding="utf-8"
     )
     assert "--allow-device-rebind" in qualification
-    nvme_script = (ROOT / "scripts" / "nta-vfio-device.sh").read_text(
-        encoding="utf-8"
-    )
+    nvme_script = (ROOT / "scripts" / "nta-vfio-device.sh").read_text(encoding="utf-8")
     assert "require_media_policy" in nvme_script
     assert "restore" in nvme_script
     print("physical_tier_safety=pass")

@@ -81,16 +81,16 @@ CLANG_PREFILL_TEMPLATE_REPLACEMENTS = (
 CLANG_PREFILL_LDCA_ANCHOR = (
     "__ldca(token_pos_in_items + idx_in_original_seq - prefix_len)"
 )
-CLANG_PREFILL_LDCA_REPLACEMENT = (
-    "token_pos_in_items[idx_in_original_seq - prefix_len]"
-)
+CLANG_PREFILL_LDCA_REPLACEMENT = "token_pos_in_items[idx_in_original_seq - prefix_len]"
 CLANG_PREFILL_BITWISE_AND_ANCHOR = (
     "if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len)"
 )
 CLANG_PREFILL_BITWISE_AND_REPLACEMENT = (
     "if (idx_in_original_seq >= prefix_len && idx_in_original_seq < kv_len)"
 )
-CTA_TILE_Q_DISPATCH_ANCHOR = "#define DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, ...)   \\\n"
+CTA_TILE_Q_DISPATCH_ANCHOR = (
+    "#define DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, ...)   \\\n"
+)
 CTA_TILE_Q_CASE_ANCHOR = (
     "    case 32: {                                             \\\n"
     "      constexpr uint32_t CTA_TILE_Q = 32;                  \\\n"
@@ -970,7 +970,7 @@ def validate_existing(
             or not (output / "flashinfer" / relative).is_file()
             or sha256(output / "flashinfer" / relative) != expected_hash
             for relative, expected_hash in overlay_hashes.items()
-            )
+        )
     ):
         raise RuntimeError(f"corrupt existing FlashInfer overlay: {output}")
     return manifest

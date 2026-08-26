@@ -30,14 +30,16 @@ def main() -> int:
         shutil.which(requested_host)
         if requested_host
         else next(
-            (path for name in ("g++-14", "g++-13", "g++-12")
-             if (path := shutil.which(name)) is not None),
+            (
+                path
+                for name in ("g++-14", "g++-13", "g++-12")
+                if (path := shutil.which(name)) is not None
+            ),
             None,
         )
     )
     if host_compiler and not any(
-        argument == "-ccbin" or argument.startswith("-ccbin=")
-        for argument in arguments
+        argument == "-ccbin" or argument.startswith("-ccbin=") for argument in arguments
     ):
         arguments = [f"-ccbin={host_compiler}", *arguments]
     return subprocess.call([nvcc, *arguments])

@@ -28,6 +28,10 @@ BIND_CURRENT_GENERATION = 1 << 2
 PLANLESS_PREACQUIRED = 1 << 3
 RUNNABLE_WORK = 1 << 4
 WORK_COUNT_MASK = (1 << 32) - 1
+# A direct or already-preloaded plan has its data dependency ordered by the
+# caller's CUDA stream/event edge. Name the no-ticket contract once so every
+# resident entry point uses the same fast path.
+PREACQUIRED_LAUNCH_FLAGS = PREACQUIRED | BIND_CURRENT_GENERATION
 
 _DEFAULT_ATTENTION_VARIANT = "DefaultAttention<false, false, false, false>"
 _DEFAULT_ATTENTION_DECL = "#include <flashinfer/attention/variants.cuh>"
@@ -67,12 +71,7 @@ def direct_requirement(
     construction here prevents framework adapters from inventing magic IDs
     that look like ownership or generation metadata.
     """
-    if (
-        direct_base <= 0
-        or bytes <= 0
-        or bytes > (1 << 32) - 1
-        or direct_tensor_map < 0
-    ):
+    if direct_base <= 0 or bytes <= 0 or bytes > (1 << 32) - 1 or direct_tensor_map < 0:
         raise ValueError("direct dependencies need positive addresses and bytes")
     return AcquireRequirement(
         int(direct_base),
@@ -107,8 +106,7 @@ def request_ranges_for_schedule(
             cursor += 1
         if cursor == begin:
             raise RuntimeError(
-                f"FlashInfer schedule has no work for request "
-                f"{binding.request_index}"
+                f"FlashInfer schedule has no work for request {binding.request_index}"
             )
         ranges.append(
             RequestRange(
@@ -119,9 +117,7 @@ def request_ranges_for_schedule(
             )
         )
     if cursor != len(request_indices):
-        raise RuntimeError(
-            "FlashInfer schedule is not grouped contiguously by request"
-        )
+        raise RuntimeError("FlashInfer schedule is not grouped contiguously by request")
     return ranges
 
 
@@ -219,7 +215,10 @@ def enqueue_resident_attention(
         plan.dependencies_tensor,
         scale,
         plan.work_item_count,
-        0,
+        # All requirements are already direct and the caller owns the
+        # stream/event ordering. Keep request-generation validation, but do
+        # not allocate or retire per-CTA tickets on this steady-state path.
+        PREACQUIRED_LAUNCH_FLAGS,
         out=out,
         **options,
     )
@@ -350,7 +349,7 @@ class FlashInferLayerEpoch:
             paged_kv_cache,
             out,
             scale,
-            False,
+            PREACQUIRED_LAUNCH_FLAGS,
             None,
             run_options,
         )
@@ -469,7 +468,7 @@ class FlashInferLayerEpoch:
                 paged_kv_cache,
                 out,
                 scale,
-                BIND_CURRENT_GENERATION if has_external else 0,
+                BIND_CURRENT_GENERATION if has_external else PREACQUIRED_LAUNCH_FLAGS,
                 None,
                 run_options,
             )
@@ -585,6 +584,10 @@ class FlashInferLayerEpoch:
         scale = 1.0 / math.sqrt(q.shape[-1]) if sm_scale is None else sm_scale
         self._prepare(stream)
         if ready_event is not None:
+            if stream is None:
+                raise ValueError(
+                    "preloaded host ready events require an explicit CUDA stream"
+                )
             stream.wait_event(ready_event)
         self._launch(
             wrapper,
@@ -592,7 +595,7 @@ class FlashInferLayerEpoch:
             paged_kv_cache,
             out,
             scale,
-            6,
+            PREACQUIRED_LAUNCH_FLAGS,
             None,
             run_options,
         )
@@ -640,6 +643,8 @@ class FlashInferLayerEpoch:
         run_options: dict[str, Any] | None = None,
     ) -> int:
         """Enqueue a fixed NVMe epoch; call ``check`` after execution."""
+        if not self.plan.has_external:
+            raise ValueError("NVMe launch needs external dependencies")
         scale = 1.0 / math.sqrt(q.shape[-1]) if sm_scale is None else sm_scale
         self._prepare(stream)
 

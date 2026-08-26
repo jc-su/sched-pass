@@ -70,7 +70,9 @@ def validate(output: Path) -> dict[str, Any]:
                 require_formal_execution=evaluation_profile == "osdi-complete",
             )
         except ValueError as error:
-            raise ValueError(f"invalid consumer contract provenance: {error}") from error
+            raise ValueError(
+                f"invalid consumer contract provenance: {error}"
+            ) from error
     _require(
         isinstance(provenance.get("workload_demand_digest"), str)
         and bool(provenance["workload_demand_digest"]),

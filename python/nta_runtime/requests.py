@@ -28,17 +28,13 @@ class RequestBinding:
         object.__setattr__(
             self, "request_index", u32(self.request_index, "request index")
         )
-        object.__setattr__(
-            self, "request_slot", u32(self.request_slot, "request slot")
-        )
+        object.__setattr__(self, "request_slot", u32(self.request_slot, "request slot"))
         object.__setattr__(
             self,
             "generation",
             u32(self.generation, "request generation", positive=True),
         )
-        object.__setattr__(
-            self, "request_id", u64(self.request_id, "request id")
-        )
+        object.__setattr__(self, "request_id", u64(self.request_id, "request id"))
         object.__setattr__(
             self,
             "priority",
@@ -54,9 +50,7 @@ class RequestBinding:
             "deadline_clock",
             u64(self.deadline_clock, "request deadline"),
         )
-        object.__setattr__(
-            self, "tenant_id", u32(self.tenant_id, "request tenant")
-        )
+        object.__setattr__(self, "tenant_id", u32(self.tenant_id, "request tenant"))
 
 
 def stable_request_id(value: str) -> int:
@@ -169,7 +163,7 @@ class RequestIdentityRegistry:
             if previous_slot is not None and previous_slot != request_slot:
                 raise ValueError(
                     "a serving batch cannot bind one request ID to multiple slots"
-            )
+                )
             batch_request_slots[request_id] = request_slot
             stable_id = stable_request_id(request_id)
             previous_batch_id = batch_stable_ids.get(stable_id)

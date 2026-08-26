@@ -115,11 +115,7 @@ class SglangForwardMetadata:
             if values is None:
                 return ()
             try:
-                maximum = (
-                    MAX_REQUEST_PRIORITY
-                    if name == "priority"
-                    else (1 << 32) - 1
-                )
+                maximum = MAX_REQUEST_PRIORITY if name == "priority" else (1 << 32) - 1
                 return _integer_vector(
                     values, f"SGLang {name} metadata", maximum=maximum
                 )

@@ -92,8 +92,7 @@ def main() -> None:
         _PREFILL_GRAPH_LOAD_BATCH_TARGET,
     ):
         assert any(
-            kind == HookType.AROUND
-            for kind, _, _ in HookRegistry._hooks[target]
+            kind == HookType.AROUND for kind, _, _ in HookRegistry._hooks[target]
         )
 
     assert any(
@@ -397,6 +396,7 @@ def main() -> None:
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
+
     class CloseProbe:
         def __init__(self, log, *, fail: bool = False) -> None:
             self.log = log
@@ -416,7 +416,12 @@ def main() -> None:
     assert partial_log == ["close", "close"]
     assert partial_backend._resources_closed
 
-    assert _flag_value(ResourceCapability.DIRECT_ADDRESS | ResourceCapability.HOST_REGISTERED) == 5
+    assert (
+        _flag_value(
+            ResourceCapability.DIRECT_ADDRESS | ResourceCapability.HOST_REGISTERED
+        )
+        == 5
+    )
     assert (
         _consumer_contract_for_stats({}, engine_version="0.5.16").kind.value
         == "projection_only"

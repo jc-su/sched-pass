@@ -18,7 +18,7 @@ import math
 from pathlib import Path
 import random
 from statistics import mean
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 SCHEMA = 1
@@ -28,7 +28,11 @@ _MISSING = object()
 
 
 def file_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def demand_trace_digest(rows: Sequence[Mapping[str, Any]]) -> str:
@@ -110,30 +114,108 @@ def _timestamp_seconds(value: Any, unit: str) -> float:
     return timestamp / 1000.0 if timestamp > 100_000_000_000 else timestamp
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """Read JSONL (or a JSON array) without silently dropping malformed rows."""
+def _decode_jsonl_line(raw: bytes, line_number: int) -> dict[str, Any] | None:
+    """Decode one physical JSONL line, preserving strict error reporting."""
+
+    try:
+        line = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"invalid UTF-8 at line {line_number}") from error
+    if not line.strip():
+        return None
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid JSON at line {line_number}") from error
+    if not isinstance(row, dict):
+        raise ValueError(f"line {line_number} is not a JSON object")
+    return dict(row)
+
+
+def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
+    """Yield JSONL/JSON-array records without materializing the input file.
+
+    A bounded source trace can be hundreds of millions of rows.  The old
+    ``read_text().splitlines()`` implementation duplicated the complete file
+    in Python memory before normalization even when the caller requested a
+    small prefix.  The iterator keeps the strict malformed-row behavior while
+    making the common bounded-replay path stream from disk.
+    """
 
     if path.suffix.lower() == ".json":
-        value = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"cannot read JSON workload {path}: {error}") from error
         if not isinstance(value, list) or not all(
             isinstance(row, dict) for row in value
         ):
             raise ValueError("JSON workload input must be an array of objects")
-        return [dict(row) for row in value]
-    rows: list[dict[str, Any]] = []
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), 1
-    ):
-        if not line.strip():
-            continue
+        for row in value:
+            yield dict(row)
+        return
+
+    try:
+        with path.open("rb") as source:
+            for line_number, raw in enumerate(source, 1):
+                row = _decode_jsonl_line(raw, line_number)
+                if row is not None:
+                    yield row
+    except OSError as error:
+        raise ValueError(f"cannot read JSONL workload {path}: {error}") from error
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read JSONL (or a JSON array) without silently dropping malformed rows."""
+
+    return list(iter_jsonl(path))
+
+
+def read_jsonl_selection(
+    path: Path, max_rows: int | None = None
+) -> tuple[list[dict[str, Any]], int, str]:
+    """Read a selected prefix and stream the source count/digest in one pass.
+
+    The returned digest is over the exact source bytes, including whitespace
+    and line endings.  ``max_rows`` bounds only the records retained for
+    normalization; the complete source is still scanned so a manifest cannot
+    claim a source count or digest for an unobserved suffix.
+    """
+
+    if max_rows is not None and max_rows <= 0:
+        raise ValueError("max_rows must be positive")
+    selected: list[dict[str, Any]] = []
+    count = 0
+    digest = hashlib.sha256()
+    if path.suffix.lower() == ".json":
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"invalid JSON at line {line_number}") from error
-        if not isinstance(row, dict):
-            raise ValueError(f"line {line_number} is not a JSON object")
-        rows.append(row)
-    return rows
+            raw = path.read_bytes()
+            value = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"cannot read JSON workload {path}: {error}") from error
+        if not isinstance(value, list) or not all(
+            isinstance(row, dict) for row in value
+        ):
+            raise ValueError("JSON workload input must be an array of objects")
+        digest.update(raw)
+        count = len(value)
+        limit = count if max_rows is None else min(max_rows, count)
+        selected = [dict(row) for row in value[:limit]]
+        return selected, count, digest.hexdigest()
+
+    try:
+        with path.open("rb") as source:
+            for line_number, raw in enumerate(source, 1):
+                digest.update(raw)
+                row = _decode_jsonl_line(raw, line_number)
+                if row is None:
+                    continue
+                count += 1
+                if max_rows is None or len(selected) < max_rows:
+                    selected.append(row)
+    except OSError as error:
+        raise ValueError(f"cannot read JSONL workload {path}: {error}") from error
+    return selected, count, digest.hexdigest()
 
 
 def _normalize_row(

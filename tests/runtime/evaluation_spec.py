@@ -132,7 +132,9 @@ def main() -> None:
         except ValueError as error:
             assert "consumer contract" in str(error)
         else:
-            raise AssertionError("formal trial without a consumer contract was accepted")
+            raise AssertionError(
+                "formal trial without a consumer contract was accepted"
+            )
         native_contract = {
             "schema": 1,
             "engine": "fixture",
@@ -144,18 +146,21 @@ def main() -> None:
             "numerical_consumer": True,
             "engine_version": "fixture",
         }
-        assert _validate_result(
-            {
-                "experiment": "with-evidence",
-                "variant": "B5",
-                "result": {
-                    "classification": "fixture",
-                    "verification_failures": 0,
-                    "consumer_contract": native_contract,
+        assert (
+            _validate_result(
+                {
+                    "experiment": "with-evidence",
+                    "variant": "B5",
+                    "result": {
+                        "classification": "fixture",
+                        "verification_failures": 0,
+                        "consumer_contract": native_contract,
+                    },
                 },
-            },
-            required_consumer_kind="native_work_unit",
-        )[0]["kind"] == "native_work_unit"
+                required_consumer_kind="native_work_unit",
+            )[0]["kind"]
+            == "native_work_unit"
+        )
         cli_output = root / "cli-spec.json"
         command = [
             sys.executable,
@@ -206,7 +211,9 @@ def main() -> None:
         except ValueError as error:
             assert "consumer_kind" in str(error)
         else:
-            raise AssertionError("formal evaluation without consumer evidence was accepted")
+            raise AssertionError(
+                "formal evaluation without consumer evidence was accepted"
+            )
 
         sysfs = root / "sysfs"
         dev = root / "dev"

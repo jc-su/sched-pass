@@ -250,15 +250,11 @@ def _validate_consumer_contract(
             contracts,
             "formal NTA serving evidence has no numerical consumer",
         )
-        if any(
-            contract.get("kind") == "framework_reference"
-            for contract in contracts
-        ):
+        if any(contract.get("kind") == "framework_reference" for contract in contracts):
             stock_external_launches = sum(
                 int(entry.get("stock_prefetched_external_attention_launches", 0))
                 for entry in report.get("engine_stats", [])
-                if isinstance(entry, dict)
-                and entry.get("backend") == "nta_flashinfer"
+                if isinstance(entry, dict) and entry.get("backend") == "nta_flashinfer"
             )
             _require(
                 stock_external_launches > 0,
@@ -418,9 +414,7 @@ def _validate_single(
     _validate_workload(report)
     _validate_byte_accounting(report)
     _validate_tier_provenance(report)
-    _validate_consumer_contract(
-        report, require_formal_execution=require_engine_stats
-    )
+    _validate_consumer_contract(report, require_formal_execution=require_engine_stats)
 
 
 def validate(report: dict[str, Any]) -> dict[str, Any]:

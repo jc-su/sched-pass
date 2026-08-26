@@ -15,9 +15,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RESULTS_ROOT = pathlib.Path(
-    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
-)
+RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,9 +96,7 @@ def integration_evidence(
     """Separate backend selection from verified numerical execution."""
     backend_selected = attention_backend == "nta_flashinfer"
     nta_stats = [
-        entry
-        for entry in engine_stats
-        if entry.get("backend") == "nta_flashinfer"
+        entry for entry in engine_stats if entry.get("backend") == "nta_flashinfer"
     ]
     native_execution = any(
         isinstance(contract := entry.get("consumer_contract"), dict)

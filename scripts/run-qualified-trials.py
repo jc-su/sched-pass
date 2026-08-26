@@ -21,6 +21,14 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from experiments.validate_tier_qualification import (  # noqa: E402
+    validate_file as validate_tier_qualification,
+)
+from experiments.validate_workload import validate as validate_workload  # noqa: E402
+
 T95 = {
     2: 12.706,
     3: 4.303,
@@ -101,7 +109,9 @@ def machine_metadata() -> dict[str, Any]:
             ]
         ),
         "nvme": command_output(["nvme", "list", "-o", "json"]),
-        "iommu_groups": command_output(["find", "/sys/kernel/iommu_groups", "-type", "l"]),
+        "iommu_groups": command_output(
+            ["find", "/sys/kernel/iommu_groups", "-type", "l"]
+        ),
     }
 
 
@@ -196,15 +206,24 @@ def workload_provenance(spec: dict[str, Any]) -> dict[str, Any]:
         return {}
     path = pathlib.Path(value).resolve()
     if not path.is_file():
-        return {}
+        raise ValueError(f"workload manifest is missing: {path}")
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"workload manifest cannot be read: {error}") from error
+    if not isinstance(manifest, dict):
+        raise ValueError("workload manifest must be a JSON object")
+    try:
+        validate_workload(path)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise ValueError(f"workload manifest failed validation: {error}") from error
+    demand_digest = manifest.get("demand_trace_digest")
+    if not isinstance(demand_digest, str) or not demand_digest:
+        raise ValueError("workload manifest has no exact demand digest")
     return {
         "workload_manifest": str(path),
         "workload_manifest_digest": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "workload_demand_digest": manifest.get("demand_trace_digest"),
+        "workload_demand_digest": demand_digest,
     }
 
 
@@ -216,7 +235,21 @@ def tier_qualification_provenance(spec: dict[str, Any]) -> dict[str, Any]:
         return {}
     path = pathlib.Path(value).resolve()
     if not path.is_file():
-        return {}
+        raise ValueError(f"tier qualification artifact is missing: {path}")
+    required_tiers = tuple(
+        dict.fromkeys(
+            str(experiment["tier"])
+            for experiment in spec.get("experiments", [])
+            if isinstance(experiment, dict)
+            and experiment.get("tier") in {"hbm", "host_mem", "nvme", "dax"}
+        )
+    ) or ("hbm", "host_mem")
+    try:
+        validate_tier_qualification(path, required_tiers=required_tiers)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise ValueError(
+            f"tier qualification artifact failed validation: {error}"
+        ) from error
     return {
         "tier_qualification": str(path),
         "tier_qualification_digest": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -346,6 +379,10 @@ def main() -> int:
         raise RuntimeError("trial specification revision does not match HEAD")
 
     output = args.output_dir.resolve()
+    if output == ROOT or ROOT in output.parents:
+        raise RuntimeError("qualification output must be outside the source tree")
+    if output.exists() and any(output.iterdir()):
+        raise RuntimeError(f"qualification output is not empty: {output}")
     logs = output / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     generator = random.Random(int(spec.get("seed", 1)))
@@ -364,8 +401,10 @@ def main() -> int:
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "machine": machine_metadata(),
     }
-    metadata.update(workload_provenance(spec))
-    metadata.update(tier_qualification_provenance(spec))
+    workload_identity = workload_provenance(spec)
+    tier_identity = tier_qualification_provenance(spec)
+    metadata.update(workload_identity)
+    metadata.update(tier_identity)
     (output / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -419,8 +458,8 @@ def main() -> int:
                 else str(log_path),
                 "result": parsed,
             }
-            record.update(workload_provenance(spec))
-            record.update(tier_qualification_provenance(spec))
+            record.update(workload_identity)
+            record.update(tier_identity)
             records.append(record)
             trial_file.write(json.dumps(record, sort_keys=True) + "\n")
             trial_file.flush()

@@ -2103,6 +2103,28 @@ commitPartial(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
               std::uint64_t estimatedComputeNs) {
   using namespace nta;
 
+  // PREACQUIRED launches share the incremental module but deliberately carry
+  // InvalidIndex because their stream/event fence, rather than a ticket, owns
+  // completion.  The fields are CTA-uniform, so reject this no-op case before
+  // the convergent barrier.  Keeping the marker and its static control-flow
+  // shape intact lets the compiler pass continue to prove a complete partial
+  // publication for the ticketed form.
+  if (runtime == nullptr || runtime->abiVersion != abi::Version) {
+    return;
+  }
+  if (workTicket >= runtime->workTicketCapacity) {
+    return;
+  }
+  if (runtime->ctaCompletions == nullptr ||
+      reductionGroup >= runtime->workTicketCapacity || contributorCount == 0 ||
+      contributorIndex >= contributorCount) {
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+      device::failWorkTicket(runtime, workTicket,
+                             abi::WorkTicketState::Failed);
+    }
+    return;
+  }
+
   // Every writer makes its numerical partial globally visible before the CTA
   // collectively publishes completion. The final sibling CTA may then make the
   // request-local reduction group mergeable.
@@ -2113,17 +2135,6 @@ commitPartial(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
   if (threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0) {
     return;
   }
-  if (runtime == nullptr || runtime->abiVersion != abi::Version ||
-      runtime->ctaCompletions == nullptr ||
-      workTicket >= runtime->workTicketCapacity ||
-      reductionGroup >= runtime->workTicketCapacity || contributorCount == 0 ||
-      contributorIndex >= contributorCount) {
-    if (runtime != nullptr && workTicket < runtime->workTicketCapacity) {
-      device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
-    }
-    return;
-  }
-
   const std::uint64_t siblingCount64 =
       static_cast<std::uint64_t>(gridDim.y) * gridDim.z;
   if (siblingCount64 == 0 || siblingCount64 > UINT32_MAX) {

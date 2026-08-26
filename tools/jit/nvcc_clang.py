@@ -50,15 +50,17 @@ def should_instrument(arguments: list[str]) -> bool:
     if not filters:
         return True
     command = " ".join(arguments)
-    return any(token.strip() in command for token in filters.split(",")
-               if token.strip())
+    return any(
+        token.strip() in command for token in filters.split(",") if token.strip()
+    )
 
 
 def matches_filter(arguments: list[str], variable: str) -> bool:
     filters = os.environ.get(variable, "")
     command = " ".join(arguments)
-    return any(token.strip() in command for token in filters.split(",")
-               if token.strip())
+    return any(
+        token.strip() in command for token in filters.split(",") if token.strip()
+    )
 
 
 def operator_family(arguments: list[str]) -> int:
@@ -162,21 +164,20 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
     command.extend(["-include", str(PRELUDE)])
     toolkit = re.search(r"cuda-(\d+)\.(\d+)", CUDA_PATH)
     major, minor = toolkit.groups() if toolkit else ("12", "0")
-    command.extend([
-        f"-D__CUDACC_VER_MAJOR__={major}",
-        f"-D__CUDACC_VER_MINOR__={minor}",
-        "-D__CUDACC_VER_BUILD__=0",
-    ])
+    command.extend(
+        [
+            f"-D__CUDACC_VER_MAJOR__={major}",
+            f"-D__CUDACC_VER_MINOR__={minor}",
+            "-D__CUDACC_VER_BUILD__=0",
+        ]
+    )
     if instrument:
         if not PLUGIN or not pathlib.Path(PLUGIN).is_file():
-            raise RuntimeError(
-                "NTA_PLUGIN must identify the built libNtaPass.so")
+            raise RuntimeError("NTA_PLUGIN must identify the built libNtaPass.so")
         command.append(f"-fpass-plugin={PLUGIN}")
         if os.environ.get("NTA_FLASHINFER_HOOK"):
             phase_source = matches_filter(arguments, "NTA_JIT_PHASE_SOURCE")
-            request_bound = matches_filter(
-                arguments, "NTA_JIT_REQUEST_BOUND_SOURCE"
-            )
+            request_bound = matches_filter(arguments, "NTA_JIT_REQUEST_BOUND_SOURCE")
             # JitRuntime is emitted by the one source selected by
             # NTA_JIT_PHASE_SOURCE.  Request-bound is a module-wide compile
             # variant, but adding JitRuntime to every request-bound helper TU
@@ -185,8 +186,7 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
             # standalone workers must use that launcher as well.
             phase_runtime = phase_source
             stream_ordered_direct = (
-                "nta_sglang_prefill_demand_acquire_tier_v4_"
-                in " ".join(arguments)
+                "nta_sglang_prefill_demand_acquire_tier_v4_" in " ".join(arguments)
             )
             family = operator_family(arguments)
             typed_module = (
@@ -227,41 +227,45 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
             ).digest()
             plan_hash_low = int.from_bytes(plan_fingerprint[:8], "little")
             plan_hash_high = int.from_bytes(plan_fingerprint[8:16], "little")
-            command.extend([
-                f"-DNTA_DEVICE_PHASE_KERNELS={1 if phase_runtime else 0}",
-                f"-DNTA_TYPED_OPERATOR_CONTRACT={1 if typed_module else 0}",
-                f"-DNTA_FLASHINFER_REQUEST_BOUND={1 if request_bound else 0}",
-                "-DNTA_FLASHINFER_PREACQUIRED_ONLY=0",
-                "-DNTA_FLASHINFER_STREAM_ORDERED_DIRECT="
-                f"{1 if stream_ordered_direct else 0}",
-                f"-DNTA_OPERATOR_FAMILY={family}",
-                f"-DNTA_OPERATOR_FORM={operator_form}",
-                f"-DNTA_OPERATOR_CAPABILITIES={capabilities}ULL",
-                f"-DNTA_OPERATOR_SOURCE_HASH_LOW={hash_low}ULL",
-                f"-DNTA_OPERATOR_SOURCE_HASH_HIGH={hash_high}ULL",
-                "-DNTA_OPERATOR_SUPPORTED_FORMS=6U",
-                f"-DNTA_OPERATOR_COORDINATE_MAP={coordinate_map}U",
-                f"-DNTA_OPERATOR_PARTIAL_STATE={partial_state}U",
-                f"-DNTA_OPERATOR_REDUCTION={reduction}U",
-                f"-DNTA_OPERATOR_PLAN_FLAGS={plan_flags}U",
-                f"-DNTA_OPERATOR_PLAN_HASH_LOW={plan_hash_low}ULL",
-                f"-DNTA_OPERATOR_PLAN_HASH_HIGH={plan_hash_high}ULL",
-                f"-DNTA_OPERATOR_INSTRUMENTATION_FLAGS={instrumentation_flags}ULL",
-                f"-DNTA_OPERATOR_IDENTITY_BINDING={identity_binding}U",
-                f"-DNTA_OPERATOR_DEMAND_BINDING={demand_binding}U",
-                f"-DNTA_OPERATOR_ACCESS_PROOF={access_proof}U",
-                "-DNTA_OPERATOR_GRANULARITY_BYTES=0U",
-                f"-DNTA_OPERATOR_TIER_MASK={tier_mask}ULL",
-                "-include",
-                str(ROOT / "runtime/device/TypedInstrumentation.cuh"),
-                "-include",
-                str(
-                    ROOT / (
-                        "runtime/device/JitRuntime.cuh"
-                        if phase_runtime else "runtime/device/Acquire.cuh"
-                    )
-                ),
-            ])
+            command.extend(
+                [
+                    f"-DNTA_DEVICE_PHASE_KERNELS={1 if phase_runtime else 0}",
+                    f"-DNTA_TYPED_OPERATOR_CONTRACT={1 if typed_module else 0}",
+                    f"-DNTA_FLASHINFER_REQUEST_BOUND={1 if request_bound else 0}",
+                    "-DNTA_FLASHINFER_PREACQUIRED_ONLY=0",
+                    "-DNTA_FLASHINFER_STREAM_ORDERED_DIRECT="
+                    f"{1 if stream_ordered_direct else 0}",
+                    f"-DNTA_OPERATOR_FAMILY={family}",
+                    f"-DNTA_OPERATOR_FORM={operator_form}",
+                    f"-DNTA_OPERATOR_CAPABILITIES={capabilities}ULL",
+                    f"-DNTA_OPERATOR_SOURCE_HASH_LOW={hash_low}ULL",
+                    f"-DNTA_OPERATOR_SOURCE_HASH_HIGH={hash_high}ULL",
+                    "-DNTA_OPERATOR_SUPPORTED_FORMS=6U",
+                    f"-DNTA_OPERATOR_COORDINATE_MAP={coordinate_map}U",
+                    f"-DNTA_OPERATOR_PARTIAL_STATE={partial_state}U",
+                    f"-DNTA_OPERATOR_REDUCTION={reduction}U",
+                    f"-DNTA_OPERATOR_PLAN_FLAGS={plan_flags}U",
+                    f"-DNTA_OPERATOR_PLAN_HASH_LOW={plan_hash_low}ULL",
+                    f"-DNTA_OPERATOR_PLAN_HASH_HIGH={plan_hash_high}ULL",
+                    f"-DNTA_OPERATOR_INSTRUMENTATION_FLAGS={instrumentation_flags}ULL",
+                    f"-DNTA_OPERATOR_IDENTITY_BINDING={identity_binding}U",
+                    f"-DNTA_OPERATOR_DEMAND_BINDING={demand_binding}U",
+                    f"-DNTA_OPERATOR_ACCESS_PROOF={access_proof}U",
+                    "-DNTA_OPERATOR_GRANULARITY_BYTES=0U",
+                    f"-DNTA_OPERATOR_TIER_MASK={tier_mask}ULL",
+                    "-include",
+                    str(ROOT / "runtime/device/TypedInstrumentation.cuh"),
+                    "-include",
+                    str(
+                        ROOT
+                        / (
+                            "runtime/device/JitRuntime.cuh"
+                            if phase_runtime
+                            else "runtime/device/Acquire.cuh"
+                        )
+                    ),
+                ]
+            )
             if family == 2 and not prefill_has_cta_tile_32(arguments):
                 command.append("-DNTA_FLASHINFER_SKIP_CTA_TILE_32=1")
 
@@ -276,15 +280,16 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
             index += 1
             continue
         if argument == "-arch" and index + 1 < len(arguments):
-            command.append(
-                f"--cuda-gpu-arch={clang_arch(arguments[index + 1])}")
+            command.append(f"--cuda-gpu-arch={clang_arch(arguments[index + 1])}")
             index += 2
             continue
         if argument.startswith("--compiler-options="):
             command.append(argument.split("=", 1)[1])
             index += 1
             continue
-        if argument in ("-Xcompiler", "--compiler-options") and index + 1 < len(arguments):
+        if argument in ("-Xcompiler", "--compiler-options") and index + 1 < len(
+            arguments
+        ):
             command.append(arguments[index + 1])
             index += 2
             continue
@@ -369,7 +374,8 @@ def main() -> int:
     workspace = os.environ.get("FLASHINFER_WORKSPACE_BASE", "")
     if instrument and cache_tag and cache_tag not in workspace:
         raise RuntimeError(
-            "instrumented FlashInfer JIT requires an NTA-tagged workspace")
+            "instrumented FlashInfer JIT requires an NTA-tagged workspace"
+        )
     if instrument and os.environ.get("NTA_STAGING_STREAMING") == "1":
         # Compile-time cache policy forks the kernel bytes; refuse to bake
         # it into a workspace that does not carry the marker, or a toggled
@@ -377,7 +383,8 @@ def main() -> int:
         if "stream" not in workspace:
             raise RuntimeError(
                 "NTA_STAGING_STREAMING requires a workspace tagged with "
-                "'stream' (fresh cache), not a policy-unmarked cache")
+                "'stream' (fresh cache), not a policy-unmarked cache"
+            )
 
     command = translate(arguments, instrument)
     if instrument and os.environ.get("NTA_STAGING_STREAMING") == "1":

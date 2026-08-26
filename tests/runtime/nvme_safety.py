@@ -31,7 +31,9 @@ def main() -> None:
     assert "NTA_NVME_BDF must use DDDD:BB:SS.F syntax" in vfio_script
     assert "nvme get-feature" in vfio_script
     assert "reference capture has an unexpected size" in vfio_script
-    assert "no namespace block device exists and reference file is absent" in vfio_script
+    assert (
+        "no namespace block device exists and reference file is absent" in vfio_script
+    )
     assert "fs.protected_regular" in vfio_script
     assert "wait_for_nvme_namespace" in vfio_script
     assert "returned to the nvme driver but no live namespace appeared" in vfio_script
@@ -78,9 +80,9 @@ def main() -> None:
     assert "cudaStreamSynchronize(stream)" in retirement
     assert "cudaDeviceSynchronize()" in retirement
     assert "releaseObject(retired.object)" in retirement
-    assert "ioctl" not in (
-        ROOT / "runtime" / "device" / "Acquire.cuh"
-    ).read_text(encoding="utf-8")
+    assert "ioctl" not in (ROOT / "runtime" / "device" / "Acquire.cuh").read_text(
+        encoding="utf-8"
+    )
     assert "NvmeDmaMapping" not in (
         ROOT / "runtime" / "host" / "NvmeControlPlane.h"
     ).read_text(encoding="utf-8")
@@ -101,7 +103,10 @@ def main() -> None:
     )
     assert "class VfioNvmeMappingBackend final" in control_plane
     assert "class VfioNvmeControlPlane final : public NvmeControlPlane" in control_plane
-    assert "class VfioNvmeControlPlane final : public NvmeMappingBackend" not in control_plane
+    assert (
+        "class VfioNvmeControlPlane final : public NvmeMappingBackend"
+        not in control_plane
+    )
     assert "mappingBackend_->shutdown()" in control_plane
     assert "std::shared_ptr<NvmeTransport::Impl> owner;" in runtime
     assert "detail::NvmeMapping dmaMapping;" in runtime
@@ -121,7 +126,7 @@ def main() -> None:
     assert "An NVMe object owns an HBM destination" in attention
     assert "options.mode == Mode::Nvme" in attention
     assert "nvmeStats.completed == nvmeStats.submitted" in attention
-    assert "\\\",\\\"queue_depth\\\":" in attention
+    assert '\\",\\"queue_depth\\":' in attention
     assert "progressNvmeUntilIdle" in runtime or "progressNvmeUntilIdle" in (
         ROOT / "include" / "nta" / "FinitePhase.h"
     ).read_text(encoding="utf-8")
@@ -161,9 +166,7 @@ def main() -> None:
         encoding="utf-8"
     )
     install_begin = runtime_c_impl.index("nta_runtime_install_nvme_object")
-    install_end = runtime_c_impl.index(
-        "nta_runtime_read_pending_count", install_begin
-    )
+    install_end = runtime_c_impl.index("nta_runtime_read_pending_count", install_begin)
     install_body = runtime_c_impl[install_begin:install_end]
     assert "runtime->nvme->allocate" not in install_body
     assert "sourceByteOffset, nativeBytes);" in install_body

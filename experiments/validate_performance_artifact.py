@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -19,15 +20,25 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def _digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def validate(output: Path) -> dict[str, Any]:
     profile = json.loads((output / "profile.json").read_text(encoding="utf-8"))
     baseline = json.loads((output / "baseline.json").read_text(encoding="utf-8"))
     measured = json.loads((output / "measured.json").read_text(encoding="utf-8"))
     regression = json.loads((output / "regression.json").read_text(encoding="utf-8"))
+    capture = json.loads((output / "capture.json").read_text(encoding="utf-8"))
 
     _require(isinstance(profile, dict), "profiler artifact is not an object")
     _require(isinstance(baseline, dict), "performance baseline is not an object")
     _require(isinstance(regression, dict), "regression artifact is not an object")
+    _require(isinstance(capture, dict), "performance capture is not an object")
     _require(profile.get("schema") == 1, "unsupported profiler artifact schema")
     _require(
         profile.get("classification") == "nta-profile", "invalid profiler artifact"
@@ -59,6 +70,22 @@ def validate(output: Path) -> dict[str, Any]:
         (output / "stdout.log").is_file(),
         "profiler stdout log is missing",
     )
+    _require(
+        capture.get("schema") == 1
+        and capture.get("classification") == "nta-performance-capture",
+        "invalid performance capture metadata",
+    )
+    for field, filename in (
+        ("profile_digest", "profile.json"),
+        ("baseline_digest", "baseline.json"),
+        ("measured_digest", "measured.json"),
+        ("regression_digest", "regression.json"),
+    ):
+        _require(
+            isinstance(capture.get(field), str)
+            and capture[field] == _digest(output / filename),
+            f"performance capture digest mismatch: {filename}",
+        )
 
     validate_baseline(baseline)
     _require(isinstance(measured, dict), "measured performance report is not an object")
@@ -83,6 +110,14 @@ def validate(output: Path) -> dict[str, Any]:
     _require(
         isinstance(measured.get("revision"), str) and bool(measured["revision"]),
         "measured performance report has no revision",
+    )
+    _require(
+        capture.get("machine") == measured_machine,
+        "performance capture machine differs from measured report",
+    )
+    _require(
+        capture.get("revision") == measured.get("revision"),
+        "performance capture revision differs from measured report",
     )
     _require(
         measured.get("verification_failures", 0) == 0,

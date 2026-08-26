@@ -56,9 +56,8 @@ from nta_runtime.runtime_resources import (
 )
 from nta_runtime.tier import ServingTierConfig
 from nta_runtime.flashinfer import (
-    BIND_CURRENT_GENERATION,
     FlashInferLayerEpoch,
-    PREACQUIRED,
+    PREACQUIRED_LAUNCH_FLAGS,
     attention_jit_args,
     direct_requirement,
     enqueue_resident_attention,
@@ -282,9 +281,7 @@ class VllmV1WorkerController:
             getattr(runner, "kv_cache_config", None), "kv_cache_groups", ()
         )
         if len(groups) != 1:
-            raise RuntimeError(
-                "NTA vLLM currently requires exactly one KV cache group"
-            )
+            raise RuntimeError("NTA vLLM currently requires exactly one KV cache group")
         spec = groups[0].kv_cache_spec
         page_size = int(getattr(spec, "block_size", 0))
         if page_size <= 0:
@@ -337,8 +334,7 @@ class VllmV1WorkerController:
             self._request_capacity = request_capacity
             self._page_bytes = page_bytes
         elif (
-            self._request_capacity != request_capacity
-            or self._page_bytes != page_bytes
+            self._request_capacity != request_capacity or self._page_bytes != page_bytes
         ):
             raise RuntimeError(
                 "vLLM KV cache geometry changed while the worker runtime was live"
@@ -356,9 +352,7 @@ class VllmV1WorkerController:
         if input_batch is None or request_capacity <= 0:
             raise RuntimeError("vLLM V1 runner is not initialized with InputBatch")
         page_size, page_bytes = self._cache_geometry(runner)
-        hook = self._ensure_hook(
-            runner, request_capacity, page_size, page_bytes
-        )
+        hook = self._ensure_hook(runner, request_capacity, page_size, page_bytes)
         batch = hook.bind_forward(
             scheduler_output,
             input_batch,
@@ -384,9 +378,7 @@ class VllmV1WorkerController:
         if request_capacity <= 0:
             raise RuntimeError("vLLM V2 runner has no positive request capacity")
         page_size, page_bytes = self._cache_geometry(runner)
-        hook = self._ensure_hook(
-            runner, request_capacity, page_size, page_bytes
-        )
+        hook = self._ensure_hook(runner, request_capacity, page_size, page_bytes)
         batch = hook.bind_v2_forward(
             scheduler_output,
             input_batch,
@@ -455,7 +447,9 @@ class NtaVllmFlashInferMetadataBuilder(FlashInferMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.NEVER
 
     @classmethod
-    def get_cudagraph_support(cls, vllm_config: Any, kv_cache_spec: Any) -> AttentionCGSupport:
+    def get_cudagraph_support(
+        cls, vllm_config: Any, kv_cache_spec: Any
+    ) -> AttentionCGSupport:
         return AttentionCGSupport.NEVER
 
 
@@ -568,11 +562,11 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         )
         workspace_bytes = _positive_env(
             "NTA_VLLM_FLASHINFER_WORKSPACE_BYTES",
-            int(getattr(envs, "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", 64 * 1024 * 1024)),
+            int(
+                getattr(envs, "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", 64 * 1024 * 1024)
+            ),
         )
-        workspace = torch.zeros(
-            workspace_bytes, dtype=torch.uint8, device=query.device
-        )
+        workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=query.device)
         self._nta_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             workspace,
             get_kv_cache_layout(),
@@ -629,9 +623,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 )
             ),
         )
-        workspace = torch.zeros(
-            workspace_bytes, dtype=torch.uint8, device=query.device
-        )
+        workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=query.device)
         self._nta_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             workspace,
             get_kv_cache_layout(),
@@ -868,9 +860,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 )
             )
             spans.append((begin, 2, 2, work_id))
-        ranges = request_ranges_for_schedule(
-            bindings, schedule.request_indices
-        )
+        ranges = request_ranges_for_schedule(bindings, schedule.request_indices)
         self._nta_plan.upload_work_units(
             execution.batch.units,
             spans,
@@ -998,17 +988,21 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 plan.dependencies_tensor,
                 self.scale,
                 schedule.work_count,
-                PREACQUIRED | BIND_CURRENT_GENERATION,
+                PREACQUIRED_LAUNCH_FLAGS,
                 out=output,
             )
         if os.environ.get("NTA_VLLM_COMPARE_STOCK") == "1":
             stock_output = torch.empty_like(output)
             stock_wrapper.run(query, kv_cache_for_flashinfer, out=stock_output)
             torch.cuda.synchronize()
-            difference = torch.nan_to_num(
-                (output.float() - stock_output.float()).abs(),
-                nan=float("inf"),
-            ).max().item()
+            difference = (
+                torch.nan_to_num(
+                    (output.float() - stock_output.float()).abs(),
+                    nan=float("inf"),
+                )
+                .max()
+                .item()
+            )
             VLLM_STATS["native_stock_diff_max_milli"] = max(
                 VLLM_STATS["native_stock_diff_max_milli"],
                 int(difference * 1000),
@@ -1079,7 +1073,9 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             raise RuntimeError(
                 "native vLLM prefill has fewer exact rows than the scheduled batch"
             )
-        prefill_batch = batch.phase(attn_metadata.num_decodes, attn_metadata.num_prefills)
+        prefill_batch = batch.phase(
+            attn_metadata.num_decodes, attn_metadata.num_prefills
+        )
         page_size = int(getattr(state, "page_size", 0) or 0)
         if page_size <= 0:
             raise RuntimeError("vLLM forward sidecar has no token page size")
@@ -1157,14 +1153,21 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         indptr = getattr(stock_wrapper, "_paged_kv_indptr_buf", None)
         indices = getattr(stock_wrapper, "_paged_kv_indices_buf", None)
         last_page_len = getattr(stock_wrapper, "_paged_kv_last_page_len_buf", None)
-        if not all(isinstance(tensor, torch.Tensor) for tensor in (indptr, indices, last_page_len)):
+        if not all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in (indptr, indices, last_page_len)
+        ):
             raise RuntimeError(
                 "vLLM FlashInfer metadata has no typed paged-KV device buffers"
             )
         if indptr.numel() != attn_metadata.num_decodes + 1:
-            raise RuntimeError("vLLM FlashInfer page indptr has the wrong request count")
+            raise RuntimeError(
+                "vLLM FlashInfer page indptr has the wrong request count"
+            )
         if any(
-            tensor.dtype != torch.int32 or not tensor.is_cuda or not tensor.is_contiguous()
+            tensor.dtype != torch.int32
+            or not tensor.is_cuda
+            or not tensor.is_contiguous()
             for tensor in (indptr, indices, last_page_len)
         ):
             raise RuntimeError(
@@ -1262,14 +1265,10 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             if attn_metadata.num_prefill_tokens:
                 self._native_prefill_forward(
                     layer,
-                    query[
-                        attn_metadata.num_decode_tokens : num_actual_tokens
-                    ],
+                    query[attn_metadata.num_decode_tokens : num_actual_tokens],
                     kv_cache,
                     attn_metadata,
-                    output[
-                        attn_metadata.num_decode_tokens : num_actual_tokens
-                    ],
+                    output[attn_metadata.num_decode_tokens : num_actual_tokens],
                 )
             if attn_metadata.num_decode_tokens:
                 if attn_metadata.num_decode_tokens != attn_metadata.num_decodes:
@@ -1305,9 +1304,9 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
 
 def consumer_contract() -> dict[str, Any]:
     """Return process-local evidence for artifact collectors."""
-    native = VLLM_STATS["native_decode_launches"] + VLLM_STATS[
-        "native_prefill_launches"
-    ]
+    native = (
+        VLLM_STATS["native_decode_launches"] + VLLM_STATS["native_prefill_launches"]
+    )
     if native:
         contract = ConsumerContract.native_work_unit(
             engine="vllm",
@@ -1324,9 +1323,7 @@ def consumer_contract() -> dict[str, Any]:
                     == 0
                 ),
                 "physical_decode_launches": VLLM_STATS["physical_decode_launches"],
-                "physical_prefill_launches": VLLM_STATS[
-                    "physical_prefill_launches"
-                ],
+                "physical_prefill_launches": VLLM_STATS["physical_prefill_launches"],
             }
         )
         return contract
@@ -1361,9 +1358,7 @@ def _publish_vllm_evidence() -> None:
         "consumer_contract": consumer_contract(),
         "stats": dict(VLLM_STATS),
         "native_enabled": os.environ.get("NTA_VLLM_NATIVE", "0") == "1",
-        "stock_fallback_enabled": os.environ.get(
-            "NTA_VLLM_ALLOW_STOCK_FALLBACK", "0"
-        )
+        "stock_fallback_enabled": os.environ.get("NTA_VLLM_ALLOW_STOCK_FALLBACK", "0")
         == "1",
         "serving_tier": os.environ.get("NTA_SERVING_TIER", "host_staged"),
         "physical_decode_launches": VLLM_STATS["physical_decode_launches"],
@@ -1372,7 +1367,9 @@ def _publish_vllm_evidence() -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.write_text(
+            json.dumps(report, sort_keys=True) + "\n", encoding="utf-8"
+        )
         temporary.replace(path)
     except OSError:
         # Evidence publication cannot change inference correctness during

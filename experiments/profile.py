@@ -82,9 +82,7 @@ def _outputs(output: Path, tool: str) -> list[str]:
     for pattern in patterns[tool]:
         found.update(path for path in output.glob(pattern) if path.is_file())
     return sorted(
-        str(path.relative_to(output))
-        for path in found
-        if path.stat().st_size > 0
+        str(path.relative_to(output)) for path in found if path.stat().st_size > 0
     )
 
 

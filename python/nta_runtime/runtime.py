@@ -1702,7 +1702,9 @@ class Runtime(_Owner):
             try:
                 return values[int(value)]
             except KeyError as error:
-                raise RuntimeError("native tier descriptor has invalid owner") from error
+                raise RuntimeError(
+                    "native tier descriptor has invalid owner"
+                ) from error
 
         return TierDescriptor(
             TierKind(native.source_kind),

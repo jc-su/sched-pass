@@ -25,9 +25,7 @@ except ImportError:
 
 
 ARMS = tuple(f"B{index}" for index in range(7))
-FORMAL_CONSUMER_KINDS = frozenset(
-    {"native_work_unit", "framework_reference"}
-)
+FORMAL_CONSUMER_KINDS = frozenset({"native_work_unit", "framework_reference"})
 # Adjacent pairs expose each boundary. The two cross-boundary pairs are
 # deliberate: B3/B1 seals the host-control round-trip effect, and B5/B3
 # tests the complete device-demand-to-heterogeneous-execution jump.
@@ -97,9 +95,7 @@ def _consumer_kinds(values: list[str]) -> dict[str, str]:
     result: dict[str, str] = {}
     for value in values:
         if "=" not in value:
-            raise ValueError(
-                "--arm-consumer-kind must use ARM=KIND: " f"{value!r}"
-            )
+            raise ValueError(f"--arm-consumer-kind must use ARM=KIND: {value!r}")
         arm, kind = value.split("=", 1)
         if arm not in ARMS or kind not in FORMAL_CONSUMER_KINDS:
             raise ValueError(f"invalid arm consumer kind: {value!r}")
@@ -108,9 +104,7 @@ def _consumer_kinds(values: list[str]) -> dict[str, str]:
         result[arm] = kind
     missing = [arm for arm in ARMS if arm not in result]
     if missing:
-        raise ValueError(
-            "missing consumer kinds for: " + ", ".join(missing)
-        )
+        raise ValueError("missing consumer kinds for: " + ", ".join(missing))
     return result
 
 

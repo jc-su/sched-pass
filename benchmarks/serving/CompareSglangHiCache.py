@@ -14,9 +14,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RESULTS_ROOT = pathlib.Path(
-    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
-)
+RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
 
 
 def parse_args() -> argparse.Namespace:

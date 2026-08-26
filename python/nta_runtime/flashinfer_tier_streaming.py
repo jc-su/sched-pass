@@ -729,9 +729,7 @@ class FlashInferTierStreamingOperator:
             else:
                 dependency_count = 1
                 direct_dependency_count = 1
-                requirements = (
-                    direct_requirement(runtime.device_view, 1),
-                )
+                requirements = (direct_requirement(runtime.device_view, 1),)
             dependencies.extend(requirements)
             self._compiled_completion_dependencies.extend(requirements)
             work.append(

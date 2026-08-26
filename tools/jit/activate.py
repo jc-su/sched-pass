@@ -19,7 +19,13 @@ try:
 except ModuleNotFoundError:
     # Installed activation lives in ``bin`` while the JIT helpers live beside
     # the installed NTA data root.
-    _installed_jit = pathlib.Path(__file__).resolve().parent.parent / "share" / "nta" / "tools" / "jit"
+    _installed_jit = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "share"
+        / "nta"
+        / "tools"
+        / "jit"
+    )
     if not (_installed_jit / "cuda_toolkit.py").is_file():
         raise
     sys.path.insert(0, str(_installed_jit))
@@ -244,8 +250,7 @@ def main() -> int:
                 ),
                 "NTA_JIT_REQUEST_BOUND_SOURCE": os.environ.get(
                     "NTA_JIT_REQUEST_BOUND_SOURCE",
-                    "nta_sglang_decode_request_bound,"
-                    "nta_sglang_prefill_request_bound",
+                    "nta_sglang_decode_request_bound,nta_sglang_prefill_request_bound",
                 ),
             }
         )

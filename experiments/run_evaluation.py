@@ -107,9 +107,7 @@ def validate_spec(
                     "osdi-complete trials must declare a numerical consumer_kind "
                     "of native_work_unit or framework_reference"
                 )
-            consumer_kinds_by_arm.setdefault(trial["arm"], set()).add(
-                consumer_kind
-            )
+            consumer_kinds_by_arm.setdefault(trial["arm"], set()).add(consumer_kind)
         if not isinstance(trial.get("stratum"), dict) or not REQUIRED_STRATA <= set(
             trial["stratum"]
         ):
@@ -209,8 +207,7 @@ def validate_spec(
                 "all strata"
             )
         if any(
-            len(consumer_kinds_by_arm.get(arm, set())) != 1
-            for arm in CANONICAL_ARMS
+            len(consumer_kinds_by_arm.get(arm, set())) != 1 for arm in CANONICAL_ARMS
         ):
             raise ValueError(
                 "osdi-complete evaluation must declare a consumer_kind for every "
@@ -370,7 +367,9 @@ def main(argv: list[str] | None = None) -> int:
                             if trial["arm"] == arm
                         )
                     },
-                    "tier_set": sorted({trial["tier"] for trial in spec["experiments"]}),
+                    "tier_set": sorted(
+                        {trial["tier"] for trial in spec["experiments"]}
+                    ),
                     "causal_pairs": sorted(
                         {
                             f"{comparison['numerator_variant']}>{comparison['denominator_variant']}"

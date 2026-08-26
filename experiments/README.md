@@ -13,7 +13,7 @@ it does not define a second runtime state machine or native ABI.
 | Physical tier capability | `qualify_tiers.py`, `validate_tier_qualification.py` | exact HBM/host/NVMe/DAX qualification; missing hardware is skip |
 | Hardware preflight | `inspect_hardware.py` | read-only GPU/NVMe/CXL/DAX capability inventory; never binds devices |
 | RQ1--RQ3 paired execution | `run_evaluation.py`, `analyze_evaluation.py` | exact demand, paired metadata, six strata, causal comparisons, bootstrap CI, Little's Law |
-| RQ4 cost and regression | `profile.py`, `check_regression.py`, `validate_performance_artifact.py` | complete profiler + baseline + measured report + passing regression gate |
+| RQ4 cost and regression | `profile.py`, `capture_performance.py`, `check_regression.py`, `validate_performance_artifact.py` | complete profiler + baseline + measured report + digest-bound passing regression gate |
 | Reproduction packaging | `reproduce.py`, `validate_bundle.py` | self-contained external bundle with command and digest provenance |
 
 Fetch the public Bailian objects without cloning Git LFS and verify their
@@ -114,7 +114,21 @@ runtime.
 - Treat modeled matrix timing, missing profilers, and unavailable hardware as
   contract/status evidence, never as serving speedup evidence.
 - An `osdi-complete` artifact must include a `performance/` directory with
-  `profile.json`, `baseline.json`, `measured.json`, and `regression.json`.
+  `profile.json`, `baseline.json`, `measured.json`, `regression.json`, and
+  `capture.json`. Compose it with `capture_performance.py`; do not hand-copy
+  evidence files:
+
+  ```bash
+  python experiments/capture_performance.py \
+    --profile-artifact /tmp/nta-profile \
+    --baseline /path/to/baseline.json \
+    --measured /path/to/measured.json \
+    --output /tmp/nta-performance
+  ```
+
+  The command computes the machine-specific regression and records digests for
+  all four evidence files. A failed comparison exits non-zero and cannot be
+  passed to `reproduce.py`.
   Build it outside the checkout and pass it with
   `--performance-evidence`; the bundle validator rejects a missing or
   unavailable profiler instead of silently downgrading the claim.

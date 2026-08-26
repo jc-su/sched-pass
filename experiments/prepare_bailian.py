@@ -8,9 +8,9 @@ from pathlib import Path
 import sys
 
 try:
-    from .bailian import normalize, read_jsonl, write_workload
+    from .bailian import normalize, read_jsonl, read_jsonl_selection, write_workload
 except ImportError:
-    from bailian import normalize, read_jsonl, write_workload
+    from bailian import normalize, read_jsonl, read_jsonl_selection, write_workload
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -52,12 +52,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_requests is not None and args.max_requests <= 0:
         parser.error("--max-requests must be positive")
     try:
-        rows = read_jsonl(args.input)
-        source_request_count = len(rows)
-        if args.max_requests is not None:
-            rows = rows[: args.max_requests]
-            if not rows:
-                raise ValueError("--max-requests selected no source rows")
+        rows, source_request_count, source_digest = read_jsonl_selection(
+            args.input, args.max_requests
+        )
+        if not rows:
+            raise ValueError("--max-requests selected no source rows")
         reference = (
             read_jsonl(args.arrival_reference) if args.arrival_reference else None
         )
@@ -76,9 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         # immutable identity; an absolute checkout path would make a copied
         # artifact appear machine-specific even when its records are intact.
         manifest["source_file"] = args.input.name
-        manifest["source_digest"] = (
-            __import__("hashlib").sha256(args.input.read_bytes()).hexdigest()
-        )
+        manifest["source_digest"] = source_digest
         manifest["selection"] = {
             "mode": "source_prefix" if args.max_requests is not None else "all_rows",
             "max_requests": args.max_requests,

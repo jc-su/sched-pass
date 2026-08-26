@@ -34,9 +34,7 @@ class HostCostModel:
         )
         return cls(
             bandwidth_bytes_per_second=int(
-                values.get(
-                    f"{prefix}_HOST_BANDWIDTH_BPS", calibrated_bandwidth
-                )
+                values.get(f"{prefix}_HOST_BANDWIDTH_BPS", calibrated_bandwidth)
             ),
             round_overhead_ns=int(
                 values.get(f"{prefix}_ROUND_OVERHEAD_NS", cls.round_overhead_ns)

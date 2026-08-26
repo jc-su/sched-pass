@@ -35,9 +35,7 @@ from SglangHiCache import (
 from SglangHiCacheQuality import run_quality_pair, stream_request  # noqa: F401
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RESULTS_ROOT = pathlib.Path(
-    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
-)
+RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
 
 # English tasks whose answers score with token F1; summarization tasks
 # score with Rouge-L. Prompts follow LongBench's own templates.

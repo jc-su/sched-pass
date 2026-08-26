@@ -51,7 +51,9 @@ class _StatsPublisher:
             if self._stopping:
                 raise RuntimeError("NTA engine statistics publisher is closed")
             if self._error is not None:
-                raise RuntimeError("NTA engine statistics publisher failed") from self._error
+                raise RuntimeError(
+                    "NTA engine statistics publisher failed"
+                ) from self._error
             self._submitted += 1
             sequence = self._submitted
             self._pending = (sequence, report)

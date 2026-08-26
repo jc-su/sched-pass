@@ -27,7 +27,12 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
     classification = report.get("classification")
     if classification == "vllm-serving-integration-smoke":
         return validate_vllm(report)
-    return validate_sglang(report)
+    if classification in {
+        "sglang-hicache-load",
+        "sglang-hicache-load-comparison",
+    }:
+        return validate_sglang(report)
+    raise ValueError(f"unsupported serving result classification: {classification!r}")
 
 
 def main() -> int:

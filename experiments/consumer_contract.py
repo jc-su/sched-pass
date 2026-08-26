@@ -42,13 +42,9 @@ def validate_consumer_contract(
         if not isinstance(field_value, str) or not field_value:
             raise ValueError(f"consumer contract lacks {field}")
     if expected_engine is not None and value["engine"] != expected_engine:
-        raise ValueError(
-            "consumer contract engine diverges from the expected engine"
-        )
+        raise ValueError("consumer contract engine diverges from the expected engine")
     if expected_backend is not None and value["backend"] != expected_backend:
-        raise ValueError(
-            "consumer contract backend diverges from the expected backend"
-        )
+        raise ValueError("consumer contract backend diverges from the expected backend")
     kind = value["kind"]
     if kind not in CONSUMER_KINDS:
         raise ValueError(f"unknown consumer contract kind: {kind!r}")
@@ -85,7 +81,5 @@ def validate_consumer_contract(
         raise ValueError("projection-only contract claims numerical execution")
 
     if require_formal_execution and kind == "projection_only":
-        raise ValueError(
-            "projection-only engine hook cannot be serving evidence"
-        )
+        raise ValueError("projection-only engine hook cannot be serving evidence")
     return dict(value)

@@ -56,13 +56,9 @@ def main() -> int:
     value = torch.randn_like(key)
     # vLLM 0.26's packed NHD cache is (blocks, kv_heads, page, 2*head_size).
     kv_cache = torch.cat((key, value), dim=-1).permute(0, 2, 1, 3).contiguous()
-    query = torch.randn(
-        (2, num_heads, head_size), device=device, dtype=torch.float16
-    )
+    query = torch.randn((2, num_heads, head_size), device=device, dtype=torch.float16)
 
-    workspace = torch.empty(
-        64 * 1024 * 1024, dtype=torch.uint8, device=device
-    )
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
     stock_wrapper = BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
     indptr = torch.tensor([0, 2, 4], dtype=torch.int32)
     indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
@@ -155,9 +151,7 @@ def main() -> int:
             version_provider=lambda: "0.26.0",
         )
         group = SimpleNamespace(
-            get_numpy_array=lambda: np.asarray(
-                [[0, 1], [2, 3]], dtype=np.int32
-            ),
+            get_numpy_array=lambda: np.asarray([[0, 1], [2, 3]], dtype=np.int32),
             num_blocks_per_row=np.asarray([2, 2], dtype=np.int32),
         )
         input_batch = SimpleNamespace(
@@ -304,9 +298,7 @@ def main() -> int:
                 stream=torch.cuda.current_stream(),
             )
             mixed_query = torch.cat((query[:1], prefill_query[:2]))
-            mixed_expected = torch.cat(
-                (mixed_decode_expected, mixed_prefill_expected)
-            )
+            mixed_expected = torch.cat((mixed_decode_expected, mixed_prefill_expected))
             mixed_output = torch.empty_like(mixed_expected)
             with vllm_v1_forward_state(
                 SimpleNamespace(
@@ -346,9 +338,7 @@ def main() -> int:
             )
             maximum = max(
                 maximum,
-                run_batch(
-                    scheduler_output, input_batch, query, expected, epoch=2
-                ),
+                run_batch(scheduler_output, input_batch, query, expected, epoch=2),
             )
             # Rebind both rows to new request generations and run again.  This
             # catches stale runtime tickets/CTA counters that a one-shot

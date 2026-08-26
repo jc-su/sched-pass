@@ -16,9 +16,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RESULTS_ROOT = pathlib.Path(
-    os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results")
-)
+RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
 RATIO_FIELDS = (
     # The registered primary: absolute-SLO goodput (TTFT <= 8.0s AND P99
     # ITL <= 100ms, all requests). Its omission until 2026-08-15 made the

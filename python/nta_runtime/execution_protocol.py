@@ -217,9 +217,7 @@ class WorkLedger:
             and len(self._state_members[Availability.RUNNING])
             >= self.config.max_inflight_units
         ):
-            raise ValueError(
-                "execution protocol in-flight capacity would be exceeded"
-            )
+            raise ValueError("execution protocol in-flight capacity would be exceeded")
         self._state_members[current].pop(work_id)
         self._state_members[target][work_id] = None
         self._states[work_id] = target
@@ -250,9 +248,7 @@ class WorkLedger:
         # is both bounded and duplicate-free.
         allowed = set(states)
         return tuple(
-            work_id
-            for work_id, state in self._states.items()
-            if state in allowed
+            work_id for work_id, state in self._states.items() if state in allowed
         )
 
     def runnable_groups(self) -> tuple[tuple[int, ...], ...]:
@@ -284,9 +280,7 @@ class WorkLedger:
 
     @property
     def state_counts(self) -> dict[Availability, int]:
-        return {
-            state: len(members) for state, members in self._state_members.items()
-        }
+        return {state: len(members) for state, members in self._state_members.items()}
 
 
 @dataclass(frozen=True)

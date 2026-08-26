@@ -9,6 +9,10 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
+from experiments.bailian import normalize, write_workload  # noqa: E402
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -84,6 +88,68 @@ def main() -> None:
         comparison = summary["comparisons"][0]
         assert comparison["ratio"] == "baseline/mechanism"
         assert comparison["interval"]["mean"] == 2.0
+
+        occupied = root / "occupied"
+        occupied.mkdir()
+        (occupied / "sentinel").write_text("keep\n", encoding="utf-8")
+        refused = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/run-qualified-trials.py"),
+                "--spec",
+                str(spec_path),
+                "--output-dir",
+                str(occupied),
+                "--allow-dirty",
+            ],
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert refused.returncode != 0
+        assert "not empty" in refused.stderr
+        assert (occupied / "sentinel").read_text(encoding="utf-8") == "keep\n"
+
+        workload_manifest, workload_records = normalize(
+            [
+                {
+                    "chat_id": "qualification-workload",
+                    "input_length": 16,
+                    "output_length": 1,
+                }
+            ]
+        )
+        workload_path = root / "workload" / "manifest.json"
+        records_path = root / "workload" / "records.jsonl"
+        write_workload(workload_path, records_path, workload_manifest, workload_records)
+        malformed_manifest = root / "malformed-workload.json"
+        malformed_document = json.loads(workload_path.read_text(encoding="utf-8"))
+        malformed_document["request_count"] = 2
+        malformed_manifest.write_text(json.dumps(malformed_document), encoding="utf-8")
+        invalid_spec = dict(spec)
+        invalid_spec["workload_manifest"] = str(malformed_manifest)
+        invalid_spec_path = root / "invalid-spec.json"
+        invalid_spec_path.write_text(json.dumps(invalid_spec), encoding="utf-8")
+        refused_manifest = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/run-qualified-trials.py"),
+                "--spec",
+                str(invalid_spec_path),
+                "--output-dir",
+                str(root / "invalid-output"),
+                "--allow-dirty",
+            ],
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert refused_manifest.returncode != 0
+        assert "failed validation" in refused_manifest.stderr
 
     print("qualification_runner=pass")
 

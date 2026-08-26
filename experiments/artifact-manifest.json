@@ -71,6 +71,7 @@
     "experiments/validate_serving_result.py",
     "experiments/profile.py",
     "experiments/check_regression.py",
+    "experiments/capture_performance.py",
     "experiments/validate_performance_artifact.py"
   ],
   "hardware_tools": [

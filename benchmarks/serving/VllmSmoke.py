@@ -49,14 +49,17 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.model.is_dir():
         parser.error(f"model directory does not exist: {args.model}")
-    if min(
-        args.requests,
-        args.max_new_tokens,
-        args.iterations,
-        args.warmup_iterations,
-        args.max_model_len,
-        args.max_num_seqs,
-    ) <= 0:
+    if (
+        min(
+            args.requests,
+            args.max_new_tokens,
+            args.iterations,
+            args.warmup_iterations,
+            args.max_model_len,
+            args.max_num_seqs,
+        )
+        <= 0
+    ):
         parser.error("request, token, iteration, and model limits must be positive")
     if args.max_num_seqs < args.requests:
         parser.error("--max-num-seqs must cover the request batch")
@@ -215,9 +218,7 @@ def main() -> int:
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError(f"invalid vLLM evidence file: {path}") from error
     contracts = [
-        entry.get("consumer_contract")
-        for entry in evidence
-        if isinstance(entry, dict)
+        entry.get("consumer_contract") for entry in evidence if isinstance(entry, dict)
     ]
     native_verified = any(
         isinstance(contract, dict) and contract.get("kind") == "native_work_unit"
@@ -231,8 +232,7 @@ def main() -> int:
         consumer_contract = next(
             contract
             for contract in contracts
-            if isinstance(contract, dict)
-            and contract.get("kind") == "native_work_unit"
+            if isinstance(contract, dict) and contract.get("kind") == "native_work_unit"
         )
     else:
         consumer_contract = {

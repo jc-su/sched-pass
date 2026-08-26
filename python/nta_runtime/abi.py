@@ -15,9 +15,7 @@ UINT64_MAX = (1 << 64) - 1
 MAX_REQUEST_PRIORITY = 7
 
 
-def bounded_integer(
-    value: int, name: str, *, minimum: int, maximum: int
-) -> int:
+def bounded_integer(value: int, name: str, *, minimum: int, maximum: int) -> int:
     """Validate and normalize an integer before it crosses the C ABI."""
 
     if isinstance(value, bool) or not isinstance(value, numbers.Integral):

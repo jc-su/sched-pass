@@ -43,10 +43,20 @@ Every completed bundle can be checked independently with
 An `osdi-complete` evaluation additionally requires a separately captured
 performance evidence directory. It contains the successful `profile.json`,
 the same-machine `baseline.json`, the measured correctness report
-`measured.json`, and the machine-generated `regression.json`. Validate it with
-`experiments/validate_performance_artifact.py`, then pass it to
-`reproduce.py --performance-evidence`; a missing profiler is not a passing
-performance gate.
+`measured.json`, the machine-generated `regression.json`, and digest-bound
+`capture.json`. Compose it with the canonical command:
+
+```bash
+python experiments/capture_performance.py \
+  --profile-artifact /tmp/nta-profile \
+  --baseline /path/to/baseline.json \
+  --measured /path/to/measured.json \
+  --output /tmp/nta-performance
+python experiments/validate_performance_artifact.py /tmp/nta-performance
+```
+
+Then pass it to `reproduce.py --performance-evidence`; a missing profiler or a
+hand-edited/failed comparison is not a passing performance gate.
 
 Before selecting a physical tier, capture a read-only capability inventory:
 

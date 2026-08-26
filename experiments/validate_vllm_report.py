@@ -144,9 +144,9 @@ def _validate_evidence(report: dict[str, Any], *, native: bool) -> None:
             and fallback_value >= 0,
             f"vLLM evidence {index} has invalid reference_fallback_launches",
         )
-        observed_launches += stats["native_decode_launches"] + stats[
-            "native_prefill_launches"
-        ]
+        observed_launches += (
+            stats["native_decode_launches"] + stats["native_prefill_launches"]
+        )
         observed_fallbacks += fallback_value
     _require(
         report.get("native_launches") == observed_launches > 0,
@@ -185,7 +185,9 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         isinstance(report.get("machine"), dict) and report["machine"],
         "vLLM report has no machine metadata",
     )
-    _require(isinstance(report.get("dirty"), bool), "vLLM report has invalid dirty state")
+    _require(
+        isinstance(report.get("dirty"), bool), "vLLM report has invalid dirty state"
+    )
     requests = _positive_integer(report.get("requests"), "request count")
     _positive_integer(report.get("max_new_tokens"), "maximum new token count")
     iterations = _positive_integer(report.get("iterations"), "iteration count")

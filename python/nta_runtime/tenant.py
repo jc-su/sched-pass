@@ -98,7 +98,9 @@ def tenant_mapper_from_environment(
         rules.append((tenant_id, prefix))
 
     def map_request(request_id: str) -> int:
-        matches = [tenant_id for tenant_id, prefix in rules if request_id.startswith(prefix)]
+        matches = [
+            tenant_id for tenant_id, prefix in rules if request_id.startswith(prefix)
+        ]
         if len(set(matches)) > 1:
             raise RuntimeError(
                 f"request ID {request_id!r} matches multiple tenant prefixes"

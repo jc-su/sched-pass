@@ -221,13 +221,9 @@ def parse_args() -> argparse.Namespace:
     if args.request_rate <= 0:
         parser.error("request rate must be positive")
     if args.external_tokens + args.external_suffix_tokens >= max_request_input_tokens:
-        parser.error(
-            "external prompt exceeds the SGLang request input budget"
-        )
+        parser.error("external prompt exceeds the SGLang request input budget")
     if args.resident_tokens >= max_request_input_tokens:
-        parser.error(
-            "resident prompt exceeds the SGLang request input budget"
-        )
+        parser.error("resident prompt exceeds the SGLang request input budget")
     if args.hicache_ratio <= 1:
         parser.error("HiCache ratio must exceed device cache capacity")
     if args.workload_manifest is None:
@@ -338,12 +334,8 @@ def _load_workload(
         }
     )
     block_size = int(manifest["block_size"])
-    resident_page_ids = unique_input_page_ids(
-        resident_rows, block_size=block_size
-    )
-    external_page_ids = unique_input_page_ids(
-        external_rows, block_size=block_size
-    )
+    resident_page_ids = unique_input_page_ids(resident_rows, block_size=block_size)
+    external_page_ids = unique_input_page_ids(external_rows, block_size=block_size)
     resident_prompt_text = [prompt(row) for row in resident_rows]
     external_prompt_text = [prompt(row) for row in external_rows]
     metadata = {
@@ -541,8 +533,7 @@ async def _run_load(
                     "max_new_tokens": max(
                         1,
                         external_output_tokens[index]
-                        if external_output_tokens is not None
-                        and not warmup
+                        if external_output_tokens is not None and not warmup
                         else args.external_output_tokens,
                     ),
                 },
@@ -788,6 +779,7 @@ def main() -> int:
         hicache_io_backend="kernel",
         hicache_mem_layout="page_first",
     ) as engine:
+
         def warm_residents() -> None:
             """Materialize and verify the resident working set in bounded batches."""
 

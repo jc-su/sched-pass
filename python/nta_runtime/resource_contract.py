@@ -96,9 +96,7 @@ class ResourceContract:
             )
         direct = bool(self.capabilities & ResourceCapability.DIRECT_ADDRESS)
         if direct != self.direct_device_visible:
-            raise ValueError(
-                "direct-address capability must match device visibility"
-            )
+            raise ValueError("direct-address capability must match device visibility")
         if self.kind is ResourceKind.HOST_STAGED:
             if not self.uses_host_proxy:
                 raise ValueError("host-staged resources require a host proxy")
@@ -126,10 +124,14 @@ class ResourceContract:
             if self.payload_owner is not ResourceOwner.ENGINE:
                 raise ValueError("resident resources must be engine-owned")
             if self.transfer_destination_owner is not None:
-                raise ValueError("direct resident resources cannot have a staging destination")
+                raise ValueError(
+                    "direct resident resources cannot have a staging destination"
+                )
         if self.kind is ResourceKind.CXL_DAX:
             if self.transfer_destination_owner is not None:
-                raise ValueError("direct CXL resources cannot have a staging destination")
+                raise ValueError(
+                    "direct CXL resources cannot have a staging destination"
+                )
         if self.kind is ResourceKind.NVME:
             if self.transfer_destination_owner is not ResourceOwner.TRANSPORT:
                 raise ValueError("NVMe HBM destination must be transport-owned")
@@ -217,8 +219,7 @@ _CONTRACTS = {
     ),
     ResourceKind.CXL_DAX: ResourceContract(
         ResourceKind.CXL_DAX,
-        ResourceCapability.DIRECT_ADDRESS
-        | ResourceCapability.HOST_REGISTERED,
+        ResourceCapability.DIRECT_ADDRESS | ResourceCapability.HOST_REGISTERED,
         ResourceOwner.TRANSPORT,
         ResourceOwner.TRANSPORT,
         None,

@@ -38,9 +38,7 @@ def validate(document: dict[str, Any]) -> None:
         if not isinstance(tier, dict):
             raise ValueError(f"evaluation contract lacks tier object: {tier_id}")
         if tier.get("resource_kind") != resource_kind:
-            raise ValueError(
-                f"{tier_id} must name resource kind {resource_kind!r}"
-            )
+            raise ValueError(f"{tier_id} must name resource kind {resource_kind!r}")
         if tier.get("steady_state_path") != steady_state_path:
             raise ValueError(
                 f"{tier_id} must name steady-state path {steady_state_path!r}"

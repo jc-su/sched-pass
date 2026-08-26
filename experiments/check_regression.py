@@ -37,8 +37,10 @@ def validate_baseline(baseline: dict[str, Any]) -> None:
     if int(report.get("verification_failures", 0)) != 0:
         raise ValueError("baseline contains correctness failures")
     for metric in metrics:
-        if not isinstance(metric, dict) or not metric.get("name") or not metric.get(
-            "path"
+        if (
+            not isinstance(metric, dict)
+            or not metric.get("name")
+            or not metric.get("path")
         ):
             raise ValueError("baseline metric must have a name and path")
         direction = metric.get("direction", "lower_is_better")

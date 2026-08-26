@@ -22,9 +22,8 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
 from nta_runtime.flashinfer import (
-    BIND_CURRENT_GENERATION,
     FlashInferLayerEpoch,
-    PREACQUIRED,
+    PREACQUIRED_LAUNCH_FLAGS,
     attention_jit_args,
     direct_requirement,
     enqueue_resident_attention,
@@ -1906,7 +1905,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 allocation.plan.dependencies_tensor,
                 layer.scaling,
                 schedule.work_count,
-                PREACQUIRED | BIND_CURRENT_GENERATION,
+                PREACQUIRED_LAUNCH_FLAGS,
                 out=output,
                 **run_options,
             )

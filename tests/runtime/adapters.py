@@ -122,16 +122,13 @@ def main() -> None:
             assert "physical tier" in str(error)
         else:
             raise AssertionError("vLLM physical tier was accepted without native mode")
-        assert (
-            validate_vllm_attention_tier(
-                {
-                    "NTA_SERVING_TIER": value,
-                    "NTA_VLLM_NATIVE": "1",
-                    "NTA_VLLM_PHYSICAL_CATALOG": "1",
-                }
-            )
-            == ("cxl_dax" if value == "cxl" else value)
-        )
+        assert validate_vllm_attention_tier(
+            {
+                "NTA_SERVING_TIER": value,
+                "NTA_VLLM_NATIVE": "1",
+                "NTA_VLLM_PHYSICAL_CATALOG": "1",
+            }
+        ) == ("cxl_dax" if value == "cxl" else value)
         try:
             validate_vllm_attention_tier(
                 {"NTA_SERVING_TIER": value, "NTA_VLLM_NATIVE": "1"}
@@ -237,7 +234,11 @@ def main() -> None:
         raise AssertionError("fractional exact demand ID was accepted")
     for malformed in (
         type("Output", (), {"request_ids": ("bad",), "request_slots": (1.5,)})(),
-        type("Output", (), {"request_ids": ("bad",), "request_slots": (1,), "priorities": (8,)})(),
+        type(
+            "Output",
+            (),
+            {"request_ids": ("bad",), "request_slots": (1,), "priorities": (8,)},
+        )(),
     ):
         try:
             VllmSchedulerProjection.from_scheduler_output(malformed)
@@ -344,24 +345,32 @@ def main() -> None:
         page_bytes=4096,
         version_provider=lambda: "0.26.0",
     )
+
     def swap_input(ids, rows):
         return type("InputBatch", (), {"req_ids": ids, "idx_mapping_np": rows})()
+
     swap_hook.bind_v2_forward(
-        type("SchedulerOutput", (), {"num_scheduled_tokens": {"swap-a": 1, "swap-b": 1}})(),
+        type(
+            "SchedulerOutput", (), {"num_scheduled_tokens": {"swap-a": 1, "swap-b": 1}}
+        )(),
         swap_input(("swap-a", "swap-b"), (1, 2)),
         block_tables=(FakeVllmV2Table(),),
         num_blocks=((3, 2, 3),),
         epoch=12,
     )
     swap_hook.bind_v2_forward(
-        type("SchedulerOutput", (), {"num_scheduled_tokens": {"swap-a": 1, "swap-b": 1}})(),
+        type(
+            "SchedulerOutput", (), {"num_scheduled_tokens": {"swap-a": 1, "swap-b": 1}}
+        )(),
         swap_input(("swap-a", "swap-b"), (2, 1)),
         block_tables=(FakeVllmV2Table(),),
         num_blocks=((3, 2, 3),),
         epoch=13,
     )
     swap_replacement = swap_hook.bind_v2_forward(
-        type("SchedulerOutput", (), {"num_scheduled_tokens": {"swap-c": 1, "swap-d": 1}})(),
+        type(
+            "SchedulerOutput", (), {"num_scheduled_tokens": {"swap-c": 1, "swap-d": 1}}
+        )(),
         swap_input(("swap-c", "swap-d"), (2, 1)),
         block_tables=(FakeVllmV2Table(),),
         num_blocks=((3, 2, 3),),
