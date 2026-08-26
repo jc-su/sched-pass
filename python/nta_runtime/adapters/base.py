@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Sequence
 from enum import Enum
+from operator import index as integer_index
 from typing import Any, Protocol, runtime_checkable
 
 from ..requests import RequestBinding, RequestIdentityRegistry
@@ -156,17 +157,32 @@ class ExactDemandProjection:
     unit_bytes: int
 
     def __post_init__(self) -> None:
-        if self.unit_bytes <= 0:
+        if isinstance(self.unit_bytes, bool):
+            raise ValueError("exact demand unit_bytes must be an integer")
+        try:
+            unit_bytes = integer_index(self.unit_bytes)
+        except TypeError:
+            raise ValueError("exact demand unit_bytes must be an integer") from None
+        if unit_bytes <= 0:
             raise ValueError("exact demand unit_bytes must be positive")
-        if not self.request_unit_ids or any(
-            not units for units in self.request_unit_ids
-        ):
+        try:
+            normalized_rows = tuple(
+                tuple(integer_index(unit) for unit in units)
+                for units in self.request_unit_ids
+            )
+        except (TypeError, ValueError):
+            raise ValueError(
+                "exact demand unit IDs must be integer sequences"
+            ) from None
+        if not normalized_rows or any(not units for units in normalized_rows):
             raise ValueError("exact demand must contain units for every request")
         if any(
             any(unit < 0 for unit in units) or len(set(units)) != len(units)
-            for units in self.request_unit_ids
+            for units in normalized_rows
         ):
             raise ValueError("exact demand unit IDs must be unique and nonnegative")
+        object.__setattr__(self, "request_unit_ids", normalized_rows)
+        object.__setattr__(self, "unit_bytes", int(unit_bytes))
 
 
 @dataclass(frozen=True)
@@ -182,8 +198,15 @@ class EngineBatch:
     def __post_init__(self) -> None:
         if not self.engine:
             raise ValueError("engine name must be non-empty")
-        if self.epoch < 0:
+        if isinstance(self.epoch, bool):
+            raise ValueError("engine batch epoch must be an integer")
+        try:
+            epoch = integer_index(self.epoch)
+        except TypeError:
+            raise ValueError("engine batch epoch must be an integer") from None
+        if epoch < 0:
             raise ValueError("engine batch epoch cannot be negative")
+        object.__setattr__(self, "epoch", int(epoch))
         if not self.bindings:
             raise ValueError("engine batch must contain at least one request")
         if len({binding.request_slot for binding in self.bindings}) != len(
@@ -227,8 +250,11 @@ class EngineBatch:
         """
         if isinstance(start, bool) or isinstance(count, bool):
             raise TypeError("engine batch phase bounds must be integers")
-        start = int(start)
-        count = int(count)
+        try:
+            start = integer_index(start)
+            count = integer_index(count)
+        except TypeError:
+            raise TypeError("engine batch phase bounds must be integers") from None
         if start < 0 or count <= 0 or start + count > len(self.bindings):
             raise ValueError(
                 "engine batch phase must be a non-empty contiguous binding range"

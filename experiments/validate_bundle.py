@@ -16,7 +16,7 @@ try:
     from .run_evaluation import validate_spec
     from .validate_matrix_artifact import validate as validate_matrix
     from .validate_performance_artifact import validate as validate_performance_artifact
-    from .validate_serving_report import validate as validate_serving_report
+    from .validate_serving_result import validate as validate_serving_result
     from .validate_tier_qualification import (
         validate_file as validate_tier_qualification,
     )
@@ -30,7 +30,7 @@ except ImportError:  # Direct script execution.
     from run_evaluation import validate_spec
     from validate_matrix_artifact import validate as validate_matrix
     from validate_performance_artifact import validate as validate_performance_artifact
-    from validate_serving_report import validate as validate_serving_report
+    from validate_serving_result import validate as validate_serving_result
     from validate_tier_qualification import validate_file as validate_tier_qualification
     from validate_tier_catalog import validate as validate_tier_catalog
     from validate_workload import validate as validate_workload
@@ -120,7 +120,7 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
         )
         if metadata.get("profile") == "serving":
             serving_report = json.loads(result_path.read_text(encoding="utf-8"))
-            validate_serving_report(serving_report)
+            validate_serving_result(serving_report)
             if metadata.get("workload_replay_manifest"):
                 workload_file = bundle / Path(metadata["workload_replay_manifest"])
                 workload_records = workload_file.parent / "records.jsonl"

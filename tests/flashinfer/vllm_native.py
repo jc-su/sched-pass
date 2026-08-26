@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import math
+import os
 
 import numpy as np
 import torch
@@ -37,6 +38,7 @@ class _BlockTable:
 def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the vLLM native consumer test")
+    os.environ["NTA_VLLM_NATIVE"] = "1"
 
     device = torch.device("cuda")
     page_size = 16
@@ -100,6 +102,38 @@ def main() -> int:
         disable_split_kv=True,
     )
     prefill_expected = stock_prefill.run(prefill_query, (key, value))
+    mixed_decode = BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
+    mixed_decode.plan(
+        torch.tensor([0, 2], dtype=torch.int32),
+        indices[:2],
+        torch.tensor([page_size], dtype=torch.int32),
+        num_heads,
+        num_kv_heads,
+        head_size,
+        page_size,
+        q_data_type=query.dtype,
+        kv_data_type=kv_cache.dtype,
+        sm_scale=scale,
+        disable_split_kv=True,
+    )
+    mixed_decode_expected = mixed_decode.run(query[:1], (key, value))
+    mixed_prefill = BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
+    mixed_prefill.plan(
+        torch.tensor([0, 2], dtype=torch.int32, device=device),
+        torch.tensor([0, 2], dtype=torch.int32),
+        indices[2:4],
+        torch.tensor([page_size], dtype=torch.int32),
+        num_heads,
+        num_kv_heads,
+        head_size,
+        page_size,
+        q_data_type=prefill_query.dtype,
+        kv_data_type=kv_cache.dtype,
+        sm_scale=scale,
+        causal=False,
+        disable_split_kv=True,
+    )
+    mixed_prefill_expected = mixed_prefill.run(prefill_query[:2], (key, value))
 
     runtime = Runtime(
         RuntimeConfig(
@@ -156,6 +190,18 @@ def main() -> int:
             use_cascade=False,
             prefill=FIPrefill(wrapper=stock_prefill),
             decode=None,
+        )
+        mixed_metadata = SimpleNamespace(
+            num_decodes=1,
+            num_decode_tokens=1,
+            num_prefills=1,
+            num_prefill_tokens=2,
+            num_actual_tokens=3,
+            causal=False,
+            use_cascade=False,
+            prefill=FIPrefill(wrapper=mixed_prefill),
+            decode=FIDecode(wrapper=mixed_decode),
+            decode_use_trtllm=False,
         )
 
         with set_current_vllm_config(VllmConfig()):
@@ -248,10 +294,60 @@ def main() -> int:
                 return (output - prefill_expected).abs().max().item()
 
             maximum = run_prefill(epoch=0)
+            mixed_batch = hook.bind_forward(
+                SimpleNamespace(
+                    num_scheduled_tokens={"a": 1, "b": 2},
+                    finished_req_ids=set(),
+                ),
+                input_batch,
+                epoch=1,
+                stream=torch.cuda.current_stream(),
+            )
+            mixed_query = torch.cat((query[:1], prefill_query[:2]))
+            mixed_expected = torch.cat(
+                (mixed_decode_expected, mixed_prefill_expected)
+            )
+            mixed_output = torch.empty_like(mixed_expected)
+            with vllm_v1_forward_state(
+                SimpleNamespace(
+                    num_scheduled_tokens={"a": 1, "b": 2},
+                    finished_req_ids=set(),
+                )
+            ):
+                state = current_vllm_v1_forward_state()
+                assert state is not None
+                state.batch = mixed_batch
+                state.hook = hook
+                state.page_size = page_size
+                implementation.forward(
+                    None,
+                    mixed_query,
+                    torch.empty(
+                        (3, num_kv_heads, head_size),
+                        device=device,
+                        dtype=mixed_query.dtype,
+                    ),
+                    torch.empty(
+                        (3, num_kv_heads, head_size),
+                        device=device,
+                        dtype=mixed_query.dtype,
+                    ),
+                    kv_cache,
+                    mixed_metadata,
+                    mixed_output,
+                )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                mixed_output, mixed_expected, rtol=2e-3, atol=2e-3
+            )
+            maximum = max(
+                maximum,
+                (mixed_output - mixed_expected).abs().max().item(),
+            )
             maximum = max(
                 maximum,
                 run_batch(
-                    scheduler_output, input_batch, query, expected, epoch=1
+                    scheduler_output, input_batch, query, expected, epoch=2
                 ),
             )
             # Rebind both rows to new request generations and run again.  This
@@ -275,7 +371,7 @@ def main() -> int:
                     second_input,
                     second_query,
                     second_expected,
-                    epoch=2,
+                    epoch=3,
                 ),
             )
 

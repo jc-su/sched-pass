@@ -16,7 +16,9 @@ import importlib.metadata
 import json
 import os
 import pathlib
+import platform
 import statistics
+import subprocess
 import time
 import uuid
 from typing import Any
@@ -39,6 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument("--cuda-home", type=pathlib.Path)
     parser.add_argument("--cuda-host-cxx", type=pathlib.Path)
+    parser.add_argument(
+        "--output",
+        type=pathlib.Path,
+        help="optional JSON report path; stdout remains the machine-readable report",
+    )
     args = parser.parse_args()
     if not args.model.is_dir():
         parser.error(f"model directory does not exist: {args.model}")
@@ -88,6 +95,44 @@ def output_token_ids(result: Any) -> tuple[int, ...]:
         if outputs
         else ()
     )
+
+
+def repository_metadata() -> tuple[str, bool]:
+    """Return the source revision used by this smoke, without importing tools."""
+
+    revision = os.environ.get("NTA_REVISION", "").strip()
+    if not revision:
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=ROOT,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            revision = completed.stdout.strip()
+    if not revision:
+        revision = "unrecorded"
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        dirty = False
+    else:
+        dirty = status.returncode != 0 or bool(status.stdout.strip())
+    return revision, dirty
 
 
 def main() -> int:
@@ -201,6 +246,18 @@ def main() -> int:
             "numerical_consumer": True,
             "engine_version": importlib.metadata.version("vllm"),
         }
+    native_launches = sum(
+        int(entry.get("stats", {}).get("native_decode_launches", 0))
+        + int(entry.get("stats", {}).get("native_prefill_launches", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    reference_fallback_launches = sum(
+        int(entry.get("stats", {}).get("reference_fallback_launches", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    revision, dirty = repository_metadata()
     median_seconds = statistics.median(samples)
     report = {
         "schema": 1,
@@ -208,13 +265,29 @@ def main() -> int:
         "backend": args.backend,
         "backend_selected": True,
         "native_execution_verified": native_verified,
+        "native_launches": native_launches,
+        "reference_fallback_launches": reference_fallback_launches,
+        "stock_fallback_enabled": (
+            args.backend == "nta"
+            and os.environ.get("NTA_VLLM_ALLOW_STOCK_FALLBACK") == "1"
+        ),
         "engine": "vllm",
         "engine_version": importlib.metadata.version("vllm"),
         "flashinfer_version": importlib.metadata.version("flashinfer-python"),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "model": str(args.model.resolve()),
+        "revision": revision,
+        "dirty": dirty,
+        "machine": {
+            "hostname": platform.node(),
+            "platform": platform.platform(),
+            "kernel": platform.release(),
+            "gpu_count": torch.cuda.device_count(),
+            "gpu_name": torch.cuda.get_device_name(0),
+        },
         "requests": args.requests,
+        "max_new_tokens": args.max_new_tokens,
         "iterations": args.iterations,
         "warmup_iterations": args.warmup_iterations,
         "generated_tokens": generated,
@@ -229,7 +302,12 @@ def main() -> int:
         "consumer_contract": consumer_contract,
         "flashinfer_workspace_base": str(workspace),
     }
-    print(json.dumps(report, sort_keys=True))
+    serialized = json.dumps(report, sort_keys=True)
+    if args.output is not None:
+        destination = args.output.resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(serialized + "\n", encoding="utf-8")
+    print(serialized)
     return 0
 
 

@@ -369,6 +369,12 @@ if(Python3_Interpreter_FOUND)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_report.py
   )
   add_test(
+    NAME nta-vllm-report
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/vllm_report.py
+  )
+  add_test(
     NAME nta-semantic-native-bridge
     COMMAND
       ${Python3_EXECUTABLE}

@@ -3,7 +3,12 @@ from nta_runtime.adapters.sglang import (
     SglangExecutionConfig,
     SglangForwardMetadata,
 )
-from nta_runtime.adapters.base import ConsumerContract, ConsumerKind, EngineBoundary
+from nta_runtime.adapters.base import (
+    ConsumerContract,
+    ConsumerKind,
+    EngineBoundary,
+    ExactDemandProjection,
+)
 from nta_runtime.adapters.vllm import VllmAdapter, VllmSchedulerProjection
 from nta_runtime.adapters.vllm_v1 import (
     VllmV1Hook,
@@ -218,6 +223,18 @@ def main() -> None:
         pass
     else:
         raise AssertionError("out-of-range engine phase was accepted")
+    try:
+        vllm_batch.phase(0.5, 1)
+    except TypeError as error:
+        assert "integers" in str(error)
+    else:
+        raise AssertionError("fractional engine phase bound was truncated")
+    try:
+        ExactDemandProjection(((1.5,),), 4096)
+    except ValueError as error:
+        assert "integer" in str(error)
+    else:
+        raise AssertionError("fractional exact demand ID was accepted")
     projection = VllmSchedulerProjection.from_scheduler_output(
         FakeVllmSchedulerOutput()
     )
@@ -251,6 +268,27 @@ def main() -> None:
     assert v2_projection.block_tables == ((40, 41, 42), (30, 31))
     assert v2_projection.request_rows == (2, 1)
     assert v2_projection.exact_demand().unit_bytes == 4096
+    for bad_rows in (None, (1.5, 1), (2, 2)):
+        try:
+            VllmV1SchedulerProjection.from_v2_forward(
+                type(
+                    "SchedulerOutput",
+                    (),
+                    {"num_scheduled_tokens": {"v2-a": 1, "v2-b": 1}},
+                )(),
+                type(
+                    "InputBatch",
+                    (),
+                    {"req_ids": ("v2-a", "v2-b"), "idx_mapping_np": bad_rows},
+                )(),
+                block_tables=(FakeVllmV2Table(),),
+                num_blocks=((3, 2, 3),),
+                page_bytes=4096,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("invalid vLLM V2 row mapping was accepted")
     v2_hook = VllmV1Hook(
         runtime,
         2,

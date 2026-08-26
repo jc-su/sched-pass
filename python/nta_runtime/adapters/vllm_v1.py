@@ -19,6 +19,7 @@ import contextvars
 from dataclasses import dataclass
 import heapq
 import importlib.metadata
+from operator import index as integer_index
 import os
 from typing import Any, Protocol
 
@@ -148,6 +149,18 @@ def _installed_vllm_version() -> str | None:
         return None
 
 
+def _exact_integer(value: Any, description: str) -> int:
+    """Accept Python/NumPy integer scalars, but never truncate floats."""
+
+    if isinstance(value, bool):
+        raise RuntimeError(f"vLLM {description} must be an integer")
+    try:
+        normalized = integer_index(value)
+    except TypeError:
+        raise RuntimeError(f"vLLM {description} must be an integer") from None
+    return int(normalized)
+
+
 @dataclass(frozen=True)
 class VllmV1SchedulerProjection:
     """Exact NTA projection extracted from one vLLM V1 worker step."""
@@ -229,27 +242,47 @@ class VllmV1SchedulerProjection:
             ) from None
 
         rows: list[tuple[int, ...]] = []
+        used_rows: set[int] = set()
         for request_id in request_ids:
             if request_id not in request_indices:
                 raise RuntimeError(
                     f"vLLM V1 input batch has no row for scheduled request {request_id!r}"
                 )
-            row_index = int(request_indices[request_id])
+            row_index = _exact_integer(
+                request_indices[request_id], "request row index"
+            )
             if row_index < 0 or row_index >= len(row_counts):
                 raise RuntimeError(
                     f"vLLM V1 request row {row_index} is outside the input batch"
                 )
-            row_count = int(row_counts[row_index])
+            if row_index in used_rows:
+                raise RuntimeError(
+                    "vLLM V1 scheduled requests reuse an allocation row"
+                )
+            used_rows.add(row_index)
+            row_count = _exact_integer(row_counts[row_index], "block count")
             if row_count <= 0:
                 raise RuntimeError(
                     f"vLLM V1 request {request_id!r} has no exact KV blocks"
                 )
             try:
-                row = tuple(int(page) for page in table[row_index, :row_count].tolist())
+                values = table[row_index, :row_count].tolist()
             except (AttributeError, IndexError, TypeError, ValueError):
                 raise RuntimeError(
                     f"vLLM V1 block-table row is not readable for {request_id!r}"
                 ) from None
+            if not isinstance(values, Sequence) or len(values) != row_count:
+                raise RuntimeError(
+                    f"vLLM V1 block-table row is shorter than its block count "
+                    f"for {request_id!r}"
+                )
+            row = tuple(
+                _exact_integer(page, "block-table page ID") for page in values
+            )
+            if any(page < 0 for page in row):
+                raise RuntimeError(
+                    f"vLLM V1 block-table row has a negative page ID for {request_id!r}"
+                )
             rows.append(row)
         return cls(request_ids, tuple(rows), page_bytes)
 
@@ -287,8 +320,17 @@ class VllmV1SchedulerProjection:
             request_ids_in_batch, (str, bytes)
         ):
             raise RuntimeError("vLLM V2 input batch has no request-id sequence")
-        if isinstance(row_indices, (str, bytes)):
+        if row_indices is None or isinstance(row_indices, (str, bytes)):
             raise RuntimeError("vLLM V2 input batch has no CPU request index map")
+        try:
+            row_indices = tuple(
+                _exact_integer(value, "CPU request row index")
+                for value in row_indices
+            )
+        except TypeError:
+            raise RuntimeError(
+                "vLLM V2 input batch has no CPU request index map"
+            ) from None
         if len(request_ids_in_batch) != len(row_indices):
             raise RuntimeError("vLLM V2 request IDs and row indices are misaligned")
         scheduled_ids = {str(request_id) for request_id in scheduled}
@@ -310,25 +352,46 @@ class VllmV1SchedulerProjection:
         counts = num_blocks[0]
         rows: list[tuple[int, ...]] = []
         request_indices: dict[str, int] = {}
+        used_rows: set[int] = set()
         for request_id, row_index in zip(
             request_ids_in_batch, row_indices, strict=True
         ):
             request_id = str(request_id)
             if request_id not in scheduled_ids:
                 continue
-            row_index = int(row_index)
+            if row_index < 0:
+                raise RuntimeError(
+                    f"vLLM V2 request {request_id!r} has a negative row index"
+                )
+            if row_index in used_rows:
+                raise RuntimeError(
+                    "vLLM V2 scheduled requests reuse an allocation row"
+                )
+            used_rows.add(row_index)
             request_indices[request_id] = row_index
             try:
-                row_count = int(counts[row_index])
+                row_count = _exact_integer(counts[row_index], "block count")
                 if row_count <= 0:
                     raise RuntimeError(
                         f"vLLM V2 request {request_id!r} has no exact KV blocks"
                     )
-                row = tuple(int(page) for page in table[row_index, :row_count].tolist())
+                values = table[row_index, :row_count].tolist()
             except (AttributeError, IndexError, TypeError, ValueError):
                 raise RuntimeError(
                     f"vLLM V2 block-table row is not readable for {request_id!r}"
                 ) from None
+            if not isinstance(values, Sequence) or len(values) != row_count:
+                raise RuntimeError(
+                    f"vLLM V2 block-table row is shorter than its block count "
+                    f"for {request_id!r}"
+                )
+            row = tuple(
+                _exact_integer(page, "block-table page ID") for page in values
+            )
+            if any(page < 0 for page in row):
+                raise RuntimeError(
+                    f"vLLM V2 block-table row has a negative page ID for {request_id!r}"
+                )
             rows.append(row)
         if set(request_indices) != set(request_ids):
             raise RuntimeError("vLLM V2 scheduled request rows are incomplete")

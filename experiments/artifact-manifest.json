@@ -33,7 +33,9 @@
     "serving": [
       "benchmarks/serving/CompareSglangHiCacheLoad.py",
       "benchmarks/serving/VllmSmoke.py",
-      "experiments/validate_serving_report.py"
+      "experiments/validate_serving_report.py",
+      "experiments/validate_vllm_report.py",
+      "experiments/validate_serving_result.py"
     ],
     "artifact": [
       "experiments/reproduce.py",
@@ -65,6 +67,8 @@
     "experiments/validate_evaluation_artifact.py",
     "experiments/validate_tier_qualification.py",
     "experiments/validate_serving_report.py",
+    "experiments/validate_vllm_report.py",
+    "experiments/validate_serving_result.py",
     "experiments/profile.py",
     "experiments/check_regression.py",
     "experiments/validate_performance_artifact.py"
@@ -120,7 +124,7 @@
       "kind": "user-supplied-serving-command",
       "commands": [
         "the command after -- is recorded and executed verbatim",
-        "experiments/validate_serving_report.py"
+        "experiments/validate_serving_result.py"
       ],
       "requires": [
         "pinned SGLang/FlashInfer/model environment",

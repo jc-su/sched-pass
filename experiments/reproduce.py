@@ -624,7 +624,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run.command(
                     [
                         sys.executable,
-                        "experiments/validate_serving_report.py",
+                        "experiments/validate_serving_result.py",
                         str(destination),
                     ],
                     name="serving-validate",
