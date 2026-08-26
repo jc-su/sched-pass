@@ -123,6 +123,23 @@ int main() {
     require(uninitializedCancelRejected,
             "uninitialized request cancellation must be rejected");
 
+    bool zeroGenerationRejected = false;
+    try {
+      runtime.setRequest(1, 1002, 0);
+    } catch (const std::invalid_argument &) {
+      zeroGenerationRejected = true;
+    }
+    require(zeroGenerationRejected,
+            "zero request generation must be rejected at the native boundary");
+    bool outOfRangePriorityRejected = false;
+    try {
+      runtime.setRequest(1, 1002, 1, 0, nta::abi::UrgencyBucketCount);
+    } catch (const std::invalid_argument &) {
+      outOfRangePriorityRejected = true;
+    }
+    require(outOfRangePriorityRejected,
+            "request priority outside urgency buckets must be rejected");
+
     runtime.setRequest(0, 1001, 7, 2, 3, 9000);
     runtime.setTenantBudget(2, 1ULL << 20U, 3);
     const nta::abi::RequestContext request = runtime.readRequest(0);

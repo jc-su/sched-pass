@@ -127,7 +127,9 @@ def main() -> None:
     failing_runtime = FailingRuntime()
     with (
         patch.object(runtime_resources, "ServingTierService", return_value=fake_tier),
-        patch.object(runtime_resources, "Runtime", return_value=failing_runtime),
+        patch.object(
+            runtime_resources, "_create_runtime", return_value=failing_runtime
+        ),
     ):
         try:
             runtime_resources.ServingRuntimeResources.open(

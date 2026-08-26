@@ -235,6 +235,22 @@ def main() -> None:
         assert "integer" in str(error)
     else:
         raise AssertionError("fractional exact demand ID was accepted")
+    for malformed in (
+        type("Output", (), {"request_ids": ("bad",), "request_slots": (1.5,)})(),
+        type("Output", (), {"request_ids": ("bad",), "request_slots": (1,), "priorities": (8,)})(),
+    ):
+        try:
+            VllmSchedulerProjection.from_scheduler_output(malformed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("malformed vLLM scheduler metadata was truncated")
+    try:
+        SglangForwardMetadata((1.5,), (0,), (0,))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("fractional SGLang metadata was truncated")
     projection = VllmSchedulerProjection.from_scheduler_output(
         FakeVllmSchedulerOutput()
     )

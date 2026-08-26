@@ -9,25 +9,20 @@ transport before the native runtime has quiesced.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import numbers
 import os
+from typing import TYPE_CHECKING, Any
 
-from .runtime import Runtime, RuntimeConfig, TierKind
+from .abi import bounded_integer as _bounded_integer
+from .abi import u64 as _u64
 from .tier import ServingTier, ServingTierConfig, ServingTierService
+
+if TYPE_CHECKING:
+    from .runtime import Runtime, RuntimeConfig
 
 
 _UINT64_MAX = (1 << 64) - 1
 _UINT32_MAX = (1 << 32) - 1
 _INT32_MAX = (1 << 31) - 1
-
-
-def _bounded_integer(value: int, name: str, *, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-        raise ValueError(f"{name} must be an integer")
-    result = int(value)
-    if result < minimum or result > maximum:
-        raise ValueError(f"{name} is outside [{minimum}, {maximum}]")
-    return result
 
 
 def _nonnegative_environment(name: str, default: int) -> int:
@@ -36,9 +31,20 @@ def _nonnegative_environment(name: str, default: int) -> int:
         value = int(raw)
     except ValueError as error:
         raise ValueError(f"{name} must be a nonnegative integer") from error
-    if value < 0 or value > _UINT64_MAX:
-        raise ValueError(f"{name} must be a nonnegative integer")
-    return value
+    try:
+        return _u64(value, name)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a nonnegative integer") from error
+
+
+def _create_runtime(
+    config: "RuntimeConfig", *, nvme: Any, cxl: Any
+) -> "Runtime":
+    """Load and construct the native owner at the explicit open boundary."""
+
+    from .runtime import Runtime
+
+    return Runtime(config, nvme=nvme, cxl=cxl)
 
 
 @dataclass(frozen=True)
@@ -77,7 +83,12 @@ class RuntimeResourceConfig:
             maximum=_UINT64_MAX,
         )
 
-    def native(self) -> RuntimeConfig:
+    def native(self) -> "RuntimeConfig":
+        # Configuration and catalog inspection must remain usable in a
+        # framework frontend that has no CUDA context.  Open the native
+        # binding only at the explicit resource-owner boundary.
+        from .runtime import RuntimeConfig
+
         return RuntimeConfig(
             request_capacity=self.request_capacity,
             object_capacity=self.object_capacity,
@@ -138,10 +149,12 @@ class ServingRuntimeResources:
         tier_config: ServingTierConfig,
         runtime_config: RuntimeResourceConfig,
     ) -> "ServingRuntimeResources":
+        from .runtime import TierKind
+
         tier = ServingTierService(tier_config)
         runtime: Runtime | None = None
         try:
-            runtime = Runtime(
+            runtime = _create_runtime(
                 runtime_config.native(),
                 nvme=tier.nvme,
                 cxl=tier.cxl,

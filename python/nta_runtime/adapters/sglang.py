@@ -9,7 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .base import EngineBatch, RequestIdentityAdapter
+from .base import (
+    EngineBatch,
+    RequestIdentityAdapter,
+    _integer_vector,
+    _request_id_vector,
+)
+from ..abi import MAX_REQUEST_PRIORITY
 from ..execution_protocol import ExecutionProtocolConfig
 from ..work_unit import Granularity
 
@@ -72,10 +78,29 @@ class SglangForwardMetadata:
         }
         if len(lengths) != 1:
             raise ValueError("SGLang forward metadata vectors must be aligned")
-        if any(slot < 0 for slot in self.request_slots):
-            raise ValueError("SGLang request slots must be nonnegative")
-        if any(tenant_id < 0 for tenant_id in self.tenant_ids):
-            raise ValueError("SGLang tenant IDs must be nonnegative")
+        object.__setattr__(
+            self,
+            "request_slots",
+            _integer_vector(
+                self.request_slots, "SGLang request slots", maximum=(1 << 32) - 1
+            ),
+        )
+        object.__setattr__(
+            self,
+            "priorities",
+            _integer_vector(
+                self.priorities,
+                "SGLang priorities",
+                maximum=MAX_REQUEST_PRIORITY,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tenant_ids",
+            _integer_vector(
+                self.tenant_ids, "SGLang tenant IDs", maximum=(1 << 32) - 1
+            ),
+        )
 
     @classmethod
     def from_values(
@@ -89,12 +114,17 @@ class SglangForwardMetadata:
         def normalize(values: Any, name: str) -> tuple[int, ...]:
             if values is None:
                 return ()
-            if hasattr(values, "tolist"):
-                values = values.tolist()
             try:
-                return tuple(int(value) for value in values)
-            except (TypeError, ValueError) as error:
-                raise RuntimeError(f"SGLang {name} metadata is not a sequence") from error
+                maximum = (
+                    MAX_REQUEST_PRIORITY
+                    if name == "priority"
+                    else (1 << 32) - 1
+                )
+                return _integer_vector(
+                    values, f"SGLang {name} metadata", maximum=maximum
+                )
+            except ValueError as error:
+                raise RuntimeError(str(error)) from error
 
         slots = normalize(request_slots, "request-slot")
         if batch_size is not None and len(slots) != batch_size:
@@ -121,9 +151,13 @@ class SglangForwardMetadata:
         if hasattr(padded_request_slots, "tolist"):
             padded_request_slots = padded_request_slots.tolist()
         try:
-            padded_slots = tuple(int(slot) for slot in padded_request_slots)
-        except (TypeError, ValueError) as error:
-            raise ValueError("padded SGLang request slots are not a sequence") from error
+            padded_slots = _integer_vector(
+                padded_request_slots,
+                "padded SGLang request slots",
+                maximum=(1 << 32) - 1,
+            )
+        except ValueError as error:
+            raise ValueError(str(error)) from error
         raw_size = len(self.request_slots)
         padded_size = len(padded_slots)
         if padded_size < raw_size:
@@ -184,7 +218,10 @@ class SglangAdapter(RequestIdentityAdapter):
             request_ids = [
                 f"__nta_graph_capture_{index}" for index in range(batch_size)
             ]
-        request_ids = tuple(str(request_id) for request_id in request_ids)
+        try:
+            request_ids = _request_id_vector(request_ids, "SGLang request IDs")
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
         if len(request_ids) != batch_size:
             raise RuntimeError("SGLang request IDs do not match the graph batch")
         try:

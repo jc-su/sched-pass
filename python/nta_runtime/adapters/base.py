@@ -8,8 +8,62 @@ from enum import Enum
 from operator import index as integer_index
 from typing import Any, Protocol, runtime_checkable
 
+from ..abi import bounded_integer
 from ..requests import RequestBinding, RequestIdentityRegistry
 from ..work_unit import Granularity
+
+
+_UINT32_MAX = (1 << 32) - 1
+_UINT64_MAX = (1 << 64) - 1
+
+
+def _sequence(values: Any, name: str) -> tuple[Any, ...]:
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    if values is None or isinstance(values, (str, bytes, bytearray)):
+        raise ValueError(f"{name} must be a sequence")
+    try:
+        return tuple(values)
+    except TypeError:
+        raise ValueError(f"{name} must be a sequence") from None
+
+
+def _integer_vector(
+    values: Any,
+    name: str,
+    *,
+    minimum: int = 0,
+    maximum: int = _UINT64_MAX,
+) -> tuple[int, ...]:
+    try:
+        return tuple(
+            bounded_integer(
+                value,
+                name,
+                minimum=minimum,
+                maximum=maximum,
+            )
+            for value in _sequence(values, name)
+        )
+    except ValueError as error:
+        raise ValueError(f"{name} contains an invalid integer") from error
+
+
+def _nested_integer_vector(values: Any, name: str) -> tuple[tuple[int, ...], ...]:
+    try:
+        rows = _sequence(values, name)
+        return tuple(
+            _integer_vector(row, f"{name} row") for row in rows
+        )
+    except ValueError as error:
+        raise ValueError(f"{name} must be a sequence of integer rows") from error
+
+
+def _request_id_vector(values: Any, name: str) -> tuple[str, ...]:
+    request_ids = _sequence(values, name)
+    if any(not isinstance(value, str) or not value for value in request_ids):
+        raise ValueError(f"{name} must contain non-empty strings")
+    return request_ids
 
 
 class ConsumerKind(str, Enum):

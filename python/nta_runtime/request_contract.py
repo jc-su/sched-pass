@@ -12,6 +12,8 @@ import dataclasses
 
 from .abi import u32 as _u32
 from .abi import u64 as _u64
+from .abi import MAX_REQUEST_PRIORITY as _MAX_REQUEST_PRIORITY
+from .abi import bounded_integer as _bounded_integer
 
 
 class _RequestSpec(ctypes.Structure):
@@ -43,9 +45,14 @@ class RequestSpec:
     def __post_init__(self) -> None:
         _u32(self.slot, "request slot")
         _u64(self.request_id, "request id")
-        _u32(self.generation, "request generation")
+        _u32(self.generation, "request generation", positive=True)
         _u32(self.tenant_id, "request tenant")
-        _u32(self.priority, "request priority")
+        _bounded_integer(
+            self.priority,
+            "request priority",
+            minimum=0,
+            maximum=_MAX_REQUEST_PRIORITY,
+        )
         _u64(self.deadline_clock, "request deadline")
         _u64(self.max_outstanding_bytes, "request max outstanding bytes")
 

@@ -12,6 +12,7 @@ import numbers
 
 UINT32_MAX = (1 << 32) - 1
 UINT64_MAX = (1 << 64) - 1
+MAX_REQUEST_PRIORITY = 7
 
 
 def bounded_integer(

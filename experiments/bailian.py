@@ -182,18 +182,32 @@ def _normalize_row(
 
 
 def _prefix_reuse(rows: list[dict[str, Any]]) -> None:
-    """Annotate exact shared prefixes against previously seen requests."""
+    """Annotate exact shared prefixes against previously seen requests.
 
-    seen: dict[tuple[str, ...], int] = {}
+    A trie makes this linear in the total number of hash IDs.  The previous
+    tuple-prefix set rebuilt a tuple of length 1..L for every row, which made
+    long anonymized traces needlessly quadratic in both copying and hashing.
+    """
+
+    prefix_trie: dict[str, Any] = {}
     for row in rows:
         hashes = row["hash_ids"]
+        node = prefix_trie
         longest = 0
-        for length in range(1, len(hashes) + 1):
-            prefix = tuple(hashes[:length])
-            if prefix in seen:
-                longest = length
-            else:
-                seen[prefix] = row["source_row"]
+        for block_id in hashes:
+            child = node.get(block_id)
+            if child is None:
+                break
+            node = child
+            longest += 1
+
+        node = prefix_trie
+        for block_id in hashes:
+            child = node.get(block_id)
+            if child is None:
+                child = {}
+                node[block_id] = child
+            node = child
         row["shared_prefix_blocks"] = longest
         row["unique_blocks"] = max(
             0, math.ceil(row["input_length"] / row["block_size"]) - longest

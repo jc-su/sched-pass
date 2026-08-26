@@ -56,6 +56,18 @@ def main() -> None:
     assert input_page_ids(rows[1]) == ("x", "y", "z")
     assert len(unique_input_page_ids(rows)) == 3
 
+    # The prefix statistic must remain exact while using a linear trie rather
+    # than rebuilding every tuple prefix for every request.
+    trie_manifest, trie_rows = normalize(
+        [
+            {"chat_id": "p0", "input_length": 64, "output_length": 1, "hash_ids": ["a", "b", "c", "d"]},
+            {"chat_id": "p1", "input_length": 48, "output_length": 1, "hash_ids": ["a", "b", "x"]},
+            {"chat_id": "p2", "input_length": 32, "output_length": 1, "hash_ids": ["a", "z"]},
+        ]
+    )
+    assert trie_manifest["statistics"]["shared_prefix_blocks"] == 3
+    assert [row["shared_prefix_blocks"] for row in trie_rows] == [0, 2, 1]
+
     scaled_manifest, _ = normalize(ONLINE, arrival_mode="trace", time_scale=0.5)
     assert scaled_manifest["arrival"]["production_arrival_claim"] is False
     assert scaled_manifest["claims"]["arrival_is_production_trace"] is False

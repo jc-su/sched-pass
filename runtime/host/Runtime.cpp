@@ -1104,6 +1104,12 @@ void HostRuntime::setRequest(std::uint32_t slot, std::uint64_t requestId,
   if (tenantId >= impl_->config.tenantCapacity) {
     throw std::out_of_range("tenant id exceeds runtime capacity");
   }
+  if (generation == 0) {
+    throw std::invalid_argument("request generation must be positive");
+  }
+  if (priority >= abi::UrgencyBucketCount) {
+    throw std::invalid_argument("request priority exceeds urgency buckets");
+  }
   if (impl_->requestInstalled[slot]) {
     const abi::RequestContext current = downloadOne(impl_->requests, slot);
     if (current.outstandingBytes != 0) {
@@ -1140,6 +1146,12 @@ void HostRuntime::publishRequestsAsync(std::span<const RequestSpec> requests,
     impl_->checkRequestSlot(request.slot);
     if (request.tenantId >= impl_->config.tenantCapacity) {
       throw std::out_of_range("tenant id exceeds runtime capacity");
+    }
+    if (request.generation == 0) {
+      throw std::invalid_argument("request generation must be positive");
+    }
+    if (request.priority >= abi::UrgencyBucketCount) {
+      throw std::invalid_argument("request priority exceeds urgency buckets");
     }
     if (index != 0 && requests[index - 1].slot >= request.slot) {
       throw std::invalid_argument(
@@ -1232,6 +1244,9 @@ void HostRuntime::setTenantBudget(std::uint32_t tenantId,
 void HostRuntime::cancelRequest(std::uint32_t slot, std::uint32_t generation) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkRequestSlot(slot);
+  if (generation == 0) {
+    throw std::invalid_argument("request generation must be positive");
+  }
   if (!impl_->requestInstalled[slot]) {
     throw std::invalid_argument("cannot cancel an uninitialized request slot");
   }

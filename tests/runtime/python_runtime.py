@@ -35,6 +35,8 @@ def main() -> None:
     for factory in (
         lambda: RuntimeConfig(1 << 32, 1, 1, 1),
         lambda: RequestSpec(0, 1 << 64, 0),
+        lambda: RequestSpec(0, 17, 0),
+        lambda: RequestSpec(0, 17, 1, priority=8),
         lambda: Replica(1, Placement.HBM, estimated_latency_ns=1 << 64),
         lambda: NvmeOptions("vfio:0000:00:00.0", queue_depth=1 << 32),
         lambda: CxlDaxOptions("/dev/dax0.0", 1 << 64),

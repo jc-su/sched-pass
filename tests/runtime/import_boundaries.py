@@ -21,6 +21,7 @@ def main() -> None:
         importlib.import_module("nta_runtime.work_unit")
         importlib.import_module("nta_runtime.execution_protocol")
         importlib.import_module("nta_runtime.adapters.base")
+        importlib.import_module("nta_runtime.runtime_resources")
         from nta_runtime import RequestSpec
         from nta_runtime.request_contract import RequestSpec as ContractRequestSpec
     finally:

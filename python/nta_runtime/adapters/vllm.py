@@ -10,7 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .base import ExactDemandProjection, EngineBatch, RequestIdentityAdapter
+from .base import (
+    ExactDemandProjection,
+    EngineBatch,
+    RequestIdentityAdapter,
+    _integer_vector,
+    _nested_integer_vector,
+    _request_id_vector,
+)
+from ..abi import MAX_REQUEST_PRIORITY
 from ..work_unit import Granularity
 
 
@@ -26,6 +34,52 @@ class VllmSchedulerProjection:
     block_tables: tuple[tuple[int, ...], ...] | None = None
     page_bytes: int | None = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "request_ids",
+            _request_id_vector(self.request_ids, "vLLM request IDs"),
+        )
+        object.__setattr__(
+            self,
+            "request_slots",
+            _integer_vector(
+                self.request_slots, "vLLM request slots", maximum=(1 << 32) - 1
+            ),
+        )
+        if len(self.request_ids) != len(self.request_slots):
+            raise ValueError("vLLM request IDs and slots must be aligned")
+        for name, value, maximum in (
+            ("vLLM priorities", self.priorities, MAX_REQUEST_PRIORITY),
+            ("vLLM deadline clocks", self.deadline_clocks, (1 << 64) - 1),
+            ("vLLM tenant IDs", self.tenant_ids, (1 << 32) - 1),
+        ):
+            if value is not None:
+                normalized = _integer_vector(value, name, maximum=maximum)
+                if len(normalized) != len(self.request_ids):
+                    raise ValueError(f"{name} must match the request batch")
+                object.__setattr__(
+                    self,
+                    {
+                        "vLLM priorities": "priorities",
+                        "vLLM deadline clocks": "deadline_clocks",
+                        "vLLM tenant IDs": "tenant_ids",
+                    }[name],
+                    normalized,
+                )
+        if self.block_tables is not None:
+            normalized_tables = _nested_integer_vector(
+                self.block_tables, "vLLM block tables"
+            )
+            if len(normalized_tables) != len(self.request_ids):
+                raise ValueError("vLLM block tables must match the request batch")
+            object.__setattr__(self, "block_tables", normalized_tables)
+        if self.page_bytes is not None:
+            page_bytes = _integer_vector(
+                (self.page_bytes,), "vLLM page bytes", minimum=1
+            )[0]
+            object.__setattr__(self, "page_bytes", page_bytes)
+
     @classmethod
     def from_scheduler_output(cls, output: Any) -> "VllmSchedulerProjection":
         request_ids = getattr(output, "request_ids", None)
@@ -38,24 +92,17 @@ class VllmSchedulerProjection:
         deadlines = getattr(output, "deadline_clocks", None)
         tenant_ids = getattr(output, "tenant_ids", None)
         block_tables = getattr(output, "block_tables", None)
-        if block_tables is not None and hasattr(block_tables, "tolist"):
-            block_tables = block_tables.tolist()
-        normalized_tables = (
-            None
-            if block_tables is None
-            else tuple(tuple(int(page) for page in row) for row in block_tables)
-        )
         raw_page_bytes = getattr(output, "kv_page_bytes", None)
         if raw_page_bytes is None:
             raw_page_bytes = getattr(output, "page_bytes", None)
         return cls(
-            tuple(str(request_id) for request_id in request_ids),
-            tuple(int(request_slot) for request_slot in request_slots),
-            None if priorities is None else tuple(int(value) for value in priorities),
-            None if deadlines is None else tuple(int(value) for value in deadlines),
-            None if tenant_ids is None else tuple(int(value) for value in tenant_ids),
-            normalized_tables,
-            None if raw_page_bytes is None else int(raw_page_bytes),
+            request_ids,
+            request_slots,
+            priorities,
+            deadlines,
+            tenant_ids,
+            block_tables,
+            raw_page_bytes,
         )
 
     def exact_demand(self) -> ExactDemandProjection:
