@@ -2563,25 +2563,28 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         allocation.min_unresolved_dependencies = min(unresolved_dependencies, default=1)
         allocation.direct_work_count = direct_work_count
         allocation.external_object_slots = tuple(external_object_slots)
-        if self._tier_service.is_host and prefetched is None:
-            transfer_bytes = sum(
-                object_.index_count * object_.element_bytes
-                for object_ in indexed_objects
-            )
-            self._record_demand_plan_stats(
-                batch,
-                schedule,
-                object_count,
-                transfer_bytes,
-                host_execution,
-            )
+        if self._tier_service.is_host:
+            if prefetched is None:
+                transfer_bytes = sum(
+                    object_.index_count * object_.element_bytes
+                    for object_ in indexed_objects
+                )
+                self._record_demand_plan_stats(
+                    batch,
+                    schedule,
+                    object_count,
+                    transfer_bytes,
+                    host_execution,
+                )
         elif self._tier_service.is_nvme:
             self._stats["cta_work_items"] += schedule.work_count
             self._stats["nvme_bytes"] += transfer_bytes
             self._stats["nvme_epochs"] += 1
-        else:
+        elif self._tier_service.is_cxl:
             self._stats["cta_work_items"] += schedule.work_count
             self._stats["cxl_direct_work_items"] += direct_work_count
+        else:
+            raise RuntimeError("external plan selected an unsupported serving tier")
         if self._profile_cpu:
             self._stats["plan_cpu_ns"] = self._stats.get("plan_cpu_ns", 0) + (
                 time.perf_counter_ns() - profile_started

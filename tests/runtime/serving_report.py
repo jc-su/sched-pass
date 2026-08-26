@@ -162,6 +162,21 @@ def main() -> None:
         assert "projection-only" in str(error)
     else:
         raise AssertionError("projection-only serving evidence was accepted")
+
+    host_tier = copy.deepcopy(nta)
+    host_tier["engine_stats"][0].update(
+        {"serving_tier": "host_staged", "tier_fallback": False}
+    )
+    validate(host_tier)
+    invalid_host_tier = copy.deepcopy(host_tier)
+    invalid_host_tier["engine_stats"][0]["cxl_direct_work_items"] = 1
+    try:
+        validate(invalid_host_tier)
+    except ValueError as error:
+        assert "CXL direct work" in str(error)
+    else:
+        raise AssertionError("host-staged evidence reported CXL work")
+
     invalid_type = copy.deepcopy(comparison)
     invalid_type["nta"]["engine_stats"][0]["consumer_contract"][
         "numerical_consumer"

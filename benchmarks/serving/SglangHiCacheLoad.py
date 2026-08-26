@@ -93,6 +93,43 @@ def _machine_metadata() -> dict[str, Any]:
     }
 
 
+def _engine_byte_accounting(
+    stats: list[dict[str, Any]],
+) -> tuple[int | None, int | None, str]:
+    """Project NTA's physical transfer counters into the serving report.
+
+    ``work_*_bytes`` describe the exact logical demand selected by the
+    execution session.  The physical bar needs the bytes actually staged into
+    the device-side destination, so it is the sum of the mutually exclusive
+    host-pipeline, indexed-host, and NVMe transfer counters.  Keeping this
+    projection here avoids making the serving harness infer physical traffic
+    from token counts or from a framework cache-size estimate.
+    """
+    nta_stats = [
+        entry
+        for entry in stats
+        if isinstance(entry, dict) and entry.get("backend") == "nta_flashinfer"
+    ]
+    if not nta_stats:
+        return None, None, "not exposed by SGLang engine metadata"
+    selected = sum(int(entry.get("work_selected_bytes", 0)) for entry in nta_stats)
+    physical = sum(
+        int(entry.get("prefetched_host_bytes", 0))
+        + int(entry.get("indexed_host_bytes", 0))
+        + int(entry.get("nvme_bytes", 0))
+        for entry in nta_stats
+    )
+    if selected < 0 or physical < 0:
+        raise RuntimeError("NTA engine published negative byte accounting")
+    if physical == 0:
+        return None, None, "not exposed by SGLang engine metadata"
+    if physical < selected:
+        raise RuntimeError(
+            "NTA engine physical transfer bytes are below selected demand bytes"
+        )
+    return selected, physical, "exact_engine_transfer_counters"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=pathlib.Path, required=True)
@@ -220,6 +257,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("SLO thresholds must be positive")
     if args.request_rate <= 0:
         parser.error("request rate must be positive")
+    if not 0.0 < args.mem_fraction_static < 1.0:
+        parser.error("--mem-fraction-static must be between zero and one")
     if args.external_tokens + args.external_suffix_tokens >= max_request_input_tokens:
         parser.error("external prompt exceeds the SGLang request input budget")
     if args.resident_tokens >= max_request_input_tokens:
@@ -834,10 +873,25 @@ def main() -> int:
         for prompt in churn_prompts[eviction_rounds:]:
             generated_text(engine.generate(prompt, setup_sampling))
         warm_residents()
-        for prompt in placement_eviction_prompts:
-            generated_text(engine.generate(prompt, setup_sampling))
-        if placement_eviction_prompts:
-            warm_residents()
+
+        def establish_final_placement() -> None:
+            """Restore the requested device/host split after setup traffic.
+
+            Warmup requests intentionally exercise the same mixed scheduler
+            path as the timed load, but they also perturb the device LRU.  A
+            timed external request must not accidentally become a device hit
+            merely because a graph warmup touched it.  Repeat the explicit
+            pressure-and-resident-warm protocol after every excluded warmup so
+            placement is a property of the timed phase, not of incidental
+            setup order.
+            """
+
+            for prompt in placement_eviction_prompts:
+                generated_text(engine.generate(prompt, setup_sampling))
+            if placement_eviction_prompts:
+                warm_residents()
+
+        establish_final_placement()
 
         for warmup in range(args.load_warmup_iterations):
             # Demand graphs warm on the first occurrence and capture on the
@@ -862,6 +916,7 @@ def main() -> int:
                 generated_text(engine.generate(prompt, setup_sampling))
             if eviction_rounds:
                 warm_residents()
+            establish_final_placement()
 
         records, elapsed = engine.loop.run_until_complete(
             _run_load(
@@ -1006,6 +1061,9 @@ def main() -> int:
             else None
         ),
     }
+    selected_bytes, physical_bytes, byte_accounting_status = _engine_byte_accounting(
+        stats
+    )
     report = {
         "schema": 1,
         "classification": "sglang-hicache-load",
@@ -1061,9 +1119,9 @@ def main() -> int:
             if workload_metadata is not None
             else None
         ),
-        "selected_bytes": None,
-        "physical_bytes": None,
-        "byte_accounting_status": "not exposed by SGLang engine metadata",
+        "selected_bytes": selected_bytes,
+        "physical_bytes": physical_bytes,
+        "byte_accounting_status": byte_accounting_status,
         "selected_kv_tokens": selected_tokens,
         "physical_kv_tokens": physical_tokens,
         "load_seconds": load_seconds,

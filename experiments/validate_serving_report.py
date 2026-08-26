@@ -203,6 +203,11 @@ def _validate_tier_provenance(report: dict[str, Any]) -> None:
             entry.get("tier_fallback") is False,
             "serving tier fallback was not fail-closed",
         )
+        if tier == "host_staged":
+            _require(
+                int(entry.get("cxl_direct_work_items", 0)) == 0,
+                "host-staged serving report contains CXL direct work",
+            )
         if tier in {"nvme", "cxl_dax"}:
             expected_path = (
                 "gpu_owned_nvme_to_hbm" if tier == "nvme" else "cuda_visible_cxl_direct"

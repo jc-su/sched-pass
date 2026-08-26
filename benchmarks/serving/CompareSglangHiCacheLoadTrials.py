@@ -299,6 +299,9 @@ def main() -> int:
         "candidate_bytes_per_trial": [
             report.get("nta_candidate_bytes") for report in reports
         ],
+        "staged_bytes_per_trial": [
+            report.get("nta_staged_bytes") for report in reports
+        ],
         "ratios": _aggregate(reports, args.seed_base),
     }
     # Registered-bar status: "qualified" alone only certifies trial count

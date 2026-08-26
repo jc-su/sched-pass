@@ -54,21 +54,17 @@ class _StagedBatch:
     bridge: SglangHiCacheBridge
     consumer_index: int
     started_ns: int
-    request_count: int
-    external_bytes: int
     force_release: bool = False
 
 
-def _has_runnable_decode(scheduler: Any) -> bool:
-    running = getattr(scheduler, "running_batch", None)
+def _has_runnable_decode(running: Any) -> bool:
     for request in tuple(getattr(running, "reqs", ()) or ()):
         if not request.finished():
             return True
     return False
 
 
-def _running_request_ids(scheduler: Any) -> set[int]:
-    running = getattr(scheduler, "running_batch", None)
+def _running_request_ids(running: Any) -> set[int]:
     return {
         stable_request_id(str(request.rid))
         for request in tuple(getattr(running, "reqs", ()) or ())
@@ -76,10 +72,8 @@ def _running_request_ids(scheduler: Any) -> set[int]:
     }
 
 
-def _compiler_feedback_reason(
-    scheduler: Any, bridge: SglangHiCacheBridge
-) -> str | None:
-    plan = bridge.poll_critical_work(_running_request_ids(scheduler))
+def _compiler_feedback_reason(running: Any, bridge: SglangHiCacheBridge) -> str | None:
+    plan = bridge.poll_critical_work(_running_request_ids(running))
     if plan is None:
         return None
     if plan.compute_order:
@@ -128,11 +122,18 @@ class AcquisitionAdmission:
         scheduler: Any,
         batch: Any,
         bridge: SglangHiCacheBridge | None,
+        *,
+        running_batch: Any | None = None,
     ) -> Any | None:
         if batch is None or not self._config.enabled or bridge is None:
             return batch
         if self._staged is not None:
             raise RuntimeError("acquisition admission already owns a batch")
+        running = (
+            running_batch
+            if running_batch is not None
+            else getattr(scheduler, "running_batch", None)
+        )
         consumer_index = int(getattr(batch, "hicache_consumer_index", -1))
         requests = tuple(getattr(batch, "reqs", ()) or ())
         external_bytes = bridge.transfer_bytes(consumer_index)
@@ -155,10 +156,10 @@ class AcquisitionAdmission:
         if progress.total_bytes < self._config.minimum_bytes:
             bridge.record_admission(admission_released_small_batches=1)
             return batch
-        if not _has_runnable_decode(scheduler):
+        if not _has_runnable_decode(running):
             bridge.record_admission(admission_released_without_decode=1)
             return batch
-        feedback_reason = _compiler_feedback_reason(scheduler, bridge)
+        feedback_reason = _compiler_feedback_reason(running, bridge)
         if feedback_reason is not None:
             bridge.record_admission(
                 **{f"admission_released_feedback_{feedback_reason}": 1}
@@ -174,8 +175,6 @@ class AcquisitionAdmission:
             bridge,
             consumer_index,
             now,
-            len(requests),
-            progress.total_bytes,
         )
         bridge.record_admission(
             admission_delayed_batches=1,
@@ -183,10 +182,15 @@ class AcquisitionAdmission:
         )
         return None
 
-    def poll(self, scheduler: Any) -> Any | None:
+    def poll(self, scheduler: Any, *, running_batch: Any | None = None) -> Any | None:
         staged = self._staged
         if staged is None:
             raise RuntimeError("acquisition admission has no staged batch")
+        running = (
+            running_batch
+            if running_batch is not None
+            else getattr(scheduler, "running_batch", None)
+        )
         now = self._clock()
         elapsed = now - staged.started_ns
         staged.bridge.record_admission(admission_delay_polls=1)
@@ -202,10 +206,10 @@ class AcquisitionAdmission:
             reason = "lead"
         elif elapsed >= self._config.max_delay_ns:
             reason = "deadline"
-        elif not _has_runnable_decode(scheduler):
+        elif not _has_runnable_decode(running):
             reason = "no_decode"
         else:
-            feedback_reason = _compiler_feedback_reason(scheduler, staged.bridge)
+            feedback_reason = _compiler_feedback_reason(running, staged.bridge)
             if feedback_reason is not None:
                 reason = f"feedback_{feedback_reason}"
         if not reason:
@@ -252,14 +256,48 @@ def _state(scheduler: Any) -> AcquisitionAdmission:
     return state
 
 
+def _prefill_running_batch(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """Extract the pinned SGLang 0.5.16 prefill input from the hook call."""
+    if "running_batch" in kwargs:
+        return kwargs["running_batch"]
+    # The target's pinned signature is
+    # (self, prefill_delayer_single_pass, running_batch).  Keep this explicit:
+    # silently guessing another framework signature would make admission act
+    # on the wrong running set.
+    if len(args) == 2:
+        return args[1]
+    raise RuntimeError(
+        "SGLang prefill admission hook received an unsupported argument shape"
+    )
+
+
+def _split_prefill_result(result: Any) -> tuple[Any | None, Any]:
+    """Validate the pinned SGLang raw-prefill return contract."""
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(
+            "SGLang 0.5.16 prefill hook returned neither "
+            "(batch_to_run, running_batch) nor the pinned tuple shape"
+        )
+    return result[0], result[1]
+
+
 def route_prefill_admission(
     original: Callable[..., Any], scheduler: Any, *args: Any, **kwargs: Any
-) -> Any | None:
+) -> tuple[Any | None, Any]:
+    running_batch = _prefill_running_batch(args, kwargs)
     state = _state(scheduler)
     if state.has_staged_batch:
-        return state.poll(scheduler)
-    batch = original(scheduler, *args, **kwargs)
-    return state.consider(scheduler, batch, _bridge_for_batch(batch))
+        return state.poll(scheduler, running_batch=running_batch), running_batch
+    batch, next_running_batch = _split_prefill_result(
+        original(scheduler, *args, **kwargs)
+    )
+    admitted = state.consider(
+        scheduler,
+        batch,
+        _bridge_for_batch(batch),
+        running_batch=next_running_batch,
+    )
+    return admitted, next_running_batch
 
 
 def cancel_staged_batch(scheduler: Any, recv_req: Any) -> None:

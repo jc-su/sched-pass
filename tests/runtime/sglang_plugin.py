@@ -143,6 +143,7 @@ def main() -> None:
     from nta_runtime.engines.sglang_admission import (
         AcquisitionAdmission,
         AdmissionConfig,
+        route_prefill_admission,
     )
     from nta_runtime.engines.sglang_hicache import (
         HostLoadProgress,
@@ -279,6 +280,64 @@ def main() -> None:
     admission = AcquisitionAdmission(config, clock=lambda: clock[0])
     assert admission.consider(scheduler, batch, bridge) is None
     assert bridge.stats["admission_feedback_executable"] == 1
+
+    # SGLang 0.5.16's raw prefill seam returns a pair, not a ScheduleBatch.
+    # The adapter must preserve the running-batch half while delaying only the
+    # newly allocated external batch, and must not call the scheduler again
+    # while that batch is staged.
+    route_scheduler = types.SimpleNamespace(
+        running_batch=types.SimpleNamespace(reqs=[])
+    )
+    route_running = types.SimpleNamespace(reqs=[resident])
+    route_batch = types.SimpleNamespace(
+        reqs=[external], hicache_consumer_index=3, decoding_reqs=None
+    )
+    route_calls = []
+
+    def raw_prefill(_scheduler, **_kwargs):
+        route_calls.append(True)
+        return route_batch, route_running
+
+    route_clock = [2_000]
+    route_admission = AcquisitionAdmission(
+        AdmissionConfig(True, 4, 100, 1), clock=lambda: route_clock[0]
+    )
+    setattr(route_scheduler, "_nta_acquisition_admission", route_admission)
+    with patch(
+        "nta_runtime.engines.sglang_admission._bridge_for_batch",
+        return_value=bridge,
+    ):
+        first = route_prefill_admission(
+            raw_prefill,
+            route_scheduler,
+            prefill_delayer_single_pass=None,
+            running_batch=route_running,
+        )
+        assert first == (None, route_running)
+        bridge.leading_layers = 4
+        second = route_prefill_admission(
+            raw_prefill,
+            route_scheduler,
+            prefill_delayer_single_pass=None,
+            running_batch=route_running,
+        )
+    assert second == (route_batch, route_running)
+    assert len(route_calls) == 1
+
+    def malformed_prefill(_scheduler, **_kwargs):
+        return route_batch
+
+    try:
+        route_prefill_admission(
+            malformed_prefill,
+            types.SimpleNamespace(running_batch=route_running),
+            prefill_delayer_single_pass=None,
+            running_batch=route_running,
+        )
+    except RuntimeError as error:
+        assert "pinned tuple shape" in str(error)
+    else:
+        raise AssertionError("prefill admission accepted a malformed return shape")
 
     class DevicePool:
         pass

@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-total-tokens", type=int, default=18000)
     parser.add_argument("--context-length", type=int, default=32768)
     parser.add_argument("--chunked-prefill-size", type=int, default=0)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.35)
     parser.add_argument("--hicache-ratio", type=float, default=8.0)
     parser.add_argument("--max-running-requests", type=int, default=16)
     parser.add_argument(
@@ -144,6 +145,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("load warmup iterations cannot be negative")
     if args.incremental_setup_ns < 0:
         parser.error("incremental setup cost must be nonnegative")
+    if not 0.0 < args.mem_fraction_static < 1.0:
+        parser.error("--mem-fraction-static must be between zero and one")
     if args.external_suffix_tokens < 0:
         parser.error("external suffix token count cannot be negative")
     if args.churn_tokens > args.context_length:
@@ -350,6 +353,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         str(args.context_length),
         "--chunked-prefill-size",
         str(args.chunked_prefill_size),
+        "--mem-fraction-static",
+        str(args.mem_fraction_static),
         "--hicache-ratio",
         str(args.hicache_ratio),
         "--max-running-requests",
@@ -725,6 +730,11 @@ def main() -> int:
         ),
         "nta_candidate_bytes": sum(
             int(entry.get("work_candidate_bytes", 0)) for entry in stats
+        ),
+        "nta_staged_bytes": (
+            int(nta["physical_bytes"])
+            if isinstance(nta.get("physical_bytes"), int)
+            else None
         ),
         "batch_mode": args.batch_mode,
         "slo_scale": args.slo_scale,
