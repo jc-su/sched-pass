@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from .abi import bounded_integer
 from .resource_contract import (
     ResourceContract,
     ResourceKind,
@@ -55,14 +56,22 @@ class PageExtent:
     bytes: int
 
     def __post_init__(self) -> None:
-        if self.offset < 0 or self.bytes <= 0:
-            raise ValueError(
-                "tier extents require a nonnegative offset and positive bytes"
-            )
-        if self.bytes > (1 << 32) - 1:
-            raise ValueError("tier extent exceeds the native dependency byte limit")
-        if self.offset > _UINT64_MAX or self.bytes > _UINT64_MAX - self.offset:
+        offset = bounded_integer(
+            self.offset,
+            "tier extent offset",
+            minimum=0,
+            maximum=_UINT64_MAX,
+        )
+        size = bounded_integer(
+            self.bytes,
+            "tier extent bytes",
+            minimum=1,
+            maximum=(1 << 32) - 1,
+        )
+        if size > _UINT64_MAX - offset:
             raise ValueError("tier extent exceeds the native address-space limit")
+        object.__setattr__(self, "offset", offset)
+        object.__setattr__(self, "bytes", size)
 
 
 @dataclass(frozen=True)
@@ -95,14 +104,17 @@ class TierPageCatalog:
         window_bytes: int | None = None,
         digest: str = "",
     ) -> None:
-        if alignment_bytes <= 0 or alignment_bytes & (alignment_bytes - 1):
+        if not isinstance(tier, ServingTier):
+            raise TypeError("tier catalog tier must be a ServingTier value")
+        alignment_bytes = _catalog_uint64(
+            alignment_bytes, "catalog alignment_bytes", minimum=1
+        )
+        if alignment_bytes & (alignment_bytes - 1):
             raise ValueError("catalog alignment_bytes must be a positive power of two")
-        if alignment_bytes > _UINT64_MAX:
-            raise ValueError("catalog alignment_bytes exceeds the native uint64 limit")
-        if window_bytes is not None and window_bytes <= 0:
-            raise ValueError("catalog window_bytes must be positive")
-        if window_bytes is not None and window_bytes > _UINT64_MAX:
-            raise ValueError("catalog window_bytes exceeds the native uint64 limit")
+        if window_bytes is not None:
+            window_bytes = _catalog_uint64(
+                window_bytes, "catalog window_bytes", minimum=1
+            )
         by_key: dict[tuple[int, int], _PageRecord] = {}
         ranges: list[tuple[int, int, tuple[int, int], str]] = []
         for record in records:
@@ -226,18 +238,21 @@ class TierPageCatalog:
         kind: str,
         row_bytes: int,
     ) -> PageExtent:
-        if layer < 0 or row_bytes <= 0:
-            raise ValueError(
-                "catalog span requires a nonnegative layer and positive row size"
-            )
+        layer = bounded_integer(
+            layer, "catalog span layer", minimum=0, maximum=_UINT32_MAX
+        )
+        row_bytes = bounded_integer(
+            row_bytes, "catalog span row size", minimum=1, maximum=_UINT32_MAX
+        )
         if kind not in {"key", "value"}:
             raise ValueError("catalog span kind must be key or value")
         if not pages:
             raise ValueError("catalog span cannot be empty")
         extents: list[PageExtent] = []
         for page in pages:
-            if page < 0:
-                raise ValueError("catalog page IDs cannot be negative")
+            page = bounded_integer(
+                page, "catalog span page", minimum=0, maximum=_UINT32_MAX
+            )
             record = self._records.get((layer, page))
             if record is None:
                 raise KeyError(f"tier catalog has no layer={layer}, page={page}")
@@ -277,6 +292,13 @@ class ServingTierConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.tier, ServingTier):
             raise ValueError("tier must be a ServingTier value")
+        if self.endpoint is not None:
+            if not isinstance(self.endpoint, str) or not self.endpoint:
+                raise ValueError("tier endpoint must be a non-empty string")
+        if self.catalog_path is not None:
+            if not isinstance(self.catalog_path, (str, os.PathLike)):
+                raise ValueError("tier catalog_path must be path-like")
+            object.__setattr__(self, "catalog_path", Path(self.catalog_path))
         for name in (
             "namespace_id",
             "queue_depth",
@@ -284,24 +306,42 @@ class ServingTierConfig:
             "completion_budget",
             "progress_rounds",
         ):
-            _bounded_int(getattr(self, name), name, minimum=1, maximum=_UINT32_MAX)
-        _bounded_int(
-            self.progress_timeout_ns,
+            object.__setattr__(
+                self,
+                name,
+                bounded_integer(
+                    getattr(self, name), name, minimum=1, maximum=_UINT32_MAX
+                ),
+            )
+        object.__setattr__(
+            self,
             "progress_timeout_ns",
-            minimum=1,
-            maximum=_UINT64_MAX,
+            bounded_integer(
+                self.progress_timeout_ns,
+                "progress_timeout_ns",
+                minimum=1,
+                maximum=_UINT64_MAX,
+            ),
         )
-        _bounded_int(
-            self.window_bytes,
+        object.__setattr__(
+            self,
             "window_bytes",
-            minimum=0,
-            maximum=_UINT64_MAX,
+            bounded_integer(
+                self.window_bytes,
+                "window_bytes",
+                minimum=0,
+                maximum=_UINT64_MAX,
+            ),
         )
-        _bounded_int(
-            self.device_ordinal,
+        object.__setattr__(
+            self,
             "device_ordinal",
-            minimum=-1,
-            maximum=_INT32_MAX,
+            bounded_integer(
+                self.device_ordinal,
+                "device_ordinal",
+                minimum=-1,
+                maximum=_INT32_MAX,
+            ),
         )
         if not isinstance(self.trust_read_only_device_code, bool):
             raise ValueError("trust_read_only_device_code must be boolean")
@@ -499,7 +539,9 @@ class ServingTierService:
                 if first_error is None:
                     first_error = error
         if first_error is not None:
-            raise RuntimeError("serving tier transport teardown failed") from first_error
+            raise RuntimeError(
+                "serving tier transport teardown failed"
+            ) from first_error
 
     def __del__(self) -> None:
         # A physical transport can be created before a later capability check
@@ -611,23 +653,13 @@ def _positive_int(value: Any, name: str) -> int:
     return result
 
 
-def _bounded_int(value: Any, name: str, *, minimum: int, maximum: int) -> int:
-    if minimum > 0:
-        result = _positive_int(value, name)
-    elif minimum == 0:
-        result = _nonnegative_int(value, name)
-    else:
-        if isinstance(value, bool):
-            raise ValueError(f"{name} must be an integer")
-        try:
-            result = int(value)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"{name} must be an integer") from error
-        if isinstance(value, float) and result != value:
-            raise ValueError(f"{name} must be an integer")
-    if result < minimum or result > maximum:
-        raise ValueError(f"{name} is outside [{minimum}, {maximum}]")
-    return result
+def _catalog_uint64(value: Any, name: str, *, minimum: int) -> int:
+    try:
+        return bounded_integer(value, name, minimum=minimum, maximum=_UINT64_MAX)
+    except ValueError as error:
+        if isinstance(value, int) and value > _UINT64_MAX:
+            raise ValueError(f"{name} exceeds the native uint64 limit") from error
+        raise
 
 
 def _nonnegative_int(value: Any, name: str) -> int:

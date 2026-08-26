@@ -19,6 +19,27 @@ die() {
   exit 1
 }
 
+as_root() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    "$@"
+  else
+    # Physical bring-up must never block waiting for a password in an
+    # artifact/evaluation process.  The operator can install a narrowly
+    # scoped sudoers rule or file capability before entering this path.
+    sudo -n "$@"
+  fi
+}
+
+as_user() {
+  local uid=$1
+  shift
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    runuser --uid "$uid" -- "$@"
+  else
+    sudo -n --user "#$uid" -- "$@"
+  fi
+}
+
 cuda_library_path() {
   if [[ -n ${LD_LIBRARY_PATH:-} ]]; then
     printf '%s\n' "$LD_LIBRARY_PATH"
@@ -97,7 +118,7 @@ wait_for_driver() {
 
 wait_for_nvme_namespace() {
   local _ controller block
-  command -v udevadm >/dev/null 2>&1 && sudo udevadm settle --timeout=10 || true
+  command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 || true
   for _ in {1..100}; do
     for controller in "$device"/nvme/nvme*; do
       [[ -d $controller ]] || continue
@@ -151,7 +172,7 @@ check_block_device() {
   if [[ -n $(ls -A "/sys/class/block/$(basename "$sysfs_block")/holders" 2>/dev/null) ]]; then
     die "$block_device has kernel block holders"
   fi
-  if sudo fuser "$block_device" >/dev/null 2>&1; then
+  if as_root fuser "$block_device" >/dev/null 2>&1; then
     die "$block_device is open by another process"
   fi
 }
@@ -227,7 +248,7 @@ require_media_policy() {
     [[ -e $block ]] || continue
     controller=$(basename "$(dirname "$block")")
     nsid=$(<"$block/nsid")
-    controller_output=$(sudo nvme id-ctrl "/dev/$controller" 2>&1) ||
+    controller_output=$(as_root nvme id-ctrl "/dev/$controller" 2>&1) ||
       die "read-only NVMe Identify Controller failed for /dev/$controller"
     nwpc=$(awk '$1 == "nwpc" { print $3; exit }' <<<"$controller_output")
     [[ -n $nwpc ]] ||
@@ -235,7 +256,7 @@ require_media_policy() {
     if (( nwpc == 0 )); then
       die "/dev/$controller namespace $nsid lacks NVMe Namespace Write Protection"
     fi
-    sudo nvme get-feature "/dev/$controller" -f 0x84 -n "$nsid" -H >/dev/null 2>&1 ||
+    as_root nvme get-feature "/dev/$controller" -f 0x84 -n "$nsid" -H >/dev/null 2>&1 ||
       die "read-only Namespace Write Protection Get Feature failed for /dev/$controller namespace $nsid"
     checked=$((checked + 1))
   done
@@ -249,8 +270,8 @@ require_hbm_peer() {
   [[ -c /dev/nta_nvme_p2p ]] ||
     die "/dev/nta_nvme_p2p is unavailable"
   if [[ $probe_as_root == 1 ]]; then
-    if ! sudo test -r /dev/nta_nvme_p2p ||
-      ! sudo test -w /dev/nta_nvme_p2p; then
+    if ! as_root test -r /dev/nta_nvme_p2p ||
+      ! as_root test -w /dev/nta_nvme_p2p; then
       die "root cannot access /dev/nta_nvme_p2p"
     fi
   else
@@ -264,7 +285,7 @@ capture_reference() {
   for block in "$device"/nvme/nvme*/nvme*n*; do
     [[ -e $block ]] || continue
     [[ $(<"$block/nsid") == "$nsid" ]] || continue
-    sudo dd if="/dev/$(basename "$block")" bs=4096 \
+    as_root dd if="/dev/$(basename "$block")" bs=4096 \
       count="$((reference_bytes / 4096))" \
       iflag=direct status=none | write_reference bs=4096
     [[ -f $reference && $(stat -c '%s' "$reference") == "$reference_bytes" ]] ||
@@ -283,7 +304,7 @@ write_reference() {
       # fs.protected_regular can reject root opening another user's file in a
       # sticky directory such as /tmp.  Preserve the artifact owner instead of
       # weakening that protection or replacing the existing file.
-      sudo -u "#$owner_uid" dd of="$reference" status=none "$@"
+      as_user "$owner_uid" dd of="$reference" status=none "$@"
       return
     fi
   fi
@@ -303,10 +324,10 @@ snapshot_partitions() {
     done
   )
   if [[ -n $partitions ]]; then
-    printf '%s\n' "$partitions" | sudo tee "$partition_state" >/dev/null
-    sudo chmod 0644 "$partition_state"
+    printf '%s\n' "$partitions" | as_root tee "$partition_state" >/dev/null
+    as_root chmod 0644 "$partition_state"
   else
-    sudo rm -f "$partition_state"
+    as_root rm -f "$partition_state"
   fi
 }
 
@@ -322,16 +343,16 @@ bind_vfio() {
   require_hbm_peer
   snapshot_partitions
   capture_reference
-  sudo modprobe iommufd
-  sudo modprobe vfio-pci
+  as_root modprobe iommufd
+  as_root modprobe vfio-pci
   local driver
   driver=$(current_driver)
-  printf '%s\n' "$driver" | sudo tee "$state" >/dev/null
+  printf '%s\n' "$driver" | as_root tee "$state" >/dev/null
   if [[ $driver != none ]]; then
-    printf '%s' "$bdf" | sudo tee "$device/driver/unbind" >/dev/null
+    printf '%s' "$bdf" | as_root tee "$device/driver/unbind" >/dev/null
   fi
-  printf '%s' vfio-pci | sudo tee "$device/driver_override" >/dev/null
-  printf '%s' "$bdf" | sudo tee /sys/bus/pci/drivers_probe >/dev/null
+  printf '%s' vfio-pci | as_root tee "$device/driver_override" >/dev/null
+  printf '%s' "$bdf" | as_root tee /sys/bus/pci/drivers_probe >/dev/null
   [[ $(current_driver) == vfio-pci ]] || die "vfio-pci probe failed"
   local cdev
   cdev=$(vfio_cdev)
@@ -364,7 +385,7 @@ probe)
   [[ $(current_driver) == vfio-pci ]] || die "$bdf is not bound to vfio-pci"
   [[ -x $probe ]] || die "probe executable is absent; build nta-vfio-nvme-probe"
   if [[ $probe_as_root == 1 ]]; then
-    sudo env LD_LIBRARY_PATH="$(cuda_library_path)" \
+    as_root env LD_LIBRARY_PATH="$(cuda_library_path)" \
       "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy" \
       "$dma_target"
   else
@@ -423,7 +444,7 @@ qualify)
     "${@:2}"
   )
   if [[ $benchmark_as_root == 1 ]]; then
-    sudo "${benchmark_command[@]}"
+    as_root "${benchmark_command[@]}"
   else
     "${benchmark_command[@]}"
   fi
@@ -438,23 +459,23 @@ qualify)
 restore)
   require_safe_device
   if [[ $(current_driver) == vfio-pci ]]; then
-    printf '%s' "$bdf" | sudo tee "$device/driver/unbind" >/dev/null
+    printf '%s' "$bdf" | as_root tee "$device/driver/unbind" >/dev/null
   fi
   driver=nvme
   if [[ -r $state ]]; then
     driver=$(<"$state")
   fi
   [[ $driver != none && -d /sys/bus/pci/drivers/$driver ]] || driver=nvme
-  printf '%s' "$driver" | sudo tee "$device/driver_override" >/dev/null
-  printf '%s' "$bdf" | sudo tee /sys/bus/pci/drivers_probe >/dev/null
+  printf '%s' "$driver" | as_root tee "$device/driver_override" >/dev/null
+  printf '%s' "$bdf" | as_root tee /sys/bus/pci/drivers_probe >/dev/null
   wait_for_driver "$driver"
   # driver_override is only a transactional bind aid. Leaving it set makes
   # later hotplug and recovery depend on stale experiment state.
-  printf '\n' | sudo tee "$device/driver_override" >/dev/null
+  printf '\n' | as_root tee "$device/driver_override" >/dev/null
   [[ $driver != nvme ]] || wait_for_nvme_namespace
   [[ $driver != nvme ]] || wait_for_expected_partitions
-  sudo rm -f "$state"
-  sudo rm -f "$partition_state"
+  as_root rm -f "$state"
+  as_root rm -f "$partition_state"
   "$0" status
   ;;
 *)

@@ -38,8 +38,7 @@ _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET = (
     "PrefillCudaGraphRunner.capture_prepare"
 )
 _DECODE_GRAPH_REPLAY_VIEW_TARGET = (
-    "sglang.srt.model_executor.runner.decode_cuda_graph_runner."
-    "build_replay_fb_view"
+    "sglang.srt.model_executor.runner.decode_cuda_graph_runner.build_replay_fb_view"
 )
 _REQUIRED_LIFECYCLE_HOOK_TARGETS = (
     _RELEASE_TARGET,
@@ -275,8 +274,7 @@ def _register_hook(registry, target, hook, hook_type) -> None:
     patched = getattr(registry, "_patched", None)
     if not isinstance(patched, set):
         raise RuntimeError(
-            "unsupported SGLang HookRegistry: missing its pinned applied-target "
-            "state"
+            "unsupported SGLang HookRegistry: missing its pinned applied-target state"
         )
     if target in patched:
         raise RuntimeError(
@@ -374,6 +372,7 @@ def _attach_request_priorities(
     # objects; accepting and deliberately ignoring extension arguments keeps
     # the integration version-tolerant without hiding required state.
     del cls, hook_args, hook_kwargs
+    from nta_runtime.adapters.base import _integer_vector
     from nta_runtime.adapters.sglang import (
         FORWARD_METADATA_ATTRIBUTE,
         SglangForwardMetadata,
@@ -387,7 +386,18 @@ def _attach_request_priorities(
     if not bool(getattr(server_args, "enable_priority_scheduling", False)):
         priorities = (0,) * len(requests)
     else:
-        raw = tuple(int(getattr(request, "priority", 0) or 0) for request in requests)
+        try:
+            raw = _integer_vector(
+                tuple(
+                    0 if (value := getattr(request, "priority", 0)) is None else value
+                    for request in requests
+                ),
+                "SGLang scheduler priorities",
+                minimum=-(1 << 31),
+                maximum=(1 << 31) - 1,
+            )
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
         low_first = bool(
             getattr(server_args, "schedule_low_priority_values_first", False)
         )
@@ -443,9 +453,7 @@ def register() -> None:
 
     if BACKEND_NAME not in ATTENTION_BACKEND_CHOICES:
         add_attention_backend_choices([BACKEND_NAME])
-    _register_hook(
-        HookRegistry, _RELEASE_TARGET, _flush_backend_stats, HookType.BEFORE
-    )
+    _register_hook(HookRegistry, _RELEASE_TARGET, _flush_backend_stats, HookType.BEFORE)
     _register_hook(
         HookRegistry, _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
     )
@@ -470,7 +478,10 @@ def register() -> None:
         HookRegistry, _FORWARD_BATCH_TARGET, _attach_request_priorities, HookType.AFTER
     )
     _register_hook(
-        HookRegistry, _PREFILL_ADMISSION_TARGET, route_prefill_admission, HookType.AROUND
+        HookRegistry,
+        _PREFILL_ADMISSION_TARGET,
+        route_prefill_admission,
+        HookType.AROUND,
     )
     if BACKEND_NAME not in ATTENTION_BACKENDS:
 

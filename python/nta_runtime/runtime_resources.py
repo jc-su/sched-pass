@@ -37,9 +37,7 @@ def _nonnegative_environment(name: str, default: int) -> int:
         raise ValueError(f"{name} must be a nonnegative integer") from error
 
 
-def _create_runtime(
-    config: "RuntimeConfig", *, nvme: Any, cxl: Any
-) -> "Runtime":
+def _create_runtime(config: "RuntimeConfig", *, nvme: Any, cxl: Any) -> "Runtime":
     """Load and construct the native owner at the explicit open boundary."""
 
     from .runtime import Runtime
@@ -67,20 +65,32 @@ class RuntimeResourceConfig:
             "tenant_capacity",
             "max_dependencies_per_work_ticket",
         ):
-            _bounded_integer(
-                getattr(self, name), name, minimum=1, maximum=_UINT32_MAX
+            object.__setattr__(
+                self,
+                name,
+                _bounded_integer(
+                    getattr(self, name), name, minimum=1, maximum=_UINT32_MAX
+                ),
             )
-        _bounded_integer(
-            self.device_ordinal,
+        object.__setattr__(
+            self,
             "device_ordinal",
-            minimum=-1,
-            maximum=_INT32_MAX,
+            _bounded_integer(
+                self.device_ordinal,
+                "device_ordinal",
+                minimum=-1,
+                maximum=_INT32_MAX,
+            ),
         )
-        _bounded_integer(
-            self.staging_byte_capacity,
+        object.__setattr__(
+            self,
             "staging_byte_capacity",
-            minimum=0,
-            maximum=_UINT64_MAX,
+            _bounded_integer(
+                self.staging_byte_capacity,
+                "staging_byte_capacity",
+                minimum=0,
+                maximum=_UINT64_MAX,
+            ),
         )
 
     def native(self) -> "RuntimeConfig":
@@ -102,7 +112,8 @@ class RuntimeResourceConfig:
 
     @classmethod
     def with_environment_staging_limit(
-        cls, *,
+        cls,
+        *,
         request_capacity: int,
         object_capacity: int,
         intent_capacity: int,
@@ -203,7 +214,9 @@ class ServingRuntimeResources:
             if first_error is None:
                 first_error = error
         if first_error is not None:
-            raise RuntimeError("serving runtime resource teardown failed") from first_error
+            raise RuntimeError(
+                "serving runtime resource teardown failed"
+            ) from first_error
 
     def __del__(self) -> None:
         # NtaFlashInferAttnBackend can fail during partially initialized

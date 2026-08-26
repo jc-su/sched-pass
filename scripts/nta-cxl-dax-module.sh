@@ -30,7 +30,7 @@ as_root() {
   if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
     "$@"
   else
-    sudo "$@"
+    sudo -n "$@"
   fi
 }
 

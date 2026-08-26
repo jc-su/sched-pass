@@ -10,6 +10,14 @@ die() {
   exit 1
 }
 
+as_root() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
 nvidia_version() {
   [[ -r /sys/module/nvidia/version ]] || die "the NVIDIA kernel driver is not loaded"
   tr -d '\n' </sys/module/nvidia/version
@@ -41,7 +49,7 @@ load)
     [[ -n $loaded_srcversion && $loaded_srcversion == "$built_srcversion" ]] ||
       die "a different nta_nvme_p2p build is loaded; unload it before loading this revision"
   else
-    sudo insmod "$module_dir/nta_nvme_p2p.ko"
+    as_root insmod "$module_dir/nta_nvme_p2p.ko"
   fi
   [[ -c /dev/nta_nvme_p2p ]] || die "module loaded without a device node"
   printf 'module=nta_nvme_p2p state=loaded device=/dev/nta_nvme_p2p kernel=%s\n' \
@@ -49,7 +57,7 @@ load)
   ;;
 unload)
   if [[ -d /sys/module/nta_nvme_p2p ]]; then
-    sudo rmmod nta_nvme_p2p
+    as_root rmmod nta_nvme_p2p
   fi
   printf 'module=nta_nvme_p2p state=unloaded\n'
   ;;

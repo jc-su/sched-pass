@@ -16,8 +16,17 @@ from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RESULTS_ROOT = pathlib.Path(
-    os.environ.get("NTA_RESULTS_DIR", pathlib.Path(tempfile.gettempdir()) / "nta-results")
+    os.environ.get(
+        "NTA_RESULTS_DIR", pathlib.Path(tempfile.gettempdir()) / "nta-results"
+    )
 )
+
+
+def _privileged(command: list[str]) -> list[str]:
+    """Run a control-plane command with a non-interactive privilege boundary."""
+    if os.geteuid() == 0:
+        return command
+    return ["sudo", "-n", *command]
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,14 +89,17 @@ def parse_args() -> argparse.Namespace:
         default=RESULTS_ROOT / "qualification" / "nvme-qualification.json",
     )
     args = parser.parse_args()
-    if min(
-        args.queue_depth,
-        args.bytes,
-        args.requests,
-        args.progress_rounds,
-        args.iterations,
-        args.fio_runtime,
-    ) <= 0:
+    if (
+        min(
+            args.queue_depth,
+            args.bytes,
+            args.requests,
+            args.progress_rounds,
+            args.iterations,
+            args.fio_runtime,
+        )
+        <= 0
+    ):
         parser.error("NVMe qualification dimensions must be positive")
     if not 0 < args.minimum_bandwidth_ratio <= 1:
         parser.error("minimum bandwidth ratio must be in (0, 1]")
@@ -129,7 +141,7 @@ def revision() -> tuple[str, bool]:
 
 
 def namespace_block_device(bdf: str, namespace: int) -> pathlib.Path:
-    run(["sudo", "udevadm", "settle"])
+    run(["udevadm", "settle"])
     directory = pathlib.Path("/sys/bus/pci/devices") / bdf / "nvme"
     candidates = []
     for controller in directory.glob("nvme[0-9]*"):
@@ -147,7 +159,10 @@ def namespace_block_device(bdf: str, namespace: int) -> pathlib.Path:
 
 
 def validate_bdf(bdf: str) -> None:
-    if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", bdf) is None:
+    if (
+        re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", bdf)
+        is None
+    ):
         raise RuntimeError(f"invalid PCI BDF: {bdf!r}")
     device = pathlib.Path("/sys/bus/pci/devices") / bdf
     if not device.is_dir():
@@ -176,24 +191,25 @@ def read_only_preflight(args: argparse.Namespace) -> None:
 def fio_baseline(args: argparse.Namespace, block: pathlib.Path) -> dict[str, Any]:
     with tempfile.NamedTemporaryFile(prefix="nta-fio-", suffix=".json") as raw:
         run(
-            [
-                "sudo",
-                "fio",
-                "--name=nta-matched-read",
-                f"--filename={block}",
-                "--readonly",
-                "--direct=1",
-                "--ioengine=io_uring",
-                "--rw=read",
-                f"--bs={args.bytes}",
-                f"--iodepth={args.requests}",
-                "--numjobs=1",
-                f"--size={args.fio_size}",
-                f"--runtime={args.fio_runtime}",
-                "--time_based=1",
-                "--group_reporting=1",
-                "--output-format=json",
-            ],
+            _privileged(
+                [
+                    "fio",
+                    "--name=nta-matched-read",
+                    f"--filename={block}",
+                    "--readonly",
+                    "--direct=1",
+                    "--ioengine=io_uring",
+                    "--rw=read",
+                    f"--bs={args.bytes}",
+                    f"--iodepth={args.requests}",
+                    "--numjobs=1",
+                    f"--size={args.fio_size}",
+                    f"--runtime={args.fio_runtime}",
+                    "--time_based=1",
+                    "--group_reporting=1",
+                    "--output-format=json",
+                ]
+            ),
             output=pathlib.Path(raw.name),
         )
         document = json.loads(pathlib.Path(raw.name).read_text(encoding="utf-8"))
@@ -216,7 +232,7 @@ def fio_baseline(args: argparse.Namespace, block: pathlib.Path) -> dict[str, Any
 
 def iommu_fault_count(bdf: str) -> int:
     requester = bdf.split(":", 1)[1]
-    output = run(["sudo", "dmesg", "--color=never"])
+    output = run(_privileged(["dmesg", "--color=never"]))
     marker = f"Request device [{requester}] fault"
     return sum(marker in line for line in output.splitlines())
 
@@ -250,14 +266,7 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
         ],
         environment=environment,
     )
-    run(
-        [
-            "sudo",
-            "chown",
-            f"{os.getuid()}:{os.getgid()}",
-            str(raw_output),
-        ]
-    )
+    run(_privileged(["chown", f"{os.getuid()}:{os.getgid()}", str(raw_output)]))
     return json.loads(raw_output.read_text(encoding="utf-8"))
 
 
@@ -315,8 +324,7 @@ def main() -> int:
                 args.dma_target != "hbm-peer"
                 or (
                     gpu.get("hbm_peer_dma_supported") is True
-                    and gpu.get("hbm_mapping_backend")
-                    == "nvidia-peer-pages"
+                    and gpu.get("hbm_mapping_backend") == "nvidia-peer-pages"
                 )
             )
             and gpu.get("translated_iommu") is True

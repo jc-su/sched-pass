@@ -64,6 +64,10 @@ class ResourceContract:
     uses_host_proxy: bool
 
     def __post_init__(self) -> None:
+        if not isinstance(self.kind, ResourceKind):
+            raise TypeError("resource kind must be a ResourceKind value")
+        if not isinstance(self.capabilities, ResourceCapability):
+            raise TypeError("resource capabilities must be ResourceCapability flags")
         if not isinstance(self.protocol_owner, ResourceOwner):
             raise TypeError("resource protocol owner must be typed")
         if not isinstance(self.payload_owner, ResourceOwner):
@@ -72,6 +76,16 @@ class ResourceContract:
             self.transfer_destination_owner, ResourceOwner
         ):
             raise TypeError("resource transfer destination owner must be typed")
+        for field in (
+            "requires_catalog",
+            "requires_endpoint",
+            "direct_device_visible",
+            "uses_host_proxy",
+        ):
+            if type(getattr(self, field)) is not bool:
+                raise TypeError(f"resource contract {field} must be bool")
+        if not isinstance(self.steady_state_path, str):
+            raise TypeError("resource steady-state path must be a string")
         if not self.steady_state_path:
             raise ValueError("resource steady-state path must be named")
         if self.directory_owner is not ResourceOwner.RUNTIME:

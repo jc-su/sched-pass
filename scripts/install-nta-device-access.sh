@@ -15,7 +15,7 @@ as_root() {
   if [[ $EUID -eq 0 ]]; then
     "$@"
   else
-    sudo "$@"
+    sudo -n "$@"
   fi
 }
 

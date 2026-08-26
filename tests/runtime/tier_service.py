@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 from nta_runtime.tier import (  # noqa: E402
+    PageExtent,
     ServingTier,
     ServingTierConfig,
     ServingTierService,
@@ -64,6 +65,7 @@ def main() -> None:
         device_ordinal=-1,
     )
     assert config.staging_byte_capacity == (1 << 64) - 1
+
     class FakeTier:
         contract = host_staged
         nvme = None
@@ -185,6 +187,19 @@ def main() -> None:
         assert "device_ordinal" in str(error)
     else:
         raise AssertionError("device ordinal overflow was accepted")
+    for invalid_extent in ((0.5, 4096), ("0", 4096), (0, "4096")):
+        try:
+            PageExtent(*invalid_extent)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError("non-integer tier extent was accepted")
+    try:
+        ServingTierConfig(queue_depth="64")  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("string tier configuration was retained")
     try:
         RuntimeResourceConfig(
             request_capacity=1 << 32,

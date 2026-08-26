@@ -183,8 +183,7 @@ class VllmV1SchedulerProjection:
         scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
         if not isinstance(scheduled, Mapping) or not scheduled:
             raise RuntimeError(
-                "vLLM V1 scheduler output must expose non-empty "
-                "num_scheduled_tokens"
+                "vLLM V1 scheduler output must expose non-empty num_scheduled_tokens"
             )
         scheduled_ids = {str(request_id) for request_id in scheduled}
         input_request_ids = getattr(input_batch, "req_ids", None)
@@ -248,17 +247,13 @@ class VllmV1SchedulerProjection:
                 raise RuntimeError(
                     f"vLLM V1 input batch has no row for scheduled request {request_id!r}"
                 )
-            row_index = _exact_integer(
-                request_indices[request_id], "request row index"
-            )
+            row_index = _exact_integer(request_indices[request_id], "request row index")
             if row_index < 0 or row_index >= len(row_counts):
                 raise RuntimeError(
                     f"vLLM V1 request row {row_index} is outside the input batch"
                 )
             if row_index in used_rows:
-                raise RuntimeError(
-                    "vLLM V1 scheduled requests reuse an allocation row"
-                )
+                raise RuntimeError("vLLM V1 scheduled requests reuse an allocation row")
             used_rows.add(row_index)
             row_count = _exact_integer(row_counts[row_index], "block count")
             if row_count <= 0:
@@ -276,9 +271,7 @@ class VllmV1SchedulerProjection:
                     f"vLLM V1 block-table row is shorter than its block count "
                     f"for {request_id!r}"
                 )
-            row = tuple(
-                _exact_integer(page, "block-table page ID") for page in values
-            )
+            row = tuple(_exact_integer(page, "block-table page ID") for page in values)
             if any(page < 0 for page in row):
                 raise RuntimeError(
                     f"vLLM V1 block-table row has a negative page ID for {request_id!r}"
@@ -311,8 +304,7 @@ class VllmV1SchedulerProjection:
         scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
         if not isinstance(scheduled, Mapping) or not scheduled:
             raise RuntimeError(
-                "vLLM V2 scheduler output must expose non-empty "
-                "num_scheduled_tokens"
+                "vLLM V2 scheduler output must expose non-empty num_scheduled_tokens"
             )
         request_ids_in_batch = getattr(input_batch, "req_ids", None)
         row_indices = getattr(input_batch, "idx_mapping_np", None)
@@ -324,8 +316,7 @@ class VllmV1SchedulerProjection:
             raise RuntimeError("vLLM V2 input batch has no CPU request index map")
         try:
             row_indices = tuple(
-                _exact_integer(value, "CPU request row index")
-                for value in row_indices
+                _exact_integer(value, "CPU request row index") for value in row_indices
             )
         except TypeError:
             raise RuntimeError(
@@ -364,9 +355,7 @@ class VllmV1SchedulerProjection:
                     f"vLLM V2 request {request_id!r} has a negative row index"
                 )
             if row_index in used_rows:
-                raise RuntimeError(
-                    "vLLM V2 scheduled requests reuse an allocation row"
-                )
+                raise RuntimeError("vLLM V2 scheduled requests reuse an allocation row")
             used_rows.add(row_index)
             request_indices[request_id] = row_index
             try:
@@ -385,9 +374,7 @@ class VllmV1SchedulerProjection:
                     f"vLLM V2 block-table row is shorter than its block count "
                     f"for {request_id!r}"
                 )
-            row = tuple(
-                _exact_integer(page, "block-table page ID") for page in values
-            )
+            row = tuple(_exact_integer(page, "block-table page ID") for page in values)
             if any(page < 0 for page in row):
                 raise RuntimeError(
                     f"vLLM V2 block-table row has a negative page ID for {request_id!r}"
@@ -420,11 +407,14 @@ class _StableVllmSlots:
     ) -> tuple[str, ...]:
         if len(request_ids) != len(request_rows):
             raise RuntimeError("vLLM request IDs and allocation rows are misaligned")
+        normalized_rows = tuple(
+            _nonnegative_integer(row, "allocation row") for row in request_rows
+        )
         current = set(request_ids)
         replaced = {
             previous
-            for request_id, row in zip(request_ids, request_rows, strict=True)
-            if (previous := self._row_to_request.get(int(row))) is not None
+            for request_id, row in zip(request_ids, normalized_rows, strict=True)
+            if (previous := self._row_to_request.get(row)) is not None
             and previous != request_id
             and previous not in current
         }
@@ -447,7 +437,9 @@ class _StableVllmSlots:
         if request_rows is not None and len(request_rows) != len(request_ids):
             raise RuntimeError("vLLM request IDs and allocation rows are misaligned")
         if request_rows is not None:
-            request_rows = tuple(int(row) for row in request_rows)
+            request_rows = tuple(
+                _nonnegative_integer(row, "allocation row") for row in request_rows
+            )
             if len(set(request_rows)) != len(request_rows):
                 raise RuntimeError("vLLM allocation rows are not unique")
 
@@ -491,11 +483,18 @@ class _StableVllmSlots:
                 slot = heapq.heappop(self._free)
                 self._request_to_slot[request_id] = slot
             if request_rows is not None:
-                row = int(request_rows[offset])
+                row = request_rows[offset]
                 self._request_to_row[request_id] = row
                 self._row_to_request[row] = request_id
             result.append(slot)
         return tuple(result)
+
+
+def _nonnegative_integer(value: Any, description: str) -> int:
+    normalized = _exact_integer(value, description)
+    if normalized < 0:
+        raise RuntimeError(f"vLLM {description} must be nonnegative")
+    return normalized
 
 
 class VllmV1Hook:
@@ -617,17 +616,26 @@ class VllmV1Hook:
         priorities = (
             None
             if self._priority_for_request is None
-            else tuple(self._priority_for_request(request_id) for request_id in projection.request_ids)
+            else tuple(
+                self._priority_for_request(request_id)
+                for request_id in projection.request_ids
+            )
         )
         deadlines = (
             None
             if self._deadline_for_request is None
-            else tuple(self._deadline_for_request(request_id) for request_id in projection.request_ids)
+            else tuple(
+                self._deadline_for_request(request_id)
+                for request_id in projection.request_ids
+            )
         )
         tenants = (
             None
             if self._tenant_for_request is None
-            else tuple(self._tenant_for_request(request_id) for request_id in projection.request_ids)
+            else tuple(
+                self._tenant_for_request(request_id)
+                for request_id in projection.request_ids
+            )
         )
         return self._adapter.bind_batch(
             projection.request_ids,
@@ -732,9 +740,7 @@ class VllmV1Hook:
         error rather than a stock-attention disguise.
         """
         if self._consumer is None:
-            raise RuntimeError(
-                "vLLM V1 projection has no numerical attention consumer"
-            )
+            raise RuntimeError("vLLM V1 projection has no numerical attention consumer")
         batch = self.bind_forward(
             scheduler_output,
             input_batch,
