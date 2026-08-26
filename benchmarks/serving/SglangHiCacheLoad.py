@@ -50,6 +50,18 @@ from SglangHiCache import (
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
+# SGLang 0.5.16 publishes ``max_req_input_len`` as ``context_len - 6``
+# (``max_req_len`` is ``context_len - 1`` and the scheduler reserves another
+# five tokens), then rejects inputs at the published bound.  Keep a small
+# adapter margin so generated pressure requests remain valid across that
+# tokenizer/scheduler boundary.  This is a request-envelope constraint, not a
+# change to the normalized workload's exact token counts.
+SGLANG_INPUT_MARGIN_TOKENS = 8
+
+
+def _max_request_input_tokens(context_length: int) -> int:
+    return context_length - SGLANG_INPUT_MARGIN_TOKENS
+
 
 def _machine_metadata() -> dict[str, Any]:
     def command(argv: list[str]) -> str | None:
@@ -195,8 +207,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("request and token counts must be positive")
     if args.external_suffix_tokens < 0:
         parser.error("external suffix token count cannot be negative")
-    if args.churn_tokens > args.context_length:
-        parser.error("churn token count cannot exceed context length")
+    if args.context_length <= SGLANG_INPUT_MARGIN_TOKENS:
+        parser.error("context length is too small for the SGLang request envelope")
+    max_request_input_tokens = _max_request_input_tokens(args.context_length)
+    if args.churn_tokens >= max_request_input_tokens:
+        parser.error("churn token count exceeds the SGLang request input budget")
     if args.load_warmup_iterations < 0:
         parser.error("load warmup iterations cannot be negative")
     if args.eviction_rounds is not None and args.eviction_rounds < 0:
@@ -205,6 +220,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("SLO thresholds must be positive")
     if args.request_rate <= 0:
         parser.error("request rate must be positive")
+    if args.external_tokens + args.external_suffix_tokens >= max_request_input_tokens:
+        parser.error(
+            "external prompt exceeds the SGLang request input budget"
+        )
+    if args.resident_tokens >= max_request_input_tokens:
+        parser.error(
+            "resident prompt exceeds the SGLang request input budget"
+        )
     if args.hicache_ratio <= 1:
         parser.error("HiCache ratio must exceed device cache capacity")
     if args.workload_manifest is None:
@@ -620,6 +643,29 @@ def main() -> int:
                 "Bailian structure prompt could not preserve exact tokenizer lengths; "
                 "use a tokenizer-compatible prompt adapter before claiming serving evidence"
             )
+        prompt_lengths = [
+            *workload_metadata["resident_input_tokens"],
+            *workload_metadata["external_input_tokens"],
+        ]
+        output_lengths = [
+            *workload_metadata["resident_output_tokens"],
+            *workload_metadata["external_output_tokens"],
+        ]
+        max_request_input_tokens = _max_request_input_tokens(args.context_length)
+        if any(length >= max_request_input_tokens for length in prompt_lengths):
+            raise RuntimeError(
+                "Bailian prompt exceeds the SGLang request input budget "
+                f"({max_request_input_tokens} tokens for context length "
+                f"{args.context_length})"
+            )
+        if any(
+            input_length + output_length > args.context_length
+            for input_length, output_length in zip(prompt_lengths, output_lengths)
+        ):
+            raise RuntimeError(
+                "Bailian input and output lengths exceed the configured context "
+                f"length ({args.context_length})"
+            )
         args.resident_requests = len(resident_prompts)
         args.external_requests = len(external_prompts)
         args.resident_tokens = max(workload_metadata["resident_input_tokens"])
@@ -650,6 +696,16 @@ def main() -> int:
             for index in range(args.resident_requests)
         ]
         shape_prompt = make_prompt(tokenizer, "load-shape", args.external_tokens)
+    if any(
+        len(tokenizer.encode(prompt, add_special_tokens=False))
+        >= _max_request_input_tokens(args.context_length)
+        for prompt in [*resident_prompts, *external_prompts]
+    ):
+        raise RuntimeError(
+            "a generated prompt exceeds the SGLang request input budget "
+            f"({_max_request_input_tokens(args.context_length)} tokens for "
+            f"context length {args.context_length})"
+        )
     eviction_rounds = (
         args.eviction_rounds
         if args.eviction_rounds is not None
@@ -697,8 +753,9 @@ def main() -> int:
             args.max_total_tokens - combined_cache_tokens + block_size,
         )
         remaining = max(args.churn_tokens, required_placement_pressure)
+        maximum_prompt_tokens = _max_request_input_tokens(args.context_length) - 1
         while remaining > 0:
-            token_count = min(args.context_length, remaining)
+            token_count = min(maximum_prompt_tokens, remaining)
             placement_eviction_prompts.append(
                 make_prompt(
                     tokenizer,

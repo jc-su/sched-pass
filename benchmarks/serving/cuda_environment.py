@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import os
 import pathlib
-import re
 import shlex
 import shutil
 import subprocess
 import sys
+
+try:
+    from tools.jit.cuda_toolkit import cuda_release, resolve_cuda_home
+except ModuleNotFoundError:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools" / "jit"))
+    from cuda_toolkit import cuda_release, resolve_cuda_home
 
 
 def _resolve_host_cxx(requested: pathlib.Path | None) -> pathlib.Path:
@@ -31,61 +36,6 @@ def _resolve_host_cxx(requested: pathlib.Path | None) -> pathlib.Path:
     if not candidate.is_file():
         raise RuntimeError(f"CUDA host compiler does not exist: {candidate}")
     return candidate
-
-
-def _resolve_cuda_home(requested: pathlib.Path | None) -> pathlib.Path:
-    candidate = requested
-    if candidate is None:
-        configured = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-        candidate = pathlib.Path(configured) if configured else None
-    if candidate is None:
-        import torch
-
-        version = str(torch.version.cuda or "").split(".")
-        candidates: list[pathlib.Path] = []
-        if len(version) >= 2:
-            candidates.extend(
-                (
-                    pathlib.Path(f"/usr/local/cuda-{version[0]}.{version[1]}"),
-                    pathlib.Path(f"/usr/local/cuda-{version[0]}"),
-                )
-            )
-        candidates.append(pathlib.Path("/usr/local/cuda"))
-        candidate = next(
-            (item for item in candidates if (item / "bin" / "nvcc").is_file()),
-            None,
-        )
-    if candidate is None:
-        discovered = shutil.which("nvcc")
-        candidate = pathlib.Path(discovered).parent.parent if discovered else None
-    if candidate is None:
-        raise RuntimeError(
-            "CUDA toolkit matching torch.version.cuda was not found; "
-            "pass an explicit CUDA home"
-        )
-    candidate = candidate.resolve()
-    nvcc = candidate / "bin" / "nvcc"
-    if not nvcc.is_file():
-        raise RuntimeError(f"CUDA toolkit has no nvcc: {nvcc}")
-    return candidate
-
-
-def _cuda_major(cuda_home: pathlib.Path) -> int:
-    nvcc = cuda_home / "bin" / "nvcc"
-    try:
-        result = subprocess.run(
-            [str(nvcc), "--version"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        ).stdout
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise RuntimeError(f"cannot query CUDA toolkit version: {nvcc}") from error
-    match = re.search(r"release\s+(\d+)", result)
-    if match is None:
-        raise RuntimeError(f"cannot parse CUDA toolkit version from {nvcc}")
-    return int(match.group(1))
 
 
 def configure_jit_environment(
@@ -108,7 +58,7 @@ def configure_jit_environment(
     """
 
     resolved_host_cxx = _resolve_host_cxx(host_cxx)
-    resolved_cuda_home = _resolve_cuda_home(cuda_home)
+    resolved_cuda_home = resolve_cuda_home(cuda_home)
     launcher = pathlib.Path(
         os.environ.get(
             "FLASHINFER_NVCC", root / "tools" / "flashinfer" / "nvcc_compat.py"
@@ -136,7 +86,7 @@ def configure_jit_environment(
     if not compat_header.is_file():
         raise RuntimeError(f"serving CUDA compatibility header is missing: {compat_header}")
     nvcc_flags = [f"-ccbin={resolved_host_cxx}"]
-    if _cuda_major(resolved_cuda_home) < 13:
+    if cuda_release(resolved_cuda_home)[0] < 13:
         nvcc_flags.extend(
             (
                 "-U_GNU_SOURCE",
