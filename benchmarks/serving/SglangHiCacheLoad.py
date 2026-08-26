@@ -808,9 +808,31 @@ def main() -> int:
         load_seconds = time.perf_counter() - load_started
         generated_text(engine.generate(shape_prompt, setup_sampling))
         generated_text(engine.generate(shape_prompt, setup_sampling))
-        generation_results(
-            engine.generate(external_prefixes, [dict(setup_sampling)] * len(external_prefixes))
-        )
+
+        def warm_external_prefixes() -> None:
+            """Create a reusable, write-through-backed external prefix.
+
+            SGLang may mark a long prefill as ``chunked`` and deliberately
+            defer its write-through hit-count update.  A second setup hit is
+            therefore part of the placement protocol: it makes the external
+            prefix eligible for D→H backup before the pressure phase.  This
+            is setup-only and never contributes to the timed records.
+            """
+
+            generation_results(
+                engine.generate(
+                    external_prefixes,
+                    [dict(setup_sampling)] * len(external_prefixes),
+                )
+            )
+            generation_results(
+                engine.generate(
+                    external_prefixes,
+                    [dict(setup_sampling)] * len(external_prefixes),
+                )
+            )
+
+        warm_external_prefixes()
         for prompt in churn_prompts[:eviction_rounds]:
             generated_text(engine.generate(prompt, setup_sampling))
         if workload_metadata is None:
