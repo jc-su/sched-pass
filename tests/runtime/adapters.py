@@ -206,6 +206,18 @@ def main() -> None:
     assert vllm_batch.exact_demand is not None
     assert vllm_batch.exact_demand.request_unit_ids == ((10, 11), (20, 21, 22))
     assert vllm_batch.exact_demand.unit_bytes == 4096
+    phase = vllm_batch.phase(1, 1)
+    assert phase.request_ids == (vllm_batch.request_ids[1],)
+    assert phase.bindings[0].request_index == 0
+    assert phase.bindings[0].request_slot == vllm_batch.bindings[1].request_slot
+    assert phase.exact_demand is not None
+    assert phase.exact_demand.request_unit_ids == ((20, 21, 22),)
+    try:
+        vllm_batch.phase(2, 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("out-of-range engine phase was accepted")
     projection = VllmSchedulerProjection.from_scheduler_output(
         FakeVllmSchedulerOutput()
     )

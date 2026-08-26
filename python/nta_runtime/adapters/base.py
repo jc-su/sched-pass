@@ -216,6 +216,50 @@ class EngineBatch:
         """Logical tenant for each request in the engine batch."""
         return tuple(binding.tenant_id for binding in self.bindings)
 
+    def phase(self, start: int, count: int) -> "EngineBatch":
+        """Return a validated contiguous phase view of this forward.
+
+        Frameworks may reorder one forward into contiguous phases (vLLM, for
+        example, places decode rows before prefill rows).  A phase view keeps
+        the original epoch and immutable request bindings while narrowing the
+        exact-demand rows to the wrapper that consumes them.  It is metadata
+        only: no request is rebound and no runtime state is duplicated.
+        """
+        if isinstance(start, bool) or isinstance(count, bool):
+            raise TypeError("engine batch phase bounds must be integers")
+        start = int(start)
+        count = int(count)
+        if start < 0 or count <= 0 or start + count > len(self.bindings):
+            raise ValueError(
+                "engine batch phase must be a non-empty contiguous binding range"
+            )
+        demand = self.exact_demand
+        if demand is not None:
+            demand = ExactDemandProjection(
+                demand.request_unit_ids[start : start + count], demand.unit_bytes
+            )
+        bindings = tuple(
+            RequestBinding(
+                request_index=local_index,
+                request_slot=binding.request_slot,
+                generation=binding.generation,
+                request_id=binding.request_id,
+                priority=binding.priority,
+                deadline_clock=binding.deadline_clock,
+                tenant_id=binding.tenant_id,
+            )
+            for local_index, binding in enumerate(
+                self.bindings[start : start + count]
+            )
+        )
+        return EngineBatch(
+            self.engine,
+            self.epoch,
+            bindings,
+            self.granularity,
+            demand,
+        )
+
 
 @runtime_checkable
 class EngineBoundary(Protocol):

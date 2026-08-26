@@ -641,13 +641,12 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
 
     def _build_plan(
         self,
-        state: Any,
+        batch: EngineBatch,
         schedule: Any,
         *,
         layer: int = 0,
     ) -> ExecutionSession:
-        batch = state.batch
-        if not isinstance(batch, EngineBatch) or batch.exact_demand is None:
+        if batch.exact_demand is None:
             raise RuntimeError("vLLM NTA attention has no exact engine batch")
         bindings = batch.bindings
         if any(
@@ -699,6 +698,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
     def _upload_physical_plan(
         self,
         state: Any,
+        batch: EngineBatch,
         schedule: Any,
         execution: ExecutionSession,
         layer: int,
@@ -717,9 +717,6 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         tier = getattr(state, "tier_service", None)
         if tier is None or tier.is_host:
             raise RuntimeError("vLLM physical plan has no physical tier service")
-        batch = state.batch
-        if not isinstance(batch, EngineBatch):
-            raise RuntimeError("vLLM physical plan has no engine batch")
         runtime = state.hook.runtime
         work_count = schedule.work_count
         if work_count <= 0:
@@ -887,6 +884,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
     def _run_native_schedule(
         self,
         state: Any,
+        batch: EngineBatch,
         schedule: Any,
         wrapper: Any,
         stock_wrapper: Any,
@@ -906,14 +904,13 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             )
         layer_id = 0 if raw_layer_id is None else int(raw_layer_id)
         execution = self._build_plan(
-            state,
+            batch,
             schedule,
             layer=layer_id if physical else 0,
         )
         if self._nta_program is None:
             raise RuntimeError("vLLM NTA attention has no validated phase program")
-        batch = state.batch
-        if not isinstance(batch, EngineBatch) or batch.exact_demand is None:
+        if batch.exact_demand is None:
             raise RuntimeError("vLLM NTA attention has no exact engine batch")
         if physical:
             tier = getattr(state, "tier_service", None)
@@ -927,6 +924,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 )
             plan, object_count, is_nvme = self._upload_physical_plan(
                 state,
+                batch,
                 schedule,
                 execution,
                 layer_id,
@@ -1040,8 +1038,8 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         state = current_vllm_v1_forward_state()
         if state is None or state.batch is None or state.hook is None:
             raise RuntimeError("vLLM NTA prefill ran without a worker sidecar")
-        if attn_metadata.num_decodes or attn_metadata.use_cascade:
-            raise RuntimeError("native vLLM prefill requires a pure prefill batch")
+        if attn_metadata.use_cascade:
+            raise RuntimeError("native vLLM prefill does not support cascade attention")
         prefill_metadata = attn_metadata.prefill
         if not isinstance(prefill_metadata, FIPrefill):
             raise RuntimeError(
@@ -1076,10 +1074,12 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         batch = state.batch
         if not isinstance(batch, EngineBatch):
             raise RuntimeError("vLLM prefill has no engine batch")
-        if len(batch.bindings) != attn_metadata.num_prefills:
+        expected_rows = attn_metadata.num_decodes + attn_metadata.num_prefills
+        if len(batch.bindings) < expected_rows or batch.exact_demand is None:
             raise RuntimeError(
-                "native vLLM prefill requires one exact row per scheduled request"
+                "native vLLM prefill has fewer exact rows than the scheduled batch"
             )
+        prefill_batch = batch.phase(attn_metadata.num_decodes, attn_metadata.num_prefills)
         page_size = int(getattr(state, "page_size", 0) or 0)
         if page_size <= 0:
             raise RuntimeError("vLLM forward sidecar has no token page size")
@@ -1105,6 +1105,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             raise RuntimeError("vLLM FlashInfer prefill produced no work units")
         return self._run_native_schedule(
             state,
+            prefill_batch,
             schedule,
             self._nta_prefill_wrapper,
             stock_wrapper,
@@ -1129,12 +1130,14 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         if state is None or state.batch is None or state.hook is None:
             raise RuntimeError("vLLM NTA attention ran without a worker sidecar")
         batch = state.batch
-        if len(batch.bindings) != attn_metadata.num_decodes:
+        if not isinstance(batch, EngineBatch):
+            raise RuntimeError("vLLM decode has no engine batch")
+        if len(batch.bindings) < attn_metadata.num_decodes:
             raise RuntimeError(
-                "native vLLM decode requires one scheduled token per request"
+                "native vLLM decode has fewer exact rows than the scheduled batch"
             )
-        if attn_metadata.num_prefill_tokens or attn_metadata.use_cascade:
-            raise RuntimeError("native vLLM path only supports pure decode batches")
+        if attn_metadata.use_cascade:
+            raise RuntimeError("native vLLM decode does not support cascade attention")
         if getattr(attn_metadata, "decode_use_trtllm", False):
             raise RuntimeError(
                 "native vLLM path requires FlashInfer FA2 decode, not TRTLLM"
@@ -1143,6 +1146,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             raise RuntimeError("native vLLM path requires one query token per request")
         if len(batch.exact_demand.request_unit_ids) != len(batch.bindings):
             raise RuntimeError("native vLLM exact-demand rows are misaligned")
+        decode_batch = batch.phase(0, attn_metadata.num_decodes)
 
         decode_metadata = getattr(attn_metadata, "decode", None)
         stock_wrapper = getattr(decode_metadata, "wrapper", None)
@@ -1197,6 +1201,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         schedule = decode_schedule(self._nta_wrapper)
         return self._run_native_schedule(
             state,
+            decode_batch,
             schedule,
             self._nta_wrapper,
             stock_wrapper,
@@ -1255,31 +1260,30 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         try:
             if attn_metadata.num_prefill_tokens:
-                if attn_metadata.num_decodes:
-                    raise RuntimeError(
-                        "native vLLM attention requires a pure prefill or pure "
-                        "decode batch; mixed batches use the explicit reference"
-                    )
                 self._native_prefill_forward(
                     layer,
-                    query[:num_actual_tokens],
+                    query[
+                        attn_metadata.num_decode_tokens : num_actual_tokens
+                    ],
                     kv_cache,
                     attn_metadata,
-                    output[:num_actual_tokens],
+                    output[
+                        attn_metadata.num_decode_tokens : num_actual_tokens
+                    ],
                 )
-            else:
+            if attn_metadata.num_decode_tokens:
                 if attn_metadata.num_decode_tokens != attn_metadata.num_decodes:
                     raise RuntimeError(
                         "native vLLM decode requires one query token per request"
                     )
                 self._native_forward(
                     layer,
-                    query[:num_actual_tokens],
-                    key[:num_actual_tokens],
-                    value[:num_actual_tokens],
+                    query[: attn_metadata.num_decode_tokens],
+                    key[: attn_metadata.num_decode_tokens],
+                    value[: attn_metadata.num_decode_tokens],
                     kv_cache,
                     attn_metadata,
-                    output[:num_actual_tokens],
+                    output[: attn_metadata.num_decode_tokens],
                 )
             return original_output
         except RuntimeError:
