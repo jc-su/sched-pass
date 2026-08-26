@@ -122,6 +122,9 @@ def main() -> None:
     ]
     offline_manifest, offline_rows = normalize(offline, arrival_mode="batch_release")
     assert offline_manifest["claims"]["offline_row_order_is_arrival"] is False
+    assert (
+        offline_manifest["claims"]["serving_state_is_production_cache_state"] is False
+    )
     assert offline_rows[0]["arrival_source"] == "batch_release_no_arrival_claim"
     try:
         normalize(offline, arrival_mode="trace")
@@ -139,6 +142,27 @@ def main() -> None:
         )
         write_workload(root / "manifest.json", root / "records.jsonl", manifest, rows)
         validate(root / "manifest.json")
+
+        absent_manifest, absent_rows = normalize(offline, arrival_mode="batch_release")
+        write_workload(
+            root / "absent-manifest.json",
+            root / "absent-records.jsonl",
+            absent_manifest,
+            absent_rows,
+        )
+        absent_document = json.loads(
+            (root / "absent-manifest.json").read_text(encoding="utf-8")
+        )
+        absent_document["claims"]["serving_state_is_production_cache_state"] = True
+        (root / "absent-manifest.json").write_text(
+            json.dumps(absent_document), encoding="utf-8"
+        )
+        try:
+            validate(root / "absent-manifest.json")
+        except ValueError as error:
+            assert "absent serving state" in str(error)
+        else:
+            raise AssertionError("absent serving state was accepted as production")
 
         class LossyTokenizer:
             def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:

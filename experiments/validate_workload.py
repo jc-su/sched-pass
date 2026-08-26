@@ -168,6 +168,28 @@ def validate(path: Path) -> dict[str, Any]:
             )
         if claims.get("serving_state_is_production_cache_state"):
             raise ValueError("synthetic serving state was marked as production state")
+    state_claim = claims.get("serving_state_is_production_cache_state")
+    if not isinstance(state_claim, bool):
+        raise ValueError("workload serving-state claim is not boolean")
+    if state["policy"] == "preserve_absent":
+        if request_states != {None} or state_claim:
+            raise ValueError(
+                "absent serving state cannot be claimed as production cache state"
+            )
+    elif state["policy"] == "preserve_existing":
+        if not request_states <= {"resident", "external"} or None in request_states:
+            raise ValueError(
+                "preserved serving state must label every request as resident or external"
+            )
+        if not state_claim:
+            raise ValueError(
+                "preserved serving state must retain its production-state claim"
+            )
+    elif state["policy"] == "root_resident":
+        if not state["synthetic"] or state_claim:
+            raise ValueError("root_resident state provenance is inconsistent")
+    else:
+        raise ValueError(f"unknown serving-state policy: {state['policy']}")
     prompt = manifest.get("prompt")
     if (
         not isinstance(prompt, dict)

@@ -619,7 +619,11 @@ def normalize(
             "prompt_semantics_are_representative": False,
             "hash_block_identity_is_exact": True,
             "offline_row_order_is_arrival": False,
-            "serving_state_is_production_cache_state": not state["synthetic"],
+            # An absent state is not evidence of a production cache state.
+            # Only labels explicitly supplied by the source trace may carry
+            # that claim; root_resident is an experimental construction.
+            "serving_state_is_production_cache_state": state["policy"]
+            == "preserve_existing",
         },
     }
     manifest["demand_trace_digest"] = demand_trace_digest(normalized)
