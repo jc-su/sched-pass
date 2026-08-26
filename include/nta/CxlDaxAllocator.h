@@ -33,6 +33,11 @@ public:
   [[nodiscard]] std::size_t availableBytes() const noexcept;
 
 private:
+  struct ActiveAllocation {
+    std::size_t reservationBytes;
+    std::size_t payloadBytes;
+  };
+
   [[nodiscard]] static std::size_t roundUp(std::size_t value,
                                            std::size_t alignment);
 
@@ -41,6 +46,10 @@ private:
   std::size_t nextOffset_ = 0;
   std::size_t allocatedBytes_ = 0;
   std::map<std::size_t, std::size_t> freeRanges_;
+  // A release is accepted only for the exact live reservation returned by
+  // allocate(). This makes the noexcept RAII release path idempotent against
+  // accidental duplicate or forged release records.
+  std::map<std::size_t, ActiveAllocation> activeAllocations_;
 };
 
 } // namespace nta::detail

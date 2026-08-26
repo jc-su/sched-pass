@@ -212,6 +212,14 @@ class WorkLedger:
             raise ValueError(
                 "the selected execution protocol does not support partial work"
             )
+        if (
+            target is Availability.RUNNING
+            and len(self._state_members[Availability.RUNNING])
+            >= self.config.max_inflight_units
+        ):
+            raise ValueError(
+                "execution protocol in-flight capacity would be exceeded"
+            )
         self._state_members[current].pop(work_id)
         self._state_members[target][work_id] = None
         self._states[work_id] = target
@@ -252,8 +260,10 @@ class WorkLedger:
 
         Conventional execution has a batch readiness boundary.  The other
         forms expose ready work immediately, but never exceed the configured
-        in-flight bound.  Keeping this rule in the ledger prevents each engine
-        adapter from inventing its own interpretation of the configuration.
+        in-flight bound per group. Groups are sequential launch windows: a
+        caller must complete or partially release one group before launching
+        the next. Keeping this rule in the ledger prevents each engine adapter
+        from inventing its own interpretation of the configuration.
         """
         ready = self.units_in(Availability.READY)
         if self.config.kind is ProtocolKind.CONVENTIONAL and len(ready) != len(

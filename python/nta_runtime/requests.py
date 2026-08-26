@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import hashlib
 from typing import Any
 
-from .runtime import RequestSpec
+from .request_contract import RequestSpec
 
 
 @dataclass(frozen=True)

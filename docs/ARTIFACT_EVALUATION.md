@@ -260,12 +260,9 @@ cmake -S . -B build \
   -DNTA_TEST_NVME_ENDPOINT=vfio:0000:d8:00.0 \
   -DNTA_TEST_NVME_REFERENCE=/tmp/nta-nvme-reference.bin \
   -DNTA_TEST_NVME_MEDIA_POLICY=trusted-read-only-code \
-  -DNTA_TEST_NVME_DMA_TARGET=hbm-peer
-sudo -E env NTA_NVME_ENDPOINT=vfio:0000:d8:00.0 \
-  NTA_NVME_REFERENCE=/tmp/nta-nvme-reference.bin \
-  NTA_NVME_MEDIA_POLICY=trusted-read-only-code \
-  NTA_NVME_DMA_TARGET=hbm-peer \
-  ctest --test-dir build -R 'nta-(vfio-nvme-probe|paged-attention-nvme-gpu)'
+  -DNTA_TEST_NVME_DMA_TARGET=hbm-peer \
+  -DNTA_TEST_NVME_USE_SUDO=ON
+ctest --test-dir build -R 'nta-(vfio-nvme-probe|paged-attention-nvme-gpu)'
 ```
 
 The JIT launcher namespaces FlashInfer caches by Unix UID, so privileged
@@ -281,9 +278,12 @@ NVMe namespace access and does not change VFIO's existing `kvm` policy:
 ```
 
 The NVIDIA driver additionally requires `CAP_SYS_ADMIN` to register the VFIO
-BAR doorbell as CUDA IO memory. Install that capability only on the three
-physical NVMe executables after building; it is not needed by the compiler,
-runtime, SGLang/vLLM adapters, or resident serving path:
+BAR doorbell as CUDA IO memory. The CTest option above runs only the two
+explicit physical NVMe tests through non-interactive `sudo`; it does not run
+the rest of the suite as root. As an alternative for repeated artifact runs,
+install that capability only on the three physical NVMe executables after
+building; it is not needed by the compiler, runtime, SGLang/vLLM adapters, or
+resident serving path:
 
 ```bash
 ./scripts/install-nta-physical-capabilities.sh build

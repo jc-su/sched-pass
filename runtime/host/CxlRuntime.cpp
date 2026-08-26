@@ -171,8 +171,15 @@ CxlDaxBuffer::CxlDaxBuffer(std::shared_ptr<Impl> impl, std::size_t bytes)
     : impl_(std::move(impl)), bytes_(bytes) {}
 
 CxlDaxBuffer::~CxlDaxBuffer() = default;
-CxlDaxBuffer::CxlDaxBuffer(CxlDaxBuffer &&) noexcept = default;
-CxlDaxBuffer &CxlDaxBuffer::operator=(CxlDaxBuffer &&) noexcept = default;
+CxlDaxBuffer::CxlDaxBuffer(CxlDaxBuffer &&other) noexcept
+    : impl_(std::move(other.impl_)), bytes_(std::exchange(other.bytes_, 0)) {}
+CxlDaxBuffer &CxlDaxBuffer::operator=(CxlDaxBuffer &&other) noexcept {
+  if (this != &other) {
+    impl_ = std::move(other.impl_);
+    bytes_ = std::exchange(other.bytes_, 0);
+  }
+  return *this;
+}
 
 void *CxlDaxBuffer::hostAddress() const noexcept {
   return impl_ == nullptr ? nullptr : impl_->hostAddress;

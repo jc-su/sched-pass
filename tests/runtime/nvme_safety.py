@@ -44,6 +44,9 @@ def main() -> None:
     assert "mapExternalHbm" in runtime
     assert "ownsDestinationMemory" in runtime
     assert "mapping.cacheable = cacheable" in runtime
+    assert "impl_ == nullptr ? nullptr : impl_->deviceAddress" in runtime
+    assert "cannot allocate from a moved-from NVMe transport" in runtime
+    assert "cannot map HBM through a moved-from NVMe transport" in runtime
     external_begin = runtime.index("NvmeTransport::mapExternalHbm")
     external_end = runtime.index("} // namespace nta", external_begin)
     external_mapping = runtime[external_begin:external_end]

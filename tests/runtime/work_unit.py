@@ -156,6 +156,13 @@ def test_inflight_bound_counts_running_units() -> None:
         ledger.discover(unit.work_id, ready=True, binding=unit.binding, epoch=7)
     ledger.transition(0, Availability.RUNNING, binding=units[0].binding, epoch=7)
     assert ledger.runnable_groups() == ()
+    try:
+        ledger.transition(1, Availability.RUNNING, binding=units[1].binding, epoch=7)
+    except ValueError as error:
+        assert "in-flight capacity" in str(error)
+    else:
+        raise AssertionError("ledger exceeded its in-flight capacity")
+    assert ledger.state(1) is Availability.READY
 
 
 def test_granularity_balances_skew_and_control_cost() -> None:

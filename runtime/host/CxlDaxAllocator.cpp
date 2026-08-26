@@ -33,6 +33,9 @@ CxlDaxAllocation CxlDaxRangeAllocator::allocate(std::size_t bytes,
   }
 
   std::lock_guard lock(mutex_);
+  if (bytes > capacity_ - allocatedBytes_) {
+    throw std::runtime_error("CXL DAX window capacity exhausted");
+  }
   for (auto range = freeRanges_.begin(); range != freeRanges_.end(); ++range) {
     const std::size_t candidate = roundUp(range->first, alignment);
     if (range->second >
@@ -51,20 +54,38 @@ CxlDaxAllocation CxlDaxRangeAllocator::allocate(std::size_t bytes,
       throw std::overflow_error("CXL reservation size overflows size_t");
     }
     const std::size_t reservationBytes = bytes + prefixBytes;
+    const auto [active, inserted] = activeAllocations_.emplace(
+        rangeBegin, ActiveAllocation{reservationBytes, bytes});
+    if (!inserted) {
+      throw std::logic_error("CXL allocator live reservation overlaps free range");
+    }
     auto original = freeRanges_.extract(range);
+    bool prefixInserted = false;
+    bool suffixInserted = false;
     try {
       if (prefixBytes != 0) {
-        freeRanges_.emplace(rangeBegin, prefixBytes);
+        prefixInserted =
+            freeRanges_.emplace(rangeBegin, prefixBytes).second;
+        if (!prefixInserted) {
+          throw std::logic_error("CXL allocator free-range insertion collided");
+        }
       }
       if (suffixBytes != 0) {
-        freeRanges_.emplace(candidate + bytes, suffixBytes);
+        suffixInserted =
+            freeRanges_.emplace(candidate + bytes, suffixBytes).second;
+        if (!suffixInserted) {
+          throw std::logic_error("CXL allocator free-range insertion collided");
+        }
       }
     } catch (...) {
-      freeRanges_.erase(rangeBegin);
-      if (suffixBytes != 0) {
+      if (prefixInserted) {
+        freeRanges_.erase(rangeBegin);
+      }
+      if (suffixInserted) {
         freeRanges_.erase(candidate + bytes);
       }
       freeRanges_.insert(std::move(original));
+      activeAllocations_.erase(active);
       throw;
     }
     allocatedBytes_ += bytes;
@@ -81,6 +102,13 @@ CxlDaxAllocation CxlDaxRangeAllocator::allocate(std::size_t bytes,
   }
   const std::size_t end = offset + bytes;
   const std::size_t reservationBytes = end - reservationOffset;
+  const bool inserted = activeAllocations_
+                            .emplace(reservationOffset,
+                                     ActiveAllocation{reservationBytes, bytes})
+                            .second;
+  if (!inserted) {
+    throw std::logic_error("CXL allocator live reservation overlaps tail");
+  }
   nextOffset_ = end;
   allocatedBytes_ += bytes;
   return {offset, reservationOffset, reservationBytes, bytes};
@@ -93,6 +121,12 @@ void CxlDaxRangeAllocator::release(
   }
 
   std::lock_guard lock(mutex_);
+  const auto active = activeAllocations_.find(allocation.reservationOffset);
+  if (active == activeAllocations_.end() ||
+      active->second.reservationBytes != allocation.reservationBytes ||
+      active->second.payloadBytes != allocation.payloadBytes) {
+    return;
+  }
   if (allocation.payloadBytes > allocatedBytes_ ||
       allocation.reservationOffset > capacity_ ||
       allocation.reservationBytes > capacity_ - allocation.reservationOffset) {
@@ -157,7 +191,18 @@ void CxlDaxRangeAllocator::release(
   }
 
   try {
-    freeRanges_.emplace(mergedBegin, mergedEnd - mergedBegin);
+    const auto [unused, inserted] =
+        freeRanges_.emplace(mergedBegin, mergedEnd - mergedBegin);
+    (void)unused;
+    if (!inserted) {
+      if (previousNode) {
+        freeRanges_.insert(std::move(previousNode));
+      }
+      if (nextNode) {
+        freeRanges_.insert(std::move(nextNode));
+      }
+      return;
+    }
   } catch (...) {
     if (previousNode) {
       freeRanges_.insert(std::move(previousNode));
@@ -168,6 +213,7 @@ void CxlDaxRangeAllocator::release(
     return;
   }
 
+  activeAllocations_.erase(active);
   allocatedBytes_ -= allocation.payloadBytes;
   while (!freeRanges_.empty()) {
     auto tail = std::prev(freeRanges_.end());

@@ -29,6 +29,13 @@ set(NTA_TEST_NVME_MEDIA_POLICY "$ENV{NTA_NVME_MEDIA_POLICY}" CACHE STRING
     "NVMe media policy for physical CTest")
 set(NTA_TEST_NVME_DMA_TARGET "$ENV{NTA_NVME_DMA_TARGET}" CACHE STRING
     "NVMe DMA destination for physical CTest")
+set(NTA_TEST_NVME_USE_SUDO "OFF" CACHE STRING
+    "Run explicit physical NVMe CTest commands through sudo -n (OFF or ON)")
+set_property(CACHE NTA_TEST_NVME_USE_SUDO PROPERTY STRINGS OFF ON)
+if(NOT NTA_TEST_NVME_USE_SUDO STREQUAL "OFF" AND
+   NOT NTA_TEST_NVME_USE_SUDO STREQUAL "ON")
+  message(FATAL_ERROR "NTA_TEST_NVME_USE_SUDO must be OFF or ON")
+endif()
 if(NTA_TEST_NVME_REFERENCE AND
    NOT EXISTS "${NTA_TEST_NVME_REFERENCE}")
   message(FATAL_ERROR
@@ -65,6 +72,21 @@ if(NTA_TEST_NVME_ENDPOINT AND NTA_TEST_NVME_DMA_TARGET)
   list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "${NTA_TEST_NVME_DMA_TARGET}")
 elseif(NTA_TEST_NVME_ENDPOINT)
   list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "hbm-peer")
+endif()
+set(NTA_TEST_NVME_COMMAND_PREFIX)
+if(NTA_TEST_NVME_USE_SUDO STREQUAL "ON")
+  if(NOT NTA_TEST_NVME_ENDPOINT)
+    message(FATAL_ERROR
+      "NTA_TEST_NVME_USE_SUDO=ON requires an explicit NTA_TEST_NVME_ENDPOINT")
+  endif()
+  find_program(NTA_SUDO_EXECUTABLE sudo REQUIRED)
+  # CTest's ENVIRONMENT property is applied to sudo itself, and sudo's
+  # env_reset intentionally removes those variables. Pass the explicit test
+  # contract through ``env`` so the privileged child receives exactly the
+  # configured endpoint/policy, without relying on a broad sudo -E.
+  list(APPEND NTA_TEST_NVME_COMMAND_PREFIX
+       "${NTA_SUDO_EXECUTABLE}" "-n" "env")
+  list(APPEND NTA_TEST_NVME_COMMAND_PREFIX ${NTA_TEST_NVME_ENVIRONMENT})
 endif()
 
 find_package(LLVM REQUIRED CONFIG)
@@ -653,6 +675,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/python_runtime.py
     )
     add_test(
+      NAME nta-import-boundaries
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/import_boundaries.py
+    )
+    add_test(
       NAME nta-jit-operator-family
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/jit_operator_family.py
@@ -1090,7 +1117,8 @@ if(Python3_Interpreter_FOUND)
   endif()
   add_test(
     NAME nta-vfio-nvme-probe
-    COMMAND nta-vfio-nvme-probe ${NTA_TEST_NVME_PROBE_ARGUMENTS}
+    COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
+            $<TARGET_FILE:nta-vfio-nvme-probe> ${NTA_TEST_NVME_PROBE_ARGUMENTS}
   )
   set_tests_properties(nta-vfio-nvme-probe PROPERTIES
     TIMEOUT 60 SKIP_RETURN_CODE 77 RESOURCE_LOCK nta_nvme_physical
@@ -1576,7 +1604,7 @@ if(Python3_Interpreter_FOUND)
   )
   add_test(
     NAME nta-paged-attention-nvme-gpu
-    COMMAND
+    COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
       $<TARGET_FILE:nta-paged-attention>
       --mode=nvme
       --requests=4

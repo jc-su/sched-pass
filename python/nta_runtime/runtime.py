@@ -6,44 +6,20 @@ import ctypes
 import ctypes.util
 import dataclasses
 import enum
-import numbers
 import os
 import pathlib
 from collections.abc import Iterable
 from typing import Any
 
+from .abi import bounded_integer as _bounded_integer
+from .abi import u32 as _u32
+from .abi import u64 as _u64
+from .request_contract import RequestSpec, _RequestSpec
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
 API_VERSION = 37
-_UINT32_MAX = (1 << 32) - 1
-_UINT64_MAX = (1 << 64) - 1
 _INT32_MAX = (1 << 31) - 1
-
-
-def _bounded_integer(
-    value: int, name: str, *, minimum: int, maximum: int
-) -> int:
-    """Validate a Python integer before it crosses the C ABI boundary."""
-
-    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-        raise ValueError(f"{name} must be an integer")
-    result = int(value)
-    if result < minimum or result > maximum:
-        raise ValueError(f"{name} is outside [{minimum}, {maximum}]")
-    return result
-
-
-def _u32(value: int, name: str, *, positive: bool = False) -> int:
-    return _bounded_integer(
-        value, name, minimum=1 if positive else 0, maximum=_UINT32_MAX
-    )
-
-
-def _u64(value: int, name: str, *, positive: bool = False) -> int:
-    return _bounded_integer(
-        value, name, minimum=1 if positive else 0, maximum=_UINT64_MAX
-    )
 
 
 def _device_ordinal(value: int, name: str = "device_ordinal") -> int:
@@ -552,18 +528,6 @@ class _RequestProgress(ctypes.Structure):
     ]
 
 
-class _RequestSpec(ctypes.Structure):
-    _fields_ = [
-        ("request_id", ctypes.c_uint64),
-        ("deadline_clock", ctypes.c_uint64),
-        ("max_outstanding_bytes", ctypes.c_uint64),
-        ("slot", ctypes.c_uint32),
-        ("generation", ctypes.c_uint32),
-        ("tenant_id", ctypes.c_uint32),
-        ("priority", ctypes.c_uint32),
-    ]
-
-
 def _validate_abi_layouts() -> None:
     layouts = (
         ("OperatorContract", ctypes.sizeof(_OperatorContract), 80),
@@ -627,37 +591,6 @@ class RuntimeConfig:
             int(self.enable_cta_nvme_try_issue),
             self.tenant_capacity,
             self.staging_byte_capacity,
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class RequestSpec:
-    slot: int
-    request_id: int
-    generation: int
-    tenant_id: int = 0
-    priority: int = 0
-    deadline_clock: int = 0
-    max_outstanding_bytes: int = (1 << 64) - 1
-
-    def __post_init__(self) -> None:
-        _u32(self.slot, "request slot")
-        _u64(self.request_id, "request id")
-        _u32(self.generation, "request generation")
-        _u32(self.tenant_id, "request tenant")
-        _u32(self.priority, "request priority")
-        _u64(self.deadline_clock, "request deadline")
-        _u64(self.max_outstanding_bytes, "request max outstanding bytes")
-
-    def native(self) -> _RequestSpec:
-        return _RequestSpec(
-            self.request_id,
-            self.deadline_clock,
-            self.max_outstanding_bytes,
-            self.slot,
-            self.generation,
-            self.tenant_id,
-            self.priority,
         )
 
 

@@ -697,22 +697,26 @@ NvmeBuffer::NvmeBuffer(NvmeBuffer &&) noexcept = default;
 NvmeBuffer &NvmeBuffer::operator=(NvmeBuffer &&) noexcept = default;
 
 void *NvmeBuffer::deviceAddress() const noexcept {
-  return impl_->deviceAddress;
+  return impl_ == nullptr ? nullptr : impl_->deviceAddress;
 }
 
 std::uint64_t NvmeBuffer::dmaPageListAddress() const noexcept {
-  return reinterpret_cast<std::uint64_t>(impl_->devicePageList);
+  return impl_ == nullptr
+             ? 0
+             : reinterpret_cast<std::uint64_t>(impl_->devicePageList);
 }
 
 std::uint32_t NvmeBuffer::dmaPageCount() const noexcept {
-  return impl_->pageCount;
+  return impl_ == nullptr ? 0 : impl_->pageCount;
 }
 
 std::size_t NvmeBuffer::bytes() const noexcept {
-  return impl_->allocationBytes;
+  return impl_ == nullptr ? 0 : impl_->allocationBytes;
 }
 
-NvmeDmaTarget NvmeBuffer::dmaTarget() const noexcept { return impl_->target; }
+NvmeDmaTarget NvmeBuffer::dmaTarget() const noexcept {
+  return impl_ == nullptr ? NvmeDmaTarget::HostMapped : impl_->target;
+}
 
 bool NvmeBuffer::ownsDestinationMemory() const noexcept {
   return impl_ != nullptr && impl_->ownsDestinationMemory;
@@ -730,18 +734,22 @@ NvmeTransport::NvmeTransport(NvmeTransport &&) noexcept = default;
 NvmeTransport &NvmeTransport::operator=(NvmeTransport &&) noexcept = default;
 
 const NvmeCapabilities &NvmeTransport::capabilities() const noexcept {
-  return impl_->capabilities;
+  static const NvmeCapabilities empty{};
+  return impl_ == nullptr ? empty : impl_->capabilities;
 }
 
 int NvmeTransport::deviceOrdinal() const noexcept {
-  return impl_->deviceOrdinal;
+  return impl_ == nullptr ? -1 : impl_->deviceOrdinal;
 }
 
 abi::NvmeQueueView *NvmeTransport::deviceQueue() const noexcept {
-  return impl_->deviceQueue;
+  return impl_ == nullptr ? nullptr : impl_->deviceQueue;
 }
 
 NvmeQueueStats NvmeTransport::readStats() const {
+  if (impl_ == nullptr) {
+    throw std::logic_error("cannot read stats from a moved-from NVMe transport");
+  }
   detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
   impl_->reapMappings();
   abi::NvmeQueueView queue{};
@@ -768,6 +776,9 @@ NvmeQueueStats NvmeTransport::readStats() const {
 }
 
 std::unique_ptr<NvmeBuffer> NvmeTransport::allocate(std::size_t bytes) {
+  if (impl_ == nullptr) {
+    throw std::logic_error("cannot allocate from a moved-from NVMe transport");
+  }
   detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
   impl_->reapMappings();
   if (bytes == 0 || bytes > impl_->capabilities.maxTransferBytes ||
@@ -869,6 +880,10 @@ std::unique_ptr<NvmeBuffer> NvmeTransport::allocate(std::size_t bytes) {
 
 std::unique_ptr<NvmeBuffer>
 NvmeTransport::mapExternalHbm(void *deviceAddress, std::size_t bytes) {
+  if (impl_ == nullptr) {
+    throw std::logic_error(
+        "cannot map HBM through a moved-from NVMe transport");
+  }
   detail::CudaDeviceGuard deviceGuard(impl_->deviceOrdinal);
   impl_->reapMappings();
   constexpr std::size_t peerAlignment = 64U * 1024U;

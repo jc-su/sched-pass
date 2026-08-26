@@ -186,9 +186,18 @@ class ExecutionSession:
 
     def launch_group(self, work_ids: Iterable[int]) -> None:
         """Record a bounded native launch for already-runnable work."""
-        for work_id in work_ids:
+        values = tuple(work_ids)
+        if len(set(values)) != len(values):
+            raise RuntimeError("a launch group cannot contain duplicate work units")
+        for work_id in values:
             if self.ledger.state(work_id) is not Availability.READY:
                 raise RuntimeError(f"work unit {work_id} is not runnable")
+        running = self.ledger.state_counts[Availability.RUNNING]
+        if running + len(values) > self.protocol.max_inflight_units:
+            raise RuntimeError(
+                "launch group exceeds execution protocol in-flight capacity"
+            )
+        for work_id in values:
             self.ledger.transition(
                 work_id,
                 Availability.RUNNING,

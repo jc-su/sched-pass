@@ -29,6 +29,12 @@ int main() {
     std::cerr << "CXL allocator did not coalesce released slices\n";
     return 1;
   }
+  allocator.release(aligned);
+  if (allocator.allocatedBytes() != 0 ||
+      allocator.availableBytes() != allocator.capacity()) {
+    std::cerr << "CXL allocator accepted a duplicate release\n";
+    return 1;
+  }
 
   bool rejected = false;
   try {

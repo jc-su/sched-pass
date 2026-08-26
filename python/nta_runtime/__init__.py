@@ -60,7 +60,7 @@ _EXPORTS = {
     "Placement": ("runtime", "Placement"),
     "Replica": ("runtime", "Replica"),
     "RequestRange": ("runtime", "RequestRange"),
-    "RequestSpec": ("runtime", "RequestSpec"),
+    "RequestSpec": ("request_contract", "RequestSpec"),
     "RequestProgress": ("runtime", "RequestProgress"),
     "RequestProgressSnapshot": ("runtime", "RequestProgressSnapshot"),
     "Runtime": ("runtime", "Runtime"),

@@ -44,6 +44,33 @@ def main() -> None:
     stats = session.expose_stats()
     assert stats["work_complete"] == 1
     assert stats["work_is_heterogeneous"]
+
+    bounded = ExecutionSession.from_tiles(
+        epoch=5,
+        granularity=Granularity.PAGE_GROUP,
+        protocol=ExecutionProtocolConfig.late_bound(
+            granularity=Granularity.PAGE_GROUP,
+            max_inflight_units=1,
+        ),
+        tiles=(
+            ExecutionTile(0, bindings[0], 0, 0, 1, (0,), 128, True, 100, 0),
+            ExecutionTile(1, bindings[1], 0, 1, 1, (0,), 128, True, 100, 1),
+        ),
+    )
+    try:
+        bounded.launch_group((0, 1))
+    except RuntimeError as error:
+        assert "in-flight capacity" in str(error)
+    else:
+        raise AssertionError("launch group exceeded its in-flight capacity")
+    assert bounded.ready_work == (0, 1)
+    try:
+        bounded.launch_group((0, 0))
+    except RuntimeError as error:
+        assert "duplicate" in str(error)
+    else:
+        raise AssertionError("duplicate launch work unit was accepted")
+    assert bounded.ready_work == (0, 1)
     print("execution_core=pass")
 
 
