@@ -319,6 +319,14 @@ def main() -> int:
             )
             for report in reports
         ),
+        "all_batch_heterogeneity_proven": all(
+            bool(
+                report["mechanism_activation"].get(
+                    "batch_heterogeneity_proven"
+                )
+            )
+            for report in reports
+        ),
         "evidence_scopes": sorted(
             {str(report.get("evidence_scope")) for report in reports}
         ),
@@ -392,7 +400,8 @@ def main() -> int:
             and aggregate["all_fallback_free"]
             and aggregate["all_external_attention_transformed"]
             and aggregate["all_native_work_unit_active"]
-            and aggregate["all_heterogeneous_work_unit_active"],
+            and aggregate["all_heterogeneous_work_unit_active"]
+            and aggregate["all_batch_heterogeneity_proven"],
         },
         "physical_bytes": {
             # The registered evidence standard records physically staged

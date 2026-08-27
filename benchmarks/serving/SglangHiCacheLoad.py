@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import importlib.metadata
 import json
@@ -26,6 +27,7 @@ try:
     )
     from experiments.queueing import finite_window_littles_law
     from experiments.validate_workload import validate as validate_workload
+    from experiments.workload_heterogeneity import serving_batch_heterogeneity
 except ModuleNotFoundError:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
     from experiments.bailian import (
@@ -36,6 +38,7 @@ except ModuleNotFoundError:
     )
     from experiments.queueing import finite_window_littles_law
     from experiments.validate_workload import validate as validate_workload
+    from experiments.workload_heterogeneity import serving_batch_heterogeneity
 
 from SglangHiCache import (
     configure_environment,
@@ -124,6 +127,15 @@ _MEASUREMENT_COUNTERS = frozenset(
         "mixed_forward_batches",
         "mixed_forward_requests",
         "mixed_scheduled_requests",
+        "multi_request_engine_batches",
+        "heterogeneous_engine_batches",
+        "multi_axis_heterogeneous_batches",
+        "sequence_length_heterogeneous_batches",
+        "availability_heterogeneous_batches",
+        "external_rows_heterogeneous_batches",
+        "tenant_heterogeneous_batches",
+        "priority_heterogeneous_batches",
+        "deadline_heterogeneous_batches",
         "native_external_attention_launches",
         "nvme_bytes",
         "nvme_destination_rebinds",
@@ -686,18 +698,22 @@ def _tokenized_structure_prompt(tokenizer: Any, row: dict[str, Any]) -> tuple[st
     return prompt, measured
 
 
-def _load_workload(
-    path: pathlib.Path, tokenizer: Any
-) -> tuple[
-    list[str],
-    list[str],
-    list[str],
-    list[str],
-    list[float],
-    list[int],
-    list[int],
-    dict[str, Any],
-]:
+@dataclass(frozen=True)
+class LoadedWorkload:
+    """Role-partitioned replay inputs sharing one exact arrival timebase."""
+
+    resident_request_ids: tuple[str, ...]
+    external_request_ids: tuple[str, ...]
+    resident_prompt_text: tuple[str, ...]
+    external_prompt_text: tuple[str, ...]
+    resident_arrival_offsets: tuple[float, ...]
+    external_arrival_offsets: tuple[float, ...]
+    resident_output_tokens: tuple[int, ...]
+    external_output_tokens: tuple[int, ...]
+    metadata: dict[str, Any]
+
+
+def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
     manifest = validate_workload(path.resolve())
     records_path = path.resolve().parent / str(manifest["records_file"])
     rows = read_jsonl(records_path)
@@ -709,15 +725,13 @@ def _load_workload(
             "normalized workload demand digest does not match its records"
         )
     explicit_states = [row.get("request_state") for row in rows]
-    if any(state is not None for state in explicit_states):
-        resident_rows = [row for row in rows if row.get("request_state") == "resident"]
-        external_rows = [row for row in rows if row.get("request_state") != "resident"]
-    else:
-        # A structure-only manifest without an application state annotation is
-        # still usable, but this deterministic split is recorded as harness
-        # policy rather than mistaken for a production label.
-        resident_rows = rows[:1]
-        external_rows = rows[1:]
+    if any(state not in {"resident", "external"} for state in explicit_states):
+        raise RuntimeError(
+            "serving replay requires explicit resident/external placement for "
+            "every request"
+        )
+    resident_rows = [row for row in rows if row["request_state"] == "resident"]
+    external_rows = [row for row in rows if row["request_state"] == "external"]
     if not resident_rows or not external_rows:
         raise RuntimeError(
             "serving replay needs at least one resident and one external request; "
@@ -739,24 +753,21 @@ def _load_workload(
             return value
         return str(value)
 
-    external_offsets = [float(row["arrival_seconds"]) for row in external_rows]
-    origin = min(external_offsets)
-    external_offsets = [offset - origin for offset in external_offsets]
-    request_arrival_offsets = {str(row["request_id"]): 0.0 for row in resident_rows}
-    request_arrival_offsets.update(
-        {
-            str(row["request_id"]): offset
-            for row, offset in zip(external_rows, external_offsets)
-        }
+    origin = min(float(row["arrival_seconds"]) for row in rows)
+    resident_offsets = tuple(
+        float(row["arrival_seconds"]) - origin for row in resident_rows
     )
+    external_offsets = tuple(
+        float(row["arrival_seconds"]) - origin for row in external_rows
+    )
+    request_arrival_offsets = {
+        str(row["request_id"]): float(row["arrival_seconds"]) - origin
+        for row in rows
+    }
     block_size = int(manifest["block_size"])
     resident_page_ids = unique_input_page_ids(resident_rows, block_size=block_size)
     external_cached_prefix_tokens = [
-        min(
-            int(row["input_length"]) - 1,
-            int(row.get("shared_prefix_blocks", 0)) * block_size,
-        )
-        for row in external_rows
+        int(row["cached_prefix_tokens"]) for row in external_rows
     ]
     external_cached_page_ids = frozenset(
         page_id
@@ -777,9 +788,8 @@ def _load_workload(
         "block_size": block_size,
         "arrival": manifest["arrival"],
         "prompt": manifest["prompt"],
-        "state_mapping": "explicit_request_state"
-        if any(state is not None for state in explicit_states)
-        else "first_row_resident_fallback",
+        "state_mapping": "explicit_request_state",
+        "cache_placement": manifest["cache_placement"],
         "request_count": len(rows),
         "request_id_order": [str(row["request_id"]) for row in rows],
         "request_arrival_offsets": request_arrival_offsets,
@@ -803,15 +813,20 @@ def _load_workload(
             resident_page_ids & external_cached_page_ids
         ),
     }
-    return (
-        [str(row["request_id"]) for row in resident_rows],
-        [str(row["request_id"]) for row in external_rows],
-        resident_prompt_text,
-        external_prompt_text,
-        external_offsets,
-        metadata["resident_output_tokens"],
-        metadata["external_output_tokens"],
-        metadata,
+    return LoadedWorkload(
+        resident_request_ids=tuple(
+            str(row["request_id"]) for row in resident_rows
+        ),
+        external_request_ids=tuple(
+            str(row["request_id"]) for row in external_rows
+        ),
+        resident_prompt_text=tuple(resident_prompt_text),
+        external_prompt_text=tuple(external_prompt_text),
+        resident_arrival_offsets=resident_offsets,
+        external_arrival_offsets=external_offsets,
+        resident_output_tokens=tuple(metadata["resident_output_tokens"]),
+        external_output_tokens=tuple(metadata["external_output_tokens"]),
+        metadata=metadata,
     )
 
 
@@ -992,11 +1007,12 @@ async def _run_load(
     resident_prompts: list[TokenInput],
     external_prompts: list[TokenInput],
     args: argparse.Namespace,
-    external_offsets: list[float] | None = None,
-    resident_output_tokens: list[int] | None = None,
-    external_output_tokens: list[int] | None = None,
-    resident_request_ids: list[str] | None = None,
-    external_request_ids: list[str] | None = None,
+    resident_offsets: Sequence[float] | None = None,
+    external_offsets: Sequence[float] | None = None,
+    resident_output_tokens: Sequence[int] | None = None,
+    external_output_tokens: Sequence[int] | None = None,
+    resident_request_ids: Sequence[str] | None = None,
+    external_request_ids: Sequence[str] | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     started = time.perf_counter()
     resident_started = asyncio.Event()
@@ -1033,11 +1049,19 @@ async def _run_load(
             ),
             gate=None,
             first_token_event=resident_started,
-            offset_seconds=0.0,
+            offset_seconds=(
+                float(resident_offsets[index])
+                if resident_offsets is not None
+                else 0.0
+            ),
             load_start_seconds=started,
         )
         return record
 
+    if resident_offsets is not None and len(resident_offsets) != len(
+        resident_prompts
+    ):
+        raise RuntimeError("workload arrival count does not match resident prompts")
     if external_offsets is not None:
         if len(external_offsets) != len(external_prompts):
             raise RuntimeError("workload arrival count does not match external prompts")
@@ -1075,7 +1099,11 @@ async def _run_load(
                     if external_request_ids is not None
                     else None
                 ),
-                gate=None if external_offsets is not None else resident_started,
+                gate=(
+                    None
+                    if resident_offsets is not None and external_offsets is not None
+                    else resident_started
+                ),
                 first_token_event=None,
                 offset_seconds=offsets[index],
                 load_start_seconds=started,
@@ -1144,23 +1172,24 @@ def main() -> int:
     from transformers import AutoTokenizer
 
     workload_metadata: dict[str, Any] | None = None
-    external_offsets: list[float] | None = None
-    resident_output_tokens: list[int] | None = None
-    external_output_tokens: list[int] | None = None
-    resident_request_ids: list[str] | None = None
-    external_request_ids: list[str] | None = None
+    resident_offsets: Sequence[float] | None = None
+    external_offsets: Sequence[float] | None = None
+    resident_output_tokens: Sequence[int] | None = None
+    external_output_tokens: Sequence[int] | None = None
+    resident_request_ids: Sequence[str] | None = None
+    external_request_ids: Sequence[str] | None = None
     tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()))
     if args.workload_manifest is not None:
-        (
-            resident_request_ids,
-            external_request_ids,
-            resident_texts,
-            external_texts,
-            external_offsets,
-            resident_output_tokens,
-            external_output_tokens,
-            workload_metadata,
-        ) = _load_workload(args.workload_manifest, tokenizer)
+        loaded_workload = _load_workload(args.workload_manifest, tokenizer)
+        resident_request_ids = loaded_workload.resident_request_ids
+        external_request_ids = loaded_workload.external_request_ids
+        resident_texts = loaded_workload.resident_prompt_text
+        external_texts = loaded_workload.external_prompt_text
+        resident_offsets = loaded_workload.resident_arrival_offsets
+        external_offsets = loaded_workload.external_arrival_offsets
+        resident_output_tokens = loaded_workload.resident_output_tokens
+        external_output_tokens = loaded_workload.external_output_tokens
+        workload_metadata = loaded_workload.metadata
         if workload_metadata["tokenization_errors"]:
             raise RuntimeError(
                 "Bailian structure prompt could not preserve exact tokenizer lengths; "
@@ -1471,10 +1500,11 @@ def main() -> int:
             ]
             warmup_records, _ = engine.loop.run_until_complete(
                 _run_load(
-                    engine,
-                    resident_prompts,
-                    calibration_external_prompts,
+                engine,
+                resident_prompts,
+                calibration_external_prompts,
                     args,
+                    resident_offsets,
                     external_offsets,
                     resident_output_tokens,
                     external_output_tokens,
@@ -1529,6 +1559,7 @@ def main() -> int:
                 resident_prompts,
                 external_prompts,
                 args,
+                resident_offsets,
                 external_offsets,
                 resident_output_tokens,
                 external_output_tokens,
@@ -1728,6 +1759,7 @@ def main() -> int:
     selected_bytes, physical_bytes, byte_accounting_status = _engine_byte_accounting(
         stats
     )
+    batch_heterogeneity = serving_batch_heterogeneity(records, stats)
     report = {
         "schema": 1,
         "classification": "sglang-hicache-load",
@@ -1780,6 +1812,7 @@ def main() -> int:
             and calibration_contract["verified"]
         ),
         "calibration_input_contract": calibration_contract,
+        "batch_heterogeneity": batch_heterogeneity,
         "workload": workload_metadata,
         "demand_semantics": "exact",
         "execution_dispatch": execution_dispatch,

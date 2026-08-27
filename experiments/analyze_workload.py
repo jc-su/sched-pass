@@ -19,6 +19,81 @@ except ImportError:  # pragma: no cover - direct CLI execution
     from validate_workload import validate
 
 
+def _percentile(values: list[float | int], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _quantiles(values: list[float | int], fractions: tuple[float, ...]) -> dict[str, float]:
+    return {
+        f"p{round(fraction * 100)}": _percentile(values, fraction)
+        for fraction in fractions
+    }
+
+
+def _followup_statistics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    timestamp_by_request: dict[str, float] = {}
+    gaps: list[float] = []
+    followups = 0
+    unresolved = 0
+    for row in rows:
+        request_id = str(row["request_id"])
+        timestamp = float(row["arrival_seconds"])
+        parent = row.get("parent_chat_id")
+        if parent not in (None, "", -1, "-1"):
+            followups += 1
+            parent_timestamp = timestamp_by_request.get(str(parent))
+            if parent_timestamp is None or parent_timestamp > timestamp:
+                unresolved += 1
+            else:
+                gaps.append(timestamp - parent_timestamp)
+        timestamp_by_request[request_id] = timestamp
+    return {
+        "requests": followups,
+        "request_fraction": followups / len(rows),
+        "resolved_parent_links": len(gaps),
+        "unresolved_parent_links": unresolved,
+        "reuse_gap_seconds": _quantiles(gaps, (0.50, 0.90, 0.99)),
+    }
+
+
+def _block_repetition_statistics(
+    rows: list[dict[str, Any]], block_size: int
+) -> dict[str, Any]:
+    seen: set[str] = set()
+    total_occurrences = 0
+    repeated_occurrences = 0
+    covered_tokens = 0
+    input_tokens = 0
+    for row in rows:
+        hashes = [str(value) for value in row["hash_ids"]]
+        total_occurrences += len(hashes)
+        repeated_occurrences += sum(value in seen for value in hashes)
+        seen.update(hashes)
+        request_tokens = int(row["input_length"])
+        input_tokens += request_tokens
+        covered_tokens += min(request_tokens, len(hashes) * block_size)
+    return {
+        "total_block_occurrences": total_occurrences,
+        "distinct_block_ids": len(seen),
+        "cross_request_repeated_occurrences": repeated_occurrences,
+        "cross_request_repeat_fraction": (
+            repeated_occurrences / total_occurrences if total_occurrences else 0.0
+        ),
+        "input_token_hash_coverage": (
+            covered_tokens / input_tokens if input_tokens else 0.0
+        ),
+    }
+
+
 def analyze(path: Path) -> dict[str, Any]:
     path = path.resolve()
     manifest = validate(path)
@@ -46,8 +121,13 @@ def analyze(path: Path) -> dict[str, Any]:
             probability = count / len(states)
             entropy -= probability * math.log2(probability)
     mean_gap = statistics.fmean(positive_gaps) if positive_gaps else 0.0
+    all_gap_mean = statistics.fmean(gaps) if gaps else 0.0
+    block_size = int(manifest["block_size"])
+    reused_prefix_tokens = [value * block_size for value in shared if value > 0]
+    trace_span = arrivals[-1] - arrivals[0] if len(arrivals) > 1 else 0.0
+    block_repetition = _block_repetition_statistics(rows, block_size)
     report = {
-        "schema": 1,
+        "schema": 2,
         "classification": "bailian-rq0-opportunity-report",
         "provenance": {
             "manifest": str(path),
@@ -66,17 +146,32 @@ def analyze(path: Path) -> dict[str, Any]:
                 if len(positive_gaps) > 1 and mean_gap > 0
                 else 0.0
             ),
+            "trace_span_seconds": trace_span,
+            "mean_request_rate_per_second": (
+                len(rows) / trace_span if trace_span > 0 else 0.0
+            ),
+            "interarrival_cv": (
+                statistics.pstdev(gaps) / all_gap_mean
+                if len(gaps) > 1 and all_gap_mean > 0
+                else 0.0
+            ),
         },
         "lengths": {
             "input_tokens": {
                 "min": min(input_lengths),
-                "median": statistics.median(input_lengths),
+                **_quantiles(input_lengths, (0.50, 0.90, 0.99)),
                 "mean": statistics.fmean(input_lengths),
                 "max": max(input_lengths),
+                "share_at_least_4k": sum(value >= 4096 for value in input_lengths)
+                / len(rows),
+                "share_at_least_8k": sum(value >= 8192 for value in input_lengths)
+                / len(rows),
+                "share_at_least_16k": sum(value >= 16384 for value in input_lengths)
+                / len(rows),
             },
             "output_tokens": {
                 "min": min(output_lengths),
-                "median": statistics.median(output_lengths),
+                **_quantiles(output_lengths, (0.50, 0.90, 0.99)),
                 "mean": statistics.fmean(output_lengths),
                 "max": max(output_lengths),
             },
@@ -86,6 +181,27 @@ def analyze(path: Path) -> dict[str, Any]:
             "shared_request_fraction": sum(value > 0 for value in shared) / len(rows),
             "mean_shared_prefix_blocks": statistics.fmean(shared),
             "max_shared_prefix_blocks": max(shared),
+            "reused_prefix_tokens": _quantiles(
+                reused_prefix_tokens, (0.50, 0.90, 0.99)
+            ),
+            "exact_prefix_block_occurrence_fraction": (
+                sum(shared) / block_repetition["total_block_occurrences"]
+                if block_repetition["total_block_occurrences"]
+                else 0.0
+            ),
+        },
+        "sessions": _followup_statistics(rows),
+        "block_identity": block_repetition,
+        "request_shape_heterogeneity": {
+            "distinct_input_lengths": len(set(input_lengths)),
+            "distinct_output_lengths": len(set(output_lengths)),
+            "distinct_input_output_prefix_shapes": len(
+                set(zip(input_lengths, output_lengths, shared))
+            ),
+            "joint_shape_heterogeneous": len(
+                set(zip(input_lengths, output_lengths, shared))
+            )
+            > 1,
         },
         "state_heterogeneity": {
             "counts": state_counts,

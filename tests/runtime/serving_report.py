@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from experiments.validate_serving_report import validate  # noqa: E402
+from experiments.workload_heterogeneity import (  # noqa: E402
+    serving_batch_heterogeneity,
+)
 
 
 def single() -> dict[str, object]:
@@ -31,11 +34,14 @@ def single() -> dict[str, object]:
             "admission_delay_seconds": 0.0,
             "system_time_seconds": 0.2,
             "completion_tokens": 2,
+            "input_tokens": 32,
+            "device_cached_tokens": 31,
+            "host_cached_tokens": 0,
             "text_sha256": "resident-digest",
             "inter_token_seconds": [0.01],
         }
     ]
-    return {
+    report = {
         "schema": 1,
         "classification": "sglang-hicache-load",
         "revision": "test-revision",
@@ -87,9 +93,55 @@ def single() -> dict[str, object]:
         "physical_bytes": None,
         "byte_accounting_status": "not exposed by SGLang engine metadata",
     }
+    report["batch_heterogeneity"] = serving_batch_heterogeneity(
+        records, report["engine_stats"]
+    )
+    return report
 
 
 def main() -> None:
+    heterogeneous_records = [
+        {
+            "kind": "resident",
+            "input_tokens": 32,
+            "completion_tokens": 8,
+            "host_cached_tokens": 0,
+            "device_cached_tokens": 31,
+            "arrival_offset_seconds": 0.0,
+            "submitted_offset_seconds": 0.0,
+            "finished_offset_seconds": 0.2,
+        },
+        {
+            "kind": "external",
+            "input_tokens": 128,
+            "completion_tokens": 2,
+            "host_cached_tokens": 95,
+            "device_cached_tokens": 1,
+            "arrival_offset_seconds": 0.05,
+            "submitted_offset_seconds": 0.05,
+            "finished_offset_seconds": 0.15,
+        },
+    ]
+    heterogeneity = serving_batch_heterogeneity(
+        heterogeneous_records,
+        [
+            {
+                "multi_request_engine_batches": 1,
+                "heterogeneous_engine_batches": 1,
+                "multi_axis_heterogeneous_batches": 1,
+                "sequence_length_heterogeneous_batches": 1,
+                "availability_heterogeneous_batches": 1,
+                "mixed_dependency_layers": 1,
+            }
+        ],
+    )
+    assert heterogeneity["proven"] is True
+    assert heterogeneity["heterogeneous_axis_count"] == 6
+    assert abs(
+        heterogeneity["client_overlap"]["resident_external_overlap_seconds"]
+        - 0.1
+    ) < 1e-12
+
     stock = single()
     nta = copy.deepcopy(stock)
     nta["correctness"] = {"verification_failures": 0, "generated_text_sha256": "nta"}
@@ -112,6 +164,7 @@ def main() -> None:
             "ticketed_incremental_launches": 1,
             "native_work_unit_active": True,
             "heterogeneous_work_unit_active": False,
+            "batch_heterogeneity_proven": False,
             "transport_only": False,
         },
         "stock_slo_goodput": 5.0,

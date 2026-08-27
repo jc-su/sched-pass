@@ -565,6 +565,7 @@ def main() -> None:
     from nta_runtime.engines.sglang import (
         _capacity_constrained_transfer_dependencies,
         _project_work_acquisitions,
+        _request_batch_heterogeneity,
         _resolve_request_acquisitions,
     )
     from nta_runtime.flashinfer_schedule import Schedule
@@ -582,6 +583,30 @@ def main() -> None:
         _resolve_request_acquisitions(acquisitions, transfers, lease_transfer_rows=40)
         == acquisitions
     )
+    heterogeneous_bindings = (
+        RequestBinding(0, 10, 1, stable_request_id("heterogeneous-0")),
+        RequestBinding(
+            1,
+            11,
+            1,
+            stable_request_id("heterogeneous-1"),
+            priority=2,
+            tenant_id=7,
+        ),
+        RequestBinding(2, 12, 1, stable_request_id("heterogeneous-2")),
+    )
+    assert _request_batch_heterogeneity(
+        heterogeneous_bindings, (40, 8, 16), acquisitions
+    ) == (
+        "sequence_length",
+        "availability",
+        "external_rows",
+        "tenant",
+        "priority",
+    )
+    assert _request_batch_heterogeneity(
+        (heterogeneous_bindings[0],), (40,), (acquisitions[0],)
+    ) == ()
     projected_dependencies = _project_work_acquisitions(
         Schedule(
             (0, 0, 0, 0, 0, 0, 1, 2),

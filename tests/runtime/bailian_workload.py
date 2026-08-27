@@ -22,6 +22,7 @@ from experiments.bailian import (  # noqa: E402
     write_workload,
 )
 from experiments.check_regression import compare  # noqa: E402
+from experiments.prepare_serving_cohort import build_cohort  # noqa: E402
 from experiments.run_evaluation import validate_spec  # noqa: E402
 from experiments.validate_workload import validate  # noqa: E402
 from SglangHiCacheLoad import _load_workload  # noqa: E402
@@ -138,7 +139,13 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="nta-bailian-") as directory:
         root = Path(directory)
         manifest, rows = normalize(
-            ONLINE, arrival_mode="trace", synthesize_prompts=True
+            [
+                {**ONLINE[0], "parent_chat_id": -1, "turn": 0},
+                {**ONLINE[1], "parent_chat_id": "a", "turn": 1},
+            ],
+            arrival_mode="trace",
+            synthesize_prompts=True,
+            state_policy="root_resident",
         )
         write_workload(root / "manifest.json", root / "records.jsonl", manifest, rows)
         validate(root / "manifest.json")
@@ -174,7 +181,43 @@ def main() -> None:
                 return " ".join(f"token-{value}" for value in token_ids[:-1])
 
         loaded = _load_workload(root / "manifest.json", LossyTokenizer())
-        assert loaded[-1]["tokenization_errors"] == len(rows)
+        assert loaded.metadata["tokenization_errors"] == len(rows)
+        assert loaded.resident_arrival_offsets == (0.0,)
+        assert loaded.external_arrival_offsets == (0.5,)
+
+        cohort_manifest, cohort_rows = build_cohort(
+            root / "manifest.json",
+            resident_requests=1,
+            external_requests=1,
+            context_length=64,
+            max_input_tokens=56,
+            max_output_tokens=8,
+            active_token_budget=96,
+            arrival_mode="batch_release",
+        )
+        cohort_path = root / "cohort-manifest.json"
+        write_workload(
+            cohort_path,
+            root / "cohort-records.jsonl",
+            cohort_manifest,
+            cohort_rows,
+        )
+        validated_cohort = validate(cohort_path)
+        assert validated_cohort["cohort_heterogeneity"][
+            "joint_shape_heterogeneity"
+        ]
+        assert validated_cohort["selection"]["active_tokens"] == sum(
+            row["input_length"] + max(1, row["output_length"])
+            for row in cohort_rows
+        )
+        assert {row["request_state"] for row in cohort_rows} == {
+            "resident",
+            "external",
+        }
+        assert all(row["arrival_seconds"] == 0.0 for row in cohort_rows)
+        loaded_cohort = _load_workload(cohort_path, LossyTokenizer())
+        assert loaded_cohort.resident_arrival_offsets == (0.0,)
+        assert loaded_cohort.external_arrival_offsets == (0.0,)
         document = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         assert document["request_count"] == 2
         fixture = (

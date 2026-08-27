@@ -490,6 +490,44 @@ def _cpu_sequence_lengths(forward_batch: Any, request_count: int) -> tuple[int, 
     return lengths
 
 
+def _request_batch_heterogeneity(
+    bindings: Sequence[RequestBinding],
+    sequence_lengths: Sequence[int],
+    acquisitions: Sequence[SglangAcquisitionSpan],
+) -> tuple[str, ...]:
+    """Return the exact axes that differ inside one engine ForwardBatch.
+
+    This is deliberately computed from the framework's CPU metadata and the
+    typed acquisition spans, never from request-level benchmark intent.  It
+    therefore proves that heterogeneous requests reached the *same* scheduler
+    forward instead of merely overlapping somewhere in the client trace.
+    """
+
+    size = len(bindings)
+    if len(sequence_lengths) != size or len(acquisitions) != size:
+        raise RuntimeError("SGLang batch heterogeneity vectors are misaligned")
+    if size < 2:
+        return ()
+    axes: list[str] = []
+    if len({int(value) for value in sequence_lengths}) > 1:
+        axes.append("sequence_length")
+    if len({item.is_external for item in acquisitions}) > 1:
+        axes.append("availability")
+    external_rows = {
+        int(item.row_count) for item in acquisitions if item.is_external
+    }
+    if len(external_rows) > 1:
+        axes.append("external_rows")
+    for name, values in (
+        ("tenant", (binding.tenant_id for binding in bindings)),
+        ("priority", (binding.priority for binding in bindings)),
+        ("deadline", (binding.deadline_clock for binding in bindings)),
+    ):
+        if len({int(value) for value in values}) > 1:
+            axes.append(name)
+    return tuple(axes)
+
+
 def _project_work_acquisitions(
     schedule: Schedule,
     acquisitions: Sequence[SglangAcquisitionSpan],
@@ -1144,6 +1182,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             "mixed_scheduled_requests": 0,
             "mixed_direct_work_items": 0,
             "mixed_external_work_items": 0,
+            "multi_request_engine_batches": 0,
+            "heterogeneous_engine_batches": 0,
+            "multi_axis_heterogeneous_batches": 0,
+            "sequence_length_heterogeneous_batches": 0,
+            "availability_heterogeneous_batches": 0,
+            "external_rows_heterogeneous_batches": 0,
+            "tenant_heterogeneous_batches": 0,
+            "priority_heterogeneous_batches": 0,
+            "deadline_heterogeneous_batches": 0,
             "direct_host_layers": 0,
             "transformed_direct_launches": 0,
             "typed_bulk_attention_launches": 0,
@@ -2403,6 +2450,25 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         reason_key = f"host_selection_{selected.selection_reason}_batches"
         self._stats[reason_key] = self._stats.get(reason_key, 0) + 1
 
+    def _record_request_batch_heterogeneity(
+        self,
+        bindings: Sequence[RequestBinding],
+        sequence_lengths: Sequence[int],
+        acquisitions: Sequence[SglangAcquisitionSpan],
+    ) -> None:
+        if len(bindings) < 2:
+            return
+        self._stats["multi_request_engine_batches"] += 1
+        axes = _request_batch_heterogeneity(
+            bindings, sequence_lengths, acquisitions
+        )
+        if not axes:
+            return
+        self._stats["heterogeneous_engine_batches"] += 1
+        self._stats["multi_axis_heterogeneous_batches"] += int(len(axes) > 1)
+        for axis in axes:
+            self._stats[f"{axis}_heterogeneous_batches"] += 1
+
     def _init_external_metadata(
         self,
         forward_batch: Any,
@@ -2458,22 +2524,25 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._stats["batches"] += 1
                 self._stats["hicache_external_batches"] += 1
             return bounded_direct
+        metadata = forward_metadata(forward_batch)
+        if len(metadata.acquisitions) != len(bindings):
+            raise RuntimeError(
+                "SGLang acquisition metadata does not match request bindings"
+            )
+        lease_rows = int(pending.device_indices.numel())
+        acquisitions = _resolve_request_acquisitions(
+            metadata.acquisitions,
+            pending.transfers_by_operation(),
+            lease_transfer_rows=lease_rows,
+        )
+        sequence_lengths = _cpu_sequence_lengths(forward_batch, len(bindings))
+        self._record_request_batch_heterogeneity(
+            bindings, sequence_lengths, acquisitions
+        )
         if (
             self._tier_service.is_host_staged
             and os.environ.get("NTA_VERIFY_REQUEST_DEPENDENCIES") != "1"
         ):
-            metadata = forward_metadata(forward_batch)
-            if len(metadata.acquisitions) != len(bindings):
-                raise RuntimeError(
-                    "SGLang acquisition metadata does not match request bindings"
-                )
-            lease_rows = int(pending.device_indices.numel())
-            acquisitions = _resolve_request_acquisitions(
-                metadata.acquisitions,
-                pending.transfers_by_operation(),
-                lease_transfer_rows=lease_rows,
-            )
-            sequence_lengths = _cpu_sequence_lengths(forward_batch, len(bindings))
             work_dependencies = {
                 wrapper_id: _project_work_acquisitions(
                     schedule, acquisitions, sequence_lengths

@@ -21,7 +21,7 @@ from statistics import mean
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
-SCHEMA = 1
+SCHEMA = 2
 DEFAULT_BLOCK_SIZE = 16
 STATE_POLICIES = ("preserve", "root_resident")
 _MISSING = object()
@@ -51,6 +51,7 @@ def demand_trace_digest(rows: Sequence[Mapping[str, Any]]) -> str:
             "hash_ids": [str(value) for value in row.get("hash_ids", ())],
             "block_size": int(row.get("block_size", DEFAULT_BLOCK_SIZE)),
             "request_state": row.get("request_state"),
+            "cached_prefix_tokens": int(row["cached_prefix_tokens"]),
             "arrival_seconds": float(row["arrival_seconds"]),
         }
         for row in rows
@@ -242,6 +243,7 @@ def _normalize_row(
     )
     hashes = _hash_ids(_first(row, "hash_ids", "prefix_hashes", default=[]))
     timestamp = _first(row, "timestamp", "arrival", "arrival_seconds", default=None)
+    cached_prefix = _first(row, "cached_prefix_tokens", default=None)
     normalized: dict[str, Any] = {
         "request_id": request_id,
         "input_length": input_length,
@@ -253,6 +255,17 @@ def _normalize_row(
         "turn": int(_number(_first(row, "turn", default=index), "turn", integer=True)),
         "modality": str(_first(row, "type", "modality", default="text")),
         "request_state": _first(row, "request_state", "state", default=None),
+        "cached_prefix_tokens": (
+            None
+            if cached_prefix is None
+            else int(
+                _number(
+                    cached_prefix,
+                    "cached_prefix_tokens",
+                    integer=True,
+                )
+            )
+        ),
         "source_row": index,
     }
     if timestamp is not None:
@@ -378,6 +391,63 @@ def _assign_serving_states(rows: list[dict[str, Any]], policy: str) -> dict[str,
             "counts": counts,
         }
     raise ValueError(f"unhandled serving state policy {policy}")
+
+
+def _assign_cached_prefixes(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Make cache placement an explicit part of exact workload identity.
+
+    Source traces describe content reuse, not this experiment's HBM/remote
+    placement.  Unless every row carries an explicit cached-prefix length, the
+    normalized workload derives a reproducible synthetic placement from the
+    request-state policy: resident requests retain all but their query token,
+    while external requests retain only the previously observed exact prefix.
+    """
+
+    explicit = [row["cached_prefix_tokens"] is not None for row in rows]
+    if any(explicit) and not all(explicit):
+        raise ValueError(
+            "cached_prefix_tokens must be supplied for every request or none"
+        )
+    if all(explicit):
+        source = "trace_cached_prefix_tokens"
+        synthetic = False
+    else:
+        source = "request_state_and_exact_prefix_reuse"
+        synthetic = True
+        for row in rows:
+            state = row.get("request_state")
+            if state == "resident":
+                cached = max(0, int(row["input_length"]) - 1)
+            elif state == "external":
+                cached = min(
+                    max(0, int(row["input_length"]) - 1),
+                    int(row.get("shared_prefix_blocks", 0))
+                    * int(row["block_size"]),
+                )
+            else:
+                cached = 0
+            row["cached_prefix_tokens"] = cached
+    for row in rows:
+        cached = int(row["cached_prefix_tokens"])
+        if cached < 0 or cached >= int(row["input_length"]):
+            raise ValueError(
+                "cached_prefix_tokens must leave at least one uncached query token"
+            )
+        state = row.get("request_state")
+        if state == "resident" and cached != int(row["input_length"]) - 1:
+            raise ValueError(
+                "resident requests must cache the complete pre-query prefix"
+            )
+        if state == "external" and cached <= 0:
+            raise ValueError("external requests need a nonempty cached prefix")
+        if state is None and cached != 0:
+            raise ValueError("unplaced requests cannot carry cached-prefix state")
+        row["cached_prefix_tokens"] = cached
+    return {
+        "source": source,
+        "synthetic": synthetic,
+        "identity_field": "cached_prefix_tokens",
+    }
 
 
 def _normalize_arrivals(
@@ -506,6 +576,75 @@ def synthesize_prompt(
     }
 
 
+def workload_statistics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize normalized rows without weakening their exact identity."""
+
+    if not rows:
+        raise ValueError("workload statistics require at least one request")
+    arrival_gaps = [
+        float(right["arrival_seconds"]) - float(left["arrival_seconds"])
+        for left, right in zip(rows, rows[1:])
+    ]
+    return {
+        "input_tokens": {
+            "min": min(int(row["input_length"]) for row in rows),
+            "max": max(int(row["input_length"]) for row in rows),
+            "mean": mean(int(row["input_length"]) for row in rows),
+        },
+        "output_tokens": {
+            "min": min(int(row["output_length"]) for row in rows),
+            "max": max(int(row["output_length"]) for row in rows),
+            "mean": mean(int(row["output_length"]) for row in rows),
+        },
+        "shared_prefix_blocks": sum(
+            int(row.get("shared_prefix_blocks", 0)) for row in rows
+        ),
+        "requests_with_shared_prefix": sum(
+            int(row.get("shared_prefix_blocks", 0)) > 0 for row in rows
+        ),
+        "cached_prefix_tokens": {
+            "min": min(int(row["cached_prefix_tokens"]) for row in rows),
+            "max": max(int(row["cached_prefix_tokens"]) for row in rows),
+            "mean": mean(int(row["cached_prefix_tokens"]) for row in rows),
+        },
+        "uncached_query_rows": {
+            "min": min(
+                int(row["input_length"]) - int(row["cached_prefix_tokens"])
+                for row in rows
+            ),
+            "max": max(
+                int(row["input_length"]) - int(row["cached_prefix_tokens"])
+                for row in rows
+            ),
+            "mean": mean(
+                int(row["input_length"]) - int(row["cached_prefix_tokens"])
+                for row in rows
+            ),
+        },
+        "modalities": sorted({str(row["modality"]) for row in rows}),
+        "request_state_counts": {
+            str(state): sum(row.get("request_state") == state for row in rows)
+            for state in sorted(
+                {
+                    row.get("request_state")
+                    for row in rows
+                    if row.get("request_state") is not None
+                }
+            )
+        },
+        "interarrival_seconds": {
+            "min": min(arrival_gaps) if arrival_gaps else 0.0,
+            "max": max(arrival_gaps) if arrival_gaps else 0.0,
+            "mean": mean(arrival_gaps) if arrival_gaps else 0.0,
+            "positive_fraction": (
+                sum(gap > 0 for gap in arrival_gaps) / len(arrival_gaps)
+                if arrival_gaps
+                else 0.0
+            ),
+        },
+    }
+
+
 def normalize(
     rows: Iterable[Mapping[str, Any]],
     *,
@@ -525,6 +664,7 @@ def normalize(
         raise ValueError("workload input contains no requests")
     _prefix_reuse(normalized)
     state = _assign_serving_states(normalized, state_policy)
+    cache_placement = _assign_cached_prefixes(normalized)
     reference = None
     if reference_rows is not None:
         reference = [
@@ -550,13 +690,6 @@ def normalize(
     if synthesize_prompts:
         for row in normalized:
             row.update(synthesize_prompt(row))
-    arrival_gaps = [
-        right - left
-        for left, right in zip(
-            (row["arrival_seconds"] for row in normalized),
-            (row["arrival_seconds"] for row in normalized[1:]),
-        )
-    ]
     manifest = {
         "schema": SCHEMA,
         "classification": "bailian-structure-replay",
@@ -575,45 +708,8 @@ def normalize(
             "semantic_representativeness_claim": False,
         },
         "serving_state": state,
-        "statistics": {
-            "input_tokens": {
-                "min": min(row["input_length"] for row in normalized),
-                "max": max(row["input_length"] for row in normalized),
-                "mean": mean(row["input_length"] for row in normalized),
-            },
-            "output_tokens": {
-                "min": min(row["output_length"] for row in normalized),
-                "max": max(row["output_length"] for row in normalized),
-                "mean": mean(row["output_length"] for row in normalized),
-            },
-            "shared_prefix_blocks": sum(
-                row["shared_prefix_blocks"] for row in normalized
-            ),
-            "requests_with_shared_prefix": sum(
-                row["shared_prefix_blocks"] > 0 for row in normalized
-            ),
-            "modalities": sorted({row["modality"] for row in normalized}),
-            "request_state_counts": {
-                str(state): sum(row["request_state"] == state for row in normalized)
-                for state in sorted(
-                    {
-                        row["request_state"]
-                        for row in normalized
-                        if row["request_state"] is not None
-                    }
-                )
-            },
-            "interarrival_seconds": {
-                "min": min(arrival_gaps) if arrival_gaps else 0.0,
-                "max": max(arrival_gaps) if arrival_gaps else 0.0,
-                "mean": mean(arrival_gaps) if arrival_gaps else 0.0,
-                "positive_fraction": (
-                    sum(gap > 0 for gap in arrival_gaps) / len(arrival_gaps)
-                    if arrival_gaps
-                    else 0.0
-                ),
-            },
-        },
+        "cache_placement": cache_placement,
+        "statistics": workload_statistics(normalized),
         "claims": {
             "arrival_is_production_trace": arrival["production_arrival_claim"],
             "prompt_semantics_are_representative": False,
@@ -624,6 +720,7 @@ def normalize(
             # that claim; root_resident is an experimental construction.
             "serving_state_is_production_cache_state": state["policy"]
             == "preserve_existing",
+            "cache_placement_is_production": not cache_placement["synthetic"],
         },
     }
     manifest["demand_trace_digest"] = demand_trace_digest(normalized)

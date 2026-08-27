@@ -11,8 +11,10 @@ from typing import Any
 
 try:
     from .consumer_contract import validate_consumer_contract
+    from .workload_heterogeneity import serving_batch_heterogeneity
 except ImportError:  # pragma: no cover - direct script execution
     from consumer_contract import validate_consumer_contract
+    from workload_heterogeneity import serving_batch_heterogeneity
 
 
 def _require(condition: bool, message: str) -> None:
@@ -176,6 +178,19 @@ def _validate_byte_accounting(report: dict[str, Any]) -> None:
     )
 
 
+def _validate_batch_heterogeneity(report: dict[str, Any]) -> None:
+    try:
+        expected = serving_batch_heterogeneity(
+            report.get("records", ()), report.get("engine_stats", ())
+        )
+    except ValueError as error:
+        raise ValueError(f"serving batch heterogeneity is invalid: {error}") from error
+    _require(
+        report.get("batch_heterogeneity") == expected,
+        "serving batch heterogeneity does not match request and engine evidence",
+    )
+
+
 def _validate_tier_provenance(report: dict[str, Any]) -> None:
     """Validate tier metadata when the NTA engine publishes it.
 
@@ -323,6 +338,9 @@ def _validate_single(
             "admission_delay_seconds",
             "system_time_seconds",
             "completion_tokens",
+            "input_tokens",
+            "host_cached_tokens",
+            "device_cached_tokens",
             "text_sha256",
             "request_id",
         ):
@@ -418,6 +436,7 @@ def _validate_single(
     _validate_littles_law(report)
     _validate_workload(report)
     _validate_byte_accounting(report)
+    _validate_batch_heterogeneity(report)
     _validate_tier_provenance(report)
     _validate_consumer_contract(report, require_formal_execution=require_engine_stats)
 
@@ -475,6 +494,7 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
     expected_scope = (
         "heterogeneous_work_unit"
         if activation.get("heterogeneous_work_unit_active") is True
+        and activation.get("batch_heterogeneity_proven") is True
         else "native_work_unit"
         if activation.get("native_work_unit_active") is True
         else "transport_only"
@@ -485,6 +505,12 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         evidence_scope == expected_scope,
         "serving comparison evidence scope disagrees with activation counters",
     )
+    if evidence_scope == "heterogeneous_work_unit":
+        _require(
+            isinstance(nta.get("batch_heterogeneity"), dict)
+            and nta["batch_heterogeneity"].get("proven") is True,
+            "heterogeneous-work-unit evidence lacks batch-internal workload proof",
+        )
     _require(
         activation.get("external_attention_accounted") is True,
         "serving comparison did not account for exact external attention work",

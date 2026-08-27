@@ -596,6 +596,11 @@ def main() -> int:
             require_demand_graph=args.require_demand_graph,
             require_physical_compaction=args.batch_mode == "coalesced",
         )
+        batch_heterogeneity = nta.get("batch_heterogeneity")
+        activation["batch_heterogeneity_proven"] = bool(
+            isinstance(batch_heterogeneity, dict)
+            and batch_heterogeneity.get("proven") is True
+        )
     except RuntimeError as error:
         _write_failed_comparison(
             args.output,
@@ -781,6 +786,7 @@ def main() -> int:
     evidence_scope = (
         "heterogeneous_work_unit"
         if activation["heterogeneous_work_unit_active"]
+        and activation["batch_heterogeneity_proven"]
         else "native_work_unit"
         if activation["native_work_unit_active"]
         else "transport_only"

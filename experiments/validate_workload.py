@@ -24,7 +24,7 @@ def validate(path: Path) -> dict[str, Any]:
     if not isinstance(manifest, dict):
         raise ValueError("workload manifest must be a JSON object")
     if (
-        manifest.get("schema") != 1
+        manifest.get("schema") != 2
         or manifest.get("classification") != "bailian-structure-replay"
     ):
         raise ValueError("unsupported workload manifest")
@@ -69,6 +69,7 @@ def validate(path: Path) -> dict[str, Any]:
     if not isinstance(selection, dict) or selection.get("mode") not in {
         "all_rows",
         "source_prefix",
+        "diverse_serving_cohort",
     }:
         raise ValueError("workload manifest lacks selection provenance")
     source_count = selection.get("source_request_count")
@@ -91,11 +92,79 @@ def validate(path: Path) -> dict[str, Any]:
             or selected_max != len(rows)
         ):
             raise ValueError("source_prefix selection does not match request count")
+    if selection["mode"] == "diverse_serving_cohort":
+        if (
+            not isinstance(selected_max, int)
+            or isinstance(selected_max, bool)
+            or selected_max != len(rows)
+            or selection.get("algorithm")
+            != "deterministic_joint_shape_spread_v1"
+            or selection.get("distribution_representative_claim") is not False
+        ):
+            raise ValueError("diverse serving cohort selection is inconsistent")
+        resident_count = selection.get("resident_requests")
+        external_count = selection.get("external_requests")
+        if (
+            not isinstance(resident_count, int)
+            or isinstance(resident_count, bool)
+            or resident_count <= 0
+            or not isinstance(external_count, int)
+            or isinstance(external_count, bool)
+            or external_count <= 0
+            or resident_count + external_count != len(rows)
+        ):
+            raise ValueError("diverse serving cohort role counts are invalid")
+        active_budget = selection.get("active_token_budget")
+        active_tokens = selection.get("active_tokens")
+        context_length = selection.get("context_length")
+        max_input_tokens = selection.get("max_input_tokens")
+        max_output_tokens = selection.get("max_output_tokens")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in (context_length, max_input_tokens, max_output_tokens)
+        ) or not (
+            max_input_tokens < context_length
+            and max_output_tokens < context_length
+        ):
+            raise ValueError("diverse serving cohort token envelope is invalid")
+        expected_active = sum(
+            int(row["input_length"]) + max(1, int(row["output_length"]))
+            for row in rows
+        )
+        if (
+            not isinstance(active_budget, int)
+            or isinstance(active_budget, bool)
+            or active_budget <= 0
+            or not isinstance(active_tokens, int)
+            or isinstance(active_tokens, bool)
+            or active_tokens != expected_active
+            or active_tokens > active_budget
+        ):
+            raise ValueError("diverse serving cohort exceeds its active token budget")
+        if any(
+            int(row["input_length"]) > max_input_tokens
+            or max(1, int(row["output_length"])) > max_output_tokens
+            or int(row["input_length"]) + max(1, int(row["output_length"]))
+            > context_length
+            for row in rows
+        ):
+            raise ValueError("diverse serving cohort violates its token envelope")
+        lineage = manifest.get("lineage")
+        if not isinstance(lineage, dict) or any(
+            not isinstance(lineage.get(field), str) or not lineage[field]
+            for field in (
+                "source_manifest_digest",
+                "source_records_digest",
+                "source_demand_trace_digest",
+            )
+        ):
+            raise ValueError("diverse serving cohort lacks source lineage")
     required = {
         "request_id",
         "input_length",
         "output_length",
         "hash_ids",
+        "cached_prefix_tokens",
         "arrival_seconds",
     }
     if any(not required <= set(row) for row in rows):
@@ -188,8 +257,36 @@ def validate(path: Path) -> dict[str, Any]:
     elif state["policy"] == "root_resident":
         if not state["synthetic"] or state_claim:
             raise ValueError("root_resident state provenance is inconsistent")
+    elif state["policy"] == "diverse_serving_cohort":
+        if (
+            not state["synthetic"]
+            or state_claim
+            or request_states != {"resident", "external"}
+            or state.get("counts")
+            != {
+                "resident": sum(
+                    row.get("request_state") == "resident" for row in rows
+                ),
+                "external": sum(
+                    row.get("request_state") == "external" for row in rows
+                ),
+            }
+        ):
+            raise ValueError("diverse serving cohort state provenance is inconsistent")
     else:
         raise ValueError(f"unknown serving-state policy: {state['policy']}")
+    cache_placement = manifest.get("cache_placement")
+    if (
+        not isinstance(cache_placement, dict)
+        or cache_placement.get("identity_field") != "cached_prefix_tokens"
+        or not isinstance(cache_placement.get("source"), str)
+        or not cache_placement["source"]
+        or not isinstance(cache_placement.get("synthetic"), bool)
+    ):
+        raise ValueError("workload manifest lacks cache-placement provenance")
+    cache_claim = claims.get("cache_placement_is_production")
+    if not isinstance(cache_claim, bool) or cache_claim == cache_placement["synthetic"]:
+        raise ValueError("workload cache-placement claim is inconsistent")
     prompt = manifest.get("prompt")
     if (
         not isinstance(prompt, dict)
@@ -209,6 +306,21 @@ def validate(path: Path) -> dict[str, Any]:
             or output_length < 0
         ):
             raise ValueError("workload lengths are out of range")
+        cached_prefix_tokens = row["cached_prefix_tokens"]
+        if (
+            not isinstance(cached_prefix_tokens, int)
+            or isinstance(cached_prefix_tokens, bool)
+            or cached_prefix_tokens < 0
+            or cached_prefix_tokens >= input_length
+        ):
+            raise ValueError("workload cached-prefix length is out of range")
+        request_state = row.get("request_state")
+        if request_state == "resident" and cached_prefix_tokens != input_length - 1:
+            raise ValueError("resident workload row is not fully prefix-cached")
+        if request_state == "external" and cached_prefix_tokens <= 0:
+            raise ValueError("external workload row has no cached prefix")
+        if request_state is None and cached_prefix_tokens != 0:
+            raise ValueError("unplaced workload row carries cached-prefix state")
         if not isinstance(row["hash_ids"], list) or any(
             not isinstance(value, str) or not value for value in row["hash_ids"]
         ):
@@ -225,6 +337,38 @@ def validate(path: Path) -> dict[str, Any]:
                 )
         if len(row["hash_ids"]) > (input_length + block_size - 1) // block_size:
             raise ValueError("hash prefix is longer than the request")
+    if selection["mode"] == "diverse_serving_cohort":
+        cohort = manifest.get("cohort_heterogeneity")
+        if (
+            not isinstance(cohort, dict)
+            or cohort.get("schema") != 1
+            or cohort.get("joint_shape_heterogeneity") is not True
+            or cohort.get("request_states") != ["external", "resident"]
+            or not isinstance(cohort.get("axes"), dict)
+        ):
+            raise ValueError("diverse serving cohort lacks heterogeneity evidence")
+        expected_axes = {
+            "input_tokens": [int(row["input_length"]) for row in rows],
+            "output_tokens": [int(row["output_length"]) for row in rows],
+            "cached_prefix_tokens": [
+                int(row["cached_prefix_tokens"]) for row in rows
+            ],
+            "uncached_query_rows": [
+                int(row["input_length"]) - int(row["cached_prefix_tokens"])
+                for row in rows
+            ],
+        }
+        for name, values in expected_axes.items():
+            expected = {
+                "min": min(values),
+                "max": max(values),
+                "distinct": len(set(values)),
+                "heterogeneous": len(set(values)) > 1,
+            }
+            if cohort["axes"].get(name) != expected or not expected["heterogeneous"]:
+                raise ValueError(
+                    f"diverse serving cohort {name} evidence is inconsistent"
+                )
     expected_demand_digest = demand_trace_digest(rows)
     if manifest.get("demand_trace_digest") != expected_demand_digest:
         raise ValueError("workload demand trace digest mismatch")
