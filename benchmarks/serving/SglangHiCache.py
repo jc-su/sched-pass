@@ -39,6 +39,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument(
+        "--promotion-warmup-iterations",
+        type=int,
+        default=1,
+        help=(
+            "placement-proven host promotions used to warm the runtime selector "
+            "and excluded from reported latency samples"
+        ),
+    )
+    parser.add_argument(
         "--max-attempts",
         type=int,
         help="fail unless this many attempts yield the requested promotions",
@@ -52,6 +61,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mem-fraction-static", type=float, default=0.35)
     parser.add_argument("--hicache-ratio", type=float, default=4.0)
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=pathlib.Path,
+        help="optional persistent JSON report path",
+    )
     parser.add_argument("--cuda-home", type=pathlib.Path)
     parser.add_argument("--cuda-host-cxx", type=pathlib.Path)
     parser.add_argument(
@@ -74,8 +88,8 @@ def parse_args() -> argparse.Namespace:
         <= 0
     ):
         parser.error("token counts and iterations must be positive")
-    if args.resident_tokens < 0:
-        parser.error("resident token count cannot be negative")
+    if args.resident_tokens < 0 or args.promotion_warmup_iterations < 0:
+        parser.error("resident and promotion-warmup counts cannot be negative")
     if args.hot_tokens < MIN_HICACHE_PREFIX_TOKENS:
         parser.error(
             "hot token count must be at least "
@@ -97,6 +111,10 @@ def parse_args() -> argparse.Namespace:
 def configure_environment(args: argparse.Namespace) -> pathlib.Path:
     from cuda_environment import configure_jit_environment
 
+    if args.attention_backend == "nta_flashinfer":
+        # This harness deliberately measures CPU-DRAM HiCache promotion.  Name
+        # that data path explicitly; the runtime default is resident HBM.
+        os.environ.setdefault("NTA_SERVING_TIER", "host_staged")
     _, _, workspace = configure_jit_environment(
         root=ROOT,
         workspace=args.flashinfer_workspace_base,
@@ -110,11 +128,29 @@ def configure_environment(args: argparse.Namespace) -> pathlib.Path:
 
 def make_prompt(tokenizer: Any, label: str, token_count: int) -> str:
     seed = f"{label}: finite GPU kernels acquire cache pages by request identity. "
-    text = seed
-    while len(tokenizer.encode(text, add_special_tokens=False)) < token_count:
-        text += seed
-    ids = tokenizer.encode(text, add_special_tokens=False)[:token_count]
-    return tokenizer.decode(ids, skip_special_tokens=True)
+    seed_tokens = tokenizer.encode(seed, add_special_tokens=False)
+    if not seed_tokens or token_count <= 0:
+        raise ValueError("prompt construction requires a tokenizable seed and length")
+
+    # Encoding the complete growing prefix after every append is quadratic and
+    # made 32K/64K artifact setup take minutes before the engine even started.
+    # Estimate the repeat count, then correct for tokenizer merges at the seed
+    # boundaries with a bounded number of full linear passes.
+    repetitions = (token_count + len(seed_tokens) - 1) // len(seed_tokens)
+    for _ in range(4):
+        ids = tokenizer.encode(seed * repetitions, add_special_tokens=False)
+        if len(ids) >= token_count:
+            prompt = tokenizer.decode(ids[:token_count], skip_special_tokens=True)
+            if len(tokenizer.encode(prompt, add_special_tokens=False)) != token_count:
+                raise RuntimeError(
+                    "tokenizer could not round-trip an exact-length benchmark prompt"
+                )
+            return prompt
+        repetitions = max(
+            repetitions + 1,
+            (repetitions * token_count + len(ids) - 1) // len(ids),
+        )
+    raise RuntimeError("prompt construction did not converge to the requested length")
 
 
 def generated_text(result: Any) -> str:
@@ -147,6 +183,7 @@ def device_cached_tokens(result: dict[str, Any]) -> int:
 def main() -> int:
     args = parse_args()
     workspace = configure_environment(args)
+    prior_stats = set(workspace.glob("nta-engine.*.json"))
     import sglang as sgl
     import torch
     from transformers import AutoTokenizer
@@ -167,12 +204,15 @@ def main() -> int:
     eviction_rounds = args.max_total_tokens // args.churn_tokens + 1
     churn = [
         make_prompt(tokenizer, f"eviction-{attempt}", args.churn_tokens)
-        for attempt in range(eviction_rounds * (args.max_attempts + 1))
+        for attempt in range(
+            eviction_rounds
+            * (args.max_attempts + args.promotion_warmup_iterations + 1)
+        )
     ]
     resident = (
         [
             make_prompt(tokenizer, f"resident-{attempt}", args.resident_tokens)
-            for attempt in range(args.max_attempts)
+            for attempt in range(args.max_attempts + args.promotion_warmup_iterations)
         ]
         if args.resident_tokens
         else []
@@ -208,6 +248,33 @@ def main() -> int:
         for _ in range(eviction_rounds):
             generated_text(engine.generate(churn[churn_cursor], sampling))
             churn_cursor += 1
+        warmup_seconds: list[float] = []
+        warmup_metadata: list[Any] = []
+        for warmup in range(args.promotion_warmup_iterations):
+            if resident:
+                generated_text(engine.generate(resident[warmup], sampling))
+            started = time.perf_counter()
+            prompts = hot + ([resident[warmup]] if resident else [])
+            values = generation_results(engine.generate(prompts, sampling))
+            elapsed = time.perf_counter() - started
+            result_metadata = [value.get("meta_info", {}) for value in values]
+            hot_is_external = all(
+                host_cached_tokens(value) > 0 for value in values[: args.hot_requests]
+            )
+            peer_is_resident = not resident or (
+                device_cached_tokens(values[args.hot_requests]) > 0
+                and host_cached_tokens(values[args.hot_requests]) == 0
+            )
+            if not hot_is_external or not peer_is_resident:
+                raise RuntimeError(
+                    "a performance-excluded promotion warmup did not reproduce "
+                    "the requested host/device placement"
+                )
+            warmup_seconds.append(elapsed)
+            warmup_metadata.append(result_metadata)
+            for _ in range(eviction_rounds):
+                generated_text(engine.generate(churn[churn_cursor], sampling))
+                churn_cursor += 1
         samples: list[float] = []
         metadata: list[Any] = []
         attempt_seconds: list[float] = []
@@ -216,13 +283,14 @@ def main() -> int:
         generated_samples: list[list[str]] = []
         digest = hashlib.sha256()
         for attempt in range(args.max_attempts):
+            resident_index = attempt + args.promotion_warmup_iterations
             if resident:
                 # Make the peer a device-cache hit, rather than an uncached
                 # prefill that SGLang can place in a different forward batch.
                 # This setup is deliberately excluded from the measured call.
-                generated_text(engine.generate(resident[attempt], sampling))
+                generated_text(engine.generate(resident[resident_index], sampling))
             started = time.perf_counter()
-            prompts = hot + ([resident[attempt]] if resident else [])
+            prompts = hot + ([resident[resident_index]] if resident else [])
             result = engine.generate(prompts, sampling)
             elapsed = time.perf_counter() - started
             values = generation_results(result)
@@ -257,7 +325,7 @@ def main() -> int:
             )
 
     stats = []
-    for path in sorted(workspace.glob("nta-engine.*.json")):
+    for path in sorted(set(workspace.glob("nta-engine.*.json")) - prior_stats):
         stats.append(json.loads(path.read_text(encoding="utf-8")))
     median = statistics.median(samples)
     hot_request_seconds = [
@@ -302,7 +370,12 @@ def main() -> int:
         "resident_tokens": args.resident_tokens,
         "batch_width": args.hot_requests + (1 if resident else 0),
         "max_total_tokens": args.max_total_tokens,
+        "context_length": args.context_length,
+        "mem_fraction_static": args.mem_fraction_static,
         "iterations": args.iterations,
+        "promotion_warmup_iterations": args.promotion_warmup_iterations,
+        "promotion_warmup_seconds_samples": warmup_seconds,
+        "promotion_warmup_metadata": warmup_metadata,
         "attempts": len(attempt_seconds),
         "max_attempts": args.max_attempts,
         "external_attempt_indices": external_attempt_indices,
@@ -330,7 +403,13 @@ def main() -> int:
         report["peer_delay_seconds_samples"] = peer_delay_seconds
         report["median_peer_request_seconds"] = statistics.median(peer_request_seconds)
         report["median_peer_delay_seconds"] = statistics.median(peer_delay_seconds)
-    print(json.dumps(report, sort_keys=True))
+    serialized = json.dumps(report, sort_keys=True)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.output.with_suffix(args.output.suffix + ".tmp")
+        temporary.write_text(serialized + "\n", encoding="utf-8")
+        temporary.replace(args.output)
+    print(serialized)
     return 0
 
 

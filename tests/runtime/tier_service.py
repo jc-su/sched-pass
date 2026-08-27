@@ -21,16 +21,25 @@ from nta_runtime.tier import (  # noqa: E402
     _validate_nvme_extent,
 )
 from nta_runtime.resource_contract import (  # noqa: E402
+    ResourceAddressSpace,
     ResourceCapability,
     ResourceKind,
     ResourceOwner,
+    ResourcePath,
+    require_numerical_binding,
     resource_contract,
+)
+from nta_runtime.storage_identity import (  # noqa: E402
+    sglang_storage_key,
+    vllm_storage_key,
 )
 from nta_runtime.runtime_resources import RuntimeResourceConfig  # noqa: E402
 import nta_runtime.runtime_resources as runtime_resources  # noqa: E402
 
 
 def main() -> None:
+    assert sglang_storage_key("same") != vllm_storage_key(b"same")
+    assert sglang_storage_key("same") == sglang_storage_key("same")
     hbm = resource_contract(ResourceKind.HBM)
     host_mapped = resource_contract(ResourceKind.HOST_MAPPED)
     host_staged = resource_contract(ResourceKind.HOST_STAGED)
@@ -50,12 +59,37 @@ def main() -> None:
     assert host_staged.directory_owner is ResourceOwner.RUNTIME
     assert host_staged.protocol_owner is ResourceOwner.RUNTIME
     assert host_staged.payload_owner is ResourceOwner.ENGINE
-    assert host_staged.transfer_destination_owner is ResourceOwner.RUNTIME
+    assert host_staged.transfer_destination_owner is ResourceOwner.ENGINE
+    assert host_staged.mapping_owner is None
     assert nvme.protocol_owner is ResourceOwner.TRANSPORT
     assert nvme.payload_owner is ResourceOwner.TRANSPORT
-    assert nvme.transfer_destination_owner is ResourceOwner.TRANSPORT
-    assert nvme.as_dict()["steady_state_path"] == "gpu_owned_nvme_to_hbm"
-    assert nvme.as_dict()["transfer_destination_owner"] == "transport"
+    assert nvme.transfer_destination_owner is ResourceOwner.ENGINE
+    assert nvme.mapping_owner is ResourceOwner.TRANSPORT
+    assert nvme.numerical_address_owner is ResourceOwner.ENGINE
+    assert cxl.numerical_address_owner is ResourceOwner.TRANSPORT
+    assert nvme.as_dict()["steady_state_path"] == "nvme_peer_dma_to_engine_hbm"
+    assert nvme.as_dict()["transfer_destination_owner"] == "engine"
+    assert nvme.as_dict()["mapping_owner"] == "transport"
+    assert nvme.as_dict()["numerical_address_owner"] == "engine"
+    require_numerical_binding(
+        nvme,
+        ResourceOwner.ENGINE,
+        ResourceAddressSpace.HBM,
+        frozenset((ResourcePath.MATERIALIZED,)),
+        consumer="test paged-KV consumer",
+    )
+    try:
+        require_numerical_binding(
+            cxl,
+            ResourceOwner.ENGINE,
+            ResourceAddressSpace.HBM,
+            frozenset((ResourcePath.MATERIALIZED,)),
+            consumer="test paged-KV consumer",
+        )
+    except RuntimeError as error:
+        assert "ready address" in str(error)
+    else:
+        raise AssertionError("mismatched numerical address ownership was accepted")
     config = RuntimeResourceConfig.with_environment_staging_limit(
         request_capacity=4,
         object_capacity=8,
@@ -155,7 +189,15 @@ def main() -> None:
         assert "request_capacity" in str(error)
     else:
         raise AssertionError("invalid runtime resource capacity was accepted")
-    assert ServingTierConfig.from_environment().tier is ServingTier.HOST_STAGED
+    assert ServingTierConfig.from_environment().tier is ServingTier.HBM
+    assert (
+        ServingTierConfig.from_environment({"NTA_SERVING_TIER": "host_staged"}).tier
+        is ServingTier.HOST_STAGED
+    )
+    assert (
+        ServingTierConfig.from_environment({"NTA_SERVING_TIER": "host_mapped"}).tier
+        is ServingTier.HOST_MAPPED
+    )
     try:
         ServingTierConfig.from_environment({"NTA_SERVING_TIER": "nvme"})
     except ValueError as error:
@@ -215,21 +257,32 @@ def main() -> None:
         raise AssertionError("runtime uint32 capacity overflow was accepted")
 
     document = {
-        "schema": 1,
+        "schema": 2,
         "tier": "nvme",
+        "format": "typed-components-v1",
+        "namespace": "test-model/tp0",
+        "page_tokens": 1,
+        "layer_count": 1,
+        "components": ["key", "value"],
         "alignment_bytes": 4096,
-        "pages": [
+        "entries": [
             {
-                "layer": 3,
-                "page": 7,
-                "key": {"offset": 0, "bytes": 4096},
-                "value": {"offset": 8192, "bytes": 4096},
+                "storage_key": "key-a",
+                "ordinal": 0,
+                "layer": 0,
+                "components": {
+                    "key": {"offset": 0, "bytes": 4096},
+                    "value": {"offset": 8192, "bytes": 4096},
+                },
             },
             {
-                "layer": 3,
-                "page": 8,
-                "key": {"offset": 4096, "bytes": 4096},
-                "value": {"offset": 12288, "bytes": 4096},
+                "storage_key": "key-b",
+                "ordinal": 1,
+                "layer": 0,
+                "components": {
+                    "key": {"offset": 4096, "bytes": 4096},
+                    "value": {"offset": 12288, "bytes": 4096},
+                },
             },
         ],
     }
@@ -237,22 +290,71 @@ def main() -> None:
         path = Path(directory) / "catalog.json"
         path.write_text(json.dumps(document), encoding="utf-8")
         catalog = TierPageCatalog.load(path, expected_tier=ServingTier.NVME)
+        assert catalog.ordinal("key-a") == 0
+        assert catalog.storage_key(1) == "key-b"
+        assert catalog.namespace == "test-model/tp0"
         assert (
-            catalog.span(layer=3, pages=(7, 8), kind="key", row_bytes=4096).bytes
+            catalog.span(
+                layer=0, ordinals=(0, 1), component="key", row_bytes=4096
+            ).bytes
             == 8192
         )
         assert (
-            catalog.span(layer=3, pages=(7, 8), kind="value", row_bytes=4096).offset
+            catalog.span(
+                layer=0, ordinals=(0, 1), component="value", row_bytes=4096
+            ).offset
             == 8192
         )
+        runs = catalog.transfer_runs(
+            layer=0,
+            storage_keys=("key-b", "key-a"),
+            destination_indices=(11, 10),
+            component="key",
+            row_bytes=4096,
+            max_transfer_bytes=8192,
+        )
+        assert len(runs) == 1
+        assert runs[0].source == PageExtent(0, 8192)
+        assert runs[0].destination_first == 10 and runs[0].row_count == 2
+        bounded_runs = catalog.transfer_runs(
+            layer=0,
+            storage_keys=("key-a", "key-b"),
+            destination_indices=(10, 11),
+            component="key",
+            row_bytes=4096,
+            max_transfer_bytes=4096,
+        )
+        assert tuple(run.row_count for run in bounded_runs) == (1, 1)
+        fragmented_runs = catalog.transfer_runs(
+            layer=0,
+            storage_keys=("key-a", "key-b"),
+            destination_indices=(10, 12),
+            component="key",
+            row_bytes=4096,
+            max_transfer_bytes=8192,
+        )
+        assert tuple(run.destination_first for run in fragmented_runs) == (10, 12)
         try:
-            catalog.span(layer=3, pages=(8, 7), kind="key", row_bytes=4096)
+            catalog.transfer_runs(
+                layer=0,
+                storage_keys=("key-a", "key-b"),
+                destination_indices=(10, 10),
+                component="key",
+                row_bytes=4096,
+                max_transfer_bytes=8192,
+            )
+        except ValueError as error:
+            assert "unique" in str(error)
+        else:
+            raise AssertionError("duplicate transfer destinations were accepted")
+        try:
+            catalog.span(layer=0, ordinals=(1, 0), component="key", row_bytes=4096)
         except ValueError as error:
             assert "contiguous" in str(error)
         else:
-            raise AssertionError("non-contiguous catalog pages were accepted")
+            raise AssertionError("non-contiguous catalog ordinals were accepted")
         overlap = json.loads(json.dumps(document))
-        overlap["pages"][1]["value"]["offset"] = 0
+        overlap["entries"][1]["components"]["value"]["offset"] = 0
         overlap_path = Path(directory) / "overlap.json"
         overlap_path.write_text(json.dumps(overlap), encoding="utf-8")
         try:
@@ -263,7 +365,7 @@ def main() -> None:
             raise AssertionError("cross-page catalog overlap was accepted")
 
         fractional = json.loads(json.dumps(document))
-        fractional["pages"][0]["key"]["offset"] = 0.5
+        fractional["entries"][0]["components"]["key"]["offset"] = 0.5
         fractional_path = Path(directory) / "fractional.json"
         fractional_path.write_text(json.dumps(fractional), encoding="utf-8")
         try:
@@ -283,17 +385,22 @@ def main() -> None:
         assert config.catalog_path == path
         service = ServingTierService(ServingTierConfig())
         assert service.stats()["tier_fallback"] is False
-        assert service.stats()["resource_contract"]["kind"] == "host_staged"
+        assert service.stats()["resource_contract"]["kind"] == "hbm"
         service.close()
         _validate_nvme_extent(
-            catalog.span(layer=3, pages=(7,), kind="key", row_bytes=4096),
+            catalog.span(layer=0, ordinals=(0,), component="key", row_bytes=4096),
             lba_size=4096,
             max_transfer_bytes=8192,
             kind="key",
         )
         try:
             _validate_nvme_extent(
-                catalog.span(layer=3, pages=(7, 8), kind="key", row_bytes=4096),
+                catalog.span(
+                    layer=0,
+                    ordinals=(0, 1),
+                    component="key",
+                    row_bytes=4096,
+                ),
                 lba_size=4096,
                 max_transfer_bytes=4096,
                 kind="key",

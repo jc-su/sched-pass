@@ -1,15 +1,18 @@
 #include "CudaDeviceGuard.h"
-#include "nta/DeviceWorkPlan.h"
 #include "nta/CxlRuntime.h"
+#include "nta/DeviceWorkPlan.h"
 #include "nta/HostRuntime.h"
 #include "nta/NvmeRuntime.h"
 #include "nta/WorkPlan.h"
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -51,12 +54,10 @@ void validateDeviceVisiblePointer(const void *address, int deviceOrdinal,
     throw std::invalid_argument(std::string(description) +
                                 " is not a live CUDA allocation");
   }
-  const bool deviceAllocation =
-      attributes.type == cudaMemoryTypeDevice ||
-      attributes.type == cudaMemoryTypeManaged;
-  const bool mappedHostAllocation =
-      attributes.type == cudaMemoryTypeHost &&
-      attributes.devicePointer != nullptr;
+  const bool deviceAllocation = attributes.type == cudaMemoryTypeDevice ||
+                                attributes.type == cudaMemoryTypeManaged;
+  const bool mappedHostAllocation = attributes.type == cudaMemoryTypeHost &&
+                                    attributes.devicePointer != nullptr;
   if ((!deviceAllocation && !mappedHostAllocation) ||
       attributes.device != deviceOrdinal) {
     throw std::invalid_argument(std::string(description) +
@@ -79,8 +80,9 @@ void validateDeviceAllocation(const void *address, int deviceOrdinal,
   if ((attributes.type != cudaMemoryTypeDevice &&
        attributes.type != cudaMemoryTypeManaged) ||
       attributes.device != deviceOrdinal) {
-    throw std::invalid_argument(std::string(description) +
-                                " must be HBM allocated on the runtime CUDA device");
+    throw std::invalid_argument(
+        std::string(description) +
+        " must be HBM allocated on the runtime CUDA device");
   }
 }
 
@@ -97,11 +99,93 @@ void validateMappedHostPointer(const void *address, int deviceOrdinal,
                                 " is not a live CUDA host mapping");
   }
   if (attributes.type != cudaMemoryTypeHost ||
-      attributes.device != deviceOrdinal || attributes.devicePointer == nullptr) {
-    throw std::invalid_argument(std::string(description) +
-                                " must be a device-visible mapped host allocation");
+      attributes.device != deviceOrdinal ||
+      attributes.devicePointer == nullptr) {
+    throw std::invalid_argument(
+        std::string(description) +
+        " must be a device-visible mapped host allocation");
   }
 }
+
+class IndexedPointerValidationCache {
+public:
+  explicit IndexedPointerValidationCache(int deviceOrdinal)
+      : deviceOrdinal_(deviceOrdinal) {}
+
+  void validateVisible(const void *address, const char *description) {
+    if (std::find(visible_.begin(), visible_.end(), address) != visible_.end()) {
+      return;
+    }
+    validateDeviceVisiblePointer(address, deviceOrdinal_, description);
+    visible_.push_back(address);
+  }
+
+  void validateDevice(const void *address, std::size_t requiredBytes,
+                      const char *description) {
+    if (address == nullptr || requiredBytes == 0) {
+      throw std::invalid_argument(std::string(description) +
+                                  " has an empty address range");
+    }
+    const std::uintptr_t value = reinterpret_cast<std::uintptr_t>(address);
+    if (requiredBytes <= std::numeric_limits<std::uintptr_t>::max() - value) {
+      const std::uintptr_t end = value + requiredBytes;
+      for (const DeviceRange &range : deviceRanges_) {
+        if (value >= range.begin && end <= range.end) {
+          return;
+        }
+      }
+    }
+    validateDeviceAllocation(address, deviceOrdinal_, description);
+    CUdeviceptr base = 0;
+    std::size_t bytes = 0;
+    const CUresult rangeStatus = cuMemGetAddressRange(
+        &base, &bytes, static_cast<CUdeviceptr>(value));
+    if (rangeStatus != CUDA_SUCCESS) {
+      // Pointer attributes already proved this exact address. Retaining a
+      // one-byte range preserves correctness on allocation types for which
+      // CUDA does not expose an address range; later distinct pointers are
+      // validated independently.
+      deviceRanges_.push_back({value, value + 1});
+      return;
+    }
+    const std::uintptr_t begin = static_cast<std::uintptr_t>(base);
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+      throw std::invalid_argument(std::string(description) +
+                                  " has an invalid CUDA allocation range");
+    }
+    const std::uintptr_t end = begin + bytes;
+    if (value < begin || requiredBytes > end - value) {
+      throw std::invalid_argument(std::string(description) +
+                                  " exceeds its CUDA allocation");
+    }
+    deviceRanges_.push_back({begin, end});
+  }
+
+  void bindDeviceRange(const void *address, std::size_t bytes,
+                       const char *description) {
+    if (address == nullptr || bytes == 0) {
+      throw std::invalid_argument(std::string(description) +
+                                  " has an empty address range");
+    }
+    validateDeviceAllocation(address, deviceOrdinal_, description);
+    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(address);
+    if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+      throw std::invalid_argument(std::string(description) +
+                                  " has an overflowing address range");
+    }
+    deviceRanges_.push_back({begin, begin + bytes});
+  }
+
+private:
+  struct DeviceRange {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+  };
+
+  int deviceOrdinal_;
+  std::vector<const void *> visible_;
+  std::vector<DeviceRange> deviceRanges_;
+};
 
 void validateReplicaAddress(const RegisteredReplicaSpec &replica,
                             int deviceOrdinal) {
@@ -192,8 +276,7 @@ const char *tierEnvironmentName(abi::SourceKind kind) {
 }
 
 std::uint64_t configuredTierValue(abi::SourceKind kind, const char *suffix,
-                                  std::uint64_t fallback,
-                                  bool allowZero) {
+                                  std::uint64_t fallback, bool allowZero) {
   std::string name = "NTA_TIER_";
   name += tierEnvironmentName(kind);
   name += suffix;
@@ -224,7 +307,7 @@ std::uint64_t configuredTierBandwidth(abi::SourceKind kind) {
 }
 
 void validateIndexedHostObject(const IndexedHostObjectSpec &object,
-                               int deviceOrdinal) {
+                               IndexedPointerValidationCache &pointers) {
   if (object.sourceDeviceAddress == nullptr ||
       object.stagingDeviceAddress == nullptr ||
       object.sourceIndicesDevice == nullptr ||
@@ -233,18 +316,19 @@ void validateIndexedHostObject(const IndexedHostObjectSpec &object,
       object.sourceStrideBytes < object.elementBytes ||
       object.stagingStrideBytes < object.elementBytes ||
       object.sourceIndexLimit == 0 || object.stagingIndexLimit == 0 ||
-      object.indexCount > std::numeric_limits<std::uint32_t>::max() /
-                              object.elementBytes) {
+      object.indexCount >
+          std::numeric_limits<std::uint32_t>::max() / object.elementBytes) {
     throw std::invalid_argument("invalid indexed host transfer geometry");
   }
-  validateDeviceVisiblePointer(object.sourceDeviceAddress, deviceOrdinal,
-                               "indexed source");
-  validateDeviceAllocation(object.stagingDeviceAddress, deviceOrdinal,
-                           "indexed staging destination");
-  validateDeviceAllocation(object.sourceIndicesDevice, deviceOrdinal,
-                           "indexed source indices");
-  validateDeviceAllocation(object.stagingIndicesDevice, deviceOrdinal,
-                           "indexed staging indices");
+  pointers.validateVisible(object.sourceDeviceAddress, "indexed source");
+  pointers.validateDevice(object.stagingDeviceAddress, 1,
+                          "indexed staging destination");
+  const std::size_t indexBytes =
+      static_cast<std::size_t>(object.indexCount) * sizeof(std::uint32_t);
+  pointers.validateDevice(object.sourceIndicesDevice, indexBytes,
+                          "indexed source indices");
+  pointers.validateDevice(object.stagingIndicesDevice, indexBytes,
+                          "indexed staging indices");
 }
 
 abi::ReplicaEntry makeIndexedHostReplica(const IndexedHostObjectSpec &object,
@@ -274,12 +358,10 @@ abi::ObjectEntry makeIndexedHostObject(const IndexedHostObjectSpec &object,
       static_cast<std::uint64_t>(object.indexCount) * object.elementBytes,
       0,
       object.version,
-      static_cast<std::uint32_t>(object.preacquired
-                                     ? abi::ObjectState::Ready
-                                     : abi::ObjectState::New),
+      static_cast<std::uint32_t>(abi::ObjectState::New),
       replicaStart,
       1,
-      object.preacquired ? 0U : abi::InvalidIndex,
+      abi::InvalidIndex,
       // For indexed objects, flags carries the registered index-array
       // capacity so a device-side row-count update can validate against it.
       object.indexCount,
@@ -307,6 +389,25 @@ template <typename T> T downloadOne(const T *source, std::uint32_t slot) {
   checkCuda(
       cudaMemcpy(&value, source + slot, sizeof(T), cudaMemcpyDeviceToHost),
       "cudaMemcpy device-to-host");
+  return value;
+}
+
+template <typename Aggregate, typename Field>
+void uploadField(Aggregate *destination, std::uint32_t slot, std::size_t offset,
+                 const Field &value) {
+  auto *field = reinterpret_cast<std::byte *>(destination + slot) + offset;
+  checkCuda(cudaMemcpy(field, &value, sizeof(value), cudaMemcpyHostToDevice),
+            "cudaMemcpy field host-to-device");
+}
+
+template <typename Aggregate, typename Field>
+Field downloadField(const Aggregate *source, std::uint32_t slot,
+                    std::size_t offset) {
+  Field value{};
+  const auto *field =
+      reinterpret_cast<const std::byte *>(source + slot) + offset;
+  checkCuda(cudaMemcpy(&value, field, sizeof(value), cudaMemcpyDeviceToHost),
+            "cudaMemcpy field device-to-host");
   return value;
 }
 
@@ -374,11 +475,11 @@ struct HostRuntime::Impl {
   explicit Impl(RuntimeConfig runtimeConfig,
                 RuntimeBackends runtimeBackends = {})
       : config(normalizeRuntimeConfig(runtimeConfig)),
-        requestsHost(config.requestCapacity), tenantsHost(config.tenantCapacity),
+        requestsHost(config.requestCapacity),
+        tenantsHost(config.tenantCapacity),
         requestInstalled(config.requestCapacity, false),
         objectInstalled(config.objectCapacity, false),
-        objects(config.objectCapacity),
-        nvme(std::move(runtimeBackends.nvme)),
+        objects(config.objectCapacity), nvme(std::move(runtimeBackends.nvme)),
         cxl(std::move(runtimeBackends.cxl)) {
     config.deviceOrdinal = detail::resolveCudaDevice(config.deviceOrdinal);
     detail::CudaDeviceGuard deviceGuard(config.deviceOrdinal);
@@ -391,17 +492,16 @@ struct HostRuntime::Impl {
           "HostRuntime and CxlDaxTransport must own the same CUDA device");
     }
     if (config.requestCapacity == 0 || config.tenantCapacity == 0 ||
-        config.objectCapacity == 0 ||
-        config.intentCapacity == 0 || config.workTicketCapacity == 0 ||
-        config.maxReplicasPerObject == 0 ||
+        config.objectCapacity == 0 || config.intentCapacity == 0 ||
+        config.workTicketCapacity == 0 || config.maxReplicasPerObject == 0 ||
         config.maxDependenciesPerWorkTicket == 0 ||
         config.objectCapacity > std::numeric_limits<std::uint32_t>::max() /
                                     config.maxReplicasPerObject ||
-        config.workTicketCapacity >
-            std::numeric_limits<std::uint32_t>::max() /
-                config.maxDependenciesPerWorkTicket) {
-      throw std::invalid_argument("runtime capacities must be finite, non-zero, "
-                                  "and must not overflow");
+        config.workTicketCapacity > std::numeric_limits<std::uint32_t>::max() /
+                                        config.maxDependenciesPerWorkTicket) {
+      throw std::invalid_argument(
+          "runtime capacities must be finite, non-zero, "
+          "and must not overflow");
     }
     replicaCapacity = config.objectCapacity * config.maxReplicasPerObject;
     dependencyCapacity =
@@ -433,20 +533,17 @@ struct HostRuntime::Impl {
       replicaEntries = deviceAllocate<abi::ReplicaEntry>(replicaCapacity);
       backendEntries = deviceAllocate<abi::BackendView>(abi::BackendCount);
       intents = deviceAllocate<abi::IntentSlot>(config.intentCapacity);
-      workTickets =
-          deviceAllocate<abi::WorkTicket>(config.workTicketCapacity);
-      workRunnableNs =
-          deviceAllocate<std::uint64_t>(config.workTicketCapacity);
+      workTickets = deviceAllocate<abi::WorkTicket>(config.workTicketCapacity);
+      workRunnableNs = deviceAllocate<std::uint64_t>(config.workTicketCapacity);
       checkCuda(cudaMemset(workRunnableNs, 0,
                            config.workTicketCapacity * sizeof(std::uint64_t)),
                 "initialize work runnable timestamps");
-      dependencies =
-          deviceAllocate<abi::WorkDependency>(dependencyCapacity);
+      dependencies = deviceAllocate<abi::WorkDependency>(dependencyCapacity);
       intentPool = deviceAllocate<abi::IntentPool>(1);
       intentQueueEntries =
           deviceAllocate<abi::IntentQueueEntry>(config.intentCapacity);
-      intentQueueHeads = deviceAllocate<std::uint64_t>(
-          abi::BackendCount * abi::UrgencyBucketCount);
+      intentQueueHeads = deviceAllocate<std::uint64_t>(abi::BackendCount *
+                                                       abi::UrgencyBucketCount);
       checkCuda(cudaMemset(intentQueueHeads, 0xff,
                            abi::BackendCount * abi::UrgencyBucketCount *
                                sizeof(std::uint64_t)),
@@ -458,19 +555,16 @@ struct HostRuntime::Impl {
       pendingWorkTickets =
           deviceAllocate<std::uint32_t>(config.workTicketCapacity);
       pendingCount = deviceAllocate<std::uint32_t>(1);
-      ctaCompletions =
-          deviceAllocate<std::uint32_t>(config.workTicketCapacity);
+      ctaCompletions = deviceAllocate<std::uint32_t>(config.workTicketCapacity);
       objectDependentHeads =
           deviceAllocate<std::uint32_t>(config.objectCapacity);
       dependencyNext = deviceAllocate<std::uint32_t>(dependencyCapacity);
-      dependencySatisfied =
-          deviceAllocate<std::uint32_t>(dependencyCapacity);
+      dependencySatisfied = deviceAllocate<std::uint32_t>(dependencyCapacity);
       remainingDependencies =
           deviceAllocate<std::uint32_t>(config.workTicketCapacity);
       changedWorkTickets =
           deviceAllocate<std::uint32_t>(config.workTicketCapacity);
-      changedQueued =
-          deviceAllocate<std::uint32_t>(config.workTicketCapacity);
+      changedQueued = deviceAllocate<std::uint32_t>(config.workTicketCapacity);
       changedCount = deviceAllocate<std::uint32_t>(1);
       changedOverflow = deviceAllocate<std::uint32_t>(1);
       requestProgress =
@@ -482,34 +576,33 @@ struct HostRuntime::Impl {
       reductionFailed =
           deviceAllocate<std::uint32_t>(config.workTicketCapacity);
       for (DirectoryUpload &upload : directoryUploads) {
-        checkCuda(cudaHostAlloc(
-                      reinterpret_cast<void **>(&upload.objects),
-                      config.objectCapacity * sizeof(abi::ObjectEntry),
-                      cudaHostAllocPortable),
-                  "cudaHostAlloc object-directory staging");
-        checkCuda(cudaHostAlloc(
-                      reinterpret_cast<void **>(&upload.replicas),
-                      replicaCapacity * sizeof(abi::ReplicaEntry),
-                      cudaHostAllocPortable),
+        checkCuda(
+            cudaHostAlloc(reinterpret_cast<void **>(&upload.objects),
+                          config.objectCapacity * sizeof(abi::ObjectEntry),
+                          cudaHostAllocPortable),
+            "cudaHostAlloc object-directory staging");
+        checkCuda(cudaHostAlloc(reinterpret_cast<void **>(&upload.replicas),
+                                replicaCapacity * sizeof(abi::ReplicaEntry),
+                                cudaHostAllocPortable),
                   "cudaHostAlloc replica-directory staging");
-        checkCuda(cudaEventCreateWithFlags(&upload.complete,
-                                           cudaEventDisableTiming),
-                  "cudaEventCreate directory upload");
+        checkCuda(
+            cudaEventCreateWithFlags(&upload.complete, cudaEventDisableTiming),
+            "cudaEventCreate directory upload");
       }
       for (RequestUpload &upload : requestUploads) {
-        checkCuda(cudaHostAlloc(
-                      reinterpret_cast<void **>(&upload.requests),
-                      config.requestCapacity * sizeof(abi::RequestContext),
-                      cudaHostAllocPortable),
-                  "cudaHostAlloc request-directory staging");
-        checkCuda(cudaHostAlloc(
-                      reinterpret_cast<void **>(&upload.progress),
-                      config.requestCapacity * sizeof(abi::RequestProgress),
-                      cudaHostAllocPortable),
-                  "cudaHostAlloc request-progress staging");
-        checkCuda(cudaEventCreateWithFlags(&upload.complete,
-                                           cudaEventDisableTiming),
-                  "cudaEventCreate request upload");
+        checkCuda(
+            cudaHostAlloc(reinterpret_cast<void **>(&upload.requests),
+                          config.requestCapacity * sizeof(abi::RequestContext),
+                          cudaHostAllocPortable),
+            "cudaHostAlloc request-directory staging");
+        checkCuda(
+            cudaHostAlloc(reinterpret_cast<void **>(&upload.progress),
+                          config.requestCapacity * sizeof(abi::RequestProgress),
+                          cudaHostAllocPortable),
+            "cudaHostAlloc request-progress staging");
+        checkCuda(
+            cudaEventCreateWithFlags(&upload.complete, cudaEventDisableTiming),
+            "cudaEventCreate request upload");
       }
 
       const auto backend = [](abi::SourceKind kind, bool active,
@@ -528,6 +621,8 @@ struct HostRuntime::Impl {
             static_cast<std::uint32_t>(ownership.protocol),
             static_cast<std::uint32_t>(ownership.payload),
             static_cast<std::uint32_t>(ownership.transferDestination),
+            static_cast<std::uint32_t>(ownership.mapping),
+            static_cast<std::uint32_t>(ownership.directory),
             0,
         };
         const std::uint32_t directFlags =
@@ -549,34 +644,42 @@ struct HostRuntime::Impl {
         };
       };
       const std::array<abi::BackendView, abi::BackendCount> hostBackends{
-          backend(abi::SourceKind::Hbm, true, 0,
-                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::Hbm)],
-                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Hbm)]),
+          backend(
+              abi::SourceKind::Hbm, true, 0,
+              tierLatencies[static_cast<std::size_t>(abi::SourceKind::Hbm)],
+              tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Hbm)]),
           backend(abi::SourceKind::HostMapped, true, 0,
-                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::HostMapped)],
-                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::HostMapped)]),
+                  tierLatencies[static_cast<std::size_t>(
+                      abi::SourceKind::HostMapped)],
+                  tierBandwidths[static_cast<std::size_t>(
+                      abi::SourceKind::HostMapped)]),
           backend(abi::SourceKind::HostStaged, true, 0,
-                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::HostStaged)],
-                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::HostStaged)]),
-          backend(abi::SourceKind::Nvme, nvme != nullptr,
-                  nvme == nullptr
-                      ? 0
-                      : reinterpret_cast<std::uint64_t>(nvme->deviceQueue()),
-                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::Nvme)],
-                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Nvme)],
-                  nvme != nullptr && config.enableCtaNvmeTryIssue
-                      ? abi::BackendCtaTryIssue
-                      : 0U),
-          backend(abi::SourceKind::Cxl, cxl != nullptr,
-                  cxl == nullptr
-                      ? 0
-                      : reinterpret_cast<std::uint64_t>(cxl->deviceAddress()),
-                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::Cxl)],
-                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Cxl)],
-                  cxl != nullptr ? abi::BackendDeviceVisible : 0U),
-          backend(abi::SourceKind::Rdma, false, 0,
-                  tierLatencies[static_cast<std::size_t>(abi::SourceKind::Rdma)],
-                  tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Rdma)]),
+                  tierLatencies[static_cast<std::size_t>(
+                      abi::SourceKind::HostStaged)],
+                  tierBandwidths[static_cast<std::size_t>(
+                      abi::SourceKind::HostStaged)]),
+          backend(
+              abi::SourceKind::Nvme, nvme != nullptr,
+              nvme == nullptr
+                  ? 0
+                  : reinterpret_cast<std::uint64_t>(nvme->deviceQueue()),
+              tierLatencies[static_cast<std::size_t>(abi::SourceKind::Nvme)],
+              tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Nvme)],
+              nvme != nullptr && config.enableCtaNvmeTryIssue
+                  ? abi::BackendCtaTryIssue
+                  : 0U),
+          backend(
+              abi::SourceKind::Cxl, cxl != nullptr,
+              cxl == nullptr
+                  ? 0
+                  : reinterpret_cast<std::uint64_t>(cxl->deviceAddress()),
+              tierLatencies[static_cast<std::size_t>(abi::SourceKind::Cxl)],
+              tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Cxl)],
+              cxl != nullptr ? abi::BackendDeviceVisible : 0U),
+          backend(
+              abi::SourceKind::Rdma, false, 0,
+              tierLatencies[static_cast<std::size_t>(abi::SourceKind::Rdma)],
+              tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Rdma)]),
       };
       checkCuda(cudaMemcpy(backendEntries, hostBackends.data(),
                            sizeof(hostBackends), cudaMemcpyHostToDevice),
@@ -596,11 +699,13 @@ struct HostRuntime::Impl {
             static_cast<std::uint32_t>(ownership.protocol),
             static_cast<std::uint32_t>(ownership.payload),
             static_cast<std::uint32_t>(ownership.transferDestination),
+            static_cast<std::uint32_t>(ownership.mapping),
+            static_cast<std::uint32_t>(ownership.directory),
             0,
         };
       }
       for (abi::TenantContext &tenant : tenantsHost) {
-        tenant = {UINT64_MAX, 0, 1, 1, 0};
+        tenant = {UINT64_MAX, 0};
       }
       checkCuda(cudaMemcpy(tenants, tenantsHost.data(),
                            tenantsHost.size() * sizeof(tenantsHost.front()),
@@ -739,8 +844,8 @@ struct HostRuntime::Impl {
       return;
     }
     if (stream == nullptr || priorConsumerEvent == nullptr) {
-      throw std::invalid_argument(
-          "runtime object retirement requires a stream and prior consumer event");
+      throw std::invalid_argument("runtime object retirement requires a stream "
+                                  "and prior consumer event");
     }
     RetiredObject retired{std::move(object), nullptr};
     const cudaError_t eventStatus =
@@ -1182,8 +1287,7 @@ void HostRuntime::publishRequestsAsync(std::span<const RequestSpec> requests,
     };
     upload.requests[index] = request;
     upload.progress[index] = abi::RequestProgress{
-        spec.requestId, spec.generation, 0, 0, 0, 0, 0, 0,
-        0,              0,               0, 0, 0, 0, 0};
+        spec.requestId, spec.generation, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   }
 
   try {
@@ -1223,22 +1327,28 @@ void HostRuntime::publishRequestsAsync(std::span<const RequestSpec> requests,
 }
 
 void HostRuntime::setTenantBudget(std::uint32_t tenantId,
-                                  std::uint64_t maxOutstandingBytes,
-                                  std::uint32_t weight) {
+                                  std::uint64_t maxOutstandingBytes) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
-  if (tenantId >= impl_->config.tenantCapacity || weight == 0) {
-    throw std::invalid_argument("tenant budget id and weight must be valid");
+  if (tenantId >= impl_->config.tenantCapacity) {
+    throw std::invalid_argument("tenant budget id must be valid");
   }
-  abi::TenantContext tenant = downloadOne(impl_->tenants, tenantId);
-  if (tenant.outstandingBytes > maxOutstandingBytes) {
+  const std::uint64_t outstandingBytes =
+      downloadField<abi::TenantContext, std::uint64_t>(
+          impl_->tenants, tenantId,
+          offsetof(abi::TenantContext, outstandingBytes));
+  if (outstandingBytes > maxOutstandingBytes) {
     throw std::invalid_argument(
         "tenant budget cannot drop below currently outstanding bytes");
   }
-  tenant.maxOutstandingBytes = maxOutstandingBytes;
-  tenant.weight = weight;
-  tenant.active = 1;
-  impl_->tenantsHost[tenantId] = tenant;
-  uploadOne(impl_->tenants, tenantId, tenant);
+  abi::TenantContext &hostTenant = impl_->tenantsHost[tenantId];
+  hostTenant.maxOutstandingBytes = maxOutstandingBytes;
+
+  // outstandingBytes is a device-owned atomic. Publishing the whole aggregate
+  // here can roll the counter back while acquisitions are in flight, so the
+  // control-plane update is deliberately scoped to its one host-owned field.
+  uploadField(impl_->tenants, tenantId,
+              offsetof(abi::TenantContext, maxOutstandingBytes),
+              maxOutstandingBytes);
 }
 
 void HostRuntime::cancelRequest(std::uint32_t slot, std::uint32_t generation) {
@@ -1250,14 +1360,21 @@ void HostRuntime::cancelRequest(std::uint32_t slot, std::uint32_t generation) {
   if (!impl_->requestInstalled[slot]) {
     throw std::invalid_argument("cannot cancel an uninitialized request slot");
   }
-  abi::RequestContext request = downloadOne(impl_->requests, slot);
-  if (request.generation != generation) {
+  const std::uint32_t publishedGeneration =
+      downloadField<abi::RequestContext, std::uint32_t>(
+          impl_->requests, slot, offsetof(abi::RequestContext, generation));
+  if (publishedGeneration != generation) {
     throw std::invalid_argument(
         "cannot cancel a reused request slot with a stale generation");
   }
-  request.cancelled = 1;
-  impl_->requestsHost[slot] = request;
-  uploadOne(impl_->requests, slot, request);
+  constexpr std::uint32_t cancelled = 1;
+  impl_->requestsHost[slot].cancelled = cancelled;
+
+  // outstandingBytes is updated atomically by device acquisition/release.
+  // A whole-RequestContext upload would race that counter and can create a
+  // stuck credit or an underflow. Cancellation owns exactly one field.
+  uploadField(impl_->requests, slot, offsetof(abi::RequestContext, cancelled),
+              cancelled);
 }
 
 ObjectHandle HostRuntime::installObject(std::uint32_t slot,
@@ -1306,7 +1423,8 @@ ObjectHandle HostRuntime::installReplicatedObject(
   bool hasTransport = false;
   try {
     for (const HostReplicaSpec &spec : replicas) {
-      allocation.replicas.push_back({spec.placement, nullptr, nullptr, nullptr});
+      allocation.replicas.push_back(
+          {spec.placement, nullptr, nullptr, nullptr});
       Impl::OwnedReplica &owned = allocation.replicas.back();
       if (spec.placement == Placement::Hbm) {
         checkCuda(cudaMalloc(&owned.sourceDevice, bytes),
@@ -1320,7 +1438,8 @@ ObjectHandle HostRuntime::installReplicatedObject(
               "CXL placement requires an active CXL DAX transport");
         }
         owned.cxlBuffer = impl_->cxl->allocate(bytes);
-        std::memcpy(owned.cxlBuffer->hostAddress(), spec.contents.data(), bytes);
+        std::memcpy(owned.cxlBuffer->hostAddress(), spec.contents.data(),
+                    bytes);
         owned.sourceDevice = owned.cxlBuffer->deviceAddress();
       } else {
         checkCuda(
@@ -1429,9 +1548,8 @@ HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
     hasTransport |= !direct;
     const abi::SourceKind sourceKind = sourceKindFor(replica.placement);
     if (replica.placement == Placement::CxlMapped &&
-        (impl_->cxl == nullptr ||
-         !impl_->cxl->containsDeviceAddress(replica.sourceDeviceAddress,
-                                             bytes))) {
+        (impl_->cxl == nullptr || !impl_->cxl->containsDeviceAddress(
+                                      replica.sourceDeviceAddress, bytes))) {
       throw std::invalid_argument(
           "CXL replica must belong to the active mapped CXL window");
     }
@@ -1512,21 +1630,26 @@ ObjectHandle HostRuntime::registerIndexedHostObject(
     std::uint32_t stagingStrideBytes, std::uint32_t sourceIndexLimit,
     std::uint32_t stagingIndexLimit) {
   const IndexedHostObjectSpec object{
-      objectId,          version,
-      sourceDeviceAddress, stagingDeviceAddress,
-      sourceIndicesDevice, stagingIndicesDevice,
-      indexCount,        elementBytes,
-      sourceStrideBytes, stagingStrideBytes,
-      sourceIndexLimit,  stagingIndexLimit,
-      false,
+      objectId,
+      version,
+      sourceDeviceAddress,
+      stagingDeviceAddress,
+      sourceIndicesDevice,
+      stagingIndicesDevice,
+      indexCount,
+      elementBytes,
+      sourceStrideBytes,
+      stagingStrideBytes,
+      sourceIndexLimit,
+      stagingIndexLimit,
   };
-  registerIndexedHostObjects(slot, std::span<const IndexedHostObjectSpec>(&object, 1));
+  registerIndexedHostObjects(
+      slot, std::span<const IndexedHostObjectSpec>(&object, 1));
   return {slot, nullptr};
 }
 
 void HostRuntime::registerIndexedHostObjects(
-    std::uint32_t firstSlot,
-    std::span<const IndexedHostObjectSpec> objects) {
+    std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (objects.empty() || firstSlot > impl_->config.objectCapacity ||
       objects.size() > impl_->config.objectCapacity - firstSlot) {
@@ -1536,22 +1659,23 @@ void HostRuntime::registerIndexedHostObjects(
       firstSlot, static_cast<std::uint32_t>(objects.size()));
 
   std::vector<abi::ObjectEntry> entries;
-  std::vector<abi::ReplicaEntry> replicas(
-      objects.size() * impl_->config.maxReplicasPerObject);
+  std::vector<abi::ReplicaEntry> replicas(objects.size() *
+                                          impl_->config.maxReplicasPerObject);
   entries.reserve(objects.size());
+  IndexedPointerValidationCache pointerValidation(
+      impl_->config.deviceOrdinal);
   for (std::size_t index = 0; index < objects.size(); ++index) {
     const IndexedHostObjectSpec &object = objects[index];
-    validateIndexedHostObject(object, impl_->config.deviceOrdinal);
+    validateIndexedHostObject(object, pointerValidation);
     const std::uint32_t slot = firstSlot + static_cast<std::uint32_t>(index);
     const std::uint32_t replicaStart =
         slot * impl_->config.maxReplicasPerObject;
     replicas[index * impl_->config.maxReplicasPerObject] =
-        makeIndexedHostReplica(
-            object,
-            impl_->tierLatencies[
-                static_cast<std::size_t>(abi::SourceKind::HostStaged)],
-            impl_->tierBandwidths[
-                static_cast<std::size_t>(abi::SourceKind::HostStaged)]);
+        makeIndexedHostReplica(object,
+                               impl_->tierLatencies[static_cast<std::size_t>(
+                                   abi::SourceKind::HostStaged)],
+                               impl_->tierBandwidths[static_cast<std::size_t>(
+                                   abi::SourceKind::HostStaged)]);
     entries.push_back(makeIndexedHostObject(object, replicaStart));
   }
   const std::uint32_t firstReplica =
@@ -1582,7 +1706,8 @@ void HostRuntime::registerIndexedHostObjectsAsync(
 
 void HostRuntime::registerIndexedHostObjectsAsyncQuiesced(
     std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects,
-    cudaStream_t stream, cudaEvent_t priorConsumerEvent) {
+    cudaStream_t stream, cudaEvent_t priorConsumerEvent,
+    const IndexedHostIndexBinding *indexBinding) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (objects.empty() || firstSlot > impl_->config.objectCapacity ||
       objects.size() > impl_->config.objectCapacity - firstSlot) {
@@ -1619,22 +1744,38 @@ void HostRuntime::registerIndexedHostObjectsAsyncQuiesced(
   }
   const std::size_t replicaCount =
       objects.size() * impl_->config.maxReplicasPerObject;
-  std::memset(upload.replicas, 0,
-              replicaCount * sizeof(abi::ReplicaEntry));
+  std::memset(upload.replicas, 0, replicaCount * sizeof(abi::ReplicaEntry));
 
+  IndexedPointerValidationCache pointerValidation(
+      impl_->config.deviceOrdinal);
+  if (indexBinding != nullptr) {
+    if (indexBinding->sourceIndicesDevice == nullptr ||
+        indexBinding->stagingIndicesDevice == nullptr ||
+        indexBinding->indexCount == 0) {
+      throw std::invalid_argument("indexed host index binding is empty");
+    }
+    const std::size_t indexBytes =
+        static_cast<std::size_t>(indexBinding->indexCount) *
+        sizeof(std::uint32_t);
+    pointerValidation.bindDeviceRange(indexBinding->sourceIndicesDevice,
+                                      indexBytes,
+                                      "bound indexed source array");
+    pointerValidation.bindDeviceRange(indexBinding->stagingIndicesDevice,
+                                      indexBytes,
+                                      "bound indexed staging array");
+  }
   for (std::size_t index = 0; index < objects.size(); ++index) {
     const IndexedHostObjectSpec &object = objects[index];
-    validateIndexedHostObject(object, impl_->config.deviceOrdinal);
+    validateIndexedHostObject(object, pointerValidation);
     const std::uint32_t slot = firstSlot + static_cast<std::uint32_t>(index);
     const std::uint32_t replicaStart =
         slot * impl_->config.maxReplicasPerObject;
     upload.replicas[index * impl_->config.maxReplicasPerObject] =
-        makeIndexedHostReplica(
-            object,
-            impl_->tierLatencies[
-                static_cast<std::size_t>(abi::SourceKind::HostStaged)],
-            impl_->tierBandwidths[
-                static_cast<std::size_t>(abi::SourceKind::HostStaged)]);
+        makeIndexedHostReplica(object,
+                               impl_->tierLatencies[static_cast<std::size_t>(
+                                   abi::SourceKind::HostStaged)],
+                               impl_->tierBandwidths[static_cast<std::size_t>(
+                                   abi::SourceKind::HostStaged)]);
     upload.objects[index] = makeIndexedHostObject(object, replicaStart);
   }
 
@@ -1719,11 +1860,10 @@ ObjectHandle HostRuntime::installNvmeObject(
       buffer->dmaPageCount(),
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
       abi::ReplicaTransport |
-          (buffer->dmaTarget() == NvmeDmaTarget::HbmPeer
-               ? abi::ReplicaDmaHbm
-               : 0U),
+          (buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm
+                                                         : 0U),
       0,
-      0,
+      buffer->dmaFirstByteOffset(),
   };
   const std::uint32_t replicaStart = slot * impl_->config.maxReplicasPerObject;
   abi::ObjectEntry entry{
@@ -1736,9 +1876,7 @@ ObjectHandle HostRuntime::installNvmeObject(
       replicaStart,
       1,
       abi::InvalidIndex,
-      buffer->dmaTarget() == NvmeDmaTarget::HbmPeer
-          ? abi::ReplicaDmaHbm
-          : 0U,
+      buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm : 0U,
       0,
   };
   uploadOne(impl_->replicaEntries, replicaStart, replica);
@@ -1763,9 +1901,9 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
     cudaEvent_t priorConsumerEvent) {
-  return installNvmeObjectAsync(
-      slot, objectId, version, sourceByteOffset, bytes, stream,
-      priorConsumerEvent, std::unique_ptr<NvmeBuffer>{});
+  return installNvmeObjectAsync(slot, objectId, version, sourceByteOffset,
+                                bytes, stream, priorConsumerEvent,
+                                std::unique_ptr<NvmeBuffer>{});
 }
 
 ObjectHandle HostRuntime::installNvmeObjectAsync(
@@ -1792,8 +1930,8 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
 
   const bool hasCurrent = impl_->objects[slot].has_value();
   if (hasCurrent && priorConsumerEvent == nullptr) {
-    throw std::invalid_argument(
-        "replacing an NVMe object asynchronously requires its prior consumer event");
+    throw std::invalid_argument("replacing an NVMe object asynchronously "
+                                "requires its prior consumer event");
   }
   if (hasCurrent && impl_->objects[slot]->nvmeBuffer == nullptr) {
     throw std::logic_error(
@@ -1811,7 +1949,22 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
     destination = impl_->nvme->allocate(bytes);
     buffer = destination.get();
   } else {
-    buffer = destination.get();
+    NvmeBuffer *current =
+        hasCurrent ? impl_->objects[slot]->nvmeBuffer.get() : nullptr;
+    const bool sameRegisteredView =
+        current != nullptr && !current->ownsDestinationMemory() &&
+        current->deviceAddress() == destination->deviceAddress() &&
+        current->bytes() == destination->bytes() &&
+        current->dmaPageListAddress() == destination->dmaPageListAddress() &&
+        current->dmaPageCount() == destination->dmaPageCount() &&
+        current->dmaFirstByteOffset() == destination->dmaFirstByteOffset();
+    if (sameRegisteredView) {
+      buffer = current;
+      reuseExisting = true;
+      destination.reset();
+    } else {
+      buffer = destination.get();
+    }
   }
   if (buffer == nullptr || bytes > buffer->bytes()) {
     throw std::invalid_argument("NVMe destination is smaller than the object");
@@ -1827,9 +1980,9 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
       abi::ReplicaTransport |
           (buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm
-                                                          : 0U),
+                                                         : 0U),
       0,
-      0,
+      buffer->dmaFirstByteOffset(),
   };
   const std::uint32_t replicaStart = slot * impl_->config.maxReplicasPerObject;
   const abi::ObjectEntry entry{
@@ -1867,8 +2020,8 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
   upload.replicas[replicaStart] = replica;
   checkCuda(cudaMemcpyAsync(impl_->replicaEntries + replicaStart,
                             upload.replicas + replicaStart,
-                            sizeof(abi::ReplicaEntry),
-                            cudaMemcpyHostToDevice, stream),
+                            sizeof(abi::ReplicaEntry), cudaMemcpyHostToDevice,
+                            stream),
             "publish NVMe replica asynchronously");
   checkCuda(cudaMemcpyAsync(impl_->objectEntries + slot, upload.objects + slot,
                             sizeof(abi::ObjectEntry), cudaMemcpyHostToDevice,
@@ -1895,9 +2048,11 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
   return {slot, buffer->deviceAddress()};
 }
 
-ObjectHandle HostRuntime::installNvmeObject(
-    std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
-    std::uint64_t sourceByteOffset, std::size_t bytes) {
+ObjectHandle HostRuntime::installNvmeObject(std::uint32_t slot,
+                                            std::uint64_t objectId,
+                                            std::uint32_t version,
+                                            std::uint64_t sourceByteOffset,
+                                            std::size_t bytes) {
   return installNvmeObject(slot, objectId, version, sourceByteOffset, bytes,
                            std::unique_ptr<NvmeBuffer>{});
 }
@@ -1995,33 +2150,32 @@ HostRuntime::readRequestProgress(std::uint32_t firstSlot,
 }
 
 void HostRuntime::copyRequestProgressAsync(
-    std::uint32_t firstSlot,
-    std::span<abi::RequestProgress> destination,
+    std::uint32_t firstSlot, std::span<abi::RequestProgress> destination,
     cudaStream_t stream) const {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   const std::uint32_t count = static_cast<std::uint32_t>(destination.size());
   if (destination.empty() || destination.size() > UINT32_MAX ||
       firstSlot > impl_->config.requestCapacity ||
       count > impl_->config.requestCapacity - firstSlot) {
-    throw std::out_of_range("request-progress snapshot exceeds runtime capacity");
+    throw std::out_of_range(
+        "request-progress snapshot exceeds runtime capacity");
   }
   cudaPointerAttributes attributes{};
   const cudaError_t attributeStatus =
       cudaPointerGetAttributes(&attributes, destination.data());
   if (attributeStatus != cudaSuccess) {
     (void)cudaGetLastError();
-    throw std::invalid_argument(
-        "request-progress snapshot destination is not CUDA page-locked host memory");
+    throw std::invalid_argument("request-progress snapshot destination is not "
+                                "CUDA page-locked host memory");
   }
   if (attributes.type != cudaMemoryTypeHost) {
-    throw std::invalid_argument(
-        "request-progress snapshot destination is not CUDA page-locked host memory");
+    throw std::invalid_argument("request-progress snapshot destination is not "
+                                "CUDA page-locked host memory");
   }
-  checkCuda(cudaMemcpyAsync(destination.data(),
-                            impl_->requestProgress + firstSlot,
-                            destination.size_bytes(), cudaMemcpyDeviceToHost,
-                            stream),
-            "enqueue request-progress snapshot");
+  checkCuda(
+      cudaMemcpyAsync(destination.data(), impl_->requestProgress + firstSlot,
+                      destination.size_bytes(), cudaMemcpyDeviceToHost, stream),
+      "enqueue request-progress snapshot");
 }
 
 abi::ObjectEntry HostRuntime::readObject(std::uint32_t slot) const {
@@ -2067,8 +2221,9 @@ HostRuntime::readWorkRunnableNs(std::uint32_t count) const {
   return values;
 }
 
-abi::WorkDependency HostRuntime::readWorkDependency(
-    std::uint32_t workTicket, std::uint32_t relativeDependency) const {
+abi::WorkDependency
+HostRuntime::readWorkDependency(std::uint32_t workTicket,
+                                std::uint32_t relativeDependency) const {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (workTicket >= impl_->config.workTicketCapacity ||
       relativeDependency >= impl_->config.maxDependenciesPerWorkTicket) {
@@ -2089,13 +2244,11 @@ std::uint32_t HostRuntime::readPendingCount() const {
   return readEpochStatus(impl_->config.workTicketCapacity).pending;
 }
 
-EpochStatus
-HostRuntime::readEpochStatus(std::uint32_t workTicketCount) const {
+EpochStatus HostRuntime::readEpochStatus(std::uint32_t workTicketCount) const {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   if (workTicketCount == 0 ||
       workTicketCount > impl_->config.workTicketCapacity) {
-    throw std::out_of_range(
-        "epoch work-ticket count exceeds runtime capacity");
+    throw std::out_of_range("epoch work-ticket count exceeds runtime capacity");
   }
   std::vector<abi::WorkTicket> workTickets(workTicketCount);
   checkCuda(cudaMemcpy(workTickets.data(), impl_->workTickets,

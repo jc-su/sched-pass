@@ -5,6 +5,58 @@ from __future__ import annotations
 from typing import Any
 
 
+def modeled_blocked_cohort_accounting(
+    blocked_units: int, pending_window_us: float
+) -> dict[str, Any]:
+    """Account for a synthetic blocked cohort over one availability window.
+
+    All units enter the blocked population at the beginning of the modeled
+    window and become available at deterministic interval midpoints.  The
+    occupancy and residence time are integrated from the release events.  This
+    is deterministic cohort accounting, not a Little's-law test and not a
+    stationary queueing measurement.
+    """
+
+    if blocked_units < 0:
+        raise ValueError("blocked unit count cannot be negative")
+    if pending_window_us < 0:
+        raise ValueError("pending window cannot be negative")
+
+    release_count = int(blocked_units)
+    window_us = float(pending_window_us)
+    if release_count == 0 or window_us == 0.0:
+        return {
+            "method": "finite_window_synthetic_release_accounting",
+            "release_process": "uniform_midpoint_over_availability_window",
+            "pending_release_count": release_count,
+            "pending_window_us": window_us,
+            "pending_area_unit_us": 0.0,
+            "release_rate_per_second": 0.0,
+            "mean_pending_units": 0.0,
+            "mean_pending_us": 0.0,
+            "interpretation": "cohort_accounting_not_stationary_queueing",
+        }
+
+    release_offsets_us = (
+        window_us * (index + 0.5) / release_count for index in range(release_count)
+    )
+    pending_area_unit_us = sum(release_offsets_us)
+    completion_rate = release_count / window_us * 1_000_000
+    mean_pending_units = pending_area_unit_us / window_us
+    mean_pending_us = pending_area_unit_us / release_count
+    return {
+        "method": "finite_window_synthetic_release_accounting",
+        "release_process": "uniform_midpoint_over_availability_window",
+        "pending_release_count": release_count,
+        "pending_window_us": window_us,
+        "pending_area_unit_us": pending_area_unit_us,
+        "release_rate_per_second": completion_rate,
+        "mean_pending_units": mean_pending_units,
+        "mean_pending_us": mean_pending_us,
+        "interpretation": "cohort_accounting_not_stationary_queueing",
+    }
+
+
 def finite_window_littles_law(
     records: list[dict[str, Any]], elapsed_seconds: float
 ) -> dict[str, Any]:

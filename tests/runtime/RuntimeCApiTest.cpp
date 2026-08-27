@@ -11,9 +11,12 @@
 
 namespace {
 
-static_assert(sizeof(nta_tier_descriptor) == 56);
+static_assert(sizeof(nta_tier_descriptor) == 64);
 static_assert(sizeof(nta_cxl_dax_options) == 32);
 static_assert(sizeof(nta_cxl_dax_capabilities) == 32);
+static_assert(sizeof(nta_contiguous_copy_run) == 16);
+static_assert(sizeof(nta_strided_copy_group) == 40);
+static_assert(sizeof(nta_nvme_hbm_registration_range) == 32);
 
 void require(bool condition, const char *message) {
   if (!condition) {
@@ -78,7 +81,7 @@ int main() {
                 hbm.transfer_destination_owner == NTA_TIER_OWNER_NONE,
             "HBM tier descriptor ownership is incomplete");
 
-    requireOk(nta_runtime_set_tenant_budget(runtime, 0, 4096, 1),
+    requireOk(nta_runtime_set_tenant_budget(runtime, 0, 4096),
               "set tenant budget");
     requireOk(
         nta_runtime_set_request(runtime, 0, 17, 3, 0, 4, 0,
@@ -170,9 +173,8 @@ int main() {
                 progressRange[1].generation == 5,
             "C request-progress range lost request identity");
     require(nta_runtime_copy_request_progress_async(
-                runtime, 0, 2,
-                reinterpret_cast<std::uintptr_t>(progressRange), 0) ==
-                NTA_STATUS_INVALID_ARGUMENT,
+                runtime, 0, 2, reinterpret_cast<std::uintptr_t>(progressRange),
+                0) == NTA_STATUS_INVALID_ARGUMENT,
             "C request-progress snapshot accepted pageable memory");
     nta_request_progress *progressSnapshot = nullptr;
     requireCuda(cudaHostAlloc(reinterpret_cast<void **>(&progressSnapshot),
@@ -200,14 +202,27 @@ int main() {
     require(nta_copy_host_to_device_async(0, 0, 0, 0) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "C API accepted an invalid host-to-device copy");
-    require(nta_runtime_install_external_nvme_object(
-                nullptr, 0, 0, 0, 0, 0, 0, nullptr) ==
+    require(nta_copy_strided_host_runs_async(nullptr, 0, nullptr, 0, 0) ==
                 NTA_STATUS_INVALID_ARGUMENT,
-            "C API accepted a null external NVMe runtime");
-    require(nta_runtime_install_external_nvme_object_async(
-                nullptr, 0, 0, 0, 0, 0, 0, 0, 0, nullptr) ==
+            "C API accepted an empty strided host-copy batch");
+    require(nta_runtime_install_registered_nvme_object(nullptr, 0, 0, 0, 0, 0,
+                                                       nullptr, 0, nullptr) ==
                 NTA_STATUS_INVALID_ARGUMENT,
-            "C API accepted a null external async NVMe runtime");
+            "C API accepted a null registered NVMe runtime");
+    require(nta_runtime_install_registered_nvme_object_async(
+                nullptr, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, nullptr) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted a null registered async NVMe runtime");
+    require(nta_nvme_transport_register_hbm_region(nullptr, 0, 0, nullptr) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted a null NVMe HBM registration");
+    nta_nvme_hbm_registration_range hbmRange{};
+    require(nta_nvme_transport_describe_hbm_region(nullptr, 0, 0, &hbmRange) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted a null NVMe HBM description");
+    require(hbmRange.allocation_address == 0 &&
+                hbmRange.registration_address == 0,
+            "failed C HBM description returned stale geometry");
     nta_operator_plan operatorPlan{};
     require(nta_jit_phase_operator_plan(nullptr, &operatorPlan) ==
                 NTA_STATUS_INVALID_ARGUMENT,

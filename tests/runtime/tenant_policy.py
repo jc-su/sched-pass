@@ -6,10 +6,10 @@ from nta_runtime.tenant import tenant_budget_specs, tenant_mapper_from_environme
 
 def main() -> None:
     environ = {
-        "NTA_TENANT_BUDGETS": "7:1048576:3,11:2097152",
+        "NTA_TENANT_BUDGETS": "7:1048576,11:2097152",
         "NTA_TENANT_REQUEST_PREFIXES": "7:team-a/,11:team-b/",
     }
-    assert tenant_budget_specs(environ) == ((7, 1048576, 3), (11, 2097152, 1))
+    assert tenant_budget_specs(environ) == ((7, 1048576), (11, 2097152))
     mapper = tenant_mapper_from_environment(environ)
     assert mapper is not None
     assert mapper("team-a/request-0") == 7
@@ -26,7 +26,7 @@ def main() -> None:
     for value in (
         f"{1 << 32}:1048576",
         f"7:{1 << 64}",
-        f"7:1048576:{1 << 32}",
+        "7:1048576:3",
     ):
         try:
             tenant_budget_specs({"NTA_TENANT_BUDGETS": value})

@@ -33,8 +33,11 @@ class BoundedEpoch:
         work_ticket_count: int,
         max_progress_rounds: int,
     ) -> None:
-        if min(object_count, work_ticket_count, max_progress_rounds) <= 0:
-            raise ValueError("bounded epoch counts must be positive")
+        if object_count < 0 or min(work_ticket_count, max_progress_rounds) <= 0:
+            raise ValueError(
+                "bounded epoch object count cannot be negative and ticket/round "
+                "counts must be positive"
+            )
         self.phases = phases
         self.runtime = runtime
         self.object_count = object_count

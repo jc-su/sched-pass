@@ -20,6 +20,7 @@ from CompareSglangHiCache import require_clean_mechanism
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
+_TRIAL_OWNER_ENV = "NTA_BENCHMARK_TRIAL_OWNER"
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,10 +73,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--incremental-setup-ns",
         type=int,
-        default=0,
+        default=None,
         help=(
-            "modeled setup cost for the mechanism stress arm; zero forces the "
-            "trial to expose the request-overlap path but does not remove real cost"
+            "optional deployment calibration; when omitted, the runtime starts "
+            "uncalibrated and may use its explicitly counted calibration probe"
         ),
     )
     parser.add_argument("--build-dir", default="build")
@@ -143,7 +144,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("eviction rounds cannot be negative")
     if args.load_warmup_iterations < 0:
         parser.error("load warmup iterations cannot be negative")
-    if args.incremental_setup_ns < 0:
+    if args.incremental_setup_ns is not None and args.incremental_setup_ns < 0:
         parser.error("incremental setup cost must be nonnegative")
     if not 0.0 < args.mem_fraction_static < 1.0:
         parser.error("--mem-fraction-static must be between zero and one")
@@ -235,9 +236,12 @@ class _CotenantSampler:
     criterion instead of by their metric values.
     """
 
-    def __init__(self, interval_seconds: float = 1.0) -> None:
+    def __init__(self, owner_token: str, interval_seconds: float = 1.0) -> None:
+        if not owner_token or "\0" in owner_token:
+            raise ValueError("co-tenant sampler owner token is invalid")
         if interval_seconds <= 0:
             raise ValueError("co-tenant sampling interval must be positive")
+        self.owner_token = owner_token
         self.interval_seconds = interval_seconds
         self.samples = 0
         self.sampling_errors = 0
@@ -267,6 +271,22 @@ class _CotenantSampler:
             pass
         return pids
 
+    def _owned_by_trial(self, pid: int, descendants: set[int]) -> bool:
+        if pid in descendants:
+            return True
+        # SGLang workers may daemonize and be reparented after launch. Process
+        # ancestry then stops being an ownership proof even though the worker
+        # is ours. An exact inherited environment token survives reparenting;
+        # unreadable or exited processes remain foreign/fail-closed.
+        try:
+            environment = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(
+                b"\0"
+            )
+        except OSError:
+            return False
+        marker = f"{_TRIAL_OWNER_ENV}={self.owner_token}".encode()
+        return marker in environment
+
     def _sample_once(self) -> None:
         try:
             out = subprocess.run(
@@ -283,7 +303,10 @@ class _CotenantSampler:
             self.sampling_errors += 1
             return
         self.samples += 1
-        foreign = apps - self._descendants()
+        descendants = self._descendants()
+        foreign = {
+            pid for pid in apps if not self._owned_by_trial(pid, descendants)
+        }
         if foreign:
             self.foreign_samples += 1
             self.foreign_pids |= foreign
@@ -387,24 +410,31 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     environment["NTA_EXECUTION_ADMISSION_MAX_DELAY_US"] = str(
         args.admission_max_delay_us
     )
+    owner_token = f"{os.getpid()}:{time.monotonic_ns()}:{backend}"
+    environment[_TRIAL_OWNER_ENV] = owner_token
     if backend == "nta_flashinfer" and args.batch_mode == "coalesced":
-        # Exercise the actual request-aware finite-kernel path. One transfer
-        # wave isolates overlap from deeper transfer pipelining: resident CTAs
-        # run immediately, then only the externally dependent CTAs resume.
+        # Exercise the production selector.  The benchmark must not silently
+        # force a one-wave/direct arm: doing so turns a mechanism comparison
+        # into a hand-picked scheduling-policy comparison.  Dedicated
+        # ablations may still override planner parameters explicitly.
         protocol = os.environ.get("NTA_COMPARE_EXECUTION_PROTOCOL", "late_bound")
-        prefetch = os.environ.get("NTA_COMPARE_EXECUTION_PREFETCH", "0")
-        max_rounds = os.environ.get("NTA_COMPARE_EXECUTION_MAX_ROUNDS", "1")
-        environment.update(
-            {
-                "NTA_EXECUTION_PREFETCH": prefetch,
-                "NTA_EXECUTION_PROTOCOL": protocol,
-                "NTA_EXECUTION_MAX_ROUNDS": max_rounds,
-                "NTA_EXECUTION_MIN_PREDICTED_GAIN": "1.0",
-                "NTA_EXECUTION_INCREMENTAL_SETUP_NS": str(args.incremental_setup_ns),
-            }
-        )
+        environment["NTA_EXECUTION_PROTOCOL"] = protocol
+        if args.incremental_setup_ns is not None:
+            environment["NTA_EXECUTION_INCREMENTAL_SETUP_NS"] = str(
+                args.incremental_setup_ns
+            )
+        for compare_name, runtime_name in (
+            ("NTA_COMPARE_EXECUTION_MAX_ROUNDS", "NTA_EXECUTION_MAX_ROUNDS"),
+            (
+                "NTA_COMPARE_EXECUTION_MIN_PREDICTED_GAIN",
+                "NTA_EXECUTION_MIN_PREDICTED_GAIN",
+            ),
+        ):
+            override = os.environ.get(compare_name)
+            if override is not None:
+                environment[runtime_name] = override
     _wait_for_free_gpu()
-    with _CotenantSampler() as sampler:
+    with _CotenantSampler(owner_token) as sampler:
         completed = subprocess.run(
             command,
             cwd=ROOT,
@@ -580,6 +610,40 @@ def main() -> int:
             args.output, reports, order, "mixed-arrival warmup was not excluded"
         )
         raise RuntimeError("load trial did not exclude mixed-arrival graph warmup")
+    calibration_contracts = {
+        backend: report.get("calibration_input_contract")
+        for backend, report in reports.items()
+    }
+    invalid_calibration = {
+        backend: contract
+        for backend, contract in calibration_contracts.items()
+        if not isinstance(contract, dict)
+        or contract.get("kind") != "exact_token_prefix_and_query_rows"
+        or contract.get("verified") is not True
+    }
+    if invalid_calibration:
+        _write_failed_comparison(
+            args.output,
+            reports,
+            order,
+            "paired warmups did not prove an exact token-prefix/query-row contract",
+            {"invalid_calibration_contracts": invalid_calibration},
+        )
+        raise RuntimeError("load warmup did not preserve the exact request shape")
+    stock_calibration = calibration_contracts["flashinfer"]
+    nta_calibration = calibration_contracts["nta_flashinfer"]
+    assert isinstance(stock_calibration, dict) and isinstance(nta_calibration, dict)
+    for field in ("cached_prefix_tokens", "uncached_query_rows", "timed_shapes"):
+        if stock_calibration.get(field) != nta_calibration.get(field):
+            _write_failed_comparison(
+                args.output,
+                reports,
+                order,
+                f"paired warmup calibration disagreed on {field}",
+            )
+            raise RuntimeError(
+                f"stock and NTA calibration contracts disagree on {field}"
+            )
     if not stock["placement_proven"] or not nta["placement_proven"]:
         _write_failed_comparison(
             args.output, reports, order, "cache placement was not proven"
@@ -696,25 +760,37 @@ def main() -> int:
         for key, value in sorted(vars(args).items())
         if key not in ("output", "seed", "execution_order")
     }
-    # These are experiment-level controls rather than runtime defaults. Record
-    # them in the report so a banked trial cannot be mistaken for the default
-    # late-bound variant when the prefetch/control ablation changes.
+    # Record explicit experiment-level overrides.  ``auto`` means the runtime
+    # production default selected the execution form from its cost model.
     harness_args.update(
         {
             "nta_execution_max_rounds": os.environ.get(
-                "NTA_COMPARE_EXECUTION_MAX_ROUNDS", "1"
+                "NTA_COMPARE_EXECUTION_MAX_ROUNDS", "auto"
             ),
-            "nta_execution_prefetch": os.environ.get(
-                "NTA_COMPARE_EXECUTION_PREFETCH", "0"
+            "nta_execution_min_predicted_gain": os.environ.get(
+                "NTA_COMPARE_EXECUTION_MIN_PREDICTED_GAIN", "auto"
             ),
             "nta_execution_protocol": os.environ.get(
                 "NTA_COMPARE_EXECUTION_PROTOCOL", "late_bound"
             ),
+            "nta_execution_host_mover": os.environ.get(
+                "NTA_EXECUTION_HOST_MOVER", "auto"
+            ),
         }
+    )
+    evidence_scope = (
+        "heterogeneous_work_unit"
+        if activation["heterogeneous_work_unit_active"]
+        else "native_work_unit"
+        if activation["native_work_unit_active"]
+        else "transport_only"
+        if activation["transport_only"]
+        else "exact_execution_only"
     )
     comparison = {
         "schema": 1,
         "classification": "sglang-hicache-load-comparison",
+        "evidence_scope": evidence_scope,
         "execution_order": order,
         "outputs_diverge": outputs_diverge,
         # Trial identity for strict resume validation: the revision both
@@ -726,9 +802,15 @@ def main() -> int:
         ),
         "harness_args": harness_args,
         "nta_selected_bytes": sum(
-            int(entry.get("work_selected_bytes", 0)) for entry in stats
+            int(entry.get("tier_selected_bytes", 0)) for entry in stats
         ),
         "nta_candidate_bytes": sum(
+            int(entry.get("tier_candidate_bytes", 0)) for entry in stats
+        ),
+        "nta_work_selected_bytes": sum(
+            int(entry.get("work_selected_bytes", 0)) for entry in stats
+        ),
+        "nta_work_candidate_bytes": sum(
             int(entry.get("work_candidate_bytes", 0)) for entry in stats
         ),
         "nta_staged_bytes": (

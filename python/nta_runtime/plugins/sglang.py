@@ -12,16 +12,30 @@ _RELEASE_TARGET = "sglang.srt.managers.scheduler.Scheduler.release_host_resource
 _HICACHE_LOAD_TARGET = (
     "sglang.srt.managers.cache_controller.HiCacheController.start_loading"
 )
+_PREFILL_REQUEST_BIND_TARGET = (
+    "sglang.srt.managers.schedule_policy.PrefillAdder.add_one_req"
+)
 _EXECUTE_EXTEND_TARGET = (
     "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_extend"
 )
 _EXECUTE_DECODE_TARGET = (
     "sglang.srt.model_executor.runner.eager_runner.EagerRunner._execute_decode"
 )
+_EAGER_LOAD_BATCH_TARGET = (
+    "sglang.srt.model_executor.runner.eager_runner.EagerRunner.load_batch"
+)
 _ABORT_TARGET = "sglang.srt.managers.scheduler.Scheduler.abort_request"
 _REQUEST_FINISH_TARGET = (
     "sglang.srt.managers.scheduler_components.batch_result_processor."
     "SchedulerBatchResultProcessor._handle_finish_state_updated_req"
+)
+_PREFILL_FINISH_TARGET = (
+    "sglang.srt.managers.scheduler_components.batch_result_processor."
+    "SchedulerBatchResultProcessor.process_batch_result_prefill"
+)
+_PREBUILT_FINISH_TARGET = (
+    "sglang.srt.managers.scheduler_components.batch_result_processor."
+    "SchedulerBatchResultProcessor.process_batch_result_prebuilt"
 )
 _FORWARD_BATCH_TARGET = (
     "sglang.srt.model_executor.forward_batch_info.ForwardBatch.init_new"
@@ -43,14 +57,20 @@ _DECODE_GRAPH_REPLAY_VIEW_TARGET = (
 _REQUIRED_LIFECYCLE_HOOK_TARGETS = (
     _RELEASE_TARGET,
     _HICACHE_LOAD_TARGET,
+    _PREFILL_REQUEST_BIND_TARGET,
     _ABORT_TARGET,
     _REQUEST_FINISH_TARGET,
+    _PREFILL_FINISH_TARGET,
+    _PREBUILT_FINISH_TARGET,
     _FORWARD_BATCH_TARGET,
+    _EAGER_LOAD_BATCH_TARGET,
     _PREFILL_ADMISSION_TARGET,
     _PREFILL_GRAPH_LOAD_BATCH_TARGET,
     _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
     _DECODE_GRAPH_REPLAY_VIEW_TARGET,
 )
+
+_ACQUISITION_ATTRIBUTE = "_nta_acquisition_span"
 
 # HookRegistry owns ordering and application.  This local set only makes a
 # repeated ``register()`` call idempotent; it deliberately does not inspect or
@@ -196,11 +216,31 @@ def _preserve_prefill_load_batch(original, self, forward_batch, **kwargs):
     return static_batch
 
 
+def _preserve_eager_load_batch(
+    original, runner, forward_batch, *args, **kwargs
+):
+    """Carry NTA's immutable sidecar through SGLang's eager buffer view."""
+
+    from nta_runtime.adapters.sglang import (
+        FORWARD_METADATA_ATTRIBUTE,
+        forward_metadata,
+    )
+
+    metadata = forward_metadata(forward_batch)
+    view = original(runner, forward_batch, *args, **kwargs)
+    setattr(view, FORWARD_METADATA_ATTRIBUTE, metadata)
+    raw_batch_size = getattr(forward_batch, "_nta_raw_batch_size", None)
+    if raw_batch_size is not None:
+        view._nta_raw_batch_size = raw_batch_size
+    return view
+
+
 def _preserve_prefill_capture_prepare(original, self, num_tokens, *args, **kwargs):
     """Give graph-capture-only prefill batches stable placeholder identity."""
     from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
     from nta_runtime.adapters.sglang import (
         FORWARD_METADATA_ATTRIBUTE,
+        SglangAcquisitionSpan,
         SglangForwardMetadata,
     )
 
@@ -216,6 +256,7 @@ def _preserve_prefill_capture_prepare(original, self, num_tokens, *args, **kwarg
             tuple(range(batch_size)),
             (0,) * batch_size,
             (0,) * batch_size,
+            (SglangAcquisitionSpan.direct(),) * batch_size,
         )
         setattr(
             forward_batch,
@@ -361,6 +402,104 @@ def _retire_finished_request(processor, req, *args, **kwargs) -> None:
     request_id = getattr(req, "rid", "") or ""
     if not request_id:
         raise RuntimeError("finished SGLang request omitted its request ID")
+    # This hook runs after SGLang has updated the request's finish state and
+    # immediately before it releases the request-pool slot.  Close NTA's
+    # generation at that same lifecycle boundary.  Merely observing finish here
+    # leaves the old request active in the identity registry; a later request
+    # with the same rid in a recycled SGLang slot would then be rejected as a
+    # simultaneous binding even though the generations do not overlap.
+    for backend in _walk_attention_backends(processor):
+        retire = getattr(backend, "retire_request", None)
+        if callable(retire):
+            retire(request_id)
+
+
+def _retire_prefill_finished_requests(
+    result, processor, batch, *args, **kwargs
+) -> None:
+    """Close requests that SGLang finishes directly in prefill.
+
+    ``max_new_tokens == 1`` never enters the decode helper hooked above:
+    SGLang updates its finish state and releases KV directly inside
+    ``process_batch_result_prefill``.  Run after that method so every branch
+    (generation, embedding, and mixed prefill) has a single common retirement
+    test.  The registry operation is idempotent for resident-only requests that
+    never entered NTA's acquisition path.
+    """
+    del result, args, kwargs
+    for req in tuple(getattr(batch, "reqs", ())):
+        if req.finished():
+            _retire_finished_request(processor, req)
+
+
+def _capture_prefill_request_binding(original, adder, request, *args, **kwargs):
+    """Capture SGLang's exact request→load-operation ownership edge."""
+
+    from nta_runtime.adapters.sglang import SglangAcquisitionSpan
+
+    request_id = str(getattr(request, "rid", "") or "")
+    if not request_id:
+        raise RuntimeError("SGLang prefill request omitted its request identity")
+    needs_load = bool(request.needs_host_load_back())
+    expected_node_id = int(getattr(request.best_match_node, "id", -1))
+    prefix_begin = len(request.prefix_indices)
+    tree_cache = getattr(adder, "tree_cache", None)
+    controller = getattr(tree_cache, "cache_controller", None)
+    load_queue = getattr(controller, "load_queue", None)
+    if needs_load and load_queue is None:
+        raise RuntimeError("SGLang host-load request has no cache-controller queue")
+    queued_operation_ids = (
+        set()
+        if load_queue is None
+        else {int(getattr(operation, "id", -1)) for operation in load_queue}
+    )
+    if -1 in queued_operation_ids:
+        raise RuntimeError("SGLang load queue contains an untyped operation")
+    result = original(adder, request, *args, **kwargs)
+    loaded_rows = len(request.prefix_indices) - prefix_begin
+    if loaded_rows < 0:
+        raise RuntimeError("SGLang host loading shrank the request prefix")
+    loaded_node_id = int(getattr(request.last_node, "id", -1))
+    if loaded_rows:
+        if not needs_load or expected_node_id < 0 or loaded_node_id != expected_node_id:
+            raise RuntimeError("SGLang loaded rows without a stable radix identity")
+        new_operations = tuple(
+            operation
+            for operation in load_queue
+            if int(getattr(operation, "id", -1)) not in queued_operation_ids
+        )
+        if len(new_operations) != 1:
+            raise RuntimeError(
+                "one SGLang request must create exactly one unmerged load operation"
+            )
+        operation = new_operations[0]
+        operation_id = int(getattr(operation, "id", -1))
+        operation_nodes = tuple(int(node) for node in operation.node_ids)
+        operation_rows = int(operation.device_indices.numel())
+        if operation_id < 0 or operation_nodes != (expected_node_id,):
+            raise RuntimeError("SGLang load operation identity disagrees with request")
+        if operation_rows != loaded_rows:
+            raise RuntimeError("SGLang load operation rows disagree with request span")
+        acquisition = SglangAcquisitionSpan(
+            operation_id,
+            expected_node_id,
+            prefix_begin,
+            loaded_rows,
+        )
+    else:
+        previous = getattr(request, _ACQUISITION_ATTRIBUTE, None)
+        if previous is not None and not isinstance(previous, SglangAcquisitionSpan):
+            raise RuntimeError("SGLang request carries malformed acquisition metadata")
+        # A request may be revisited after add_one_req loaded its rows but did
+        # not admit it. Preserve that one-shot edge until ForwardBatch.init_new
+        # consumes it; otherwise this is a resident request.
+        acquisition = (
+            previous
+            if isinstance(previous, SglangAcquisitionSpan) and previous.is_external
+            else SglangAcquisitionSpan.direct()
+        )
+    setattr(request, _ACQUISITION_ATTRIBUTE, acquisition)
+    return result
 
 
 def _attach_request_priorities(
@@ -375,6 +514,7 @@ def _attach_request_priorities(
     from nta_runtime.adapters.base import _integer_vector
     from nta_runtime.adapters.sglang import (
         FORWARD_METADATA_ATTRIBUTE,
+        SglangAcquisitionSpan,
         SglangForwardMetadata,
     )
 
@@ -418,6 +558,19 @@ def _attach_request_priorities(
         if existing is None
         else tuple(int(tenant_id) for tenant_id in existing.tenant_ids)
     )
+    acquisitions: list[SglangAcquisitionSpan] = []
+    for request in requests:
+        acquisition = getattr(
+            request, _ACQUISITION_ATTRIBUTE, SglangAcquisitionSpan.direct()
+        )
+        if not isinstance(acquisition, SglangAcquisitionSpan):
+            raise RuntimeError("SGLang request carries malformed acquisition metadata")
+        acquisitions.append(acquisition)
+    for request in requests:
+        # The sidecar now owns this forward's immutable copy. Clearing the
+        # mutable request attribute prevents a later decode or unrelated load
+        # lease from reusing stale acquisition ownership.
+        setattr(request, _ACQUISITION_ATTRIBUTE, SglangAcquisitionSpan.direct())
     setattr(
         forward_batch,
         FORWARD_METADATA_ATTRIBUTE,
@@ -425,6 +578,7 @@ def _attach_request_priorities(
             tuple(int(slot) for slot in request_slots),
             priorities,
             tenant_ids,
+            tuple(acquisitions),
         ),
     )
 
@@ -457,6 +611,12 @@ def register() -> None:
     _register_hook(
         HookRegistry, _HICACHE_LOAD_TARGET, route_start_loading, HookType.AROUND
     )
+    _register_hook(
+        HookRegistry,
+        _PREFILL_REQUEST_BIND_TARGET,
+        _capture_prefill_request_binding,
+        HookType.AROUND,
+    )
     # Forward timing is diagnostic instrumentation, not part of the serving
     # contract.  Do not leave an AROUND wrapper on the hottest framework
     # methods when profiling is disabled: even a fast wrapper adds a Python
@@ -475,7 +635,25 @@ def register() -> None:
         HookRegistry, _REQUEST_FINISH_TARGET, _retire_finished_request, HookType.BEFORE
     )
     _register_hook(
+        HookRegistry,
+        _PREFILL_FINISH_TARGET,
+        _retire_prefill_finished_requests,
+        HookType.AFTER,
+    )
+    _register_hook(
+        HookRegistry,
+        _PREBUILT_FINISH_TARGET,
+        _retire_prefill_finished_requests,
+        HookType.AFTER,
+    )
+    _register_hook(
         HookRegistry, _FORWARD_BATCH_TARGET, _attach_request_priorities, HookType.AFTER
+    )
+    _register_hook(
+        HookRegistry,
+        _EAGER_LOAD_BATCH_TARGET,
+        _preserve_eager_load_batch,
+        HookType.AROUND,
     )
     _register_hook(
         HookRegistry,

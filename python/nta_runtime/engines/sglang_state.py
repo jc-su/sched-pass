@@ -9,7 +9,7 @@ state object from accidentally becoming a second execution protocol.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 import json
 import operator
@@ -19,8 +19,9 @@ from typing import Any
 
 import torch
 
-from nta_runtime.engines.sglang_hicache import PendingHostLoad
-from nta_runtime.execution_core import ExecutionSession
+from nta_runtime.engines.sglang_hicache import LeaseWorkDependency, PendingHostLoad
+from nta_runtime.execution_core import ExecutionPlan, ExecutionSession
+from nta_runtime.execution_topology import ExactWorkTopology
 from nta_runtime.execution_planner import HostExecutionPlan
 from nta_runtime.flashinfer_schedule import Schedule
 from nta_runtime.requests import RequestBinding
@@ -103,15 +104,48 @@ class _StatsPublisher:
 
 @dataclass(frozen=True)
 class _PrefetchedLayer:
-    key_slot: int
-    key_object_id: int
-    value_slot: int
-    value_object_id: int
-    version: int
     key_bytes: int
     value_bytes: int
     ready_event: torch.cuda.Event
-    transfer_first_slot: int
+    # SM movers use runtime object slots. Copy-engine movers are ordered only
+    # by the CUDA event and therefore own no acquisition-directory entry.
+    transfer_first_slot: int | None
+
+
+@dataclass(frozen=True)
+class _MoverProfile:
+    """One separable mover-wave observation retired off the hot path."""
+
+    start: torch.cuda.Event
+    finish: torch.cuda.Event
+    engine: str
+    transfer_bytes: int
+    operation_count: int
+    issue_cpu_ns: int
+
+    def __post_init__(self) -> None:
+        if self.engine not in {"sm", "copy_engine"}:
+            raise ValueError("mover profile has an invalid engine")
+        if self.transfer_bytes <= 0 or self.operation_count <= 0:
+            raise ValueError("mover profile requires positive service geometry")
+        if self.issue_cpu_ns < 0:
+            raise ValueError("mover profile issue time cannot be negative")
+        if self.engine == "sm" and self.issue_cpu_ns != 0:
+            raise ValueError("SM mover profiles cannot carry CPU issue time")
+
+
+@dataclass(frozen=True)
+class _LayerServiceProfile:
+    """One completed attention-arrival interval for a stable forward shape."""
+
+    start: torch.cuda.Event
+    finish: torch.cuda.Event
+    key: tuple[str, int, int]
+
+    def __post_init__(self) -> None:
+        phase, query_rows, batch_size = self.key
+        if phase not in {"decode", "extend"} or min(query_rows, batch_size) <= 0:
+            raise ValueError("layer service profile has an invalid shape key")
 
 
 @dataclass(frozen=True)
@@ -138,8 +172,90 @@ class _ActiveBatch:
     prefetch_tensors: tuple[torch.Tensor, ...]
     host_execution: HostExecutionPlan | None = None
     grouping: str = "request"
+    # Exact operation-local interval required by each FlashInfer work unit.
+    # ``None`` is the canonical resident/direct value. Transport ownership
+    # remains one lease; repeated CTA/head work shares the same typed interval.
+    work_dependencies: dict[int, tuple[LeaseWorkDependency | None, ...]] = field(
+        default_factory=dict
+    )
+    # Capacity-constrained completion groups aligned with ``work_dependencies``.
+    # A group may cover adjacent exact intervals from one operation, but never
+    # introduces or drops rows; it only chooses the readiness granularity.
+    transfer_dependencies: dict[int, tuple[LeaseWorkDependency | None, ...]] = field(
+        default_factory=dict
+    )
+    lease_transfer_rows: int = 0
     fragment_lookahead: dict[int, _FragmentLookahead] = field(default_factory=dict)
-    execution: ExecutionSession | None = None
+    # Production topology is layer-invariant because SGLang reuses one
+    # FlashInfer schedule and the native WorkItem ABI has no layer coordinate.
+    # ``execution`` remains an opt-in semantic view used only by verification.
+    work_topologies: dict[int, ExactWorkTopology] = field(default_factory=dict)
+    execution: ExecutionPlan | None = None
+    verification_session: ExecutionSession | None = None
+    # Measured recurring control work between the direct/incremental decision
+    # and the first typed attention dispatch. It is combined with that first
+    # dispatch's CPU issue time exactly once to calibrate later batches.
+    incremental_metadata_setup_ns: int = 0
+    incremental_setup_observed: bool = False
+    incremental_setup_observation_ns: int = 0
+    # A bounded calibration records adjacent attention arrivals for this
+    # forward shape. It is performance state only and never participates in
+    # request identity, demand exactness, or numerical ordering.
+    layer_service_key: tuple[str, int, int] | None = None
+    layer_arrival_event: torch.cuda.Event | None = None
+    layer_arrival_local_layer: int = -1
+    # Artifact harnesses request an explicit counter snapshot with a reserved
+    # request identity.  Ordinary resident forwards never serialize stats on
+    # their latency-critical completion edge.
+    publish_stats_on_completion: bool = False
+
+    def adopt_wrapper_identity(self, source_to_target: Mapping[int, int]) -> None:
+        """Re-key a validated plan after zero-copy numerical-module adoption.
+
+        FlashInfer's stock and typed wrappers share one immutable plan and its
+        workspace after adoption.  Schedule and acquisition metadata belong to
+        that plan, not to either Python wrapper object, so rebuilding them from
+        the CUDA workspace would add a redundant D2H synchronization.  Wrapper
+        replacement is legal only before any layer-specific execution state is
+        created; fail closed if that lifecycle boundary has already passed.
+        """
+
+        mapping = dict(source_to_target)
+        source_ids = set(mapping)
+        target_ids = set(mapping.values())
+        if not mapping or len(target_ids) != len(mapping):
+            raise RuntimeError(
+                "FlashInfer wrapper adoption must be non-empty and injective"
+            )
+        if set(self.schedules) != source_ids:
+            raise RuntimeError(
+                "FlashInfer wrapper adoption does not cover its schedules"
+            )
+        if (
+            self.execution is not None
+            or self.verification_session is not None
+            or self.fragment_lookahead
+        ):
+            raise RuntimeError(
+                "FlashInfer wrapper identity changed after execution began"
+            )
+
+        def remap(values: dict[int, Any], label: str) -> dict[int, Any]:
+            if values and set(values) != source_ids:
+                raise RuntimeError(
+                    f"FlashInfer wrapper adoption does not cover {label}"
+                )
+            return {mapping[source]: value for source, value in values.items()}
+
+        self.schedules = remap(self.schedules, "schedule metadata")
+        self.page_pairs = remap(self.page_pairs, "page dependencies")
+        self.work_dependencies = remap(
+            self.work_dependencies, "exact work dependencies"
+        )
+        self.transfer_dependencies = remap(
+            self.transfer_dependencies, "transfer dependencies"
+        )
+        self.work_topologies = remap(self.work_topologies, "exact work topologies")
 
 
 @dataclass
@@ -157,6 +273,10 @@ class _PlanAllocation:
     min_unresolved_dependencies: int = 1
     direct_work_count: int = 0
     external_object_slots: tuple[tuple[int, ...], ...] = ()
+    # Each progress wave owns a disjoint K/V object pair for every deferred
+    # work item, in canonical work order.  Such plans can consume a disjoint
+    # ready-queue window instead of relaunching every earlier prefix.
+    exact_resume_windows: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,6 +300,7 @@ class _DemandGraphKey:
     object_count: int
     progress_blocks: tuple[int, ...]
     ready_work_counts: tuple[int, ...]
+    ready_work_offsets: tuple[int, ...]
     initial_ready_work_count: int
     indexed_copy_blocks_per_group: int
     query_shape: tuple[int, ...]
@@ -261,6 +382,7 @@ def _demand_graph_key(
     object_count: int,
     progress_blocks: tuple[int, ...],
     ready_work_counts: tuple[int, ...],
+    ready_work_offsets: tuple[int, ...],
     initial_ready_work_count: int,
     indexed_copy_blocks_per_group: int,
     query: torch.Tensor,
@@ -285,6 +407,7 @@ def _demand_graph_key(
         int(object_count),
         tuple(int(count) for count in progress_blocks),
         tuple(int(count) for count in ready_work_counts),
+        tuple(int(offset) for offset in ready_work_offsets),
         int(initial_ready_work_count),
         int(indexed_copy_blocks_per_group),
         tuple(int(extent) for extent in query.shape),

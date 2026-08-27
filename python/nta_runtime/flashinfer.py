@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Any
 
 from .epoch import BoundedEpoch, EpochResult
 from .runtime import AcquireRequirement, DeviceWorkPlan, JitPhaseProgram, Runtime
-from .runtime import RequestRange
-from .requests import RequestBinding
 
 
 TENSOR_NAMES = ["nta_runtime", "nta_work_items", "nta_dependencies"]
@@ -21,6 +19,10 @@ REQUEST_BOUND_TENSOR_NAMES = ["nta_runtime"]
 REQUEST_BOUND_TENSOR_DTYPES = ["uint8_t"]
 REQUEST_BOUND_SCALAR_NAMES = ["sm_scale", "nta_request_slot_offset"]
 REQUEST_BOUND_SCALAR_DTYPES = ["double", "int64_t"]
+MAPPED_REQUEST_BOUND_TENSOR_NAMES = ["nta_runtime", "nta_request_slots"]
+MAPPED_REQUEST_BOUND_TENSOR_DTYPES = ["uint8_t", "int32_t"]
+MAPPED_REQUEST_BOUND_SCALAR_NAMES = ["sm_scale"]
+MAPPED_REQUEST_BOUND_SCALAR_DTYPES = ["double"]
 
 SKIP_MERGE = 1 << 0
 PREACQUIRED = 1 << 1
@@ -35,6 +37,69 @@ PREACQUIRED_LAUNCH_FLAGS = PREACQUIRED | BIND_CURRENT_GENERATION
 
 _DEFAULT_ATTENTION_VARIANT = "DefaultAttention<false, false, false, false>"
 _DEFAULT_ATTENTION_DECL = "#include <flashinfer/attention/variants.cuh>"
+
+
+def adopt_planned_flashinfer_state(target: Any, source: Any) -> None:
+    """Bind an instrumented module to an already planned FlashInfer wrapper.
+
+    FlashInfer's plan output describes launch geometry and workspace offsets;
+    it is independent of the additional tensors consumed by a custom JIT
+    attention kernel.  SGLang first plans its stock wrapper so NTA can make a
+    no-overhead execution decision.  If that decision selects native work,
+    planning an otherwise identical instrumented wrapper again introduces a
+    blocking device-to-host round trip and duplicates tens of milliseconds of
+    control work.  This adapter shares the validated stock plan/buffers while
+    retaining only the target's custom module ABI.
+
+    Both wrappers remain alive for the forward, so shared tensor and pinned
+    workspace lifetimes are unchanged.  The target's original workspaces are
+    retained explicitly because replacing their references may otherwise make
+    allocator reclamation part of the scheduling path.
+    """
+
+    if type(target) is not type(source):
+        raise TypeError("FlashInfer plan reuse requires identical wrapper classes")
+    if not hasattr(target, "__dict__") or not hasattr(source, "__dict__"):
+        raise TypeError("FlashInfer plan reuse requires stateful Python wrappers")
+    for name in ("_kv_layout", "_backend", "device"):
+        if getattr(target, name, None) != getattr(source, name, None):
+            raise RuntimeError(f"FlashInfer plan reuse disagrees on {name}")
+    if getattr(source, "_plan_info", None) is None:
+        raise RuntimeError("FlashInfer source wrapper has no completed plan")
+    if getattr(source, "_jit_module", None) is not None:
+        raise RuntimeError("FlashInfer plan source must be the stock wrapper")
+    module = getattr(target, "_jit_module", None)
+    tensor_names = tuple(getattr(target, "_jit_additional_tensor_names", ()) or ())
+    if module is None or not tensor_names:
+        raise RuntimeError("FlashInfer plan target has no typed JIT module ABI")
+    if not callable(getattr(module, "plan", None)) or not callable(
+        getattr(module, "paged_run", None)
+    ):
+        raise RuntimeError("FlashInfer typed module does not expose the plan/run ABI")
+
+    target_state = vars(target)
+    retained = target_state.get("_nta_owned_plan_resources")
+    if retained is None:
+        retained = tuple(
+            target_state[name]
+            for name in (
+                "_int_workspace_buffer",
+                "_pin_memory_int_workspace_buffer",
+                "_kv_lens_buffer",
+            )
+            if name in target_state
+        )
+    adopted = dict(vars(source))
+    adopted.update(
+        {
+            "_jit_module": module,
+            "_cached_module": module,
+            "_jit_additional_tensor_names": list(tensor_names),
+            "_nta_owned_plan_resources": retained,
+        }
+    )
+    target_state.clear()
+    target_state.update(adopted)
 
 
 def _current_cuda_stream() -> Any:
@@ -85,40 +150,43 @@ def direct_requirement(
     )
 
 
-def request_ranges_for_schedule(
-    bindings: Sequence[RequestBinding], request_indices: Sequence[int]
-) -> list[RequestRange]:
-    """Build the native contiguous request ranges for a CTA schedule.
+def object_requirement(
+    *,
+    object_slot: int,
+    object_id: int,
+    object_version: int,
+    bytes: int,
+) -> AcquireRequirement:
+    """Build one whole-object transport dependency.
 
-    FlashInfer emits contributors grouped by request.  Keeping this check in
-    the engine-neutral FlashInfer boundary makes SGLang and vLLM share the
-    same O(work-items) validation and prevents either adapter from silently
-    assigning a contributor to the wrong request generation.
+    Transport objects are acquisition tiles: duplicate suppression and ready
+    publication apply to the whole transfer.  Keeping offset zero and bytes
+    equal to the installed object is therefore part of the public typed
+    contract, not an adapter convention.
     """
-    ranges: list[RequestRange] = []
-    cursor = 0
-    for binding in bindings:
-        begin = cursor
-        while (
-            cursor < len(request_indices)
-            and int(request_indices[cursor]) == binding.request_index
-        ):
-            cursor += 1
-        if cursor == begin:
-            raise RuntimeError(
-                f"FlashInfer schedule has no work for request {binding.request_index}"
-            )
-        ranges.append(
-            RequestRange(
-                begin,
-                cursor - begin,
-                binding.request_slot,
-                binding.generation,
-            )
-        )
-    if cursor != len(request_indices):
-        raise RuntimeError("FlashInfer schedule is not grouped contiguously by request")
-    return ranges
+
+    limits = (1 << 32) - 1
+    if (
+        object_slot < 0
+        or object_slot > limits
+        or object_id <= 0
+        or object_id > (1 << 64) - 1
+        or object_version <= 0
+        or object_version > limits
+        or bytes <= 0
+        or bytes > limits
+    ):
+        raise ValueError("object dependencies require bounded positive identity")
+    return AcquireRequirement(
+        0,
+        0,
+        int(object_id),
+        0,
+        int(object_slot),
+        int(object_version),
+        int(bytes),
+        0,
+    )
 
 
 def pack_work_metadata(work_count: int, request_count: int) -> int:
@@ -184,6 +252,36 @@ def request_bound_attention_jit_args(
         REQUEST_BOUND_TENSOR_DTYPES,
         REQUEST_BOUND_SCALAR_NAMES,
         REQUEST_BOUND_SCALAR_DTYPES,
+        _DEFAULT_ATTENTION_VARIANT,
+        _DEFAULT_ATTENTION_DECL,
+    ]
+
+
+def mapped_request_bound_attention_jit_args(
+    module_name: str,
+    *,
+    dtype_q: Any,
+    dtype_kv: Any,
+    dtype_o: Any,
+    idtype: Any,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> list[Any]:
+    """Build typed arguments for a direct module with an explicit slot map."""
+    if not module_name or min(head_dim_qk, head_dim_vo) <= 0:
+        raise ValueError("FlashInfer module name and head dimensions are required")
+    return [
+        module_name,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        MAPPED_REQUEST_BOUND_TENSOR_NAMES,
+        MAPPED_REQUEST_BOUND_TENSOR_DTYPES,
+        MAPPED_REQUEST_BOUND_SCALAR_NAMES,
+        MAPPED_REQUEST_BOUND_SCALAR_DTYPES,
         _DEFAULT_ATTENTION_VARIANT,
         _DEFAULT_ATTENTION_DECL,
     ]
@@ -310,7 +408,9 @@ class FlashInferLayerEpoch:
         paged_kv_cache: Any,
         out: Any,
         *,
-        progress_blocks: int,
+        progress_blocks: int | tuple[int, ...],
+        ready_work_counts: int | tuple[int, ...] | None = None,
+        ready_work_offsets: tuple[int, ...] | None = None,
         sm_scale: float | None = None,
         stream: Any = None,
         run_options: dict[str, Any] | None = None,
@@ -321,6 +421,8 @@ class FlashInferLayerEpoch:
             paged_kv_cache,
             out,
             progress_blocks=progress_blocks,
+            ready_work_counts=ready_work_counts,
+            ready_work_offsets=ready_work_offsets,
             sm_scale=sm_scale,
             stream=stream,
             run_options=run_options,
@@ -367,6 +469,7 @@ class FlashInferLayerEpoch:
         progress_stream: Any = None,
         ready_event: Any = None,
         ready_work_counts: int | tuple[int, ...] | None = None,
+        ready_work_offsets: tuple[int, ...] | None = None,
         initial_ready_work_count: int = 0,
         indexed_host_first_object: int | None = None,
         indexed_host_prevalidated: bool = False,
@@ -395,21 +498,38 @@ class FlashInferLayerEpoch:
             launch_counts = (int(ready_work_counts),) * len(block_counts)
         else:
             launch_counts = tuple(int(count) for count in ready_work_counts)
-        if (
-            len(launch_counts) != len(block_counts)
-            or any(
-                count <= 0 or count > self.plan.work_item_count
-                for count in launch_counts
-            )
-            or any(
-                current < previous
-                for previous, current in zip(launch_counts, launch_counts[1:])
-            )
-        ):
-            raise ValueError("runnable launch bounds must be monotonic plan counts")
         initial_ready_work_count = int(initial_ready_work_count)
         if not 0 <= initial_ready_work_count <= self.plan.work_item_count:
             raise ValueError("initial runnable work count is outside the active plan")
+        if ready_work_offsets is None:
+            launch_offsets = (initial_ready_work_count,) * len(block_counts)
+            valid_launch_geometry = not any(
+                current < previous
+                for previous, current in zip(launch_counts, launch_counts[1:])
+            )
+        else:
+            launch_offsets = tuple(int(offset) for offset in ready_work_offsets)
+            valid_launch_geometry = (
+                len(launch_offsets) == len(block_counts)
+                and bool(launch_offsets)
+                and launch_offsets[0] >= initial_ready_work_count
+                and all(
+                    current_offset == previous_offset + previous_count
+                    for previous_offset, previous_count, current_offset in zip(
+                        launch_offsets, launch_counts, launch_offsets[1:]
+                    )
+                )
+            )
+        if (
+            len(launch_counts) != len(block_counts)
+            or any(count <= 0 for count in launch_counts)
+            or not valid_launch_geometry
+            or any(
+                offset < 0 or offset + count > self.plan.work_item_count
+                for offset, count in zip(launch_offsets, launch_counts, strict=True)
+            )
+        ):
+            raise ValueError("runnable launch windows are outside the active plan")
         next_indexed_object = (
             None
             if indexed_host_first_object is None
@@ -442,11 +562,6 @@ class FlashInferLayerEpoch:
                 )
             next_indexed_object += blocks
 
-        if any(
-            count > self.plan.work_item_count - initial_ready_work_count
-            for count in launch_counts
-        ):
-            raise ValueError("resume launch bound exceeds work after initial fragment")
         if stream is None and progress_stream is not None:
             import torch
 
@@ -494,7 +609,7 @@ class FlashInferLayerEpoch:
                 scale,
                 BIND_CURRENT_GENERATION
                 | RUNNABLE_WORK
-                | (initial_ready_work_count << RUNNABLE_OFFSET_SHIFT),
+                | (launch_offsets[progress_round - 1] << RUNNABLE_OFFSET_SHIFT),
                 launch_counts[progress_round - 1],
                 run_options,
             )
@@ -599,6 +714,76 @@ class FlashInferLayerEpoch:
             None,
             run_options,
         )
+
+    def enqueue_arriving_host(
+        self,
+        wrapper: Any,
+        q: Any,
+        paged_kv_cache: Any,
+        out: Any,
+        *,
+        ready_event: Any,
+        initial_ready_work_count: int,
+        sm_scale: float | None = None,
+        stream: Any,
+        run_options: dict[str, Any] | None = None,
+    ) -> int:
+        """Consume direct work while directory-backed proactive KV arrives.
+
+        The producer already owns and is acquiring the dependency objects, so
+        this epoch resets tickets only. Initial discovery compacts the direct
+        contributors and launches that prefix. After the producer event, a
+        second discovery observes those same objects as ready and one compact
+        resume launch completes the exact reduction. The two discoveries also
+        close the race in which the producer finishes just before the first.
+        """
+
+        if not self.plan.has_external:
+            raise ValueError("arriving host launch needs external dependencies")
+        if ready_event is None or stream is None:
+            raise ValueError("arriving host launch needs an event and CUDA stream")
+        initial_ready_work_count = int(initial_ready_work_count)
+        deferred_work_count = self.plan.work_item_count - initial_ready_work_count
+        if initial_ready_work_count <= 0 or deferred_work_count <= 0:
+            raise ValueError("arriving host launch requires direct and deferred work")
+        if self.epoch.object_count != 0 or self.epoch.max_progress_rounds != 1:
+            raise ValueError(
+                "arriving host epoch must not own producer objects or extra rounds"
+            )
+        scale = 1.0 / math.sqrt(q.shape[-1]) if sm_scale is None else sm_scale
+        self._prepare(stream)
+        self.epoch.phases.reset(
+            self.runtime,
+            0,
+            self.epoch.work_ticket_count,
+            stream,
+        )
+        self.epoch.phases.discover(self.runtime, self.plan, stream)
+        self._launch(
+            wrapper,
+            q,
+            paged_kv_cache,
+            out,
+            scale,
+            BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+            initial_ready_work_count,
+            run_options,
+        )
+        stream.wait_event(ready_event)
+        self.epoch.phases.discover(self.runtime, self.plan, stream)
+        self._launch(
+            wrapper,
+            q,
+            paged_kv_cache,
+            out,
+            scale,
+            BIND_CURRENT_GENERATION
+            | RUNNABLE_WORK
+            | (initial_ready_work_count << RUNNABLE_OFFSET_SHIFT),
+            deferred_work_count,
+            run_options,
+        )
+        return 1
 
     def run_nvme(
         self,

@@ -460,8 +460,7 @@ __device__ __forceinline__ bool tryReserveTenantBytes(abi::RuntimeView *runtime,
     return false;
   }
   abi::TenantContext &tenant = runtime->tenants[tenantId];
-  return tenant.active != 0 &&
-         tryReserveCounter(&tenant.outstandingBytes, tenant.maxOutstandingBytes,
+  return tryReserveCounter(&tenant.outstandingBytes, tenant.maxOutstandingBytes,
                            bytes);
 }
 
@@ -970,8 +969,7 @@ __device__ __forceinline__ void consumeIntent(abi::RuntimeView *runtime,
 __device__ __forceinline__ bool tryClaimValidatedIndexedHostIntent(
     abi::RuntimeView *runtime, abi::IntentSlot &intentSlot,
     abi::ObjectEntry &object, const abi::ReplicaEntry &replica) {
-  if ((replica.flags &
-       (abi::ReplicaIndexed | abi::ReplicaIndicesValidated)) !=
+  if ((replica.flags & (abi::ReplicaIndexed | abi::ReplicaIndicesValidated)) !=
           (abi::ReplicaIndexed | abi::ReplicaIndicesValidated) ||
       replica.sourceKind !=
           static_cast<std::uint32_t>(abi::SourceKind::HostStaged) ||
@@ -991,8 +989,8 @@ __device__ __forceinline__ bool tryClaimValidatedIndexedHostIntent(
       accepted = false;
     }
   }
-  if (accepted && !tryReserveBackendBytes(
-                      runtime, abi::SourceKind::HostStaged, intent.bytes)) {
+  if (accepted && !tryReserveBackendBytes(runtime, abi::SourceKind::HostStaged,
+                                          intent.bytes)) {
     if (live) {
       releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
                           intent.bytes);
@@ -1034,6 +1032,8 @@ validNvmeTransfer(abi::RuntimeView *runtime, const abi::NvmeQueueView &queue,
                   const abi::AcquireIntent &intent,
                   const abi::ObjectEntry &object,
                   const abi::ReplicaEntry *replica) {
+  const std::uint64_t firstByteOffset =
+      replica == nullptr ? UINT64_MAX : replica->transferShape;
   if (replica == nullptr || queue.controllerPageSize == 0 ||
       queue.lbaShift >= 32U || object.bytes == 0 ||
       queue.submissions == nullptr || queue.contexts == nullptr ||
@@ -1041,15 +1041,20 @@ validNvmeTransfer(abi::RuntimeView *runtime, const abi::NvmeQueueView &queue,
       queue.cqDoorbell == nullptr || object.objectId != intent.objectId ||
       object.version != intent.objectVersion || intent.offset != 0 ||
       intent.bytes != object.bytes || replica->dmaPageListAddress == 0 ||
+      firstByteOffset >= queue.controllerPageSize ||
       object.bytes > UINT64_MAX - (queue.controllerPageSize - 1U)) {
     return false;
   }
+  const auto *dmaPages =
+      reinterpret_cast<const std::uint64_t *>(replica->dmaPageListAddress);
   const std::uint64_t expectedPages64 =
-      (object.bytes + queue.controllerPageSize - 1U) / queue.controllerPageSize;
+      (firstByteOffset + object.bytes + queue.controllerPageSize - 1U) /
+      queue.controllerPageSize;
   const std::uint64_t lbaSize = 1ULL << queue.lbaShift;
   const std::uint64_t lbaCount = object.bytes >> queue.lbaShift;
   return expectedPages64 <= UINT32_MAX &&
          replica->dmaPageCount == static_cast<std::uint32_t>(expectedPages64) &&
+         dmaPages[0] % queue.controllerPageSize == 0 &&
          object.bytes % lbaSize == 0 && replica->sourceAddress % lbaSize == 0 &&
          lbaCount != 0 && lbaCount <= 65'536ULL &&
          replica->dmaPageCount <=
@@ -1135,7 +1140,7 @@ publishNvmeRead(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
   abi::NvmeSubmission &submission = queue.submissions[submissionSlot];
   const auto *dmaPages =
       reinterpret_cast<const std::uint64_t *>(replica.dmaPageListAddress);
-  const std::uint64_t firstPrp = dmaPages[0];
+  const std::uint64_t firstPrp = dmaPages[0] + replica.transferShape;
   const std::uint64_t secondPrp =
       replica.dmaPageCount == 2
           ? dmaPages[1]
@@ -1173,11 +1178,6 @@ publishNvmeRead(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
   atomicExch(&context.active, 1U);
   atomicExch(&object.state,
              static_cast<std::uint32_t>(abi::ObjectState::Issued));
-  if (intent.tenantId < runtime->tenantCapacity) {
-    atomicAdd(reinterpret_cast<unsigned long long *>(
-                  &runtime->tenants[intent.tenantId].serviceBytes),
-              static_cast<unsigned long long>(object.bytes));
-  }
   if (consumedIntent != nullptr) {
     consumeIntent(runtime, *consumedIntent);
   }
@@ -1323,17 +1323,16 @@ nta_request_live(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
 // every lane supplies the same slot and generation, so one lane per warp can
 // load the entry and broadcast the CTA-uniform decision without a CTA barrier.
 __device__ __forceinline__ bool
-nta_request_live_warp(nta::abi::RuntimeView *runtime,
-                      std::uint32_t requestSlot,
+nta_request_live_warp(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
                       std::uint32_t generation) {
   const std::uint32_t linearThread =
       threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
   const unsigned active = __activemask();
   const int leader = __ffs(static_cast<int>(active)) - 1;
-  const bool live = static_cast<int>(linearThread & 31U) == leader
-                        ? nta::device::requestLive(runtime, requestSlot,
-                                                   generation)
-                        : false;
+  const bool live =
+      static_cast<int>(linearThread & 31U) == leader
+          ? nta::device::requestLive(runtime, requestSlot, generation)
+          : false;
   return __shfl_sync(active, static_cast<unsigned>(live), leader) != 0;
 }
 
@@ -1345,8 +1344,7 @@ nta_request_live_cta(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
 
 extern "C" __device__ __forceinline__ __attribute__((used)) bool
 nta_request_live_work_cta(nta::abi::RuntimeView *runtime,
-                          std::uint32_t requestSlot,
-                          std::uint32_t generation,
+                          std::uint32_t requestSlot, std::uint32_t generation,
                           std::uint32_t workTicket) {
   const bool live = nta_request_live_warp(runtime, requestSlot, generation);
   if (!live && threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
@@ -1514,8 +1512,8 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
         intentSlot->intent = pending;
         device::publishIntent(runtime, *intentSlot, source);
         if (source == abi::SourceKind::HostStaged) {
-          (void)device::tryClaimValidatedIndexedHostIntent(
-              runtime, *intentSlot, object, *selected);
+          (void)device::tryClaimValidatedIndexedHostIntent(runtime, *intentSlot,
+                                                           object, *selected);
         }
         if (!device::backendAcceptsIntent(runtime, source) &&
             device::claimIntent(*intentSlot)) {
@@ -2017,14 +2015,12 @@ extern "C" __global__ void nta_progress_nvme_until_idle(
     bool timedOut = false;
     if (lane == 0) {
       abi::NvmeQueueView *queue = device::nvmeQueue(runtime);
-      abi::BackendView *entry =
-          device::backend(runtime, abi::SourceKind::Nvme);
+      abi::BackendView *entry = device::backend(runtime, abi::SourceKind::Nvme);
       const std::uint64_t pending =
-          entry == nullptr
-              ? 0
-              : atomicAdd(reinterpret_cast<unsigned long long *>(
-                              &entry->pendingAcquisitions),
-                          0ULL);
+          entry == nullptr ? 0
+                           : atomicAdd(reinterpret_cast<unsigned long long *>(
+                                           &entry->pendingAcquisitions),
+                                       0ULL);
       finished = queue == nullptr || queue->error != 0 ||
                  (queue->outstanding == 0 && pending == 0);
       timedOut = !finished && device::globalTimerNs() - start >= timeoutNs;
@@ -2119,8 +2115,7 @@ commitPartial(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
       reductionGroup >= runtime->workTicketCapacity || contributorCount == 0 ||
       contributorIndex >= contributorCount) {
     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
-      device::failWorkTicket(runtime, workTicket,
-                             abi::WorkTicketState::Failed);
+      device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
     }
     return;
   }
@@ -2199,9 +2194,9 @@ nta_commit_stream_ordered_partial(
     std::uint32_t generation, std::uint32_t workTicket,
     std::uint32_t reductionGroup, std::uint32_t contributorIndex,
     std::uint32_t contributorCount, std::uint64_t estimatedComputeNs) {
-  nta::device::commitPartial<true>(
-      runtime, requestSlot, generation, workTicket, reductionGroup,
-      contributorIndex, contributorCount, estimatedComputeNs);
+  nta::device::commitPartial<true>(runtime, requestSlot, generation, workTicket,
+                                   reductionGroup, contributorIndex,
+                                   contributorCount, estimatedComputeNs);
 }
 
 #if NTA_DEVICE_PHASE_KERNELS
@@ -2434,8 +2429,8 @@ __device__ __forceinline__ void copyIndexedHostObjectFixed(
   const std::uint32_t workersPerBlock = blockDim.x / ThreadsPerRow;
   const auto *sourceIndices =
       reinterpret_cast<const std::uint32_t *>(replica.dmaPageListAddress);
-  const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
-      object.stagingTensorMapAddress);
+  const auto *destinationIndices =
+      reinterpret_cast<const std::uint32_t *>(object.stagingTensorMapAddress);
   const std::uint32_t sourceStride =
       abi::sourceTransferStride(replica.transferShape);
   const std::uint32_t destinationStride =
@@ -2461,12 +2456,12 @@ __device__ __forceinline__ void copyIndexedHostObjectFixed(
 #pragma unroll
     for (std::uint32_t segment = 0; segment < Segments; ++segment) {
       const std::uint32_t vector = segment * ThreadsPerRow + lane;
-      storeNoAllocate(reinterpret_cast<uint4 *>(
-                          destination +
-                          static_cast<std::uint64_t>(destinationIndex) *
-                              destinationStride +
-                          static_cast<std::uint64_t>(vector) * sizeof(uint4)),
-                      values[segment]);
+      storeNoAllocate(
+          reinterpret_cast<uint4 *>(
+              destination +
+              static_cast<std::uint64_t>(destinationIndex) * destinationStride +
+              static_cast<std::uint64_t>(vector) * sizeof(uint4)),
+          values[segment]);
     }
   }
 }
@@ -2553,8 +2548,7 @@ __device__ __forceinline__ void copyIndexedHostPair(
 
 template <std::uint32_t ElementBytes, std::uint32_t ThreadsPerRow>
 __device__ __forceinline__ void copyIndexedHostObjectPairFixed(
-    const abi::ObjectEntry &firstObject,
-    const abi::ReplicaEntry &firstReplica,
+    const abi::ObjectEntry &firstObject, const abi::ReplicaEntry &firstReplica,
     const abi::ObjectEntry &secondObject,
     const abi::ReplicaEntry &secondReplica, std::uint32_t objectBlock,
     std::uint32_t blocksPerObject) {
@@ -2564,8 +2558,8 @@ __device__ __forceinline__ void copyIndexedHostObjectPairFixed(
   const std::uint32_t lane = threadIdx.x % ThreadsPerRow;
   const std::uint32_t worker = threadIdx.x / ThreadsPerRow;
   const std::uint32_t workersPerBlock = blockDim.x / ThreadsPerRow;
-  const auto *sourceIndices = reinterpret_cast<const std::uint32_t *>(
-      firstReplica.dmaPageListAddress);
+  const auto *sourceIndices =
+      reinterpret_cast<const std::uint32_t *>(firstReplica.dmaPageListAddress);
   const auto *destinationIndices = reinterpret_cast<const std::uint32_t *>(
       firstObject.stagingTensorMapAddress);
   const std::uint32_t sourceStride =
@@ -2609,7 +2603,8 @@ __device__ __forceinline__ void copyIndexedHostObjectPairFixed(
     for (std::uint32_t segment = 0; segment < Segments; ++segment) {
       const std::uint32_t vector = segment * ThreadsPerRow + lane;
       values[segment] = loadNoAllocate(reinterpret_cast<const uint4 *>(
-          secondSource + static_cast<std::uint64_t>(sourceIndex) * sourceStride +
+          secondSource +
+          static_cast<std::uint64_t>(sourceIndex) * sourceStride +
           static_cast<std::uint64_t>(vector) * sizeof(uint4)));
     }
 #pragma unroll
@@ -2981,9 +2976,10 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
 // gives each adjacent object pair a small block quota, matching the K/V access
 // shape while bounding PCIe read pressure. Stream ordering keeps publication
 // after every copy CTA has retired.
-extern "C" __global__ void nta_validate_indexed_host_range(
-    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
-    std::uint32_t objectCount) {
+extern "C" __global__ void
+nta_validate_indexed_host_range(nta::abi::RuntimeView *runtime,
+                                std::uint32_t firstObject,
+                                std::uint32_t objectCount) {
   using namespace nta;
   const std::uint32_t relative = blockIdx.x;
   const std::uint64_t objectSlot64 =
@@ -3010,8 +3006,8 @@ extern "C" __global__ void nta_validate_indexed_host_range(
           static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
       (replica->flags & abi::ReplicaIndexed) != 0 &&
       replica->sourceAddress != 0 && object.stagingAddress != 0 &&
-      replica->dmaPageListAddress != 0 &&
-      object.stagingTensorMapAddress != 0 && replica->dmaPageCount != 0 &&
+      replica->dmaPageListAddress != 0 && object.stagingTensorMapAddress != 0 &&
+      replica->dmaPageCount != 0 &&
       abi::sourceTransferIndexLimit(replica->tensorMapAddress) != 0 &&
       abi::destinationTransferIndexLimit(replica->tensorMapAddress) != 0 &&
       object.bytes != 0 && object.bytes % replica->dmaPageCount == 0 &&
@@ -3038,9 +3034,10 @@ extern "C" __global__ void nta_validate_indexed_host_range(
   atomicOr(&replica->flags, abi::ReplicaIndicesValidated);
 }
 
-extern "C" __global__ void nta_claim_indexed_host_range(
-    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
-    std::uint32_t objectCount) {
+extern "C" __global__ void
+nta_claim_indexed_host_range(nta::abi::RuntimeView *runtime,
+                             std::uint32_t firstObject,
+                             std::uint32_t objectCount) {
   using namespace nta;
   const std::uint32_t relative = blockIdx.x;
   const std::uint64_t objectSlot64 =
@@ -3086,10 +3083,9 @@ extern "C" __global__ void nta_claim_indexed_host_range(
           static_cast<std::uint32_t>(abi::SourceKind::HostStaged) &&
       (replica->flags & abi::ReplicaIndexed) != 0 &&
       replica->sourceAddress != 0 && object.stagingAddress != 0 &&
-      replica->dmaPageListAddress != 0 &&
-      object.stagingTensorMapAddress != 0 && replica->dmaPageCount != 0 &&
-      sourceLimit != 0 && destinationLimit != 0 && object.bytes != 0 &&
-      object.bytes % replica->dmaPageCount == 0 &&
+      replica->dmaPageListAddress != 0 && object.stagingTensorMapAddress != 0 &&
+      replica->dmaPageCount != 0 && sourceLimit != 0 && destinationLimit != 0 &&
+      object.bytes != 0 && object.bytes % replica->dmaPageCount == 0 &&
       sourceStride >= object.bytes / replica->dmaPageCount &&
       destinationStride >= object.bytes / replica->dmaPageCount;
 
@@ -3122,8 +3118,8 @@ extern "C" __global__ void nta_claim_indexed_host_range(
       device::requestLive(runtime, intent.requestSlot, intent.generation);
   bool accepted = true;
   if (live) {
-    accepted = device::tryReserveRequestBytes(
-        runtime, intent.requestSlot, intent.generation, intent.bytes);
+    accepted = device::tryReserveRequestBytes(runtime, intent.requestSlot,
+                                              intent.generation, intent.bytes);
     if (accepted && !device::tryReserveTenantBytes(runtime, intent.tenantId,
                                                    intent.bytes)) {
       device::releaseRequestBytes(runtime, intent.requestSlot,
@@ -3187,14 +3183,13 @@ extern "C" __global__ void nta_copy_indexed_host_range(
         firstReplica != nullptr && secondReplica != nullptr &&
         firstReplica->dmaPageCount != 0 &&
         firstReplica->dmaPageCount == secondReplica->dmaPageCount &&
-        firstReplica->dmaPageListAddress ==
-            secondReplica->dmaPageListAddress &&
+        firstReplica->dmaPageListAddress == secondReplica->dmaPageListAddress &&
         first.stagingTensorMapAddress == second.stagingTensorMapAddress &&
         firstReplica->transferShape == secondReplica->transferShape &&
         first.bytes == second.bytes;
     if (paired) {
-      const std::uint32_t elementBytes = static_cast<std::uint32_t>(
-          first.bytes / firstReplica->dmaPageCount);
+      const std::uint32_t elementBytes =
+          static_cast<std::uint32_t>(first.bytes / firstReplica->dmaPageCount);
       switch (elementBytes) {
       case 128:
         device::copyIndexedHostObjectPairFixed<128, 8>(
@@ -3248,16 +3243,16 @@ extern "C" __global__ void nta_copy_indexed_host_range(
         static_cast<std::uint32_t>(object.bytes / replica->dmaPageCount);
     switch (elementBytes) {
     case 128:
-      device::copyIndexedHostObjectFixed<128, 8>(
-          object, *replica, objectBlock, blocksPerObject);
+      device::copyIndexedHostObjectFixed<128, 8>(object, *replica, objectBlock,
+                                                 blocksPerObject);
       break;
     case 256:
-      device::copyIndexedHostObjectFixed<256, 8>(
-          object, *replica, objectBlock, blocksPerObject);
+      device::copyIndexedHostObjectFixed<256, 8>(object, *replica, objectBlock,
+                                                 blocksPerObject);
       break;
     case 512:
-      device::copyIndexedHostObjectFixed<512, 8>(
-          object, *replica, objectBlock, blocksPerObject);
+      device::copyIndexedHostObjectFixed<512, 8>(object, *replica, objectBlock,
+                                                 blocksPerObject);
       break;
     case 1024:
       device::copyIndexedHostObjectFixed<1024, 16>(
@@ -3275,9 +3270,10 @@ extern "C" __global__ void nta_copy_indexed_host_range(
   }
 }
 
-extern "C" __global__ void nta_finalize_indexed_host_range(
-    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
-    std::uint32_t objectCount) {
+extern "C" __global__ void
+nta_finalize_indexed_host_range(nta::abi::RuntimeView *runtime,
+                                std::uint32_t firstObject,
+                                std::uint32_t objectCount) {
   using namespace nta;
   const std::uint32_t relative = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint64_t objectSlot64 =
@@ -3300,13 +3296,19 @@ extern "C" __global__ void nta_finalize_indexed_host_range(
   __threadfence_system();
   atomicExch(&object.state,
              static_cast<std::uint32_t>(abi::ObjectState::Ready));
-  device::publishObjectTransition(runtime, objectSlot, abi::ObjectState::Ready);
+  // Indexed range progress is a high-fanout path: one K/V wave commonly feeds
+  // hundreds of attention work tickets. Walking each object's singly-linked
+  // dependency list here would serialize that fanout on one thread per object.
+  // Force the stream-ordered publication kernel to scan pending work in
+  // parallel after every object in this range has reached its terminal state.
+  if (runtime->changedOverflow != nullptr) {
+    atomicExch(runtime->changedOverflow, 1U);
+  }
   const bool live =
       device::requestLive(runtime, intent.requestSlot, intent.generation);
   device::releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
                               live ? intent.bytes : 0);
-  device::releaseTenantBytes(runtime, intent.tenantId,
-                             live ? intent.bytes : 0);
+  device::releaseTenantBytes(runtime, intent.tenantId, live ? intent.bytes : 0);
   device::releaseBackendBytes(runtime, abi::SourceKind::HostStaged,
                               intent.bytes);
   device::consumeIntent(runtime, intentSlot);
@@ -3436,6 +3438,16 @@ extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
     if (!ready) {
       continue;
     }
+    // A full-scan publication is also the dependency-accounting fallback used
+    // by high-fanout indexed range completion. The ticket is still Pending, so
+    // this thread owns its dependency records until publishRunnableWork wins
+    // the state transition below. Preserve the same exact bookkeeping as the
+    // object-centric linked-list path before exposing the ticket as runnable.
+    for (std::uint32_t index = 0; index < workTicket.dependencyCount; ++index) {
+      atomicCAS(&runtime->dependencySatisfied[dependencyStart + index], 0U, 1U);
+    }
+    __threadfence();
+    atomicExch(&runtime->remainingDependencies[workTicketIndex], 0U);
     (void)device::publishRunnableWork(runtime, workTicketIndex);
   }
 }
@@ -3444,20 +3456,21 @@ extern "C" __global__ void nta_publish_ready(nta::abi::RuntimeView *runtime,
 #if NTA_DEVICE_PHASE_KERNELS
 extern "C" __global__ void nta_rebind_indexed_host_pairs(
     nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
-    std::uint32_t pairCount, std::uint64_t keySource,
-    std::uint64_t keyStaging, std::uint64_t valueSource,
-    std::uint64_t valueStaging) {
+    std::uint32_t pairCount, std::uint64_t keySource, std::uint64_t keyStaging,
+    std::uint64_t valueSource, std::uint64_t valueStaging) {
   using namespace nta;
   const std::uint32_t relative = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint64_t objectCount = static_cast<std::uint64_t>(pairCount) * 2U;
-  const std::uint64_t slot64 = static_cast<std::uint64_t>(firstObject) + relative;
+  const std::uint64_t slot64 =
+      static_cast<std::uint64_t>(firstObject) + relative;
   if (runtime == nullptr || relative >= objectCount ||
       slot64 >= runtime->objectCapacity) {
     return;
   }
   const std::uint32_t slot = static_cast<std::uint32_t>(slot64);
   abi::ObjectEntry &object = runtime->objects[slot];
-  if (object.replicaCount != 1 || object.replicaStart >= runtime->replicaCapacity) {
+  if (object.replicaCount != 1 ||
+      object.replicaStart >= runtime->replicaCapacity) {
     device::recordFailure(runtime);
     return;
   }
@@ -3605,9 +3618,10 @@ nta_complete_launched(nta::abi::RuntimeView *runtime,
 // Retire one exact work plan after its application kernel. Kernel-launch stream
 // order supplies the data-publication boundary, so each ticket is initialized
 // and completed once instead of every CTA contending on the same record.
-extern "C" __global__ void nta_complete_stream_ordered(
-    nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *workItems,
-    std::uint32_t workItemCount) {
+extern "C" __global__ void
+nta_complete_stream_ordered(nta::abi::RuntimeView *runtime,
+                            const nta::abi::WorkItem *workItems,
+                            std::uint32_t workItemCount) {
   using namespace nta;
   if (runtime == nullptr || workItems == nullptr) {
     return;

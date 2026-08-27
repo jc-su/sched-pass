@@ -13,9 +13,10 @@ import torch
 
 from .bounded_staging import BoundedStagingPool
 from .flashinfer import (
-    BIND_CURRENT_GENERATION,
+    PREACQUIRED_LAUNCH_FLAGS,
     attention_jit_args,
     direct_requirement,
+    object_requirement,
     pack_work_metadata,
     request_bound_attention_jit_args,
 )
@@ -76,8 +77,18 @@ class _ResidentRun:
 @dataclass(frozen=True)
 class _CompiledWorkPlan:
     plan: DeviceWorkPlan
-    work_ticket_begin: int
-    reduction_group_begin: int
+
+
+@dataclass(frozen=True)
+class _AcquisitionGroup:
+    """One request-owned K/V segment and its wave-local staging slice."""
+
+    wave_index: int
+    request_index: int
+    work_ticket: int
+    object_first: int
+    token_offset: int
+    token_count: int
 
 
 @dataclass(frozen=True)
@@ -410,6 +421,7 @@ class FlashInferTierStreamingOperator:
         self.kv_heads = int(external_key.shape[1])
         self.head_dim = int(external_key.shape[2])
         self.dtype = external_key.dtype
+        self.element_size = external_key.element_size()
         self.backend = backend
         self.workspace = workspace
         self._metadata: list[torch.Tensor] = []
@@ -418,10 +430,9 @@ class FlashInferTierStreamingOperator:
         self._compiled_object_count = 0
         self._compiled_host_indices: list[torch.Tensor] = []
         self._compiled_plans: dict[int, _CompiledWorkPlan] = {}
-        self._compiled_completion_plan: DeviceWorkPlan | None = None
-        self._compiled_completion_work: list[WorkItem] = []
-        self._compiled_completion_dependencies: list[AcquireRequirement] = []
-        self._compiled_completion_ranges: list[RequestRange] = []
+        self._compiled_epoch_plan: DeviceWorkPlan | None = None
+        self._compiled_acquisition_groups: tuple[_AcquisitionGroup, ...] = ()
+        self._compiled_wave_object_ranges: tuple[tuple[int, int], ...] = ()
         self._wrapper_forms: dict[int, OperatorForm] = {}
         self._wrapper_request_counts: dict[int, int] = {}
         self._wrapper_request_slots: dict[int, tuple[int, ...]] = {}
@@ -429,8 +440,8 @@ class FlashInferTierStreamingOperator:
         self._operator_plan: OperatorPlan | None = None
         self._direct_jit_args: list[Any] | None = None
         self._incremental_jit_args: list[Any] | None = None
-        self._compiled_work_count = 0
-        self._compiled_reduction_group_count = 0
+        self._compiled_structural_work_count = 0
+        self._compiled_epoch_work_count = 0
         self._last_compiled_work_count = 0
         if compiler_module_tag is not None:
             self._prepare_compiler_modules(compiler_module_tag)
@@ -443,9 +454,6 @@ class FlashInferTierStreamingOperator:
         )
         self._resident_runs = self._build_resident_runs()
         host_waves = self._build_host_waves(external_key, external_value)
-        self._wrapper_wave_indices = {
-            id(wave.wrapper): index for index, wave in enumerate(host_waves)
-        }
         self.executor = FlashInferTierStreamingExecutor(
             schedule,
             host_waves,
@@ -572,26 +580,80 @@ class FlashInferTierStreamingOperator:
             for wave in self.executor.waves
             if self._wrapper_forms.get(id(wave.wrapper)) == OperatorForm.INCREMENTAL
         ]
-        work_count = sum(
+        structural_work_count = sum(
             paged_prefill_schedule(wrapper).work_count
             for wrapper in incremental_wrappers
         )
-        capacity = work_count
-        self._compiled_object_count = (
-            2 * len(self.executor.waves) if self._gpu_initiated_host else 1
-        )
-        if capacity <= 0:
+        if structural_work_count <= 0:
             raise RuntimeError("compiled FlashInfer operator has no incremental work")
+
+        raw_groups: list[tuple[int, int, int, int, int]] = []
+        wave_object_ranges: list[tuple[int, int]] = []
+        object_cursor = 0
+        if self._gpu_initiated_host:
+            for wave_index, wave in enumerate(self.schedule.waves):
+                first_object = object_cursor
+                token_offset = 0
+                for segment in wave.segments:
+                    raw_groups.append(
+                        (
+                            wave_index,
+                            segment.request_index,
+                            object_cursor,
+                            token_offset,
+                            segment.token_count,
+                        )
+                    )
+                    object_cursor += 2
+                    token_offset += segment.token_count
+                if token_offset != wave.token_count:
+                    raise RuntimeError("compiled wave ownership does not cover its KV")
+                wave_object_ranges.append((first_object, object_cursor - first_object))
+        else:
+            raw_groups.extend(
+                (0, request_index, 0, 0, request.external_tokens)
+                for request_index, request in enumerate(self.schedule.requests)
+            )
+
+        ordered_groups = sorted(raw_groups, key=lambda group: (group[1], group[0]))
+        groups = tuple(
+            _AcquisitionGroup(
+                wave_index,
+                request_index,
+                work_ticket,
+                object_first,
+                token_offset,
+                token_count,
+            )
+            for work_ticket,
+            (wave_index, request_index, object_first, token_offset, token_count) in enumerate(
+                ordered_groups
+            )
+        )
+        if not groups:
+            raise RuntimeError("compiled FlashInfer operator has no epoch groups")
+        self._compiled_acquisition_groups = groups
+        self._compiled_wave_object_ranges = tuple(wave_object_ranges)
+        self._compiled_object_count = object_cursor if self._gpu_initiated_host else 1
+        self._compiled_structural_work_count = structural_work_count
+        self._compiled_epoch_work_count = len(groups)
+        tenant_capacity = max(
+            len(self.schedule.requests),
+            1 + max(request.tenant_id for request in self.schedule.requests),
+        )
         self._compiled_runtime = Runtime(
             RuntimeConfig(
                 request_capacity=len(self.schedule.requests),
                 object_capacity=self._compiled_object_count,
-                intent_capacity=max(capacity, self._compiled_object_count),
-                work_ticket_capacity=capacity,
+                intent_capacity=max(
+                    self._compiled_epoch_work_count, self._compiled_object_count
+                ),
+                work_ticket_capacity=self._compiled_epoch_work_count,
                 max_dependencies_per_work_ticket=(2 if self._gpu_initiated_host else 1),
                 device_ordinal=self.workspace.device.index
                 if self.workspace.device.index is not None
                 else -1,
+                tenant_capacity=tenant_capacity,
             )
         )
         for slot, request in enumerate(self.schedule.requests):
@@ -608,19 +670,89 @@ class FlashInferTierStreamingOperator:
             self._compiled_plans[id(wrapper)] = self._build_compiled_plan(
                 wrapper, request_slots
             )
-        if self._compiled_work_count != work_count:
-            raise RuntimeError("compiled FlashInfer ticket allocation is inconsistent")
-        self._compiled_completion_plan = DeviceWorkPlan(
-            work_count,
-            len(self._compiled_completion_dependencies),
-            self._compiled_runtime.device_ordinal,
-        )
-        self._compiled_completion_plan.upload(
-            self._compiled_completion_work,
-            self._compiled_completion_dependencies,
-            self._compiled_completion_ranges,
-        )
-        self._compiled_completion_plan.synchronize_upload()
+        if sum(
+            compiled.plan.work_item_count for compiled in self._compiled_plans.values()
+        ) != structural_work_count:
+            raise RuntimeError("compiled FlashInfer structural plans are inconsistent")
+        self._compiled_epoch_plan = self._build_epoch_plan(groups)
+
+    def _build_epoch_plan(
+        self, groups: tuple[_AcquisitionGroup, ...]
+    ) -> DeviceWorkPlan:
+        runtime = self._compiled_runtime
+        if runtime is None:
+            raise RuntimeError("compiled FlashInfer epoch plan has no runtime")
+        contributor_counts = [0] * len(self.schedule.requests)
+        for group in groups:
+            contributor_counts[group.request_index] += 1
+        contributor_indices = [0] * len(self.schedule.requests)
+        work: list[WorkItem] = []
+        dependencies: list[AcquireRequirement] = []
+        ranges: list[RequestRange] = []
+        range_begin = 0
+        for group in groups:
+            request = self.schedule.requests[group.request_index]
+            dependency_begin = len(dependencies)
+            if self._gpu_initiated_host:
+                object_bytes = (
+                    group.token_count
+                    * self.kv_heads
+                    * self.head_dim
+                    * self.element_size
+                )
+                requirements = tuple(
+                    object_requirement(
+                        object_slot=group.object_first + lane,
+                        object_id=0x4E54414800000000 | (group.object_first + lane),
+                        object_version=1,
+                        bytes=object_bytes,
+                    )
+                    for lane in range(2)
+                )
+                direct_count = 0
+            else:
+                requirements = (direct_requirement(runtime.device_view, 1),)
+                direct_count = 1
+            dependencies.extend(requirements)
+            contributor_index = contributor_indices[group.request_index]
+            work.append(
+                WorkItem(
+                    group.request_index,
+                    group.request_index,
+                    request.generation,
+                    group.wave_index,
+                    dependency_begin,
+                    len(requirements),
+                    direct_count,
+                    group.work_ticket,
+                    group.request_index,
+                    contributor_index,
+                    contributor_counts[group.request_index],
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            )
+            contributor_indices[group.request_index] += 1
+            if contributor_index == 0:
+                range_begin = group.work_ticket
+            if contributor_indices[group.request_index] == contributor_counts[
+                group.request_index
+            ]:
+                ranges.append(
+                    RequestRange(
+                        range_begin,
+                        contributor_counts[group.request_index],
+                        group.request_index,
+                        request.generation,
+                    )
+                )
+        plan = DeviceWorkPlan(len(work), len(dependencies), runtime.device_ordinal)
+        plan.upload(work, dependencies, ranges)
+        plan.synchronize_upload()
+        return plan
 
     def _wrapper(
         self,
@@ -692,77 +824,26 @@ class FlashInferTierStreamingOperator:
         if any(count == 0 for count in counts):
             raise RuntimeError("FlashInfer emitted no work for a compiled request")
         contributor_indices = [0] * len(request_slots)
-        work_ticket_begin = self._compiled_work_count
-        reduction_group_begin = self._compiled_reduction_group_count
         work: list[WorkItem] = []
         dependencies: list[AcquireRequirement] = []
-        wave_index = self._wrapper_wave_indices.get(id(wrapper))
-        if self._gpu_initiated_host and wave_index is None:
-            raise RuntimeError("incremental wrapper has no host wave identity")
         for local_work_ticket, (request_index, logical_work) in enumerate(
             zip(schedule.request_indices, schedule.kv_tile_indices, strict=True)
         ):
-            work_ticket = work_ticket_begin + local_work_ticket
             slot = request_slots[request_index]
             request = self.schedule.requests[slot]
-            local_dependency_begin = len(dependencies)
-            completion_dependency_begin = len(self._compiled_completion_dependencies)
-            if self._gpu_initiated_host:
-                if wave_index is None:  # pragma: no cover - checked above
-                    raise RuntimeError("incremental wrapper has no host wave identity")
-                wave = self.executor.waves[wave_index]
-                dependency_count = 2
-                direct_dependency_count = 0
-                requirements = tuple(
-                    AcquireRequirement(
-                        0,
-                        0,
-                        0x4E54414800000000 | object_slot,
-                        0,
-                        object_slot,
-                        1,
-                        wave.key.nbytes,
-                        0,
-                    )
-                    for object_slot in (2 * wave_index, 2 * wave_index + 1)
-                )
-            else:
-                dependency_count = 1
-                direct_dependency_count = 1
-                requirements = (direct_requirement(runtime.device_view, 1),)
-            dependencies.extend(requirements)
-            self._compiled_completion_dependencies.extend(requirements)
+            dependency_begin = len(dependencies)
+            dependencies.append(direct_requirement(runtime.device_view, 1))
             work.append(
                 WorkItem(
                     request_index,
                     slot,
                     request.generation,
                     logical_work,
-                    local_dependency_begin,
-                    dependency_count,
-                    direct_dependency_count,
-                    work_ticket,
-                    reduction_group_begin + request_index,
-                    contributor_indices[request_index],
-                    counts[request_index],
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                )
-            )
-            self._compiled_completion_work.append(
-                WorkItem(
-                    reduction_group_begin + request_index,
-                    slot,
-                    request.generation,
-                    logical_work,
-                    completion_dependency_begin,
-                    dependency_count,
-                    direct_dependency_count,
-                    work_ticket,
-                    reduction_group_begin + request_index,
+                    dependency_begin,
+                    1,
+                    1,
+                    local_work_ticket,
+                    request_index,
                     contributor_indices[request_index],
                     counts[request_index],
                     0,
@@ -782,14 +863,6 @@ class FlashInferTierStreamingOperator:
                     cursor, count, slot, self.schedule.requests[slot].generation
                 )
             )
-            self._compiled_completion_ranges.append(
-                RequestRange(
-                    work_ticket_begin + cursor,
-                    count,
-                    slot,
-                    self.schedule.requests[slot].generation,
-                )
-            )
             cursor += count
         if tuple(schedule.request_indices) != tuple(
             request_index
@@ -802,13 +875,7 @@ class FlashInferTierStreamingOperator:
         )
         plan.upload(work, dependencies, request_ranges)
         plan.synchronize_upload()
-        self._compiled_work_count += schedule.work_count
-        self._compiled_reduction_group_count += len(request_slots)
-        return _CompiledWorkPlan(
-            plan,
-            work_ticket_begin,
-            reduction_group_begin,
-        )
+        return _CompiledWorkPlan(plan)
 
     def _enable_gpu_initiated_host(self) -> None:
         runtime = self._compiled_runtime
@@ -816,33 +883,43 @@ class FlashInferTierStreamingOperator:
         if runtime is None or programs is None:
             raise RuntimeError("GPU-initiated host acquisition has no runtime")
         objects: list[IndexedHostObject] = []
-        for wave_index, wave in enumerate(self.executor.waves):
-            slot = wave_index % self.executor.slot_count
+        for group in sorted(
+            self._compiled_acquisition_groups, key=lambda value: value.object_first
+        ):
+            if len(objects) != group.object_first:
+                raise RuntimeError("compiled host objects are not densely assigned")
+            wave = self.executor.waves[group.wave_index]
+            slot = group.wave_index % self.executor.slot_count
             indices = torch.arange(
-                wave.token_count,
+                group.token_count,
                 dtype=torch.int32,
                 device=self.workspace.device,
             )
             self._compiled_host_indices.append(indices)
-            for object_slot, source, staging in (
-                (2 * wave_index, wave.key, self.executor.staging_key[slot]),
-                (2 * wave_index + 1, wave.value, self.executor.staging_value[slot]),
+            for lane, source, staging in (
+                (0, wave.key, self.executor.staging_key[slot]),
+                (1, wave.value, self.executor.staging_value[slot]),
             ):
+                object_slot = group.object_first + lane
                 element_bytes = source[0].numel() * source.element_size()
+                source_stride_bytes = source.stride(0) * source.element_size()
+                staging_stride_bytes = staging.stride(0) * staging.element_size()
                 objects.append(
                     IndexedHostObject(
                         0x4E54414800000000 | object_slot,
                         1,
-                        source.data_ptr(),
-                        staging.data_ptr(),
+                        source.data_ptr()
+                        + group.token_offset * source_stride_bytes,
+                        staging.data_ptr()
+                        + group.token_offset * staging_stride_bytes,
                         indices.data_ptr(),
                         indices.data_ptr(),
-                        wave.token_count,
+                        group.token_count,
                         element_bytes,
-                        source.stride(0) * source.element_size(),
-                        staging.stride(0) * staging.element_size(),
-                        wave.token_count,
-                        int(staging.shape[0]),
+                        source_stride_bytes,
+                        staging_stride_bytes,
+                        group.token_count,
+                        group.token_count,
                     )
                 )
         runtime.register_indexed_host_objects(0, objects)
@@ -862,10 +939,13 @@ class FlashInferTierStreamingOperator:
         programs = self._compiler_programs
         if runtime is None or programs is None:
             raise RuntimeError("GPU-initiated host wave has no runtime")
+        if wave_index < 0 or wave_index >= len(self._compiled_wave_object_ranges):
+            raise RuntimeError("GPU-initiated host wave is outside the finite plan")
+        first_object, object_count = self._compiled_wave_object_ranges[wave_index]
         programs[1].progress_indexed_host_range(
             runtime,
-            2 * wave_index,
-            2,
+            first_object,
+            object_count,
             stream,
         )
 
@@ -1101,7 +1181,7 @@ class FlashInferTierStreamingOperator:
             work_items = compiled.plan.work_items_tensor
             dependencies = compiled.plan.dependencies_tensor
             work_count = compiled.plan.work_item_count
-            flags = BIND_CURRENT_GENERATION | (compiled.reduction_group_begin << 32)
+            flags = PREACQUIRED_LAUNCH_FLAGS
         request_count = self._wrapper_request_counts.get(id(wrapper))
         if request_count is None:
             raise RuntimeError("compiled FlashInfer wrapper has no request count")
@@ -1186,31 +1266,31 @@ class FlashInferTierStreamingOperator:
         """Enqueue the complete finite incremental operator."""
 
         if self._compiler_programs is not None:
-            if self._compiled_runtime is None or self._compiled_work_count <= 0:
+            if (
+                self._compiled_runtime is None
+                or self._compiled_epoch_plan is None
+                or self._compiled_epoch_work_count <= 0
+            ):
                 raise RuntimeError("compiled FlashInfer operator has no finite epoch")
             self._compiler_programs[1].reset(
                 self._compiled_runtime,
                 self._compiled_object_count,
-                self._compiled_work_count,
+                self._compiled_epoch_work_count,
                 self.executor.compute_stream,
             )
             if self._gpu_initiated_host:
-                if self._compiled_completion_plan is None:
-                    raise RuntimeError(
-                        "GPU-initiated host acquisition has no discovery plan"
-                    )
                 self._compiler_programs[1].invalidate_cached_objects(
                     self._compiled_runtime,
                     0,
                     self._compiled_object_count,
                     self.executor.compute_stream,
                 )
-                self._compiler_programs[1].discover(
-                    self._compiled_runtime,
-                    self._compiled_completion_plan,
-                    self.executor.compute_stream,
-                )
-            self._last_compiled_work_count = self._compiled_work_count
+            self._compiler_programs[1].discover(
+                self._compiled_runtime,
+                self._compiled_epoch_plan,
+                self.executor.compute_stream,
+            )
+            self._last_compiled_work_count = self._compiled_epoch_work_count
 
         self.executor.run(
             query,
@@ -1242,16 +1322,16 @@ class FlashInferTierStreamingOperator:
             completion_events=completion_events,
         )
         if self._compiler_programs is not None:
-            if self._compiled_runtime is None or self._compiled_completion_plan is None:
+            if self._compiled_runtime is None or self._compiled_epoch_plan is None:
                 raise RuntimeError(
                     "compiled FlashInfer operator has no completion plan"
                 )
             self._compiler_programs[1].complete_stream_ordered(
                 self._compiled_runtime,
-                self._compiled_completion_plan,
+                self._compiled_epoch_plan,
                 self.executor.compute_stream,
             )
-            self._compiled_completion_plan.mark_consumed(self.executor.compute_stream)
+            self._compiled_epoch_plan.mark_consumed(self.executor.compute_stream)
 
     def capture(
         self,

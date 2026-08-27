@@ -96,6 +96,7 @@ def main() -> None:
     comparison = {
         "schema": 1,
         "classification": "sglang-hicache-load-comparison",
+        "evidence_scope": "native_work_unit",
         "outputs_diverge": False,
         "stock": stock,
         "nta": nta,
@@ -109,6 +110,9 @@ def main() -> None:
             "fallback_batches": 0,
             "transformed_direct_launches": 0,
             "ticketed_incremental_launches": 1,
+            "native_work_unit_active": True,
+            "heterogeneous_work_unit_active": False,
+            "transport_only": False,
         },
         "stock_slo_goodput": 5.0,
         "nta_slo_goodput": 6.0,

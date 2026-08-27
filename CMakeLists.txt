@@ -401,23 +401,73 @@ if(Python3_Interpreter_FOUND)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/vllm_report.py
   )
   add_test(
-    NAME nta-semantic-native-bridge
+    NAME nta-exact-native-bridge
     COMMAND
       ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/semantic_native_bridge.py
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/exact_native_bridge.py
   )
   set_tests_properties(
-    nta-semantic-native-bridge PROPERTIES
+    nta-exact-native-bridge PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
-    NAME nta-critical-work
+    NAME nta-execution-topology
     COMMAND
       ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/critical_work.py
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/execution_topology.py
   )
   set_tests_properties(
-    nta-critical-work PROPERTIES
+    nta-execution-topology PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-indexed-host-plan
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/indexed_host_plan.py
+  )
+  set_tests_properties(
+    nta-indexed-host-plan PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-sglang-lease-topology
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_lease_topology.py
+  )
+  set_tests_properties(
+    nta-sglang-lease-topology PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-progress-frontier
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/progress_frontier.py
+  )
+  set_tests_properties(
+    nta-progress-frontier PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-indexed-transfer
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/indexed_transfer.py
+  )
+  set_tests_properties(
+    nta-indexed-transfer PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-hbm-registration
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/hbm_registration.py
+  )
+  set_tests_properties(
+    nta-hbm-registration PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
@@ -455,6 +505,16 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(
     nta-flashinfer-overlay PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  add_test(
+    NAME nta-flashinfer-plan
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/flashinfer_plan.py
+  )
+  set_tests_properties(
+    nta-flashinfer-plan PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
 endif()
 
@@ -614,11 +674,56 @@ if(NTA_ENABLE_CUDA)
       nta-runtime PRIVATE -Wall -Wextra -Wpedantic -Werror
     )
   endif()
+
+  # Transport phases are runtime infrastructure, not part of a numerical
+  # operator.  Build them once as a compact generic module so serving paths do
+  # not JIT an otherwise-unused FlashInfer attention family merely to launch
+  # indexed copies or NVMe progress kernels.
+  set(NTA_TRANSPORT_PROGRAM
+      "${CMAKE_CURRENT_BINARY_DIR}/libnta-transport-program.so")
+  add_custom_command(
+    OUTPUT "${NTA_TRANSPORT_PROGRAM}"
+    COMMAND
+      ${CMAKE_COMMAND} -E env
+      NTA_CLANG=${NTA_CLANG_CUDA}
+      NTA_CUDA_PATH=${NTA_CUDA_ROOT}
+      NTA_PROJECT_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+      NTA_JIT_ONLY=__nta_transport_never_instrument__
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/nvcc_clang.py
+      -std=c++20
+      --expt-relaxed-constexpr
+      -O3
+      -lineinfo
+      -shared
+      -Xcompiler -fPIC
+      -arch ${NTA_CUDA_ARCH}
+      -I${CMAKE_CURRENT_SOURCE_DIR}/include
+      -I${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/runtime/device/TransportProgram.cu
+      -o "${NTA_TRANSPORT_PROGRAM}"
+    DEPENDS
+      runtime/device/TransportProgram.cu
+      runtime/device/JitRuntime.cuh
+      runtime/device/TypedInstrumentation.cuh
+      runtime/device/Acquire.cuh
+      include/nta/KernelPolicy.cuh
+      include/nta/OperatorContract.h
+      include/nta/RuntimeABI.h
+      tools/jit/nvcc_clang.py
+      tools/jit/clang_cuda_prelude.h
+      tools/jit/cuda_toolkit.py
+    VERBATIM
+    COMMAND_EXPAND_LISTS
+  )
+  add_custom_target(nta-transport-program ALL
+                    DEPENDS "${NTA_TRANSPORT_PROGRAM}")
   install(
     TARGETS nta-runtime nta-runtime-host
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   )
+  install(FILES "${NTA_TRANSPORT_PROGRAM}"
+          DESTINATION ${CMAKE_INSTALL_LIBDIR})
   install(
     DIRECTORY include/nta
     DESTINATION ${CMAKE_INSTALL_DATADIR}/nta/include
@@ -667,6 +772,11 @@ if(NTA_ENABLE_CUDA)
       NAME nta-sglang-plugin
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_plugin.py
+    )
+    add_test(
+      NAME nta-sglang-storage-connector
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_storage_connector.py
     )
     add_test(
       NAME nta-bounded-staging
@@ -754,7 +864,7 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/physical_tier_capability.py
     )
     set_tests_properties(
-      nta-request-slots nta-sglang-plugin
+      nta-request-slots nta-sglang-plugin nta-sglang-storage-connector
       nta-bounded-staging
       nta-qualification-runner
       nta-serving-evidence nta-jit-operator-family
@@ -773,6 +883,9 @@ if(NTA_ENABLE_CUDA)
     set_tests_properties(nta-request-slots PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
     )
+    set_tests_properties(nta-sglang-storage-connector PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    )
     set_tests_properties(nta-performance-gate PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}"
     )
@@ -785,12 +898,18 @@ if(NTA_ENABLE_CUDA)
   endif()
 
   add_executable(nta-jit-phase-load tests/runtime/JitPhaseLoad.cpp)
+  add_dependencies(nta-jit-phase-load nta-transport-program)
   target_link_libraries(nta-jit-phase-load PRIVATE nta-runtime-host)
   if(NTA_WARNINGS_AS_ERRORS)
     target_compile_options(
       nta-jit-phase-load PRIVATE -Wall -Wextra -Wpedantic -Werror
     )
   endif()
+  add_test(
+    NAME nta-transport-program-load
+    COMMAND nta-jit-phase-load "${NTA_TRANSPORT_PROGRAM}"
+  )
+  set_tests_properties(nta-transport-program-load PROPERTIES TIMEOUT 30)
 
   find_program(
     NTA_PTXAS
@@ -950,6 +1069,33 @@ if(Python3_Interpreter_FOUND)
       nta-flashinfer-jit-compile nta-flashinfer-hooked-decode
       PROPERTIES RUN_SERIAL TRUE TIMEOUT 300
     )
+    if(NTA_TEST_NVME_ENDPOINT AND NTA_TEST_NVME_REFERENCE AND
+       NTA_TEST_NVME_MEDIA_POLICY AND
+       NTA_TEST_NVME_DMA_TARGET STREQUAL "hbm-peer")
+      add_test(
+        NAME nta-flashinfer-nvme-numerical
+        COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
+          --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --cache-root ${NTA_TEST_JIT_CACHE_ROOT}
+          --clang ${NTA_CLANG_CUDA}
+          --cuda-path ${NTA_CUDA_ROOT}
+          --flashinfer-hook
+          --
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/flashinfer/hooked_decode.py
+          --nvme-numerical-only
+      )
+      set_tests_properties(
+        nta-flashinfer-nvme-numerical PROPERTIES
+        RUN_SERIAL TRUE TIMEOUT 300 RESOURCE_LOCK nta_nvme_physical
+        LABELS "physical;correctness;nvme;flashinfer;numerical"
+        PASS_REGULAR_EXPRESSION
+          "nvme_flashinfer_numerical=pass payload_alias=1"
+        ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
+      )
+    endif()
     set_tests_properties(
       nta-indexed-row-count-seam
       PROPERTIES DEPENDS nta-flashinfer-jit-compile
@@ -1104,6 +1250,34 @@ if(Python3_Interpreter_FOUND)
   if(NTA_WARNINGS_AS_ERRORS)
     target_compile_options(
       nta-nvme-bench PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+  if(NTA_TEST_NVME_ENDPOINT AND NTA_TEST_NVME_REFERENCE AND
+     NTA_TEST_NVME_MEDIA_POLICY AND
+     NTA_TEST_NVME_DMA_TARGET STREQUAL "hbm-peer")
+    add_test(
+      NAME nta-nvme-external-hbm-offset-gpu
+      COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
+        $<TARGET_FILE:nta-nvme-bench>
+        --device=${NTA_TEST_NVME_ENDPOINT}
+        --gpu=0
+        --namespace=1
+        --queue-depth=64
+        --media-policy=${NTA_TEST_NVME_MEDIA_POLICY}
+        --dma-target=hbm-peer
+        --reference=${NTA_TEST_NVME_REFERENCE}
+        --source-offset=512
+        --bytes=65536
+        --requests=4
+        --iterations=2
+        --progress-rounds=1
+        --external-destination-offset=512
+    )
+    set_tests_properties(
+      nta-nvme-external-hbm-offset-gpu PROPERTIES
+      TIMEOUT 120 RESOURCE_LOCK nta_nvme_physical
+      LABELS "physical;correctness;nvme;external-hbm"
+      ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
     )
   endif()
 
@@ -1726,6 +1900,10 @@ endif()
 
 add_custom_target(
   nta-vfio-preflight
-  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/nta-vfio-device.sh preflight
+  COMMAND
+    ${CMAKE_COMMAND} -E env
+    ${NTA_TEST_NVME_ENVIRONMENT}
+    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/nta-vfio-device.sh preflight
   USES_TERMINAL
+  COMMAND_EXPAND_LISTS
 )

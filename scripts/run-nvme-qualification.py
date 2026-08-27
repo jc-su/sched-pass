@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         default=RESULTS_ROOT / "qualification" / "nvme-qualification.json",
     )
+    parser.add_argument(
+        "--reference",
+        type=pathlib.Path,
+        default=RESULTS_ROOT / "qualification" / "nvme-reference.bin",
+        help=(
+            "build/artifact-scoped read-only namespace reference; it is "
+            "captured before VFIO binding and reused by the exact-data checks"
+        ),
+    )
     args = parser.parse_args()
     if (
         min(
@@ -183,6 +192,7 @@ def read_only_preflight(args: argparse.Namespace) -> None:
             "NTA_GPU": str(args.gpu),
             "NTA_NVME_MEDIA_POLICY": args.media_policy,
             "NTA_NVME_DMA_TARGET": args.dma_target,
+            "NTA_NVME_REFERENCE": str(args.reference),
             "NTA_NVME_REFERENCE_BYTES": str(args.bytes * args.requests),
         },
     )
@@ -247,6 +257,7 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
         "NTA_GPU": str(args.gpu),
         "NTA_NVME_MEDIA_POLICY": args.media_policy,
         "NTA_NVME_DMA_TARGET": args.dma_target,
+        "NTA_NVME_REFERENCE": str(args.reference),
         "NTA_NVME_REFERENCE_BYTES": str(args.bytes * args.requests),
         "NTA_ALLOW_DEVICE_REBIND": "1",
         "NTA_NVME_KEEP_VFIO": "1" if args.keep_vfio else "0",
@@ -301,6 +312,10 @@ def main() -> int:
             "review the read-only preflight and explicitly authorize VFIO rebinding"
         )
     git_revision, dirty = revision()
+    args.reference = args.reference.expanduser().resolve()
+    if args.reference.exists() and not args.reference.is_file():
+        raise SystemExit(f"NVMe reference is not a regular file: {args.reference}")
+    args.reference.parent.mkdir(parents=True, exist_ok=True)
     phase = "preflight"
     try:
         read_only_preflight(args)

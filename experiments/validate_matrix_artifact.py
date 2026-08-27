@@ -4,13 +4,14 @@
 The validator deliberately knows nothing about GPU timings.  It checks the
 properties that a dependency-free artifact can prove: one exact trace per
 case/repetition, complete arm coverage, explicit mechanism activation, tier
-and granularity strata, and Little's-law accounting.
+and granularity strata, and deterministic blocked-cohort accounting.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -38,10 +39,16 @@ _REQUIRED_FIELDS = (
     "physical_bytes",
     "tier",
     "stratum",
-    "pending_arrival_rate",
+    "queueing_accounting_method",
+    "queueing_release_process",
+    "queueing_interpretation",
+    "initial_blocked_work_units",
+    "pending_release_count",
+    "pending_window_us",
+    "pending_area_unit_us",
+    "pending_release_rate_per_second",
     "mean_pending_units",
     "mean_pending_us",
-    "littles_law_residual",
     "activation_counters",
     "execution_mode",
     "ablation_applied",
@@ -71,6 +78,59 @@ def _case_key(record: dict[str, Any]) -> tuple[int, str]:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def _validate_pending_accounting(record: dict[str, Any]) -> None:
+    _require(
+        record["queueing_accounting_method"]
+        == "finite_window_synthetic_release_accounting",
+        "matrix queueing method is not the declared finite-window model",
+    )
+    _require(
+        record["queueing_release_process"]
+        == "uniform_midpoint_over_availability_window",
+        "matrix queueing release process is not reproducible",
+    )
+    _require(
+        record["queueing_interpretation"]
+        == "cohort_accounting_not_stationary_queueing",
+        "matrix queueing scope is overstated",
+    )
+    count = int(record["pending_release_count"])
+    initial_blocked = int(record["initial_blocked_work_units"])
+    window_us = float(record["pending_window_us"])
+    area_unit_us = float(record["pending_area_unit_us"])
+    _require(count == initial_blocked >= 0, "pending cohort count is inconsistent")
+    _require(window_us >= 0.0, "pending observation window is negative")
+    _require(area_unit_us >= 0.0, "pending occupancy area is negative")
+
+    if count == 0 or window_us == 0.0:
+        expected_area = 0.0
+        expected_rate = 0.0
+        expected_mean_units = 0.0
+        expected_mean_us = 0.0
+    else:
+        expected_area = count * window_us / 2.0
+        expected_rate = count / window_us * 1_000_000
+        expected_mean_units = area_unit_us / window_us
+        expected_mean_us = area_unit_us / count
+
+    def close(actual: float, expected: float) -> bool:
+        return math.isclose(actual, expected, rel_tol=1.0e-12, abs_tol=1.0e-9)
+
+    _require(close(area_unit_us, expected_area), "pending event area is inconsistent")
+    _require(
+        close(float(record["pending_release_rate_per_second"]), expected_rate),
+        "pending completion rate was not derived from count and window",
+    )
+    _require(
+        close(float(record["mean_pending_units"]), expected_mean_units),
+        "mean pending occupancy was not derived from event area",
+    )
+    _require(
+        close(float(record["mean_pending_us"]), expected_mean_us),
+        "mean pending residence was not derived from event area",
+    )
 
 
 def _validate_activation(record: dict[str, Any]) -> None:
@@ -204,10 +264,7 @@ def validate(artifact: dict[str, Any], *, require_all_ablations: bool) -> None:
             record["tier"] in {"hbm", "host_mem", "nvme", "dax"},
             "record uses an undeclared tier",
         )
-        _require(
-            float(record["littles_law_residual"]) <= 1e-9,
-            "Little's-law residual is non-zero",
-        )
+        _validate_pending_accounting(record)
         _require(
             record["selected_units"] <= record["candidate_units"],
             "selected demand exceeds candidate demand",

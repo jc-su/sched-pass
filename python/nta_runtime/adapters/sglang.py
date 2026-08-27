@@ -17,7 +17,38 @@ from .base import (
 )
 from ..abi import MAX_REQUEST_PRIORITY
 from ..execution_protocol import ExecutionProtocolConfig
+from ..resource_contract import (
+    ResourceAddressSpace,
+    ResourceOwner,
+    ResourcePath,
+    require_numerical_binding,
+    resource_contract,
+)
 from ..work_unit import Granularity
+
+
+def validate_sglang_attention_tier(
+    environ: dict[str, str] | None = None,
+) -> str:
+    """Validate that SGLang's paged-KV pointer names the ready bytes."""
+
+    import os
+
+    values = os.environ if environ is None else environ
+    selected = values.get("NTA_SERVING_TIER", "hbm").strip().lower()
+    if selected not in {"hbm", "host_mapped", "host_staged", "nvme", "cxl_dax"}:
+        raise RuntimeError(
+            "NTA_SERVING_TIER must be hbm, host_mapped, host_staged, nvme, "
+            "or cxl_dax for SGLang"
+        )
+    require_numerical_binding(
+        resource_contract(selected),
+        ResourceOwner.ENGINE,
+        ResourceAddressSpace.HBM,
+        frozenset((ResourcePath.RESIDENT, ResourcePath.MATERIALIZED)),
+        consumer="SGLang FlashInfer paged-KV attention",
+    )
+    return selected
 
 
 @dataclass(frozen=True)
@@ -25,7 +56,6 @@ class SglangExecutionConfig:
     """Validated SGLang projection of the engine-neutral protocol config."""
 
     protocol: ExecutionProtocolConfig
-    prefetch: bool = True
 
     @property
     def grouping(self) -> str:
@@ -40,13 +70,56 @@ class SglangExecutionConfig:
     def from_environment(
         cls, environ: dict[str, str] | None = None
     ) -> "SglangExecutionConfig":
-        import os
+        return cls(ExecutionProtocolConfig.from_environment(environ))
 
-        values = os.environ if environ is None else environ
-        return cls(
-            ExecutionProtocolConfig.from_environment(environ),
-            values.get("NTA_EXECUTION_PREFETCH", "1") != "0",
+
+@dataclass(frozen=True, slots=True)
+class SglangAcquisitionSpan:
+    """One request's exact, one-shot HiCache acquisition identity.
+
+    ``operation_id`` is assigned by SGLang's unmerged ``CacheOperation`` and
+    therefore identifies ownership even when two requests name the same radix
+    node.  ``logical_begin`` and ``row_count`` locate the acquired rows in the
+    request's numerical KV sequence.  The all-sentinel value is the canonical
+    direct/resident representation.
+    """
+
+    operation_id: int
+    node_id: int
+    logical_begin: int
+    row_count: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.operation_id,
+            self.node_id,
+            self.logical_begin,
+            self.row_count,
         )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise TypeError("SGLang acquisition span fields must be integers")
+        if self.operation_id == -1:
+            if values != (-1, -1, 0, 0):
+                raise ValueError(
+                    "a direct SGLang acquisition span must use the canonical sentinel"
+                )
+            return
+        if self.operation_id < 0 or self.node_id < 0:
+            raise ValueError("SGLang acquisition identities cannot be negative")
+        if self.logical_begin < 0 or self.row_count <= 0:
+            raise ValueError("SGLang acquisition span geometry is invalid")
+
+    @classmethod
+    def direct(cls) -> "SglangAcquisitionSpan":
+        return cls(-1, -1, 0, 0)
+
+    @property
+    def is_external(self) -> bool:
+        return self.operation_id >= 0
+
+    @property
+    def logical_end(self) -> int:
+        return self.logical_begin + self.row_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,17 +137,24 @@ class SglangForwardMetadata:
     request_slots: tuple[int, ...]
     priorities: tuple[int, ...]
     tenant_ids: tuple[int, ...]
+    acquisitions: tuple[SglangAcquisitionSpan, ...]
 
     def __post_init__(self) -> None:
         if not all(
             isinstance(values, tuple)
-            for values in (self.request_slots, self.priorities, self.tenant_ids)
+            for values in (
+                self.request_slots,
+                self.priorities,
+                self.tenant_ids,
+                self.acquisitions,
+            )
         ):
             raise TypeError("SGLang forward metadata vectors must be tuples")
         lengths = {
             len(self.request_slots),
             len(self.priorities),
             len(self.tenant_ids),
+            len(self.acquisitions),
         }
         if len(lengths) != 1:
             raise ValueError("SGLang forward metadata vectors must be aligned")
@@ -101,6 +181,13 @@ class SglangForwardMetadata:
                 self.tenant_ids, "SGLang tenant IDs", maximum=(1 << 32) - 1
             ),
         )
+        if any(
+            not isinstance(acquisition, SglangAcquisitionSpan)
+            for acquisition in self.acquisitions
+        ):
+            raise TypeError(
+                "SGLang acquisition metadata must contain typed acquisition spans"
+            )
 
     @classmethod
     def from_values(
@@ -109,6 +196,7 @@ class SglangForwardMetadata:
         *,
         priorities: Any = None,
         tenant_ids: Any = None,
+        acquisitions: Any = None,
         batch_size: int | None = None,
     ) -> "SglangForwardMetadata":
         def normalize(values: Any, name: str) -> tuple[int, ...]:
@@ -128,13 +216,27 @@ class SglangForwardMetadata:
         size = len(slots) if batch_size is None else batch_size
         raw_priorities = normalize(priorities, "priority")
         raw_tenants = normalize(tenant_ids, "tenant")
+        raw_acquisitions = () if acquisitions is None else tuple(acquisitions)
+        if any(
+            not isinstance(acquisition, SglangAcquisitionSpan)
+            for acquisition in raw_acquisitions
+        ):
+            raise RuntimeError(
+                "SGLang acquisition metadata must contain typed acquisition spans"
+            )
         if not raw_priorities:
             raw_priorities = (0,) * size
         if not raw_tenants:
             raw_tenants = (0,) * size
-        if len(raw_priorities) != size or len(raw_tenants) != size:
+        if not raw_acquisitions:
+            raw_acquisitions = (SglangAcquisitionSpan.direct(),) * size
+        if (
+            len(raw_priorities) != size
+            or len(raw_tenants) != size
+            or len(raw_acquisitions) != size
+        ):
             raise RuntimeError("SGLang forward metadata vectors do not match the batch")
-        return cls(slots, raw_priorities, raw_tenants)
+        return cls(slots, raw_priorities, raw_tenants, raw_acquisitions)
 
     def pad(self, padded_request_slots: Any) -> "SglangForwardMetadata":
         """Extend metadata using the slots from SGLang's padded view.
@@ -165,6 +267,7 @@ class SglangForwardMetadata:
             padded_slots,
             self.priorities + (0,) * padding,
             self.tenant_ids + (0,) * padding,
+            self.acquisitions + (SglangAcquisitionSpan.direct(),) * padding,
         )
 
 
@@ -206,6 +309,13 @@ class SglangAdapter(RequestIdentityAdapter):
     ) -> EngineBatch:
         request_ids = getattr(forward_batch, "rids", None)
         batch_size = int(forward_batch.batch_size)
+        live_batch_size = int(
+            getattr(forward_batch, "_nta_raw_batch_size", batch_size)
+        )
+        if live_batch_size < 0 or live_batch_size > batch_size:
+            raise RuntimeError(
+                "SGLang graph replay published an invalid live batch size"
+            )
         if request_ids is None:
             if not allow_capture_ids:
                 raise RuntimeError(
@@ -226,9 +336,17 @@ class SglangAdapter(RequestIdentityAdapter):
             )
         except RuntimeError:
             raise
-        request_slots = metadata.request_slots
-        priorities = metadata.priorities
-        tenant_ids = metadata.tenant_ids
+        # CUDA graph replay pads the framework view to its captured bucket.
+        # Padding rows deliberately reuse request-pool slot zero so dummy
+        # attention reads remain harmless; they are not serving requests and
+        # must never enter the generation registry.  The plugin carries the
+        # unpadded prefix length explicitly, allowing identity publication to
+        # stay O(live requests) and preserving the registry's unique-slot
+        # invariant without inventing shadow request slots.
+        request_ids = request_ids[:live_batch_size]
+        request_slots = metadata.request_slots[:live_batch_size]
+        priorities = metadata.priorities[:live_batch_size]
+        tenant_ids = metadata.tenant_ids[:live_batch_size]
         bindings = self.bind(
             request_ids,
             request_slots,

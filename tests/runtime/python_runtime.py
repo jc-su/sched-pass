@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from nta_runtime import (
     AcquireRequirement,
     DeviceWorkPlan,
+    IndexedHostIndexBinding,
     IndexedHostObject,
+    JitPhaseProgram,
     CxlDaxOptions,
     NvmeOptions,
     OperatorCapability,
@@ -27,7 +31,12 @@ from nta_runtime import (
     RuntimeConfig,
     RequestSpec,
     WorkItem,
+    copy_strided_host_runs_async,
     device_abi_version,
+)
+from nta_runtime.indexed_transfer import (
+    StridedCopyGroup,
+    analyze_index_pairs,
 )
 
 
@@ -47,6 +56,26 @@ def main() -> None:
             pass
         else:
             raise AssertionError("out-of-range native ABI input was accepted")
+
+    # Reset is a phase-boundary operation, so an oversized structural schedule
+    # must fail in Python before the native reset kernel can silently truncate
+    # it to the runtime directory capacity.
+    phase_program = object.__new__(JitPhaseProgram)
+    phase_program._handle = None
+    bounded_runtime = SimpleNamespace(
+        config=SimpleNamespace(object_capacity=3, work_ticket_capacity=4)
+    )
+    for object_count, work_ticket_count in ((-1, 1), (4, 1), (0, 0), (0, 5)):
+        try:
+            phase_program.reset(
+                bounded_runtime,
+                object_count=object_count,
+                work_ticket_count=work_ticket_count,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-capacity phase reset was accepted")
     try:
         OperatorContract(
             1,
@@ -119,31 +148,64 @@ def main() -> None:
             assert plan.dependencies_tensor.data_ptr() == plan.dependencies_address
             assert not plan.has_external
         assert runtime.device_view_tensor.data_ptr() == runtime.device_view
-        host_rows = torch.arange(64, dtype=torch.uint8, pin_memory=True).view(4, 16)
-        staging_rows = torch.zeros_like(host_rows, device="cuda")
+        host_backing = torch.arange(128, dtype=torch.uint8, pin_memory=True).view(
+            4, 2, 16
+        )
+        host_rows = host_backing[:, 0, :]
+        staging_backing = torch.full((4, 2, 16), 0xA5, dtype=torch.uint8, device="cuda")
+        staging_rows = staging_backing[:, 0, :]
         source_indices = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
         staging_indices = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
         runtime.register_indexed_host_objects(
             1,
             [
                 IndexedHostObject(
-                    102,
-                    8,
-                    host_rows.data_ptr(),
-                    staging_rows.data_ptr(),
-                    source_indices.data_ptr(),
-                    staging_indices.data_ptr(),
-                    2,
-                    16,
-                    16,
-                    16,
-                    4,
-                    4,
+                    object_id=102,
+                    version=8,
+                    source_device_address=host_rows.data_ptr(),
+                    staging_device_address=staging_rows.data_ptr(),
+                    source_indices_device_address=source_indices.data_ptr(),
+                    staging_indices_device_address=staging_indices.data_ptr(),
+                    index_count=2,
+                    element_bytes=16,
+                    source_stride_bytes=host_rows.stride(0) * host_rows.element_size(),
+                    staging_stride_bytes=staging_rows.stride(0)
+                    * staging_rows.element_size(),
+                    source_index_limit=4,
+                    staging_index_limit=4,
                 )
             ],
             stream=stream,
+            index_binding=IndexedHostIndexBinding(
+                source_indices.data_ptr(),
+                staging_indices.data_ptr(),
+                int(source_indices.numel()),
+            ),
         )
+        layout = analyze_index_pairs((3, 1), (0, 2))
+        submissions = copy_strided_host_runs_async(
+            (
+                StridedCopyGroup(
+                    source_address=host_rows.data_ptr(),
+                    destination_address=staging_rows.data_ptr(),
+                    source_rows=4,
+                    destination_rows=4,
+                    row_bytes=16,
+                    source_stride_bytes=host_rows.stride(0) * host_rows.element_size(),
+                    destination_stride_bytes=staging_rows.stride(0)
+                    * staging_rows.element_size(),
+                ),
+            ),
+            layout.runs,
+            stream,
+        )
+        assert submissions == 1
         stream.synchronize()
+        expected_staging = torch.full((4, 16), 0xA5, dtype=torch.uint8)
+        expected_staging[0].copy_(host_rows[3])
+        expected_staging[2].copy_(host_rows[1])
+        assert torch.equal(staging_rows.cpu(), expected_staging)
+        assert torch.all(staging_backing[:, 1, :] == 0xA5)
         assert runtime.pending_count == 0
         progress = runtime.request_progress(0)
         assert progress.expected_work == 0

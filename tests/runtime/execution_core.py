@@ -1,4 +1,4 @@
-from nta_runtime.execution_core import ExecutionSession, ExecutionTile
+from nta_runtime.execution_core import ExecutionPlan, ExecutionSession, ExecutionTile
 from nta_runtime.execution_protocol import ExecutionProtocolConfig
 from nta_runtime.requests import RequestBinding
 from nta_runtime.work_unit import Availability, Granularity
@@ -9,7 +9,7 @@ def main() -> None:
         RequestBinding(0, 2, 1, 10),
         RequestBinding(1, 3, 4, 11),
     )
-    session = ExecutionSession.from_tiles(
+    plan = ExecutionPlan.from_tiles(
         epoch=5,
         granularity=Granularity.PAGE_GROUP,
         protocol=ExecutionProtocolConfig.late_bound(
@@ -17,16 +17,34 @@ def main() -> None:
             max_inflight_units=1,
         ),
         tiles=(
-            ExecutionTile(0, bindings[0], 0, 0, 2, (0, 1), 128, True, 100, 0),
+            ExecutionTile(0, bindings[0], 0, 0, 2, (), 128, True, 100, 0),
             # Multiple native contributors may share a logical KV coordinate;
             # the schedule work ticket remains their unique semantic identity.
             ExecutionTile(1, bindings[1], 0, 0, 4, (1, 3), 128, False, 100, 1),
         ),
     )
+    session = ExecutionSession.from_plan(plan)
     assert session.runnable_groups() == ((0,),)
+    dense = session.unit_for_ticket(
+        work_id=0, layer=0, logical_begin=0, request_index=0
+    ).demand
+    assert dense.semantics.value == "exact_dense"
+    assert dense.selected_units == 2 and dense.selected_ids == ()
+    # The native topology is reusable across layers because layer identity is
+    # not part of WorkItem. Ticket/request/logical coordinates remain strict.
+    assert plan.unit_for_topology(
+        work_id=0, logical_begin=0, request_index=0
+    ).work_id == 0
+    try:
+        plan.unit_for_topology(work_id=0, logical_begin=1, request_index=0)
+    except RuntimeError as error:
+        assert "topology diverged" in str(error)
+    else:
+        raise AssertionError("stale native topology coordinates were accepted")
     session.launch_group((0,))
     session.complete_group((0,))
     assert session.ledger.state(0) is Availability.COMPLETE
+    assert plan.expose_stats()["work_complete"] == 0
     session.make_ready((1,))
     assert session.runnable_groups() == ((1,),)
     assert (

@@ -6,18 +6,182 @@ from dataclasses import dataclass, field
 import logging
 import os
 import threading
-import time
 import weakref
 from typing import Any
 
 import torch
 
-from nta_runtime.critical_work import (
-    CriticalWorkPlan,
-    RequestWork,
-    ServiceModel,
-    plan_critical_work,
+from nta_runtime.engines.sglang_transfer import HostMoverLeasePlan
+from nta_runtime.indexed_transfer import (
+    IndexedTransferGroup,
+    IndexedTransferTopology,
+    IndexedWorkDependency,
 )
+
+from nta_runtime.progress_frontier import (
+    RequestFrontier,
+    RequestFrontierEntry,
+    build_request_frontier,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseOperationTransfer:
+    """Unmerged SGLang load operation captured into one owned lease."""
+
+    operation_id: int
+    node_id: int
+    row_count: int
+
+    def __post_init__(self) -> None:
+        if self.operation_id < 0 or self.node_id < 0 or self.row_count <= 0:
+            raise ValueError("SGLang lease operation geometry is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseOperationRange:
+    """One unmerged load operation's contiguous range in the merged lease."""
+
+    operation_id: int
+    row_begin: int
+    row_count: int
+
+    def __post_init__(self) -> None:
+        if self.operation_id < 0 or self.row_begin < 0 or self.row_count <= 0:
+            raise ValueError("SGLang lease operation range is invalid")
+
+    @property
+    def row_end(self) -> int:
+        return self.row_begin + self.row_count
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseWorkDependency:
+    """Exact operation-local rows required by one numerical work unit."""
+
+    operation_id: int
+    row_begin: int
+    row_count: int
+
+    def __post_init__(self) -> None:
+        if self.operation_id < 0 or self.row_begin < 0 or self.row_count <= 0:
+            raise ValueError("SGLang work dependency geometry is invalid")
+
+    @property
+    def row_end(self) -> int:
+        return self.row_begin + self.row_count
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseDeviceIndexMap:
+    """Lease-owned device ABI map retained for every indexed acquisition."""
+
+    source_indices: torch.Tensor
+    destination_indices: torch.Tensor
+    operations: tuple[LeaseOperationRange, ...]
+
+    def __post_init__(self) -> None:
+        source = self.source_indices
+        destination = self.destination_indices
+        if (
+            source.device != destination.device
+            or source.device.type != "cuda"
+            or source.dtype is not torch.int32
+            or destination.dtype is not torch.int32
+            or source.ndim != 1
+            or destination.ndim != 1
+            or source.numel() <= 0
+            or source.numel() != destination.numel()
+        ):
+            raise ValueError("SGLang lease device index map has an invalid ABI")
+        cursor = 0
+        operation_ids: set[int] = set()
+        for operation in self.operations:
+            if operation.operation_id in operation_ids or operation.row_begin != cursor:
+                raise ValueError("SGLang lease operation ranges are not a partition")
+            operation_ids.add(operation.operation_id)
+            cursor = operation.row_end
+        if cursor != int(source.numel()):
+            raise ValueError("SGLang lease operation ranges do not cover the map")
+
+    def operation(self, operation_id: int) -> LeaseOperationRange:
+        for operation in self.operations:
+            if operation.operation_id == operation_id:
+                return operation
+        raise KeyError(operation_id)
+
+    @property
+    def retained_tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.source_indices, self.destination_indices
+
+
+def lease_indexed_transfer_topology(
+    work_dependencies: tuple[LeaseWorkDependency | None, ...],
+    transfer_dependencies: tuple[LeaseWorkDependency | None, ...],
+    operations: tuple[LeaseOperationRange, ...],
+    *,
+    index_count: int,
+) -> IndexedTransferTopology:
+    """Translate lease-local exactness into the shared indexed work contract."""
+
+    if not work_dependencies or len(work_dependencies) != len(transfer_dependencies):
+        raise ValueError("lease indexed topology requires aligned work dependencies")
+    operation_by_id = {operation.operation_id: operation for operation in operations}
+    if len(operation_by_id) != len(operations):
+        raise ValueError("lease indexed topology repeats an operation identity")
+    group_by_transfer: dict[LeaseWorkDependency, int] = {}
+    groups: list[IndexedTransferGroup] = []
+
+    def group_index(dependency: LeaseWorkDependency) -> int:
+        existing = group_by_transfer.get(dependency)
+        if existing is not None:
+            return existing
+        operation = operation_by_id.get(dependency.operation_id)
+        if operation is None or dependency.row_end > operation.row_count:
+            raise ValueError("lease transfer dependency exceeds its operation")
+        result = len(groups)
+        group_by_transfer[dependency] = result
+        groups.append(
+            IndexedTransferGroup(
+                operation.row_begin + dependency.row_begin,
+                dependency.row_count,
+            )
+        )
+        return result
+
+    dependencies_by_work: list[tuple[IndexedWorkDependency, ...]] = []
+    for exact, transfer in zip(
+        work_dependencies, transfer_dependencies, strict=True
+    ):
+        if exact is None:
+            if transfer is not None:
+                raise ValueError("direct lease work retained a transfer dependency")
+            dependencies_by_work.append(())
+            continue
+        if (
+            transfer is None
+            or transfer.operation_id != exact.operation_id
+            or transfer.row_begin > exact.row_begin
+            or transfer.row_end < exact.row_end
+        ):
+            raise ValueError("lease transfer group does not contain exact work")
+        index = group_index(transfer)
+        dependencies_by_work.append(
+            (
+                IndexedWorkDependency(
+                    index,
+                    exact.row_begin - transfer.row_begin,
+                    exact.row_count,
+                ),
+            )
+        )
+    if not groups:
+        raise ValueError("lease indexed topology has no external transfer")
+    return IndexedTransferTopology(
+        index_count,
+        tuple(groups),
+        tuple(dependencies_by_work),
+    )
 
 
 @dataclass
@@ -29,11 +193,41 @@ class PendingHostLoad:
     producer_event: Any
     controller: Any
     node_ids: tuple[int, ...]
+    # Exact scheduler-side decomposition captured before SGLang merges load
+    # operations. The operation ID, not merely a radix node ID, is the unique
+    # control-plane join key: separate requests may legitimately name the same
+    # node. This avoids downloading and reverse-engineering the numerical page
+    # table to recover request ownership.
+    operation_transfers: tuple[LeaseOperationTransfer, ...]
+    storage_keys: tuple[str, ...] | None = None
     held_ack: Any = None
     host_by_device: dict[int, int] = field(default_factory=dict)
     completed_layers: int = 0
     prefetched_layers: dict[int, Any] = field(default_factory=dict)
     prefetch_tensors: tuple[torch.Tensor, ...] = ()
+    # Immutable byte geometry for the whole local model.  The acquisition
+    # owner publishes this before enqueueing the first frontier so admission
+    # can distinguish "four of thirty-six layers ready" from "all four
+    # published layers ready" without synchronizing or inspecting page data.
+    layer_bytes: tuple[int, ...] = ()
+    mover_plan: HostMoverLeasePlan | None = None
+    device_index_map: LeaseDeviceIndexMap | None = None
+    transfer_events: tuple[Any, ...] = ()
+    selection_accounted: bool = False
+
+    def transfers_by_operation(self) -> dict[int, LeaseOperationTransfer]:
+        transfers: dict[int, LeaseOperationTransfer] = {}
+        for transfer in self.operation_transfers:
+            if not isinstance(transfer, LeaseOperationTransfer):
+                raise RuntimeError("SGLang HiCache published an untyped operation")
+            if transfer.operation_id in transfers:
+                raise RuntimeError("SGLang HiCache repeated a load operation identity")
+            transfers[transfer.operation_id] = transfer
+        if sum(item.row_count for item in transfers.values()) != int(
+            self.device_indices.numel()
+        ):
+            raise RuntimeError("SGLang HiCache operations do not cover the lease")
+        return transfers
 
     def materialize_mapping(self) -> dict[int, int]:
         if not self.host_by_device:
@@ -44,16 +238,112 @@ class PendingHostLoad:
             self.host_by_device = dict(zip(device, host))
         return self.host_by_device
 
+    def operation_ranges(self) -> tuple[LeaseOperationRange, ...]:
+        """Return the exact merge-order partition without inspecting page data."""
+
+        cursor = 0
+        ranges: list[LeaseOperationRange] = []
+        operation_ids: set[int] = set()
+        for transfer in self.operation_transfers:
+            if not isinstance(transfer, LeaseOperationTransfer):
+                raise RuntimeError("SGLang HiCache published an untyped operation")
+            if transfer.operation_id in operation_ids:
+                raise RuntimeError("SGLang HiCache repeated a load operation identity")
+            operation_ids.add(transfer.operation_id)
+            ranges.append(
+                LeaseOperationRange(
+                    transfer.operation_id,
+                    cursor,
+                    transfer.row_count,
+                )
+            )
+            cursor += transfer.row_count
+        if cursor != int(self.device_indices.numel()):
+            raise RuntimeError("SGLang HiCache operations do not partition the lease")
+        return tuple(ranges)
+
+    def materialize_device_index_map(self) -> LeaseDeviceIndexMap:
+        """Publish the merged lease map in the runtime's int32 CUDA ABI.
+
+        ``CacheOperation.merge_ops`` concatenates unmerged operations in queue
+        order.  Retaining that typed partition avoids downloading the page map
+        merely to recover request ownership, and the returned tensors remain
+        owned by this lease until its final numerical consumer retires it.
+        """
+
+        cached = self.device_index_map
+        if cached is not None:
+            if int(cached.source_indices.numel()) != int(self.device_indices.numel()):
+                raise RuntimeError("SGLang lease index geometry changed after binding")
+            return cached
+        source, destination = self.controller.move_indices(
+            self.host_indices, self.device_indices
+        )
+        if (
+            not isinstance(source, torch.Tensor)
+            or not isinstance(destination, torch.Tensor)
+            or source.ndim != 1
+            or destination.ndim != 1
+            or source.numel() <= 0
+            or source.numel() != destination.numel()
+        ):
+            raise RuntimeError("SGLang produced an invalid merged lease index map")
+        device = torch.device(self.controller.mem_pool_device.device)
+        if device.type != "cuda":
+            raise RuntimeError("SGLang indexed acquisition requires a CUDA device")
+        source = source.detach().to(
+            device=device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        destination = destination.detach().to(
+            device=device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        result = LeaseDeviceIndexMap(
+            source,
+            destination,
+            self.operation_ranges(),
+        )
+        self.device_index_map = result
+        return result
+
+    def materialize_storage_mapping(self, catalog: Any) -> dict[int, int]:
+        """Bind stable physical ordinals to this lease's GPU destinations."""
+
+        if self.storage_keys is None:
+            raise RuntimeError(
+                "physical HiCache load has no stable storage-key connector binding"
+            )
+        device = tuple(
+            int(value)
+            for value in self.device_indices.detach().to(device="cpu").tolist()
+        )
+        if len(device) != len(self.storage_keys) or len(set(device)) != len(device):
+            raise RuntimeError("physical HiCache storage/device bindings disagree")
+        return {
+            destination: int(catalog.ordinal(storage_key))
+            for destination, storage_key in zip(
+                device, self.storage_keys, strict=True
+            )
+        }
+
 
 @dataclass(frozen=True)
 class HostLoadProgress:
     """Nonblocking snapshot of an NTA-owned HiCache transfer."""
 
     consumer_index: int
+    published_layers: int
     leading_layers: int
     total_layers: int
     leading_bytes: int
     total_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.consumer_index < 0 or self.total_layers <= 0 or self.total_bytes <= 0:
+            raise ValueError("HiCache progress geometry is invalid")
+        if not 0 <= self.leading_layers <= self.published_layers <= self.total_layers:
+            raise ValueError("HiCache progress frontiers are not ordered")
+        if not 0 <= self.leading_bytes <= self.total_bytes:
+            raise ValueError("HiCache progress bytes are invalid")
 
     @property
     def complete(self) -> bool:
@@ -64,7 +354,6 @@ class HostLoadProgress:
 class _ProgressPublication:
     snapshot: Any
     bindings: tuple[Any, ...]
-    model: ServiceModel
 
 
 class SglangHiCacheBridge:
@@ -79,18 +368,23 @@ class SglangHiCacheBridge:
         self._owned: dict[int, PendingHostLoad] = {}
         self._next_lease_id = 1
         self._lock = threading.Lock()
-        self._prefetch_callback: Any = None
+        self._acquire_callback: Any = None
         self._admission_stats: dict[str, int] = {}
         self._progress_publications: list[_ProgressPublication] = []
-        self._latest_request_work: dict[
-            tuple[int, int], tuple[RequestWork, ServiceModel]
-        ] = {}
+        self._latest_request_work: dict[tuple[int, int], RequestFrontierEntry] = {}
         self._latest_request_key: dict[int, tuple[int, int]] = {}
         self._closed = False
         _register_bridge(device_pool, self)
 
-    def set_prefetch_callback(self, callback: Any) -> None:
-        self._prefetch_callback = callback
+    def set_acquire_callback(self, callback: Any) -> None:
+        """Install the owner invoked after a host-load lease is captured.
+
+        The callback may defer, directly stage, or incrementally stage the
+        payload. Its primary contract is ownership: while it is installed the
+        bridge holds SGLang's acknowledgement until the NTA consumer retires.
+        """
+
+        self._acquire_callback = callback
 
     def close(self) -> None:
         """Retire leases and release feedback snapshots during engine teardown.
@@ -155,9 +449,30 @@ class SglangHiCacheBridge:
         from sglang.srt.managers.cache_controller import CacheOperation, HiCacheAck
 
         producer_id = controller.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(controller.load_queue)
+        queued_operations = tuple(controller.load_queue)
+        operation_transfers: list[LeaseOperationTransfer] = []
+        for queued in queued_operations:
+            if len(queued.node_ids) != 1:
+                raise RuntimeError(
+                    "unmerged SGLang HiCache operation has ambiguous node ownership"
+                )
+            operation_transfers.append(
+                LeaseOperationTransfer(
+                    int(getattr(queued, "id", -1)),
+                    int(queued.node_ids[0]),
+                    int(queued.device_indices.numel()),
+                )
+            )
+        op = CacheOperation.merge_ops(list(queued_operations))
         controller.load_queue.clear()
         event = controller.layer_done_counter.events[producer_id]
+        from nta_runtime.connectors.sglang_storage import (
+            maybe_resolve_sglang_storage_keys,
+        )
+
+        storage_keys = maybe_resolve_sglang_storage_keys(
+            controller.mem_pool_host, op.host_indices
+        )
         with self._lock:
             lease_id = self._next_lease_id
             self._next_lease_id += 1
@@ -169,9 +484,11 @@ class SglangHiCacheBridge:
             producer_event=event,
             controller=controller,
             node_ids=tuple(op.node_ids),
+            operation_transfers=tuple(operation_transfers),
+            storage_keys=storage_keys,
         )
         ack = HiCacheAck(event.start_event, event.finish_event, op.node_ids)
-        if self._prefetch_callback is None:
+        if self._acquire_callback is None:
             controller.ack_load_queue.append(ack)
         else:
             # A leased load completes its producer events immediately, which
@@ -185,27 +502,27 @@ class SglangHiCacheBridge:
         with self._lock:
             self._pending[producer_id] = pending
             self._owned[lease_id] = pending
-        if self._prefetch_callback is not None:
+        if self._acquire_callback is not None:
             try:
-                self._prefetch_callback(pending)
+                self._acquire_callback(pending)
             except Exception as error:
-                # A prefetch failure must not silently revert a leased load to
+                # An acquisition failure must not silently revert a leased load to
                 # stock transfer: that bypasses request-level semantics and is
                 # invisible to the zero-fallback measurement gates. Restoring
                 # SGLang's own transfer is an explicit, counted opt-in for
                 # resilience deployments only.
-                if os.environ.get("NTA_EXECUTION_ALLOW_PREFETCH_FALLBACK", "0") != "1":
+                if os.environ.get("NTA_EXECUTION_ALLOW_LOAD_FALLBACK", "0") != "1":
                     # Fail closed, but not dirty: the dead lease must not
                     # keep the producer slot occupied or the host nodes
                     # pinned for whoever survives this exception.
                     self._drop_ownership(pending)
                     raise RuntimeError(
-                        "NTA early HiCache prefetch failed for a leased load; "
-                        "set NTA_EXECUTION_ALLOW_PREFETCH_FALLBACK=1 to enable "
+                        "NTA HiCache acquisition failed for a leased load; "
+                        "set NTA_EXECUTION_ALLOW_LOAD_FALLBACK=1 to enable "
                         "SGLang transfer instead of failing"
                     ) from error
                 logging.getLogger(__name__).exception(
-                    "NTA early HiCache prefetch failed; restoring SGLang transfer"
+                    "NTA HiCache acquisition failed; restoring SGLang transfer"
                 )
                 with self._lock:
                     self._admission_stats["prefetch_fallback_loads"] = (
@@ -227,28 +544,31 @@ class SglangHiCacheBridge:
     def progress(self, consumer_index: int) -> HostLoadProgress | None:
         """Query ordered layer progress without synchronizing a CUDA stream."""
         pending = self.get(consumer_index)
-        if pending is None or not pending.prefetched_layers:
+        if pending is None or not pending.layer_bytes:
             return None
-        ordered = tuple(
-            pending.prefetched_layers[index]
-            for index in sorted(pending.prefetched_layers)
-        )
-        total_bytes = sum(
-            int(layer.key_bytes) + int(layer.value_bytes) for layer in ordered
-        )
+        total_layers = len(pending.layer_bytes)
+        if total_layers != int(pending.controller.layer_num):
+            raise RuntimeError("HiCache progress geometry changed during a lease")
         leading_layers = 0
         leading_bytes = 0
-        for layer in ordered:
+        for local_layer, expected_bytes in enumerate(pending.layer_bytes):
+            layer = pending.prefetched_layers.get(local_layer)
+            if layer is None:
+                break
+            actual_bytes = int(layer.key_bytes) + int(layer.value_bytes)
+            if actual_bytes != expected_bytes:
+                raise RuntimeError("HiCache progress byte geometry is inconsistent")
             if not layer.ready_event.query():
                 break
             leading_layers += 1
-            leading_bytes += int(layer.key_bytes) + int(layer.value_bytes)
+            leading_bytes += actual_bytes
         return HostLoadProgress(
-            consumer_index,
-            leading_layers,
-            len(ordered),
-            leading_bytes,
-            total_bytes,
+            consumer_index=consumer_index,
+            published_layers=len(pending.prefetched_layers),
+            leading_layers=leading_layers,
+            total_layers=total_layers,
+            leading_bytes=leading_bytes,
+            total_bytes=sum(pending.layer_bytes),
         )
 
     def transfer_bytes(self, consumer_index: int) -> int:
@@ -291,9 +611,6 @@ class SglangHiCacheBridge:
         self,
         snapshot: Any,
         bindings: tuple[Any, ...],
-        *,
-        bandwidth_bytes_per_second: int,
-        fixed_latency_ns: int = 0,
     ) -> None:
         """Publish one post-discovery snapshot for serving admission.
 
@@ -303,11 +620,6 @@ class SglangHiCacheBridge:
         """
         if not bindings or not getattr(snapshot, "pending", False):
             raise ValueError("request-progress publication is empty")
-        model = ServiceModel(
-            bandwidth_bytes_per_second,
-            fixed_latency_ns=fixed_latency_ns,
-        )
-        model.validate()
         self._drain_progress_publications()
         with self._lock:
             if self._closed:
@@ -315,21 +627,21 @@ class SglangHiCacheBridge:
             if len(self._progress_publications) >= 8:
                 raise RuntimeError("request-progress publication ring is full")
             self._progress_publications.append(
-                _ProgressPublication(snapshot, tuple(bindings), model)
+                _ProgressPublication(snapshot, tuple(bindings))
             )
             self._admission_stats["progress_feedback_published"] = (
                 self._admission_stats.get("progress_feedback_published", 0) + 1
             )
 
-    def poll_critical_work(self, request_ids: set[int]) -> CriticalWorkPlan | None:
-        """Consume current-generation compiler work for active engine requests."""
+    def poll_request_frontier(self, request_ids: set[int]) -> RequestFrontier | None:
+        """Consume current-generation compiler progress for active requests."""
         if not request_ids:
             return None
         self._drain_progress_publications()
         with self._lock:
             selected_keys = [
                 key
-                for key, (work, _) in self._latest_request_work.items()
+                for key, work in self._latest_request_work.items()
                 if work.request_id in request_ids
             ]
             selected = []
@@ -339,26 +651,19 @@ class SglangHiCacheBridge:
                     self._latest_request_key.pop(key[0], None)
         if not selected:
             return None
-        models = {model for _, model in selected}
-        if len(models) != 1:
-            raise RuntimeError("request-progress feedback mixed service models")
-        plan = plan_critical_work(
-            (work for work, _ in selected),
-            now_ns=time.monotonic_ns(),
-            model=models.pop(),
-        )
+        frontier = build_request_frontier(selected)
         self.record_admission(
             progress_feedback_consumed=1,
-            progress_feedback_requests=len(plan.requests),
+            progress_feedback_requests=len(frontier.requests),
         )
-        return plan
+        return frontier
 
     def _drain_progress_publications(self) -> None:
         with self._lock:
             publications = tuple(self._progress_publications)
             self._progress_publications.clear()
         incomplete: list[_ProgressPublication] = []
-        completed: list[tuple[RequestWork, ServiceModel]] = []
+        completed: list[RequestFrontierEntry] = []
         stale = 0
         position = 0
         try:
@@ -376,16 +681,7 @@ class SglangHiCacheBridge:
                     ):
                         stale += 1
                         continue
-                    completed.append(
-                        (
-                            RequestWork.from_progress(
-                                item,
-                                priority=binding.priority,
-                                deadline_ns=0,
-                            ),
-                            publication.model,
-                        )
-                    )
+                    completed.append(RequestFrontierEntry.from_progress(item))
         except Exception:
             # Publications own pinned host storage until their stream
             # events complete; dropping the untraversed tail on an
@@ -400,7 +696,7 @@ class SglangHiCacheBridge:
             raise
         with self._lock:
             self._progress_publications.extend(incomplete)
-            for work, model in completed:
+            for work in completed:
                 # Keep only the newest generation for a request.  Feedback is
                 # advisory admission state, not an ownership record; stale
                 # generations must not accumulate until a long-lived server
@@ -417,10 +713,7 @@ class SglangHiCacheBridge:
                         self._admission_stats.get("progress_feedback_evictions", 0) + 1
                     )
                 key = (work.request_id, work.generation)
-                self._latest_request_work[key] = (
-                    work,
-                    model,
-                )
+                self._latest_request_work[key] = work
                 self._latest_request_key[work.request_id] = key
             if stale:
                 self._admission_stats["progress_feedback_stale_rows"] = (

@@ -74,7 +74,6 @@ public:
   // command still owns an exact byte range, so retain only the page prefix
   // covered by that command while keeping the backend lease for the full map.
   void retainPagePrefix(std::size_t count);
-
 private:
   NvmeMapping(NvmeMappingBackend *backend, NvmeMappingToken token,
               std::vector<std::uint64_t> pages)

@@ -24,7 +24,17 @@ def load_runner():
 
 def main() -> None:
     runner = load_runner()
-    vfio_script = (ROOT / "scripts" / "nta-vfio-device.sh").read_text(encoding="utf-8")
+    vfio_path = ROOT / "scripts" / "nta-vfio-device.sh"
+    vfio_script = vfio_path.read_text(encoding="utf-8")
+    syntax = subprocess.run(
+        ["bash", "-n", str(vfio_path)],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    assert syntax.returncode == 0, syntax.stdout
     assert '"$(basename "$block")"p*' in vfio_script
     assert "hidden multipath namespace" in vfio_script
     assert "require_media_policy" in vfio_script
@@ -34,7 +44,9 @@ def main() -> None:
     assert (
         "no namespace block device exists and reference file is absent" in vfio_script
     )
-    assert "fs.protected_regular" in vfio_script
+    assert '.nta-nvme-reference.XXXXXX' in vfio_script
+    assert 'chmod 0444 "$temporary"' in vfio_script
+    assert 'mv -f "$temporary" "$reference"' in vfio_script
     assert "wait_for_nvme_namespace" in vfio_script
     assert "returned to the nvme driver but no live namespace appeared" in vfio_script
     assert "driver_override is only a transactional bind aid" in vfio_script
@@ -43,18 +55,31 @@ def main() -> None:
     )
     assert "controlPlane->mappingBackend().mapHbm" in runtime
     assert "retainPagePrefix" in runtime
-    assert "mapExternalHbm" in runtime
+    assert "registerExternalHbm" in runtime
+    assert "NvmeHbmRegion::view" in runtime
     assert "ownsDestinationMemory" in runtime
     assert "mapping.cacheable = cacheable" in runtime
     assert "impl_ == nullptr ? nullptr : impl_->deviceAddress" in runtime
     assert "cannot allocate from a moved-from NVMe transport" in runtime
-    assert "cannot map HBM through a moved-from NVMe transport" in runtime
-    external_begin = runtime.index("NvmeTransport::mapExternalHbm")
-    external_end = runtime.index("} // namespace nta", external_begin)
-    external_mapping = runtime[external_begin:external_end]
-    assert "cacheable = false" in external_mapping
-    assert "cudaMemoryTypeDevice" in external_mapping
-    assert "cuMemGetAddressRange" in external_mapping
+    assert "cannot register HBM through a moved-from NVMe transport" in runtime
+    description_begin = runtime.index("NvmeTransport::describeExternalHbm")
+    registration_begin = runtime.index(
+        "NvmeTransport::registerExternalHbm", description_begin
+    )
+    view_begin = runtime.index("NvmeHbmRegion::view", registration_begin)
+    description = runtime[description_begin:registration_begin]
+    registration = runtime[registration_begin:view_begin]
+    view = runtime[view_begin:]
+    assert "cudaMemoryTypeDevice" in description
+    assert "cuMemGetAddressRange" in description
+    assert "mappingBackend().mapHbm" not in description
+    assert "cudaMalloc" not in description
+    assert "describeExternalHbm(deviceAddress, bytes)" in registration
+    assert "mappingBackend().mapHbm" in registration
+    assert "cudaMalloc registered NVMe HBM page table" in registration
+    assert "mappingBackend().mapHbm" not in view
+    assert "cudaMalloc" not in view
+    assert "externalRegion = impl_" in view
     assert "mappingBackend().mapHost" in runtime
     assert "NvmeHbmMappingBackend::NvidiaPeerPages" in runtime
     assert "cuMemAlloc(&allocation.base" in runtime
@@ -94,10 +119,17 @@ def main() -> None:
     qualification = (ROOT / "scripts" / "run-nvme-qualification.py").read_text(
         encoding="utf-8"
     )
+    assert qualification.count('f"--requests={args.requests}"') == 1
     assert '"NTA_NVME_DMA_TARGET": args.dma_target' in qualification
+    assert qualification.count('"NTA_NVME_REFERENCE": str(args.reference)') == 2
+    assert 'RESULTS_ROOT / "qualification" / "nvme-reference.bin"' in qualification
     assert 'gpu.get("selected_data_path_verified") is True' in qualification
     assert 'gpu.get("destination") == args.dma_target' in qualification
     assert "and iommu_fault_free" in qualification
+    cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    preflight = cmake[cmake.index("add_custom_target(\n  nta-vfio-preflight") :]
+    assert "${CMAKE_COMMAND} -E env" in preflight
+    assert "${NTA_TEST_NVME_ENVIRONMENT}" in preflight
     control_plane = (ROOT / "runtime" / "host" / "NvmeVfioControlPlane.cpp").read_text(
         encoding="utf-8"
     )
@@ -160,8 +192,10 @@ def main() -> None:
     runtime_c = (ROOT / "include" / "nta" / "RuntimeC.h").read_text(encoding="utf-8")
     assert "nta_jit_phase_progress_nvme_until_idle" in runtime_c
     assert "nta_runtime_install_nvme_object_async" in runtime_c
-    assert "nta_runtime_install_external_nvme_object" in runtime_c
-    assert "nta_runtime_install_external_nvme_object_async" in runtime_c
+    assert "nta_nvme_transport_register_hbm_region" in runtime_c
+    assert "nta_nvme_transport_describe_hbm_region" in runtime_c
+    assert "nta_runtime_install_registered_nvme_object" in runtime_c
+    assert "nta_runtime_install_registered_nvme_object_async" in runtime_c
     runtime_c_impl = (ROOT / "runtime" / "host" / "RuntimeC.cpp").read_text(
         encoding="utf-8"
     )
@@ -169,7 +203,13 @@ def main() -> None:
     install_end = runtime_c_impl.index("nta_runtime_read_pending_count", install_begin)
     install_body = runtime_c_impl[install_begin:install_end]
     assert "runtime->nvme->allocate" not in install_body
-    assert "sourceByteOffset, nativeBytes);" in install_body
+    assert "region->value->view" in install_body
+    assert "mapExternalHbm" not in install_body
+    planner = (
+        ROOT / "python" / "nta_runtime" / "hbm_registration.py"
+    ).read_text(encoding="utf-8")
+    assert "begin < mutable[-1]" in planner
+    assert "HBM registration plan contains duplicate destination keys" in planner
     epoch = (ROOT / "python" / "nta_runtime" / "epoch.py").read_text(encoding="utf-8")
     assert "self.phases.progress_nvme_until_idle(" in epoch
     devices = sorted((Path("/sys/bus/pci/devices")).glob("*:*:*.*"))

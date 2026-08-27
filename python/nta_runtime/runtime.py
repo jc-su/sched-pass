@@ -8,17 +8,23 @@ import dataclasses
 import enum
 import os
 import pathlib
+import struct
 from collections.abc import Iterable
 from typing import Any
 
 from .abi import bounded_integer as _bounded_integer
 from .abi import u32 as _u32
 from .abi import u64 as _u64
+from .execution_topology import ExactWorkTopology, WorkDependencySpan
+from .indexed_transfer import (
+    IndexedTensorLane,
+    IndexedTransferTopology,
+)
 from .request_contract import RequestSpec, _RequestSpec
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 37
+API_VERSION = 42
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -376,7 +382,42 @@ class _IndexedHostObject(ctypes.Structure):
         ("staging_stride_bytes", ctypes.c_uint32),
         ("source_index_limit", ctypes.c_uint32),
         ("staging_index_limit", ctypes.c_uint32),
-        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
+_INDEXED_HOST_OBJECT_PACKER = struct.Struct("@QQQQQIIIIIIII")
+_ACQUIRE_REQUIREMENT_PACKER = struct.Struct("@QQQQIIII")
+
+
+class _IndexedHostIndexBinding(ctypes.Structure):
+    _fields_ = [
+        ("source_indices_device_address", ctypes.c_uint64),
+        ("staging_indices_device_address", ctypes.c_uint64),
+        ("index_count", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
+class _ContiguousCopyRun(ctypes.Structure):
+    _fields_ = [
+        ("source_first_row", ctypes.c_uint32),
+        ("destination_first_row", ctypes.c_uint32),
+        ("row_count", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
+class _StridedCopyGroup(ctypes.Structure):
+    _fields_ = [
+        ("source_address", ctypes.c_uint64),
+        ("destination_address", ctypes.c_uint64),
+        ("source_rows", ctypes.c_uint32),
+        ("destination_rows", ctypes.c_uint32),
+        ("row_bytes", ctypes.c_uint32),
+        ("source_stride_bytes", ctypes.c_uint32),
+        ("destination_stride_bytes", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
     ]
 
 
@@ -455,6 +496,18 @@ class _NvmeQueueStats(ctypes.Structure):
         ("cq_head", ctypes.c_uint32),
         ("cq_phase", ctypes.c_uint32),
         ("next_completion_dword3", ctypes.c_uint32),
+        ("hbm_region_registrations", ctypes.c_uint64),
+        ("hbm_region_bytes", ctypes.c_uint64),
+        ("hbm_transfer_views", ctypes.c_uint64),
+    ]
+
+
+class _NvmeHbmRegistrationRange(ctypes.Structure):
+    _fields_ = [
+        ("allocation_address", ctypes.c_uint64),
+        ("allocation_bytes", ctypes.c_uint64),
+        ("registration_address", ctypes.c_uint64),
+        ("registration_bytes", ctypes.c_uint64),
     ]
 
 
@@ -490,6 +543,8 @@ class _TierDescriptor(ctypes.Structure):
         ("protocol_owner", ctypes.c_uint32),
         ("payload_owner", ctypes.c_uint32),
         ("transfer_destination_owner", ctypes.c_uint32),
+        ("mapping_owner", ctypes.c_uint32),
+        ("directory_owner", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
     ]
 
@@ -531,9 +586,10 @@ class _RequestProgress(ctypes.Structure):
 def _validate_abi_layouts() -> None:
     layouts = (
         ("OperatorContract", ctypes.sizeof(_OperatorContract), 80),
-        ("TierDescriptor", ctypes.sizeof(_TierDescriptor), 56),
+        ("TierDescriptor", ctypes.sizeof(_TierDescriptor), 64),
         ("OperatorPlan", ctypes.sizeof(_OperatorPlan), 72),
         ("AcquireRequirement", ctypes.sizeof(AcquireRequirement), 48),
+        ("IndexedHostObject", ctypes.sizeof(_IndexedHostObject), 72),
         ("WorkItem", ctypes.sizeof(WorkItem), 64),
         ("RequestProgress", ctypes.sizeof(_RequestProgress), 96),
         ("RequestSpec", ctypes.sizeof(_RequestSpec), 40),
@@ -545,6 +601,11 @@ def _validate_abi_layouts() -> None:
     ]
     if invalid:
         raise RuntimeError("Python/native ABI layout mismatch: " + ", ".join(invalid))
+    if (
+        _ACQUIRE_REQUIREMENT_PACKER.size != ctypes.sizeof(AcquireRequirement)
+        or _INDEXED_HOST_OBJECT_PACKER.size != ctypes.sizeof(_IndexedHostObject)
+    ):
+        raise RuntimeError("Python packed/native indexed ABI layout mismatch")
 
 
 _validate_abi_layouts()
@@ -640,7 +701,6 @@ class IndexedHostObject:
     staging_stride_bytes: int
     source_index_limit: int
     staging_index_limit: int
-    preacquired: bool = False
 
     def __post_init__(self) -> None:
         _u64(self.object_id, "indexed object id")
@@ -661,9 +721,6 @@ class IndexedHostObject:
             "staging_index_limit",
         ):
             _u32(getattr(self, name), f"indexed {name}", positive=True)
-        if not isinstance(self.preacquired, bool):
-            raise ValueError("indexed object preacquired must be boolean")
-
     def native(self) -> _IndexedHostObject:
         return _IndexedHostObject(
             self.object_id,
@@ -678,7 +735,220 @@ class IndexedHostObject:
             self.staging_stride_bytes,
             self.source_index_limit,
             self.staging_index_limit,
-            int(self.preacquired),
+            0,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class IndexedHostIndexBinding:
+    source_indices_device_address: int
+    staging_indices_device_address: int
+    index_count: int
+
+    def __post_init__(self) -> None:
+        _u64(
+            self.source_indices_device_address,
+            "bound indexed source address",
+            positive=True,
+        )
+        _u64(
+            self.staging_indices_device_address,
+            "bound indexed staging address",
+            positive=True,
+        )
+        _u32(self.index_count, "bound indexed count", positive=True)
+
+    def native(self) -> _IndexedHostIndexBinding:
+        return _IndexedHostIndexBinding(
+            self.source_indices_device_address,
+            self.staging_indices_device_address,
+            self.index_count,
+            0,
+        )
+
+
+class IndexedHostPlan:
+    """Native-ready directory and dependency image for indexed tensor lanes.
+
+    Framework adapters publish exact groups and lane geometry.  This owner
+    expands their Cartesian product directly into ctypes arrays, avoiding a
+    per-object Python dataclass graph and retaining one immutable image for the
+    corresponding work-plan upload.
+    """
+
+    def __init__(
+        self,
+        topology: IndexedTransferTopology,
+        lanes: Iterable[IndexedTensorLane],
+        *,
+        source_indices_device_address: int,
+        staging_indices_device_address: int,
+        object_version: int,
+        direct_base: int,
+        first_slot: int = 0,
+        object_id_base: int = 0x4E54410000000000,
+    ) -> None:
+        if not isinstance(topology, IndexedTransferTopology):
+            raise TypeError("indexed host plan requires IndexedTransferTopology")
+        lane_values = tuple(lanes)
+        if not lane_values or any(
+            not isinstance(lane, IndexedTensorLane) for lane in lane_values
+        ):
+            raise TypeError("indexed host plan requires typed tensor lanes")
+        self.topology = topology
+        self.lanes = lane_values
+        self.first_slot = _u32(first_slot, "first indexed object slot")
+        self.object_version = _u32(
+            object_version, "indexed object version", positive=True
+        )
+        self.object_id_base = _u64(object_id_base, "indexed object ID base")
+        self.direct_base = _u64(direct_base, "direct runtime base", positive=True)
+        source_indices = _u64(
+            source_indices_device_address,
+            "source indices device address",
+            positive=True,
+        )
+        staging_indices = _u64(
+            staging_indices_device_address,
+            "staging indices device address",
+            positive=True,
+        )
+        if source_indices % 4 or staging_indices % 4:
+            raise ValueError("indexed host plan index vectors must be int32-aligned")
+
+        lane_count = len(lane_values)
+        object_count = len(topology.groups) * lane_count
+        if object_count == 0:
+            raise ValueError("indexed host plan has no external transfer group")
+        if self.first_slot + object_count >= 1 << 32:
+            raise ValueError("indexed host plan object slots exceed uint32")
+        if self.object_id_base + object_count > (1 << 64) - 1:
+            raise ValueError("indexed host plan object IDs exceed uint64")
+        self._objects = (_IndexedHostObject * object_count)()
+        object_cursor = 0
+        for group_index, group in enumerate(topology.groups):
+            index_byte_offset = group.index_offset * 4
+            for lane_index, lane in enumerate(lane_values):
+                relative_slot = group_index * lane_count + lane_index
+                _INDEXED_HOST_OBJECT_PACKER.pack_into(
+                    self._objects,
+                    object_cursor * _INDEXED_HOST_OBJECT_PACKER.size,
+                    self.object_id_base + relative_slot,
+                    lane.source_address,
+                    lane.staging_address,
+                    source_indices + index_byte_offset,
+                    staging_indices + index_byte_offset,
+                    self.object_version,
+                    group.row_count,
+                    lane.element_bytes,
+                    lane.source_stride_bytes,
+                    lane.staging_stride_bytes,
+                    lane.source_index_limit,
+                    lane.staging_index_limit,
+                    0,
+                )
+                object_cursor += 1
+        if object_cursor != object_count:
+            raise RuntimeError("indexed host object materialization diverged")
+
+        dependency_count = sum(
+            lane_count * max(1, len(work))
+            for work in topology.dependencies_by_work
+        )
+        self._dependencies = (AcquireRequirement * dependency_count)()
+        spans: list[WorkDependencySpan] = []
+        external_slots: list[tuple[int, ...]] = []
+        dependency_cursor = 0
+        unresolved_counts: list[int] = []
+        for work in topology.dependencies_by_work:
+            begin = dependency_cursor
+            work_slots: list[int] = []
+            if not work:
+                for _lane in lane_values:
+                    _ACQUIRE_REQUIREMENT_PACKER.pack_into(
+                        self._dependencies,
+                        dependency_cursor * _ACQUIRE_REQUIREMENT_PACKER.size,
+                        self.direct_base,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                        0,
+                    )
+                    dependency_cursor += 1
+                direct_count = lane_count
+            else:
+                for dependency in work:
+                    for lane_index, lane in enumerate(lane_values):
+                        relative_slot = dependency.group_index * lane_count + lane_index
+                        slot = self.first_slot + relative_slot
+                        required_bytes = dependency.row_count * lane.element_bytes
+                        if required_bytes >= 1 << 32:
+                            raise ValueError(
+                                "indexed work dependency bytes exceed uint32"
+                            )
+                        _ACQUIRE_REQUIREMENT_PACKER.pack_into(
+                            self._dependencies,
+                            dependency_cursor * _ACQUIRE_REQUIREMENT_PACKER.size,
+                            0,
+                            0,
+                            self.object_id_base + relative_slot,
+                            0,
+                            slot,
+                            self.object_version,
+                            required_bytes,
+                            0,
+                        )
+                        dependency_cursor += 1
+                        work_slots.append(slot)
+                direct_count = 0
+                unresolved_counts.append(dependency_cursor - begin)
+            spans.append(
+                WorkDependencySpan(begin, dependency_cursor - begin, direct_count)
+            )
+            external_slots.append(tuple(work_slots))
+        if dependency_cursor != dependency_count:
+            raise RuntimeError("indexed host dependency materialization diverged")
+        self.dependency_spans = tuple(spans)
+        self.external_object_slots = tuple(external_slots)
+        self.min_unresolved_dependencies = min(unresolved_counts, default=1)
+
+    @property
+    def object_count(self) -> int:
+        return len(self._objects)
+
+    @property
+    def dependencies(self) -> Any:
+        return self._dependencies
+
+    @property
+    def native_objects(self) -> Any:
+        return self._objects
+
+    @property
+    def transfer_bytes(self) -> int:
+        lane_bytes = sum(lane.element_bytes for lane in self.lanes)
+        return sum(group.row_count * lane_bytes for group in self.topology.groups)
+
+    @property
+    def max_object_fanout(self) -> int:
+        return self.topology.max_group_fanout
+
+    @property
+    def direct_work_count(self) -> int:
+        return self.topology.direct_work_count
+
+    @property
+    def exact_resume_windows(self) -> bool:
+        return (
+            self.direct_work_count == 0
+            and len(self.topology.groups) == self.topology.work_count
+            and all(
+                len(work) == 1 and work[0].group_index == work_id
+                for work_id, work in enumerate(self.topology.dependencies_by_work)
+            )
         )
 
 
@@ -737,6 +1007,37 @@ class NvmeQueueStats:
     cq_head: int
     cq_phase: int
     next_completion_dword3: int
+    hbm_region_registrations: int
+    hbm_region_bytes: int
+    hbm_transfer_views: int
+
+
+@dataclasses.dataclass(frozen=True)
+class NvmeHbmRegistrationRange:
+    """Validated allocation identity and minimal peer-registration envelope."""
+
+    allocation_address: int
+    allocation_bytes: int
+    registration_address: int
+    registration_bytes: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "allocation_address",
+            "allocation_bytes",
+            "registration_address",
+            "registration_bytes",
+        ):
+            _u64(getattr(self, name), f"NVMe HBM {name}", positive=True)
+        allocation_end = self.allocation_address + self.allocation_bytes
+        registration_end = self.registration_address + self.registration_bytes
+        if allocation_end >= 1 << 64 or registration_end >= 1 << 64:
+            raise ValueError("NVMe HBM registration geometry exceeds uint64")
+        if not (
+            self.allocation_address <= self.registration_address
+            and registration_end <= allocation_end
+        ):
+            raise ValueError("NVMe HBM registration exceeds its CUDA allocation")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -773,6 +1074,8 @@ class TierDescriptor:
     protocol_owner: ResourceOwner
     payload_owner: ResourceOwner
     transfer_destination_owner: ResourceOwner | None
+    mapping_owner: ResourceOwner | None
+    directory_owner: ResourceOwner
 
     def __post_init__(self) -> None:
         if not isinstance(self.protocol_owner, ResourceOwner):
@@ -783,6 +1086,12 @@ class TierDescriptor:
             self.transfer_destination_owner, ResourceOwner
         ):
             raise TypeError("tier transfer destination owner is not typed")
+        if self.mapping_owner is not None and not isinstance(
+            self.mapping_owner, ResourceOwner
+        ):
+            raise TypeError("tier mapping owner is not typed")
+        if not isinstance(self.directory_owner, ResourceOwner):
+            raise TypeError("tier directory owner is not typed")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -913,6 +1222,23 @@ _nvme_stats = _function(
     _Handle,
     ctypes.POINTER(_NvmeQueueStats),
 )
+_nvme_describe_hbm_region = _function(
+    "nta_nvme_transport_describe_hbm_region",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.POINTER(_NvmeHbmRegistrationRange),
+)
+_nvme_register_hbm_region = _function(
+    "nta_nvme_transport_register_hbm_region",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    _HandlePointer,
+)
+_nvme_hbm_region_destroy = _function("nta_nvme_hbm_region_destroy", None, _Handle)
 _cxl_create = _function(
     "nta_cxl_dax_transport_create",
     ctypes.c_int,
@@ -975,7 +1301,6 @@ _runtime_set_tenant_budget = _function(
     _Handle,
     ctypes.c_uint32,
     ctypes.c_uint64,
-    ctypes.c_uint32,
 )
 _runtime_register_object = _function(
     "nta_runtime_register_object",
@@ -1035,6 +1360,17 @@ _runtime_register_indexed_host_objects_async_quiesced = _function(
     ctypes.c_uint64,
     ctypes.c_uint64,
 )
+_runtime_register_indexed_host_objects_async_bound = _function(
+    "nta_runtime_register_indexed_host_objects_async_bound",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.POINTER(_IndexedHostObject),
+    ctypes.c_uint32,
+    ctypes.POINTER(_IndexedHostIndexBinding),
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
 _runtime_bind_tensor_maps = _function(
     "nta_runtime_bind_tensor_maps",
     ctypes.c_int,
@@ -1068,8 +1404,8 @@ _runtime_install_nvme_object_async = _function(
     ctypes.c_uint64,
     ctypes.POINTER(ctypes.c_uint64),
 )
-_runtime_install_external_nvme_object = _function(
-    "nta_runtime_install_external_nvme_object",
+_runtime_install_registered_nvme_object = _function(
+    "nta_runtime_install_registered_nvme_object",
     ctypes.c_int,
     _Handle,
     ctypes.c_uint32,
@@ -1077,17 +1413,20 @@ _runtime_install_external_nvme_object = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint64,
+    _Handle,
     ctypes.c_uint64,
     ctypes.POINTER(ctypes.c_uint64),
 )
-_runtime_install_external_nvme_object_async = _function(
-    "nta_runtime_install_external_nvme_object_async",
+_runtime_install_registered_nvme_object_async = _function(
+    "nta_runtime_install_registered_nvme_object_async",
     ctypes.c_int,
     _Handle,
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint32,
     ctypes.c_uint64,
+    ctypes.c_uint64,
+    _Handle,
     ctypes.c_uint64,
     ctypes.c_uint64,
     ctypes.c_uint64,
@@ -1215,6 +1554,15 @@ _copy_host_to_device = _function(
     ctypes.c_uint64,
     ctypes.c_uint64,
 )
+_copy_strided_host_runs = _function(
+    "nta_copy_strided_host_runs_async",
+    ctypes.c_int,
+    ctypes.POINTER(_StridedCopyGroup),
+    ctypes.c_uint32,
+    ctypes.POINTER(_ContiguousCopyRun),
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
 _phase_create = _function(
     "nta_jit_phase_program_create", ctypes.c_int, ctypes.c_char_p, _HandlePointer
 )
@@ -1266,6 +1614,13 @@ _phase_validate_indexed_host_range = _function(
     _Handle,
     ctypes.c_uint32,
     ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_warmup_indexed_host_validation = _function(
+    "nta_jit_phase_warmup_indexed_host_validation",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
     ctypes.c_uint64,
 )
 _phase_rebind_indexed_host_pairs = _function(
@@ -1511,6 +1866,101 @@ def copy_host_to_device_async(
     _check(_copy_host_to_device(destination, source, bytes, _stream_address(stream)))
 
 
+def copy_strided_host_runs_async(groups: Any, runs: Any, stream: Any = None) -> int:
+    """Enqueue safe batches over a shared exact index-run layout.
+
+    Returns the number of native batch submissions. Groups whose conservative
+    destination spans overlap are partitioned into separate stream-ordered
+    submissions, so the CUDA batch never contains dependent copies.
+    """
+    from nta_runtime.indexed_transfer import ContiguousPairRun, StridedCopyGroup
+
+    group_values = tuple(groups)
+    run_values = tuple(runs)
+    if not group_values or not run_values:
+        raise ValueError("strided host copy needs groups and runs")
+    if any(not isinstance(group, StridedCopyGroup) for group in group_values):
+        raise TypeError("strided host copy groups use StridedCopyGroup")
+    if any(not isinstance(run, ContiguousPairRun) for run in run_values):
+        raise TypeError("strided host copy runs use ContiguousPairRun")
+    if len(group_values) >= 1 << 32 or len(run_values) >= 1 << 32:
+        raise ValueError("strided host copy exceeds uint32 capacity")
+    for run in run_values:
+        if (
+            min(run.source_first, run.destination_first) < 0
+            or run.row_count <= 0
+            or max(run.source_first, run.destination_first, run.row_count) >= 1 << 32
+        ):
+            raise ValueError("strided host copy run exceeds uint32 geometry")
+    native_runs = (_ContiguousCopyRun * len(run_values))(
+        *(
+            _ContiguousCopyRun(
+                run.source_first, run.destination_first, run.row_count, 0
+            )
+            for run in run_values
+        )
+    )
+    maximum_copies = 1 << 16
+    batches: list[list[tuple[StridedCopyGroup, tuple[int, int]]]] = []
+    for group in group_values:
+        for run in run_values:
+            if (
+                run.source_first + run.row_count > group.source_rows
+                or run.destination_first + run.row_count > group.destination_rows
+            ):
+                raise ValueError("strided host-copy run exceeds group geometry")
+        span = (
+            group.destination_address
+            + min(run.destination_first for run in run_values)
+            * group.destination_stride_bytes,
+            group.destination_address
+            + max(
+                (run.destination_first + run.row_count - 1)
+                * group.destination_stride_bytes
+                + group.row_bytes
+                for run in run_values
+            ),
+        )
+        if span[1] >= 1 << 64:
+            raise ValueError("strided host-copy address geometry exceeds uint64")
+        for batch in batches:
+            if (len(batch) + 1) * len(run_values) > maximum_copies:
+                continue
+            if all(span[1] <= other[0] or other[1] <= span[0] for _, other in batch):
+                batch.append((group, span))
+                break
+        else:
+            batches.append([(group, span)])
+
+    stream_address = _stream_address(stream)
+    for batch in batches:
+        native_groups = (_StridedCopyGroup * len(batch))(
+            *(
+                _StridedCopyGroup(
+                    group.source_address,
+                    group.destination_address,
+                    group.source_rows,
+                    group.destination_rows,
+                    group.row_bytes,
+                    group.source_stride_bytes,
+                    group.destination_stride_bytes,
+                    0,
+                )
+                for group, _ in batch
+            )
+        )
+        _check(
+            _copy_strided_host_runs(
+                native_groups,
+                len(batch),
+                native_runs,
+                len(run_values),
+                stream_address,
+            )
+        )
+    return len(batches)
+
+
 def _device_byte_tensor(address: int, device_ordinal: int):
     if address == 0:
         raise ValueError("cannot wrap a null CUDA address")
@@ -1552,6 +2002,28 @@ class _Owner:
         self.close()
 
 
+class NvmeHbmRegion(_Owner):
+    """Setup-time peer mapping for one stable caller-owned CUDA range."""
+
+    _destroy = staticmethod(_nvme_hbm_region_destroy)
+
+    def __init__(self, transport: "NvmeTransport", address: int, bytes: int):
+        if address <= 0 or bytes <= 0:
+            raise ValueError("NVMe HBM region address and bytes must be positive")
+        self._handle = _Handle()
+        self._transport = transport
+        _check(
+            _nvme_register_hbm_region(
+                transport._handle,
+                address,
+                bytes,
+                ctypes.byref(self._handle),
+            )
+        )
+        self.address = address
+        self.bytes = bytes
+
+
 class NvmeTransport(_Owner):
     _destroy = staticmethod(_nvme_destroy)
 
@@ -1591,6 +2063,32 @@ class NvmeTransport(_Owner):
             bool(value.gpu_doorbell_mapping_validated),
         )
 
+    def register_hbm_region(self, address: int, bytes: int) -> NvmeHbmRegion:
+        """Pin/map a stable CUDA range once for allocation-free transfer views."""
+
+        return NvmeHbmRegion(self, address, bytes)
+
+    def describe_hbm_region(self, address: int, bytes: int) -> NvmeHbmRegistrationRange:
+        """Describe a slice without pinning it or changing IOMMU state."""
+
+        _u64(address, "NVMe HBM address", positive=True)
+        _u64(bytes, "NVMe HBM bytes", positive=True)
+        native = _NvmeHbmRegistrationRange()
+        _check(
+            _nvme_describe_hbm_region(
+                self._handle,
+                address,
+                bytes,
+                ctypes.byref(native),
+            )
+        )
+        return NvmeHbmRegistrationRange(
+            native.allocation_address,
+            native.allocation_bytes,
+            native.registration_address,
+            native.registration_bytes,
+        )
+
     @property
     def stats(self) -> NvmeQueueStats:
         value = _NvmeQueueStats()
@@ -1607,6 +2105,9 @@ class NvmeTransport(_Owner):
             value.cq_head,
             value.cq_phase,
             value.next_completion_dword3,
+            value.hbm_region_registrations,
+            value.hbm_region_bytes,
+            value.hbm_transfer_views,
         )
 
 
@@ -1717,6 +2218,8 @@ class Runtime(_Owner):
             owner(native.protocol_owner),
             owner(native.payload_owner),
             owner(native.transfer_destination_owner, optional=True),
+            owner(native.mapping_owner, optional=True),
+            owner(native.directory_owner),
         )
 
     @property
@@ -1777,10 +2280,9 @@ class Runtime(_Owner):
     def cancel_request(self, slot: int, generation: int) -> None:
         _check(_runtime_cancel_request(self._handle, slot, generation))
 
-    def set_tenant_budget(
-        self, tenant_id: int, max_bytes: int, weight: int = 1
-    ) -> None:
-        _check(_runtime_set_tenant_budget(self._handle, tenant_id, max_bytes, weight))
+    def set_tenant_budget(self, tenant_id: int, max_bytes: int) -> None:
+        """Bound this tenant's concurrently acquired staging bytes."""
+        _check(_runtime_set_tenant_budget(self._handle, tenant_id, max_bytes))
 
     def register_object(
         self,
@@ -1854,18 +2356,81 @@ class Runtime(_Owner):
         objects: Iterable[IndexedHostObject],
         stream: Any = None,
         quiescence_event: Any = None,
+        index_binding: IndexedHostIndexBinding | None = None,
     ) -> None:
         """Bulk-publish a contiguous layer's indexed host objects."""
         values = [object_.native() for object_ in objects]
         if not values:
             raise ValueError("indexed host object batch cannot be empty")
         array = (_IndexedHostObject * len(values))(*values)
+        self._register_indexed_host_native(
+            first_slot,
+            array,
+            stream=stream,
+            quiescence_event=quiescence_event,
+            index_binding=index_binding,
+        )
+
+    def register_indexed_host_plan(
+        self,
+        plan: IndexedHostPlan,
+        *,
+        stream: Any,
+        quiescence_event: Any = None,
+        index_binding: IndexedHostIndexBinding | None = None,
+    ) -> None:
+        """Publish one pre-materialized indexed resource/work image."""
+
+        if not isinstance(plan, IndexedHostPlan):
+            raise TypeError("indexed host publication requires IndexedHostPlan")
+        self._register_indexed_host_native(
+            plan.first_slot,
+            plan.native_objects,
+            stream=stream,
+            quiescence_event=quiescence_event,
+            index_binding=index_binding,
+        )
+
+    def _register_indexed_host_native(
+        self,
+        first_slot: int,
+        array: Any,
+        *,
+        stream: Any,
+        quiescence_event: Any,
+        index_binding: IndexedHostIndexBinding | None,
+    ) -> None:
+        if not isinstance(array, ctypes.Array) or getattr(
+            type(array), "_type_", None
+        ) is not _IndexedHostObject:
+            raise TypeError("indexed host native objects have an invalid ABI")
+        if not len(array):
+            raise ValueError("indexed host object batch cannot be empty")
         if quiescence_event is not None and stream is None:
             raise ValueError("quiescence_event requires an asynchronous stream")
-        if stream is None:
+        if index_binding is not None:
+            if stream is None:
+                raise ValueError("index_binding requires an asynchronous stream")
+            if not isinstance(index_binding, IndexedHostIndexBinding):
+                raise TypeError("index_binding has an invalid type")
+            native_binding = index_binding.native()
+            _check(
+                _runtime_register_indexed_host_objects_async_bound(
+                    self._handle,
+                    first_slot,
+                    array,
+                    len(array),
+                    ctypes.byref(native_binding),
+                    _stream_address(stream),
+                    0
+                    if quiescence_event is None
+                    else _event_address(quiescence_event),
+                )
+            )
+        elif stream is None:
             _check(
                 _runtime_register_indexed_host_objects(
-                    self._handle, first_slot, array, len(values)
+                    self._handle, first_slot, array, len(array)
                 )
             )
         elif quiescence_event is not None:
@@ -1874,7 +2439,7 @@ class Runtime(_Owner):
                     self._handle,
                     first_slot,
                     array,
-                    len(values),
+                    len(array),
                     _stream_address(stream),
                     _event_address(quiescence_event),
                 )
@@ -1885,7 +2450,7 @@ class Runtime(_Owner):
                     self._handle,
                     first_slot,
                     array,
-                    len(values),
+                    len(array),
                     _stream_address(stream),
                 )
             )
@@ -1964,62 +2529,66 @@ class Runtime(_Owner):
         )
         return int(destination.value)
 
-    def install_external_nvme_object(
+    def install_registered_nvme_object(
         self,
         slot: int,
         object_id: int,
         version: int,
         source_byte_offset: int,
         bytes: int,
+        region: NvmeHbmRegion,
         destination_device_address: int,
     ) -> int:
-        """Publish a direct-NVMe object into caller-owned HBM.
-
-        The caller retains ownership of the CUDA allocation. NTA retains the
-        peer mapping lease until the object is safely retired.
-        """
+        """Publish one transfer view of a setup-time registered HBM region."""
+        if not isinstance(region, NvmeHbmRegion) or not region._handle:
+            raise ValueError("registered NVMe object requires a live HBM region")
         if destination_device_address <= 0:
-            raise ValueError("external NVMe destination address must be positive")
+            raise ValueError("registered NVMe destination must be positive")
         destination = ctypes.c_uint64()
         _check(
-            _runtime_install_external_nvme_object(
+            _runtime_install_registered_nvme_object(
                 self._handle,
                 slot,
                 object_id,
                 version,
                 source_byte_offset,
                 bytes,
+                region._handle,
                 destination_device_address,
                 ctypes.byref(destination),
             )
         )
         return int(destination.value)
 
-    def install_external_nvme_object_async(
+    def install_registered_nvme_object_async(
         self,
         slot: int,
         object_id: int,
         version: int,
         source_byte_offset: int,
         bytes: int,
+        region: NvmeHbmRegion,
         destination_device_address: int,
         stream: Any,
         prior_consumer_event: Any = None,
     ) -> int:
-        """Stream-order a direct-NVMe object into caller-owned HBM."""
+        """Stream-order one view of a setup-time registered HBM region."""
+        if not isinstance(region, NvmeHbmRegion) or not region._handle:
+            raise ValueError("registered NVMe object requires a live HBM region")
         if destination_device_address <= 0:
-            raise ValueError("external NVMe destination address must be positive")
+            raise ValueError("registered NVMe destination must be positive")
         if stream is None:
             raise ValueError("asynchronous NVMe installation requires a stream")
         destination = ctypes.c_uint64()
         _check(
-            _runtime_install_external_nvme_object_async(
+            _runtime_install_registered_nvme_object_async(
                 self._handle,
                 slot,
                 object_id,
                 version,
                 source_byte_offset,
                 bytes,
+                region._handle,
                 destination_device_address,
                 _stream_address(stream),
                 _event_address(prior_consumer_event),
@@ -2225,85 +2794,114 @@ class DeviceWorkPlan(_Owner):
         work_array = (WorkItem * len(work))(*work)
         dependency_array = (AcquireRequirement * len(dependency))(*dependency)
         request_array = (RequestRange * len(request))(*request)
+        self._upload_native(work_array, dependency_array, request_array, stream)
+
+    def _upload_native(
+        self,
+        work_items: Any,
+        dependencies: Any,
+        requests: Any,
+        stream: Any,
+    ) -> None:
+        """Upload already-materialized ctypes arrays without another host copy."""
+
+        work_count = len(work_items)
+        dependency_count = len(dependencies)
+        request_count = len(requests)
+        if not work_count or not dependency_count or not request_count:
+            raise ValueError("work-plan native arrays must be non-empty")
         _check(
             _plan_upload(
                 self._handle,
-                work_array,
-                len(work),
-                dependency_array,
-                len(dependency),
-                request_array,
-                len(request),
+                work_items,
+                work_count,
+                dependencies,
+                dependency_count,
+                requests,
+                request_count,
                 _stream_address(stream),
             )
         )
         self._has_external = any(
-            item.direct_dependency_count != item.dependency_count for item in work
+            item.direct_dependency_count != item.dependency_count
+            for item in work_items
         )
 
-    def upload_work_units(
+    def upload_exact(
         self,
-        units: Iterable[Any],
-        dependency_spans: Iterable[tuple[int, int, int, int]],
+        topology: ExactWorkTopology,
+        dependency_spans: Iterable[WorkDependencySpan],
         dependencies: Iterable[AcquireRequirement],
-        requests: Iterable[RequestRange],
         *,
-        epoch: int,
         stream: Any = None,
     ) -> None:
-        """Materialize one exact semantic epoch into the native ABI.
+        """Materialize a compact exact topology into the native ticket ABI.
 
-        This is the only Python-to-native WorkItem conversion.  The native
-        ABI intentionally stores execution identity and dependency geometry;
-        demand semantics and granularity stay in the validated semantic batch.
+        Request index, reduction ownership, contributor coordinates, and work
+        tickets are canonical consequences of the request ranges.  Deriving
+        them here avoids rebuilding a semantic object graph in every framework
+        adapter while retaining the same native validation and generation
+        checks as :meth:`upload`.
         """
-        unit_values = tuple(units)
+
+        if not isinstance(topology, ExactWorkTopology):
+            raise TypeError("exact work-plan upload requires ExactWorkTopology")
         spans = tuple(dependency_spans)
-        dependency_values = tuple(dependencies)
-        if epoch < 0:
-            raise ValueError("execution epoch cannot be negative")
-        if len(unit_values) != len(spans):
-            raise ValueError("semantic units and dependency spans must align")
-        if not unit_values:
-            raise ValueError("semantic work-unit upload cannot be empty")
-        if any(not unit.demand.is_exact for unit in unit_values):
-            raise ValueError("native WorkItem upload requires exact demand")
-        if any(unit.demand.epoch != epoch for unit in unit_values):
-            raise ValueError("semantic work-unit epochs do not match the upload")
-        dependency_total = len(dependency_values)
-        for unit, span in zip(unit_values, spans, strict=True):
-            dependency_begin, dependency_count, direct_count, work_ticket = span
-            if unit.work_id != work_ticket:
-                raise ValueError("semantic work ID and native work ticket diverge")
-            if min(dependency_begin, dependency_count, direct_count) < 0:
-                raise ValueError("native dependency spans cannot be negative")
-            if direct_count > dependency_count:
-                raise ValueError("direct dependency count exceeds total dependencies")
-            if dependency_begin + dependency_count > dependency_total:
-                raise ValueError("native dependency span exceeds the dependency array")
-        native_items = tuple(
-            WorkItem(
-                unit.binding.request_index,
-                unit.binding.request_slot,
-                unit.binding.generation,
-                unit.logical_begin,
-                dependency_begin,
-                dependency_count,
-                direct_dependency_count,
-                work_ticket,
-                unit.reduction_group,
-                unit.contributor_index,
-                unit.contributor_count,
-                unit.estimated_compute_ns,
+        if isinstance(dependencies, ctypes.Array) and getattr(
+            type(dependencies), "_type_", None
+        ) is AcquireRequirement:
+            native_dependencies = dependencies
+        else:
+            dependency_values = tuple(dependencies)
+            native_dependencies = (AcquireRequirement * len(dependency_values))(
+                *dependency_values
             )
-            for unit, (
-                dependency_begin,
-                dependency_count,
-                direct_dependency_count,
-                work_ticket,
-            ) in zip(unit_values, spans, strict=True)
+        if len(spans) != topology.work_count:
+            raise ValueError("exact topology and dependency spans must align")
+        if any(not isinstance(span, WorkDependencySpan) for span in spans):
+            raise TypeError("exact work-plan dependency spans must be typed")
+        dependency_total = len(native_dependencies)
+        if dependency_total == 0:
+            raise ValueError("exact work-plan dependency array cannot be empty")
+        for span in spans:
+            if span.begin > dependency_total or span.count > dependency_total - span.begin:
+                raise ValueError("exact work dependency span exceeds its array")
+
+        work_items = (WorkItem * topology.work_count)()
+        for request in topology.requests:
+            for contributor_index in range(request.work_count):
+                work_ticket = request.work_begin + contributor_index
+                span = spans[work_ticket]
+                work_items[work_ticket] = WorkItem(
+                    request.request_index,
+                    request.request_slot,
+                    request.generation,
+                    topology.logical_work[work_ticket],
+                    span.begin,
+                    span.count,
+                    span.direct_count,
+                    work_ticket,
+                    request.request_index,
+                    contributor_index,
+                    request.work_count,
+                    topology.estimated_compute_ns[work_ticket],
+                )
+        request_values = tuple(
+            RequestRange(
+                request.work_begin,
+                request.work_count,
+                request.request_slot,
+                request.generation,
+            )
+            for request in topology.requests
         )
-        self.upload(native_items, dependency_values, requests, stream)
+        native_requests = (RequestRange * len(request_values))(*request_values)
+        self._upload_native(
+            work_items,
+            native_dependencies,
+            native_requests,
+            stream,
+        )
 
     def wait_on(self, stream: Any) -> None:
         _check(_plan_wait(self._handle, _stream_address(stream)))
@@ -2440,6 +3038,13 @@ class JitPhaseProgram(_Owner):
         work_ticket_count: int,
         stream: Any = None,
     ) -> None:
+        if object_count < 0 or object_count > runtime.config.object_capacity:
+            raise ValueError("phase object count exceeds runtime capacity")
+        if (
+            work_ticket_count <= 0
+            or work_ticket_count > runtime.config.work_ticket_capacity
+        ):
+            raise ValueError("phase work-ticket count exceeds runtime capacity")
         _check(
             _phase_reset(
                 self._handle,
@@ -2496,6 +3101,19 @@ class JitPhaseProgram(_Owner):
                 runtime._handle,
                 first_object,
                 object_count,
+                _stream_address(stream),
+            )
+        )
+
+    def warmup_indexed_host_validation(
+        self, runtime: Runtime, stream: Any = None
+    ) -> None:
+        """Materialize the exact validation kernel without touching state."""
+
+        _check(
+            _phase_warmup_indexed_host_validation(
+                self._handle,
+                runtime._handle,
                 _stream_address(stream),
             )
         )

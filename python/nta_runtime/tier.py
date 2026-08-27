@@ -6,23 +6,33 @@ storage preparation step.  This keeps the compiler/runtime mechanism exact:
 the operator supplies requested page identities, while this module resolves
 those identities to byte extents owned by one physical tier.
 
-There is intentionally no implicit fallback between tiers.  Host-staged is
-the default deployment profile; selecting a physical tier requires both its
-endpoint and a validated catalog.  A missing capability is therefore an
-operator/configuration error, not a silent change in the measured path.
+There is intentionally no implicit fallback between tiers.  Resident HBM is
+the safe default because it is the only source already named by an unmodified
+framework KV table.  Host-staged is a distinct materialization path and must
+never be used as a label for resident HBM.  Selecting a physical tier requires
+both its endpoint and a validated catalog.  A missing capability is therefore
+an operator/configuration error, not a silent change in the measured path.
 """
 
 from __future__ import annotations
 
+from collections.abc import Hashable
 from dataclasses import dataclass
 import enum
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from .abi import bounded_integer
+from .hbm_registration import (
+    DescribedHbmDestination,
+    HbmDestinationSlice,
+    coalesce_hbm_destinations,
+)
 from .resource_contract import (
     ResourceContract,
     ResourceKind,
@@ -36,16 +46,22 @@ _INT32_MAX = (1 << 31) - 1
 
 
 class ServingTier(str, enum.Enum):
+    HBM = "hbm"
+    HOST_MAPPED = "host_mapped"
     HOST_STAGED = "host_staged"
     NVME = "nvme"
     CXL_DAX = "cxl_dax"
 
 
 _RESOURCE_KIND_FOR_SERVING_TIER = {
+    ServingTier.HBM: ResourceKind.HBM,
+    ServingTier.HOST_MAPPED: ResourceKind.HOST_MAPPED,
     ServingTier.HOST_STAGED: ResourceKind.HOST_STAGED,
     ServingTier.NVME: ResourceKind.NVME,
     ServingTier.CXL_DAX: ResourceKind.CXL_DAX,
 }
+
+PHYSICAL_SERVING_TIERS = frozenset((ServingTier.NVME, ServingTier.CXL_DAX))
 
 
 @dataclass(frozen=True)
@@ -75,37 +91,106 @@ class PageExtent:
 
 
 @dataclass(frozen=True)
+class PageTransferRun:
+    """One maximal source/destination-contiguous physical page transfer.
+
+    ``destination_first`` is a framework-owned page/block index.  The tier
+    owns only the immutable source extent; translating the destination index
+    to an HBM address remains the framework adapter's responsibility.
+    """
+
+    source: PageExtent
+    destination_first: int
+    row_count: int
+
+    def __post_init__(self) -> None:
+        destination = bounded_integer(
+            self.destination_first,
+            "page-transfer destination",
+            minimum=0,
+            maximum=_UINT32_MAX,
+        )
+        rows = bounded_integer(
+            self.row_count,
+            "page-transfer row count",
+            minimum=1,
+            maximum=_UINT32_MAX,
+        )
+        if destination > _UINT32_MAX - (rows - 1):
+            raise ValueError("page-transfer destination range exceeds uint32")
+        object.__setattr__(self, "destination_first", destination)
+        object.__setattr__(self, "row_count", rows)
+
+
+@dataclass(frozen=True)
+class NvmeHbmPreparation:
+    """Owned setup result for disjoint framework destination registrations."""
+
+    regions: Mapping[Hashable, Any]
+    destination_count: int
+    destination_bytes: int
+    registration_count: int
+    registration_bytes: int
+
+
+@dataclass(frozen=True)
 class _PageRecord:
+    storage_key: str
+    ordinal: int
     layer: int
-    page: int
-    key: PageExtent
-    value: PageExtent
+    components: Mapping[str, PageExtent]
 
 
 class TierPageCatalog:
-    """Validated logical-page to physical-byte mapping.
+    """Stable storage-key to physical-byte directory.
 
-    Catalog entries are keyed by the device page identity emitted by the
-    framework's page table.  Each entry describes one complete K/V row.  A
-    multi-page request is accepted only when all requested rows are present,
-    have the expected exact row size, and form one contiguous byte span.  The
-    latter rule is required by the current NVMe object ABI and also prevents a
-    CXL direct dependency from silently changing into a gather operation.
+    Framework device page numbers are destination slots and may change on
+    every cache load.  They are deliberately absent from this catalog.  A
+    connector binds a stable content/storage key to the current destination;
+    the catalog maps that key to a dense physical ordinal and exact per-layer
+    typed component extents. Consecutive ordinals may be coalesced into one
+    transfer only when the selected component extents are also contiguous.
     """
 
-    SCHEMA = 1
+    SCHEMA = 2
+    FORMAT = "typed-components-v1"
 
     def __init__(
         self,
         *,
         tier: ServingTier,
         records: tuple[_PageRecord, ...],
+        namespace: str,
+        page_tokens: int,
+        layer_count: int,
+        components: tuple[str, ...],
         alignment_bytes: int = 4096,
         window_bytes: int | None = None,
         digest: str = "",
     ) -> None:
         if not isinstance(tier, ServingTier):
             raise TypeError("tier catalog tier must be a ServingTier value")
+        if tier not in PHYSICAL_SERVING_TIERS:
+            raise ValueError("tier page catalogs are only valid for physical tiers")
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("tier catalog namespace must be non-empty")
+        if len(namespace.encode("utf-8")) > 1024:
+            raise ValueError("tier catalog namespace is too long")
+        page_tokens = _positive_int(page_tokens, "catalog page_tokens")
+        layer_count = _positive_int(layer_count, "catalog layer_count")
+        if (
+            not components
+            or len(set(components)) != len(components)
+            or any(
+                not isinstance(component, str)
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", component) is None
+                for component in components
+            )
+        ):
+            raise ValueError(
+                "tier catalog components must be unique lower-case identifiers"
+            )
+        component_set = set(components)
         alignment_bytes = _catalog_uint64(
             alignment_bytes, "catalog alignment_bytes", minimum=1
         )
@@ -115,55 +200,124 @@ class TierPageCatalog:
             window_bytes = _catalog_uint64(
                 window_bytes, "catalog window_bytes", minimum=1
             )
-        by_key: dict[tuple[int, int], _PageRecord] = {}
+        by_coordinate: dict[tuple[int, int], _PageRecord] = {}
+        ordinal_by_storage_key: dict[str, int] = {}
+        storage_key_by_ordinal: dict[int, str] = {}
+        layers_by_ordinal: dict[int, set[int]] = {}
         ranges: list[tuple[int, int, tuple[int, int], str]] = []
         for record in records:
-            key = (record.layer, record.page)
-            if key in by_key:
-                raise ValueError(f"catalog contains duplicate page {key}")
-            for extent in (record.key, record.value):
+            if not isinstance(record.storage_key, str) or not record.storage_key:
+                raise ValueError("catalog storage keys must be non-empty strings")
+            if len(record.storage_key.encode("utf-8")) > 4096:
+                raise ValueError("catalog storage key is too long")
+            ordinal = bounded_integer(
+                record.ordinal,
+                "catalog ordinal",
+                minimum=0,
+                maximum=_UINT32_MAX,
+            )
+            layer = bounded_integer(
+                record.layer,
+                "catalog layer",
+                minimum=0,
+                maximum=_UINT32_MAX,
+            )
+            if layer >= layer_count:
+                raise ValueError("catalog entry layer exceeds layer_count")
+            coordinate = (layer, ordinal)
+            if coordinate in by_coordinate:
+                raise ValueError(f"catalog contains duplicate coordinate {coordinate}")
+            previous_ordinal = ordinal_by_storage_key.setdefault(
+                record.storage_key, ordinal
+            )
+            previous_key = storage_key_by_ordinal.setdefault(
+                ordinal, record.storage_key
+            )
+            if previous_ordinal != ordinal or previous_key != record.storage_key:
+                raise ValueError("catalog storage keys and ordinals are not one-to-one")
+            layers_by_ordinal.setdefault(ordinal, set()).add(layer)
+            if set(record.components) != component_set:
+                raise ValueError(
+                    f"catalog entry {coordinate} does not define every component"
+                )
+            for extent in record.components.values():
                 if extent.offset % alignment_bytes:
                     raise ValueError(
-                        f"catalog extent {key} is not aligned to {alignment_bytes} bytes"
+                        "catalog extent "
+                        f"{coordinate} is not aligned to {alignment_bytes} bytes"
                     )
                 if (
                     window_bytes is not None
                     and extent.offset + extent.bytes > window_bytes
                 ):
-                    raise ValueError(f"catalog extent {key} exceeds its tier window")
-            if (
-                record.key.offset < record.value.offset + record.value.bytes
-                and record.value.offset < record.key.offset + record.key.bytes
-            ):
-                raise ValueError(f"catalog K/V extents overlap for page {key}")
+                    raise ValueError(
+                        f"catalog extent {coordinate} exceeds its tier window"
+                    )
             ranges.extend(
                 (
                     extent.offset,
                     extent.offset + extent.bytes,
-                    key,
-                    kind,
+                    coordinate,
+                    component,
                 )
-                for kind, extent in (("key", record.key), ("value", record.value))
+                for component, extent in record.components.items()
             )
-            by_key[key] = record
+            by_coordinate[coordinate] = record
+        expected_ordinals = set(range(len(storage_key_by_ordinal)))
+        if set(storage_key_by_ordinal) != expected_ordinals:
+            raise ValueError("catalog physical ordinals must be dense from zero")
+        expected_layers = set(range(layer_count))
+        incomplete = {
+            ordinal: sorted(expected_layers - layers)
+            for ordinal, layers in layers_by_ordinal.items()
+            if layers != expected_layers
+        }
+        if incomplete:
+            raise ValueError(
+                f"catalog pages do not cover every model layer: {incomplete}"
+            )
         previous: tuple[int, int, tuple[int, int], str] | None = None
         for current in sorted(ranges):
             if previous is not None and current[0] < previous[1]:
                 raise ValueError(
                     "catalog extents overlap: "
-                    f"layer/page={previous[2]} {previous[3]} and "
-                    f"layer/page={current[2]} {current[3]}"
+                    f"layer/ordinal={previous[2]} {previous[3]} and "
+                    f"layer/ordinal={current[2]} {current[3]}"
                 )
             previous = current
         self.tier = tier
-        self._records = by_key
+        self._records = by_coordinate
+        self._ordinal_by_storage_key = ordinal_by_storage_key
+        self._storage_key_by_ordinal = storage_key_by_ordinal
+        self.namespace = namespace
+        self.page_tokens = page_tokens
+        self.layer_count = layer_count
+        self.components = components
         self.alignment_bytes = alignment_bytes
         self.window_bytes = window_bytes
         self.digest = digest
 
     @property
     def page_count(self) -> int:
-        return len(self._records)
+        return len(self._storage_key_by_ordinal)
+
+    def has_storage_key(self, storage_key: str) -> bool:
+        return storage_key in self._ordinal_by_storage_key
+
+    def ordinal(self, storage_key: str) -> int:
+        try:
+            return self._ordinal_by_storage_key[storage_key]
+        except KeyError:
+            raise KeyError(f"tier catalog has no storage key {storage_key!r}") from None
+
+    def storage_key(self, ordinal: int) -> str:
+        ordinal = bounded_integer(
+            ordinal, "catalog ordinal", minimum=0, maximum=_UINT32_MAX
+        )
+        try:
+            return self._storage_key_by_ordinal[ordinal]
+        except KeyError:
+            raise KeyError(f"tier catalog has no ordinal {ordinal}") from None
 
     @classmethod
     def load(
@@ -182,14 +336,21 @@ class TierPageCatalog:
         unknown = set(document) - {
             "schema",
             "tier",
+            "format",
+            "namespace",
+            "page_tokens",
+            "layer_count",
+            "components",
             "alignment_bytes",
             "window_bytes",
-            "pages",
+            "entries",
         }
         if unknown:
             raise ValueError(f"tier catalog has unknown fields: {sorted(unknown)}")
         if document.get("schema") != cls.SCHEMA:
             raise ValueError("unsupported tier catalog schema")
+        if document.get("format") != cls.FORMAT:
+            raise ValueError("unsupported tier catalog payload format")
         if document.get("tier") != expected_tier.value:
             raise ValueError(
                 f"tier catalog declares {document.get('tier')!r}, expected {expected_tier.value!r}"
@@ -200,31 +361,63 @@ class TierPageCatalog:
         window = document.get("window_bytes")
         if window is not None:
             window = _positive_int(window, "window_bytes")
-        raw_records = document.get("pages")
+        namespace = document.get("namespace")
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise ValueError("tier catalog namespace must be non-empty")
+        page_tokens = _positive_int(document.get("page_tokens"), "page_tokens")
+        layer_count = _positive_int(document.get("layer_count"), "layer_count")
+        raw_components = document.get("components")
+        if not isinstance(raw_components, list) or not raw_components:
+            raise ValueError("tier catalog components must be a non-empty list")
+        components = tuple(raw_components)
+        raw_records = document.get("entries")
         if not isinstance(raw_records, list) or not raw_records:
-            raise ValueError("tier catalog must contain a non-empty pages list")
+            raise ValueError("tier catalog must contain a non-empty entries list")
         records: list[_PageRecord] = []
         for index, item in enumerate(raw_records):
             if not isinstance(item, dict):
-                raise ValueError(f"tier catalog page {index} is not an object")
-            unknown = set(item) - {"layer", "page", "key", "value"}
+                raise ValueError(f"tier catalog entry {index} is not an object")
+            unknown = set(item) - {
+                "storage_key",
+                "ordinal",
+                "layer",
+                "components",
+            }
             if unknown:
                 raise ValueError(
-                    f"tier catalog page {index} has unknown fields: {sorted(unknown)}"
+                    f"tier catalog entry {index} has unknown fields: {sorted(unknown)}"
                 )
-            layer = _nonnegative_int(item.get("layer"), f"pages[{index}].layer")
-            page = _nonnegative_int(item.get("page"), f"pages[{index}].page")
+            storage_key = item.get("storage_key")
+            if not isinstance(storage_key, str) or not storage_key:
+                raise ValueError(f"entries[{index}].storage_key must be non-empty")
+            ordinal = _nonnegative_int(item.get("ordinal"), f"entries[{index}].ordinal")
+            layer = _nonnegative_int(item.get("layer"), f"entries[{index}].layer")
+            raw_entry_components = item.get("components")
+            if not isinstance(raw_entry_components, dict):
+                raise ValueError(f"entries[{index}].components must be an object")
             records.append(
                 _PageRecord(
+                    storage_key,
+                    ordinal,
                     layer,
-                    page,
-                    _parse_extent(item.get("key"), f"pages[{index}].key"),
-                    _parse_extent(item.get("value"), f"pages[{index}].value"),
+                    MappingProxyType(
+                        {
+                            component: _parse_extent(
+                                extent,
+                                f"entries[{index}].components.{component}",
+                            )
+                            for component, extent in raw_entry_components.items()
+                        }
+                    ),
                 )
             )
         return cls(
             tier=expected_tier,
             records=tuple(records),
+            namespace=namespace,
+            page_tokens=page_tokens,
+            layer_count=layer_count,
+            components=components,
             alignment_bytes=alignment,
             window_bytes=window,
             digest=hashlib.sha256(raw).hexdigest(),
@@ -234,8 +427,8 @@ class TierPageCatalog:
         self,
         *,
         layer: int,
-        pages: tuple[int, ...],
-        kind: str,
+        ordinals: tuple[int, ...],
+        component: str,
         row_bytes: int,
     ) -> PageExtent:
         layer = bounded_integer(
@@ -244,22 +437,23 @@ class TierPageCatalog:
         row_bytes = bounded_integer(
             row_bytes, "catalog span row size", minimum=1, maximum=_UINT32_MAX
         )
-        if kind not in {"key", "value"}:
-            raise ValueError("catalog span kind must be key or value")
-        if not pages:
+        if component not in self.components:
+            raise ValueError(f"catalog has no component {component!r}")
+        if not ordinals:
             raise ValueError("catalog span cannot be empty")
         extents: list[PageExtent] = []
-        for page in pages:
-            page = bounded_integer(
-                page, "catalog span page", minimum=0, maximum=_UINT32_MAX
+        for ordinal in ordinals:
+            ordinal = bounded_integer(
+                ordinal, "catalog span ordinal", minimum=0, maximum=_UINT32_MAX
             )
-            record = self._records.get((layer, page))
+            record = self._records.get((layer, ordinal))
             if record is None:
-                raise KeyError(f"tier catalog has no layer={layer}, page={page}")
-            extent = record.key if kind == "key" else record.value
+                raise KeyError(f"tier catalog has no layer={layer}, ordinal={ordinal}")
+            extent = record.components[component]
             if extent.bytes != row_bytes:
                 raise ValueError(
-                    f"catalog row size mismatch for layer={layer}, page={page}, {kind}: "
+                    "catalog row size mismatch for "
+                    f"layer={layer}, ordinal={ordinal}, {component}: "
                     f"{extent.bytes} != {row_bytes}"
                 )
             extents.append(extent)
@@ -269,14 +463,102 @@ class TierPageCatalog:
             for previous, current in zip(extents, extents[1:])
         ):
             raise ValueError(
-                f"tier catalog pages are not contiguous for layer={layer}, {kind}"
+                "tier catalog ordinals are not contiguous for "
+                f"layer={layer}, {component}"
             )
         return PageExtent(extents[0].offset, expected_bytes)
+
+    def transfer_runs(
+        self,
+        *,
+        layer: int,
+        storage_keys: tuple[str, ...],
+        destination_indices: tuple[int, ...],
+        component: str,
+        row_bytes: int,
+        max_transfer_bytes: int,
+    ) -> tuple[PageTransferRun, ...]:
+        """Resolve exact identities into maximal bounded physical runs.
+
+        Coalescing is legal only when both the immutable source byte extent and
+        the framework destination block advance contiguously.  Input order is
+        irrelevant; destination ownership defines the canonical order.  This
+        lets SGLang and vLLM share one directory rule without treating their
+        transient page numbers as storage identities.
+        """
+
+        if not storage_keys or len(storage_keys) != len(destination_indices):
+            raise ValueError(
+                "page-transfer identities and destinations must be non-empty "
+                "and aligned"
+            )
+        row_bytes = bounded_integer(
+            row_bytes,
+            "page-transfer row size",
+            minimum=1,
+            maximum=_UINT32_MAX,
+        )
+        max_transfer_bytes = bounded_integer(
+            max_transfer_bytes,
+            "page-transfer byte limit",
+            minimum=row_bytes,
+            maximum=_UINT32_MAX,
+        )
+        if max_transfer_bytes < row_bytes:
+            raise ValueError("page-transfer byte limit is smaller than one row")
+
+        resolved: list[tuple[int, PageExtent]] = []
+        seen_destinations: set[int] = set()
+        for storage_key, destination in zip(
+            storage_keys, destination_indices, strict=True
+        ):
+            if not isinstance(storage_key, str) or not storage_key:
+                raise ValueError("page-transfer storage keys must be non-empty")
+            destination = bounded_integer(
+                destination,
+                "page-transfer destination",
+                minimum=0,
+                maximum=_UINT32_MAX,
+            )
+            if destination in seen_destinations:
+                raise ValueError("page-transfer destinations must be unique")
+            seen_destinations.add(destination)
+            ordinal = self.ordinal(storage_key)
+            extent = self.span(
+                layer=layer,
+                ordinals=(ordinal,),
+                component=component,
+                row_bytes=row_bytes,
+            )
+            resolved.append((destination, extent))
+
+        ordered = sorted(resolved, key=lambda item: item[0])
+        runs: list[PageTransferRun] = []
+        run_destination, run_extent = ordered[0]
+        run_rows = 1
+        for destination, extent in ordered[1:]:
+            contiguous = (
+                destination == run_destination + run_rows
+                and extent.offset == run_extent.offset + run_extent.bytes
+                and run_extent.bytes + row_bytes <= max_transfer_bytes
+            )
+            if contiguous:
+                run_extent = PageExtent(
+                    run_extent.offset, run_extent.bytes + row_bytes
+                )
+                run_rows += 1
+                continue
+            runs.append(PageTransferRun(run_extent, run_destination, run_rows))
+            run_destination = destination
+            run_extent = extent
+            run_rows = 1
+        runs.append(PageTransferRun(run_extent, run_destination, run_rows))
+        return tuple(runs)
 
 
 @dataclass(frozen=True)
 class ServingTierConfig:
-    tier: ServingTier = ServingTier.HOST_STAGED
+    tier: ServingTier = ServingTier.HBM
     endpoint: str | None = None
     catalog_path: Path | None = None
     namespace_id: int = 1
@@ -349,16 +631,16 @@ class ServingTierConfig:
             raise ValueError("CXL DAX window_bytes must be positive")
         if self.tier is ServingTier.NVME and self.window_bytes != 0:
             raise ValueError("NVMe does not accept a CXL window_bytes value")
-        if self.tier is not ServingTier.HOST_STAGED and (
+        if self.tier in PHYSICAL_SERVING_TIERS and (
             not self.endpoint or self.catalog_path is None
         ):
             raise ValueError(
                 "physical serving tiers require an endpoint and page catalog"
             )
-        if self.tier is ServingTier.HOST_STAGED and (
+        if self.tier not in PHYSICAL_SERVING_TIERS and (
             self.endpoint is not None or self.catalog_path is not None
         ):
-            raise ValueError("host-staged tier cannot own a physical endpoint/catalog")
+            raise ValueError("non-physical tiers cannot own an endpoint or catalog")
 
     @classmethod
     def from_environment(
@@ -366,22 +648,18 @@ class ServingTierConfig:
     ) -> "ServingTierConfig":
         values = os.environ if environ is None else environ
         raw_tier = (
-            values.get("NTA_SERVING_TIER", ServingTier.HOST_STAGED.value)
+            values.get("NTA_SERVING_TIER", ServingTier.HBM.value)
             .strip()
             .lower()
         )
-        aliases = {
-            "host": ServingTier.HOST_STAGED.value,
-            "cxl": ServingTier.CXL_DAX.value,
-        }
-        raw_tier = aliases.get(raw_tier, raw_tier)
         try:
             tier = ServingTier(raw_tier)
         except ValueError as error:
             raise ValueError(
-                "NTA_SERVING_TIER must be host_staged, nvme, or cxl_dax"
+                "NTA_SERVING_TIER must be hbm, host_mapped, host_staged, "
+                "nvme, or cxl_dax"
             ) from error
-        if tier is ServingTier.HOST_STAGED:
+        if tier not in PHYSICAL_SERVING_TIERS:
             return cls(tier=tier)
         endpoint_name = (
             "NTA_NVME_ENDPOINT" if tier is ServingTier.NVME else "NTA_CXL_DAX_DEVICE"
@@ -452,12 +730,14 @@ class ServingTierService:
         )
         self.nvme: NvmeTransport | None = None
         self.cxl: CxlDaxTransport | None = None
+        self._nvme_hbm_regions: dict[tuple[int, int], Any] = {}
+        self._nvme_hbm_prepared = False
         self._nvme_lba_size: int | None = None
         self._nvme_max_transfer_bytes: int | None = None
         # Keep catalog validation and experiment tooling independent of CUDA
         # and libnta-runtime.  Native bindings are loaded only when a serving
         # process explicitly opens a physical tier.
-        if config.tier is not ServingTier.HOST_STAGED:
+        if config.tier in PHYSICAL_SERVING_TIERS:
             from .runtime import (
                 CxlDaxOptions,
                 CxlDaxTransport,
@@ -527,11 +807,20 @@ class ServingTierService:
         self.nvme = None
         self.cxl = None
         first_error: BaseException | None = None
+        regions = getattr(self, "_nvme_hbm_regions", {})
+        for region in regions.values():
+            try:
+                region.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        regions.clear()
         if nvme is not None:
             try:
                 nvme.close()
             except BaseException as error:
-                first_error = error
+                if first_error is None:
+                    first_error = error
         if cxl is not None:
             try:
                 cxl.close()
@@ -557,8 +846,20 @@ class ServingTierService:
         return self.config.tier
 
     @property
-    def is_host(self) -> bool:
+    def is_hbm(self) -> bool:
+        return self.tier is ServingTier.HBM
+
+    @property
+    def is_host_mapped(self) -> bool:
+        return self.tier is ServingTier.HOST_MAPPED
+
+    @property
+    def is_host_staged(self) -> bool:
         return self.tier is ServingTier.HOST_STAGED
+
+    @property
+    def is_physical(self) -> bool:
+        return self.tier in PHYSICAL_SERVING_TIERS
 
     @property
     def is_nvme(self) -> bool:
@@ -573,17 +874,88 @@ class ServingTierService:
         return None if self.catalog is None else self.catalog.digest
 
     @property
+    def nvme_lba_size(self) -> int:
+        if not self.is_nvme or self._nvme_lba_size is None:
+            raise RuntimeError("NVMe LBA size is only available for an NVMe tier")
+        return self._nvme_lba_size
+
+    @property
+    def nvme_max_transfer_bytes(self) -> int:
+        if not self.is_nvme or self._nvme_max_transfer_bytes is None:
+            raise RuntimeError("NVMe transfer limit is only available for an NVMe tier")
+        return self._nvme_max_transfer_bytes
+
+    def prepare_nvme_hbm_destinations(
+        self, destinations: tuple[HbmDestinationSlice, ...]
+    ) -> NvmeHbmPreparation:
+        """Validate, coalesce, and register all framework HBM slices once.
+
+        The describe phase is mutation-free.  Only after every tensor has a
+        consistent native allocation/envelope description are disjoint peer
+        mappings installed.  This prevents CUDA allocator suballocations from
+        acquiring overlapping IOMMU PTE ownership.
+        """
+
+        if not self.is_nvme or self.nvme is None:
+            raise RuntimeError("HBM destination preparation requires an NVMe tier")
+        if self._nvme_hbm_prepared or self._nvme_hbm_regions:
+            raise RuntimeError("NVMe HBM destinations were already prepared")
+        if not destinations:
+            raise ValueError("NVMe HBM destination preparation cannot be empty")
+
+        descriptions = tuple(
+            DescribedHbmDestination.from_native(
+                destination,
+                self.nvme.describe_hbm_region(destination.address, destination.bytes),
+            )
+            for destination in destinations
+        )
+        groups = coalesce_hbm_destinations(descriptions)
+        registered: list[tuple[Any, Any]] = []
+        try:
+            for group in groups:
+                region = self.nvme.register_hbm_region(
+                    group.registration_address, group.registration_bytes
+                )
+                registered.append((group, region))
+        except BaseException:
+            for _group, region in reversed(registered):
+                region.close()
+            raise
+
+        by_destination: dict[Hashable, Any] = {}
+        for group, region in registered:
+            self._nvme_hbm_regions[
+                (group.registration_address, group.registration_bytes)
+            ] = region
+            for destination in group.destinations:
+                by_destination[destination.key] = region
+        if len(by_destination) != len(destinations):
+            raise RuntimeError("NVMe HBM preparation lost a destination binding")
+        self._nvme_hbm_prepared = True
+        return NvmeHbmPreparation(
+            regions=MappingProxyType(by_destination),
+            destination_count=len(destinations),
+            destination_bytes=sum(item.bytes for item in destinations),
+            registration_count=len(groups),
+            registration_bytes=sum(item.registration_bytes for item in groups),
+        )
+
+    @property
     def resource_contract(self) -> ResourceContract:
         """The immutable setup/data-path contract for the selected tier."""
         return self.contract
 
     def extent(
-        self, layer: int, pages: tuple[int, ...], kind: str, row_bytes: int
+        self, layer: int, ordinals: tuple[int, ...], component: str, row_bytes: int
     ) -> PageExtent:
         if self.catalog is None:
             raise RuntimeError(f"{self.tier.value} has no page catalog")
         extent = self.catalog.span(
-            layer=layer, pages=pages, kind=kind, row_bytes=row_bytes
+            layer=layer,
+            ordinals=ordinals,
+            component=component,
+            row_bytes=row_bytes,
         )
         if self.is_nvme:
             lba_size = self._nvme_lba_size
@@ -594,7 +966,7 @@ class ServingTierService:
                 extent,
                 lba_size=lba_size,
                 max_transfer_bytes=max_transfer_bytes,
-                kind=kind,
+                kind=component,
             )
         return extent
 
@@ -620,6 +992,7 @@ class ServingTierService:
         }
         if self.nvme is not None:
             capabilities = self.nvme.capabilities
+            queue_stats = self.nvme.stats
             result["tier_capabilities"] = {
                 "translated_iommu": capabilities.translated_iommu,
                 "hbm_peer_dma": capabilities.supports_hbm_peer_dma,
@@ -628,6 +1001,9 @@ class ServingTierService:
                 "mapping_backend": capabilities.hbm_mapping_backend.name.lower(),
                 "lba_size": capabilities.lba_size,
                 "max_transfer_bytes": capabilities.max_transfer_bytes,
+                "hbm_region_registrations": queue_stats.hbm_region_registrations,
+                "hbm_region_bytes": queue_stats.hbm_region_bytes,
+                "hbm_transfer_views": queue_stats.hbm_transfer_views,
             }
         elif self.cxl is not None:
             capabilities = self.cxl.capabilities

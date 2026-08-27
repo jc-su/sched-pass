@@ -1,6 +1,5 @@
 from nta_runtime.execution_protocol import (
     ExecutionProtocolConfig,
-    GranularityCostModel,
     WorkLedger,
 )
 from nta_runtime.requests import RequestBinding
@@ -165,31 +164,6 @@ def test_inflight_bound_counts_running_units() -> None:
     assert ledger.state(1) is Availability.READY
 
 
-def test_granularity_balances_skew_and_control_cost() -> None:
-    model = GranularityCostModel(group_overhead_ns=10_000)
-    coarse = model.estimate(
-        selected_units=64,
-        unit_bytes=4096,
-        units_per_group=64,
-        availability_skew_ns=1_000_000,
-    )
-    fine = model.estimate(
-        selected_units=64,
-        unit_bytes=4096,
-        units_per_group=4,
-        availability_skew_ns=1_000_000,
-    )
-    assert fine.availability_ns < coarse.availability_ns
-    assert fine.control_ns > coarse.control_ns
-    chosen = model.choose(
-        selected_units=64,
-        unit_bytes=4096,
-        candidate_group_sizes=(4, 8, 16, 32, 64),
-        availability_skew_ns=1_000_000,
-    )
-    assert chosen.units_per_group in (4, 8, 16, 32, 64)
-
-
 def test_protocol_configuration_is_framework_neutral() -> None:
     config = ExecutionProtocolConfig.from_environment(
         {
@@ -208,7 +182,6 @@ def main() -> None:
     test_conventional_protocol_rejects_partial_execution()
     test_conventional_protocol_has_a_readiness_boundary()
     test_inflight_bound_counts_running_units()
-    test_granularity_balances_skew_and_control_cost()
     test_protocol_configuration_is_framework_neutral()
     print("work_unit=pass")
 

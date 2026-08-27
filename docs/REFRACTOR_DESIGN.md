@@ -69,24 +69,18 @@ For SGLang:
 scheduler forward
   -> SglangAdapter: rids + real request-pool slots
   -> SglangHiCacheBridge: owns exact host load, physical page mapping, and fence
-  -> _ActiveBatch: schedules and page mappings
-  -> ExecutionSession: one WorkBatch per real attention launch
-  -> DeviceWorkPlan.upload_work_units: checked native WorkItems
+  -> _ActiveBatch: schedules, exact work topology, and indexed resource topology
+  -> IndexedHostPlan + DeviceWorkPlan.upload_exact: checked native ABI image
   -> compiler-instrumented FlashInfer wrapper
-  -> session completion + HiCache layer retirement
+  -> optional ExecutionSession verifier + HiCache layer retirement
 ```
 
-The session is created immediately before each actual attention launch, using
-the semantic model layer and current KV-cache geometry. This avoids the prior
-error of treating reusable wrapper positions as model layers. Every native
-plan unit is looked up by layer, logical tile, and request index and must match
-the session's request binding before upload.
-
-The session keeps an immutable work-id index for that validation boundary. A
-native schedule with `W` work units therefore performs O(W) ticket validation
-for a launch rather than accidentally turning repeated Python-side lookups
-into O(W²) control-plane work. Device-side dependency admission remains
-bounded by the configured intent, ticket, and dependency capacities.
+Production constructs the compact topology once per wrapper schedule and
+derives canonical request/reduction/contributor identity during native upload.
+The semantic execution graph is an opt-in executable specification and never a
+second serving state machine. A schedule with `W` work units and `G` transfer
+groups performs O(W + G) validation and image construction; device dependency
+admission remains bounded by the configured capacities.
 
 SGLang external pages remain ordinary physical page-table entries. The bridge
 owns the host source rows until the last layer's CUDA completion edge and

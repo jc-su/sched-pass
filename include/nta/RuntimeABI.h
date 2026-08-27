@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 29;
+inline constexpr std::uint32_t Version = 31;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 6;
 inline constexpr std::uint32_t UrgencyBucketCount = 8;
@@ -82,14 +82,15 @@ struct alignas(32) RequestContext {
 };
 static_assert(sizeof(RequestContext) == 64);
 
-struct alignas(32) TenantContext {
+// Per-tenant staging isolation.  The host owns maxOutstandingBytes; device
+// acquisition paths atomically own outstandingBytes.  A zero maximum disables
+// acquisition for the tenant without a second, potentially inconsistent
+// active flag.
+struct alignas(16) TenantContext {
   std::uint64_t maxOutstandingBytes;
   std::uint64_t outstandingBytes;
-  std::uint32_t weight;
-  std::uint32_t active;
-  std::uint64_t serviceBytes;
 };
-static_assert(sizeof(TenantContext) == 32);
+static_assert(sizeof(TenantContext) == 16);
 
 struct alignas(32) RequestProgress {
   std::uint64_t requestId;
@@ -141,6 +142,9 @@ struct alignas(64) ReplicaEntry {
   std::uint32_t backendIndex;
   std::uint32_t flags;
   std::uint64_t tensorMapAddress;
+  // Indexed host replicas pack row strides here. NVMe replicas store the
+  // controller-page offset of PRP1; dmaPageListAddress always names aligned
+  // page bases, which lets registered HBM regions share one immutable table.
   std::uint64_t transferShape;
 };
 static_assert(sizeof(ReplicaEntry) == 64);

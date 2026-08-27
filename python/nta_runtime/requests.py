@@ -182,7 +182,10 @@ class RequestIdentityRegistry:
                     )
                 if previous_active_slot != request_slot:
                     raise ValueError(
-                        "a serving request ID cannot be active in multiple slots"
+                        "a serving request ID cannot be active in multiple slots: "
+                        f"request_id={request_id!r}, active_slot="
+                        f"{previous_active_slot}, incoming_slot={request_slot}, "
+                        f"batch_slots={normalized_slots!r}"
                     )
             batch_stable_ids[stable_id] = request_id
             prospective_active_ids[stable_id] = (request_id, request_slot)

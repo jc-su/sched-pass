@@ -31,27 +31,25 @@ runner, not a GPU performance result.
 The default command emits the full mechanism. `--ablation all` emits every
 declared RQ3 ablation as well. `experiments/validate_matrix_artifact.py`
 checks that each record has a shared exact-trace hash, a valid activation
-counter set, and a zero Little's-law residual. Its modeled timing fields are
-explicitly marked `synthetic_regime_contract`; they cannot be used as serving
-speedup evidence.
+counter set, and internally consistent finite-window blocked-cohort
+accounting. Its modeled timing fields are explicitly marked
+`synthetic_regime_contract`; they cannot be used as serving speedup or
+stationary queueing evidence.
 
 The matrix includes the evaluation tiers HBM, host memory, NVMe, and DAX. Host
 memory's direct/staged implementation detail is selected inside the native
 transport configuration; the tier axis never changes exact demand IDs or
 the numerical workload.
 
-Use Little's law as a consistency check:
-
-```
-L = lambda W
-```
-
-For each stratum, the runner records admitted pending-work rate `lambda`, mean
-number of pending units `L`, and mean pending time `W`, together with the
-residual `abs(L - lambda*W)`. A
-violation indicates dropped observations, an incorrectly defined population,
-or a measurement boundary mismatch; it is not a performance conclusion by
-itself.
+For each synthetic stratum, all initially blocked work units enter one finite
+cohort and are released at declared uniform interval midpoints over the modeled
+availability window. The runner emits the cohort count, window, integrated
+pending-unit area, release rate, mean occupancy, mean residence time, and the
+release-process name. The validator recomputes these deterministic quantities,
+but deliberately emits no Little's-law residual: deriving `L`, `lambda`, and
+`W` from the same cohort makes the identity true by construction and is not
+queueing evidence. Serving-side Little's-law fields instead use measured client
+timestamps and disclose their observable queue scope.
 
 ## RQ1: heterogeneous exact serving
 
@@ -137,14 +135,14 @@ Report results by explicit strata rather than one average:
 - staging pressure: under-capacity, near-capacity, over-capacity;
 - compute/transfer ratio: control-dominated, balanced, compute-dominated.
 
-The dependency-free runner emits these strata fields and Little's Law
-residuals. Its `arrival` and `load_ratio` labels are synthetic strata derived
-from availability skew and the modeled compute/transfer/control split; they do
-not claim a measured arrival process. Serving runners must preserve the same
-field names and add measured GPU/engine counters; synthetic records must never
-be presented as serving speedups. The serving harness is the source of timing
-truth for RQ1/RQ2; the dependency-free artifact is the source of contract,
-fairness, and regime truth.
+The dependency-free runner emits these strata fields and finite-cohort
+accounting residuals. Its `arrival` and `load_ratio` labels are synthetic
+strata derived from availability skew and the modeled
+compute/transfer/control split; they do not claim a measured arrival process.
+Serving runners must preserve the same field names and add measured GPU/engine
+counters; synthetic records must never be presented as serving speedups. The
+serving harness is the source of timing truth for RQ1/RQ2; the dependency-free
+artifact is the source of contract, fairness, and regime truth.
 
 A result is interpretable only when the workload stratum, demand trace,
 protocol, and mechanism counters are included in the artifact.

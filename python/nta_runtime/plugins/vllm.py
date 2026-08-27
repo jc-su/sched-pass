@@ -13,8 +13,6 @@ import functools
 import importlib.metadata
 from typing import Any
 
-import numpy as np
-
 from nta_runtime.adapters.vllm_v1 import (
     current_vllm_v1_forward_state,
     vllm_v1_reference_warmup_state,
@@ -43,55 +41,6 @@ def _has_scheduled_work(scheduler_output: Any) -> bool:
     return isinstance(scheduled, Mapping) and bool(scheduled)
 
 
-def _patch_v2_block_tables() -> None:
-    """Keep a CPU ownership mirror for vLLM V2 block allocation writes."""
-    from vllm.v1.worker.gpu.block_table import BlockTables
-
-    if getattr(BlockTables, "_nta_bridge_patched", False):
-        return
-    original_init = BlockTables.__init__
-    original_append = BlockTables.append_block_ids
-
-    @functools.wraps(original_init)
-    def init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self._nta_cpu_block_tables = [
-            np.zeros(tuple(table.gpu.shape), dtype=np.int32)
-            for table in self.block_tables
-        ]
-        self._nta_cpu_num_blocks = np.zeros(
-            (self.num_kv_cache_groups, self.max_num_reqs), dtype=np.int32
-        )
-
-    @functools.wraps(original_append)
-    def append(self, req_index, new_block_ids, overwrite):
-        result = original_append(self, req_index, new_block_ids, overwrite)
-        tables = self._nta_cpu_block_tables
-        counts = self._nta_cpu_num_blocks
-        for group_id, group_block_ids in enumerate(new_block_ids):
-            expanded = list(group_block_ids)
-            blocks_per_kv_block = self.blocks_per_kv_block[group_id]
-            if blocks_per_kv_block > 1:
-                expanded = [
-                    block * blocks_per_kv_block + offset
-                    for block in expanded
-                    for offset in range(blocks_per_kv_block)
-                ]
-            start = 0 if overwrite else int(counts[group_id, req_index])
-            if overwrite:
-                tables[group_id][req_index, :].fill(0)
-            end = start + len(expanded)
-            if end > tables[group_id].shape[1]:
-                raise RuntimeError("vLLM V2 CPU block-table mirror capacity exhausted")
-            tables[group_id][req_index, start:end] = expanded
-            counts[group_id, req_index] = end
-        return result
-
-    BlockTables.__init__ = init
-    BlockTables.append_block_ids = append
-    BlockTables._nta_bridge_patched = True
-
-
 def _patch_v1_runner(runner_class: type[Any]) -> None:
     if getattr(runner_class, "_nta_bridge_patched", False):
         return
@@ -116,8 +65,11 @@ def _patch_v1_runner(runner_class: type[Any]) -> None:
         state.scheduler_output = scheduler_output
         state.input_batch = self.input_batch
         state.batch = controller.bind(scheduler_output)
+        controller.prepare_physical_destinations()
         state.hook = controller.hook
         state.tier_service = controller.tier_service
+        state.execution_owner = controller
+        state.request_slots_tensor = controller.request_slots_tensor
         state.page_size = controller.page_size
         return result
 
@@ -126,8 +78,12 @@ def _patch_v1_runner(runner_class: type[Any]) -> None:
         state = current_vllm_v1_forward_state()
         if state is not None and state.reference_warmup:
             return original_execute(self, scheduler_output, intermediate_tensors)
-        with vllm_v1_forward_state(scheduler_output):
-            return original_execute(self, scheduler_output, intermediate_tensors)
+        with vllm_v1_forward_state(scheduler_output) as forward_state:
+            result = original_execute(self, scheduler_output, intermediate_tensors)
+            from nta_runtime.engines.vllm import _commit_forward_evidence
+
+            _commit_forward_evidence(forward_state)
+            return result
 
     @functools.wraps(original_dummy_run)
     def dummy_run(self, *args, **kwargs):
@@ -187,8 +143,8 @@ def _patch_v2_runner(runner_class: type[Any]) -> None:
                     skip_attn_for_dummy_run,
                     is_profile,
                 )
-        with vllm_v1_forward_state(scheduler_output):
-            return original_execute(
+        with vllm_v1_forward_state(scheduler_output) as forward_state:
+            result = original_execute(
                 self,
                 scheduler_output,
                 intermediate_tensors,
@@ -196,31 +152,39 @@ def _patch_v2_runner(runner_class: type[Any]) -> None:
                 skip_attn_for_dummy_run,
                 is_profile,
             )
+            from nta_runtime.engines.vllm import _commit_forward_evidence
+
+            _commit_forward_evidence(forward_state)
+            return result
 
     @functools.wraps(original_prepare_attn)
     def prepare_attn(self, input_batch):
-        result = original_prepare_attn(self, input_batch)
         state = current_vllm_v1_forward_state()
         if state is None or state.reference_warmup or state.batch is not None:
-            return result
-        tables = getattr(self.block_tables, "_nta_cpu_block_tables", None)
-        counts = getattr(self.block_tables, "_nta_cpu_num_blocks", None)
-        if tables is None or counts is None:
-            raise RuntimeError("vLLM V2 NTA block-table mirror is not initialized")
+            return original_prepare_attn(self, input_batch)
+        from nta_runtime.connectors.vllm import NtaVllmConnectorMetadata
+
+        metadata = getattr(state.scheduler_output, "kv_connector_metadata", None)
+        if not isinstance(metadata, NtaVllmConnectorMetadata):
+            raise RuntimeError(
+                "NTA vLLM requires NtaVllmConnector through kv_transfer_config"
+            )
         from nta_runtime.engines.vllm import _controller
 
         controller = _controller(self)
         state.input_batch = input_batch
-        state.batch = controller.bind_v2(
-            state.scheduler_output,
-            input_batch,
-            block_tables=tables,
-            num_blocks=counts,
-        )
+        state.batch = controller.bind_connector(metadata)
+        controller.prepare_physical_destinations()
         state.hook = controller.hook
         state.tier_service = controller.tier_service
+        state.execution_owner = controller
+        state.request_slots_tensor = controller.request_slots_tensor
         state.page_size = controller.page_size
-        return result
+        # FlashInferMetadataBuilder now sees the immutable EngineBatch and can
+        # select the request-bound wrapper before vLLM performs its one native
+        # plan.  Publication remains stream ordered before that plan and the
+        # subsequent model launch.
+        return original_prepare_attn(self, input_batch)
 
     @functools.wraps(original_dummy_run)
     def dummy_run(self, *args, **kwargs):
@@ -264,7 +228,6 @@ def _patch_worker() -> None:
     global _PATCHED
     if _PATCHED:
         return
-    _patch_v2_block_tables()
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2ModelRunner
 
     _patch_v2_runner(V2ModelRunner)

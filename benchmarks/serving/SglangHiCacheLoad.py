@@ -15,7 +15,7 @@ import random
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Sequence
 
 try:
     from experiments.bailian import (
@@ -46,6 +46,376 @@ from SglangHiCache import (
     host_cached_tokens,
     make_prompt,
 )
+
+
+_MEASUREMENT_COUNTERS = frozenset(
+    {
+        "batches",
+        "canonical_initial_cta_bound",
+        "canonical_resume_cta_bound",
+        "compact_initial_cta_bound",
+        "compact_initial_launches",
+        "compact_resume_cta_bound",
+        "compact_resume_launches",
+        "copy_engine_bytes",
+        "copy_engine_issue_cpu_ns",
+        "copy_engine_layout_cpu_ns",
+        "copy_engine_operations",
+        "copy_engine_selected_rows",
+        "copy_engine_selected_runs",
+        "copy_engine_submissions",
+        "copy_engine_waves",
+        "cost_model_transfer_samples",
+        "cross_layer_frontier_batches",
+        "cross_layer_frontier_layers",
+        "cta_work_items",
+        "decode_launches",
+        "demand_graph_captures",
+        "demand_graph_evictions",
+        "demand_graph_paged_prefill_warmups",
+        "demand_graph_replays",
+        "demand_graph_warmups",
+        "demand_host_layers",
+        "direct_host_layers",
+        "direct_staging_bytes",
+        "direct_staging_launches",
+        "exact_resume_window_layers",
+        "external_launches",
+        "fragment_lookahead_layers",
+        "fragment_lookahead_objects",
+        "graph_captures",
+        "graph_external_batches",
+        "graph_replays",
+        "hicache_external_batches",
+        "hicache_fallback_batches",
+        "host_direct_batches",
+        "host_bound_after_full_publication_batches",
+        "host_incremental_batches",
+        "host_mixed_direct_batches",
+        "host_typed_mixed_batches",
+        "host_progress_rounds",
+        "hybrid_parallel_waves",
+        "indexed_host_bytes",
+        "indexed_host_objects",
+        "indexed_layout_candidate_bytes",
+        "indexed_layout_eligible_rows",
+        "indexed_layout_profile_cpu_ns",
+        "indexed_layout_profiles",
+        "indexed_layout_rows",
+        "indexed_layout_runs",
+        "indexed_object_lifetime_guard_fallbacks",
+        "indexed_object_quiesced_registrations",
+        "initial_acquisition_batches",
+        "initial_acquisition_layers",
+        "initial_typed_gap_layers",
+        "incremental_host_layers",
+        "incremental_initialization_samples",
+        "incremental_initialization_setup_ns",
+        "incremental_setup_observed_ns_total",
+        "incremental_setup_samples",
+        "lookahead_acquisition_layers",
+        "lookahead_acquisition_objects",
+        "lookahead_bound_launches",
+        "lookahead_copy_waves",
+        "metadata_cpu_ns",
+        "mixed_dependency_layers",
+        "mixed_direct_work_items",
+        "mixed_external_work_items",
+        "mixed_forward_batches",
+        "mixed_forward_requests",
+        "mixed_scheduled_requests",
+        "native_external_attention_launches",
+        "nvme_bytes",
+        "nvme_destination_rebinds",
+        "nvme_destination_slice_bytes",
+        "nvme_destination_slice_count",
+        "nvme_epochs",
+        "nvme_fresh_slot_installs",
+        "nvme_object_quiesced_replacements",
+        "nvme_progress_rounds",
+        "nvme_region_bytes",
+        "nvme_region_count",
+        "nvme_region_prepare_ns",
+        "nvme_same_destination_installs",
+        "nvme_shared_region_slices",
+        "nvme_view_publications",
+        "paired_lookahead_layers",
+        "parallel_indexed_progress_layers",
+        "pipeline_cpu_ns",
+        "plan_cpu_ns",
+        "plan_uploads",
+        "prefetched_host_bytes",
+        "prefetched_layers",
+        "prefill_graph_capture_batches",
+        "prefill_graph_served_batches",
+        "prefill_launches",
+        "prevalidated_indexed_progress_layers",
+        "progress_snapshots",
+        "ready_stock_wrapper_pairs",
+        "request_acquisition_groups",
+        "request_cancellations",
+        "request_retirements",
+        "request_compute_completed_ns",
+        "request_metadata_updates",
+        "request_overlap_layers",
+        "request_rebindings",
+        "request_work_completed",
+        "request_work_failed",
+        "layer_service_plan_key_missing_batches",
+        "layer_service_plan_curve_missing_batches",
+        "layer_service_plan_curve_uncalibrated_batches",
+        "layer_service_plan_curve_calibrated_batches",
+        "layer_service_retirement_commits",
+        "layer_service_profiled_intervals",
+        "resident_reference_batches",
+        "work_topology_builds",
+        "work_topology_cache_hits",
+        "work_topology_cpu_ns",
+        "work_topology_items",
+        "semantic_dense_tiles",
+        "semantic_plan_builds",
+        "semantic_plan_cpu_ns",
+        "semantic_verifier_sessions",
+        "sm_mover_bytes",
+        "sm_mover_rows",
+        "stock_attention_launches",
+        "stock_prefetch_metadata_fastpath_batches",
+        "stock_prefetched_external_attention_launches",
+        "stock_prefetched_external_batches",
+        "stock_ready_external_attention_launches",
+        "stock_resident_attention_launches",
+        "stock_resident_batches",
+        "ticketed_incremental_launches",
+        "tier_external_layers",
+        "tier_host_proxy_bytes",
+        "tier_candidate_bytes",
+        "tier_selected_bytes",
+        "tier_selected_leases",
+        "tier_selected_rows",
+        "tile_acquisition_groups",
+        "transformed_direct_launches",
+        "typed_acquisition_batches",
+        "typed_acquisition_rows",
+        "typed_acquisition_work_items",
+        "typed_bulk_attention_launches",
+        "typed_demand_gap_layers",
+        "typed_exact_dependency_groups",
+        "typed_granularity_constrained_batches",
+        "typed_transfer_groups",
+    }
+)
+
+
+def _read_engine_stats(
+    workspace: pathlib.Path, prior_paths: set[pathlib.Path]
+) -> dict[str, dict[str, Any]]:
+    reports: dict[str, dict[str, Any]] = {}
+    for path in sorted(set(workspace.glob("nta-engine.*.json")) - prior_paths):
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(report, dict):
+            reports[path.name] = report
+    return reports
+
+
+def _wait_for_engine_stats(
+    workspace: pathlib.Path,
+    prior_paths: set[pathlib.Path],
+    *,
+    after_unix_ns: int,
+    timeout_seconds: float = 10.0,
+) -> dict[str, dict[str, Any]]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        reports = _read_engine_stats(workspace, prior_paths)
+        if reports and all(
+            int(report.get("snapshot_unix_ns", 0)) >= after_unix_ns
+            for report in reports.values()
+        ):
+            return reports
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "NTA engine statistics did not publish the measurement marker"
+            )
+        time.sleep(0.01)
+
+
+def _measured_consumer_contract(report: dict[str, Any]) -> dict[str, Any]:
+    native = int(report.get("transformed_direct_launches", 0)) + int(
+        report.get("ticketed_incremental_launches", 0)
+    )
+    stock = int(report.get("stock_prefetched_external_attention_launches", 0))
+    kind = (
+        "native_work_unit"
+        if native
+        else "framework_reference"
+        if stock
+        else "projection_only"
+    )
+    return {
+        "schema": 1,
+        "engine": "sglang",
+        "backend": "nta_flashinfer",
+        "kind": kind,
+        "exact_demand": True,
+        "typed_work_plan": kind == "native_work_unit",
+        "native_submission": kind == "native_work_unit",
+        "numerical_consumer": kind != "projection_only",
+        "engine_version": os.environ.get("NTA_SGLANG_VERSION", "0.5.16"),
+    }
+
+
+def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate and classify the timed selection-to-consumer boundary.
+
+    Typed metadata may prove that a mixed batch has no profitable overlap.
+    That decision must dispatch stock FlashInfer; entering the native
+    work-unit consumer in a direct-only window is pure mechanism overhead and
+    invalidates a no-regression result.  Mixed direct/incremental windows are
+    represented explicitly instead of guessing which batch owned a launch.
+    """
+
+    counters = {
+        name: sum(int(report.get(name, 0)) for report in reports)
+        for name in (
+            "host_direct_batches",
+            "host_incremental_batches",
+            "host_mixed_direct_batches",
+            "host_typed_mixed_batches",
+            "stock_prefetched_external_attention_launches",
+            "transformed_direct_launches",
+            "ticketed_incremental_launches",
+            "plan_uploads",
+            "work_topology_builds",
+        )
+    }
+    direct = counters["host_direct_batches"]
+    incremental = counters["host_incremental_batches"]
+    stock_launches = counters["stock_prefetched_external_attention_launches"]
+    native_launches = (
+        counters["transformed_direct_launches"]
+        + counters["ticketed_incremental_launches"]
+    )
+    if direct and not incremental:
+        residual = {
+            name: counters[name]
+            for name in (
+                "transformed_direct_launches",
+                "ticketed_incremental_launches",
+                "plan_uploads",
+                "work_topology_builds",
+            )
+            if counters[name]
+        }
+        if residual:
+            raise RuntimeError(
+                "direct-only host selection entered the native work-unit path: "
+                + json.dumps(residual, sort_keys=True)
+            )
+        if stock_launches == 0:
+            raise RuntimeError(
+                "direct-only host selection did not execute stock FlashInfer"
+            )
+        kind = "stock_direct"
+    elif incremental and not direct:
+        if native_launches == 0:
+            raise RuntimeError(
+                "incremental host selection did not execute a native work unit"
+            )
+        kind = "native_incremental"
+    elif direct and incremental:
+        kind = "mixed_dispatch"
+    else:
+        kind = "unclassified"
+    return {"kind": kind, **counters}
+
+
+def _measurement_delta(
+    final: dict[str, Any], baseline: dict[str, Any]
+) -> dict[str, Any]:
+    """Project cumulative engine counters onto the timed request window."""
+    measured = dict(final)
+    counter_names = set(_MEASUREMENT_COUNTERS)
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.startswith("admission_") and name != "admission_lead_layers"
+    )
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.startswith("host_selection_") and name != "host_selection"
+    )
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.startswith("host_mover_")
+        and (
+            name.endswith("_batches")
+            or name
+            in {
+                "host_mover_overlap_compute_ns",
+                "host_mover_predicted_sm_ns",
+                "host_mover_predicted_selected_ns",
+            }
+        )
+    )
+    # Profiling and CPU accounting fields are created lazily, so a static
+    # allow-list cannot know every operator form in advance.  Only cumulative
+    # quantities are projected; rates and maxima are derived/gauge values and
+    # must never be subtracted as counters.
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.endswith("_cpu_ns")
+    )
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.endswith("_enqueue_layers")
+    )
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.startswith("profiled_")
+        and "_max_" not in name
+        and name.endswith(("_batches", "_bytes", "_gpu_ms", "_layers", "_waits"))
+    )
+    for name in counter_names:
+        end = final.get(name, 0)
+        begin = baseline.get(name, 0)
+        if isinstance(end, bool) or isinstance(begin, bool):
+            raise RuntimeError(f"measurement counter {name} is boolean")
+        if not isinstance(end, (int, float)) or not isinstance(begin, (int, float)):
+            continue
+        value = end - begin
+        if value < 0:
+            raise RuntimeError(f"measurement counter {name} decreased")
+        measured[name] = value
+    for prefix in (
+        "profiled_transfer",
+        "profiled_pipeline_transfer",
+        "profiled_demand_transfer",
+    ):
+        elapsed_ms = float(measured.get(f"{prefix}_gpu_ms", 0.0))
+        transfer_bytes = int(measured.get(f"{prefix}_bytes", 0))
+        rate_name = f"{prefix}_gib_per_second"
+        if elapsed_ms > 0.0 and transfer_bytes > 0:
+            measured[rate_name] = (
+                transfer_bytes / (1 << 30) / (elapsed_ms / 1_000.0)
+            )
+        else:
+            measured.pop(rate_name, None)
+    measured["measurement_scope"] = "timed_load_delta"
+    measured["measurement_baseline_unix_ns"] = int(
+        baseline.get("snapshot_unix_ns", 0)
+    )
+    measured["measurement_counter_fields"] = sorted(counter_names)
+    measured["consumer_contract"] = _measured_consumer_contract(measured)
+    measured["execution_protocol_status"] = measured["consumer_contract"]["kind"]
+    return measured
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -98,12 +468,12 @@ def _engine_byte_accounting(
 ) -> tuple[int | None, int | None, str]:
     """Project NTA's physical transfer counters into the serving report.
 
-    ``work_*_bytes`` describe the exact logical demand selected by the
-    execution session.  The physical bar needs the bytes actually staged into
-    the device-side destination, so it is the sum of the mutually exclusive
-    host-pipeline, indexed-host, and NVMe transfer counters.  Keeping this
-    projection here avoids making the serving harness infer physical traffic
-    from token counts or from a framework cache-size estimate.
+    ``tier_selected_bytes`` counts each ownership lease's exact logical payload
+    once. Per-work-unit demand is deliberately separate because many CTAs may
+    share one acquired object. The physical bar is the bytes actually staged
+    into device-side destinations: the sum of mutually exclusive host-pipeline,
+    indexed-host, and NVMe counters. Keeping the projection here avoids both
+    CTA-fanout overcounting and inference from token/cache-size estimates.
     """
     nta_stats = [
         entry
@@ -112,7 +482,9 @@ def _engine_byte_accounting(
     ]
     if not nta_stats:
         return None, None, "not exposed by SGLang engine metadata"
-    selected = sum(int(entry.get("work_selected_bytes", 0)) for entry in nta_stats)
+    if any("tier_selected_bytes" not in entry for entry in nta_stats):
+        raise RuntimeError("NTA engine omitted typed tier-selection accounting")
+    selected = sum(int(entry["tier_selected_bytes"]) for entry in nta_stats)
     physical = sum(
         int(entry.get("prefetched_host_bytes", 0))
         + int(entry.get("indexed_host_bytes", 0))
@@ -203,6 +575,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=pathlib.Path,
+        help="optional persistent JSON report path",
+    )
     parser.add_argument(
         "--cuda-graph-decode", choices=("disabled", "full"), default="disabled"
     )
@@ -374,7 +751,22 @@ def _load_workload(
     )
     block_size = int(manifest["block_size"])
     resident_page_ids = unique_input_page_ids(resident_rows, block_size=block_size)
-    external_page_ids = unique_input_page_ids(external_rows, block_size=block_size)
+    external_cached_prefix_tokens = [
+        min(
+            int(row["input_length"]) - 1,
+            int(row.get("shared_prefix_blocks", 0)) * block_size,
+        )
+        for row in external_rows
+    ]
+    external_cached_page_ids = frozenset(
+        page_id
+        for row, prefix_tokens in zip(
+            external_rows, external_cached_prefix_tokens, strict=True
+        )
+        for page_id in input_page_ids(row, block_size=block_size)[
+            : (prefix_tokens + block_size - 1) // block_size
+        ]
+    )
     resident_prompt_text = [prompt(row) for row in resident_rows]
     external_prompt_text = [prompt(row) for row in external_rows]
     metadata = {
@@ -394,14 +786,22 @@ def _load_workload(
         "tokenization_errors": tokenization_errors,
         "resident_input_tokens": [int(row["input_length"]) for row in resident_rows],
         "external_input_tokens": [int(row["input_length"]) for row in external_rows],
+        # The trace exposes exact shared-prefix block identities.  Only that
+        # prefix is materialized during placement; request-local continuation
+        # rows remain uncached and are the timed prefill query.
+        "external_cached_prefix_tokens": external_cached_prefix_tokens,
         "resident_output_tokens": [int(row["output_length"]) for row in resident_rows],
         "external_output_tokens": [int(row["output_length"]) for row in external_rows],
         # These are logical page counts, not raw request-length sums.  Shared
         # Bailian prefix pages occur once in the combined pressure budget.
         "resident_input_cache_pages": len(resident_page_ids),
-        "external_input_cache_pages": len(external_page_ids),
-        "combined_input_cache_pages": len(resident_page_ids | external_page_ids),
-        "shared_input_cache_pages": len(resident_page_ids & external_page_ids),
+        "external_input_cache_pages": len(external_cached_page_ids),
+        "combined_input_cache_pages": len(
+            resident_page_ids | external_cached_page_ids
+        ),
+        "shared_input_cache_pages": len(
+            resident_page_ids & external_cached_page_ids
+        ),
     }
     return (
         [str(row["request_id"]) for row in resident_rows],
@@ -422,9 +822,96 @@ def _meta(result: dict[str, Any]) -> dict[str, Any]:
     return meta
 
 
+TokenInput = tuple[int, ...]
+
+
+def _token_input(tokenizer: Any, prompt: str) -> TokenInput:
+    token_ids = tuple(
+        int(value) for value in tokenizer.encode(prompt, add_special_tokens=False)
+    )
+    if not token_ids:
+        raise RuntimeError("serving request tokenized to an empty input")
+    return token_ids
+
+
+def _generate_one(
+    engine: Any,
+    input_ids: TokenInput,
+    sampling: dict[str, Any],
+    *,
+    rid: str | None = None,
+) -> Any:
+    return engine.generate(
+        input_ids=list(input_ids),
+        sampling_params=sampling,
+        rid=rid,
+    )
+
+
+def _generate_many(
+    engine: Any,
+    inputs: Sequence[TokenInput],
+    samplings: Sequence[dict[str, Any]],
+) -> Any:
+    if len(inputs) != len(samplings):
+        raise RuntimeError("batched serving inputs and sampling parameters disagree")
+    return engine.generate(
+        input_ids=[list(input_ids) for input_ids in inputs],
+        sampling_params=list(samplings),
+    )
+
+
+def _exact_calibration_input(
+    tokenizer: Any,
+    prefix: Sequence[int],
+    measured: Sequence[int],
+    *,
+    label: str,
+    forbidden_first_tokens: set[int],
+) -> TokenInput:
+    """Build an exact-prefix, exact-query-row calibration input.
+
+    Replaying the measured input during warmup turns its nominally uncached
+    suffix into a radix-cache hit.  That silently changes a mixed prefill with
+    hundreds of query rows into an almost-exact-prefix request.  Text-level
+    length matching is insufficient because tokenizer merges can alter the
+    boundary.  This harness submits token IDs directly: the cached prefix is
+    byte-for-byte identical and the continuation has exactly the same row
+    count, while its first token is unique across measured and warmup inputs.
+    """
+    prefix_ids = tuple(int(value) for value in prefix)
+    measured_ids = tuple(int(value) for value in measured)
+    if not prefix_ids or measured_ids[: len(prefix_ids)] != prefix_ids:
+        raise RuntimeError("calibration input does not retain the exact cached prefix")
+    query_rows = len(measured_ids) - len(prefix_ids)
+    if query_rows <= 0:
+        raise RuntimeError("calibration prompt has no uncached continuation")
+    suffix = list(_token_input(tokenizer, make_prompt(tokenizer, label, query_rows)))
+    if len(suffix) != query_rows:
+        raise RuntimeError("calibration continuation changed the exact query-row count")
+    special = {int(value) for value in getattr(tokenizer, "all_special_ids", ())}
+    vocabulary_size = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer))
+    if vocabulary_size <= len(special) + len(forbidden_first_tokens):
+        raise RuntimeError("tokenizer has no distinct calibration token")
+    if suffix[0] in forbidden_first_tokens or suffix[0] in special:
+        seed = int.from_bytes(hashlib.sha256(label.encode("utf-8")).digest()[:8], "big")
+        for offset in range(vocabulary_size):
+            candidate = (seed + offset) % vocabulary_size
+            if candidate not in special and candidate not in forbidden_first_tokens:
+                suffix[0] = candidate
+                break
+        else:  # pragma: no cover - guarded by the vocabulary-size check above
+            raise RuntimeError("could not select a distinct calibration token")
+    forbidden_first_tokens.add(suffix[0])
+    candidate = prefix_ids + tuple(suffix)
+    if len(candidate) != len(measured_ids) or candidate == measured_ids:
+        raise RuntimeError("calibration input did not preserve the exact request shape")
+    return candidate
+
+
 async def _stream_request(
     engine: Any,
-    prompt: str,
+    input_ids: TokenInput,
     sampling: dict[str, Any],
     *,
     kind: str,
@@ -441,8 +928,8 @@ async def _stream_request(
         await asyncio.sleep(offset_seconds)
     submitted = time.perf_counter()
     stream = await engine.async_generate(
-        prompt,
-        sampling,
+        input_ids=list(input_ids),
+        sampling_params=sampling,
         stream=True,
         rid=request_id or f"nta-load-{kind}-{index}",
     )
@@ -493,6 +980,7 @@ async def _stream_request(
         "inter_token_seconds": intervals,
         "p99_itl_seconds": _percentile(intervals, 0.99),
         "completion_tokens": completion_tokens,
+        "input_tokens": len(input_ids),
         "device_cached_tokens": device_cached_tokens(final),
         "host_cached_tokens": host_cached_tokens(final),
         "text": generated_text(final),
@@ -501,32 +989,36 @@ async def _stream_request(
 
 async def _run_load(
     engine: Any,
-    resident_prompts: list[str],
-    external_prompts: list[str],
+    resident_prompts: list[TokenInput],
+    external_prompts: list[TokenInput],
     args: argparse.Namespace,
     external_offsets: list[float] | None = None,
     resident_output_tokens: list[int] | None = None,
     external_output_tokens: list[int] | None = None,
     resident_request_ids: list[str] | None = None,
     external_request_ids: list[str] | None = None,
-    warmup: bool = False,
 ) -> tuple[list[dict[str, Any]], float]:
     started = time.perf_counter()
     resident_started = asyncio.Event()
     resident_sampling = {
         "temperature": 0,
-        "max_new_tokens": 1 if warmup else args.resident_output_tokens,
+        # A performance-excluded warmup must preserve the timed concurrency
+        # shape. Truncating resident decode to one token lets it retire before
+        # the external request joins, so graphs and service curves calibrate a
+        # different single-request forward and the measured mixed shape stays
+        # cold.
+        "max_new_tokens": args.resident_output_tokens,
         "ignore_eos": True,
     }
     external_sampling = {
         "temperature": 0,
-        "max_new_tokens": 1 if warmup else args.external_output_tokens,
+        "max_new_tokens": args.external_output_tokens,
         "ignore_eos": True,
     }
 
-    async def resident(index: int, prompt: str) -> dict[str, Any]:
+    async def resident(index: int, prompt: TokenInput) -> dict[str, Any]:
         sampling = dict(resident_sampling)
-        if resident_output_tokens is not None and not warmup:
+        if resident_output_tokens is not None:
             sampling["max_new_tokens"] = max(1, resident_output_tokens[index])
         record = await _stream_request(
             engine,
@@ -572,7 +1064,7 @@ async def _run_load(
                     "max_new_tokens": max(
                         1,
                         external_output_tokens[index]
-                        if external_output_tokens is not None and not warmup
+                        if external_output_tokens is not None
                         else args.external_output_tokens,
                     ),
                 },
@@ -647,6 +1139,7 @@ def _slo_goodput(
 def main() -> int:
     args = parse_args()
     workspace = configure_environment(args)
+    prior_stats_paths = set(workspace.glob("nta-engine.*.json"))
     import sglang as sgl
     from transformers import AutoTokenizer
 
@@ -661,8 +1154,8 @@ def main() -> int:
         (
             resident_request_ids,
             external_request_ids,
-            resident_prompts,
-            external_prompts,
+            resident_texts,
+            external_texts,
             external_offsets,
             resident_output_tokens,
             external_output_tokens,
@@ -696,15 +1189,44 @@ def main() -> int:
                 "Bailian input and output lengths exceed the configured context "
                 f"length ({args.context_length})"
             )
-        args.resident_requests = len(resident_prompts)
-        args.external_requests = len(external_prompts)
+        args.resident_requests = len(resident_texts)
+        args.external_requests = len(external_texts)
         args.resident_tokens = max(workload_metadata["resident_input_tokens"])
         args.external_tokens = max(workload_metadata["external_input_tokens"])
-        shape_prompt = external_prompts[0]
-        external_prefixes = external_prompts
+        resident_prompts = [_token_input(tokenizer, value) for value in resident_texts]
+        external_prompts = [_token_input(tokenizer, value) for value in external_texts]
+        cached_prefix_lengths = [
+            int(value)
+            for value in workload_metadata["external_cached_prefix_tokens"]
+        ]
+        if len(cached_prefix_lengths) != len(external_prompts) or any(
+            length <= 0 or length >= len(prompt)
+            for length, prompt in zip(
+                cached_prefix_lengths, external_prompts, strict=True
+            )
+        ):
+            raise RuntimeError(
+                "Bailian serving replay requires a nonempty exact shared prefix "
+                "and at least one uncached query token for every external request"
+            )
+        external_prefixes = [
+            prompt[:length]
+            for prompt, length in zip(
+                external_prompts, cached_prefix_lengths, strict=True
+            )
+        ]
+        # Shape setup must never insert a timed request's continuation into the
+        # radix cache. Only the token count is shared with the measured input.
+        shape_prompt = _token_input(
+            tokenizer,
+            make_prompt(tokenizer, "load-shape-workload", len(external_prompts[0])),
+        )
     else:
         external_prefixes = [
-            make_prompt(tokenizer, f"load-external-{index}", args.external_tokens)
+            _token_input(
+                tokenizer,
+                make_prompt(tokenizer, f"load-external-{index}", args.external_tokens),
+            )
             for index in range(args.external_requests)
         ]
         external_prompts = [
@@ -712,23 +1234,38 @@ def main() -> int:
                 prefix
                 if args.external_suffix_tokens == 0
                 else prefix
-                + "\n"
-                + make_prompt(
+                + _token_input(
                     tokenizer,
-                    f"load-external-suffix-{index}",
-                    args.external_suffix_tokens,
+                    make_prompt(
+                        tokenizer,
+                        f"load-external-suffix-{index}",
+                        args.external_suffix_tokens,
+                    ),
                 )
             )
             for index, prefix in enumerate(external_prefixes)
         ]
         resident_prompts = [
-            make_prompt(tokenizer, f"load-resident-{index}", args.resident_tokens)
+            _token_input(
+                tokenizer,
+                make_prompt(tokenizer, f"load-resident-{index}", args.resident_tokens),
+            )
             for index in range(args.resident_requests)
         ]
-        shape_prompt = make_prompt(tokenizer, "load-shape", args.external_tokens)
+        shape_prompt = _token_input(
+            tokenizer,
+            make_prompt(
+                tokenizer,
+                "load-shape",
+                max(len(prompt) for prompt in external_prompts),
+            ),
+        )
+    external_query_rows = [
+        len(prompt) - len(prefix)
+        for prefix, prompt in zip(external_prefixes, external_prompts, strict=True)
+    ]
     if any(
-        len(tokenizer.encode(prompt, add_special_tokens=False))
-        >= _max_request_input_tokens(args.context_length)
+        len(prompt) >= _max_request_input_tokens(args.context_length)
         for prompt in [*resident_prompts, *external_prompts]
     ):
         raise RuntimeError(
@@ -742,7 +1279,10 @@ def main() -> int:
         else args.max_total_tokens // args.churn_tokens + 1
     )
     churn_prompts = [
-        make_prompt(tokenizer, f"load-churn-{index}", args.churn_tokens)
+        _token_input(
+            tokenizer,
+            make_prompt(tokenizer, f"load-churn-{index}", args.churn_tokens),
+        )
         for index in range((2 + args.load_warmup_iterations) * eviction_rounds)
     ]
     setup_sampling = {"temperature": 0, "max_new_tokens": 1}
@@ -751,7 +1291,7 @@ def main() -> int:
     combined_cache_tokens = 0
     shared_cache_tokens = 0
     required_placement_pressure = 0
-    placement_eviction_prompts: list[str] = []
+    placement_eviction_prompts: list[TokenInput] = []
     if workload_metadata is not None:
         block_size = int(workload_metadata["block_size"])
         resident_cache_tokens = (
@@ -787,14 +1327,18 @@ def main() -> int:
         while remaining > 0:
             token_count = min(maximum_prompt_tokens, remaining)
             placement_eviction_prompts.append(
-                make_prompt(
+                _token_input(
                     tokenizer,
-                    f"load-placement-eviction-{len(placement_eviction_prompts)}",
-                    token_count,
+                    make_prompt(
+                        tokenizer,
+                        f"load-placement-eviction-{len(placement_eviction_prompts)}",
+                        token_count,
+                    ),
                 )
             )
             remaining -= token_count
 
+    measurement_baseline: dict[str, dict[str, Any]] = {}
     load_started = time.perf_counter()
     with sgl.Engine(
         model_path=str(args.model.resolve()),
@@ -825,7 +1369,8 @@ def main() -> int:
             for begin in range(0, len(resident_prompts), args.max_running_requests):
                 end = begin + args.max_running_requests
                 results = generation_results(
-                    engine.generate(
+                    _generate_many(
+                        engine,
                         resident_prompts[begin:end],
                         [dict(setup_sampling)] * len(resident_prompts[begin:end]),
                     )
@@ -837,8 +1382,8 @@ def main() -> int:
                         )
 
         load_seconds = time.perf_counter() - load_started
-        generated_text(engine.generate(shape_prompt, setup_sampling))
-        generated_text(engine.generate(shape_prompt, setup_sampling))
+        generated_text(_generate_one(engine, shape_prompt, setup_sampling))
+        generated_text(_generate_one(engine, shape_prompt, setup_sampling))
 
         def warm_external_prefixes() -> None:
             """Create a reusable, write-through-backed external prefix.
@@ -851,13 +1396,15 @@ def main() -> int:
             """
 
             generation_results(
-                engine.generate(
+                _generate_many(
+                    engine,
                     external_prefixes,
                     [dict(setup_sampling)] * len(external_prefixes),
                 )
             )
             generation_results(
-                engine.generate(
+                _generate_many(
+                    engine,
                     external_prefixes,
                     [dict(setup_sampling)] * len(external_prefixes),
                 )
@@ -865,13 +1412,13 @@ def main() -> int:
 
         warm_external_prefixes()
         for prompt in churn_prompts[:eviction_rounds]:
-            generated_text(engine.generate(prompt, setup_sampling))
+            generated_text(_generate_one(engine, prompt, setup_sampling))
         if workload_metadata is None:
-            external_probe = engine.generate(external_prefixes[0], setup_sampling)
+            external_probe = _generate_one(engine, external_prefixes[0], setup_sampling)
             if host_cached_tokens(external_probe) <= 0:
                 raise RuntimeError("external JIT warmup did not load from host cache")
         for prompt in churn_prompts[eviction_rounds:]:
-            generated_text(engine.generate(prompt, setup_sampling))
+            generated_text(_generate_one(engine, prompt, setup_sampling))
         warm_residents()
 
         def establish_final_placement() -> None:
@@ -887,36 +1434,94 @@ def main() -> int:
             """
 
             for prompt in placement_eviction_prompts:
-                generated_text(engine.generate(prompt, setup_sampling))
+                generated_text(_generate_one(engine, prompt, setup_sampling))
             if placement_eviction_prompts:
                 warm_residents()
 
         establish_final_placement()
 
+        calibration_first_tokens = [
+            ({prompt[len(prefix)]} if len(prompt) > len(prefix) else set())
+            for prefix, prompt in zip(
+                external_prefixes, external_prompts, strict=True
+            )
+        ]
+        calibration_shape_records: list[list[dict[str, int]]] = []
         for warmup in range(args.load_warmup_iterations):
             # Demand graphs warm on the first occurrence and capture on the
             # second. Both are excluded so the measured occurrence is replay.
-            engine.loop.run_until_complete(
+            # Every continuation-bearing request uses the exact measured prefix
+            # and row count, but diverges on its first uncached token. This is a
+            # token-level contract for both synthetic and Bailian replays.
+            calibration_external_prompts = [
+                (
+                    prompt
+                    if len(prompt) == len(prefix)
+                    else _exact_calibration_input(
+                        tokenizer,
+                        prefix,
+                        prompt,
+                        label=f"load-calibration-suffix-{warmup}-{index}",
+                        forbidden_first_tokens=calibration_first_tokens[index],
+                    )
+                )
+                for index, (prefix, prompt) in enumerate(
+                    zip(external_prefixes, external_prompts, strict=True)
+                )
+            ]
+            warmup_records, _ = engine.loop.run_until_complete(
                 _run_load(
                     engine,
                     resident_prompts,
-                    external_prompts,
+                    calibration_external_prompts,
                     args,
                     external_offsets,
                     resident_output_tokens,
                     external_output_tokens,
                     resident_request_ids,
                     external_request_ids,
-                    warmup=True,
                 )
+            )
+            calibration_shape_records.append(
+                [
+                    {
+                        "index": int(record["index"]),
+                        "input_tokens": int(record["input_tokens"]),
+                        "host_cached_tokens": int(record["host_cached_tokens"]),
+                        "device_cached_tokens": int(record["device_cached_tokens"]),
+                    }
+                    for record in warmup_records
+                    if record["kind"] == "external"
+                ]
             )
             begin = (2 + warmup) * eviction_rounds
             end = begin + eviction_rounds
             for prompt in churn_prompts[begin:end]:
-                generated_text(engine.generate(prompt, setup_sampling))
+                generated_text(_generate_one(engine, prompt, setup_sampling))
             if eviction_rounds:
                 warm_residents()
             establish_final_placement()
+
+        # Delimit the timed counter window with a resident-only marker. The
+        # same marker runs in both paired arms; in NTA it also forces the
+        # asynchronous stats publisher past every warmup/calibration event.
+        marker_started_ns = time.time_ns()
+        from nta_runtime.engines.sglang import OBSERVATION_MARKER_REQUEST_PREFIX
+
+        generated_text(
+            _generate_one(
+                engine,
+                resident_prompts[0],
+                setup_sampling,
+                rid=f"{OBSERVATION_MARKER_REQUEST_PREFIX}baseline",
+            )
+        )
+        if args.attention_backend == "nta_flashinfer":
+            measurement_baseline = _wait_for_engine_stats(
+                workspace,
+                prior_stats_paths,
+                after_unix_ns=marker_started_ns,
+            )
 
         records, elapsed = engine.loop.run_until_complete(
             _run_load(
@@ -964,16 +1569,75 @@ def main() -> int:
             + json.dumps(missing_resident, sort_keys=True)
         )
 
+    def external_shapes(values: Sequence[dict[str, Any]]) -> list[dict[str, int]]:
+        return sorted(
+            (
+                {
+                    "index": int(record["index"]),
+                    "input_tokens": int(record["input_tokens"]),
+                    "host_cached_tokens": int(record["host_cached_tokens"]),
+                    "device_cached_tokens": int(record["device_cached_tokens"]),
+                }
+                for record in values
+                if record["kind"] == "external"
+            ),
+            key=lambda value: value["index"],
+        )
+
+    timed_external_shapes = external_shapes(records)
+    mismatched_calibrations = [
+        {
+            "warmup": warmup,
+            "calibration": sorted(shape, key=lambda value: value["index"]),
+            "timed": timed_external_shapes,
+        }
+        for warmup, shape in enumerate(calibration_shape_records)
+        if sorted(shape, key=lambda value: value["index"]) != timed_external_shapes
+    ]
+    if mismatched_calibrations:
+        raise RuntimeError(
+            "performance warmup did not preserve exact cached-prefix placement "
+            "and uncached query rows: "
+            + json.dumps(mismatched_calibrations, sort_keys=True)
+        )
+    calibration_contract = {
+        "kind": "exact_token_prefix_and_query_rows",
+        "verified": (
+            args.load_warmup_iterations > 0
+            and len(calibration_shape_records) == args.load_warmup_iterations
+        ),
+        "warmup_iterations": len(calibration_shape_records),
+        "cached_prefix_tokens": [len(value) for value in external_prefixes],
+        "uncached_query_rows": external_query_rows,
+        "timed_shapes": timed_external_shapes,
+    }
+
     digest = hashlib.sha256()
     for record in sorted(records, key=lambda value: (value["kind"], value["index"])):
         text = record.pop("text").encode("utf-8")
         record["text_sha256"] = hashlib.sha256(text).hexdigest()
         digest.update(text)
         digest.update(b"\0")
-    stats = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(workspace.glob("nta-engine.*.json"))
-    ]
+    cumulative_stats_by_name = _read_engine_stats(workspace, prior_stats_paths)
+    cumulative_stats = list(cumulative_stats_by_name.values())
+    if args.attention_backend == "nta_flashinfer":
+        if not measurement_baseline or (
+            set(measurement_baseline) != set(cumulative_stats_by_name)
+        ):
+            raise RuntimeError(
+                "NTA measurement baseline and final worker statistics disagree"
+            )
+        stats = [
+            _measurement_delta(report, measurement_baseline[name])
+            for name, report in sorted(cumulative_stats_by_name.items())
+        ]
+    else:
+        stats = []
+    execution_dispatch = (
+        _execution_dispatch(stats)
+        if args.attention_backend == "nta_flashinfer"
+        else {"kind": "framework_reference"}
+    )
     engine_version = importlib.metadata.version("sglang")
     consumer_contract: dict[str, Any] | None = None
     if args.attention_backend == "nta_flashinfer":
@@ -1089,10 +1753,7 @@ def main() -> int:
         "external_output_tokens": args.external_output_tokens,
         "eviction_rounds": eviction_rounds,
         "placement_eviction_rounds": len(placement_eviction_prompts),
-        "placement_eviction_tokens": sum(
-            len(tokenizer.encode(prompt, add_special_tokens=False))
-            for prompt in placement_eviction_prompts
-        ),
+        "placement_eviction_tokens": sum(map(len, placement_eviction_prompts)),
         "resident_input_cache_tokens": resident_cache_tokens,
         "external_input_cache_tokens": external_cache_tokens,
         "combined_input_cache_tokens": combined_cache_tokens,
@@ -1100,6 +1761,9 @@ def main() -> int:
         "required_placement_pressure_tokens": required_placement_pressure,
         "churn_tokens": args.churn_tokens,
         "max_total_tokens": args.max_total_tokens,
+        "context_length": args.context_length,
+        "mem_fraction_static": args.mem_fraction_static,
+        "max_running_requests": args.max_running_requests,
         "batch_mode": args.batch_mode,
         "mixed_chunk_enabled": args.batch_mode == "coalesced",
         "chunked_prefill_size": (
@@ -1111,9 +1775,14 @@ def main() -> int:
         "cuda_graph_decode": args.cuda_graph_decode,
         "cuda_graph_prefill": args.cuda_graph_prefill,
         "load_warmup_iterations": args.load_warmup_iterations,
-        "load_warmup_excluded": args.load_warmup_iterations >= 2,
+        "load_warmup_excluded": (
+            args.load_warmup_iterations >= 2
+            and calibration_contract["verified"]
+        ),
+        "calibration_input_contract": calibration_contract,
         "workload": workload_metadata,
         "demand_semantics": "exact",
+        "execution_dispatch": execution_dispatch,
         "demand_trace_digest": (
             workload_metadata["demand_trace_digest"]
             if workload_metadata is not None
@@ -1170,9 +1839,15 @@ def main() -> int:
             [record["ttft_seconds"] for record in external], 0.95
         ),
         "engine_stats": stats,
+        "engine_stats_cumulative": cumulative_stats,
     }
     if consumer_contract is not None:
         report["consumer_contract"] = consumer_contract
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     print(json.dumps(report, sort_keys=True))
     return 0
 

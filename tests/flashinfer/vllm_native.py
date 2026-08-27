@@ -21,7 +21,13 @@ from nta_runtime.adapters.vllm_v1 import (
     current_vllm_v1_forward_state,
     vllm_v1_forward_state,
 )
-from nta_runtime.engines.vllm import NtaVllmFlashInferImpl
+from nta_runtime.adapters.base import ExactDemandProjection
+from nta_runtime.engines.vllm import (
+    NtaVllmFlashInferImpl,
+    VllmV1WorkerController,
+    _new_request_bound_wrapper,
+)
+from nta_runtime.connectors.vllm_host import build_indexed_host_resources
 from nta_runtime.runtime import Runtime, RuntimeConfig
 
 
@@ -44,7 +50,10 @@ def main() -> int:
     page_size = 16
     num_pages = 4
     num_kv_heads = 2
-    num_heads = 4
+    # Qwen2.5-3B's qualified serving geometry is GQA 16:2.  Group size eight
+    # exercises materially different prefill indexing than the former 4:2
+    # unit shape and must stay in the numerical gate.
+    num_heads = 16
     head_size = 128
     scale = 1.0 / math.sqrt(head_size)
 
@@ -98,6 +107,65 @@ def main() -> int:
         disable_split_kv=True,
     )
     prefill_expected = stock_prefill.run(prefill_query, (key, value))
+
+    # Match the causal chunked-prefill shape that external-tier vLLM serving
+    # actually exercises.  Keep its workspace independent: FlashInfer plans
+    # store scheduler arrays in the wrapper workspace, so sharing one with the
+    # smaller decode/prefill fixtures would make this differential ambiguous.
+    causal_tokens = 212
+    causal_pages = 14
+    causal_cache_pages = 32
+    causal_key = torch.randn(
+        (causal_cache_pages, page_size, num_kv_heads, head_size),
+        device=device,
+        dtype=torch.float16,
+    )
+    causal_value = torch.randn_like(causal_key)
+    causal_kv_cache = (
+        torch.cat((causal_key, causal_value), dim=-1)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    causal_query = torch.randn(
+        (causal_tokens, num_heads, head_size),
+        device=device,
+        dtype=torch.float16,
+    )
+    causal_workspace = torch.empty(
+        64 * 1024 * 1024, dtype=torch.uint8, device=device
+    )
+    causal_stock_prefill = BatchPrefillWithPagedKVCacheWrapper(
+        causal_workspace, "NHD"
+    )
+    causal_qo_indptr = torch.tensor(
+        [0, causal_tokens], dtype=torch.int32, device=device
+    )
+    causal_kv_indptr = torch.tensor([0, causal_pages], dtype=torch.int32)
+    causal_indices = torch.arange(
+        1, causal_pages + 1, dtype=torch.int32, device=device
+    )
+    causal_last_page_len = torch.tensor([4], dtype=torch.int32)
+    causal_stock_prefill.plan(
+        causal_qo_indptr,
+        causal_kv_indptr,
+        causal_indices,
+        causal_last_page_len,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        page_size,
+        q_data_type=causal_query.dtype,
+        kv_data_type=causal_kv_cache.dtype,
+        sm_scale=scale,
+        causal=True,
+        # vLLM leaves split-K enabled for this production shape.  The NTA
+        # external-tier wrapper currently replans it without split-K, so this
+        # reference intentionally preserves the framework plan choice.
+        disable_split_kv=False,
+    )
+    causal_expected = causal_stock_prefill.run(
+        causal_query, (causal_key, causal_value)
+    )
     mixed_decode = BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
     mixed_decode.plan(
         torch.tensor([0, 2], dtype=torch.int32),
@@ -133,19 +201,22 @@ def main() -> int:
 
     runtime = Runtime(
         RuntimeConfig(
-            request_capacity=2,
+            request_capacity=4,
             object_capacity=4,
             intent_capacity=4,
-            work_ticket_capacity=8,
+            # The causal schedule below contains 28 canonical work items.
+            # PREACQUIRED execution must not confuse those structural IDs
+            # with this deliberately smaller runtime ticket directory.
+            work_ticket_capacity=4,
             max_dependencies_per_work_ticket=2,
             device_ordinal=0,
-            tenant_capacity=2,
+            tenant_capacity=4,
         )
     )
     try:
         hook = VllmV1Hook(
             runtime,
-            2,
+            4,
             page_bytes=page_size * num_kv_heads * 2 * head_size * 2,
             expected_vllm_version="0.26.0",
             version_provider=lambda: "0.26.0",
@@ -228,6 +299,7 @@ def main() -> int:
                     assert state is not None
                     state.batch = batch
                     state.hook = hook
+                    state.connector_validated = True
                     state.page_size = page_size
                     implementation._native_forward(
                         None,
@@ -273,6 +345,7 @@ def main() -> int:
                     assert state is not None
                     state.batch = batch
                     state.hook = hook
+                    state.connector_validated = True
                     state.page_size = page_size
                     implementation._native_prefill_forward(
                         None,
@@ -287,14 +360,71 @@ def main() -> int:
                 )
                 return (output - prefill_expected).abs().max().item()
 
+            def run_causal_prefill(epoch: int) -> float:
+                causal_group = SimpleNamespace(
+                    get_numpy_array=lambda: np.arange(
+                        1, causal_pages + 1, dtype=np.int32
+                    ).reshape(1, causal_pages),
+                    num_blocks_per_row=np.asarray(
+                        [causal_pages], dtype=np.int32
+                    ),
+                )
+                causal_input = SimpleNamespace(
+                    req_ids=["causal"],
+                    req_id_to_index={"causal": 0},
+                    block_table=_BlockTable(causal_group),
+                )
+                causal_scheduler = SimpleNamespace(
+                    num_scheduled_tokens={"causal": causal_tokens},
+                    finished_req_ids=set(),
+                )
+                batch = hook.bind_forward(
+                    causal_scheduler,
+                    causal_input,
+                    epoch=epoch,
+                    stream=torch.cuda.current_stream(),
+                )
+                causal_metadata = SimpleNamespace(
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    num_prefill_tokens=causal_tokens,
+                    num_actual_tokens=causal_tokens,
+                    causal=True,
+                    use_cascade=False,
+                    prefill=FIPrefill(wrapper=causal_stock_prefill),
+                    decode=None,
+                )
+                output = torch.empty_like(causal_expected)
+                with vllm_v1_forward_state(causal_scheduler):
+                    state = current_vllm_v1_forward_state()
+                    assert state is not None
+                    state.batch = batch
+                    state.hook = hook
+                    state.connector_validated = True
+                    state.page_size = page_size
+                    implementation._native_prefill_forward(
+                        None,
+                        causal_query,
+                        causal_kv_cache,
+                        causal_metadata,
+                        output,
+                    )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    output, causal_expected, rtol=2e-3, atol=2e-3
+                )
+                return (output - causal_expected).abs().max().item()
+
             maximum = run_prefill(epoch=0)
+            maximum = max(maximum, run_causal_prefill(epoch=1))
             mixed_batch = hook.bind_forward(
                 SimpleNamespace(
                     num_scheduled_tokens={"a": 1, "b": 2},
-                    finished_req_ids=set(),
+                    finished_req_ids={"causal"},
                 ),
                 input_batch,
-                epoch=1,
+                epoch=2,
                 stream=torch.cuda.current_stream(),
             )
             mixed_query = torch.cat((query[:1], prefill_query[:2]))
@@ -303,13 +433,14 @@ def main() -> int:
             with vllm_v1_forward_state(
                 SimpleNamespace(
                     num_scheduled_tokens={"a": 1, "b": 2},
-                    finished_req_ids=set(),
+                    finished_req_ids={"causal"},
                 )
             ):
                 state = current_vllm_v1_forward_state()
                 assert state is not None
                 state.batch = mixed_batch
                 state.hook = hook
+                state.connector_validated = True
                 state.page_size = page_size
                 implementation.forward(
                     None,
@@ -338,7 +469,7 @@ def main() -> int:
             )
             maximum = max(
                 maximum,
-                run_batch(scheduler_output, input_batch, query, expected, epoch=2),
+                run_batch(scheduler_output, input_batch, query, expected, epoch=3),
             )
             # Rebind both rows to new request generations and run again.  This
             # catches stale runtime tickets/CTA counters that a one-shot
@@ -361,9 +492,201 @@ def main() -> int:
                     second_input,
                     second_query,
                     second_expected,
-                    epoch=3,
+                    epoch=4,
                 ),
             )
+
+            # The direct vLLM ABI must bind the request index through an
+            # explicit device map, not by assuming framework rows occupy
+            # consecutive runtime slots.  Reverse and gap the slots so an
+            # offset-based implementation either skips or binds the wrong
+            # generation.
+            mapped_batch = hook.adapter.bind_batch(
+                ("mapped-x", "mapped-y"),
+                (3, 1),
+                epoch=5,
+                stream=torch.cuda.current_stream(),
+                exact_demand=ExactDemandProjection(
+                    ((0, 1), (2, 3)),
+                    page_size * num_kv_heads * 2 * head_size * 2,
+                ),
+            )
+            mapped_wrapper = _new_request_bound_wrapper(
+                "decode",
+                workspace,
+                query_dtype=query.dtype,
+                kv_dtype=kv_cache.dtype,
+                head_size=head_size,
+            )
+            mapped_wrapper.plan(
+                indptr,
+                indices,
+                last_page_len,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                page_size,
+                q_data_type=query.dtype,
+                kv_data_type=kv_cache.dtype,
+                sm_scale=scale,
+                disable_split_kv=False,
+            )
+            mapped_query = torch.randn_like(query)
+            mapped_expected = stock_wrapper.run(mapped_query, (key, value))
+            mapped_output = torch.empty_like(mapped_expected)
+            with vllm_v1_forward_state(
+                SimpleNamespace(
+                    num_scheduled_tokens={"mapped-x": 1, "mapped-y": 1},
+                    finished_req_ids={"c", "d"},
+                )
+            ):
+                state = current_vllm_v1_forward_state()
+                assert state is not None
+                state.batch = mapped_batch
+                state.hook = hook
+                state.connector_validated = True
+                state.page_size = page_size
+                state.request_slots_tensor = torch.tensor(
+                    [3, 1, -1, -1], dtype=torch.int32, device=device
+                )
+                implementation._run_request_bound(
+                    state,
+                    mapped_batch,
+                    mapped_wrapper,
+                    stock_wrapper,
+                    mapped_query,
+                    kv_cache,
+                    mapped_output,
+                    kind="decode",
+                    framework_owned=True,
+                )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                mapped_output, mapped_expected, rtol=2e-3, atol=2e-3
+            )
+            maximum = max(
+                maximum,
+                (mapped_output - mapped_expected).abs().max().item(),
+            )
+
+            # Exercise the real host-staged path with vLLM's packed backing
+            # geometry.  Prefill consumes destination rows 2/3 before decode
+            # consumes rows 0/1, so this also catches phase-local index arrays
+            # that are incorrectly treated as offsets into the full load map.
+            logical_row_elements = int(kv_cache[0].numel())
+            packed_offset_elements = 64
+            packed_stride_elements = logical_row_elements + 128
+            packed_destination = torch.full(
+                (num_pages, packed_stride_elements),
+                7.0,
+                dtype=kv_cache.dtype,
+                device=device,
+            )
+            host_kv_cache = packed_destination[
+                :,
+                packed_offset_elements : packed_offset_elements
+                + logical_row_elements,
+            ].view((num_pages, *kv_cache.shape[1:]))
+            host_kv_cache.zero_()
+            packed_source = torch.zeros(
+                (num_pages, packed_stride_elements),
+                dtype=kv_cache.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            packed_source[
+                :,
+                packed_offset_elements : packed_offset_elements
+                + logical_row_elements,
+            ].copy_(kv_cache.detach().cpu().view(num_pages, logical_row_elements))
+            host_resources = build_indexed_host_resources(
+                {"model.layers.0.self_attn": host_kv_cache},
+                {"packed": packed_destination},
+                {"packed": packed_source},
+            )
+            os.environ["NTA_SERVING_TIER"] = "host_staged"
+            host_implementation = NtaVllmFlashInferImpl(
+                num_heads,
+                head_size,
+                scale,
+                num_kv_heads,
+                None,
+                None,
+                "auto",
+            )
+            host_input = SimpleNamespace(
+                req_ids=["host-decode", "host-prefill"],
+                req_id_to_index={"host-decode": 0, "host-prefill": 1},
+                block_table=_BlockTable(group),
+            )
+            host_scheduler = SimpleNamespace(
+                num_scheduled_tokens={"host-decode": 1, "host-prefill": 2},
+                finished_req_ids={"c", "d"},
+            )
+            host_batch = hook.bind_forward(
+                host_scheduler,
+                host_input,
+                epoch=6,
+                stream=torch.cuda.current_stream(),
+            )
+            host_output = torch.empty_like(mixed_expected)
+            layer = SimpleNamespace(layer_name="model.layers.0.self_attn")
+            runner = type("HostRunner", (), {})()
+            runner.kv_cache_config = SimpleNamespace(
+                kv_cache_groups=(
+                    SimpleNamespace(layer_names=(layer.layer_name,)),
+                )
+            )
+            host_owner = VllmV1WorkerController(runner)
+            with vllm_v1_forward_state(host_scheduler):
+                state = current_vllm_v1_forward_state()
+                assert state is not None
+                state.batch = host_batch
+                state.hook = hook
+                state.connector_validated = True
+                state.page_size = page_size
+                state.host_transfer_pairs = ((0, 0), (1, 1), (2, 2), (3, 3))
+                state.host_resources = host_resources
+                state.execution_owner = host_owner
+                host_implementation.forward(
+                    layer,
+                    mixed_query,
+                    torch.empty(
+                        (3, num_kv_heads, head_size),
+                        device=device,
+                        dtype=mixed_query.dtype,
+                    ),
+                    torch.empty(
+                        (3, num_kv_heads, head_size),
+                        device=device,
+                        dtype=mixed_query.dtype,
+                    ),
+                    host_kv_cache,
+                    mixed_metadata,
+                    host_output,
+                )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                host_kv_cache, kv_cache, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                host_output, mixed_expected, rtol=2e-3, atol=2e-3
+            )
+            assert torch.all(
+                packed_destination[:, :packed_offset_elements] == 7
+            ).item()
+            assert torch.all(
+                packed_destination[
+                    :,
+                    packed_offset_elements + logical_row_elements :,
+                ]
+                == 7
+            ).item()
+            maximum = max(
+                maximum,
+                (host_output - mixed_expected).abs().max().item(),
+            )
+            os.environ["NTA_SERVING_TIER"] = "hbm"
 
         torch.cuda.synchronize()
         print(

@@ -19,21 +19,20 @@ _UINT64_MAX = (1 << 64) - 1
 
 def tenant_budget_specs(
     environ: Mapping[str, str] | None = None,
-) -> tuple[tuple[int, int, int], ...]:
-    """Parse ``NTA_TENANT_BUDGETS=id:bytes[:weight],...`` once at startup."""
+) -> tuple[tuple[int, int], ...]:
+    """Parse ``NTA_TENANT_BUDGETS=id:bytes,...`` once at startup."""
     values = os.environ if environ is None else environ
     raw = values.get("NTA_TENANT_BUDGETS", "").strip()
     if not raw:
         return ()
-    specs: list[tuple[int, int, int]] = []
+    specs: list[tuple[int, int]] = []
     seen: set[int] = set()
     for item in raw.split(","):
         fields = tuple(field.strip() for field in item.split(":") if field.strip())
-        if len(fields) not in (2, 3):
-            raise ValueError("NTA_TENANT_BUDGETS entries must be id:bytes[:weight]")
+        if len(fields) != 2:
+            raise ValueError("NTA_TENANT_BUDGETS entries must be id:bytes")
         try:
             tenant_id, max_bytes = int(fields[0]), int(fields[1])
-            weight = 1 if len(fields) == 2 else int(fields[2])
         except ValueError as error:
             raise ValueError("NTA_TENANT_BUDGETS contains an invalid value") from error
         if (
@@ -41,14 +40,12 @@ def tenant_budget_specs(
             or tenant_id > _UINT32_MAX
             or max_bytes < 0
             or max_bytes > _UINT64_MAX
-            or weight <= 0
-            or weight > _UINT32_MAX
         ):
             raise ValueError("NTA_TENANT_BUDGETS contains an invalid value")
         if tenant_id in seen:
             raise ValueError("NTA_TENANT_BUDGETS repeats a tenant")
         seen.add(tenant_id)
-        specs.append((tenant_id, max_bytes, weight))
+        specs.append((tenant_id, max_bytes))
     return tuple(specs)
 
 

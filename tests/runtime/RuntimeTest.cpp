@@ -110,6 +110,10 @@ int main() {
                 calibratedHostStaged.payloadOwner ==
                     static_cast<std::uint32_t>(nta::TierOwner::Engine) &&
                 calibratedHostStaged.transferDestinationOwner ==
+                    static_cast<std::uint32_t>(nta::TierOwner::Engine) &&
+                calibratedHostStaged.mappingOwner ==
+                    static_cast<std::uint32_t>(nta::TierOwner::None) &&
+                calibratedHostStaged.directoryOwner ==
                     static_cast<std::uint32_t>(nta::TierOwner::Runtime),
             "host-staged tier descriptor ownership is incomplete");
     require(runtime.deviceOrdinal() == originalDevice,
@@ -141,7 +145,7 @@ int main() {
             "request priority outside urgency buckets must be rejected");
 
     runtime.setRequest(0, 1001, 7, 2, 3, 9000);
-    runtime.setTenantBudget(2, 1ULL << 20U, 3);
+    runtime.setTenantBudget(2, 1ULL << 20U);
     const nta::abi::RequestContext request = runtime.readRequest(0);
     require(request.requestId == 1001 && request.generation == 7,
             "request publication failed");
@@ -213,9 +217,10 @@ int main() {
                        &syntheticOutstanding, sizeof(syntheticOutstanding),
                        cudaMemcpyHostToDevice) == cudaSuccess,
             "tenant counter injection failed");
-    runtime.setTenantBudget(2, 1ULL << 21U, 4);
-    require(runtime.readTenant(2).outstandingBytes == syntheticOutstanding,
-            "tenant policy update reset a live credit counter");
+    runtime.setTenantBudget(2, 1ULL << 21U);
+    const nta::abi::TenantContext updatedTenant = runtime.readTenant(2);
+    require(updatedTenant.outstandingBytes == syntheticOutstanding,
+            "tenant policy update reset the device-owned counter");
     require(cudaMemcpy(&hostView.tenants[2].outstandingBytes, &zeroOutstanding,
                        sizeof(zeroOutstanding),
                        cudaMemcpyHostToDevice) == cudaSuccess,
@@ -258,8 +263,8 @@ int main() {
                 static_cast<std::uint32_t>(nta::abi::ObjectState::New),
             "staged object must begin nonresident");
     const std::uint64_t outstandingObjectIssue = 1;
-    require(cudaMemcpy(&hostView.objects[2].issueCount,
-                       &outstandingObjectIssue, sizeof(outstandingObjectIssue),
+    require(cudaMemcpy(&hostView.objects[2].issueCount, &outstandingObjectIssue,
+                       sizeof(outstandingObjectIssue),
                        cudaMemcpyHostToDevice) == cudaSuccess,
             "object issue-count injection failed");
     bool liveObjectReuseRejected = false;
@@ -346,33 +351,32 @@ int main() {
                            sizeof(std::uint32_t)) == cudaSuccess &&
                 cudaMalloc(reinterpret_cast<void **>(&indexedDestination),
                            sizeof(std::uint32_t)) == cudaSuccess,
-            "preacquired indexed allocation failed");
-    const nta::IndexedHostObjectSpec preacquired{2005,
-                                                 5,
-                                                 indexedHostDevice,
-                                                 indexedStaging,
-                                                 indexedSource,
-                                                 indexedDestination,
-                                                 1,
-                                                 64,
-                                                 64,
-                                                 64,
-                                                 1,
-                                                 1,
-                                                 true};
+            "indexed host allocation failed");
+    const nta::IndexedHostObjectSpec indexed{2005,
+                                             5,
+                                             indexedHostDevice,
+                                             indexedStaging,
+                                             indexedSource,
+                                             indexedDestination,
+                                             1,
+                                             64,
+                                             64,
+                                             64,
+                                             1,
+                                             1};
     runtime.registerIndexedHostObjects(
-        3, std::span<const nta::IndexedHostObjectSpec>(&preacquired, 1));
-    const nta::abi::ObjectEntry preacquiredEntry = runtime.readObject(3);
-    require(preacquiredEntry.state ==
-                    static_cast<std::uint32_t>(nta::abi::ObjectState::Ready) &&
-                preacquiredEntry.selectedReplica == 0,
-            "preacquired indexed object was not published ready");
+        3, std::span<const nta::IndexedHostObjectSpec>(&indexed, 1));
+    const nta::abi::ObjectEntry indexedEntry = runtime.readObject(3);
+    require(indexedEntry.state ==
+                    static_cast<std::uint32_t>(nta::abi::ObjectState::New) &&
+                indexedEntry.selectedReplica == nta::abi::InvalidIndex,
+            "indexed object was published ready before acquisition");
     cudaStream_t indexedStream = nullptr;
     require(cudaStreamCreateWithFlags(&indexedStream, cudaStreamNonBlocking) ==
                 cudaSuccess,
             "indexed registration stream creation failed");
     runtime.registerIndexedHostObjectsAsync(
-        3, std::span<const nta::IndexedHostObjectSpec>(&preacquired, 1),
+        3, std::span<const nta::IndexedHostObjectSpec>(&indexed, 1),
         indexedStream);
     require(cudaStreamSynchronize(indexedStream) == cudaSuccess,
             "indexed asynchronous registration did not complete");
@@ -381,12 +385,12 @@ int main() {
                 asyncReplica.estimatedBandwidthBytesPerSecond == 123456789,
             "indexed asynchronous registration ignored calibrated tier costs");
     cudaEvent_t priorConsumerEvent = nullptr;
-    require(cudaEventCreateWithFlags(&priorConsumerEvent, cudaEventDisableTiming) ==
-                cudaSuccess,
+    require(cudaEventCreateWithFlags(&priorConsumerEvent,
+                                     cudaEventDisableTiming) == cudaSuccess,
             "indexed quiescence event creation failed");
     require(cudaEventRecord(priorConsumerEvent, indexedStream) == cudaSuccess,
             "indexed quiescence event record failed");
-    nta::IndexedHostObjectSpec quiesced = preacquired;
+    nta::IndexedHostObjectSpec quiesced = indexed;
     quiesced.version = 6;
     runtime.registerIndexedHostObjectsAsyncQuiesced(
         3, std::span<const nta::IndexedHostObjectSpec>(&quiesced, 1),
@@ -414,7 +418,7 @@ int main() {
                 cudaFree(indexedSource) == cudaSuccess &&
                 cudaFree(indexedStaging) == cudaSuccess &&
                 cudaFreeHost(indexedHost) == cudaSuccess,
-            "preacquired indexed allocation release failed");
+            "indexed host allocation release failed");
 
     nta::WorkPlanBuilder planBuilder(2);
     const std::uint32_t planRequest = planBuilder.addRequest({0, 7});

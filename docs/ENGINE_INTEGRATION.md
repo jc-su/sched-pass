@@ -43,7 +43,7 @@ serving gateway may populate the typed `_nta_forward_metadata` sidecar on the
 forward batch, and the graph hooks copy it with `rids` and pool slots. Missing
 annotation means the explicit default tenant 0; it is never inferred from
 request text or batch position. Quotas are configured once at worker startup with
-`NTA_TENANT_BUDGETS=id:bytes[:weight],...` and are enforced by native device
+`NTA_TENANT_BUDGETS=id:bytes,...` and are enforced by native device
 admission counters.
 
 The vLLM worker has no stable upstream tenant field, so its deployment adapter

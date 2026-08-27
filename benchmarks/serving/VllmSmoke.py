@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a reproducible vLLM resident-reference/native integration smoke.
+"""Run a reproducible vLLM reference/native tier integration smoke.
 
 This is an integration gate, not a headline performance benchmark.  It uses
 the same model, request batch, CUDA/JIT environment, and output digest for the
@@ -30,14 +30,36 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=pathlib.Path, required=True)
-    parser.add_argument("--backend", choices=("stock", "nta"), required=True)
+    parser.add_argument(
+        "--backend", choices=("stock", "stock_offload", "nta"), required=True
+    )
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--warmup-iterations", type=int, default=1)
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-num-seqs", type=int, default=2)
+    parser.add_argument(
+        "--prompt-profile",
+        choices=("auto", "short", "long_prefix"),
+        default="auto",
+        help=(
+            "prompt shape; auto selects long_prefix for host reload and short "
+            "otherwise"
+        ),
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
+    parser.add_argument(
+        "--serving-tier", choices=("hbm", "host_staged"), default="hbm"
+    )
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        help="explicit vLLM HBM KV capacity for deterministic tier tests",
+    )
+    parser.add_argument(
+        "--host-cache-bytes", type=int, default=512 * 1024 * 1024
+    )
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument("--cuda-home", type=pathlib.Path)
     parser.add_argument("--cuda-host-cxx", type=pathlib.Path)
@@ -65,6 +87,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-num-seqs must cover the request batch")
     if not 0.0 < args.gpu_memory_utilization < 1.0:
         parser.error("--gpu-memory-utilization must be between zero and one")
+    if args.backend == "stock" and args.serving_tier != "hbm":
+        parser.error("stock backend supports only the resident HBM smoke")
+    if args.backend == "stock_offload" and args.serving_tier != "host_staged":
+        parser.error("stock_offload requires --serving-tier host_staged")
+    if args.kv_cache_memory_bytes is not None and args.kv_cache_memory_bytes <= 0:
+        parser.error("--kv-cache-memory-bytes must be positive")
+    if args.host_cache_bytes <= 0:
+        parser.error("--host-cache-bytes must be positive")
     return args
 
 
@@ -148,26 +178,71 @@ def main() -> int:
             {
                 "NTA_VLLM_NATIVE": "1",
                 "NTA_VLLM_ALLOW_STOCK_FALLBACK": "0",
-                "NTA_SERVING_TIER": "host_staged",
+                "NTA_SERVING_TIER": args.serving_tier,
             }
         )
+        if args.serving_tier == "host_staged":
+            os.environ["NTA_VLLM_VERIFY_TRANSFER"] = "1"
+        else:
+            os.environ.pop("NTA_VLLM_VERIFY_TRANSFER", None)
     else:
         os.environ.pop("NTA_VLLM_NATIVE", None)
         os.environ.pop("NTA_VLLM_ALLOW_STOCK_FALLBACK", None)
+        os.environ.pop("NTA_VLLM_VERIFY_TRANSFER", None)
+        os.environ.pop("NTA_SERVING_TIER", None)
 
     import torch
     from vllm import LLM, SamplingParams
 
-    prompts = [
-        f"Request {index}: explain one property of finite GPU kernels."
-        for index in range(args.requests)
-    ]
+    prompt_profile = args.prompt_profile
+    if prompt_profile == "auto":
+        prompt_profile = (
+            "long_prefix" if args.serving_tier == "host_staged" else "short"
+        )
+    if prompt_profile == "long_prefix":
+        prefix = " ".join(
+            [
+                "A finite GPU kernel has explicit work identity, bounded progress, "
+                "and exact data dependencies."
+            ]
+            * 12
+        )
+        prompts = [
+            f"{prefix} Request {index}: summarize the invariant."
+            for index in range(args.requests)
+        ]
+    else:
+        prompts = [
+            f"Request {index}: explain one property of finite GPU kernels."
+            for index in range(args.requests)
+        ]
     sampling = SamplingParams(
         temperature=0.0,
         max_tokens=args.max_new_tokens,
         seed=0,
     )
     attention_backend = "CUSTOM" if args.backend == "nta" else "FLASHINFER"
+    connector_config = (
+        {
+            "kv_connector": (
+                "NtaVllmConnector"
+                if args.backend == "nta"
+                else "SimpleCPUOffloadConnector"
+            ),
+            **(
+                {"kv_connector_module_path": "nta_runtime.connectors.vllm"}
+                if args.backend == "nta"
+                else {}
+            ),
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "cpu_bytes_to_use": args.host_cache_bytes,
+                "lazy_offload": False,
+            },
+        }
+        if args.backend in {"nta", "stock_offload"}
+        else None
+    )
     load_started = time.perf_counter()
     engine = LLM(
         model=str(args.model.resolve()),
@@ -178,17 +253,49 @@ def main() -> int:
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype="float16",
         seed=0,
+        enable_prefix_caching=True,
+        kv_cache_memory_bytes=args.kv_cache_memory_bytes,
+        kv_transfer_config=connector_config,
     )
     try:
         load_seconds = time.perf_counter() - load_started
-        for _ in range(args.warmup_iterations):
-            engine.generate(prompts, sampling)
         samples: list[float] = []
         results: list[Any] | None = None
-        for _ in range(args.iterations):
-            started = time.perf_counter()
-            results = engine.generate(prompts, sampling)
-            samples.append(time.perf_counter() - started)
+        if args.serving_tier == "host_staged":
+            baseline = engine.generate(prompts, sampling)
+            baseline_tokens = tuple(output_token_ids(result) for result in baseline)
+
+            def reset_resident_cache(attempt: int) -> None:
+                # Store completion is reported on a later engine step. A
+                # unique drain request advances that lifecycle without sharing
+                # the target prefix. Preserve the connector's CPU directory
+                # while resetting only vLLM's resident prefix cache.
+                engine.generate(
+                    [f"Drain {attempt}: give one word about stream ordering."],
+                    sampling,
+                )
+                if not engine.reset_prefix_cache(reset_connector=False):
+                    raise RuntimeError(
+                        "vLLM could not quiesce resident KV before host reload"
+                    )
+
+            for iteration in range(args.warmup_iterations + args.iterations):
+                reset_resident_cache(iteration)
+                started = time.perf_counter()
+                current = engine.generate(prompts, sampling)
+                elapsed = time.perf_counter() - started
+                if tuple(output_token_ids(result) for result in current) != baseline_tokens:
+                    raise RuntimeError("vLLM host reload changed generated token IDs")
+                if iteration >= args.warmup_iterations:
+                    samples.append(elapsed)
+                    results = current
+        else:
+            for _ in range(args.warmup_iterations):
+                engine.generate(prompts, sampling)
+            for _ in range(args.iterations):
+                started = time.perf_counter()
+                results = engine.generate(prompts, sampling)
+                samples.append(time.perf_counter() - started)
     finally:
         # vLLM 0.26's offline LLM wrapper is not a context manager.  Explicit
         # EngineCore shutdown is required so worker atexit evidence is flushed
@@ -238,7 +345,11 @@ def main() -> int:
         consumer_contract = {
             "schema": 1,
             "engine": "vllm",
-            "backend": "flashinfer",
+            "backend": (
+                "flashinfer+simple_cpu_offload"
+                if args.backend == "stock_offload"
+                else "flashinfer"
+            ),
             "kind": "framework_reference",
             "exact_demand": True,
             "typed_work_plan": False,
@@ -257,16 +368,142 @@ def main() -> int:
         for entry in evidence
         if isinstance(entry, dict)
     )
+    host_transfer_blocks = sum(
+        int(entry.get("stats", {}).get("host_transfer_blocks", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_transfer_bytes = sum(
+        int(entry.get("stats", {}).get("host_transfer_bytes", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_launches = sum(
+        int(entry.get("stats", {}).get("host_decode_launches", 0))
+        + int(entry.get("stats", {}).get("host_prefill_launches", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_preload_batches = sum(
+        int(entry.get("stats", {}).get("host_preload_batches", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_preload_waits = sum(
+        int(entry.get("stats", {}).get("host_preload_waits", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    native_worker_stats = [
+        entry.get("stats", {})
+        for entry in evidence
+        if isinstance(entry, dict)
+        and isinstance(entry.get("consumer_contract"), dict)
+        and entry["consumer_contract"].get("kind") == "native_work_unit"
+    ]
+    worker_incremental_wrapper_builds = sum(
+        int(stats.get("worker_incremental_wrapper_builds", 0))
+        for stats in native_worker_stats
+    )
+    worker_incremental_plan_builds = sum(
+        int(stats.get("worker_incremental_plan_builds", 0))
+        for stats in native_worker_stats
+    )
+    worker_incremental_plan_reuses = sum(
+        int(stats.get("worker_incremental_plan_reuses", 0))
+        for stats in native_worker_stats
+    )
+    worker_incremental_workspace_allocated_bytes = sum(
+        int(stats.get("worker_incremental_workspace_allocated_bytes", 0))
+        for stats in native_worker_stats
+    )
+    worker_request_bound_wrapper_builds = sum(
+        int(stats.get("worker_request_bound_wrapper_builds", 0))
+        for stats in native_worker_stats
+    )
+    worker_request_bound_plan_builds = sum(
+        int(stats.get("worker_request_bound_plan_builds", 0))
+        for stats in native_worker_stats
+    )
+    worker_request_bound_plan_reuses = sum(
+        int(stats.get("worker_request_bound_plan_reuses", 0))
+        for stats in native_worker_stats
+    )
+    worker_request_bound_workspace_allocated_bytes = sum(
+        int(stats.get("worker_request_bound_workspace_allocated_bytes", 0))
+        for stats in native_worker_stats
+    )
+    worker_attention_workspace_peak_bytes = max(
+        (
+            int(stats.get("worker_attention_workspace_peak_bytes", 0))
+            for stats in native_worker_stats
+        ),
+        default=0,
+    )
+    if args.backend == "nta" and args.serving_tier == "host_staged":
+        if (
+            host_transfer_blocks <= 0
+            or host_transfer_bytes <= 0
+            or host_launches <= 0
+            or host_preload_batches <= 0
+            or host_preload_waits <= 0
+        ):
+            raise RuntimeError(
+                "vLLM host smoke completed without evidenced host materialization"
+            )
+        expected_phases_per_worker = 2 if args.max_new_tokens > 1 else 1
+        expected_wrapper_builds = (
+            expected_phases_per_worker * len(native_worker_stats)
+        )
+        if worker_request_bound_wrapper_builds != expected_wrapper_builds:
+            raise RuntimeError(
+                "vLLM host smoke did not preserve worker-owned FlashInfer "
+                "workspace lifetime: "
+                f"expected {expected_wrapper_builds} wrappers, observed "
+                f"{worker_request_bound_wrapper_builds}"
+            )
+        if (
+            worker_incremental_wrapper_builds != 0
+            or worker_request_bound_plan_builds <= 0
+            or worker_request_bound_plan_reuses <= 0
+            or worker_request_bound_workspace_allocated_bytes <= 0
+            or worker_attention_workspace_peak_bytes <= 0
+        ):
+            raise RuntimeError(
+                "vLLM optimized host smoke did not use only the worker-shared "
+                "request-bound planner/workspace"
+            )
     revision, dirty = repository_metadata()
     median_seconds = statistics.median(samples)
     report = {
         "schema": 1,
         "classification": "vllm-serving-integration-smoke",
         "backend": args.backend,
+        "serving_tier": args.serving_tier,
         "backend_selected": True,
         "native_execution_verified": native_verified,
         "native_launches": native_launches,
         "reference_fallback_launches": reference_fallback_launches,
+        "host_launches": host_launches,
+        "host_preload_batches": host_preload_batches,
+        "host_preload_waits": host_preload_waits,
+        "host_transfer_blocks": host_transfer_blocks,
+        "host_transfer_bytes": host_transfer_bytes,
+        "worker_incremental_wrapper_builds": worker_incremental_wrapper_builds,
+        "worker_incremental_plan_builds": worker_incremental_plan_builds,
+        "worker_incremental_plan_reuses": worker_incremental_plan_reuses,
+        "worker_incremental_workspace_allocated_bytes": (
+            worker_incremental_workspace_allocated_bytes
+        ),
+        "worker_request_bound_wrapper_builds": worker_request_bound_wrapper_builds,
+        "worker_request_bound_plan_builds": worker_request_bound_plan_builds,
+        "worker_request_bound_plan_reuses": worker_request_bound_plan_reuses,
+        "worker_request_bound_workspace_allocated_bytes": (
+            worker_request_bound_workspace_allocated_bytes
+        ),
+        "worker_attention_workspace_peak_bytes": (
+            worker_attention_workspace_peak_bytes
+        ),
         "stock_fallback_enabled": (
             args.backend == "nta"
             and os.environ.get("NTA_VLLM_ALLOW_STOCK_FALLBACK") == "1"
@@ -288,6 +525,11 @@ def main() -> int:
         },
         "requests": args.requests,
         "max_new_tokens": args.max_new_tokens,
+        "prompt_profile": prompt_profile,
+        "kv_cache_memory_bytes": args.kv_cache_memory_bytes,
+        "host_cache_bytes": (
+            args.host_cache_bytes if args.serving_tier == "host_staged" else None
+        ),
         "iterations": args.iterations,
         "warmup_iterations": args.warmup_iterations,
         "generated_tokens": generated,

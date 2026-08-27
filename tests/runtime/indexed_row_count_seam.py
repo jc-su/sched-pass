@@ -151,6 +151,13 @@ def main() -> int:
             )
         )
     stream = torch.cuda.current_stream()
+    failures = 0
+    sticky_before_warmup = runtime.sticky_failed_count
+    phases.warmup_indexed_host_validation(runtime, stream=stream)
+    torch.cuda.synchronize()
+    if runtime.sticky_failed_count != sticky_before_warmup:
+        print("validation warmup modified runtime failure state")
+        failures += 1
     runtime.register_indexed_host_objects(0, objects, stream=stream)
 
     # Step one: a scattered subset, deliberately unordered.
@@ -163,7 +170,6 @@ def main() -> int:
     phases.progress_validated_indexed_host_range(runtime, 0, 2, stream=stream)
     torch.cuda.synchronize()
 
-    failures = 0
     for name, host, device_buffer in (
         ("K", host_k, device_k),
         ("V", host_v, device_v),

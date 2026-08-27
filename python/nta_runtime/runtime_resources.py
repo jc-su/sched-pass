@@ -171,6 +171,8 @@ class ServingRuntimeResources:
                 cxl=tier.cxl,
             )
             native_kind = {
+                ServingTier.HBM: TierKind.HBM,
+                ServingTier.HOST_MAPPED: TierKind.HOST_MAPPED,
                 ServingTier.HOST_STAGED: TierKind.HOST_STAGED,
                 ServingTier.NVME: TierKind.NVME,
                 ServingTier.CXL_DAX: TierKind.CXL,
@@ -178,11 +180,14 @@ class ServingRuntimeResources:
             descriptor = runtime.tier_descriptor(native_kind)
             if (
                 not descriptor.active
+                or descriptor.source_kind is not native_kind
                 or descriptor.capabilities != tier.contract.capabilities
                 or descriptor.protocol_owner is not tier.contract.protocol_owner
                 or descriptor.payload_owner is not tier.contract.payload_owner
                 or descriptor.transfer_destination_owner
                 is not tier.contract.transfer_destination_owner
+                or descriptor.mapping_owner is not tier.contract.mapping_owner
+                or descriptor.directory_owner is not tier.contract.directory_owner
             ):
                 raise RuntimeError(
                     "native tier descriptor diverges from the selected resource contract"

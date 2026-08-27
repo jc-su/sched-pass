@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Sequence
 from enum import Enum
 from operator import index as integer_index
@@ -101,14 +101,14 @@ class ConsumerContract:
             raise ValueError("consumer contract identity must be non-empty")
         if not isinstance(self.kind, ConsumerKind):
             raise TypeError("consumer contract kind must be a ConsumerKind")
-        for field in (
+        for field_name in (
             "exact_demand",
             "typed_work_plan",
             "native_submission",
             "numerical_consumer",
         ):
-            if type(getattr(self, field)) is not bool:
-                raise TypeError(f"consumer contract {field} must be bool")
+            if type(getattr(self, field_name)) is not bool:
+                raise TypeError(f"consumer contract {field_name} must be bool")
         if self.kind is ConsumerKind.NATIVE_WORK_UNIT and not all(
             (
                 self.exact_demand,
@@ -251,6 +251,7 @@ class EngineBatch:
     bindings: tuple[RequestBinding, ...]
     granularity: Granularity
     exact_demand: ExactDemandProjection | None = None
+    request_slot_offset: int | None = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.engine:
@@ -278,6 +279,14 @@ class EngineBatch:
             self.exact_demand.request_unit_ids
         ) != len(self.bindings):
             raise ValueError("exact demand rows must match the engine batch")
+        first_slot = self.bindings[0].request_slot
+        contiguous = all(
+            binding.request_slot == first_slot + request_index
+            for request_index, binding in enumerate(self.bindings)
+        )
+        object.__setattr__(
+            self, "request_slot_offset", first_slot if contiguous else None
+        )
 
     @property
     def request_ids(self) -> tuple[int, ...]:

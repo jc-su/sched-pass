@@ -138,7 +138,8 @@ def require_clean_mechanism(
     stock_launches = total("stock_attention_launches")
     stock_resident_launches = total("stock_resident_attention_launches")
     stock_external_launches = total("stock_prefetched_external_attention_launches")
-    accounted_external_launches = external_launches + stock_external_launches
+    native_external_launches = total("native_external_attention_launches")
+    accounted_external_launches = external_launches
     tier_external_layers = total("tier_external_layers")
     acquisition_layers = prefetched_layers + demand_layers + tier_external_layers
     if fallbacks:
@@ -150,6 +151,12 @@ def require_clean_mechanism(
             "external attention layers do not match acquisition layers "
             f"({accounted_external_launches} != {prefetched_layers} + "
             f"{demand_layers} + {tier_external_layers})"
+        )
+    if external_launches != native_external_launches + stock_external_launches:
+        raise RuntimeError(
+            "external numerical-consumer accounting is not disjoint "
+            f"({external_launches} != native {native_external_launches} + "
+            f"stock {stock_external_launches})"
         )
     if (
         stock_launches != stock_resident_launches + stock_external_launches
@@ -183,6 +190,8 @@ def require_clean_mechanism(
     compact_launches = total("compact_resume_launches")
     compact_ctas = total("compact_resume_cta_bound")
     canonical_ctas = total("canonical_resume_cta_bound")
+    native_work_unit_active = incremental > 0 and native_external_launches > 0
+    heterogeneous_work_unit_active = native_work_unit_active and mixed_layers > 0
     # A complete exact prefetch legitimately uses the stock consumer for the
     # external pages, so there is no resume grid to compact.  Compaction is a
     # gate for the incremental form, not for this stock-consumer control arm.
@@ -223,11 +232,21 @@ def require_clean_mechanism(
     return {
         "all_attention_transformed": stock_launches == 0,
         "external_attention_transformed": (
-            fallbacks == 0 and external_launches == acquisition_layers
+            fallbacks == 0 and native_external_launches == acquisition_layers
         ),
         "external_attention_stock_consumer": stock_external_launches > 0,
         "external_attention_accounted": (
             fallbacks == 0 and accounted_external_launches == acquisition_layers
+        ),
+        # A stock consumer after complete prefetch is valid deployment
+        # behavior, but it is transport evidence rather than evidence that
+        # heterogeneous work ran as individual dependencies became ready.
+        "native_work_unit_active": native_work_unit_active,
+        "heterogeneous_work_unit_active": heterogeneous_work_unit_active,
+        "transport_only": (
+            stock_external_launches > 0
+            and transformed == 0
+            and incremental == 0
         ),
         "resident_reference_attention_launches": stock_resident_launches,
         "active_forms": [
@@ -237,7 +256,7 @@ def require_clean_mechanism(
         ],
         "external_batches": external_batches,
         "external_launches": accounted_external_launches,
-        "transformed_external_launches": external_launches,
+        "transformed_external_launches": native_external_launches,
         "stock_prefetched_external_launches": stock_external_launches,
         "transformed_direct_launches": transformed,
         "ticketed_incremental_launches": incremental,

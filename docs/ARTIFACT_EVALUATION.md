@@ -129,7 +129,8 @@ python experiments/reproduce.py \
 
 The runner executes a small B0--B6/all-ablation matrix and the validator checks
 shared exact demand traces, activation counters, tier/granularity strata, and
-Little's Law accounting.
+deterministic blocked-cohort accounting. Little's-law reporting is reserved
+for timestamped serving runs.
 
 ### Full matrix
 
@@ -245,6 +246,7 @@ python3 scripts/run-nvme-qualification.py \
   --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 100 \
   --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
   --allow-device-rebind --require-ready \
+  --reference /tmp/nta-artifacts/nvme/nvme-reference.bin \
   --output /tmp/nta-artifacts/nvme/nvme-qualification.json
 
 python3 experiments/qualify_tiers.py \
@@ -268,7 +270,7 @@ is root-only:
 ```bash
 cmake -S . -B build \
   -DNTA_TEST_NVME_ENDPOINT=vfio:0000:d8:00.0 \
-  -DNTA_TEST_NVME_REFERENCE=/tmp/nta-nvme-reference.bin \
+  -DNTA_TEST_NVME_REFERENCE=/tmp/nta-artifacts/nvme/nvme-reference.bin \
   -DNTA_TEST_NVME_MEDIA_POLICY=trusted-read-only-code \
   -DNTA_TEST_NVME_DMA_TARGET=hbm-peer \
   -DNTA_TEST_NVME_USE_SUDO=ON \

@@ -88,7 +88,7 @@ building an execution session for every real FlashInfer attention launch.
 The vLLM adapter exposes the same request projection without importing vLLM.
 Logical multi-tenant admission is part of that shared contract: an aligned
 tenant annotation is carried with each request binding, and optional startup
-quotas (`NTA_TENANT_BUDGETS=id:bytes[:weight],...`) bound device staging rather
+quotas (`NTA_TENANT_BUDGETS=id:bytes,...`) bound concurrent device staging rather
 than adding a framework-specific scheduler.
 
 Retired selector-specific serving and graph-specialization paths were removed
@@ -129,7 +129,9 @@ python experiments/validate_matrix_artifact.py \
 
 The dependency-free matrix labels its timing as modeled regime data. Only the
 SGLang serving harness reports GPU/engine timing; the matrix is the executable
-fairness, activation, tier, granularity, and Little's-law contract.
+fairness, activation, tier, granularity, and synthetic blocked-cohort
+accounting contract. Measured serving timestamps, not this model, support the
+queueing analysis.
 
 For artifact evaluation, use `experiments/reproduce.py`; it records the exact
 commands, environment, revision, machine metadata, and raw logs in a separate

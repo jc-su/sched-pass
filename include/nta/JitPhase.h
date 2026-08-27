@@ -40,6 +40,10 @@ public:
   void validateIndexedHostRange(cudaStream_t stream, abi::RuntimeView *runtime,
                                 std::uint32_t firstObject,
                                 std::uint32_t objectCount) const;
+  // Materialize the validation kernel without reading or mutating a directory
+  // entry. This belongs to deployment startup, before requests are admitted.
+  void warmupIndexedHostValidation(cudaStream_t stream,
+                                   abi::RuntimeView *runtime) const;
   void rebindIndexedHostPairs(cudaStream_t stream, abi::RuntimeView *runtime,
                               std::uint32_t firstObject,
                               std::uint32_t pairCount, std::uint64_t keySource,

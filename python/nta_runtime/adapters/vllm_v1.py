@@ -16,15 +16,23 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 import contextvars
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import heapq
 import importlib.metadata
 from operator import index as integer_index
 import os
+import time
 from typing import Any, Protocol
 
 from .base import ConsumerContract, ExactDemandProjection, EngineBatch
 from .vllm import VllmAdapter
+from ..resource_contract import (
+    ResourceAddressSpace,
+    ResourceOwner,
+    ResourcePath,
+    require_numerical_binding,
+    resource_contract,
+)
 from ..work_unit import Granularity
 
 
@@ -42,16 +50,22 @@ def validate_vllm_attention_tier(
     silently treating a physical-tier configuration as resident vLLM data.
     """
     values = os.environ if environ is None else environ
-    selected = values.get("NTA_SERVING_TIER", "host_staged").strip().lower()
-    if selected == "host":
-        selected = "host_staged"
-    if selected == "cxl":
-        selected = "cxl_dax"
-    if selected not in {"host_staged", "nvme", "cxl_dax"}:
+    selected = values.get("NTA_SERVING_TIER", "hbm").strip().lower()
+    if selected not in {"hbm", "host_mapped", "host_staged", "nvme", "cxl_dax"}:
         raise RuntimeError(
-            "NTA_SERVING_TIER must be host_staged, nvme, or cxl_dax for vLLM"
+            "NTA_SERVING_TIER must be hbm, host_mapped, host_staged, nvme, "
+            "or cxl_dax for vLLM"
         )
-    if selected in {"nvme", "cxl_dax"}:
+    require_numerical_binding(
+        resource_contract(selected),
+        ResourceOwner.ENGINE,
+        ResourceAddressSpace.HBM,
+        frozenset((ResourcePath.RESIDENT, ResourcePath.MATERIALIZED)),
+        consumer="vLLM FlashInfer paged-KV attention",
+    )
+    if selected == "host_staged" and values.get("NTA_VLLM_NATIVE", "0") != "1":
+        raise RuntimeError("vLLM host_staged requires NTA_VLLM_NATIVE=1")
+    if selected == "nvme":
         if values.get("NTA_VLLM_NATIVE", "0") != "1":
             raise RuntimeError(
                 "vLLM physical tiers require NTA_VLLM_NATIVE=1; stock resident "
@@ -83,8 +97,210 @@ class VllmV1ForwardState:
     batch: EngineBatch | None = None
     hook: "VllmV1Hook | None" = None
     tier_service: Any | None = None
+    execution_owner: Any | None = None
+    request_slots_tensor: Any | None = None
+    connector_validated: bool = False
     page_size: int = 0
+    storage_key_tables: tuple[tuple[str | None, ...], ...] = ()
+    host_transfer_pairs: tuple[tuple[int, int], ...] = ()
+    host_resources: dict[str, Any] = field(default_factory=dict)
+    host_preload_event: Any | None = None
+    host_preload_blocks: int = 0
+    host_preload_bytes: int = 0
+    host_index_tensors: dict[
+        tuple[int, tuple[int, ...], tuple[int, ...]], tuple[Any, Any]
+    ] = field(default_factory=dict)
     reference_warmup: bool = False
+    _phase_batches: dict[tuple[int, int], EngineBatch] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _direct_evidence: dict[str, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _direct_evidence_committed: bool = field(default=False, init=False, repr=False)
+    _active_host_layer: str | None = field(default=None, init=False, repr=False)
+    _host_consumed_destinations: set[int] = field(
+        default_factory=set, init=False, repr=False
+    )
+    _host_schedule_observations: list[
+        tuple[int, tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...]]
+    ] = field(default_factory=list, init=False, repr=False)
+    _host_preload_waited: bool = field(default=False, init=False, repr=False)
+
+    def begin_host_layer(self, layer_name: str) -> None:
+        """Open exact host-transfer accounting for one numerical layer."""
+        if not layer_name or self._active_host_layer is not None:
+            raise RuntimeError("vLLM host layer lifetime is overlapping or unnamed")
+        self._active_host_layer = layer_name
+        self._host_consumed_destinations.clear()
+        self._host_schedule_observations.clear()
+
+    def consumed_host_destinations(self, layer_name: str) -> frozenset[int]:
+        if self._active_host_layer != layer_name:
+            raise RuntimeError("vLLM host transfer ran outside its active layer")
+        return frozenset(self._host_consumed_destinations)
+
+    def record_host_destinations(
+        self, layer_name: str, destinations: tuple[int, ...]
+    ) -> None:
+        if self._active_host_layer != layer_name:
+            raise RuntimeError("vLLM host transfer published into the wrong layer")
+        self._host_consumed_destinations.update(destinations)
+
+    def record_host_schedule(
+        self,
+        layer_name: str,
+        chunk_tokens: int,
+        request_indices: tuple[int, ...],
+        kv_tile_indices: tuple[int, ...],
+        selected_pages: tuple[tuple[int, ...], ...],
+    ) -> None:
+        if self._active_host_layer != layer_name:
+            raise RuntimeError("vLLM host schedule belongs to the wrong layer")
+        if not (
+            len(request_indices) == len(kv_tile_indices) == len(selected_pages)
+        ):
+            raise RuntimeError("vLLM host schedule diagnostics are misaligned")
+        self._host_schedule_observations.append(
+            (chunk_tokens, request_indices, kv_tile_indices, selected_pages)
+        )
+
+    def finish_host_layer(self, layer_name: str) -> None:
+        """Prove that every admitted host block became numerical HBM state."""
+        if self._active_host_layer != layer_name:
+            raise RuntimeError("vLLM host layer finalization is unbalanced")
+        expected = {destination for _, destination in self.host_transfer_pairs}
+        if self.host_preload_event is not None:
+            if expected and not self._host_preload_waited:
+                raise RuntimeError(
+                    "vLLM host attention did not wait for its exact preload"
+                )
+            # The first attention launch waits on the all-layer event. Every
+            # subsequent layer is ordered behind that same wait on the model
+            # stream, so the exact admitted destination set is materialized.
+            self._host_consumed_destinations.update(expected)
+        consumed = set(self._host_consumed_destinations)
+        observations = tuple(self._host_schedule_observations)
+        self._active_host_layer = None
+        self._host_consumed_destinations.clear()
+        self._host_schedule_observations.clear()
+        if consumed != expected:
+            missing = sorted(expected - consumed)
+            extra = sorted(consumed - expected)
+            raise RuntimeError(
+                "vLLM host layer did not materialize its exact admitted set: "
+                f"expected_count={len(expected)}, consumed_count={len(consumed)}, "
+                f"missing={missing[:8]}, extra={extra[:8]}, "
+                f"consumed={sorted(consumed)[:16]}, schedules={observations[:2]}"
+            )
+
+    def abort_host_layer(self, layer_name: str) -> None:
+        if self._active_host_layer == layer_name:
+            self._active_host_layer = None
+            self._host_consumed_destinations.clear()
+            self._host_schedule_observations.clear()
+
+    def wait_for_host_preload(self, stream: Any) -> bool:
+        """Order the model stream behind one typed all-layer transfer."""
+
+        event = self.host_preload_event
+        if event is None:
+            if self.host_transfer_pairs:
+                raise RuntimeError("vLLM direct host attention has no preload event")
+            return False
+        if self._host_preload_waited:
+            return False
+        stream.wait_event(event)
+        self._host_preload_waited = True
+        values = self._direct_evidence
+        values["host_preload_waits"] = values.get("host_preload_waits", 0) + 1
+        values["host_preload_batches"] = values.get("host_preload_batches", 0) + 1
+        values["host_transfer_blocks"] = values.get("host_transfer_blocks", 0) + int(
+            self.host_preload_blocks
+        )
+        values["host_transfer_bytes"] = values.get("host_transfer_bytes", 0) + int(
+            self.host_preload_bytes
+        )
+        return True
+
+    def phase_batch(self, start: int, count: int) -> EngineBatch:
+        """Validate and cache one framework phase for all model layers."""
+        if self.batch is None:
+            raise RuntimeError("vLLM forward sidecar has no engine batch")
+        key = (start, count)
+        phase = self._phase_batches.get(key)
+        if phase is None:
+            phase = self.batch.phase(start, count)
+            self._phase_batches[key] = phase
+        return phase
+
+    def storage_keys_for(
+        self, phase: EngineBatch
+    ) -> tuple[tuple[str | None, ...], ...]:
+        """Return connector storage identities aligned to one phase batch."""
+
+        if self.batch is None:
+            raise RuntimeError("vLLM forward sidecar has no engine batch")
+        if len(self.storage_key_tables) != len(self.batch.bindings):
+            raise RuntimeError(
+                "vLLM physical storage identities are not aligned to the forward"
+            )
+        by_request = {
+            binding.request_id: table
+            for binding, table in zip(
+                self.batch.bindings, self.storage_key_tables, strict=True
+            )
+        }
+        if len(by_request) != len(self.batch.bindings):
+            raise RuntimeError("vLLM forward contains duplicate stable request IDs")
+        try:
+            return tuple(by_request[binding.request_id] for binding in phase.bindings)
+        except KeyError as error:
+            raise RuntimeError(
+                "vLLM phase contains a request absent from connector metadata"
+            ) from error
+
+    def record_direct_launch(
+        self,
+        kind: str,
+        work_items: int,
+        *,
+        framework_owned: bool,
+        serving_tier: str = "hbm",
+    ) -> None:
+        """Accumulate direct-path evidence without global per-layer updates."""
+        if kind not in {"decode", "prefill"}:
+            raise ValueError(f"unknown vLLM direct phase {kind!r}")
+        if work_items <= 0:
+            raise ValueError("vLLM direct launch must contain work")
+        values = self._direct_evidence
+        for key, increment in (
+            (f"native_{kind}_launches", 1),
+            (f"request_bound_{kind}_launches", 1),
+            (f"native_{kind}_work_items", work_items),
+            ("semantic_dense_tiles", work_items),
+        ):
+            values[key] = values.get(key, 0) + increment
+        if framework_owned:
+            key = f"framework_owned_{kind}_launches"
+            values[key] = values.get(key, 0) + 1
+        if serving_tier == "host_staged":
+            key = f"host_{kind}_launches"
+            values[key] = values.get(key, 0) + 1
+
+    def record_profile_ns(self, name: str, elapsed_ns: int) -> None:
+        """Accumulate opt-in CPU timing at the same forward boundary."""
+        if not name.endswith("_cpu_ns") or elapsed_ns < 0:
+            raise ValueError("vLLM CPU profile counters must be nonnegative *_cpu_ns")
+        values = self._direct_evidence
+        values[name] = values.get(name, 0) + elapsed_ns
+
+    def commit_direct_evidence(self) -> dict[str, int]:
+        """Return this forward's counters exactly once at its owner boundary."""
+        if self._direct_evidence_committed:
+            raise RuntimeError("vLLM forward evidence was committed twice")
+        self._direct_evidence_committed = True
+        return dict(self._direct_evidence)
 
 
 _FORWARD_STATE: contextvars.ContextVar[VllmV1ForwardState | None] = (
@@ -529,12 +745,18 @@ class VllmV1Hook:
         self._slots = _StableVllmSlots(request_capacity)
         self._page_bytes = page_bytes
         self._expected_version = expected_vllm_version
-        self._version_provider = version_provider
+        installed = version_provider()
+        if installed != expected_vllm_version:
+            raise RuntimeError(
+                "unsupported vLLM version for NTA V1 hook: "
+                f"expected {expected_vllm_version}, found {installed or 'missing'}"
+            )
         self._tenant_for_request = tenant_for_request
         self._priority_for_request = priority_for_request
         self._deadline_for_request = deadline_for_request
         self._consumer = consumer
         self._native_launches = 0
+        self._last_bind_profile: dict[str, int] = {}
 
     @property
     def adapter(self) -> VllmAdapter:
@@ -545,9 +767,16 @@ class VllmV1Hook:
         """Return the runtime shared by the worker and attention consumer."""
         return self._runtime
 
-    def record_native_launch(self) -> None:
+    @property
+    def last_bind_profile(self) -> dict[str, int]:
+        """Return opt-in timing for the most recently completed bind."""
+        return dict(self._last_bind_profile)
+
+    def record_native_launch(self, count: int = 1) -> None:
         """Promote evidence only after an NTA attention launch completed."""
-        self._native_launches += 1
+        if count <= 0:
+            raise ValueError("native launch count must be positive")
+        self._native_launches += count
 
     def projection_contract(self) -> ConsumerContract:
         """Describe this hook without overstating what it executes.
@@ -583,14 +812,6 @@ class VllmV1Hook:
             )
         return contract
 
-    def _check_version(self) -> None:
-        installed = self._version_provider()
-        if installed != self._expected_version:
-            raise RuntimeError(
-                "unsupported vLLM version for NTA V1 hook: "
-                f"expected {self._expected_version}, found {installed or 'missing'}"
-            )
-
     def bind_forward(
         self,
         scheduler_output: Any,
@@ -600,7 +821,6 @@ class VllmV1Hook:
         stream: Any = None,
         granularity: Granularity = Granularity.PAGE_GROUP,
     ) -> EngineBatch:
-        self._check_version()
         projection = VllmV1SchedulerProjection.from_forward(
             scheduler_output,
             input_batch,
@@ -661,7 +881,17 @@ class VllmV1Hook:
         granularity: Granularity = Granularity.PAGE_GROUP,
     ) -> EngineBatch:
         """Bind vLLM V2's request batch through its typed CPU table mirror."""
-        self._check_version()
+        profiling = os.environ.get("NTA_PROFILE_CPU") == "1"
+        phase_started = time.perf_counter_ns()
+        profile: dict[str, int] = {}
+
+        def finish_phase(name: str) -> None:
+            nonlocal phase_started
+            if profiling:
+                now = time.perf_counter_ns()
+                profile[name] = now - phase_started
+                phase_started = now
+
         projection = VllmV1SchedulerProjection.from_v2_forward(
             scheduler_output,
             input_batch,
@@ -669,22 +899,88 @@ class VllmV1Hook:
             num_blocks=num_blocks,
             page_bytes=self._page_bytes,
         )
+        finish_phase("bridge_projection_cpu_ns")
         finished = tuple(
             str(request_id)
             for request_id in getattr(scheduler_output, "finished_req_ids", ())
         )
         for request_id in finished:
             self._adapter.retire_request(request_id)
+        finish_phase("bridge_finished_retire_cpu_ns")
         replacements = self._slots.replacements(
             projection.request_ids, projection.request_rows
         )
         for request_id in replacements:
             self._adapter.retire_request(request_id)
+        finish_phase("bridge_replacement_retire_cpu_ns")
         slots = self._slots.assign(
             projection.request_ids,
             finished,
             projection.request_rows,
         )
+        finish_phase("bridge_slot_assign_cpu_ns")
+        priorities = (
+            None
+            if self._priority_for_request is None
+            else tuple(
+                self._priority_for_request(request_id)
+                for request_id in projection.request_ids
+            )
+        )
+        deadlines = (
+            None
+            if self._deadline_for_request is None
+            else tuple(
+                self._deadline_for_request(request_id)
+                for request_id in projection.request_ids
+            )
+        )
+        tenants = (
+            None
+            if self._tenant_for_request is None
+            else tuple(
+                self._tenant_for_request(request_id)
+                for request_id in projection.request_ids
+            )
+        )
+        finish_phase("bridge_policy_cpu_ns")
+        exact_demand = projection.exact_demand()
+        finish_phase("bridge_exact_demand_cpu_ns")
+        result = self._adapter.bind_batch(
+            projection.request_ids,
+            slots,
+            epoch=epoch,
+            stream=stream,
+            priorities=priorities,
+            deadline_clocks=deadlines,
+            tenant_ids=tenants,
+            exact_demand=exact_demand,
+            granularity=granularity,
+        )
+        finish_phase("bridge_identity_publish_cpu_ns")
+        self._last_bind_profile = profile
+        return result
+
+    def bind_connector_forward(
+        self,
+        request_ids: Sequence[str],
+        block_tables: Sequence[Sequence[int]],
+        finished_request_ids: Sequence[str],
+        *,
+        epoch: int,
+        stream: Any = None,
+        granularity: Granularity = Granularity.PAGE_GROUP,
+    ) -> EngineBatch:
+        """Bind exact scheduler-owned metadata from vLLM's KVConnector seam."""
+        projection = VllmV1SchedulerProjection(
+            tuple(request_ids),
+            tuple(tuple(row) for row in block_tables),
+            self._page_bytes,
+        )
+        finished = tuple(str(request_id) for request_id in finished_request_ids)
+        for request_id in finished:
+            self._adapter.retire_request(request_id)
+        slots = self._slots.assign(projection.request_ids, finished)
         priorities = (
             None
             if self._priority_for_request is None

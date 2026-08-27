@@ -28,6 +28,9 @@ from nta_runtime import (
     OperatorPartialState,
     OperatorPlanFlag,
     OperatorReduction,
+    NvmeDmaTarget,
+    NvmeOptions,
+    NvmeTransport,
     Placement,
     Replica,
     RequestRange,
@@ -38,6 +41,7 @@ from nta_runtime import (
 )
 from nta_runtime.flashinfer import (
     BIND_CURRENT_GENERATION,
+    RUNNABLE_OFFSET_SHIFT,
     RUNNABLE_WORK,
     request_bound_attention_jit_args,
 )
@@ -565,12 +569,243 @@ def run_prefill_hooked(
     fixture.plan.mark_consumed(torch.cuda.current_stream())
 
 
+def run_nvme_numerical_oracle() -> None:
+    """Prove that direct-NVMe bytes are FlashInfer's numerical KV input."""
+
+    endpoint = os.environ.get("NTA_NVME_ENDPOINT", "")
+    reference_path = pathlib.Path(os.environ.get("NTA_NVME_REFERENCE", ""))
+    media_policy = os.environ.get("NTA_NVME_MEDIA_POLICY", "hardware-write-protect")
+    dma_target = os.environ.get("NTA_NVME_DMA_TARGET", "hbm-peer")
+    if not endpoint or not reference_path.is_file():
+        raise RuntimeError("physical NVMe oracle needs an endpoint and reference file")
+    if dma_target != "hbm-peer":
+        raise RuntimeError("physical FlashInfer oracle requires direct HBM DMA")
+
+    transport = NvmeTransport(
+        NvmeOptions(
+            endpoint=endpoint,
+            namespace_id=int(os.environ.get("NTA_NVME_NSID", "1")),
+            queue_depth=int(os.environ.get("NTA_NVME_QUEUE_DEPTH", "64")),
+            trust_read_only_device_code=media_policy == "trusted-read-only-code",
+            dma_target=NvmeDmaTarget.HBM_PEER,
+        )
+    )
+    runtime = None
+    device_plan = None
+    hbm_region = None
+    try:
+        capabilities = transport.capabilities
+        source_offset = int(os.environ.get("NTA_NVME_TEST_SOURCE_OFFSET", "512"))
+        shape = (4, 2, 16, 2, 128)
+        payload_bytes = math.prod(shape) * torch.float16.itemsize
+        if (
+            source_offset < 0
+            or source_offset % capabilities.lba_size
+            or payload_bytes % capabilities.lba_size
+            or payload_bytes > capabilities.max_transfer_bytes
+            or source_offset + payload_bytes > capabilities.namespace_bytes
+        ):
+            raise RuntimeError("NVMe FlashInfer oracle extent is not materializable")
+
+        with reference_path.open("rb") as reference_file:
+            reference_file.seek(source_offset)
+            payload = reference_file.read(payload_bytes)
+        if len(payload) != payload_bytes:
+            raise RuntimeError("NVMe reference file does not cover the oracle extent")
+        reference_bytes = torch.frombuffer(
+            bytearray(payload), dtype=torch.uint8
+        ).clone()
+        reference_device_bytes = reference_bytes.to(device="cuda")
+        reference_kv = reference_device_bytes.view(torch.float16).reshape(shape)
+        if not torch.isfinite(reference_kv).all():
+            raise RuntimeError("NVMe oracle payload is not finite fp16 KV data")
+
+        peer_alignment = 64 * 1024
+        if capabilities.lba_size >= peer_alignment:
+            raise RuntimeError("NVMe LBA cannot exercise a non-peer-aligned target")
+        allocation_bytes = payload_bytes + 3 * peer_alignment
+        destination_storage = torch.empty(
+            allocation_bytes, dtype=torch.uint8, device="cuda"
+        )
+        allocation_address = destination_storage.data_ptr()
+        peer_address = (allocation_address + peer_alignment - 1) & ~(peer_alignment - 1)
+        destination_address = peer_address + capabilities.lba_size
+        destination_offset = destination_address - allocation_address
+        if (
+            destination_address % capabilities.lba_size
+            or destination_address % peer_alignment == 0
+            or destination_offset < 0
+            or destination_offset + payload_bytes > allocation_bytes
+        ):
+            raise RuntimeError("failed to construct an exact external HBM subrange")
+        destination_bytes = destination_storage.narrow(
+            0, destination_offset, payload_bytes
+        )
+        destination_kv = destination_bytes.view(torch.float16).reshape(shape)
+        destination_kv.zero_()
+
+        q = (
+            torch.linspace(-0.5, 0.5, 4 * 128, dtype=torch.float32, device="cuda")
+            .to(torch.float16)
+            .reshape(1, 4, 128)
+        )
+        stock = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+            "NHD",
+        )
+        plan(stock)
+        expected = stock.run(q, reference_kv).clone()
+        poison_output = stock.run(q, destination_kv).clone()
+        poison_delta = float((poison_output.float() - expected.float()).abs().max())
+        if not math.isfinite(poison_delta) or poison_delta <= 1.0e-3:
+            raise RuntimeError("poison cache does not distinguish the NVMe payload")
+
+        hooked = make_wrapper()
+        plan(hooked)
+        schedule = decode_schedule(hooked)
+        if not schedule.work_count or set(schedule.request_indices) != {0}:
+            raise RuntimeError(f"unexpected FlashInfer oracle schedule: {schedule}")
+        work_count = schedule.work_count
+        runtime = Runtime(
+            RuntimeConfig(
+                request_capacity=1,
+                object_capacity=1,
+                intent_capacity=max(1, work_count),
+                work_ticket_capacity=work_count,
+                max_dependencies_per_work_ticket=1,
+            ),
+            nvme=transport,
+        )
+        runtime.set_tenant_budget(0, 2 * payload_bytes)
+        runtime.set_request(
+            0,
+            17,
+            GENERATION,
+            priority=4,
+            max_outstanding_bytes=2 * payload_bytes,
+        )
+        hbm_region = transport.register_hbm_region(destination_address, payload_bytes)
+        installed_address = runtime.install_registered_nvme_object(
+            0,
+            OBJECT_ID,
+            GENERATION,
+            source_offset,
+            payload_bytes,
+            hbm_region,
+            destination_address,
+        )
+        if installed_address != destination_address:
+            raise RuntimeError("runtime changed the FlashInfer numerical destination")
+
+        dependencies = [
+            AcquireRequirement(
+                0,
+                0,
+                OBJECT_ID,
+                0,
+                0,
+                GENERATION,
+                payload_bytes,
+                0,
+            )
+            for _ in range(work_count)
+        ]
+        work_items = [
+            WorkItem(
+                0,
+                0,
+                GENERATION,
+                int(schedule.kv_tile_indices[index]),
+                index,
+                1,
+                0,
+                index,
+                0,
+                index,
+                work_count,
+                2500,
+            )
+            for index in range(work_count)
+        ]
+        device_plan = DeviceWorkPlan(work_count, work_count, runtime.device_ordinal)
+        stream = torch.cuda.current_stream()
+        device_plan.upload(
+            work_items,
+            dependencies,
+            [RequestRange(0, work_count, 0, GENERATION)],
+            stream,
+        )
+        device_plan.wait_on(stream)
+        phases = PhaseFunctions()
+        epoch = FlashInferLayerEpoch(
+            runtime,
+            device_plan,
+            phases.program,
+            object_count=1,
+            max_progress_rounds=1,
+        )
+        output = torch.full_like(expected, math.nan)
+        result = epoch.run_nvme(
+            hooked,
+            q,
+            destination_kv,
+            output,
+            issue_budget=capabilities.queue_depth,
+            completion_budget=capabilities.queue_depth,
+            timeout_ns=1_000_000_000,
+            stream=stream,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            destination_bytes, reference_device_bytes, rtol=0, atol=0
+        )
+        torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-3)
+        states = [runtime.work_ticket_state(index) for index in range(work_count)]
+        if states != [3] * work_count or result.progress_rounds != 1:
+            raise RuntimeError(
+                f"NVMe FlashInfer epoch did not retire exactly: {states}, {result}"
+            )
+        stats = transport.stats
+        if (
+            stats.submitted == 0
+            or stats.completed != stats.submitted
+            or stats.failed
+            or stats.outstanding
+            or stats.error
+            or stats.hbm_region_registrations != 1
+            or stats.hbm_transfer_views != 1
+        ):
+            raise RuntimeError(f"NVMe FlashInfer queue did not quiesce: {stats}")
+        maximum = float((output.float() - expected.float()).abs().max())
+        print(
+            "nvme_flashinfer_numerical=pass "
+            f"payload_alias=1 poison_delta={poison_delta:.6g} "
+            f"max_abs_error={maximum:.6g} work_count={work_count} "
+            f"submitted={stats.submitted} completed={stats.completed} "
+            f"regions={stats.hbm_region_registrations} "
+            f"views={stats.hbm_transfer_views}"
+        )
+        del epoch
+    finally:
+        if device_plan is not None:
+            device_plan.close()
+        if runtime is not None:
+            runtime.close()
+        if hbm_region is not None:
+            hbm_region.close()
+        transport.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sanitizer", action="store_true")
+    parser.add_argument("--nvme-numerical-only", action="store_true")
     options = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if options.nvme_numerical_only:
+        run_nvme_numerical_oracle()
+        return
     torch.manual_seed(7)
     shape = (4, 2, 16, 2, 128)
     host_kv = torch.randn(shape, dtype=torch.float16, pin_memory=True)
@@ -664,6 +899,50 @@ def main() -> None:
         raise RuntimeError(f"unexpected heterogeneous progress rounds: {mixed_result}")
     mixed.assert_all_states(3)
     torch.testing.assert_close(mixed_output, mixed_expected, rtol=2e-3, atol=2e-3)
+
+    arriving_staging_kv = torch.zeros_like(mixed_reference_kv)
+    arriving_staging_kv[:mixed_pages].copy_(mixed_reference_kv[:mixed_pages])
+    arriving = RuntimeFixture(
+        arriving_staging_kv,
+        mixed_host_kv,
+        work_count=2,
+        request_indices=[0, 1],
+        direct_work_indices={0},
+        source_indices=torch.arange(mixed_pages, 2 * mixed_pages, dtype=torch.int32),
+        destination_indices=torch.arange(
+            mixed_pages, 2 * mixed_pages, dtype=torch.int32
+        ),
+    )
+    arriving_output = torch.full_like(mixed_expected, math.nan)
+    arriving_stream = torch.cuda.Stream(priority=0)
+    arriving_ready = torch.cuda.Event()
+    with torch.cuda.stream(arriving_stream):
+        phases.program.preload_host(arriving.native_runtime, 0, 1, arriving_stream)
+        arriving_ready.record(arriving_stream)
+    arriving_epoch = FlashInferLayerEpoch(
+        arriving.native_runtime,
+        arriving.plan,
+        phases.program,
+        object_count=0,
+        max_progress_rounds=1,
+    )
+    arriving_passes = arriving_epoch.enqueue_arriving_host(
+        hooked,
+        mixed_q,
+        arriving_staging_kv,
+        arriving_output,
+        ready_event=arriving_ready,
+        initial_ready_work_count=1,
+        stream=torch.cuda.current_stream(),
+    )
+    arriving_result = arriving_epoch.check(arriving_passes, torch.cuda.current_stream())
+    if arriving_result.progress_rounds != 1:
+        raise RuntimeError(
+            f"unexpected arriving-host progress rounds: {arriving_result}"
+        )
+    arriving.assert_all_states(3)
+    torch.testing.assert_close(arriving_staging_kv, mixed_reference_kv, rtol=0, atol=0)
+    torch.testing.assert_close(arriving_output, mixed_expected, rtol=2e-3, atol=2e-3)
 
     pipelined_staging_kv = torch.zeros_like(mixed_reference_kv)
     pipelined = RuntimeFixture(
@@ -1001,8 +1280,12 @@ def main() -> None:
         fragmented_staging,
         fragmented,
         fragmented_output,
-        launch_flags=BIND_CURRENT_GENERATION | RUNNABLE_WORK,
-        launch_work_count=split_work,
+        launch_flags=(
+            BIND_CURRENT_GENERATION
+            | RUNNABLE_WORK
+            | ((split_work // 2) << RUNNABLE_OFFSET_SHIFT)
+        ),
+        launch_work_count=split_work // 2,
     )
     torch.cuda.synchronize()
     fragmented.assert_all_states(3)
@@ -1027,6 +1310,8 @@ def main() -> None:
         fragmented_staging,
         fragmented_output,
         progress_blocks=(split_work // 2, split_work // 2),
+        ready_work_counts=(split_work // 2, split_work // 2),
+        ready_work_offsets=(0, split_work // 2),
         stream=torch.cuda.current_stream(),
     )
     if fragmented_result.progress_rounds != 2:

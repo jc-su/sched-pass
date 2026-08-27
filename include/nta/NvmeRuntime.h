@@ -69,6 +69,21 @@ struct NvmeQueueStats {
   std::uint32_t cqHead;
   std::uint32_t cqPhase;
   std::uint32_t nextCompletionDword3;
+  std::uint64_t hbmRegionRegistrations;
+  std::uint64_t hbmRegionBytes;
+  std::uint64_t hbmTransferViews;
+};
+
+// Native description of the setup-time registration envelope for a
+// caller-owned CUDA slice.  Framework allocators may place several logical
+// tensors in one CUDA allocation and in the same 64 KiB peer page.  Callers
+// use this description to coalesce overlapping envelopes before pinning, so
+// every peer PTE has exactly one mapping owner.
+struct NvmeHbmRegistrationRange {
+  void *allocationAddress;
+  std::size_t allocationBytes;
+  void *registrationAddress;
+  std::size_t registrationBytes;
 };
 
 class NvmeBuffer {
@@ -83,6 +98,7 @@ public:
   [[nodiscard]] void *deviceAddress() const noexcept;
   [[nodiscard]] std::uint64_t dmaPageListAddress() const noexcept;
   [[nodiscard]] std::uint32_t dmaPageCount() const noexcept;
+  [[nodiscard]] std::uint32_t dmaFirstByteOffset() const noexcept;
   [[nodiscard]] std::size_t bytes() const noexcept;
   [[nodiscard]] NvmeDmaTarget dmaTarget() const noexcept;
   // False for a mapping lease over caller-owned HBM (for example a vLLM KV
@@ -96,6 +112,34 @@ private:
   std::unique_ptr<Impl> impl_;
 
   friend class NvmeTransport;
+  friend class NvmeHbmRegion;
+};
+
+// Setup-time registration of a stable, caller-owned CUDA allocation.  The
+// region owns one peer-page/IOMMU mapping and one immutable device page table.
+// Transfer views borrow slices of those resources; creating a view performs no
+// ioctl, peer pin, CUDA allocation, or page-table upload.
+class NvmeHbmRegion {
+public:
+  ~NvmeHbmRegion();
+
+  NvmeHbmRegion(const NvmeHbmRegion &) = delete;
+  NvmeHbmRegion &operator=(const NvmeHbmRegion &) = delete;
+  NvmeHbmRegion(NvmeHbmRegion &&) noexcept;
+  NvmeHbmRegion &operator=(NvmeHbmRegion &&) noexcept;
+
+  [[nodiscard]] void *deviceAddress() const noexcept;
+  [[nodiscard]] std::size_t bytes() const noexcept;
+  [[nodiscard]] std::unique_ptr<NvmeBuffer> view(void *deviceAddress,
+                                                 std::size_t bytes) const;
+
+private:
+  struct Impl;
+  explicit NvmeHbmRegion(std::shared_ptr<Impl> impl);
+  std::shared_ptr<Impl> impl_;
+
+  friend class NvmeTransport;
+  friend class NvmeBuffer;
 };
 
 class NvmeTransport {
@@ -113,21 +157,23 @@ public:
   [[nodiscard]] int deviceOrdinal() const noexcept;
   [[nodiscard]] abi::NvmeQueueView *deviceQueue() const noexcept;
   [[nodiscard]] NvmeQueueStats readStats() const;
-  [[nodiscard]] std::unique_ptr<NvmeBuffer>
-  allocate(std::size_t bytes);
-  // Map a caller-owned CUDA HBM range for direct NVMe DMA.  This is a setup /
-  // lifetime operation: the returned lease must remain alive until every
-  // queued command using the range has completed.  The range must satisfy the
-  // peer mapper's 64 KiB alignment contract; arbitrary subranges are rejected
-  // rather than silently mapping a different destination.
-  [[nodiscard]] std::unique_ptr<NvmeBuffer>
-  mapExternalHbm(void *deviceAddress, std::size_t bytes);
+  [[nodiscard]] std::unique_ptr<NvmeBuffer> allocate(std::size_t bytes);
+  // Validate one caller-owned CUDA slice and describe the minimal peer-page
+  // envelope that can be registered.  This is a read-only setup-plane query;
+  // it does not pin memory or mutate the IOMMU domain.
+  [[nodiscard]] NvmeHbmRegistrationRange
+  describeExternalHbm(void *deviceAddress, std::size_t bytes) const;
+  // Register a stable caller-owned CUDA range once, before serving. Individual
+  // MDTS-bounded transfer views are then derived without setup-plane work.
+  [[nodiscard]] std::unique_ptr<NvmeHbmRegion>
+  registerExternalHbm(void *deviceAddress, std::size_t bytes);
 
 private:
   struct Impl;
   std::shared_ptr<Impl> impl_;
 
   friend class NvmeBuffer;
+  friend class NvmeHbmRegion;
 };
 
 } // namespace nta

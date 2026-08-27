@@ -102,6 +102,8 @@ try:
     active_registry.bind(["active-request"], [1])
 except ValueError as error:
     assert "multiple slots" in str(error)
+    assert "active_slot=0" in str(error)
+    assert "incoming_slot=1" in str(error)
 else:
     raise AssertionError("an active request ID was accepted in multiple slots")
 

@@ -1,5 +1,5 @@
-#include "nta/RuntimeABI.h"
 #include "nta/OperatorContract.h"
+#include "nta/RuntimeABI.h"
 #include "nta/Tier.h"
 
 #include <cstddef>
@@ -11,7 +11,9 @@ int main() {
   using namespace nta::abi;
 
   static_assert(alignof(RequestContext) == 32);
-  static_assert(alignof(TenantContext) == 32);
+  static_assert(alignof(TenantContext) == 16);
+  static_assert(sizeof(TenantContext) == 16);
+  static_assert(offsetof(TenantContext, outstandingBytes) == 8);
   static_assert(alignof(RequestProgress) == 32);
   static_assert(sizeof(RequestProgress) == 96);
   static_assert(offsetof(RequestProgress, pendingComputeNs) == 64);
@@ -76,11 +78,10 @@ int main() {
                 23);
   static_assert(
       destinationTransferIndexLimit(packTransferIndexLimits(23, 47)) == 47);
-  static_assert(nta::decodeTierCapabilities(
-                    nta::encodeTierCapabilities(nta::TierDirectAddress |
-                                                 nta::TierHostRegistered)) ==
+  static_assert(nta::decodeTierCapabilities(nta::encodeTierCapabilities(
+                    nta::TierDirectAddress | nta::TierHostRegistered)) ==
                 (nta::TierDirectAddress | nta::TierHostRegistered));
-  if (Version != 29 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
+  if (Version != 31 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

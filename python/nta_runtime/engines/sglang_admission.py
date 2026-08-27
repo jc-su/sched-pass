@@ -8,6 +8,7 @@ import time
 from typing import Any, Callable
 
 from nta_runtime.engines.sglang_hicache import SglangHiCacheBridge, find_bridge
+from nta_runtime.progress_frontier import FrontierState
 from nta_runtime.requests import stable_request_id
 
 
@@ -73,17 +74,17 @@ def _running_request_ids(running: Any) -> set[int]:
 
 
 def _compiler_feedback_reason(running: Any, bridge: SglangHiCacheBridge) -> str | None:
-    plan = bridge.poll_critical_work(_running_request_ids(running))
-    if plan is None:
+    frontier = bridge.poll_request_frontier(_running_request_ids(running))
+    if frontier is None:
         return None
-    if plan.compute_order:
+    if frontier.state is FrontierState.EXECUTABLE:
         bridge.record_admission(admission_feedback_executable=1)
         return None
-    if plan.data_order:
+    if frontier.state is FrontierState.DATA_BLOCKED:
         bridge.record_admission(admission_feedback_data_blocked=1)
         return "data_blocked"
-    bridge.record_admission(admission_feedback_terminal=1)
-    return "terminal"
+    bridge.record_admission(admission_feedback_quiescent=1)
+    return "quiescent"
 
 
 def _bridge_for_batch(batch: Any) -> SglangHiCacheBridge | None:
@@ -153,6 +154,14 @@ class AcquisitionAdmission:
             admission_considered_requests=len(requests),
             admission_external_bytes=external_bytes or progress.total_bytes,
         )
+        if progress.published_layers == 0:
+            # Late-bound ownership deliberately defers transport until exact
+            # FlashInfer work geometry exists.  Holding the batch here would
+            # create a causal cycle: metadata cannot be built before admission,
+            # while no producer can be selected before metadata.  Release the
+            # batch to bind work; this is not a readiness claim.
+            bridge.record_admission(admission_released_for_binding=1)
+            return batch
         if progress.total_bytes < self._config.minimum_bytes:
             bridge.record_admission(admission_released_small_batches=1)
             return batch

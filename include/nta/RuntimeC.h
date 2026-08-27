@@ -7,13 +7,14 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 37U
+#define NTA_RUNTIME_C_API_VERSION 42U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
 typedef struct nta_device_work_plan nta_device_work_plan;
 typedef struct nta_jit_phase_program nta_jit_phase_program;
 typedef struct nta_nvme_transport nta_nvme_transport;
+typedef struct nta_nvme_hbm_region nta_nvme_hbm_region;
 typedef struct nta_cxl_dax_transport nta_cxl_dax_transport;
 
 typedef enum nta_status {
@@ -29,10 +30,6 @@ typedef enum nta_placement {
   NTA_PLACEMENT_HOST_STAGED = 2,
   NTA_PLACEMENT_CXL_MAPPED = 3,
 } nta_placement;
-
-typedef enum nta_indexed_host_object_flags {
-  NTA_INDEXED_HOST_OBJECT_PREACQUIRED = 1U << 0,
-} nta_indexed_host_object_flags;
 
 typedef enum nta_nvme_media_policy {
   NTA_NVME_REQUIRE_HARDWARE_WRITE_PROTECTION = 0,
@@ -104,8 +101,33 @@ typedef struct nta_indexed_host_object {
   uint32_t staging_stride_bytes;
   uint32_t source_index_limit;
   uint32_t staging_index_limit;
-  uint32_t flags;
+  uint32_t reserved;
 } nta_indexed_host_object;
+
+typedef struct nta_indexed_host_index_binding {
+  uint64_t source_indices_device_address;
+  uint64_t staging_indices_device_address;
+  uint32_t index_count;
+  uint32_t reserved;
+} nta_indexed_host_index_binding;
+
+typedef struct nta_contiguous_copy_run {
+  uint32_t source_first_row;
+  uint32_t destination_first_row;
+  uint32_t row_count;
+  uint32_t reserved;
+} nta_contiguous_copy_run;
+
+typedef struct nta_strided_copy_group {
+  uint64_t source_address;
+  uint64_t destination_address;
+  uint32_t source_rows;
+  uint32_t destination_rows;
+  uint32_t row_bytes;
+  uint32_t source_stride_bytes;
+  uint32_t destination_stride_bytes;
+  uint32_t reserved;
+} nta_strided_copy_group;
 
 typedef struct nta_work_item {
   uint32_t request_index;
@@ -173,7 +195,17 @@ typedef struct nta_nvme_queue_stats {
   uint32_t cq_head;
   uint32_t cq_phase;
   uint32_t next_completion_dword3;
+  uint64_t hbm_region_registrations;
+  uint64_t hbm_region_bytes;
+  uint64_t hbm_transfer_views;
 } nta_nvme_queue_stats;
+
+typedef struct nta_nvme_hbm_registration_range {
+  uint64_t allocation_address;
+  uint64_t allocation_bytes;
+  uint64_t registration_address;
+  uint64_t registration_bytes;
+} nta_nvme_hbm_registration_range;
 
 typedef struct nta_cxl_dax_options {
   uint32_t struct_size;
@@ -202,6 +234,8 @@ typedef struct nta_tier_descriptor {
   uint32_t protocol_owner;
   uint32_t payload_owner;
   uint32_t transfer_destination_owner;
+  uint32_t mapping_owner;
+  uint32_t directory_owner;
   uint32_t reserved;
 } nta_tier_descriptor;
 
@@ -294,11 +328,20 @@ nta_nvme_transport_get_capabilities(const nta_nvme_transport *transport,
                                     nta_nvme_capabilities *capabilities);
 nta_status nta_nvme_transport_read_stats(const nta_nvme_transport *transport,
                                          nta_nvme_queue_stats *stats);
+nta_status nta_nvme_transport_describe_hbm_region(
+    const nta_nvme_transport *transport, uint64_t device_address,
+    uint64_t bytes, nta_nvme_hbm_registration_range *range_out);
+nta_status
+nta_nvme_transport_register_hbm_region(nta_nvme_transport *transport,
+                                       uint64_t device_address, uint64_t bytes,
+                                       nta_nvme_hbm_region **region_out);
+void nta_nvme_hbm_region_destroy(nta_nvme_hbm_region *region);
 nta_status nta_cxl_dax_transport_create(const nta_cxl_dax_options *options,
                                         nta_cxl_dax_transport **transport_out);
 void nta_cxl_dax_transport_destroy(nta_cxl_dax_transport *transport);
-nta_status nta_cxl_dax_transport_get_capabilities(
-    const nta_cxl_dax_transport *transport, nta_cxl_dax_capabilities *capabilities);
+nta_status
+nta_cxl_dax_transport_get_capabilities(const nta_cxl_dax_transport *transport,
+                                       nta_cxl_dax_capabilities *capabilities);
 nta_status nta_runtime_get_tier_descriptor(const nta_runtime *runtime,
                                            uint32_t source_kind,
                                            nta_tier_descriptor *descriptor);
@@ -321,8 +364,7 @@ nta_status nta_runtime_cancel_request(nta_runtime *runtime, uint32_t slot,
                                       uint32_t generation);
 nta_status nta_runtime_set_tenant_budget(nta_runtime *runtime,
                                          uint32_t tenant_id,
-                                         uint64_t max_outstanding_bytes,
-                                         uint32_t weight);
+                                         uint64_t max_outstanding_bytes);
 nta_status nta_runtime_register_object(nta_runtime *runtime, uint32_t slot,
                                        uint64_t object_id, uint32_t version,
                                        uint64_t bytes,
@@ -349,6 +391,11 @@ nta_status nta_runtime_register_indexed_host_objects_async_quiesced(
     nta_runtime *runtime, uint32_t first_slot,
     const nta_indexed_host_object *objects, uint32_t object_count,
     uint64_t cuda_stream, uint64_t prior_consumer_event);
+nta_status nta_runtime_register_indexed_host_objects_async_bound(
+    nta_runtime *runtime, uint32_t first_slot,
+    const nta_indexed_host_object *objects, uint32_t object_count,
+    const nta_indexed_host_index_binding *index_binding,
+    uint64_t cuda_stream, uint64_t prior_consumer_event);
 nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
                                         uint32_t object_slot,
                                         uint32_t relative_replica,
@@ -363,18 +410,16 @@ nta_status nta_runtime_install_nvme_object_async(
     nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
     uint64_t source_byte_offset, uint64_t bytes, uint64_t cuda_stream,
     uint64_t prior_consumer_event, uint64_t *destination_device_address_out);
-// Install an NVMe object into a caller-owned CUDA HBM range. The runtime owns
-// only the NVMe peer mapping and DMA page list; it never frees the destination
-// allocation. The mapping is created during installation and retained until
-// the object slot's stream-ordered lifetime ends.
-nta_status nta_runtime_install_external_nvme_object(
+// Publish an MDTS-bounded view of a setup-time registered caller-owned HBM
+// region. Publication owns no allocation or mapping operation.
+nta_status nta_runtime_install_registered_nvme_object(
     nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
-    uint64_t source_byte_offset, uint64_t bytes,
+    uint64_t source_byte_offset, uint64_t bytes, nta_nvme_hbm_region *region,
     uint64_t destination_device_address,
     uint64_t *destination_device_address_out);
-nta_status nta_runtime_install_external_nvme_object_async(
+nta_status nta_runtime_install_registered_nvme_object_async(
     nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
-    uint64_t source_byte_offset, uint64_t bytes,
+    uint64_t source_byte_offset, uint64_t bytes, nta_nvme_hbm_region *region,
     uint64_t destination_device_address, uint64_t cuda_stream,
     uint64_t prior_consumer_event, uint64_t *destination_device_address_out);
 nta_status nta_runtime_read_pending_count(const nta_runtime *runtime,
@@ -417,6 +462,11 @@ void nta_dlpack_managed_tensor_destroy(void *managed_tensor);
 nta_status nta_stream_synchronize(uint64_t cuda_stream);
 nta_status nta_copy_host_to_device_async(uint64_t destination, uint64_t source,
                                          uint64_t bytes, uint64_t cuda_stream);
+nta_status
+nta_copy_strided_host_runs_async(const nta_strided_copy_group *groups,
+                                 uint32_t group_count,
+                                 const nta_contiguous_copy_run *runs,
+                                 uint32_t run_count, uint64_t cuda_stream);
 
 nta_status nta_device_work_plan_create(uint32_t work_item_capacity,
                                        uint32_t dependency_capacity,
@@ -429,9 +479,9 @@ nta_status nta_device_work_plan_upload(
     uint32_t dependency_count, const nta_request_work_range *requests,
     uint32_t request_count, uint64_t cuda_stream);
 nta_status nta_device_work_plan_wait_on(const nta_device_work_plan *plan,
-                                         uint64_t cuda_stream);
+                                        uint64_t cuda_stream);
 nta_status nta_device_work_plan_mark_consumed(const nta_device_work_plan *plan,
-                                               uint64_t cuda_stream);
+                                              uint64_t cuda_stream);
 nta_status
 nta_device_work_plan_synchronize_upload(const nta_device_work_plan *plan);
 uint64_t nta_device_work_plan_work_items(const nta_device_work_plan *plan);
@@ -463,6 +513,9 @@ nta_status nta_jit_phase_invalidate_cached_objects(
 nta_status nta_jit_phase_validate_indexed_host_range(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
+nta_status nta_jit_phase_warmup_indexed_host_validation(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint64_t cuda_stream);
 nta_status nta_jit_phase_rebind_indexed_host_pairs(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t pair_count, uint64_t key_source,
@@ -543,8 +596,8 @@ nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        uint64_t cuda_stream);
 /* C API v36: typed tier ownership is exported with each descriptor and
  * NVMe object replacement has an event-ordered asynchronous form; this
- * retains the completion-driven NVMe progress API. One launch remains active until
- * both the acquisition intent queue and controller queue are idle, or the
+ * retains the completion-driven NVMe progress API. One launch remains active
+ * until both the acquisition intent queue and controller queue are idle, or the
  * device-side timeout expires. */
 nta_status nta_jit_phase_progress_nvme_until_idle(
     const nta_jit_phase_program *program, nta_runtime *runtime,

@@ -153,6 +153,9 @@ public:
   static constexpr std::uint32_t PageCount = 3;
   static constexpr std::uint32_t Bytes = PageBytes * PageCount;
   static constexpr std::uint64_t ObjectId = 0x4e544154455354ULL;
+  // PRPs contain transport/IOMMU addresses, not CUDA virtual addresses. Use a
+  // deterministic aligned IOVA fixture while staging remains real HBM.
+  static constexpr std::uint64_t DmaBase = 0x4'0000'0000ULL;
 
   QueueFixture()
       : requests(Capacity), tenants(1), requestProgress(Capacity),
@@ -189,15 +192,13 @@ public:
 
     requests.upload({1, 0, Bytes, 0, 7, 0, 4, 0});
     requestProgress.upload({1, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
-    tenants.upload({Capacity * Bytes, 0, 1, 1, 0});
+    tenants.upload({Capacity * Bytes, 0});
     objects.upload({ObjectId, reinterpret_cast<std::uint64_t>(staging.get()),
                     Bytes, 0, 3,
                     static_cast<std::uint32_t>(nta::abi::ObjectState::New), 0,
                     1, 0, 0, 0});
     for (std::uint32_t page = 0; page < PageCount; ++page) {
-      dmaPages.upload(reinterpret_cast<std::uint64_t>(
-                          reinterpret_cast<std::byte *>(staging.get()) +
-                          static_cast<std::size_t>(page) * PageBytes),
+      dmaPages.upload(DmaBase + static_cast<std::uint64_t>(page) * PageBytes,
                       page);
     }
     replicas.upload({0, reinterpret_cast<std::uint64_t>(dmaPages.get()), 80'000,
@@ -335,9 +336,8 @@ public:
         slot);
     for (std::uint32_t page = 0; page < PageCount; ++page) {
       dmaPages.upload(
-          reinterpret_cast<std::uint64_t>(
-              reinterpret_cast<std::byte *>(staging.get() + contents.size()) +
-              static_cast<std::size_t>(page) * PageBytes),
+          DmaBase + static_cast<std::uint64_t>(slot * PageCount + page) *
+                        PageBytes,
           slot * PageCount + page);
     }
     replicas.upload(
@@ -498,10 +498,18 @@ void verifyDirectPath(QueueFixture &fixture, const KernelModule &kernels,
   const nta::abi::NvmeQueueView issued = fixture.queue.download();
   const nta::abi::BackendView backend = fixture.backends.download(
       static_cast<std::uint32_t>(nta::abi::SourceKind::Nvme));
-  require(issued.submitted == 1 && issued.directSubmitted == 1 &&
-              issued.directFallbacks == 0 && issued.outstanding == 1 &&
-              issued.ownerLock == 0 && backend.pendingAcquisitions == 0,
-          "CTA direct issue counters are inconsistent");
+  if (!(issued.submitted == 1 && issued.directSubmitted == 1 &&
+        issued.directFallbacks == 0 && issued.outstanding == 1 &&
+        issued.ownerLock == 0 && backend.pendingAcquisitions == 0)) {
+    throw std::runtime_error(
+        "CTA direct issue counters are inconsistent: submitted=" +
+        std::to_string(issued.submitted) +
+        " direct=" + std::to_string(issued.directSubmitted) +
+        " fallback=" + std::to_string(issued.directFallbacks) +
+        " outstanding=" + std::to_string(issued.outstanding) +
+        " owner=" + std::to_string(issued.ownerLock) +
+        " pending=" + std::to_string(backend.pendingAcquisitions));
+  }
   require(fixture.intentPool.download().active == 0,
           "direct issue unexpectedly published a scheduled intent");
   require(fixture.objects.download().state ==
@@ -527,6 +535,9 @@ void verifyDirectPath(QueueFixture &fixture, const KernelModule &kernels,
   const nta::abi::NvmeSubmission submission =
       fixture.submissions.download(submissionIndex);
   const std::uint32_t commandId = submission.dword[0] >> 16U;
+  const std::uint64_t firstPrp =
+      static_cast<std::uint64_t>(submission.dword[6]) |
+      (static_cast<std::uint64_t>(submission.dword[7]) << 32U);
   const std::uint64_t secondPrp =
       static_cast<std::uint64_t>(submission.dword[8]) |
       (static_cast<std::uint64_t>(submission.dword[9]) << 32U);
@@ -535,7 +546,8 @@ void verifyDirectPath(QueueFixture &fixture, const KernelModule &kernels,
       static_cast<std::uint64_t>(commandId) * QueueFixture::PageBytes;
   const std::size_t listBase = static_cast<std::size_t>(commandId) *
                                QueueFixture::PageBytes / sizeof(std::uint64_t);
-  require(secondPrp == expectedPrpList &&
+  require(firstPrp == fixture.dmaPages.download(0) &&
+              secondPrp == expectedPrpList &&
               fixture.prpLists.download(listBase) ==
                   fixture.dmaPages.download(1) &&
               fixture.prpLists.download(listBase + 1) ==

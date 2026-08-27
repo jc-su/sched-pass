@@ -57,6 +57,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-native-consumer",
+        action="store_true",
+        help=(
+            "require every timed external attention launch to use NTA's native "
+            "work-unit consumer; by default the measured optimizer may select "
+            "the exact framework consumer after NTA acquisition completes"
+        ),
+    )
+    parser.add_argument(
         "comparison_args",
         nargs=argparse.REMAINDER,
         help="arguments for CompareSglangHiCacheLoad.py after --",
@@ -102,13 +111,16 @@ def _expected_harness_args(comparison_args: list[str]) -> dict:
     result.update(
         {
             "nta_execution_max_rounds": os.environ.get(
-                "NTA_COMPARE_EXECUTION_MAX_ROUNDS", "1"
+                "NTA_COMPARE_EXECUTION_MAX_ROUNDS", "auto"
             ),
-            "nta_execution_prefetch": os.environ.get(
-                "NTA_COMPARE_EXECUTION_PREFETCH", "0"
+            "nta_execution_min_predicted_gain": os.environ.get(
+                "NTA_COMPARE_EXECUTION_MIN_PREDICTED_GAIN", "auto"
             ),
             "nta_execution_protocol": os.environ.get(
                 "NTA_COMPARE_EXECUTION_PROTOCOL", "late_bound"
+            ),
+            "nta_execution_host_mover": os.environ.get(
+                "NTA_EXECUTION_HOST_MOVER", "auto"
             ),
         }
     )
@@ -287,6 +299,38 @@ def main() -> int:
             )
             for report in reports
         ),
+        "all_external_attention_accounted": all(
+            bool(
+                report["mechanism_activation"].get(
+                    "external_attention_accounted", False
+                )
+            )
+            for report in reports
+        ),
+        "all_native_work_unit_active": all(
+            bool(report["mechanism_activation"].get("native_work_unit_active"))
+            for report in reports
+        ),
+        "all_heterogeneous_work_unit_active": all(
+            bool(
+                report["mechanism_activation"].get(
+                    "heterogeneous_work_unit_active"
+                )
+            )
+            for report in reports
+        ),
+        "evidence_scopes": sorted(
+            {str(report.get("evidence_scope")) for report in reports}
+        ),
+        "all_compiler_contracts_verified": all(
+            int(report["mechanism_activation"].get("operator_contract_count", 0))
+            > 0
+            and int(
+                report["mechanism_activation"].get("verified_operator_modules", 0)
+            )
+            > 0
+            for report in reports
+        ),
         "all_fallback_free": all(
             int(report["mechanism_activation"]["fallback_batches"]) == 0
             for report in reports
@@ -342,8 +386,13 @@ def main() -> int:
             or "--allow-output-divergence" in args.comparison_args,
         },
         "mechanism": {
-            "passes": aggregate["all_external_attention_transformed"]
-            and aggregate["all_fallback_free"],
+            "required_consumer": "native_heterogeneous_work_unit",
+            "passes": aggregate["all_external_attention_accounted"]
+            and aggregate["all_compiler_contracts_verified"]
+            and aggregate["all_fallback_free"]
+            and aggregate["all_external_attention_transformed"]
+            and aggregate["all_native_work_unit_active"]
+            and aggregate["all_heterogeneous_work_unit_active"],
         },
         "physical_bytes": {
             # The registered evidence standard records physically staged
@@ -368,7 +417,13 @@ def main() -> int:
     # divergence reporting armed; then the aggregate records which trials
     # diverged instead of refusing, and the scored quality battery remains
     # the arbiter — the posture recorded with campaign three.
-    mandatory = ["all_external_attention_transformed", "all_fallback_free"]
+    mandatory = [
+        "all_external_attention_accounted",
+        "all_compiler_contracts_verified",
+        "all_fallback_free",
+    ]
+    if args.require_native_consumer:
+        mandatory.append("all_external_attention_transformed")
     if "--allow-output-divergence" not in args.comparison_args:
         mandatory.append("all_outputs_exact")
     if not all(aggregate[key] for key in mandatory):

@@ -461,6 +461,30 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         isinstance(activation, dict) and activation.get("external_launches", 0) > 0,
         "serving comparison has no mechanism activation",
     )
+    evidence_scope = report.get("evidence_scope")
+    _require(
+        evidence_scope
+        in {
+            "heterogeneous_work_unit",
+            "native_work_unit",
+            "transport_only",
+            "exact_execution_only",
+        },
+        "serving comparison has no typed evidence scope",
+    )
+    expected_scope = (
+        "heterogeneous_work_unit"
+        if activation.get("heterogeneous_work_unit_active") is True
+        else "native_work_unit"
+        if activation.get("native_work_unit_active") is True
+        else "transport_only"
+        if activation.get("transport_only") is True
+        else "exact_execution_only"
+    )
+    _require(
+        evidence_scope == expected_scope,
+        "serving comparison evidence scope disagrees with activation counters",
+    )
     _require(
         activation.get("external_attention_accounted") is True,
         "serving comparison did not account for exact external attention work",

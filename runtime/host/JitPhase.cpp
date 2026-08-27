@@ -270,6 +270,16 @@ void JitPhaseProgram::validateIndexedHostRange(
         "nta_jit_validate_indexed_host_range");
 }
 
+void JitPhaseProgram::warmupIndexedHostValidation(
+    cudaStream_t stream, abi::RuntimeView *runtime) const {
+  if (runtime == nullptr) {
+    throw std::invalid_argument(
+        "JIT indexed host validation warmup needs a runtime");
+  }
+  check(impl_->validateIndexedHostRange(runtime, 0, 0, stream),
+        "warm up nta_jit_validate_indexed_host_range");
+}
+
 void JitPhaseProgram::rebindIndexedHostPairs(
     cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
     std::uint32_t pairCount, std::uint64_t keySource, std::uint64_t keyStaging,

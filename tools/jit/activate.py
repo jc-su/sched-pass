@@ -136,6 +136,19 @@ def main() -> int:
         runtime_library = first_file(runtime_candidates, "NTA runtime library")
     except RuntimeError as error:
         parser.error(str(error))
+    transport_candidates = []
+    configured_transport = os.environ.get("NTA_TRANSPORT_PROGRAM")
+    if configured_transport:
+        transport_candidates.append(pathlib.Path(configured_transport).expanduser())
+    transport_candidates.append(build / "libnta-transport-program.so")
+    if prefix is not None:
+        transport_candidates.append(prefix / "lib" / "libnta-transport-program.so")
+    try:
+        transport_program = first_file(
+            transport_candidates, "NTA transport phase program"
+        )
+    except RuntimeError as error:
+        parser.error(str(error))
     try:
         cuda_home = resolve_cuda_home(options.cuda_path)
         real_nvcc = first_file([nvcc_path(cuda_home)], "CUDA nvcc")
@@ -155,6 +168,7 @@ def main() -> int:
         root / "include/nta/FlashInferKernelPolicy.cuh",
         root / "runtime/device/Acquire.cuh",
         root / "runtime/device/JitRuntime.cuh",
+        root / "runtime/device/TransportProgram.cu",
     ]
     flashinfer_version = ""
     flashinfer_include = None
@@ -206,6 +220,7 @@ def main() -> int:
         "NTA_ABI_VERSION": str(abi_version),
         "NTA_BUILD_DIR": str(build),
         "NTA_RUNTIME_LIBRARY": str(runtime_library),
+        "NTA_TRANSPORT_PROGRAM": str(transport_program),
         "PYTHONPATH": os.pathsep.join(
             value
             for value in (
@@ -232,6 +247,7 @@ def main() -> int:
                 str(root / "tools/flashinfer/prepare_overlay.py"),
                 "--output",
                 str(overlay),
+                "--fast-reuse",
             ],
             check=True,
             stdout=subprocess.DEVNULL,
@@ -250,7 +266,9 @@ def main() -> int:
                 ),
                 "NTA_JIT_REQUEST_BOUND_SOURCE": os.environ.get(
                     "NTA_JIT_REQUEST_BOUND_SOURCE",
-                    "nta_sglang_decode_request_bound,nta_sglang_prefill_request_bound",
+                    "nta_sglang_decode_request_bound,"
+                    "nta_sglang_prefill_request_bound,"
+                    "nta_batch_prefill_vllm_request_bound",
                 ),
             }
         )

@@ -150,10 +150,14 @@ nta_jit_validate_indexed_host_range(void *runtime, std::uint32_t firstObject,
                                     std::uint32_t objectCount,
                                     cudaStream_t stream) {
   constexpr std::uint32_t threads = 256;
-  if (runtime == nullptr || objectCount == 0) {
+  if (runtime == nullptr) {
     return cudaErrorInvalidValue;
   }
-  nta_validate_indexed_host_range<<<objectCount, threads, 0, stream>>>(
+  // A zero-count launch is the explicit deployment warmup. It materializes
+  // this exact CUDA kernel while the device body returns before touching the
+  // runtime directory, keeping lazy module loading off the first request.
+  const std::uint32_t blocks = objectCount == 0 ? 1 : objectCount;
+  nta_validate_indexed_host_range<<<blocks, threads, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime), firstObject, objectCount);
   return nta::jit::launchStatus();
 }
@@ -390,6 +394,11 @@ nta_jit_progress_indexed_host_range(void *runtime, std::uint32_t firstObject,
                                         finalizeThreads,
                                     finalizeThreads, 0, stream>>>(
       view, firstObject, objectCount);
+  status = nta::jit::launchStatus();
+  if (status != cudaSuccess) {
+    return status;
+  }
+  nta_publish_ready<<<1, finalizeThreads, 0, stream>>>(view, UINT32_MAX);
   return nta::jit::launchStatus();
 }
 
@@ -1087,6 +1096,11 @@ nta_jit_progress_validated_indexed_host_range(void *runtime,
                                         finalizeThreads,
                                     finalizeThreads, 0, stream>>>(
       view, firstObject, objectCount);
+  status = nta::jit::launchStatus();
+  if (status != cudaSuccess) {
+    return status;
+  }
+  nta_publish_ready<<<1, finalizeThreads, 0, stream>>>(view, UINT32_MAX);
   return nta::jit::launchStatus();
 }
 
@@ -1119,6 +1133,11 @@ nta_jit_progress_validated_indexed_host_range_parallel(
                                         finalizeThreads,
                                     finalizeThreads, 0, stream>>>(
       view, firstObject, objectCount);
+  status = nta::jit::launchStatus();
+  if (status != cudaSuccess) {
+    return status;
+  }
+  nta_publish_ready<<<1, finalizeThreads, 0, stream>>>(view, UINT32_MAX);
   return nta::jit::launchStatus();
 }
 

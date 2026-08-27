@@ -18,9 +18,16 @@ MAX_REQUEST_PRIORITY = 7
 def bounded_integer(value: int, name: str, *, minimum: int, maximum: int) -> int:
     """Validate and normalize an integer before it crosses the C ABI."""
 
-    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
-        raise ValueError(f"{name} must be an integer")
-    result = int(value)
+    # Native-plan construction validates thousands of scalar fields per
+    # serving batch.  Engine adapters overwhelmingly pass built-in ``int``;
+    # avoid the comparatively expensive ``numbers.Integral`` ABC walk for that
+    # exact type while retaining support for NumPy/PyTorch integer scalars.
+    if type(value) is int:
+        result = value
+    else:
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            raise ValueError(f"{name} must be an integer")
+        result = int(value)
     if result < minimum or result > maximum:
         raise ValueError(f"{name} is outside [{minimum}, {maximum}]")
     return result

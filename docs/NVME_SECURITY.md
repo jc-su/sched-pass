@@ -160,6 +160,7 @@ python3 scripts/run-nvme-qualification.py \
   --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 100 \
   --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
   --allow-device-rebind --require-ready \
+  --reference /path/outside/checkout/nvme-reference.bin \
   --output /path/outside/checkout/nvme-qualification.json
 ```
 
@@ -210,6 +211,7 @@ attachment:
 python3 scripts/run-nvme-qualification.py \
   --bdf 0000:d8:00.0 --allow-device-rebind --keep-vfio \
   --media-policy trusted-read-only-code --dma-target hbm-peer \
+  --reference /tmp/nta-artifacts/nvme/nvme-reference.bin \
   --output /tmp/nta-artifacts/nvme/qualification.json
 ```
 

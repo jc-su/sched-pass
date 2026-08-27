@@ -1,7 +1,9 @@
 from nta_runtime.adapters.sglang import (
+    SglangAcquisitionSpan,
     SglangAdapter,
     SglangExecutionConfig,
     SglangForwardMetadata,
+    validate_sglang_attention_tier,
 )
 from nta_runtime.adapters.base import (
     ConsumerContract,
@@ -39,7 +41,12 @@ class FakeForward:
     batch_size = 2
     rids = ("sg-a", "sg-b")
     req_pool_indices = (5, 7)
-    _nta_forward_metadata = SglangForwardMetadata((5, 7), (2, 5), (3, 7))
+    _nta_forward_metadata = SglangForwardMetadata(
+        (5, 7),
+        (2, 5),
+        (3, 7),
+        (SglangAcquisitionSpan.direct(),) * 2,
+    )
 
 
 class FakeVllmSchedulerOutput:
@@ -113,30 +120,79 @@ class FakeVllmV2Table:
 
 
 def main() -> None:
-    assert validate_vllm_attention_tier({}) == "host_staged"
-    assert validate_vllm_attention_tier({"NTA_SERVING_TIER": "host"}) == "host_staged"
-    for value in ("nvme", "cxl", "cxl_dax"):
+    assert validate_sglang_attention_tier({}) == "hbm"
+    assert (
+        validate_sglang_attention_tier({"NTA_SERVING_TIER": "host_staged"})
+        == "host_staged"
+    )
+    assert validate_sglang_attention_tier({"NTA_SERVING_TIER": "nvme"}) == "nvme"
+    try:
+        validate_sglang_attention_tier({"NTA_SERVING_TIER": "host_mapped"})
+    except RuntimeError as error:
+        assert "numerical pointer" in str(error)
+    else:
+        raise AssertionError("SGLang accepted a non-aliasing host-mapped path")
+    try:
+        validate_sglang_attention_tier({"NTA_SERVING_TIER": "cxl_dax"})
+    except RuntimeError as error:
+        assert "ready address" in str(error)
+    else:
+        raise AssertionError("SGLang accepted a non-aliasing CXL numerical path")
+    assert validate_vllm_attention_tier({}) == "hbm"
+    try:
+        validate_vllm_attention_tier({"NTA_SERVING_TIER": "host_staged"})
+    except RuntimeError as error:
+        assert "NTA_VLLM_NATIVE" in str(error)
+    else:
+        raise AssertionError("vLLM host_staged was accepted without native mode")
+    assert (
+        validate_vllm_attention_tier(
+            {"NTA_SERVING_TIER": "host_staged", "NTA_VLLM_NATIVE": "1"}
+        )
+        == "host_staged"
+    )
+    try:
+        validate_vllm_attention_tier({"NTA_SERVING_TIER": "host_mapped"})
+    except RuntimeError as error:
+        assert "numerical pointer" in str(error)
+    else:
+        raise AssertionError("vLLM accepted a host-mapped pointer as HBM")
+    for value in ("nvme", "cxl_dax"):
         try:
             validate_vllm_attention_tier({"NTA_SERVING_TIER": value})
         except RuntimeError as error:
-            assert "physical tier" in str(error)
+            assert "physical tier" in str(error) or "ready address" in str(error)
         else:
             raise AssertionError("vLLM physical tier was accepted without native mode")
-        assert validate_vllm_attention_tier(
-            {
-                "NTA_SERVING_TIER": value,
-                "NTA_VLLM_NATIVE": "1",
-                "NTA_VLLM_PHYSICAL_CATALOG": "1",
-            }
-        ) == ("cxl_dax" if value == "cxl" else value)
+        configured = {
+            "NTA_SERVING_TIER": value,
+            "NTA_VLLM_NATIVE": "1",
+            "NTA_VLLM_PHYSICAL_CATALOG": "1",
+        }
+        if value == "nvme":
+            assert validate_vllm_attention_tier(configured) == "nvme"
+        else:
+            try:
+                validate_vllm_attention_tier(configured)
+            except RuntimeError as error:
+                assert "ready address" in str(error)
+            else:
+                raise AssertionError("deferred vLLM CXL profile was accepted")
         try:
             validate_vllm_attention_tier(
                 {"NTA_SERVING_TIER": value, "NTA_VLLM_NATIVE": "1"}
             )
         except RuntimeError as error:
-            assert "PHYSICAL_CATALOG" in str(error)
+            assert "PHYSICAL_CATALOG" in str(error) or "ready address" in str(error)
         else:
             raise AssertionError("vLLM physical replay profile was implicit")
+    for value in ("host", "cxl"):
+        try:
+            validate_vllm_attention_tier({"NTA_SERVING_TIER": value})
+        except RuntimeError as error:
+            assert "must be" in str(error)
+        else:
+            raise AssertionError(f"deprecated tier alias {value!r} was accepted")
 
     config = SglangExecutionConfig.from_environment(
         {
@@ -182,10 +238,51 @@ def main() -> None:
     assert tuple(item.tenant_id for item in sglang_batch.bindings) == (3, 7)
     assert sglang_batch.tenant_ids == (3, 7)
     assert tuple(item.request_slot for item in sglang_batch.bindings) == (5, 7)
+    graph_runtime = FakeRuntime()
+    graph_adapter = SglangAdapter(graph_runtime, 8)
+    padded_graph_forward = type(
+        "PaddedGraphForward",
+        (),
+        {
+            "batch_size": 4,
+            "_nta_raw_batch_size": 2,
+            "rids": ("graph-a", "graph-b", "__padding_2", "__padding_3"),
+            "req_pool_indices": (1, 3, 0, 0),
+            "_nta_forward_metadata": SglangForwardMetadata(
+                (1, 3, 0, 0),
+                (4, 6, 0, 0),
+                (2, 7, 0, 0),
+                (SglangAcquisitionSpan.direct(),) * 4,
+            ),
+        },
+    )()
+    graph_batch = graph_adapter.bind_forward(
+        padded_graph_forward,
+        allow_capture_ids=False,
+        stream=None,
+        epoch=10,
+    )
+    assert tuple(item.request_slot for item in graph_batch.bindings) == (1, 3)
+    assert tuple(item.priority for item in graph_batch.bindings) == (4, 6)
+    assert tuple(item.tenant_id for item in graph_batch.bindings) == (2, 7)
+    assert len(graph_runtime.published) == 2
+    padded_graph_forward._nta_raw_batch_size = 5
+    try:
+        graph_adapter.bind_forward(
+            padded_graph_forward,
+            allow_capture_ids=False,
+            stream=None,
+            epoch=11,
+        )
+    except RuntimeError as error:
+        assert "live batch size" in str(error)
+    else:
+        raise AssertionError("graph replay accepted an oversized live prefix")
     padded = FakeForward._nta_forward_metadata.pad((5, 7, 8, 9))
     assert padded.request_slots == (5, 7, 8, 9)
     assert padded.priorities == (2, 5, 0, 0)
     assert padded.tenant_ids == (3, 7, 0, 0)
+    assert padded.acquisitions == (SglangAcquisitionSpan.direct(),) * 4
     try:
         FakeForward._nta_forward_metadata.pad((5, 6, 8, 9))
     except ValueError as error:
@@ -193,7 +290,12 @@ def main() -> None:
     else:
         raise AssertionError("graph replay accepted reordered live request slots")
     try:
-        SglangForwardMetadata((5,), (2, 5), (3, 7))
+        SglangForwardMetadata(
+            (5,),
+            (2, 5),
+            (3, 7),
+            (SglangAcquisitionSpan.direct(),) * 2,
+        )
     except ValueError as error:
         assert "aligned" in str(error)
     else:
@@ -247,7 +349,9 @@ def main() -> None:
         else:
             raise AssertionError("malformed vLLM scheduler metadata was truncated")
     try:
-        SglangForwardMetadata((1.5,), (0,), (0,))
+        SglangForwardMetadata(
+            (1.5,), (0,), (0,), (SglangAcquisitionSpan.direct(),)
+        )
     except ValueError:
         pass
     else:

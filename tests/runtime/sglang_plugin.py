@@ -53,8 +53,13 @@ def main() -> None:
         BACKEND_NAME,
         _EXECUTE_DECODE_TARGET,
         _EXECUTE_EXTEND_TARGET,
+        _EAGER_LOAD_BATCH_TARGET,
+        _PREFILL_FINISH_TARGET,
+        _PREBUILT_FINISH_TARGET,
         _attach_request_priorities,
         _require_hooks_installed,
+        _retire_prefill_finished_requests,
+        _retire_finished_request,
         register,
     )
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
@@ -75,6 +80,7 @@ def main() -> None:
         _ABORT_TARGET,
         _DECODE_GRAPH_REPLAY_VIEW_TARGET,
         _HICACHE_LOAD_TARGET,
+        _PREFILL_REQUEST_BIND_TARGET,
         _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
         _PREFILL_GRAPH_LOAD_BATCH_TARGET,
         _REQUEST_FINISH_TARGET,
@@ -100,6 +106,10 @@ def main() -> None:
         for kind, _, _ in HookRegistry._hooks[_HICACHE_LOAD_TARGET]
     )
     assert any(
+        kind == HookType.AROUND
+        for kind, _, _ in HookRegistry._hooks[_PREFILL_REQUEST_BIND_TARGET]
+    )
+    assert any(
         kind == HookType.BEFORE for kind, _, _ in HookRegistry._hooks[_ABORT_TARGET]
     )
     assert any(
@@ -109,6 +119,10 @@ def main() -> None:
         kind == HookType.BEFORE
         for kind, _, _ in HookRegistry._hooks[_REQUEST_FINISH_TARGET]
     )
+    for target in (_PREFILL_FINISH_TARGET, _PREBUILT_FINISH_TARGET):
+        assert any(
+            kind == HookType.AFTER for kind, _, _ in HookRegistry._hooks[target]
+        )
     assert any(
         kind == HookType.AFTER
         for kind, _, _ in HookRegistry._hooks[_FORWARD_BATCH_TARGET]
@@ -117,6 +131,44 @@ def main() -> None:
         kind == HookType.AROUND
         for kind, _, _ in HookRegistry._hooks[_PREFILL_ADMISSION_TARGET]
     )
+    assert any(
+        kind == HookType.AROUND
+        for kind, _, _ in HookRegistry._hooks[_EAGER_LOAD_BATCH_TARGET]
+    )
+
+    # Completion must retire the generation before SGLang releases and reuses
+    # its request-pool slot.  The result processor reaches the same backend
+    # graph as Scheduler through model_worker.model_runner.
+    retired = []
+    lifecycle_backend = types.SimpleNamespace(
+        retire_request=lambda request_id: retired.append(request_id)
+    )
+    lifecycle_processor = types.SimpleNamespace(
+        model_worker=types.SimpleNamespace(
+            model_runner=types.SimpleNamespace(attn_backend=lifecycle_backend)
+        )
+    )
+    _retire_finished_request(
+        lifecycle_processor,
+        types.SimpleNamespace(rid="completed-request", finished=lambda: True),
+    )
+    assert retired == ["completed-request"]
+    _retire_finished_request(
+        lifecycle_processor,
+        types.SimpleNamespace(rid="live-request", finished=lambda: False),
+    )
+    assert retired == ["completed-request"]
+    _retire_prefill_finished_requests(
+        None,
+        lifecycle_processor,
+        types.SimpleNamespace(
+            reqs=(
+                types.SimpleNamespace(rid="prefill-complete", finished=lambda: True),
+                types.SimpleNamespace(rid="prefill-live", finished=lambda: False),
+            )
+        ),
+    )
+    assert retired == ["completed-request", "prefill-complete"]
 
     # SGLang 0.5.16 passes capture_hidden_mode through ForwardBatch.init_new.
     # The policy sidecar does not consume that extension argument, but the
@@ -138,7 +190,89 @@ def main() -> None:
         hook_runner,
         capture_hidden_mode=None,
     )
+    from nta_runtime.adapters.sglang import SglangAcquisitionSpan
+
     assert hook_forward_batch._nta_forward_metadata.request_slots == (11, 23)
+    assert (
+        hook_forward_batch._nta_forward_metadata.acquisitions
+        == (SglangAcquisitionSpan.direct(),) * 2
+    )
+
+    external_request = types.SimpleNamespace(
+        rid="external",
+        priority=0,
+        host_hit_length=32,
+        swa_host_hit_length=0,
+        mamba_host_hit_length=0,
+        best_match_node=types.SimpleNamespace(id=41),
+        last_node=types.SimpleNamespace(id=41),
+        prefix_indices=torch.empty((0,), dtype=torch.int64),
+        needs_host_load_back=lambda: True,
+    )
+    resident_request = types.SimpleNamespace(
+        rid="resident",
+        priority=0,
+        host_hit_length=32,
+        swa_host_hit_length=0,
+        mamba_host_hit_length=0,
+        best_match_node=types.SimpleNamespace(id=99),
+        last_node=types.SimpleNamespace(id=99),
+        prefix_indices=torch.empty((0,), dtype=torch.int64),
+        needs_host_load_back=lambda: False,
+    )
+    mixed_forward_batch = types.SimpleNamespace(
+        batch_size=2,
+        rids=("external", "resident"),
+        req_pool_indices=torch.tensor((7, 9), dtype=torch.int32),
+    )
+    mixed_schedule_batch = types.SimpleNamespace(
+        reqs=(external_request, resident_request),
+        decoding_reqs=(resident_request,),
+        hicache_consumer_index=3,
+    )
+    from nta_runtime.plugins.sglang import _capture_prefill_request_binding
+
+    load_queue = []
+    adder = types.SimpleNamespace(
+        tree_cache=types.SimpleNamespace(
+            cache_controller=types.SimpleNamespace(load_queue=load_queue)
+        )
+    )
+
+    def load_external(_adder, request):
+        operation = types.SimpleNamespace(
+            id=73,
+            node_ids=[41],
+            device_indices=torch.arange(32, dtype=torch.int64),
+        )
+        load_queue.append(operation)
+        request.prefix_indices = operation.device_indices
+        request.last_node = types.SimpleNamespace(id=41)
+
+    _capture_prefill_request_binding(load_external, adder, external_request)
+    _capture_prefill_request_binding(
+        lambda _adder, _request: None, adder, resident_request
+    )
+    _attach_request_priorities(
+        mixed_forward_batch,
+        object,
+        mixed_schedule_batch,
+        hook_runner,
+    )
+    assert mixed_forward_batch._nta_forward_metadata.acquisitions == (
+        SglangAcquisitionSpan(73, 41, 0, 32),
+        SglangAcquisitionSpan.direct(),
+    )
+    assert external_request._nta_acquisition_span == SglangAcquisitionSpan.direct()
+
+    from nta_runtime.plugins.sglang import _preserve_eager_load_batch
+
+    eager_view = _preserve_eager_load_batch(
+        lambda _runner, _batch: types.SimpleNamespace(),
+        object(),
+        mixed_forward_batch,
+    )
+    assert eager_view._nta_forward_metadata is mixed_forward_batch._nta_forward_metadata
 
     from nta_runtime.engines.sglang_admission import (
         AcquisitionAdmission,
@@ -147,19 +281,23 @@ def main() -> None:
     )
     from nta_runtime.engines.sglang_hicache import (
         HostLoadProgress,
+        LeaseOperationTransfer,
+        LeaseWorkDependency,
+        PendingHostLoad,
         SglangHiCacheBridge,
     )
     from nta_runtime.tenant import tenant_budget_specs
+    from nta_runtime.progress_frontier import FrontierState
     from nta_runtime.requests import RequestBinding, stable_request_id
     from nta_runtime.runtime import RequestProgress
     from nta_runtime.fixed_range_pool import FixedRangePool
 
     with patch.dict(
         "os.environ",
-        {"NTA_TENANT_BUDGETS": "2:1048576:3,7:2097152"},
+        {"NTA_TENANT_BUDGETS": "2:1048576,7:2097152"},
         clear=False,
     ):
-        assert tenant_budget_specs() == ((2, 1048576, 3), (7, 2097152, 1))
+        assert tenant_budget_specs() == ((2, 1048576), (7, 2097152))
 
     ranges = FixedRangePool(128, 24, reserved_low=2)
     first = ranges.acquire(11)
@@ -193,11 +331,16 @@ def main() -> None:
         def __init__(self) -> None:
             self.leading_layers = 0
             self.stats = {}
-            self.critical_plan = None
+            self.frontier = None
 
         def progress(self, consumer_index: int) -> HostLoadProgress:
             return HostLoadProgress(
-                consumer_index, self.leading_layers, 12, self.leading_layers * 64, 768
+                consumer_index=consumer_index,
+                published_layers=12,
+                leading_layers=self.leading_layers,
+                total_layers=12,
+                leading_bytes=self.leading_layers * 64,
+                total_bytes=768,
             )
 
         def transfer_bytes(self, consumer_index: int) -> int:
@@ -208,10 +351,10 @@ def main() -> None:
             for name, value in increments.items():
                 self.stats[name] = self.stats.get(name, 0) + value
 
-        def poll_critical_work(self, request_ids: set[int]):
+        def poll_request_frontier(self, request_ids: set[int]):
             del request_ids
-            result = self.critical_plan
-            self.critical_plan = None
+            result = self.frontier
+            self.frontier = None
             return result
 
     clock = [1_000]
@@ -233,6 +376,23 @@ def main() -> None:
     assert admission.poll(scheduler) is batch
     assert bridge.stats["admission_hidden_decode_steps"] == 1
     assert bridge.stats["admission_released_lead"] == 1
+
+    class UnpublishedBridge(Bridge):
+        def progress(self, consumer_index: int) -> HostLoadProgress:
+            return HostLoadProgress(
+                consumer_index=consumer_index,
+                published_layers=0,
+                leading_layers=0,
+                total_layers=12,
+                leading_bytes=0,
+                total_bytes=768,
+            )
+
+    unpublished_bridge = UnpublishedBridge()
+    admission = AcquisitionAdmission(config, clock=lambda: clock[0])
+    assert admission.consider(scheduler, batch, unpublished_bridge) is batch
+    assert unpublished_bridge.stats["admission_released_for_binding"] == 1
+    assert not admission.has_staged_batch
 
     bridge.leading_layers = 0
     admission = AcquisitionAdmission(config, clock=lambda: clock[0])
@@ -264,19 +424,13 @@ def main() -> None:
     assert bridge.stats["admission_released_mixed_batches"] == 1
     assert bridge.stats["admission_external_bytes"] >= 768
 
-    bridge.critical_plan = types.SimpleNamespace(
-        compute_order=(),
-        data_order=((stable_request_id("resident"), 1),),
-    )
+    bridge.frontier = types.SimpleNamespace(state=FrontierState.DATA_BLOCKED)
     admission = AcquisitionAdmission(config, clock=lambda: clock[0])
     assert admission.consider(scheduler, batch, bridge) is batch
     assert bridge.stats["admission_feedback_data_blocked"] == 1
     assert bridge.stats["admission_released_feedback_data_blocked"] == 1
 
-    bridge.critical_plan = types.SimpleNamespace(
-        compute_order=((stable_request_id("resident"), 1),),
-        data_order=(),
-    )
+    bridge.frontier = types.SimpleNamespace(state=FrontierState.EXECUTABLE)
     admission = AcquisitionAdmission(config, clock=lambda: clock[0])
     assert admission.consider(scheduler, batch, bridge) is None
     assert bridge.stats["admission_feedback_executable"] == 1
@@ -356,6 +510,111 @@ def main() -> None:
     device_pool = DevicePool()
     progress_bridge = SglangHiCacheBridge(device_pool)
 
+    class QueryEvent:
+        def __init__(self, ready: bool = False) -> None:
+            self.ready = ready
+
+        def query(self) -> bool:
+            return self.ready
+
+    first_ready = QueryEvent()
+    second_ready = QueryEvent()
+    transfer_progress = PendingHostLoad(
+        lease_id=90,
+        consumer_index=6,
+        host_indices=torch.tensor((1,)),
+        device_indices=torch.tensor((2,)),
+        producer_event=object(),
+        controller=types.SimpleNamespace(layer_num=3),
+        node_ids=(),
+        operation_transfers=(LeaseOperationTransfer(70, 17, 1),),
+        prefetched_layers={
+            0: types.SimpleNamespace(
+                key_bytes=10, value_bytes=10, ready_event=first_ready
+            ),
+            1: types.SimpleNamespace(
+                key_bytes=20, value_bytes=20, ready_event=second_ready
+            ),
+        },
+        layer_bytes=(20, 40, 60),
+    )
+    progress_bridge._pending[6] = transfer_progress
+    progress = progress_bridge.progress(6)
+    assert progress is not None
+    assert (
+        progress.published_layers,
+        progress.leading_layers,
+        progress.total_layers,
+    ) == (
+        2,
+        0,
+        3,
+    )
+    assert (progress.leading_bytes, progress.total_bytes) == (0, 120)
+    first_ready.ready = True
+    progress = progress_bridge.progress(6)
+    assert progress is not None
+    assert (progress.leading_layers, progress.leading_bytes) == (1, 20)
+    second_ready.ready = True
+    progress = progress_bridge.progress(6)
+    assert progress is not None
+    # Layer two was never published: a ready two-layer prefix is not complete.
+    assert (progress.leading_layers, progress.total_layers) == (2, 3)
+    assert not progress.complete
+
+    from nta_runtime.engines.sglang import (
+        _capacity_constrained_transfer_dependencies,
+        _project_work_acquisitions,
+        _resolve_request_acquisitions,
+    )
+    from nta_runtime.flashinfer_schedule import Schedule
+
+    acquisitions = (
+        SglangAcquisitionSpan(71, 41, 8, 32),
+        SglangAcquisitionSpan.direct(),
+        SglangAcquisitionSpan(72, 52, 0, 8),
+    )
+    transfers = {
+        71: LeaseOperationTransfer(71, 41, 32),
+        72: LeaseOperationTransfer(72, 52, 8),
+    }
+    assert (
+        _resolve_request_acquisitions(acquisitions, transfers, lease_transfer_rows=40)
+        == acquisitions
+    )
+    projected_dependencies = _project_work_acquisitions(
+        Schedule(
+            (0, 0, 0, 0, 0, 0, 1, 2),
+            (0, 0, 1, 1, 2, 2, 0, 0),
+            16,
+            8,
+        ),
+        acquisitions,
+        (40, 8, 8),
+    )
+    assert projected_dependencies == (
+        LeaseWorkDependency(71, 0, 8),
+        LeaseWorkDependency(71, 0, 8),
+        LeaseWorkDependency(71, 8, 16),
+        LeaseWorkDependency(71, 8, 16),
+        LeaseWorkDependency(71, 24, 8),
+        LeaseWorkDependency(71, 24, 8),
+        None,
+        LeaseWorkDependency(72, 0, 8),
+    )
+    assert _capacity_constrained_transfer_dependencies(
+        projected_dependencies, maximum_groups=2
+    ) == (
+        LeaseWorkDependency(71, 0, 32),
+        LeaseWorkDependency(71, 0, 32),
+        LeaseWorkDependency(71, 0, 32),
+        LeaseWorkDependency(71, 0, 32),
+        LeaseWorkDependency(71, 0, 32),
+        LeaseWorkDependency(71, 0, 32),
+        None,
+        LeaseWorkDependency(72, 0, 8),
+    )
+
     class FakeEvent:
         def __init__(self) -> None:
             self.stream = None
@@ -409,28 +668,25 @@ def main() -> None:
     progress_bridge.publish_request_progress(
         Snapshot((blocked,)),
         (binding,),
-        bandwidth_bytes_per_second=10_000_000_000,
     )
     newer = replace(blocked, generation=5, unavailable_bytes=2048)
     newer_binding = replace(binding, generation=5)
     progress_bridge.publish_request_progress(
         Snapshot((newer,)),
         (newer_binding,),
-        bandwidth_bytes_per_second=10_000_000_000,
     )
-    critical = progress_bridge.poll_critical_work({resident_id})
-    assert critical is not None
-    assert critical.data_order == ((resident_id, 5),)
-    assert critical.requests[0].request.generation == 5
-    assert critical.compute_order == ()
-    assert progress_bridge.poll_critical_work({resident_id}) is None
+    frontier = progress_bridge.poll_request_frontier({resident_id})
+    assert frontier is not None
+    assert frontier.data_blocked == ((resident_id, 5),)
+    assert frontier.requests[0].generation == 5
+    assert frontier.executable == ()
+    assert progress_bridge.poll_request_frontier({resident_id}) is None
     assert progress_bridge.admission_stats()["progress_feedback_consumed"] == 1
     progress_bridge.close()
     try:
         progress_bridge.publish_request_progress(
             Snapshot((blocked,)),
             (binding,),
-            bandwidth_bytes_per_second=10_000_000_000,
         )
     except RuntimeError as error:
         assert "closed" in str(error)
@@ -440,21 +696,97 @@ def main() -> None:
     from nta_runtime.engines.sglang import (
         NtaFlashInferAttnBackend,
         _ActiveBatch,
+        _NvmeSlotLifetime,
         _consumer_contract_for_stats,
         _demand_graph_key,
-        _frontier_transfer_bytes,
         _group_external_pages_by_request,
+        _page_pairs_for_schedule,
         _pipeline_object_range,
         _plan_cache_signature,
+        _require_exact_prefetch_layers,
         _flag_value,
     )
     from nta_runtime.resource_contract import ResourceCapability
-    from nta_runtime.flashinfer import (
-        request_ranges_for_schedule as _request_ranges,
-    )
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
+    assert "_create_decode_wrappers" not in NtaFlashInferAttnBackend.__dict__
+    assert "_create_prefill_wrappers" not in NtaFlashInferAttnBackend.__dict__
+
+    adopted_schedule = Schedule((0,), (0,), 4, 1)
+    adopted_page_pairs = {101: (((7,), (11,)),)}
+    adopted_work_dependencies = {101: (None,)}
+    adopted_transfer_dependencies = {101: (None,)}
+    adopted_batch = _ActiveBatch(
+        (),
+        {101: adopted_schedule},
+        None,
+        adopted_page_pairs,
+        {},
+        {},
+        (),
+        work_dependencies=adopted_work_dependencies,
+        transfer_dependencies=adopted_transfer_dependencies,
+    )
+    adopted_batch.adopt_wrapper_identity({101: 202})
+    assert adopted_batch.schedules == {202: adopted_schedule}
+    assert adopted_batch.page_pairs == {202: (((7,), (11,)),)}
+    assert adopted_batch.work_dependencies == {202: (None,)}
+    assert adopted_batch.transfer_dependencies == {202: (None,)}
+    try:
+        adopted_batch.adopt_wrapper_identity({303: 404})
+    except RuntimeError as error:
+        assert "does not cover its schedules" in str(error)
+    else:
+        raise AssertionError("wrapper adoption accepted stale source identity")
+
+    class EventProbe:
+        def __init__(self) -> None:
+            self.streams = []
+
+        def record(self, stream) -> None:
+            self.streams.append(stream)
+
+    consumer_event = EventProbe()
+    nvme_slots = _NvmeSlotLifetime(consumer_event)
+    assert nvme_slots.prior_consumer_event(0) is None
+    nvme_slots.commit(((0, 4096), (1, 8192)))
+    try:
+        nvme_slots.prior_consumer_event(0)
+    except RuntimeError as error:
+        assert "prior-consumer event" in str(error)
+    else:
+        raise AssertionError("NVMe slot was replaced without a consumer proof")
+    nvme_slots.record_consumer("attention-stream")
+    assert nvme_slots.prior_consumer_event(0) is consumer_event
+    assert nvme_slots.prior_consumer_event(1) is consumer_event
+    nvme_slots.commit(((0, 4096), (1, 12288)))
+    assert nvme_slots.previous(1) == 12288
+    try:
+        nvme_slots.prior_consumer_event(1)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("NVMe predecessor proof was not single-use")
+    nvme_slots.record_consumer("next-attention-stream")
+    nvme_slots.commit(((2, 16384),))
+    assert nvme_slots.prior_consumer_event(0) is consumer_event
+    assert consumer_event.streams == ["attention-stream", "next-attention-stream"]
+    assert (
+        _require_exact_prefetch_layers(
+            {0: object(), 1: object()}, 2, consumer="test consumer"
+        )
+        == 1
+    )
+    for malformed_layers in ({1: object()}, {0: object(), 2: object()}):
+        try:
+            _require_exact_prefetch_layers(
+                malformed_layers, 2, consumer="test consumer"
+            )
+        except RuntimeError as error:
+            assert "exact full-model prefetch" in str(error)
+        else:
+            raise AssertionError("graph consumer accepted incomplete layer readiness")
 
     class CloseProbe:
         def __init__(self, log, *, fail: bool = False) -> None:
@@ -494,6 +826,12 @@ def main() -> None:
     )
     assert (
         _consumer_contract_for_stats(
+            {"graph_external_batches": 1}, engine_version="0.5.16"
+        ).kind.value
+        == "framework_reference"
+    )
+    assert (
+        _consumer_contract_for_stats(
             {
                 "stock_prefetched_external_attention_launches": 1,
                 "ticketed_incremental_launches": 1,
@@ -502,33 +840,6 @@ def main() -> None:
         ).kind.value
         == "native_work_unit"
     )
-    ranges = _request_ranges(
-        (
-            RequestBinding(0, 5, 1, stable_request_id("r0")),
-            RequestBinding(1, 9, 1, stable_request_id("r1")),
-        ),
-        (0, 0, 1),
-    )
-    assert [
-        (item.work_begin, item.work_count, item.request_slot) for item in ranges
-    ] == [
-        (0, 2, 5),
-        (2, 1, 9),
-    ]
-    for malformed in ((0, 1, 0), (0, 0)):
-        try:
-            _request_ranges(
-                (
-                    RequestBinding(0, 5, 1, stable_request_id("r0")),
-                    RequestBinding(1, 9, 1, stable_request_id("r1")),
-                ),
-                malformed,
-            )
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("malformed request schedule was accepted")
-
     assert _pipeline_object_range(128, 0, 12) == (104, 128)
     assert _pipeline_object_range(128, 1, 12) == (80, 104)
     for invalid in ((0, 0, 12), (128, -1, 12), (48, 1, 12)):
@@ -576,6 +887,7 @@ def main() -> None:
         "object_count": 4,
         "progress_blocks": (2, 2),
         "ready_work_counts": (4, 8),
+        "ready_work_offsets": (),
         "initial_ready_work_count": 0,
         "indexed_copy_blocks_per_group": 2,
         "query": query,
@@ -591,8 +903,15 @@ def main() -> None:
     changed_graph_key = _demand_graph_key(
         **(graph_key_arguments | {"progress_blocks": (4,), "ready_work_counts": (8,)})
     )
+    windowed_graph_key = _demand_graph_key(
+        **(
+            graph_key_arguments
+            | {"ready_work_counts": (4, 4), "ready_work_offsets": (0, 4)}
+        )
+    )
     assert graph_key == same_graph_key
     assert graph_key != changed_graph_key
+    assert graph_key != windowed_graph_key
 
     graph_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
     graph_backend._demand_graphs = {}
@@ -709,32 +1028,35 @@ def main() -> None:
         def element_size(self) -> int:
             return self._element_bytes
 
-    host_pool = types.SimpleNamespace(
-        k_data_refs=[TensorGeometry(128, 2), TensorGeometry(128, 2)],
-        v_data_refs=[TensorGeometry(128, 2), TensorGeometry(128, 2)],
+    stock_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
+    stock_backend._model_layer_count = 2
+    stock_backend._stats = {
+        "batches": 0,
+        "hicache_external_batches": 0,
+        "stock_prefetched_external_batches": 0,
+    }
+    prefetched = {0: object(), 1: object()}
+    stock_pending = types.SimpleNamespace(
+        prefetched_layers=prefetched,
+        prefetch_tensors=(object(),),
+        materialize_mapping=lambda: (_ for _ in ()).throw(
+            AssertionError("complete prefetch materialized an unused CPU page map")
+        ),
     )
-    pending = types.SimpleNamespace(
-        host_indices=TensorGeometry(64, 8),
-        controller=types.SimpleNamespace(mem_pool_host=host_pool),
-    )
-    assert _frontier_transfer_bytes(pending) == 64 * 2 * 2 * 128 * 2
-    host_pool.v_data_refs.pop()
+    stock_binding = RequestBinding(0, 0, 1, stable_request_id("stock"))
+    stock_backend._activate_stock_prefetch((stock_binding,), stock_pending)
+    assert stock_backend._active_batch.page_pairs == {}
+    assert stock_backend._active_batch.prefetched_layers is prefetched
+    assert stock_backend._stats["stock_prefetch_metadata_fastpath_batches"] == 1
     try:
-        _frontier_transfer_bytes(pending)
+        stock_backend._activate_stock_prefetch(
+            (stock_binding,),
+            types.SimpleNamespace(prefetched_layers={0: object()}, prefetch_tensors=()),
+        )
     except RuntimeError as error:
-        assert "K/V layer counts disagree" in str(error)
+        assert "exact full-model prefetch" in str(error)
     else:
-        raise AssertionError("frontier accepted mismatched K/V layer counts")
-    host_pool.v_data_refs.append(TensorGeometry(128, 2))
-    frontier_bytes = _frontier_transfer_bytes(pending)
-    frontier_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
-    frontier_backend._stats = {}
-    prepared = []
-    frontier_backend._prepare_cross_layer_frontier = prepared.append
-    frontier_backend._publish_cross_layer_frontier(pending)
-    assert prepared == [pending]
-    assert frontier_backend._stats["frontier_proactive_batches"] == 1
-    assert frontier_backend._stats["frontier_published_bytes"] == frontier_bytes
+        raise AssertionError("partial prefetch entered the stock fast path")
 
     schedule = Schedule((0, 0, 1, 1), (0, 1, 0, 1), 4, 128)
     grouped = _group_external_pages_by_request(
@@ -752,9 +1074,24 @@ def main() -> None:
         ((), ()),
         ((30,), (40,)),
     )
+    chunked_pairs = _page_pairs_for_schedule(
+        Schedule((0, 0, 1), (0, 1, 0), 4, 3),
+        indptr=(0, 8, 12),
+        pages=(10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 23),
+        last_page=(1, 1),
+        page_size=1,
+        source_by_device={11: 101, 12: 102, 16: 106, 20: 200, 21: 201},
+    )
+    assert chunked_pairs == (
+        ((101, 102), (11, 12)),
+        ((106,), (16,)),
+        ((200, 201), (20, 21)),
+    )
+
     source = inspect.getsource(NtaFlashInferAttnBackend._upload_plan)
     assert "initial_runnable_tiles" in source
-    assert "direct_work_count if self._overlap_enabled else 0" in source
+    assert "self._overlap_enabled and prefetched is None" in source
+    assert "force_rounds" not in source
     try:
         _group_external_pages_by_request(
             schedule,
@@ -826,6 +1163,7 @@ def main() -> None:
         work_item_count=3,
         work_items_tensor=work_items_tensor,
         dependencies_tensor=dependencies_tensor,
+        has_external=False,
         mark_consumed=lambda stream: None,
     )
     backend._wrapper_modules[id(demand_wrapper)] = "instrumented_demand_acquire"

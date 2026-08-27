@@ -126,7 +126,7 @@ DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernel(const 
 #endif
   uint32_t nta_work_index = blockIdx.x;
 #if NTA_FLASHINFER_REQUEST_BOUND
-  if constexpr (nta::flashinfer::HasRequestBindingV<Params>) {
+  if constexpr (nta::flashinfer::HasDirectRequestBindingV<Params>) {
     nta_runtime = nta::flashinfer::runtime(params);
     if (!nta::flashinfer::validRequestBoundLaunch(params, nta_runtime)) return;
     if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
@@ -152,13 +152,15 @@ DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernel(const 
               nta_runtime, nta_request_index, nta_work)) {
         return;
       }
+    } else if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::flashinfer::validPreacquiredWork(
+              params, nta_work_index, nta_request_index) ||
+          !nta::kernel::acquirePreacquiredWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta_work_index, nta_work)) return;
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
-    } else if (!nta::flashinfer::tracksCompletion(params)) {
-      if (!nta::kernel::acquirePreacquiredWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta_work_index, nta_work)) return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
       if (!nta::kernel::acquireCurrentWork(
               nta_runtime, nta::flashinfer::workItems(params),
@@ -210,7 +212,7 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
 #endif
   uint32_t nta_work_index = blockIdx.x;
 #if NTA_FLASHINFER_REQUEST_BOUND
-  if constexpr (nta::flashinfer::HasRequestBindingV<Params>) {
+  if constexpr (nta::flashinfer::HasDirectRequestBindingV<Params>) {
     nta_runtime = nta::flashinfer::runtime(params);
     if (!nta::flashinfer::validRequestBoundLaunch(params, nta_runtime)) return;
     if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
@@ -236,13 +238,15 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
               nta_runtime, nta_request_index, nta_work)) {
         return;
       }
+    } else if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::flashinfer::validPreacquiredWork(
+              params, nta_work_index, nta_request_index) ||
+          !nta::kernel::acquirePreacquiredWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta_work_index, nta_work)) return;
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
-    } else if (!nta::flashinfer::tracksCompletion(params)) {
-      if (!nta::kernel::acquirePreacquiredWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta_work_index, nta_work)) return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
       if (!nta::kernel::acquireCurrentWork(
               nta_runtime, nta::flashinfer::workItems(params),
@@ -314,7 +318,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 #endif
   uint32_t nta_work_index = blockIdx.x;
 #if NTA_FLASHINFER_REQUEST_BOUND
-  if constexpr (nta::flashinfer::HasRequestBindingV<Params>) {
+  if constexpr (nta::flashinfer::HasDirectRequestBindingV<Params>) {
     nta_runtime = nta::flashinfer::runtime(params);
     if (!nta::flashinfer::validRequestBoundLaunch(params, nta_runtime)) return;
     if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
@@ -335,13 +339,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
           nta_request_index >= nta_runtime->requestCapacity) return;
       if (!nta::kernel::acquireCurrentRequest(
               nta_runtime, nta_request_index, nta_work)) return;
+    } else if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::flashinfer::validPreacquiredWork(
+              params, nta_work_index, nta_request_index) ||
+          !nta::kernel::acquirePreacquiredWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta_work_index, nta_work)) return;
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
-    } else if (!nta::flashinfer::tracksCompletion(params)) {
-      if (!nta::kernel::acquirePreacquiredWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta_work_index, nta_work)) return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
       if (!nta::kernel::acquireCurrentWork(
               nta_runtime, nta::flashinfer::workItems(params),
@@ -375,7 +381,7 @@ RAGGED_VALID_MASK_ANCHOR = """    if (block_valid_mask && !block_valid_mask[bx])
     }
 """
 RAGGED_VALID_MASK_REPLACEMENT = """    if constexpr (!nta::flashinfer::HasWorkPlanV<Params> &&
-                  !nta::flashinfer::HasRequestBindingV<Params>) {
+                  !nta::flashinfer::HasDirectRequestBindingV<Params>) {
       if (block_valid_mask && !block_valid_mask[bx]) {
         return;
       }
@@ -435,7 +441,7 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
 #endif
   uint32_t nta_work_index = blockIdx.x;
 #if NTA_FLASHINFER_REQUEST_BOUND
-  if constexpr (nta::flashinfer::HasRequestBindingV<Params>) {
+  if constexpr (nta::flashinfer::HasDirectRequestBindingV<Params>) {
     nta_runtime = nta::flashinfer::runtime(params);
     if (!nta::flashinfer::validRequestBoundLaunch(params, nta_runtime)) return;
     if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
@@ -461,13 +467,15 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
               nta_runtime, nta_request_index, nta_work)) {
         return;
       }
+    } else if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::flashinfer::validPreacquiredWork(
+              params, nta_work_index, nta_request_index) ||
+          !nta::kernel::acquirePreacquiredWork(
+              nta_runtime, nta::flashinfer::workItems(params),
+              nta_work_index, nta_work)) return;
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
-    } else if (!nta::flashinfer::tracksCompletion(params)) {
-      if (!nta::kernel::acquirePreacquiredWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta_work_index, nta_work)) return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
       if (!nta::kernel::acquireCurrentWork(
               nta_runtime, nta::flashinfer::workItems(params),
@@ -946,6 +954,8 @@ def validate_existing(
     output: pathlib.Path,
     expected: dict[str, object],
     expected_hashes: dict[str, str],
+    *,
+    verify_tree: bool = True,
 ) -> dict[str, object] | None:
     manifest_path = output / "manifest.json"
     if not output.exists():
@@ -963,7 +973,7 @@ def validate_existing(
         not isinstance(overlay_hashes, dict)
         or set(overlay_hashes) != set(expected_hashes)
         or not isinstance(overlay_tree_hash, str)
-        or tree_hash(output / "flashinfer") != overlay_tree_hash
+        or (verify_tree and tree_hash(output / "flashinfer") != overlay_tree_hash)
         or any(
             not isinstance(relative, str)
             or not isinstance(expected_hash, str)
@@ -976,7 +986,9 @@ def validate_existing(
     return manifest
 
 
-def prepare_locked(output: pathlib.Path) -> dict[str, object]:
+def prepare_locked(
+    output: pathlib.Path, *, fast_reuse: bool = False
+) -> dict[str, object]:
     version, include = flashinfer_include()
     if version not in SUPPORTED_VERSIONS:
         raise RuntimeError(
@@ -990,7 +1002,11 @@ def prepare_locked(output: pathlib.Path) -> dict[str, object]:
         relative: sha256(include / "flashinfer" / relative)
         for relative in expected_hashes
     }
-    observed_tree_hash = tree_hash(include / "flashinfer")
+    observed_tree_hash = (
+        expected_tree_hash
+        if fast_reuse and output.exists()
+        else tree_hash(include / "flashinfer")
+    )
     if observed != expected_hashes or observed_tree_hash != expected_tree_hash:
         mismatches = [
             relative
@@ -1004,9 +1020,14 @@ def prepare_locked(output: pathlib.Path) -> dict[str, object]:
             + ", ".join(mismatches)
         )
 
-    manifest: dict[str, object] = {
+    # Overlay identity is content based.  The same validated FlashInfer tree
+    # may be installed in more than one Python environment; its absolute
+    # include path is provenance, not an input to the generated files.  If it
+    # participated in reuse validation, two byte-identical installations
+    # would map to the same activation cache key but reject each other's
+    # overlay as stale.
+    identity: dict[str, object] = {
         "flashinfer_version": version,
-        "source_include": str(include),
         "source_hashes": observed,
         "source_tree_hash": observed_tree_hash,
         "hooks": [
@@ -1021,9 +1042,16 @@ def prepare_locked(output: pathlib.Path) -> dict[str, object]:
             "clang-dependent-template-fix",
         ],
     }
-    existing = validate_existing(output, manifest, expected_hashes)
+    existing = validate_existing(
+        output,
+        identity,
+        expected_hashes,
+        verify_tree=not fast_reuse,
+    )
     if existing is not None:
         return existing
+
+    manifest = {**identity, "source_include": str(include)}
 
     destination = output / "flashinfer"
     temporary = output.with_name(output.name + ".tmp")
@@ -1070,20 +1098,34 @@ def prepare_locked(output: pathlib.Path) -> dict[str, object]:
     return manifest
 
 
-def prepare(output: pathlib.Path) -> dict[str, object]:
+def prepare(
+    output: pathlib.Path, *, fast_reuse: bool = False
+) -> dict[str, object]:
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     lock_path = output.with_name(output.name + ".lock")
     with lock_path.open("a", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return prepare_locked(output)
+        return prepare_locked(output, fast_reuse=fast_reuse)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, type=pathlib.Path)
+    parser.add_argument(
+        "--fast-reuse",
+        action="store_true",
+        help=(
+            "validate an existing content-addressed overlay from its manifest "
+            "and patched headers; creation still performs full-tree validation"
+        ),
+    )
     options = parser.parse_args()
-    print(json.dumps(prepare(options.output), sort_keys=True))
+    print(
+        json.dumps(
+            prepare(options.output, fast_reuse=options.fast_reuse), sort_keys=True
+        )
+    )
     return 0
 
 

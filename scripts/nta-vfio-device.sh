@@ -297,18 +297,27 @@ capture_reference() {
 }
 
 write_reference() {
-  local owner_uid
-  if [[ $EUID -eq 0 && -e $reference ]]; then
+  local owner_uid owner_gid reference_dir temporary
+  reference_dir=$(dirname "$reference")
+  owner_uid=$(id -u)
+  owner_gid=$(id -g)
+  if [[ -e $reference ]]; then
     owner_uid=$(stat -c '%u' "$reference")
-    if [[ $owner_uid != 0 ]]; then
-      # fs.protected_regular can reject root opening another user's file in a
-      # sticky directory such as /tmp.  Preserve the artifact owner instead of
-      # weakening that protection or replacing the existing file.
-      as_user "$owner_uid" dd of="$reference" status=none "$@"
-      return
-    fi
+    owner_gid=$(stat -c '%g' "$reference")
   fi
-  dd of="$reference" status=none "$@"
+  # Qualification artifacts are deliberately made read-only after capture.
+  # Re-capture through a sibling temporary file so a later qualification can
+  # refresh a 0444 reference without weakening it in place or leaving a
+  # partially written oracle after interruption.
+  temporary=$(mktemp "$reference_dir/.nta-nvme-reference.XXXXXX")
+  trap 'rm -f "$temporary"' EXIT
+  dd of="$temporary" status=none "$@"
+  chmod 0444 "$temporary"
+  if [[ $(stat -c '%u:%g' "$temporary") != "$owner_uid:$owner_gid" ]]; then
+    as_root chown "$owner_uid:$owner_gid" "$temporary"
+  fi
+  mv -f "$temporary" "$reference"
+  trap - EXIT
 }
 
 snapshot_partitions() {

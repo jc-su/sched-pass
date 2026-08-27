@@ -43,6 +43,14 @@ _REQUIRED_RESOURCE_KINDS = {
     "NVME",
     "CXL_DAX",
 }
+_REMOVED_DECORATIVE_POLICIES = {
+    "DeviceDemandCostModel",
+    "DeviceDemandPlan",
+    "GranularityCostModel",
+    "GranularityEstimate",
+    "tenant_virtual_time_ns",
+    "serviceBytes",
+}
 
 
 def _files(root: Path, relative_roots: tuple[str, ...]):
@@ -182,6 +190,43 @@ def _boundary_findings(root: Path) -> list[str]:
     return findings
 
 
+def _closed_loop_findings(root: Path) -> list[str]:
+    """Reject policy surfaces that have no serving control-flow consumer."""
+    findings: list[str] = []
+    implementation = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore")
+        for path in _files(root, _IMPLEMENTATION_ROOTS)
+    )
+    for symbol in sorted(_REMOVED_DECORATIVE_POLICIES):
+        if re.search(rf"\b{re.escape(symbol)}\b", implementation):
+            findings.append(f"removed decorative policy resurfaced: {symbol}")
+
+    abi = (root / "include/nta/RuntimeABI.h").read_text(encoding="utf-8")
+    tenant = re.search(
+        r"struct\s+alignas\(16\)\s+TenantContext\s*\{(?P<body>.*?)\};",
+        abi,
+        re.DOTALL,
+    )
+    if tenant is None:
+        findings.append("tenant staging-isolation ABI is missing")
+    else:
+        fields = re.findall(r"std::uint\d+_t\s+(\w+)\s*;", tenant.group("body"))
+        if fields != ["maxOutstandingBytes", "outstandingBytes"]:
+            findings.append(f"tenant ABI contains non-isolation policy state: {fields}")
+
+    bridge = (root / "python/nta_runtime/engines/sglang_hicache.py").read_text(
+        encoding="utf-8"
+    )
+    admission = (root / "python/nta_runtime/engines/sglang_admission.py").read_text(
+        encoding="utf-8"
+    )
+    if "def poll_request_frontier" not in bridge:
+        findings.append("SGLang bridge does not expose compiler progress frontier")
+    if "poll_request_frontier(" not in admission:
+        findings.append("SGLang admission does not consume compiler progress frontier")
+    return findings
+
+
 def _api_versions(root: Path) -> dict[str, int]:
     native = (root / "include/nta/RuntimeC.h").read_text(encoding="utf-8")
     python = (root / "python/nta_runtime/runtime.py").read_text(encoding="utf-8")
@@ -281,6 +326,7 @@ def main() -> int:
     findings = _unfinished_findings(root)
     findings.extend(_python_syntax_findings(root))
     findings.extend(_boundary_findings(root))
+    findings.extend(_closed_loop_findings(root))
     versions = _api_versions(root)
     flashinfer_versions = _flashinfer_versions(root)
     resource_kinds = _resource_kinds(root)

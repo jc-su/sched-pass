@@ -1,7 +1,7 @@
 #include "nta/RuntimeC.h"
 
-#include "nta/DeviceWorkPlan.h"
 #include "nta/CxlRuntime.h"
+#include "nta/DeviceWorkPlan.h"
 #include "nta/HostRuntime.h"
 #include "nta/JitPhase.h"
 #include "nta/NvmeRuntime.h"
@@ -22,6 +22,11 @@
 
 struct nta_nvme_transport {
   std::shared_ptr<nta::NvmeTransport> value;
+};
+
+struct nta_nvme_hbm_region {
+  std::shared_ptr<nta::NvmeTransport> transport;
+  std::unique_ptr<nta::NvmeHbmRegion> value;
 };
 
 struct nta_cxl_dax_transport {
@@ -60,6 +65,9 @@ static_assert(sizeof(nta_operator_plan) ==
 static_assert(offsetof(nta_operator_plan, plan_fingerprint_low) ==
               offsetof(nta::operator_contract::Plan, planFingerprintLow));
 static_assert(sizeof(nta_request_spec) == 40);
+static_assert(sizeof(nta_contiguous_copy_run) == 16);
+static_assert(sizeof(nta_strided_copy_group) == 40);
+static_assert(sizeof(nta_nvme_hbm_registration_range) == 32);
 static_assert(offsetof(nta_request_spec, request_id) == 0);
 static_assert(offsetof(nta_request_spec, deadline_clock) == 8);
 static_assert(offsetof(nta_request_spec, max_outstanding_bytes) == 16);
@@ -176,6 +184,42 @@ cudaStream_t stream(std::uint64_t address) noexcept {
 
 cudaEvent_t event(std::uint64_t address) noexcept {
   return reinterpret_cast<cudaEvent_t>(static_cast<std::uintptr_t>(address));
+}
+
+std::vector<nta::IndexedHostObjectSpec>
+indexedHostObjects(const nta_indexed_host_object *objects,
+                   std::uint32_t objectCount) {
+  if (objects == nullptr || objectCount == 0) {
+    throw std::invalid_argument("indexed host object batch is empty");
+  }
+  std::vector<nta::IndexedHostObjectSpec> result;
+  result.reserve(objectCount);
+  for (std::uint32_t index = 0; index < objectCount; ++index) {
+    const nta_indexed_host_object &object = objects[index];
+    if (object.reserved != 0) {
+      throw std::invalid_argument(
+          "indexed host object reserved field must be zero");
+    }
+    result.push_back({
+        object.object_id,
+        object.version,
+        reinterpret_cast<const void *>(
+            static_cast<std::uintptr_t>(object.source_device_address)),
+        reinterpret_cast<void *>(
+            static_cast<std::uintptr_t>(object.staging_device_address)),
+        reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
+            object.source_indices_device_address)),
+        reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
+            object.staging_indices_device_address)),
+        object.index_count,
+        object.element_bytes,
+        object.source_stride_bytes,
+        object.staging_stride_bytes,
+        object.source_index_limit,
+        object.staging_index_limit,
+    });
+  }
+  return result;
 }
 
 void checkCuda(cudaError_t status, const char *operation) {
@@ -339,13 +383,64 @@ nta_status nta_nvme_transport_read_stats(const nta_nvme_transport *transport,
         source.cqHead,
         source.cqPhase,
         source.nextCompletionDword3,
+        source.hbmRegionRegistrations,
+        source.hbmRegionBytes,
+        source.hbmTransferViews,
     };
   });
 }
 
-nta_status nta_cxl_dax_transport_create(
-    const nta_cxl_dax_options *options,
-    nta_cxl_dax_transport **transportOut) {
+nta_status nta_nvme_transport_describe_hbm_region(
+    const nta_nvme_transport *transport, std::uint64_t deviceAddress,
+    std::uint64_t bytes, nta_nvme_hbm_registration_range *rangeOut) {
+  if (rangeOut != nullptr) {
+    *rangeOut = {};
+  }
+  return protect([&] {
+    requireHandle(transport, "NVMe transport");
+    if (rangeOut == nullptr || deviceAddress == 0) {
+      throw std::invalid_argument(
+          "NVMe HBM description requires an address and output range");
+    }
+    const nta::NvmeHbmRegistrationRange range =
+        transport->value->describeExternalHbm(
+            reinterpret_cast<void *>(
+                static_cast<std::uintptr_t>(deviceAddress)),
+            checkedSize(bytes, "NVMe HBM description bytes"));
+    *rangeOut = {
+        reinterpret_cast<std::uintptr_t>(range.allocationAddress),
+        range.allocationBytes,
+        reinterpret_cast<std::uintptr_t>(range.registrationAddress),
+        range.registrationBytes,
+    };
+  });
+}
+
+nta_status nta_nvme_transport_register_hbm_region(
+    nta_nvme_transport *transport, std::uint64_t deviceAddress,
+    std::uint64_t bytes, nta_nvme_hbm_region **regionOut) {
+  if (regionOut != nullptr) {
+    *regionOut = nullptr;
+  }
+  return protect([&] {
+    requireHandle(transport, "NVMe transport");
+    if (regionOut == nullptr || deviceAddress == 0) {
+      throw std::invalid_argument(
+          "NVMe HBM registration requires an address and output handle");
+    }
+    auto handle = std::make_unique<nta_nvme_hbm_region>();
+    handle->transport = transport->value;
+    handle->value = transport->value->registerExternalHbm(
+        reinterpret_cast<void *>(static_cast<std::uintptr_t>(deviceAddress)),
+        checkedSize(bytes, "NVMe HBM region bytes"));
+    *regionOut = handle.release();
+  });
+}
+
+void nta_nvme_hbm_region_destroy(nta_nvme_hbm_region *region) { delete region; }
+
+nta_status nta_cxl_dax_transport_create(const nta_cxl_dax_options *options,
+                                        nta_cxl_dax_transport **transportOut) {
   if (transportOut != nullptr) {
     *transportOut = nullptr;
   }
@@ -373,9 +468,9 @@ void nta_cxl_dax_transport_destroy(nta_cxl_dax_transport *transport) {
   delete transport;
 }
 
-nta_status nta_cxl_dax_transport_get_capabilities(
-    const nta_cxl_dax_transport *transport,
-    nta_cxl_dax_capabilities *capabilities) {
+nta_status
+nta_cxl_dax_transport_get_capabilities(const nta_cxl_dax_transport *transport,
+                                       nta_cxl_dax_capabilities *capabilities) {
   return protect([&] {
     requireHandle(transport, "CXL DAX transport");
     if (capabilities == nullptr) {
@@ -392,9 +487,9 @@ nta_status nta_cxl_dax_transport_get_capabilities(
   });
 }
 
-nta_status nta_runtime_get_tier_descriptor(
-    const nta_runtime *runtime, std::uint32_t sourceKind,
-    nta_tier_descriptor *descriptor) {
+nta_status nta_runtime_get_tier_descriptor(const nta_runtime *runtime,
+                                           std::uint32_t sourceKind,
+                                           nta_tier_descriptor *descriptor) {
   return protect([&] {
     requireHandle(runtime, "runtime");
     if (descriptor == nullptr || sourceKind >= nta::abi::BackendCount) {
@@ -413,6 +508,8 @@ nta_status nta_runtime_get_tier_descriptor(
         source.protocolOwner,
         source.payloadOwner,
         source.transferDestinationOwner,
+        source.mappingOwner,
+        source.directoryOwner,
         source.reserved,
     };
   });
@@ -456,8 +553,8 @@ nta_status nta_runtime_create(const nta_runtime_config *config,
       handle->cxl = cxl->value;
       backends.cxl = handle->cxl;
     }
-    handle->value = std::make_unique<nta::HostRuntime>(native,
-                                                        std::move(backends));
+    handle->value =
+        std::make_unique<nta::HostRuntime>(native, std::move(backends));
     *runtimeOut = handle.release();
   });
 }
@@ -512,11 +609,10 @@ nta_status nta_runtime_cancel_request(nta_runtime *runtime, std::uint32_t slot,
 
 nta_status nta_runtime_set_tenant_budget(nta_runtime *runtime,
                                          std::uint32_t tenantId,
-                                         std::uint64_t maxOutstandingBytes,
-                                         std::uint32_t weight) {
+                                         std::uint64_t maxOutstandingBytes) {
   return protect([&] {
     requireHandle(runtime, "runtime");
-    runtime->value->setTenantBudget(tenantId, maxOutstandingBytes, weight);
+    runtime->value->setTenantBudget(tenantId, maxOutstandingBytes);
   });
 }
 
@@ -594,37 +690,7 @@ nta_status nta_runtime_register_indexed_host_objects(
     const nta_indexed_host_object *objects, std::uint32_t objectCount) {
   return protect([&] {
     requireHandle(runtime, "runtime");
-    if (objects == nullptr || objectCount == 0) {
-      throw std::invalid_argument("indexed host object batch is empty");
-    }
-    std::vector<nta::IndexedHostObjectSpec> native;
-    native.reserve(objectCount);
-    for (std::uint32_t index = 0; index < objectCount; ++index) {
-      const nta_indexed_host_object &object = objects[index];
-      if ((object.flags & ~NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0) {
-        throw std::invalid_argument(
-            "indexed host object flags are unsupported");
-      }
-      native.push_back({
-          object.object_id,
-          object.version,
-          reinterpret_cast<const void *>(
-              static_cast<std::uintptr_t>(object.source_device_address)),
-          reinterpret_cast<void *>(
-              static_cast<std::uintptr_t>(object.staging_device_address)),
-          reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
-              object.source_indices_device_address)),
-          reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
-              object.staging_indices_device_address)),
-          object.index_count,
-          object.element_bytes,
-          object.source_stride_bytes,
-          object.staging_stride_bytes,
-          object.source_index_limit,
-          object.staging_index_limit,
-          (object.flags & NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0,
-      });
-    }
+    const auto native = indexedHostObjects(objects, objectCount);
     runtime->value->registerIndexedHostObjects(firstSlot, native);
   });
 }
@@ -635,37 +701,7 @@ nta_status nta_runtime_register_indexed_host_objects_async(
     std::uint64_t cudaStream) {
   return protect([&] {
     requireHandle(runtime, "runtime");
-    if (objects == nullptr || objectCount == 0) {
-      throw std::invalid_argument("indexed host object batch is empty");
-    }
-    std::vector<nta::IndexedHostObjectSpec> native;
-    native.reserve(objectCount);
-    for (std::uint32_t index = 0; index < objectCount; ++index) {
-      const nta_indexed_host_object &object = objects[index];
-      if ((object.flags & ~NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0) {
-        throw std::invalid_argument(
-            "indexed host object flags are unsupported");
-      }
-      native.push_back({
-          object.object_id,
-          object.version,
-          reinterpret_cast<const void *>(
-              static_cast<std::uintptr_t>(object.source_device_address)),
-          reinterpret_cast<void *>(
-              static_cast<std::uintptr_t>(object.staging_device_address)),
-          reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
-              object.source_indices_device_address)),
-          reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
-              object.staging_indices_device_address)),
-          object.index_count,
-          object.element_bytes,
-          object.source_stride_bytes,
-          object.staging_stride_bytes,
-          object.source_index_limit,
-          object.staging_index_limit,
-          (object.flags & NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0,
-      });
-    }
+    const auto native = indexedHostObjects(objects, objectCount);
     runtime->value->registerIndexedHostObjectsAsync(firstSlot, native,
                                                     stream(cudaStream));
   });
@@ -677,40 +713,40 @@ nta_status nta_runtime_register_indexed_host_objects_async_quiesced(
     std::uint64_t cudaStream, std::uint64_t priorConsumerEvent) {
   return protect([&] {
     requireHandle(runtime, "runtime");
-    if (objects == nullptr || objectCount == 0 || priorConsumerEvent == 0) {
+    if (priorConsumerEvent == 0) {
       throw std::invalid_argument(
           "quiesced indexed host registration requires objects and an event");
     }
-    std::vector<nta::IndexedHostObjectSpec> native;
-    native.reserve(objectCount);
-    for (std::uint32_t index = 0; index < objectCount; ++index) {
-      const nta_indexed_host_object &object = objects[index];
-      if ((object.flags & ~NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0) {
-        throw std::invalid_argument(
-            "indexed host object flags are unsupported");
-      }
-      native.push_back({
-          object.object_id,
-          object.version,
-          reinterpret_cast<const void *>(
-              static_cast<std::uintptr_t>(object.source_device_address)),
-          reinterpret_cast<void *>(
-              static_cast<std::uintptr_t>(object.staging_device_address)),
-          reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
-              object.source_indices_device_address)),
-          reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
-              object.staging_indices_device_address)),
-          object.index_count,
-          object.element_bytes,
-          object.source_stride_bytes,
-          object.staging_stride_bytes,
-          object.source_index_limit,
-          object.staging_index_limit,
-          (object.flags & NTA_INDEXED_HOST_OBJECT_PREACQUIRED) != 0,
-      });
-    }
+    const auto native = indexedHostObjects(objects, objectCount);
     runtime->value->registerIndexedHostObjectsAsyncQuiesced(
         firstSlot, native, stream(cudaStream), event(priorConsumerEvent));
+  });
+}
+
+nta_status nta_runtime_register_indexed_host_objects_async_bound(
+    nta_runtime *runtime, std::uint32_t firstSlot,
+    const nta_indexed_host_object *objects, std::uint32_t objectCount,
+    const nta_indexed_host_index_binding *indexBinding,
+    std::uint64_t cudaStream, std::uint64_t priorConsumerEvent) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (indexBinding == nullptr || indexBinding->reserved != 0 ||
+        indexBinding->source_indices_device_address == 0 ||
+        indexBinding->staging_indices_device_address == 0 ||
+        indexBinding->index_count == 0) {
+      throw std::invalid_argument("indexed host index binding is invalid");
+    }
+    const auto native = indexedHostObjects(objects, objectCount);
+    const nta::IndexedHostIndexBinding binding{
+        reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
+            indexBinding->source_indices_device_address)),
+        reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
+            indexBinding->staging_indices_device_address)),
+        indexBinding->index_count,
+    };
+    runtime->value->registerIndexedHostObjectsAsyncQuiesced(
+        firstSlot, native, stream(cudaStream), event(priorConsumerEvent),
+        &binding);
   });
 }
 
@@ -785,27 +821,32 @@ nta_status nta_runtime_install_nvme_object_async(
   });
 }
 
-nta_status nta_runtime_install_external_nvme_object(
+nta_status nta_runtime_install_registered_nvme_object(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
     std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
-    std::uint64_t destinationDeviceAddress,
+    nta_nvme_hbm_region *region, std::uint64_t destinationDeviceAddress,
     std::uint64_t *destinationDeviceAddressOut) {
   if (destinationDeviceAddressOut != nullptr) {
     *destinationDeviceAddressOut = 0;
   }
   return protect([&] {
     requireHandle(runtime, "runtime");
+    requireHandle(region, "NVMe HBM region");
     if (runtime->nvme == nullptr) {
       throw std::invalid_argument(
           "runtime was not created with an NVMe transport");
     }
     if (destinationDeviceAddress == 0) {
-      throw std::invalid_argument("external NVMe destination is null");
+      throw std::invalid_argument("registered NVMe destination is null");
+    }
+    if (runtime->nvme != region->transport) {
+      throw std::invalid_argument(
+          "NVMe HBM region belongs to a different transport");
     }
     const std::size_t nativeBytes = checkedSize(bytes, "NVMe object bytes");
-    auto destination = runtime->nvme->mapExternalHbm(
-        reinterpret_cast<void *>(static_cast<std::uintptr_t>(
-            destinationDeviceAddress)),
+    auto destination = region->value->view(
+        reinterpret_cast<void *>(
+            static_cast<std::uintptr_t>(destinationDeviceAddress)),
         nativeBytes);
     const nta::ObjectHandle object = runtime->value->installNvmeObject(
         slot, objectId, version, sourceByteOffset, nativeBytes,
@@ -817,17 +858,18 @@ nta_status nta_runtime_install_external_nvme_object(
   });
 }
 
-nta_status nta_runtime_install_external_nvme_object_async(
+nta_status nta_runtime_install_registered_nvme_object_async(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
     std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
-    std::uint64_t destinationDeviceAddress, std::uint64_t cudaStream,
-    std::uint64_t priorConsumerEvent,
+    nta_nvme_hbm_region *region, std::uint64_t destinationDeviceAddress,
+    std::uint64_t cudaStream, std::uint64_t priorConsumerEvent,
     std::uint64_t *destinationDeviceAddressOut) {
   if (destinationDeviceAddressOut != nullptr) {
     *destinationDeviceAddressOut = 0;
   }
   return protect([&] {
     requireHandle(runtime, "runtime");
+    requireHandle(region, "NVMe HBM region");
     if (runtime->nvme == nullptr) {
       throw std::invalid_argument(
           "runtime was not created with an NVMe transport");
@@ -836,15 +878,18 @@ nta_status nta_runtime_install_external_nvme_object_async(
       throw std::invalid_argument(
           "external NVMe installation requires destination and stream");
     }
+    if (runtime->nvme != region->transport) {
+      throw std::invalid_argument(
+          "NVMe HBM region belongs to a different transport");
+    }
     const std::size_t nativeBytes = checkedSize(bytes, "NVMe object bytes");
-    auto destination = runtime->nvme->mapExternalHbm(
-        reinterpret_cast<void *>(static_cast<std::uintptr_t>(
-            destinationDeviceAddress)),
+    auto destination = region->value->view(
+        reinterpret_cast<void *>(
+            static_cast<std::uintptr_t>(destinationDeviceAddress)),
         nativeBytes);
     const nta::ObjectHandle object = runtime->value->installNvmeObjectAsync(
         slot, objectId, version, sourceByteOffset, nativeBytes,
-        stream(cudaStream), event(priorConsumerEvent),
-        std::move(destination));
+        stream(cudaStream), event(priorConsumerEvent), std::move(destination));
     if (destinationDeviceAddressOut != nullptr) {
       *destinationDeviceAddressOut =
           reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
@@ -1098,6 +1143,195 @@ nta_status nta_copy_host_to_device_async(std::uint64_t destination,
   });
 }
 
+nta_status nta_copy_strided_host_runs_async(
+    const nta_strided_copy_group *groups, std::uint32_t groupCount,
+    const nta_contiguous_copy_run *runs, std::uint32_t runCount,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    constexpr std::uint32_t MaximumCopies = 1U << 16;
+    if (groups == nullptr || groupCount == 0 || runs == nullptr ||
+        runCount == 0 || runCount > MaximumCopies ||
+        groupCount > MaximumCopies / runCount) {
+      throw std::invalid_argument(
+          "strided host copy needs bounded groups and non-empty runs");
+    }
+
+    struct RowRange {
+      std::uint32_t begin;
+      std::uint32_t end;
+    };
+    struct AddressRange {
+      std::uintptr_t begin;
+      std::uintptr_t end;
+    };
+    std::vector<AddressRange> destinationSpans;
+    destinationSpans.reserve(groupCount);
+#if CUDART_VERSION >= 12080
+    const std::size_t copyCount =
+        static_cast<std::size_t>(groupCount) * runCount;
+    std::vector<cudaMemcpy3DBatchOp> operations(copyCount);
+#endif
+    int currentDevice = 0;
+    checkCuda(cudaGetDevice(&currentDevice), "query strided host-copy device");
+    for (std::uint32_t groupIndex = 0; groupIndex < groupCount; ++groupIndex) {
+      const nta_strided_copy_group &group = groups[groupIndex];
+      if (group.source_address == 0 || group.destination_address == 0 ||
+          group.source_rows == 0 || group.destination_rows == 0 ||
+          group.row_bytes == 0 || group.source_stride_bytes < group.row_bytes ||
+          group.destination_stride_bytes < group.row_bytes ||
+          group.reserved != 0) {
+        throw std::invalid_argument("strided host copy group is invalid");
+      }
+      cudaPointerAttributes sourceAttributes{};
+      cudaPointerAttributes destinationAttributes{};
+      checkCuda(cudaPointerGetAttributes(
+                    &sourceAttributes,
+                    reinterpret_cast<const void *>(group.source_address)),
+                "inspect strided host-copy source");
+      checkCuda(cudaPointerGetAttributes(
+                    &destinationAttributes,
+                    reinterpret_cast<const void *>(group.destination_address)),
+                "inspect strided host-copy destination");
+      if (sourceAttributes.type != cudaMemoryTypeHost ||
+          destinationAttributes.type != cudaMemoryTypeDevice ||
+          destinationAttributes.device != currentDevice) {
+        throw std::invalid_argument(
+            "strided host copy requires pinned host source and a CUDA "
+            "destination on the current device");
+      }
+
+      std::vector<RowRange> destinationRanges;
+      destinationRanges.reserve(runCount);
+      std::uintptr_t destinationSpanBegin =
+          std::numeric_limits<std::uintptr_t>::max();
+      std::uintptr_t destinationSpanEnd = 0;
+      for (std::uint32_t runIndex = 0; runIndex < runCount; ++runIndex) {
+        const nta_contiguous_copy_run &run = runs[runIndex];
+        if (run.row_count == 0 || run.reserved != 0 ||
+            run.source_first_row > group.source_rows ||
+            run.row_count > group.source_rows - run.source_first_row ||
+            run.destination_first_row > group.destination_rows ||
+            run.row_count >
+                group.destination_rows - run.destination_first_row) {
+          throw std::invalid_argument("strided host copy run is invalid");
+        }
+        const std::uint64_t sourceOffset =
+            static_cast<std::uint64_t>(run.source_first_row) *
+            group.source_stride_bytes;
+        const std::uint64_t destinationOffset =
+            static_cast<std::uint64_t>(run.destination_first_row) *
+            group.destination_stride_bytes;
+        const std::uint64_t sourceExtent =
+            static_cast<std::uint64_t>(run.row_count - 1U) *
+                group.source_stride_bytes +
+            group.row_bytes;
+        const std::uint64_t destinationExtent =
+            static_cast<std::uint64_t>(run.row_count - 1U) *
+                group.destination_stride_bytes +
+            group.row_bytes;
+        if (sourceOffset > std::numeric_limits<std::uintptr_t>::max() -
+                               group.source_address ||
+            destinationOffset > std::numeric_limits<std::uintptr_t>::max() -
+                                    group.destination_address ||
+            sourceExtent > std::numeric_limits<std::uintptr_t>::max() -
+                               group.source_address - sourceOffset ||
+            destinationExtent > std::numeric_limits<std::uintptr_t>::max() -
+                                    group.destination_address -
+                                    destinationOffset) {
+          throw std::overflow_error("strided host copy address overflow");
+        }
+        const std::uintptr_t destinationBegin =
+            group.destination_address + destinationOffset;
+        const std::uintptr_t destinationEnd =
+            destinationBegin + destinationExtent;
+        destinationSpanBegin = std::min(destinationSpanBegin, destinationBegin);
+        destinationSpanEnd = std::max(destinationSpanEnd, destinationEnd);
+        destinationRanges.push_back(
+            {run.destination_first_row,
+             run.destination_first_row + run.row_count});
+#if CUDART_VERSION >= 12080
+        cudaMemcpy3DBatchOp &operation =
+            operations[static_cast<std::size_t>(groupIndex) * runCount +
+                       runIndex];
+        operation.src.type = cudaMemcpyOperandTypePointer;
+        operation.src.op.ptr.ptr =
+            reinterpret_cast<void *>(group.source_address + sourceOffset);
+        operation.src.op.ptr.rowLength = group.source_stride_bytes;
+        operation.src.op.ptr.layerHeight = run.row_count;
+        operation.dst.type = cudaMemcpyOperandTypePointer;
+        operation.dst.op.ptr.ptr = reinterpret_cast<void *>(
+            group.destination_address + destinationOffset);
+        operation.dst.op.ptr.rowLength = group.destination_stride_bytes;
+        operation.dst.op.ptr.layerHeight = run.row_count;
+        operation.extent = {group.row_bytes, run.row_count, 1};
+        operation.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        operation.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+#endif
+      }
+
+      std::sort(destinationRanges.begin(), destinationRanges.end(),
+                [](const RowRange &left, const RowRange &right) {
+                  return left.begin < right.begin;
+                });
+      for (std::size_t index = 1; index < destinationRanges.size(); ++index) {
+        if (destinationRanges[index].begin < destinationRanges[index - 1].end) {
+          throw std::invalid_argument(
+              "strided host copy destinations overlap within a group");
+        }
+      }
+      destinationSpans.push_back({destinationSpanBegin, destinationSpanEnd});
+    }
+
+    std::sort(destinationSpans.begin(), destinationSpans.end(),
+              [](const AddressRange &left, const AddressRange &right) {
+                return left.begin < right.begin;
+              });
+    for (std::size_t index = 1; index < destinationSpans.size(); ++index) {
+      if (destinationSpans[index].begin < destinationSpans[index - 1].end) {
+        throw std::invalid_argument(
+            "strided host-copy group spans overlap; submit them separately");
+      }
+    }
+
+#if CUDART_VERSION >= 12080
+    if (cudaStream != 0) {
+      std::size_t failedIndex = std::numeric_limits<std::size_t>::max();
+      checkCuda(cudaMemcpy3DBatchAsync(operations.size(), operations.data(),
+                                       &failedIndex, 0, stream(cudaStream)),
+                "enqueue strided host-copy batch");
+      return;
+    }
+#endif
+#if CUDART_VERSION < 12080
+    static_cast<void>(cudaStream);
+#endif
+    // cudaMemcpy3DBatchAsync rejects the legacy default stream. Keep the C API
+    // complete for callers that intentionally use it, and retain the same
+    // two-dimensional semantics on pre-12.8 runtimes.
+    for (std::uint32_t groupIndex = 0; groupIndex < groupCount; ++groupIndex) {
+      const nta_strided_copy_group &group = groups[groupIndex];
+      for (std::uint32_t runIndex = 0; runIndex < runCount; ++runIndex) {
+        const nta_contiguous_copy_run &run = runs[runIndex];
+        const std::uint64_t sourceOffset =
+            static_cast<std::uint64_t>(run.source_first_row) *
+            group.source_stride_bytes;
+        const std::uint64_t destinationOffset =
+            static_cast<std::uint64_t>(run.destination_first_row) *
+            group.destination_stride_bytes;
+        checkCuda(cudaMemcpy2DAsync(
+                      reinterpret_cast<void *>(group.destination_address +
+                                               destinationOffset),
+                      group.destination_stride_bytes,
+                      reinterpret_cast<const void *>(group.source_address +
+                                                     sourceOffset),
+                      group.source_stride_bytes, group.row_bytes, run.row_count,
+                      cudaMemcpyHostToDevice, stream(cudaStream)),
+                  "enqueue strided host-copy run");
+      }
+    }
+  });
+}
+
 nta_status nta_device_work_plan_create(std::uint32_t workItemCapacity,
                                        std::uint32_t dependencyCapacity,
                                        std::int32_t deviceOrdinal,
@@ -1324,6 +1558,17 @@ nta_status nta_jit_phase_validate_indexed_host_range(
   });
 }
 
+nta_status nta_jit_phase_warmup_indexed_host_validation(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->warmupIndexedHostValidation(
+        stream(cudaStream), runtime->value->deviceView());
+  });
+}
+
 nta_status nta_jit_phase_rebind_indexed_host_pairs(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     std::uint32_t firstObject, std::uint32_t pairCount, std::uint64_t keySource,
@@ -1495,7 +1740,6 @@ nta_status nta_jit_phase_prepare_bounded_selected_indexed_rows(
   });
 }
 
-
 nta_status nta_jit_phase_reduce_mapped_key_pages(
     const nta_jit_phase_program *program, std::uint64_t source,
     std::uint32_t sourceRows, std::uint64_t sourceStrideBytes,
@@ -1512,7 +1756,6 @@ nta_status nta_jit_phase_reduce_mapped_key_pages(
         reinterpret_cast<float *>(outputMax));
   });
 }
-
 
 nta_status nta_jit_phase_reduce_mapped_indexed_key_pages(
     const nta_jit_phase_program *program, std::uint64_t source,

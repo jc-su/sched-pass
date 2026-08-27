@@ -117,7 +117,7 @@ fi
   -o "${output_dir}/dependency-set.lowered.ll"
 rg -q 'call i1 @nta_acquire_set_slow' \
   "${output_dir}/dependency-set.lowered.ll"
-rg -Fq '!{!"request-bound", i32 29, !"dependency-set", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 31, !"dependency-set", !"split-phase-cta"}' \
   "${output_dir}/dependency-set.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
   "${output_dir}/dependency-set.lowered.ll"; then
@@ -147,7 +147,7 @@ fi
   -o "${output_dir}/tensor-map.lowered.ll"
 rg -q 'call ptr @nta_acquire_tensor_map_slow' \
   "${output_dir}/tensor-map.lowered.ll"
-rg -Fq '!{!"request-bound", i32 29, !"tensor-map", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 31, !"tensor-map", !"split-phase-cta"}' \
   "${output_dir}/tensor-map.lowered.ll"
 rg -q 'phi ptr \[ null, %entry \], \[ %direct.map, %nta.acquire.direct \]' \
   "${output_dir}/tensor-map.lowered.ll"
@@ -164,11 +164,24 @@ fi
   -o "${output_dir}/late-bound.lowered.ll"
 rg -q 'call ptr @nta_acquire_slow' "${output_dir}/late-bound.lowered.ll"
 rg -q 'and i32 %cta, %catalog.mask' "${output_dir}/late-bound.lowered.ll"
-rg -Fq '!{!"request-bound", i32 29, !"byte-address", !"split-phase-cta"}' \
+rg -Fq '!{!"request-bound", i32 31, !"byte-address", !"split-phase-cta"}' \
   "${output_dir}/late-bound.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
   "${output_dir}/late-bound.lowered.ll"; then
   echo "lowered late-bound module still contains an NTA marker" >&2
+  exit 1
+fi
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
+  -S "${source_dir}/uniform-cycle.ll" \
+  -o "${output_dir}/uniform-cycle.lowered.ll"
+rg -q 'call ptr @nta_acquire_slow' \
+  "${output_dir}/uniform-cycle.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
+  "${output_dir}/uniform-cycle.lowered.ll"; then
+  echo "lowered uniform-cycle module still contains an NTA marker" >&2
   exit 1
 fi
 
@@ -197,6 +210,7 @@ fixtures=(
   "reject-nondominating-divergent:acquisition marker is control-dependent on a non-CTA-uniform branch"
   "reject-divergent-operand:acquisition marker has a non-CTA-uniform operand"
   "reject-divergent-value-phi:request binding has a non-CTA-uniform operand"
+  "reject-divergent-cycle:request binding has a non-CTA-uniform operand"
   "reject-device-helper:acquisition markers must be inlined into a GPU kernel entry"
   "reject-partial-bypass:partial publication must post-dominate its numerical region"
   "reject-partial-without-acquire:partial region is not on an acquired path with the same request binding and work ticket"

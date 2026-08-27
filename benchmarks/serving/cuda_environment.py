@@ -159,6 +159,7 @@ def configure_jit_environment(
             "FLASHINFER_WORKSPACE_BASE",
             "NTA_PLUGIN",
             "NTA_RUNTIME_LIBRARY",
+            "NTA_TRANSPORT_PROGRAM",
             "NTA_FLASHINFER_HOOK",
             "NTA_FLASHINFER_OVERLAY",
         }

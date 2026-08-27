@@ -29,24 +29,31 @@ struct TierOwnership {
   TierOwner protocol = TierOwner::None;
   TierOwner payload = TierOwner::None;
   TierOwner transferDestination = TierOwner::None;
+  TierOwner mapping = TierOwner::None;
+  TierOwner directory = TierOwner::Runtime;
 };
 
 [[nodiscard]] constexpr TierOwnership
 defaultTierOwnership(abi::SourceKind kind) noexcept {
   switch (kind) {
   case abi::SourceKind::Hbm:
+    return {TierOwner::Engine, TierOwner::Engine, TierOwner::None,
+            TierOwner::None, TierOwner::Runtime};
   case abi::SourceKind::HostMapped:
-    return {TierOwner::Engine, TierOwner::Engine, TierOwner::None};
+    return {TierOwner::Engine, TierOwner::Engine, TierOwner::None,
+            TierOwner::Engine, TierOwner::Runtime};
   case abi::SourceKind::HostStaged:
-    return {TierOwner::Runtime, TierOwner::Engine, TierOwner::Runtime};
+    return {TierOwner::Runtime, TierOwner::Engine, TierOwner::Engine,
+            TierOwner::None, TierOwner::Runtime};
   case abi::SourceKind::Nvme:
-    return {TierOwner::Transport, TierOwner::Transport,
-            TierOwner::Transport};
+    return {TierOwner::Transport, TierOwner::Transport, TierOwner::Engine,
+            TierOwner::Transport, TierOwner::Runtime};
   case abi::SourceKind::Cxl:
-    return {TierOwner::Transport, TierOwner::Transport, TierOwner::None};
+    return {TierOwner::Transport, TierOwner::Transport, TierOwner::None,
+            TierOwner::Transport, TierOwner::Runtime};
   case abi::SourceKind::Rdma:
-    return {TierOwner::Transport, TierOwner::Transport,
-            TierOwner::Transport};
+    return {TierOwner::Transport, TierOwner::Transport, TierOwner::Engine,
+            TierOwner::Transport, TierOwner::Runtime};
   }
   return {};
 }
@@ -77,9 +84,11 @@ struct TierDescriptor {
   std::uint32_t protocolOwner;
   std::uint32_t payloadOwner;
   std::uint32_t transferDestinationOwner;
+  std::uint32_t mappingOwner;
+  std::uint32_t directoryOwner;
   std::uint32_t reserved;
 };
-static_assert(sizeof(TierDescriptor) == 56);
+static_assert(sizeof(TierDescriptor) == 64);
 
 [[nodiscard]] constexpr std::uint32_t
 defaultTierCapabilities(abi::SourceKind kind) noexcept {
@@ -93,7 +102,7 @@ defaultTierCapabilities(abi::SourceKind kind) noexcept {
   case abi::SourceKind::Nvme:
     return TierDeviceInitiated | TierPersistentStorage;
   case abi::SourceKind::Cxl:
-    return TierDirectAddress | TierHostRegistered | TierPersistentStorage;
+    return TierDirectAddress | TierHostRegistered;
   case abi::SourceKind::Rdma:
     return TierPersistentStorage;
   }

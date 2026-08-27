@@ -59,6 +59,24 @@ template <typename Params>
 inline constexpr bool HasRequestBindingV = HasRequestBinding<Params>::value;
 
 template <typename Params, typename = void>
+struct HasMappedRequestBinding : std::false_type {};
+
+template <typename Params>
+struct HasMappedRequestBinding<
+    Params,
+    std::void_t<decltype(std::declval<const Params &>().nta_runtime),
+                decltype(std::declval<const Params &>().nta_request_slots)>>
+    : std::true_type {};
+
+template <typename Params>
+inline constexpr bool HasMappedRequestBindingV =
+    HasMappedRequestBinding<Params>::value;
+
+template <typename Params>
+inline constexpr bool HasDirectRequestBindingV =
+    HasRequestBindingV<Params> || HasMappedRequestBindingV<Params>;
+
+template <typename Params, typename = void>
 struct HasPagedBatchSize : std::false_type {};
 
 template <typename Params>
@@ -134,10 +152,50 @@ validWork(const Params &params, std::uint32_t schedulerIndex,
   }
 }
 
+// A preacquired launch retains FlashInfer's complete canonical scheduler grid,
+// but its CUDA stream/event edge owns data readiness and completion.  Its
+// structural work IDs may therefore outnumber the runtime ticket directory.
+// Keep this validator separate from validWork so a ticket-backed path can
+// never accidentally inherit the relaxed bound.
+template <typename Params>
+[[nodiscard]] __device__ __forceinline__ bool
+validPreacquiredWork(const Params &params, std::uint32_t schedulerIndex,
+                     std::uint32_t requestIndex) {
+  if constexpr (!HasWorkPlanV<Params>) {
+    (void)params;
+    (void)schedulerIndex;
+    (void)requestIndex;
+    return false;
+  } else {
+    const std::uint64_t flags =
+        static_cast<std::uint64_t>(params.nta_skip_merge);
+    if ((flags & Preacquired) == 0 || (flags & RunnableWork) != 0 ||
+        params.nta_runtime == nullptr || params.nta_work_items == nullptr ||
+        schedulerIndex >= static_cast<std::uint64_t>(workCount(params))) {
+      return false;
+    }
+#if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+    if (params.nta_dependencies == nullptr) {
+      return false;
+    }
+#endif
+    auto *runtime = reinterpret_cast<abi::RuntimeView *>(params.nta_runtime);
+    const auto *items =
+        reinterpret_cast<const abi::WorkItem *>(params.nta_work_items);
+    const abi::WorkItem &item = items[schedulerIndex];
+    return runtime->abiVersion == abi::Version &&
+           item.requestIndex == requestIndex &&
+           item.requestSlot < runtime->requestCapacity &&
+           item.contributorCount != 0 &&
+           item.contributorIndex < item.contributorCount;
+  }
+}
+
 template <typename Params>
 [[nodiscard]] __device__ __forceinline__ abi::RuntimeView *
 runtime(const Params &params) {
-  if constexpr (HasWorkPlanV<Params> || HasRequestBindingV<Params>) {
+  if constexpr (HasWorkPlanV<Params> || HasRequestBindingV<Params> ||
+                HasMappedRequestBindingV<Params>) {
     return reinterpret_cast<abi::RuntimeView *>(params.nta_runtime);
   } else {
     (void)params;
@@ -215,7 +273,8 @@ usesPlanlessPreacquired(const Params &params) {
 template <typename Params>
 [[nodiscard]] __device__ __forceinline__ bool
 validRequestBoundLaunch(const Params &params, abi::RuntimeView *runtime) {
-  if constexpr (!HasRequestBindingV<Params>) {
+  if constexpr (!HasRequestBindingV<Params> &&
+                !HasMappedRequestBindingV<Params>) {
     (void)params;
     (void)runtime;
     return false;
@@ -229,14 +288,24 @@ template <typename Params>
 [[nodiscard]] __device__ __forceinline__ bool
 bindValidatedRequestOnly(const Params &params, abi::RuntimeView *runtime,
                          std::uint32_t requestIndex) {
-  if constexpr (!HasRequestBindingV<Params>) {
+  if constexpr (!HasRequestBindingV<Params> &&
+                !HasMappedRequestBindingV<Params>) {
     (void)params;
     (void)runtime;
     (void)requestIndex;
     return false;
   } else {
-    const std::uint64_t requestSlot64 =
-        static_cast<std::uint64_t>(params.nta_request_slot_offset) + requestIndex;
+    std::uint64_t requestSlot64 = 0;
+    if constexpr (HasMappedRequestBindingV<Params>) {
+      if (params.nta_request_slots == nullptr) {
+        return false;
+      }
+      requestSlot64 = static_cast<std::uint64_t>(
+          static_cast<const std::int32_t *>(params.nta_request_slots)[requestIndex]);
+    } else {
+      requestSlot64 =
+          static_cast<std::uint64_t>(params.nta_request_slot_offset) + requestIndex;
+    }
     if (requestSlot64 >= runtime->requestCapacity) {
       return false;
     }

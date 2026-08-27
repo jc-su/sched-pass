@@ -108,9 +108,16 @@ struct IndexedHostObjectSpec {
   std::uint32_t stagingStrideBytes;
   std::uint32_t sourceIndexLimit;
   std::uint32_t stagingIndexLimit;
-  // The caller has enqueued the transfer on the same stream after directory
-  // publication and will gate every consumer with a post-transfer event.
-  bool preacquired = false;
+};
+
+// One lease-scoped provenance proof shared by a batch of indexed objects.
+// Object index pointers may name subranges, but every subrange must fit these
+// two caller-owned uint32_t arrays. The arrays remain live through the same
+// acquisition epoch as the object registrations.
+struct IndexedHostIndexBinding {
+  const std::uint32_t *sourceIndicesDevice;
+  const std::uint32_t *stagingIndicesDevice;
+  std::uint32_t indexCount;
 };
 
 struct EpochStatus {
@@ -152,8 +159,7 @@ public:
                             cudaStream_t stream);
   void cancelRequest(std::uint32_t slot, std::uint32_t generation);
   void setTenantBudget(std::uint32_t tenantId,
-                       std::uint64_t maxOutstandingBytes,
-                       std::uint32_t weight = 1);
+                       std::uint64_t maxOutstandingBytes);
 
   ObjectHandle installObject(std::uint32_t slot, std::uint64_t objectId,
                              std::uint32_t version,
@@ -197,7 +203,8 @@ public:
   // CUDA.
   void registerIndexedHostObjectsAsyncQuiesced(
       std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects,
-      cudaStream_t stream, cudaEvent_t priorConsumerEvent);
+      cudaStream_t stream, cudaEvent_t priorConsumerEvent,
+      const IndexedHostIndexBinding *indexBinding = nullptr);
   // Install an NVMe object using a runtime-owned destination. When the slot
   // already owns a large-enough NVMe buffer, only the source-range directory
   // entry is republished; the HBM allocation and DMA mapping remain alive.

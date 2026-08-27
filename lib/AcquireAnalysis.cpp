@@ -13,6 +13,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Operator.h"
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -165,13 +166,30 @@ public:
     }
     const auto found = states_.find(instruction);
     if (found != states_.end()) {
-      // A recursive SSA edge is provisionally uniform. Any divergent seed in
-      // the cycle still propagates when the outer query completes.
-      return found->second != Divergent;
+      if (found->second == Visiting) {
+        // Uniform loop-carried values require an optimistic fixed-point seed.
+        // Record that this answer is provisional so no result derived from it
+        // is memoized before the active cycle reaches its fixed point.
+        ++provisionalReads_;
+        return true;
+      }
+      return found->second == Uniform;
     }
+    const std::uint64_t provisionalReadsBefore = provisionalReads_;
     states_[instruction] = Visiting;
     const bool uniform = classify(*instruction);
-    states_[instruction] = uniform ? Uniform : Divergent;
+    if (!uniform) {
+      // Divergence is monotone and remains sound even when its proof traversed
+      // an optimistic recursive edge.
+      states_[instruction] = Divergent;
+    } else if (provisionalReads_ == provisionalReadsBefore) {
+      states_[instruction] = Uniform;
+    } else {
+      // Recompute this node after its enclosing SCC has finalized. Caching it
+      // now could preserve an optimistic Uniform result after another member
+      // of the cycle discovers a divergent seed.
+      states_.erase(instruction);
+    }
     return uniform;
   }
 
@@ -220,8 +238,13 @@ private:
   bool localObjectUniform(AllocaInst &object) {
     const auto found = localStates_.find(&object);
     if (found != localStates_.end()) {
-      return found->second != Divergent;
+      if (found->second == Visiting) {
+        ++provisionalReads_;
+        return true;
+      }
+      return found->second == Uniform;
     }
+    const std::uint64_t provisionalReadsBefore = provisionalReads_;
     localStates_[&object] = Visiting;
 
     bool sawWrite = false;
@@ -290,7 +313,13 @@ private:
       }
     }
 
-    localStates_[&object] = sawWrite ? Uniform : Divergent;
+    if (!sawWrite) {
+      localStates_[&object] = Divergent;
+    } else if (provisionalReads_ == provisionalReadsBefore) {
+      localStates_[&object] = Uniform;
+    } else {
+      localStates_.erase(&object);
+    }
     return sawWrite;
   }
 
@@ -403,6 +432,7 @@ private:
 
   DenseMap<Instruction *, State> states_;
   DenseMap<AllocaInst *, State> localStates_;
+  std::uint64_t provisionalReads_ = 0;
   PostDominatorTree &postDominatorTree_;
 };
 

@@ -26,6 +26,11 @@ from nta_runtime.execution_protocol import ExecutionProtocolConfig, ProtocolKind
 from nta_runtime.requests import RequestBinding
 from nta_runtime.work_unit import Availability, Granularity
 
+if __package__:
+    from .queueing import modeled_blocked_cohort_accounting
+else:
+    from queueing import modeled_blocked_cohort_accounting
+
 
 @dataclass(frozen=True)
 class ArmDefinition:
@@ -208,7 +213,7 @@ def _trace(case: dict[str, Any], seed: int) -> tuple[ExecutionTile, ...]:
         category_scale = (1.0, 1.5, 0.5, 0.75)[category]
         selected_for_request = max(1, min(candidates, round(selected * category_scale)))
         selected_ids = (
-            tuple(range(candidates))
+            ()
             if selected_for_request == candidates
             else tuple(
                 (request_index * 13 + index) % candidates
@@ -243,6 +248,8 @@ def _trace_hash(tiles: tuple[ExecutionTile, ...]) -> str:
             "generation": tile.binding.generation,
             "ready": tile.ready,
             "candidate_units": tile.candidate_units,
+            "selected_units": tile.selected_units,
+            "demand_semantics": tile.demand_semantics.value,
             "selected_ids": tile.selected_ids,
         }
         for tile in tiles
@@ -359,9 +366,9 @@ def _run_arm(
             generation_rejections += 1
 
     candidate_units = sum(tile.candidate_units for tile in tiles)
-    selected_units = sum(len(tile.selected_ids) for tile in tiles)
+    selected_units = sum(tile.selected_units for tile in tiles)
     unit_bytes = tiles[0].unit_bytes
-    selected_bytes = sum(len(tile.selected_ids) * unit_bytes for tile in tiles)
+    selected_bytes = sum(tile.selected_units * unit_bytes for tile in tiles)
     availability_skew = float(case["availability_skew_us"])
     compute_us = sum(tile.estimated_compute_ns for tile in tiles) / 1000.0
     tier = str(case.get("tier", "host_mem"))
@@ -457,14 +464,8 @@ def _run_arm(
         + tier_latency_ns / 1_000,
     )
     initial_blocked = len(blocked)
-    pending_window_us = max(availability_skew, 1.0)
-    mean_pending_units = initial_blocked / 2.0
-    mean_pending_us = pending_window_us / 2.0 if initial_blocked else 0.0
-    pending_arrival_rate = (
-        mean_pending_units / mean_pending_us * 1_000_000 if mean_pending_us > 0 else 0.0
-    )
-    littles_law_residual = abs(
-        mean_pending_units - pending_arrival_rate * mean_pending_us / 1_000_000
+    pending_accounting = modeled_blocked_cohort_accounting(
+        initial_blocked, availability_skew
     )
     state_counts = {
         "resident": sum(index % 4 == 0 for index in range(len(tiles))),
@@ -556,12 +557,18 @@ def _run_arm(
             "ttft_us": elapsed_us,
             "tpot_us": compute_us / int(case["batch_size"]),
             "slo_goodput": int(case["batch_size"]) / elapsed_us * 1_000_000,
-            "pending_arrival_rate": pending_arrival_rate,
-            "mean_pending_units": mean_pending_units,
-            "mean_pending_us": mean_pending_us,
-            "littles_law_lhs": mean_pending_units,
-            "littles_law_rhs": pending_arrival_rate * mean_pending_us / 1_000_000,
-            "littles_law_residual": littles_law_residual,
+            "queueing_accounting_method": pending_accounting["method"],
+            "queueing_release_process": pending_accounting["release_process"],
+            "queueing_interpretation": pending_accounting["interpretation"],
+            "initial_blocked_work_units": initial_blocked,
+            "pending_release_count": pending_accounting["pending_release_count"],
+            "pending_window_us": pending_accounting["pending_window_us"],
+            "pending_area_unit_us": pending_accounting["pending_area_unit_us"],
+            "pending_release_rate_per_second": pending_accounting[
+                "release_rate_per_second"
+            ],
+            "mean_pending_units": pending_accounting["mean_pending_units"],
+            "mean_pending_us": pending_accounting["mean_pending_us"],
             "measurement": {
                 "kind": "synthetic_regime_contract",
                 "serving_evidence": False,

@@ -48,10 +48,22 @@ struct Options {
   std::uint32_t namespaceId = 1;
   std::uint32_t queueDepth = 64;
   std::uint32_t adminTimeoutMs = 10'000;
+  std::uint32_t externalDestinationOffset = 0;
   nta::NvmeMediaPolicy mediaPolicy =
       nta::NvmeMediaPolicy::RequireHardwareWriteProtection;
   nta::NvmeDmaTarget dmaTarget = nta::NvmeDmaTarget::HbmPeer;
   bool ctaTryIssue = false;
+  bool useExternalDestination = false;
+};
+
+constexpr std::size_t PeerMappingAlignment = 64U * 1024U;
+constexpr unsigned char GuardByte = 0xa5U;
+
+struct ExternalDestination {
+  std::unique_ptr<DeviceBuffer<std::byte>> allocation;
+  std::byte *target = nullptr;
+  std::size_t allocationBytes = 0;
+  std::size_t targetOffset = 0;
 };
 
 const char *dmaTargetName(nta::NvmeDmaTarget target) {
@@ -151,6 +163,14 @@ Options parseOptions(int argc, char **argv) {
         throw std::invalid_argument("--admin-timeout-ms exceeds uint32_t");
       }
       options.adminTimeoutMs = static_cast<std::uint32_t>(parsed);
+    } else if (name == "--external-destination-offset") {
+      const std::uint64_t parsed = parseInteger(value, name, true);
+      if (parsed > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument(
+            "--external-destination-offset exceeds uint32_t");
+      }
+      options.externalDestinationOffset = static_cast<std::uint32_t>(parsed);
+      options.useExternalDestination = true;
     } else if (name == "--media-policy") {
       if (value == "hardware-write-protect") {
         options.mediaPolicy =
@@ -193,10 +213,30 @@ Options parseOptions(int argc, char **argv) {
   return options;
 }
 
+std::uintptr_t roundUpAddress(std::uintptr_t value, std::size_t alignment) {
+  if (alignment == 0 || (alignment & (alignment - 1U)) != 0) {
+    throw std::invalid_argument("address alignment must be a power of two");
+  }
+  const std::uintptr_t mask = alignment - 1U;
+  if (value > std::numeric_limits<std::uintptr_t>::max() - mask) {
+    throw std::overflow_error("aligned address overflows uintptr_t");
+  }
+  return (value + mask) & ~mask;
+}
+
 std::vector<std::byte> readReference(const Options &options) {
   std::ifstream input(options.reference, std::ios::binary);
   if (!input) {
     throw std::runtime_error("cannot open reference file " + options.reference);
+  }
+  if (options.sourceOffset >
+      static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+    throw std::overflow_error("reference offset exceeds streamoff");
+  }
+  input.seekg(static_cast<std::streamoff>(options.sourceOffset));
+  if (!input) {
+    throw std::runtime_error(
+        "cannot seek reference file to NVMe source offset");
   }
   const std::uint64_t total =
       static_cast<std::uint64_t>(options.bytes) * options.requests;
@@ -207,7 +247,7 @@ std::vector<std::byte> readReference(const Options &options) {
   input.read(reinterpret_cast<char *>(bytes.data()), bytes.size());
   if (input.gcount() != static_cast<std::streamsize>(bytes.size())) {
     throw std::runtime_error(
-        "reference file is shorter than --bytes times --requests");
+        "reference file does not cover the requested NVMe source range");
   }
   return bytes;
 }
@@ -314,8 +354,8 @@ public:
     CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
     void *arguments[] = {&runtimeAddress, &objectCount};
     const std::uint32_t blocks = (objectCount + 255U) / 256U;
-    checkDriver(cuLaunchKernel(invalidate_, blocks, 1, 1, 256, 1, 1, 0,
-                               stream, arguments, nullptr),
+    checkDriver(cuLaunchKernel(invalidate_, blocks, 1, 1, 256, 1, 1, 0, stream,
+                               arguments, nullptr),
                 "cuLaunchKernel NVMe benchmark invalidation");
   }
 
@@ -360,6 +400,12 @@ int main(int argc, char **argv) {
         options.sourceOffset % capabilities.lbaSize != 0) {
       throw std::invalid_argument("NVMe source range must be LBA aligned");
     }
+    if (options.useExternalDestination &&
+        (options.dmaTarget != nta::NvmeDmaTarget::HbmPeer ||
+         options.externalDestinationOffset % capabilities.lbaSize != 0)) {
+      throw std::invalid_argument(
+          "external destination needs hbm-peer DMA and an LBA-aligned offset");
+    }
 
     const std::uint64_t totalSourceBytes =
         static_cast<std::uint64_t>(options.bytes) * options.requests;
@@ -367,6 +413,11 @@ int main(int argc, char **argv) {
         totalSourceBytes > capabilities.namespaceBytes - options.sourceOffset) {
       throw std::invalid_argument("requested NVMe range exceeds namespace");
     }
+    // Caller-owned allocations must outlive the runtime-held DMA leases.
+    std::vector<ExternalDestination> externalDestinations;
+    externalDestinations.reserve(options.requests);
+    std::vector<std::unique_ptr<nta::NvmeHbmRegion>> externalRegions;
+    externalRegions.reserve(options.requests);
     nta::RuntimeConfig runtimeConfig{options.requests, options.requests,
                                      options.requests, options.requests};
     runtimeConfig.deviceOrdinal = options.gpu;
@@ -375,8 +426,48 @@ int main(int argc, char **argv) {
                              nta::RuntimeBackends{transport, nullptr});
     std::vector<nta::benchmark::TileTask> hostTasks(options.requests);
     for (std::uint32_t request = 0; request < options.requests; ++request) {
-      std::unique_ptr<nta::NvmeBuffer> destination =
-          transport->allocate(options.bytes);
+      std::unique_ptr<nta::NvmeBuffer> destination;
+      if (options.useExternalDestination) {
+        if (options.bytes > std::numeric_limits<std::size_t>::max() -
+                                options.externalDestinationOffset -
+                                2U * PeerMappingAlignment) {
+          throw std::overflow_error("external destination size overflows");
+        }
+        ExternalDestination external;
+        external.allocationBytes = options.bytes +
+                                   options.externalDestinationOffset +
+                                   2U * PeerMappingAlignment;
+        external.allocation =
+            std::make_unique<DeviceBuffer<std::byte>>(external.allocationBytes);
+        checkCuda(cudaMemset(external.allocation->get(), GuardByte,
+                             external.allocationBytes),
+                  "poison external NVMe destination");
+        const std::uintptr_t allocationAddress =
+            reinterpret_cast<std::uintptr_t>(external.allocation->get());
+        const std::uintptr_t alignedAddress =
+            roundUpAddress(allocationAddress, PeerMappingAlignment);
+        if (alignedAddress > std::numeric_limits<std::uintptr_t>::max() -
+                                 options.externalDestinationOffset) {
+          throw std::overflow_error("external destination address overflows");
+        }
+        const std::uintptr_t targetAddress =
+            alignedAddress + options.externalDestinationOffset;
+        external.target = reinterpret_cast<std::byte *>(targetAddress);
+        external.targetOffset =
+            static_cast<std::size_t>(targetAddress - allocationAddress);
+        if (external.targetOffset > external.allocationBytes ||
+            options.bytes > external.allocationBytes - external.targetOffset) {
+          throw std::logic_error(
+              "external destination does not fit its CUDA allocation");
+        }
+        auto region =
+            transport->registerExternalHbm(external.target, options.bytes);
+        destination = region->view(external.target, options.bytes);
+        externalRegions.push_back(std::move(region));
+        externalDestinations.push_back(std::move(external));
+      } else {
+        destination = transport->allocate(options.bytes);
+      }
       const std::uint64_t objectId = 0x4e54414e00000000ULL + request;
       runtime.installNvmeObject(request, objectId, 1,
                                 options.sourceOffset +
@@ -446,18 +537,18 @@ int main(int argc, char **argv) {
     nta::NvmeQueueStats warmupStats = transport->readStats();
     if (warmupStats.error != 0 || warmupStats.outstanding != 0) {
       std::ostringstream message;
-      message
-          << "bounded warmup did not finish: submitted="
-          << warmupStats.submitted << " completed=" << warmupStats.completed
-          << " failed=" << warmupStats.failed
-          << " outstanding=" << warmupStats.outstanding
-          << " error=" << warmupStats.error << " sq_tail=" << warmupStats.sqTail
-          << " cq_head=" << warmupStats.cqHead
-          << " cq_phase=" << warmupStats.cqPhase << " next_cqe_dw3=0x"
-          << std::hex << warmupStats.nextCompletionDword3 << std::dec
-          << " direct_submitted=" << warmupStats.directSubmitted
-          << " direct_fallbacks=" << warmupStats.directFallbacks
-          << "; the device progress deadline expired";
+      message << "bounded warmup did not finish: submitted="
+              << warmupStats.submitted << " completed=" << warmupStats.completed
+              << " failed=" << warmupStats.failed
+              << " outstanding=" << warmupStats.outstanding
+              << " error=" << warmupStats.error
+              << " sq_tail=" << warmupStats.sqTail
+              << " cq_head=" << warmupStats.cqHead
+              << " cq_phase=" << warmupStats.cqPhase << " next_cqe_dw3=0x"
+              << std::hex << warmupStats.nextCompletionDword3 << std::dec
+              << " direct_submitted=" << warmupStats.directSubmitted
+              << " direct_fallbacks=" << warmupStats.directFallbacks
+              << "; the device progress deadline expired";
       throw std::runtime_error(message.str());
     }
     for (std::uint32_t request = 0; request < options.requests; ++request) {
@@ -497,9 +588,10 @@ int main(int argc, char **argv) {
     const std::uint64_t expectedCommands =
         static_cast<std::uint64_t>(options.requests) * options.iterations;
     std::uint32_t verificationFailures = 0;
+    std::uint32_t payloadVerificationFailures = 0;
+    std::uint32_t guardVerificationFailures = 0;
     for (std::uint32_t request = 0; request < options.requests; ++request) {
-      const nta::abi::WorkTicket workTicket =
-          runtime.readWorkTicket(request);
+      const nta::abi::WorkTicket workTicket = runtime.readWorkTicket(request);
       if (actual[request] != expected[request] ||
           workTicket.state !=
               static_cast<std::uint32_t>(nta::abi::WorkTicketState::Done)) {
@@ -510,6 +602,37 @@ int main(int argc, char **argv) {
         ++verificationFailures;
       }
     }
+    for (std::uint32_t request = 0; request < externalDestinations.size();
+         ++request) {
+      const ExternalDestination &external = externalDestinations[request];
+      std::vector<std::byte> actualAllocation(external.allocationBytes);
+      checkCuda(cudaMemcpy(actualAllocation.data(), external.allocation->get(),
+                           actualAllocation.size(), cudaMemcpyDeviceToHost),
+                "download external NVMe destination");
+      const auto targetBegin =
+          actualAllocation.begin() +
+          static_cast<std::ptrdiff_t>(external.targetOffset);
+      const auto targetEnd =
+          targetBegin + static_cast<std::ptrdiff_t>(options.bytes);
+      const std::byte *expectedPayload =
+          reference.data() + static_cast<std::size_t>(request) * options.bytes;
+      if (!std::equal(targetBegin, targetEnd, expectedPayload)) {
+        std::cerr << "external_payload_mismatch request=" << request
+                  << " destination_offset=" << external.targetOffset << '\n';
+        ++payloadVerificationFailures;
+      }
+      const auto isGuard = [](std::byte value) {
+        return std::to_integer<unsigned char>(value) == GuardByte;
+      };
+      if (!std::all_of(actualAllocation.begin(), targetBegin, isGuard) ||
+          !std::all_of(targetEnd, actualAllocation.end(), isGuard)) {
+        std::cerr << "external_guard_corruption request=" << request
+                  << " destination_offset=" << external.targetOffset << '\n';
+        ++guardVerificationFailures;
+      }
+    }
+    verificationFailures +=
+        payloadVerificationFailures + guardVerificationFailures;
     if (stats.error != 0 || stats.outstanding != 0 || stats.failed != 0) {
       ++verificationFailures;
     }
@@ -523,105 +646,114 @@ int main(int argc, char **argv) {
                                  options.requests / (1024.0 * 1024.0)) /
                                 (milliseconds / 1000.0);
 
-    std::cout << "destination=" << dmaTargetName(options.dmaTarget)
-              << " hbm_mapping_backend="
-              << hbmBackendName(capabilities.hbmMappingBackend)
-              << " backend=vfio-iommufd"
-              << " media_policy="
-              << (options.mediaPolicy ==
-                          nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode
-                      ? "trusted-read-only-code"
-                      : "hardware-write-protect")
-              << " requests=" << options.requests << " bytes=" << options.bytes
-              << " cta_try_issue=" << (options.ctaTryIssue ? 1 : 0)
-              << " progress_rounds=" << options.progressRounds
-              << " graph_ms=" << std::fixed << std::setprecision(3)
-              << milliseconds << " MiB/s=" << std::setprecision(2)
-              << mibPerSecond << " measured_submitted=" << measuredSubmitted
-              << " measured_completed=" << measuredCompleted
-              << " measured_direct_submitted=" << measuredDirectSubmitted
-              << " measured_direct_fallbacks=" << measuredDirectFallbacks
-              << " submitted=" << stats.submitted
-              << " direct_submitted=" << stats.directSubmitted
-              << " direct_fallbacks=" << stats.directFallbacks
-              << " completed=" << stats.completed << " failed=" << stats.failed
-              << " selected_data_path_verified=" << (verified ? 1 : 0)
-              << " verification_failures=" << verificationFailures << '\n';
+    std::cout
+        << "destination=" << dmaTargetName(options.dmaTarget)
+        << " hbm_mapping_backend="
+        << hbmBackendName(capabilities.hbmMappingBackend)
+        << " backend=vfio-iommufd"
+        << " media_policy="
+        << (options.mediaPolicy == nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode
+                ? "trusted-read-only-code"
+                : "hardware-write-protect")
+        << " requests=" << options.requests << " bytes=" << options.bytes
+        << " source_offset=" << options.sourceOffset
+        << " external_destination=" << (options.useExternalDestination ? 1 : 0)
+        << " external_destination_offset=" << options.externalDestinationOffset
+        << " cta_try_issue=" << (options.ctaTryIssue ? 1 : 0)
+        << " progress_rounds=" << options.progressRounds
+        << " graph_ms=" << std::fixed << std::setprecision(3) << milliseconds
+        << " MiB/s=" << std::setprecision(2) << mibPerSecond
+        << " measured_submitted=" << measuredSubmitted
+        << " measured_completed=" << measuredCompleted
+        << " measured_direct_submitted=" << measuredDirectSubmitted
+        << " measured_direct_fallbacks=" << measuredDirectFallbacks
+        << " submitted=" << stats.submitted
+        << " direct_submitted=" << stats.directSubmitted
+        << " direct_fallbacks=" << stats.directFallbacks
+        << " hbm_region_registrations=" << stats.hbmRegionRegistrations
+        << " hbm_region_bytes=" << stats.hbmRegionBytes
+        << " hbm_transfer_views=" << stats.hbmTransferViews
+        << " completed=" << stats.completed << " failed=" << stats.failed
+        << " selected_data_path_verified=" << (verified ? 1 : 0)
+        << " payload_verification_failures=" << payloadVerificationFailures
+        << " guard_verification_failures=" << guardVerificationFailures
+        << " verification_failures=" << verificationFailures << '\n';
 
     if (!options.output.empty()) {
       std::ofstream artifact(options.output, std::ios::trunc);
       if (!artifact) {
         throw std::runtime_error("cannot open result file " + options.output);
       }
-      artifact << "{\n"
-               << "  \"schema\": 2,\n"
-               << "  \"classification\": \"nta-vfio-nvme-read\",\n"
-               << "  \"revision\": " << jsonString(options.revision) << ",\n"
-               << "  \"device\": " << jsonString(options.device) << ",\n"
-               << "  \"gpu\": " << options.gpu << ",\n"
-               << "  \"runtime_abi\": " << nta::abi::Version << ",\n"
-               << "  \"namespace_id\": " << options.namespaceId << ",\n"
-               << "  \"namespace_bytes\": " << capabilities.namespaceBytes
-               << ",\n"
-               << "  \"lba_size\": " << capabilities.lbaSize << ",\n"
-               << "  \"max_transfer_bytes\": "
-               << capabilities.maxTransferBytes << ",\n"
-               << "  \"queue_depth\": " << capabilities.queueDepth << ",\n"
-               << "  \"queue_count\": " << capabilities.queueCount << ",\n"
-               << "  \"translated_iommu\": "
-               << (capabilities.translatedIommu ? "true" : "false") << ",\n"
-               << "  \"gpu_doorbell_mapping_validated\": "
-               << (capabilities.gpuDoorbellMappingValidated ? "true"
-                                                            : "false")
-               << ",\n"
-               << "  \"hbm_peer_dma_supported\": "
-               << (capabilities.supportsHbmPeerDma ? "true" : "false")
-               << ",\n"
-               << "  \"hbm_mapping_backend\": "
-               << jsonString(hbmBackendName(capabilities.hbmMappingBackend))
-               << ",\n"
-               << "  \"media_policy\": "
-               << jsonString(options.mediaPolicy ==
-                                     nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode
-                                 ? "trusted-read-only-code"
-                                 : "hardware-write-protect")
-               << ",\n"
-               << "  \"destination\": "
-               << jsonString(dmaTargetName(options.dmaTarget)) << ",\n"
-               << "  \"requests\": " << options.requests << ",\n"
-               << "  \"bytes_per_request\": " << options.bytes << ",\n"
-               << "  \"iterations\": " << options.iterations << ",\n"
-               << "  \"progress_rounds\": " << options.progressRounds
-               << ",\n"
-               << "  \"cta_try_issue\": "
-               << (options.ctaTryIssue ? "true" : "false") << ",\n"
-               << "  \"graph_ms\": " << std::setprecision(9) << milliseconds
-               << ",\n"
-               << "  \"end_to_end_mib_per_second\": " << mibPerSecond
-               << ",\n"
-               << "  \"expected_commands\": " << expectedCommands << ",\n"
-               << "  \"measured_submitted\": " << measuredSubmitted
-               << ",\n"
-               << "  \"measured_completed\": " << measuredCompleted
-               << ",\n"
-               << "  \"measured_direct_submitted\": "
-               << measuredDirectSubmitted << ",\n"
-               << "  \"measured_direct_fallbacks\": "
-               << measuredDirectFallbacks << ",\n"
-               << "  \"submitted\": " << stats.submitted << ",\n"
-               << "  \"direct_submitted\": " << stats.directSubmitted
-               << ",\n"
-               << "  \"direct_fallbacks\": " << stats.directFallbacks
-               << ",\n"
-               << "  \"completed\": " << stats.completed << ",\n"
-               << "  \"failed\": " << stats.failed << ",\n"
-               << "  \"outstanding\": " << stats.outstanding << ",\n"
-               << "  \"verification_failures\": " << verificationFailures
-               << ",\n"
-               << "  \"selected_data_path_verified\": "
-               << (verified ? "true" : "false") << ",\n"
-               << "  \"verified\": " << (verified ? "true" : "false")
-               << "\n}\n";
+      artifact
+          << "{\n"
+          << "  \"schema\": 2,\n"
+          << "  \"classification\": \"nta-vfio-nvme-read\",\n"
+          << "  \"revision\": " << jsonString(options.revision) << ",\n"
+          << "  \"device\": " << jsonString(options.device) << ",\n"
+          << "  \"gpu\": " << options.gpu << ",\n"
+          << "  \"runtime_abi\": " << nta::abi::Version << ",\n"
+          << "  \"namespace_id\": " << options.namespaceId << ",\n"
+          << "  \"source_offset\": " << options.sourceOffset << ",\n"
+          << "  \"namespace_bytes\": " << capabilities.namespaceBytes << ",\n"
+          << "  \"lba_size\": " << capabilities.lbaSize << ",\n"
+          << "  \"max_transfer_bytes\": " << capabilities.maxTransferBytes
+          << ",\n"
+          << "  \"queue_depth\": " << capabilities.queueDepth << ",\n"
+          << "  \"queue_count\": " << capabilities.queueCount << ",\n"
+          << "  \"translated_iommu\": "
+          << (capabilities.translatedIommu ? "true" : "false") << ",\n"
+          << "  \"gpu_doorbell_mapping_validated\": "
+          << (capabilities.gpuDoorbellMappingValidated ? "true" : "false")
+          << ",\n"
+          << "  \"hbm_peer_dma_supported\": "
+          << (capabilities.supportsHbmPeerDma ? "true" : "false") << ",\n"
+          << "  \"hbm_mapping_backend\": "
+          << jsonString(hbmBackendName(capabilities.hbmMappingBackend)) << ",\n"
+          << "  \"hbm_region_registrations\": " << stats.hbmRegionRegistrations
+          << ",\n"
+          << "  \"hbm_region_bytes\": " << stats.hbmRegionBytes << ",\n"
+          << "  \"hbm_transfer_views\": " << stats.hbmTransferViews << ",\n"
+          << "  \"media_policy\": "
+          << jsonString(options.mediaPolicy ==
+                                nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode
+                            ? "trusted-read-only-code"
+                            : "hardware-write-protect")
+          << ",\n"
+          << "  \"destination\": "
+          << jsonString(dmaTargetName(options.dmaTarget)) << ",\n"
+          << "  \"requests\": " << options.requests << ",\n"
+          << "  \"bytes_per_request\": " << options.bytes << ",\n"
+          << "  \"external_destination\": "
+          << (options.useExternalDestination ? "true" : "false") << ",\n"
+          << "  \"external_destination_offset\": "
+          << options.externalDestinationOffset << ",\n"
+          << "  \"iterations\": " << options.iterations << ",\n"
+          << "  \"progress_rounds\": " << options.progressRounds << ",\n"
+          << "  \"cta_try_issue\": " << (options.ctaTryIssue ? "true" : "false")
+          << ",\n"
+          << "  \"graph_ms\": " << std::setprecision(9) << milliseconds << ",\n"
+          << "  \"end_to_end_mib_per_second\": " << mibPerSecond << ",\n"
+          << "  \"expected_commands\": " << expectedCommands << ",\n"
+          << "  \"measured_submitted\": " << measuredSubmitted << ",\n"
+          << "  \"measured_completed\": " << measuredCompleted << ",\n"
+          << "  \"measured_direct_submitted\": " << measuredDirectSubmitted
+          << ",\n"
+          << "  \"measured_direct_fallbacks\": " << measuredDirectFallbacks
+          << ",\n"
+          << "  \"submitted\": " << stats.submitted << ",\n"
+          << "  \"direct_submitted\": " << stats.directSubmitted << ",\n"
+          << "  \"direct_fallbacks\": " << stats.directFallbacks << ",\n"
+          << "  \"completed\": " << stats.completed << ",\n"
+          << "  \"failed\": " << stats.failed << ",\n"
+          << "  \"outstanding\": " << stats.outstanding << ",\n"
+          << "  \"verification_failures\": " << verificationFailures << ",\n"
+          << "  \"payload_verification_failures\": "
+          << payloadVerificationFailures << ",\n"
+          << "  \"guard_verification_failures\": " << guardVerificationFailures
+          << ",\n"
+          << "  \"selected_data_path_verified\": "
+          << (verified ? "true" : "false") << ",\n"
+          << "  \"verified\": " << (verified ? "true" : "false") << "\n}\n";
       if (!artifact) {
         throw std::runtime_error("cannot write result file " + options.output);
       }

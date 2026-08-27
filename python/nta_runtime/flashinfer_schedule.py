@@ -43,7 +43,11 @@ def _read_i32(workspace: Any, byte_offset: int, count: int) -> list[int]:
     end = byte_offset + count * 4
     if workspace.dtype != torch.uint8 or end > workspace.numel():
         raise RuntimeError("FlashInfer int-workspace range is out of bounds")
-    return workspace[byte_offset:end].view(torch.int32).cpu().tolist()
+    if workspace.device.type != "cpu":
+        raise RuntimeError(
+            "FlashInfer schedule extraction requires its pinned-host planner snapshot"
+        )
+    return workspace[byte_offset:end].view(torch.int32).tolist()
 
 
 def _extract(
@@ -60,7 +64,14 @@ def _extract(
 ) -> Schedule:
     require_supported_version()
     plan = list(getattr(wrapper, "_plan_info"))
-    workspace = getattr(wrapper, "_int_workspace_buffer")
+    # FlashInfer's CPU scheduler materializes these arrays in the page-locked
+    # planner workspace before copying them to the device int workspace.  The
+    # host snapshot is therefore the authoritative no-sync source for adapter
+    # planning; reading the GPU copy here would add a D2H synchronization to
+    # every external forward even when the numerical plan is otherwise cached.
+    workspace = getattr(wrapper, "_pin_memory_int_workspace_buffer", None)
+    if workspace is None:
+        raise RuntimeError("FlashInfer wrapper has no pinned-host planner snapshot")
     if len(plan) != expected_size:
         raise RuntimeError(
             f"unexpected FlashInfer PlanInfo length {len(plan)}; expected {expected_size}"
@@ -76,7 +87,7 @@ def _extract(
         if mask_offset < 0 or mask_offset + padded > workspace.numel():
             raise RuntimeError("FlashInfer block-valid mask is out of bounds")
         active = [
-            bool(value) for value in workspace[mask_offset : mask_offset + padded].cpu()
+            bool(value) for value in workspace[mask_offset : mask_offset + padded]
         ]
     request_indices = tuple(value for value, valid in zip(requests, active) if valid)
     kv_tile_indices = tuple(value for value, valid in zip(kv_tiles, active) if valid)
