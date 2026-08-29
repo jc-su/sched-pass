@@ -9,6 +9,7 @@ from nta_runtime.acquisition_scheduler import LayerAcquisition, LayerAcquisition
 from nta_runtime.engines.sglang_acquisition import (
     SglangHostAcquisitionCoordinator,
 )
+from nta_runtime.engines.sglang_state import _ActiveBatch
 from nta_runtime.execution_planner import HostExecutionMode
 from nta_runtime.execution_protocol import ProtocolKind
 
@@ -34,6 +35,8 @@ def coordinator(
     *,
     isolated: bool = False,
     mode: HostExecutionMode = HostExecutionMode.AUTO,
+    layer_count: int = 4,
+    frontier_enabled: bool = True,
 ):
     pool = object()
     transport = FakeTransport()
@@ -44,8 +47,10 @@ def coordinator(
             host_execution_mode=mode,
         ),
         tenant_isolation_enabled=isolated,
-        model_layer_count=4,
+        model_layer_count=layer_count,
         sm_acquisition_waves=1,
+        frontier_enabled=frontier_enabled,
+        frontier_layers_per_wave=4,
         movers=types.SimpleNamespace(),
         calibration=types.SimpleNamespace(),
         transport=transport,
@@ -140,6 +145,58 @@ def main() -> None:
     assert admission_transport.ranges == [(0, 4)]
     assert admission.acquisition.fully_published
     assert admission_owner._stats["host_acquisition_jobs_submitted"] == 4
+
+    # Frontier policy belongs to the acquisition owner, not the framework
+    # adapter. Before calibration it emits one bounded probe; a frozen model
+    # can publish the complete feasible suffix in one transition.
+    def exercise_frontier(
+        *, calibrated: bool
+    ) -> tuple[list[tuple[int, int]], dict[str, int]]:
+        frontier_owner, _pool, frontier_transport = coordinator(layer_count=36)
+        frontier_owner._movers = types.SimpleNamespace(
+            collect_profiles=lambda: None,
+            lease_calibrated=lambda _pending: False,
+        )
+        frontier_owner._calibration = types.SimpleNamespace(
+            collect=lambda: None,
+            curve=lambda _key: None,
+        )
+        frontier_pending = types.SimpleNamespace(
+            controller=types.SimpleNamespace(layer_num=36),
+            mover_plan=object(),
+            prefetched_layers={},
+            transfer_plan=object(),
+            acquisition=None,
+        )
+        model = (
+            LayerAcquisitionModel(
+                layer_bytes=(1,) * 36,
+                transfer_service_ns=(50,) * 36,
+                initial_compute_ns=0,
+                inter_layer_compute_ns=100,
+            )
+            if calibrated
+            else None
+        )
+        batch = _ActiveBatch(
+            bindings=(),
+            semantic_plans={},
+            pending_host_load=frontier_pending,
+            deadline_model=model,
+            deadline_model_initialized=calibrated,
+        )
+        frontier_owner.transfer_plan = (
+            lambda item, **_kwargs: item.transfer_plan
+        )
+        frontier_owner.advance_after_attention(frontier_pending, batch, 0)
+        return frontier_transport.ranges, frontier_owner._stats
+
+    probe_ranges, probe_stats = exercise_frontier(calibrated=False)
+    assert probe_ranges == [(1, 5)]
+    assert probe_stats["deadline_frontier_calibration_layers"] == 4
+    modeled_ranges, modeled_stats = exercise_frontier(calibrated=True)
+    assert modeled_ranges == [(1, 36)]
+    assert modeled_stats["deadline_frontier_published_layers"] == 35
 
     # Every public publication edge passes the exact frozen plan into the data
     # path; the transport never calls back into planning or allocation.

@@ -9,7 +9,7 @@ steady-state submission path.
 
 from __future__ import annotations
 
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from typing import TYPE_CHECKING, Any
 
 from nta_runtime.acquisition_scheduler import (
@@ -24,7 +24,10 @@ from nta_runtime.engines.sglang_calibration import (
 )
 from nta_runtime.engines.sglang_hicache import PendingHostLoad
 from nta_runtime.engines.sglang_pipeline import SglangHostTransport
-from nta_runtime.engines.sglang_planning import pipeline_object_id
+from nta_runtime.engines.sglang_planning import (
+    calibration_probe_end,
+    pipeline_object_id,
+)
 from nta_runtime.engines.sglang_transfer import (
     HostMoverController,
     HostTransferLeasePlan,
@@ -48,18 +51,26 @@ class SglangHostAcquisitionCoordinator:
         tenant_isolation_enabled: bool,
         model_layer_count: int,
         sm_acquisition_waves: int,
+        frontier_enabled: bool,
+        frontier_layers_per_wave: int,
         movers: HostMoverController,
         calibration: SglangLayerServiceCalibration,
         transport: SglangHostTransport,
         stats: MutableMapping[str, Any],
     ) -> None:
-        if model_layer_count <= 0 or sm_acquisition_waves <= 0:
+        if min(
+            model_layer_count,
+            sm_acquisition_waves,
+            frontier_layers_per_wave,
+        ) <= 0:
             raise ValueError("SGLang Host acquisition geometry must be positive")
         self._device_pool = device_pool
         self._execution_config = execution_config
         self._tenant_isolation_enabled = bool(tenant_isolation_enabled)
         self._model_layer_count = model_layer_count
         self._sm_acquisition_waves = sm_acquisition_waves
+        self._frontier_enabled = bool(frontier_enabled)
+        self._frontier_layers_per_wave = frontier_layers_per_wave
         self._movers = movers
         self._calibration = calibration
         self._transport = transport
@@ -443,6 +454,130 @@ class SglangHostAcquisitionCoordinator:
         # HiCache load-back is exact-dense: this framework path neither
         # approximates nor drops a candidate row.
         self._add("tier_candidate_bytes", sum(layer_bytes))
+
+    def advance_after_attention(
+        self,
+        pending: PendingHostLoad,
+        batch: _ActiveBatch,
+        completed_local_layer: int,
+        *,
+        enqueue_fragment: Callable[[], bool] | None = None,
+    ) -> None:
+        """Publish the maximal calibrated layer prefix after one consumer.
+
+        Transformer layer deadlines are structurally ordered.  The compiled
+        simultaneous-release EDF test therefore proves how far whole-layer
+        transport may run ahead; it does not pretend to reorder layers.  A
+        modeled miss remains unpublished so the typed consumer can acquire
+        exact request groups, optionally seeding one fragment lookahead.
+        """
+
+        if batch.pending_host_load is not pending:
+            raise RuntimeError("deadline frontier lost its active HiCache lease")
+        acquisition = pending.acquisition
+        if acquisition is not None:
+            self.retire_layer(pending, completed_local_layer)
+            # The current Host backend normally fills its finite queue at
+            # capture. A bounded-inflight backend can refill through this same
+            # ownership edge without putting policy in the transport.
+            if not acquisition.fully_published:
+                submitted = self.submit(pending)
+                self._add("host_acquisition_refill_jobs", submitted)
+            return
+        if not self._frontier_enabled:
+            return
+
+        layer_count = int(pending.controller.layer_num)
+        if layer_count != self._model_layer_count:
+            raise RuntimeError("deadline frontier and model layer counts disagree")
+        ready_prefix = completed_local_layer + 1
+        if not 0 < ready_prefix <= layer_count:
+            raise RuntimeError("deadline frontier received an invalid layer prefix")
+        if ready_prefix == layer_count:
+            return
+
+        model = batch.deadline_model
+        frontier_plan_built = False
+        if not batch.deadline_model_initialized:
+            self._movers.collect_profiles()
+            self._calibration.collect()
+            if pending.mover_plan is None:
+                # Descriptor preparation follows the current attention launch,
+                # so it is outside the next layer's first-dispatch dependency.
+                self.transfer_plan(pending)
+            curve = (
+                None
+                if batch.layer_service_key is None
+                else self._calibration.curve(batch.layer_service_key)
+            )
+            model = (
+                None if curve is None else self.deadline_model_for_curve(pending, curve)
+            )
+            if model is not None:
+                batch.deadline_model = model
+                batch.deadline_model_initialized = True
+                self._add("deadline_frontier_model_builds")
+        else:
+            self._add("deadline_frontier_model_reuses")
+
+        if model is None:
+            self._add("deadline_frontier_uncalibrated")
+            calibration_probe = not self._movers.lease_calibrated(pending)
+            if calibration_probe and ready_prefix not in pending.prefetched_layers:
+                probe_end = calibration_probe_end(
+                    ready_prefix,
+                    layer_count,
+                    self._frontier_layers_per_wave,
+                )
+                self.publish_range(pending, ready_prefix, probe_end)
+                self._add(
+                    "deadline_frontier_calibration_layers",
+                    probe_end - ready_prefix,
+                )
+            elif (
+                enqueue_fragment is not None
+                and ready_prefix not in pending.prefetched_layers
+            ):
+                enqueue_fragment()
+            return
+
+        if batch.deadline_frontier is None:
+            batch.deadline_frontier = model.compile_after_attention_frontier()
+            frontier_plan_built = True
+            self._add("deadline_frontier_plan_builds")
+        frontier = batch.deadline_frontier
+        if frontier is None or frontier.layer_count != layer_count:
+            raise RuntimeError("deadline frontier has no compiled service plan")
+
+        feasible_end = frontier.feasible_end_after_attention(completed_local_layer)
+        self._add("deadline_frontier_plans")
+        self._add("deadline_frontier_plan_reuses", int(not frontier_plan_built))
+        if feasible_end != layer_count:
+            self._add("deadline_frontier_first_missed_layer_sum", feasible_end)
+
+        publish_begin = ready_prefix
+        while (
+            publish_begin < layer_count and publish_begin in pending.prefetched_layers
+        ):
+            publish_begin += 1
+        if publish_begin < feasible_end:
+            self.publish_range(pending, publish_begin, feasible_end)
+            self._add(
+                "deadline_frontier_published_layers",
+                feasible_end - publish_begin,
+            )
+
+        fragment_enqueued = False
+        if (
+            feasible_end == ready_prefix
+            and ready_prefix not in pending.prefetched_layers
+            and enqueue_fragment is not None
+        ):
+            fragment_enqueued = enqueue_fragment()
+            if fragment_enqueued:
+                self._add("deadline_frontier_fragment_layers")
+        if publish_begin >= feasible_end and not fragment_enqueued:
+            self._add("deadline_frontier_noop_calls")
 
     def retire_layer(self, pending: PendingHostLoad, local_layer: int) -> None:
         """Retire transport ownership after a numerical consumer is ordered."""

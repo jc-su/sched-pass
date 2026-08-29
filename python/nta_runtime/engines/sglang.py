@@ -77,7 +77,6 @@ from nta_runtime.engines.sglang_semantics import (
     build_execution_plan,
 )
 from nta_runtime.engines.sglang_planning import (
-    calibration_probe_end as _calibration_probe_end,
     require_exact_prefetch_layers as _require_exact_prefetch_layers,
 )
 from nta_runtime.engines.sglang_telemetry import (
@@ -500,6 +499,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             tenant_isolation_enabled=self._tenant_isolation_enabled,
             model_layer_count=self._model_layer_count,
             sm_acquisition_waves=self._sm_acquisition_waves,
+            frontier_enabled=self._frontier_enabled,
+            frontier_layers_per_wave=self._frontier_layers_per_wave,
             movers=self._host_movers,
             calibration=self._layer_calibration,
             transport=self._host_transport,
@@ -1664,158 +1665,27 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         *,
         fragment: DeadlineFragment | None = None,
     ) -> None:
-        """Publish the maximal calibrated EDF-feasible layer prefix.
-
-        Full-layer acquisition and numerical work are separate ownership
-        objects.  Layers whose cumulative mover service meets every attention
-        deadline are published in deadline order and later use the preacquired
-        numerical kernel.  The first modeled miss remains unpublished so the
-        compiler-verified partial consumer can acquire it at work-unit
-        granularity instead of waiting for an already-committed whole layer.
-        """
-
+        """Hand one framework consumer edge to the Host acquisition owner."""
         batch = self._active_batch
         if batch is None or batch.pending_host_load is not pending:
             raise RuntimeError("deadline frontier lost its active HiCache lease")
-        acquisition = getattr(pending, "acquisition", None)
-        if acquisition is not None:
-            self._host_acquisition.retire_layer(pending, completed_local_layer)
-            # The current Host backend publishes its complete finite queue at
-            # lease capture.  Do not rescan the queue and call the transport
-            # submitter after every transformer layer merely to rediscover that
-            # no work remains.  A future bounded-inflight backend retains the
-            # refill path through the same lifecycle predicate.
-            if not acquisition.fully_published:
-                submitted = self._host_acquisition.submit(pending)
-                self._stats["host_acquisition_refill_jobs"] = (
-                    self._stats.get("host_acquisition_refill_jobs", 0) + submitted
-                )
-            return
-        if not self._frontier_enabled:
-            return
-        layer_count = int(pending.controller.layer_num)
-        ready_prefix = completed_local_layer + 1
-        if not 0 < ready_prefix <= layer_count:
-            raise RuntimeError("deadline frontier received an invalid layer prefix")
-        if ready_prefix == layer_count:
-            return
-
-        model = batch.deadline_model
-        frontier_plan_built = False
-        if not batch.deadline_model_initialized:
-            self._host_movers.collect_profiles()
-            self._layer_calibration.collect()
-            if pending.mover_plan is None:
-                # Descriptor preparation is issued only after current attention
-                # is queued, so it is outside the next layer's first-dispatch
-                # dependency. Auto may choose one bounded calibration probe
-                # here; admission itself never runs a probe.
-                self._host_acquisition.transfer_plan(pending)
-            curve = (
-                None
-                if batch.layer_service_key is None
-                else self._layer_calibration.curve(batch.layer_service_key)
-            )
-            model = (
-                None
-                if curve is None
-                else self._host_acquisition.deadline_model_for_curve(pending, curve)
-            )
-            if model is not None:
-                batch.deadline_model = model
-                batch.deadline_model_initialized = True
-                self._stats["deadline_frontier_model_builds"] = (
-                    self._stats.get("deadline_frontier_model_builds", 0) + 1
-                )
-        else:
-            self._stats["deadline_frontier_model_reuses"] = (
-                self._stats.get("deadline_frontier_model_reuses", 0) + 1
-            )
-        if model is None:
-            self._stats["deadline_frontier_uncalibrated"] = (
-                self._stats.get("deadline_frontier_uncalibrated", 0) + 1
-            )
-            calibration_probe = not self._host_movers.lease_calibrated(pending)
-            if calibration_probe and ready_prefix not in pending.prefetched_layers:
-                probe_end = _calibration_probe_end(
-                    ready_prefix, layer_count, self._frontier_layers_per_wave
-                )
-                self._host_acquisition.publish_range(
-                    pending, ready_prefix, probe_end
-                )
-                self._stats["deadline_frontier_calibration_layers"] = (
-                    self._stats.get("deadline_frontier_calibration_layers", 0)
-                    + probe_end
-                    - ready_prefix
-                )
-            elif fragment is not None and ready_prefix not in pending.prefetched_layers:
-                self._enqueue_fragment_lookahead(
-                    fragment.wrapper,
-                    self._model_start_layer + completed_local_layer,
-                    fragment.object_count,
-                    fragment.host_execution,
-                    fragment.stream,
-                )
-            return
-
-        if batch.deadline_frontier is None:
-            batch.deadline_frontier = model.compile_after_attention_frontier()
-            frontier_plan_built = True
-            self._stats["deadline_frontier_plan_builds"] = (
-                self._stats.get("deadline_frontier_plan_builds", 0) + 1
-            )
-
-        frontier = batch.deadline_frontier
-        if frontier is None or frontier.layer_count != layer_count:
-            raise RuntimeError("deadline frontier has no compiled service plan")
-        feasible_end = frontier.feasible_end_after_attention(completed_local_layer)
-        self._stats["deadline_frontier_plans"] = (
-            self._stats.get("deadline_frontier_plans", 0) + 1
-        )
-        self._stats["deadline_frontier_plan_reuses"] = self._stats.get(
-            "deadline_frontier_plan_reuses", 0
-        ) + int(not frontier_plan_built)
-        first_missed_layer = None if feasible_end == layer_count else feasible_end
-        if first_missed_layer is not None:
-            self._stats["deadline_frontier_first_missed_layer_sum"] = (
-                self._stats.get("deadline_frontier_first_missed_layer_sum", 0)
-                + first_missed_layer
-            )
-        publish_begin = ready_prefix
-        while (
-            publish_begin < layer_count and publish_begin in pending.prefetched_layers
-        ):
-            publish_begin += 1
-        if publish_begin < feasible_end:
-            self._host_acquisition.publish_range(
-                pending, publish_begin, feasible_end
-            )
-            self._stats["deadline_frontier_published_layers"] = (
-                self._stats.get("deadline_frontier_published_layers", 0)
-                + feasible_end
-                - publish_begin
-            )
-        fragment_enqueued = False
-        if (
-            feasible_end == ready_prefix
-            and ready_prefix not in pending.prefetched_layers
-            and fragment is not None
-        ):
-            fragment_enqueued = self._enqueue_fragment_lookahead(
+        enqueue_fragment = (
+            None
+            if fragment is None
+            else lambda: self._enqueue_fragment_lookahead(
                 fragment.wrapper,
                 self._model_start_layer + completed_local_layer,
                 fragment.object_count,
                 fragment.host_execution,
                 fragment.stream,
             )
-            if fragment_enqueued:
-                self._stats["deadline_frontier_fragment_layers"] = (
-                    self._stats.get("deadline_frontier_fragment_layers", 0) + 1
-                )
-        if publish_begin >= feasible_end and not fragment_enqueued:
-            self._stats["deadline_frontier_noop_calls"] = (
-                self._stats.get("deadline_frontier_noop_calls", 0) + 1
-            )
+        )
+        self._host_acquisition.advance_after_attention(
+            pending,
+            batch,
+            completed_local_layer,
+            enqueue_fragment=enqueue_fragment,
+        )
 
     def _require_host_execution_plan(self) -> HostExecutionPlan:
         batch = self._active_batch
@@ -1852,7 +1722,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if next_local_layer < 0 or next_local_layer >= int(
             pending.controller.layer_num
         ):
-            return
+            return False
         if next_layer_id in batch.fragment_lookahead:
             raise RuntimeError("duplicate fragment lookahead for one attention layer")
 
