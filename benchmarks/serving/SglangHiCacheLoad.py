@@ -454,6 +454,11 @@ def _measurement_delta(
     """Project cumulative engine counters onto the timed request window."""
     measured = dict(final)
     counter_names = set(_MEASUREMENT_COUNTERS)
+    final_schema = _cumulative_counter_schema(final)
+    baseline_schema = _cumulative_counter_schema(baseline)
+    if final_schema != baseline_schema:
+        raise RuntimeError("engine cumulative-counter schema changed during measurement")
+    counter_names.update(final_schema)
     counter_names.update(
         name
         for name in set(final) | set(baseline)
@@ -602,6 +607,22 @@ def _measurement_delta(
     measured["consumer_contract"] = _measured_consumer_contract(measured)
     measured["execution_protocol_status"] = measured["consumer_contract"]["kind"]
     return measured
+
+
+def _cumulative_counter_schema(report: dict[str, Any]) -> frozenset[str]:
+    """Validate the counter ownership schema published by an engine report."""
+
+    fields = report.get("cumulative_counter_fields")
+    if fields is None:
+        # Stock/upstream reports predate and do not need the NTA producer schema.
+        return frozenset()
+    if (
+        not isinstance(fields, list)
+        or any(not isinstance(field, str) or not field for field in fields)
+        or len(fields) != len(set(fields))
+    ):
+        raise RuntimeError("engine cumulative-counter schema is invalid")
+    return frozenset(fields)
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]

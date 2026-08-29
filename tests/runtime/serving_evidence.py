@@ -514,6 +514,12 @@ def main() -> None:
         "progressive_consumer_batches": 2,
         "progressive_consumer_layers": 2,
         "progressive_consumer_layers_1_batches": 2,
+        "cumulative_counter_fields": [
+            "host_device_bulk_batches",
+            "forward_lifecycle_aborts",
+        ],
+        "host_device_bulk_batches": 4,
+        "forward_lifecycle_aborts": 2,
         "deadline_frontier_modeled_ready_layers": 70,
         "deadline_frontier_modeled_stock_dispatches": 70,
         "deadline_frontier_first_missed_layer_sum": 140,
@@ -567,6 +573,8 @@ def main() -> None:
         "progressive_consumer_batches": 3,
         "progressive_consumer_layers": 3,
         "progressive_consumer_layers_1_batches": 3,
+        "host_device_bulk_batches": 7,
+        "forward_lifecycle_aborts": 3,
         "deadline_frontier_modeled_ready_layers": 105,
         "deadline_frontier_modeled_stock_dispatches": 105,
         "deadline_frontier_first_missed_layer_sum": 210,
@@ -622,6 +630,8 @@ def main() -> None:
     assert measured["progressive_consumer_batch_observations"] == 1
     assert measured["progressive_consumer_layers"] == 1
     assert measured["progressive_consumer_layers_1_batches"] == 1
+    assert measured["host_device_bulk_batches"] == 3
+    assert measured["forward_lifecycle_aborts"] == 1
     assert measured["deadline_frontier_modeled_ready_layers"] == 35
     assert measured["deadline_frontier_modeled_stock_dispatches"] == 35
     assert measured["deadline_frontier_first_missed_layer_sum"] == 70

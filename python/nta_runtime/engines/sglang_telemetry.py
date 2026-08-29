@@ -368,6 +368,27 @@ _ZERO_FLOAT_COUNTERS = (
     "host_mover_profiled_copy_gpu_ms",
 )
 
+# These fields are current capabilities or model state, not work performed in
+# an interval. Every other zero-initialized field is a monotone cumulative
+# counter whose ownership belongs to this producer schema.
+_ENGINE_GAUGE_FIELDS = frozenset(
+    {
+        "host_mover_sm_calibrated_buckets",
+        "host_mover_copy_calibrated_buckets",
+        "host_mover_sm_max_sample_bytes",
+        "host_mover_copy_max_sample_bytes",
+        "layer_service_calibrated_shapes",
+        "layer_service_conservative_ns",
+        "verified_operator_modules",
+    }
+)
+
+_CUMULATIVE_COUNTER_FIELDS = tuple(
+    field
+    for field in (*_ZERO_COUNTERS, *_ZERO_FLOAT_COUNTERS)
+    if field not in _ENGINE_GAUGE_FIELDS
+)
+
 
 def initial_engine_stats(
     config: SglangTelemetryConfig, tier_stats: Mapping[str, Any]
@@ -376,6 +397,9 @@ def initial_engine_stats(
 
     if len(_ZERO_COUNTERS) != len(set(_ZERO_COUNTERS)):
         raise RuntimeError("SGLang telemetry counter schema contains duplicates")
+    zero_fields = set(_ZERO_COUNTERS) | set(_ZERO_FLOAT_COUNTERS)
+    if not _ENGINE_GAUGE_FIELDS.issubset(zero_fields):
+        raise RuntimeError("SGLang telemetry gauge schema contains unknown fields")
     result: dict[str, Any] = {
         "schema": 1,
         "engine": "sglang",
@@ -445,6 +469,10 @@ def initial_engine_stats(
         "demand_graph_enabled": config.demand_graph_enabled,
         "demand_graph_capacity": config.demand_graph_capacity,
         "transport_program_loaded": False,
+        # Measurement consumers subtract exactly these fields at timed-window
+        # boundaries. Publishing the schema with the values prevents a second,
+        # drifting allow-list in every benchmark harness.
+        "cumulative_counter_fields": list(_CUMULATIVE_COUNTER_FIELDS),
         "started_unix_ns": time.time_ns(),
     }
     result.update(dict.fromkeys(_ZERO_COUNTERS, 0))
