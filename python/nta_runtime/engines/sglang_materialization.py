@@ -297,7 +297,7 @@ class SglangPlanMaterializer:
         """Account an in-flight proactive acquisition without charging it twice.
 
         An arriving consumer publishes dependencies on the directory objects
-        owned by ``HostLayerAcquisition`` and waits on that owner's readiness
+        owned by ``LayerAcquisition`` and waits on that owner's readiness
         fence.  It neither registers an indexed demand acquisition nor moves a
         second copy of the K/V bytes.  In particular, physical-byte, object,
         group, and CTA accounting belongs to the proactive owner (CTA work is

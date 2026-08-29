@@ -47,7 +47,22 @@ def parse_args() -> argparse.Namespace:
             "prompt shape; auto selects long_prefix for host reload and short otherwise"
         ),
     )
+    parser.add_argument(
+        "--long-prefix-repetitions",
+        type=int,
+        default=12,
+        help="deterministic long-prefix scale for controlled Host reload sweeps",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
+    parser.add_argument(
+        "--async-scheduling",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "override vLLM asynchronous scheduling; leave unset to preserve "
+            "the framework deployment default"
+        ),
+    )
     parser.add_argument("--serving-tier", choices=("hbm", "host_staged"), default="hbm")
     parser.add_argument(
         "--kv-cache-memory-bytes",
@@ -55,6 +70,15 @@ def parse_args() -> argparse.Namespace:
         help="explicit vLLM HBM KV capacity for deterministic tier tests",
     )
     parser.add_argument("--host-cache-bytes", type=int, default=512 * 1024 * 1024)
+    parser.add_argument(
+        "--tenant-budget-bytes",
+        type=int,
+        help=(
+            "finite tenant-0 byte credit; sufficient credit exercises the "
+            "accounted copy-engine acquisition, while insufficient credit "
+            "exercises the exact dependency-aware fallback"
+        ),
+    )
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument("--cuda-home", type=pathlib.Path)
     parser.add_argument("--cuda-host-cxx", type=pathlib.Path)
@@ -74,6 +98,7 @@ def parse_args() -> argparse.Namespace:
             args.warmup_iterations,
             args.max_model_len,
             args.max_num_seqs,
+            args.long_prefix_repetitions,
         )
         <= 0
     ):
@@ -90,6 +115,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--kv-cache-memory-bytes must be positive")
     if args.host_cache_bytes <= 0:
         parser.error("--host-cache-bytes must be positive")
+    if args.tenant_budget_bytes is not None and args.tenant_budget_bytes <= 0:
+        parser.error("--tenant-budget-bytes must be positive")
     return args
 
 
@@ -168,6 +195,11 @@ def main() -> int:
     workspace = configure_environment(args)
     run_token = uuid.uuid4().hex
     os.environ["NTA_VLLM_EVIDENCE_TOKEN"] = run_token
+    if args.tenant_budget_bytes is None:
+        os.environ.pop("NTA_TENANT_BUDGETS", None)
+    else:
+        os.environ["NTA_TENANT_BUDGETS"] = f"0:{args.tenant_budget_bytes}"
+        os.environ["NTA_TENANT_CAPACITY"] = "1"
     if args.backend == "nta":
         os.environ.update(
             {
@@ -200,7 +232,7 @@ def main() -> int:
                 "A finite GPU kernel has explicit work identity, bounded progress, "
                 "and exact data dependencies."
             ]
-            * 12
+            * args.long_prefix_repetitions
         )
         prompts = [
             f"{prefix} Request {index}: summarize the invariant."
@@ -251,6 +283,7 @@ def main() -> int:
         enable_prefix_caching=True,
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         kv_transfer_config=connector_config,
+        async_scheduling=args.async_scheduling,
     )
     try:
         load_seconds = time.perf_counter() - load_started
@@ -376,19 +409,69 @@ def main() -> int:
         for entry in evidence
         if isinstance(entry, dict)
     )
+    host_transfer_runs = sum(
+        int(entry.get("stats", {}).get("host_transfer_runs", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_copy_operations = sum(
+        int(entry.get("stats", {}).get("host_copy_operations", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_copy_submissions = sum(
+        int(entry.get("stats", {}).get("host_copy_submissions", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
     host_launches = sum(
         int(entry.get("stats", {}).get("host_decode_launches", 0))
         + int(entry.get("stats", {}).get("host_prefill_launches", 0))
         for entry in evidence
         if isinstance(entry, dict)
     )
-    host_preload_batches = sum(
-        int(entry.get("stats", {}).get("host_preload_batches", 0))
+    host_acquisition_batches = sum(
+        int(entry.get("stats", {}).get("host_acquisition_batches", 0))
         for entry in evidence
         if isinstance(entry, dict)
     )
-    host_preload_waits = sum(
-        int(entry.get("stats", {}).get("host_preload_waits", 0))
+    host_acquisition_jobs = sum(
+        int(entry.get("stats", {}).get("host_acquisition_jobs", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_acquisition_waves = sum(
+        int(entry.get("stats", {}).get("host_acquisition_waves", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_acquisition_waits = sum(
+        int(entry.get("stats", {}).get("host_acquisition_waits", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_acquisition_retirements = sum(
+        int(entry.get("stats", {}).get("host_acquisition_retirements", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_acquisition_submission_cpu_ns = sum(
+        int(entry.get("stats", {}).get("host_acquisition_submission_cpu_ns", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_acquisition_credit_rejections = sum(
+        int(entry.get("stats", {}).get("host_acquisition_credit_rejections", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_acquisition_tenant_accounted_batches = sum(
+        int(entry.get("stats", {}).get("host_acquisition_tenant_accounted_batches", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    host_acquisition_tenant_charge_bytes = sum(
+        int(entry.get("stats", {}).get("host_acquisition_tenant_charge_bytes", 0))
         for entry in evidence
         if isinstance(entry, dict)
     )
@@ -413,6 +496,10 @@ def main() -> int:
     )
     worker_incremental_workspace_allocated_bytes = sum(
         int(stats.get("worker_incremental_workspace_allocated_bytes", 0))
+        for stats in native_worker_stats
+    )
+    worker_incremental_workspace_borrowed_bindings = sum(
+        int(stats.get("worker_incremental_workspace_borrowed_bindings", 0))
         for stats in native_worker_stats
     )
     worker_request_bound_wrapper_builds = sum(
@@ -450,16 +537,31 @@ def main() -> int:
         default=0,
     )
     if args.backend == "nta" and args.serving_tier == "host_staged":
-        if (
-            host_transfer_blocks <= 0
-            or host_transfer_bytes <= 0
-            or host_launches <= 0
-            or host_preload_batches <= 0
-            or host_preload_waits <= 0
-        ):
+        if host_transfer_blocks <= 0 or host_transfer_bytes <= 0 or host_launches <= 0:
+            raise RuntimeError("vLLM Host smoke did not execute exact Host demand")
+        acquisition_enabled = host_acquisition_batches > 0
+        if acquisition_enabled:
+            if (
+                host_acquisition_jobs <= 0
+                or host_acquisition_waves <= 0
+                or host_acquisition_waits != host_acquisition_waves
+                or host_acquisition_retirements != host_acquisition_jobs
+            ):
+                raise RuntimeError(
+                    "vLLM Host smoke did not publish, wait, and retire every layer"
+                )
+        elif host_acquisition_credit_rejections <= 0:
             raise RuntimeError(
-                "vLLM host smoke completed without evidenced host materialization"
+                "vLLM Host smoke neither acquired nor rejected exact Host demand"
             )
+        if args.tenant_budget_bytes is not None and acquisition_enabled:
+            if (
+                host_acquisition_tenant_accounted_batches != host_acquisition_batches
+                or host_acquisition_tenant_charge_bytes <= 0
+            ):
+                raise RuntimeError(
+                    "finite tenant credits were bypassed by Host acquisition"
+                )
         expected_phases_per_worker = 2 if args.max_new_tokens > 1 else 1
         expected_wrapper_builds = expected_phases_per_worker * len(native_worker_stats)
         if worker_request_bound_wrapper_builds != expected_wrapper_builds:
@@ -470,8 +572,7 @@ def main() -> int:
                 f"{worker_request_bound_wrapper_builds}"
             )
         if (
-            worker_incremental_wrapper_builds != 0
-            or worker_request_bound_plan_builds <= 0
+            worker_request_bound_plan_builds <= 0
             or worker_request_bound_plan_reuses <= 0
             or worker_request_bound_workspace_allocated_bytes != 0
             or worker_request_bound_workspace_borrowed_bindings <= 0
@@ -481,6 +582,29 @@ def main() -> int:
             raise RuntimeError(
                 "vLLM optimized host smoke did not use only the worker-shared "
                 "request-bound planner with framework-owned workspace"
+            )
+        if acquisition_enabled:
+            if (
+                worker_incremental_wrapper_builds != 0
+                or worker_incremental_plan_builds != 0
+                or worker_incremental_plan_reuses != 0
+                or worker_incremental_workspace_allocated_bytes != 0
+                or worker_incremental_workspace_borrowed_bindings != 0
+            ):
+                raise RuntimeError(
+                    "bulk vLLM Host acquisition unexpectedly used the "
+                    "incremental consumer"
+                )
+        elif (
+            worker_incremental_wrapper_builds <= 0
+            or worker_incremental_plan_builds <= 0
+            or worker_incremental_plan_reuses <= 0
+            or worker_incremental_workspace_allocated_bytes != 0
+            or worker_incremental_workspace_borrowed_bindings <= 0
+        ):
+            raise RuntimeError(
+                "tenant-accounted vLLM Host execution did not use a shared, "
+                "framework-workspace incremental consumer"
             )
     revision, dirty = repository_metadata()
     median_seconds = statistics.median(samples)
@@ -494,15 +618,30 @@ def main() -> int:
         "native_launches": native_launches,
         "reference_fallback_launches": reference_fallback_launches,
         "host_launches": host_launches,
-        "host_preload_batches": host_preload_batches,
-        "host_preload_waits": host_preload_waits,
+        "host_acquisition_batches": host_acquisition_batches,
+        "host_acquisition_jobs": host_acquisition_jobs,
+        "host_acquisition_waves": host_acquisition_waves,
+        "host_acquisition_waits": host_acquisition_waits,
+        "host_acquisition_retirements": host_acquisition_retirements,
+        "host_acquisition_submission_cpu_ns": (host_acquisition_submission_cpu_ns),
+        "host_acquisition_credit_rejections": host_acquisition_credit_rejections,
+        "host_acquisition_tenant_accounted_batches": (
+            host_acquisition_tenant_accounted_batches
+        ),
+        "host_acquisition_tenant_charge_bytes": (host_acquisition_tenant_charge_bytes),
         "host_transfer_blocks": host_transfer_blocks,
         "host_transfer_bytes": host_transfer_bytes,
+        "host_transfer_runs": host_transfer_runs,
+        "host_copy_operations": host_copy_operations,
+        "host_copy_submissions": host_copy_submissions,
         "worker_incremental_wrapper_builds": worker_incremental_wrapper_builds,
         "worker_incremental_plan_builds": worker_incremental_plan_builds,
         "worker_incremental_plan_reuses": worker_incremental_plan_reuses,
         "worker_incremental_workspace_allocated_bytes": (
             worker_incremental_workspace_allocated_bytes
+        ),
+        "worker_incremental_workspace_borrowed_bindings": (
+            worker_incremental_workspace_borrowed_bindings
         ),
         "worker_request_bound_wrapper_builds": worker_request_bound_wrapper_builds,
         "worker_request_bound_plan_builds": worker_request_bound_plan_builds,
@@ -540,11 +679,17 @@ def main() -> int:
         },
         "requests": args.requests,
         "max_new_tokens": args.max_new_tokens,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
         "prompt_profile": prompt_profile,
+        "long_prefix_repetitions": args.long_prefix_repetitions,
+        "async_scheduling": args.async_scheduling,
         "kv_cache_memory_bytes": args.kv_cache_memory_bytes,
         "host_cache_bytes": (
             args.host_cache_bytes if args.serving_tier == "host_staged" else None
         ),
+        "tenant_budget_bytes": args.tenant_budget_bytes,
         "iterations": args.iterations,
         "warmup_iterations": args.warmup_iterations,
         "generated_tokens": generated,

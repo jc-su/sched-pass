@@ -43,7 +43,7 @@ from nta_runtime.engines.sglang_hicache import (
     PendingHostLoad,
     SglangHiCacheBridge,
 )
-from nta_runtime.engines.sglang_acquisition import HostLayerAcquisition
+from nta_runtime.acquisition_scheduler import LayerAcquisition
 from nta_runtime.engines.sglang_transfer import (
     HostMoverController,
     HostMoverLeasePlan,
@@ -638,9 +638,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if layer_count != self._model_layer_count:
             raise RuntimeError("HiCache load and model layer counts disagree")
         self._account_tier_selection(pending)
-        conventional = (
-            self._execution_config.protocol.kind is ProtocolKind.CONVENTIONAL
-        )
+        conventional = self._execution_config.protocol.kind is ProtocolKind.CONVENTIONAL
         eager_dense = (
             not conventional
             and not self._tenant_isolation_enabled
@@ -660,21 +658,21 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             # ForwardBatch exists here; mover choice therefore uses only its
             # deployment-local link curve, never stale batch state.
             self._host_transfer_lease_plan(pending)
-            pending.acquisition = HostLayerAcquisition(pending.layer_bytes)
-            self._stats["host_acquisition_jobs_prepared"] = self._stats.get(
-                "host_acquisition_jobs_prepared", 0
-            ) + layer_count
-            self._stats["lease_acquisition_groups_prepared"] = self._stats.get(
-                "lease_acquisition_groups_prepared", 0
-            ) + 1
+            pending.acquisition = LayerAcquisition(pending.layer_bytes)
+            self._stats["host_acquisition_jobs_prepared"] = (
+                self._stats.get("host_acquisition_jobs_prepared", 0) + layer_count
+            )
+            self._stats["lease_acquisition_groups_prepared"] = (
+                self._stats.get("lease_acquisition_groups_prepared", 0) + 1
+            )
             initial_layers = self._submit_host_acquisition(pending)
             if initial_layers != layer_count:
                 raise RuntimeError(
                     "dense HiCache lease did not fill its finite acquisition queue"
                 )
-            self._stats["lease_acquisition_groups_started"] = self._stats.get(
-                "lease_acquisition_groups_started", 0
-            ) + 1
+            self._stats["lease_acquisition_groups_started"] = (
+                self._stats.get("lease_acquisition_groups_started", 0) + 1
+            )
         self._stats["initial_acquisition_batches"] = (
             self._stats.get("initial_acquisition_batches", 0) + 1
         )
@@ -797,9 +795,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         shape_key = self._acquisition_shape_key(batch)
         curve = self._admission_shape_curve(batch)
         if shape_key is None or curve is None:
-            self._stats["host_acquisition_shape_uncalibrated"] = self._stats.get(
-                "host_acquisition_shape_uncalibrated", 0
-            ) + 1
+            self._stats["host_acquisition_shape_uncalibrated"] = (
+                self._stats.get("host_acquisition_shape_uncalibrated", 0) + 1
+            )
             return False
         active = self._active_batch
         if active is not None and active.pending_host_load is pending:
@@ -820,15 +818,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._stats[counter] = self._stats.get(counter, 0) + 1
             return False
         if acquisition is None:
-            acquisition = HostLayerAcquisition(pending.layer_bytes)
+            acquisition = LayerAcquisition(pending.layer_bytes)
             pending.acquisition = acquisition
             self._stats["host_acquisition_jobs_prepared"] = self._stats.get(
                 "host_acquisition_jobs_prepared", 0
             ) + len(model.layer_bytes)
         if acquisition.bind_model(model):
-            self._stats["host_acquisition_models_bound"] = self._stats.get(
-                "host_acquisition_models_bound", 0
-            ) + 1
+            self._stats["host_acquisition_models_bound"] = (
+                self._stats.get("host_acquisition_models_bound", 0) + 1
+            )
         return True
 
     def _prepare_admission_acquisition(
@@ -868,9 +866,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._stats["host_acquisition_submission_calls"] = self._stats.get(
                 "host_acquisition_submission_calls", 0
             ) + len(submission.ranges)
-            self._stats["host_acquisition_jobs_submitted"] = self._stats.get(
-                "host_acquisition_jobs_submitted", 0
-            ) + submission.job_count
+            self._stats["host_acquisition_jobs_submitted"] = (
+                self._stats.get("host_acquisition_jobs_submitted", 0)
+                + submission.job_count
+            )
         return submission.job_count
 
     def _start_admission_acquisition(
@@ -1763,10 +1762,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     raise RuntimeError("host-staged batch has no execution decision")
                 self._record_host_selection(selected)
                 if (
-                    (
-                        pending.acquisition is None
-                        or pending.acquisition.model is None
-                    )
+                    (pending.acquisition is None or pending.acquisition.model is None)
                     and selected.uses_dependency_protocol
                     and not self._tenant_isolation_enabled
                     and self._execution_config.host_execution_mode
@@ -1805,18 +1801,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         )
                     if ready_stock_fastpath:
                         self._stats["host_bound_after_full_ready_batches"] = (
-                            self._stats.get(
-                                "host_bound_after_full_ready_batches", 0
-                            )
+                            self._stats.get("host_bound_after_full_ready_batches", 0)
                             + 1
                         )
                     return
 
                 if prefetch_fully_published:
                     self._stats["host_typed_after_full_publication_batches"] = (
-                        self._stats.get(
-                            "host_typed_after_full_publication_batches", 0
-                        )
+                        self._stats.get("host_typed_after_full_publication_batches", 0)
                         + 1
                     )
 
@@ -2157,9 +2149,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             # refill path through the same lifecycle predicate.
             if not acquisition.fully_published:
                 submitted = self._submit_host_acquisition(pending)
-                self._stats["host_acquisition_refill_jobs"] = self._stats.get(
-                    "host_acquisition_refill_jobs", 0
-                ) + submitted
+                self._stats["host_acquisition_refill_jobs"] = (
+                    self._stats.get("host_acquisition_refill_jobs", 0) + submitted
+                )
             return
         if not self._frontier_enabled:
             return
@@ -2302,9 +2294,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if acquisition is None:
             return
         acquisition.retire(local_layer)
-        self._stats["host_acquisition_layers_consumed"] = self._stats.get(
-            "host_acquisition_layers_consumed", 0
-        ) + 1
+        self._stats["host_acquisition_layers_consumed"] = (
+            self._stats.get("host_acquisition_layers_consumed", 0) + 1
+        )
 
     def _require_host_execution_plan(self) -> HostExecutionPlan:
         batch = self._active_batch

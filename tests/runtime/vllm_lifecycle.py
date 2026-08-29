@@ -19,9 +19,16 @@ sys.path.insert(0, str(ROOT / "python"))
 from nta_runtime.engines import vllm as vllm_engine  # noqa: E402
 from nta_runtime.engines import vllm_modules  # noqa: E402
 from nta_runtime.engines import vllm_worker  # noqa: E402
-from nta_runtime.engines.vllm_config import VllmAttentionConfig  # noqa: E402
+from nta_runtime.engines.vllm_config import (  # noqa: E402
+    VllmAttentionConfig,
+    vllm_host_layers_per_wave,
+)
 from nta_runtime.plugins import vllm as vllm_plugin  # noqa: E402
 from nta_runtime.adapters.base import EngineBatch, ExactDemandProjection  # noqa: E402
+from nta_runtime.acquisition_scheduler import (  # noqa: E402
+    TenantCreditCharge,
+    TenantCreditLedger,
+)
 from nta_runtime.adapters.vllm_v1 import (  # noqa: E402
     VllmV1ForwardState,
     VllmV1Hook,
@@ -33,6 +40,8 @@ from nta_runtime.connectors.vllm import (  # noqa: E402
     NtaVllmForwardAck,
 )
 from nta_runtime.connectors.vllm_host import (  # noqa: E402
+    NtaVllmHostTransferMetadata,
+    VllmHostRequestTransfer,
     VllmHostWorker,
     _resolve_synchronous_load,
 )
@@ -41,6 +50,9 @@ from nta_runtime.storage_identity import vllm_storage_key  # noqa: E402
 from nta_runtime.work_unit import Granularity  # noqa: E402
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
     KVConnectorRole,
+)
+from vllm.v1.simple_kv_offload.metadata import (  # noqa: E402
+    SimpleCPUOffloadMetadata,
 )
 
 
@@ -495,56 +507,95 @@ def _test_synchronous_host_load_binding() -> None:
         raise AssertionError("incomplete synchronous host allocation was accepted")
 
 
-def _test_typed_all_layer_host_preload() -> None:
+def _test_typed_layer_host_acquisition() -> None:
     worker = object.__new__(VllmHostWorker)
-    worker._metadata = SimpleNamespace(
-        load_cpu_blocks=[100, 101], load_gpu_blocks=[10, 11]
+    worker._metadata = NtaVllmHostTransferMetadata(
+        SimpleCPUOffloadMetadata(
+            load_event=0,
+            load_cpu_blocks=[100, 101],
+            load_gpu_blocks=[10, 11],
+            load_event_to_reqs={0: ["request-0"]},
+        ),
+        (VllmHostRequestTransfer("request-0", ((100, 10), (101, 11))),),
     )
     worker._resources = {
         "layer.0": SimpleNamespace(row_bytes=4096),
         "layer.1": SimpleNamespace(row_bytes=4096),
     }
-    params = object()
-    worker._preload_params = params
-    worker._preload_event = None
-    worker._worker = SimpleNamespace(load_stream="load-stream")
+    groups = (object(), object())
+    worker._wave_groups = ((0, 2, groups),)
+    worker._acquisition = None
+    worker._credits = TenantCreditLedger(())
+    worker._pending_credit_releases = []
+    cleared: list[bool] = []
+    worker._worker = SimpleNamespace(
+        load_stream="load-stream",
+        clear_connector_metadata=lambda: cleared.append(True),
+    )
 
-    copied: list[tuple[list[int], list[int], object]] = []
-    recorded: list[object] = []
-    event = SimpleNamespace(record=lambda stream: recorded.append(stream))
+    copied: list[tuple[tuple[object, ...], tuple[object, ...], object]] = []
+    recorded: list[tuple[int, object]] = []
+    synchronized: list[int] = []
+
+    def new_event() -> SimpleNamespace:
+        event_id = len(recorded)
+        return SimpleNamespace(
+            record=lambda stream: recorded.append((event_id, stream)),
+            query=lambda: True,
+            synchronize=lambda: synchronized.append(event_id),
+        )
+
     with (
         patch(
-            "nta_runtime.connectors.vllm_host.copy_blocks",
-            side_effect=lambda source, destination, value: copied.append(
-                (source, destination, value)
+            "nta_runtime.connectors.vllm_host.copy_strided_host_runs_async",
+            side_effect=lambda copy_groups, runs, stream: (
+                copied.append((copy_groups, runs, stream)) or 1
             ),
         ),
         patch(
             "nta_runtime.connectors.vllm_host.torch.cuda.Event",
-            return_value=event,
+            side_effect=new_event,
         ),
     ):
-        assert worker.preload_exact() is event
-    assert copied == [([100, 101], [10, 11], params)]
-    assert recorded == ["load-stream"]
+        acquisition = worker.submit_exact_layers()
+    assert acquisition is not None
+    assert len(copied) == 1
+    assert copied[0][0] == groups and copied[0][2] == "load-stream"
+    assert len(copied[0][1]) == 1
+    assert copied[0][1][0].source_first == 100
+    assert copied[0][1][0].destination_first == 10
+    assert copied[0][1][0].row_count == 2
+    assert recorded == [(0, "load-stream")]
+    assert acquisition.layer_count == 2
+    assert acquisition.wave_count == 1
+    assert acquisition.submission_cpu_ns > 0
+    assert acquisition.transfer_blocks == 4
+    assert acquisition.transfer_bytes == 16384
+    assert acquisition.transfer_runs == 1
+    assert acquisition.copy_operations == 2
+    assert acquisition.copy_submissions == 1
+    assert not acquisition.tenant_accounted
     try:
-        worker.preload_exact()
+        worker.submit_exact_layers()
     except RuntimeError as error:
         assert "twice" in str(error)
     else:
-        raise AssertionError("vLLM host preload accepted duplicate submission")
+        raise AssertionError("vLLM Host acquisition accepted duplicate submission")
 
     waits: list[object] = []
     state = VllmV1ForwardState()
     state.host_transfer_pairs = ((100, 10), (101, 11))
-    state.host_preload_event = event
-    state.host_preload_blocks = 4
-    state.host_preload_bytes = 16384
+    state.host_acquisition = acquisition
+    state.record_evidence("host_acquisition_batches")
+    state.record_evidence("host_acquisition_jobs", acquisition.layer_count)
+    state.record_evidence("host_acquisition_waves", acquisition.wave_count)
+    state.record_evidence("host_transfer_blocks", acquisition.transfer_blocks)
+    state.record_evidence("host_transfer_bytes", acquisition.transfer_bytes)
     stream = SimpleNamespace(wait_event=lambda value: waits.append(value))
-    for layer_name in ("layer.0", "layer.1"):
+    for layer_index, layer_name in enumerate(("layer.0", "layer.1")):
         state.begin_host_layer(layer_name)
-        first_wait = state.wait_for_host_preload(stream)
-        assert first_wait is (layer_name == "layer.0")
+        assert state.wait_for_host_layer(stream) is (layer_index == 0)
+        assert not state.wait_for_host_layer(stream)
         state.finish_host_layer(layer_name)
     state.record_native_launch(
         "prefill",
@@ -554,32 +605,169 @@ def _test_typed_all_layer_host_preload() -> None:
         serving_tier="host_staged",
     )
     evidence = state.commit_evidence()
-    assert waits == [event]
-    assert evidence["host_preload_waits"] == 1
-    assert evidence["host_preload_batches"] == 1
+    assert len(waits) == 1
+    assert evidence["host_acquisition_waits"] == 1
+    assert evidence["host_acquisition_retirements"] == 2
+    assert evidence["host_acquisition_jobs"] == 2
+    assert evidence["host_acquisition_waves"] == 1
+    assert evidence["host_acquisition_batches"] == 1
     assert evidence["host_transfer_blocks"] == 4
     assert evidence["host_transfer_bytes"] == 16384
     assert evidence["host_prefill_launches"] == 1
+    worker.clear()
+    assert cleared == [True]
 
     missing = VllmV1ForwardState()
     missing.host_transfer_pairs = ((100, 10),)
+    missing.begin_host_layer("layer.0")
     try:
-        missing.wait_for_host_preload(stream)
+        missing.wait_for_host_layer(stream)
     except RuntimeError as error:
-        assert "no preload event" in str(error)
+        assert "no layer acquisition" in str(error)
     else:
         raise AssertionError("direct host attention accepted an unready transfer")
 
     isolated = VllmV1ForwardState()
     isolated.host_transfer_pairs = ((100, 10),)
-    isolated.host_preload_event = event
+    isolated.host_acquisition = acquisition
     isolated.tenant_isolation_enabled = True
+    isolated.begin_host_layer("layer.0")
     try:
-        isolated.wait_for_host_preload(stream)
+        isolated.wait_for_host_layer(stream)
     except RuntimeError as error:
         assert "tenant byte credits" in str(error)
     else:
-        raise AssertionError("finite tenant credits allowed a bulk host preload")
+        raise AssertionError("finite tenant credits allowed a bulk Host acquisition")
+
+    worker._metadata = NtaVllmHostTransferMetadata(
+        SimpleCPUOffloadMetadata(
+            load_event=1,
+            load_cpu_blocks=[100, 101],
+            load_gpu_blocks=[10, 11],
+            load_event_to_reqs={1: ["request-0"]},
+        ),
+        (VllmHostRequestTransfer("request-0", ((100, 10), (101, 11))),),
+    )
+    worker._credits = TenantCreditLedger(((7, 16384),))
+    with (
+        patch(
+            "nta_runtime.connectors.vllm_host.copy_strided_host_runs_async",
+            return_value=1,
+        ),
+        patch(
+            "nta_runtime.connectors.vllm_host.torch.cuda.Event",
+            side_effect=new_event,
+        ),
+    ):
+        accounted = worker.submit_exact_layers({"request-0": 7, "resident": 9})
+    assert accounted is not None and accounted.tenant_accounted
+    assert accounted.tenant_charge_bytes == 16384
+    assert worker._credits.outstanding_bytes(7) == 16384
+    accounted_state = VllmV1ForwardState()
+    accounted_state.host_transfer_pairs = ((100, 10), (101, 11))
+    accounted_state.host_acquisition = accounted
+    accounted_state.tenant_isolation_enabled = True
+    for layer_name in ("layer.0", "layer.1"):
+        accounted_state.begin_host_layer(layer_name)
+        accounted_state.wait_for_host_layer(stream)
+        accounted_state.finish_host_layer(layer_name)
+    worker.clear()
+    assert worker._credits.outstanding_bytes(7) == 0
+
+    worker._metadata = NtaVllmHostTransferMetadata(
+        SimpleCPUOffloadMetadata(
+            load_event=2,
+            load_cpu_blocks=[100, 101],
+            load_gpu_blocks=[10, 11],
+            load_event_to_reqs={2: ["request-0"]},
+        ),
+        (VllmHostRequestTransfer("request-0", ((100, 10), (101, 11))),),
+    )
+    worker._credits = TenantCreditLedger(((7, 16383),))
+    assert worker.submit_exact_layers({"request-0": 7}) is None
+    assert worker._credits.outstanding_bytes(7) == 0
+    worker.clear()
+    assert cleared == [True, True, True]
+
+    # Request ownership, rather than batch position, determines each tenant's
+    # exact charge. Resident requests may appear in the batch mapping without
+    # acquiring bytes and must not perturb the two transfer owners.
+    worker._metadata = NtaVllmHostTransferMetadata(
+        SimpleCPUOffloadMetadata(
+            load_event=3,
+            load_cpu_blocks=[100, 101],
+            load_gpu_blocks=[10, 11],
+            load_event_to_reqs={3: ["request-a", "request-b"]},
+        ),
+        (
+            VllmHostRequestTransfer("request-a", ((100, 10),)),
+            VllmHostRequestTransfer("request-b", ((101, 11),)),
+        ),
+    )
+    worker._credits = TenantCreditLedger(((7, 8192), (8, 8192)))
+    split_lease = worker._reserve_tenant_credits(
+        {"request-a": 7, "request-b": 8, "resident": 9}
+    )
+    assert split_lease is not None
+    assert split_lease.charges == (
+        TenantCreditCharge(7, 8192),
+        TenantCreditCharge(8, 8192),
+    )
+    worker._credits.release(split_lease)
+    assert worker._credits.outstanding_bytes(7) == 0
+    assert worker._credits.outstanding_bytes(8) == 0
+    worker.clear()
+    assert cleared == [True, True, True, True]
+
+    # A CUDA event can fail after native DMA was already queued. The exceptional
+    # owner must synchronize the transport stream before releasing byte credit;
+    # an empty published-event map is not evidence that no transfer started.
+    worker._metadata = NtaVllmHostTransferMetadata(
+        SimpleCPUOffloadMetadata(
+            load_event=4,
+            load_cpu_blocks=[100, 101],
+            load_gpu_blocks=[10, 11],
+            load_event_to_reqs={4: ["request-0"]},
+        ),
+        (VllmHostRequestTransfer("request-0", ((100, 10), (101, 11))),),
+    )
+    worker._credits = TenantCreditLedger(((7, 16384),))
+    exceptional_syncs: list[bool] = []
+    worker._worker.load_stream = SimpleNamespace(
+        synchronize=lambda: exceptional_syncs.append(True)
+    )
+    with (
+        patch(
+            "nta_runtime.connectors.vllm_host.copy_strided_host_runs_async",
+            return_value=1,
+        ),
+        patch(
+            "nta_runtime.connectors.vllm_host.torch.cuda.Event",
+            side_effect=RuntimeError("event publication failed"),
+        ),
+    ):
+        try:
+            worker.submit_exact_layers({"request-0": 7})
+        except RuntimeError as error:
+            assert "event publication failed" in str(error)
+        else:
+            raise AssertionError("vLLM Host accepted a missing completion event")
+    assert exceptional_syncs == [True]
+    assert worker._credits.outstanding_bytes(7) == 0
+    worker.clear()
+    assert cleared == [True, True, True, True, True]
+
+
+def _test_host_wave_override_is_setup_only() -> None:
+    assert vllm_host_layers_per_wave({}) is None
+    assert vllm_host_layers_per_wave({"NTA_VLLM_HOST_LAYERS_PER_WAVE": "6"}) == 6
+    for value in ("0", "-1", "auto", "invalid"):
+        try:
+            vllm_host_layers_per_wave({"NTA_VLLM_HOST_LAYERS_PER_WAVE": value})
+        except RuntimeError as error:
+            assert "positive integer" in str(error)
+        else:
+            raise AssertionError("invalid vLLM Host wave override was accepted")
 
 
 def _test_external_tier_preserves_acquisition_schedule() -> None:
@@ -1057,7 +1245,8 @@ def main() -> None:
     _test_connector_lifecycle()
     _test_typed_destination_setup_dispatch()
     _test_synchronous_host_load_binding()
-    _test_typed_all_layer_host_preload()
+    _test_typed_layer_host_acquisition()
+    _test_host_wave_override_is_setup_only()
     _test_external_tier_preserves_acquisition_schedule()
     _test_attention_modules_are_prepared_at_setup()
     _test_worker_global_external_directory_lifetime()

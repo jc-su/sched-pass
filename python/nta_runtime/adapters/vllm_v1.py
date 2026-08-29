@@ -106,9 +106,7 @@ class VllmV1ForwardState:
     storage_key_tables: tuple[tuple[str | None, ...], ...] = ()
     host_transfer_pairs: tuple[tuple[int, int], ...] = ()
     host_resources: dict[str, Any] = field(default_factory=dict)
-    host_preload_event: Any | None = None
-    host_preload_blocks: int = 0
-    host_preload_bytes: int = 0
+    host_acquisition: Any | None = None
     tenant_isolation_enabled: bool = False
     host_index_tensors: dict[
         tuple[int, tuple[int, ...], tuple[int, ...]], tuple[Any, Any]
@@ -129,7 +127,7 @@ class VllmV1ForwardState:
     _host_schedule_observations: list[
         tuple[int, tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...]]
     ] = field(default_factory=list, init=False, repr=False)
-    _host_preload_waited: bool = field(default=False, init=False, repr=False)
+    _host_waited_fences: set[int] = field(default_factory=set, init=False, repr=False)
 
     def begin_host_layer(self, layer_name: str) -> None:
         """Open exact host-transfer accounting for one numerical layer."""
@@ -172,15 +170,16 @@ class VllmV1ForwardState:
         if self._active_host_layer != layer_name:
             raise RuntimeError("vLLM host layer finalization is unbalanced")
         expected = {destination for _, destination in self.host_transfer_pairs}
-        if self.host_preload_event is not None:
-            if expected and not self._host_preload_waited:
+        acquisition = self.host_acquisition
+        if acquisition is not None:
+            fence, _ = acquisition.fence_for(layer_name)
+            if expected and fence not in self._host_waited_fences:
                 raise RuntimeError(
-                    "vLLM host attention did not wait for its exact preload"
+                    "vLLM Host attention did not wait for its layer acquisition"
                 )
-            # The first attention launch waits on the all-layer event. Every
-            # subsequent layer is ordered behind that same wait on the model
-            # stream, so the exact admitted destination set is materialized.
             self._host_consumed_destinations.update(expected)
+            acquisition.retire(layer_name)
+            self.record_evidence("host_acquisition_retirements")
         consumed = set(self._host_consumed_destinations)
         observations = tuple(self._host_schedule_observations)
         self._active_host_layer = None
@@ -202,26 +201,29 @@ class VllmV1ForwardState:
             self._host_consumed_destinations.clear()
             self._host_schedule_observations.clear()
 
-    def wait_for_host_preload(self, stream: Any) -> bool:
-        """Order the model stream behind one typed all-layer transfer."""
+    def wait_for_host_layer(self, stream: Any) -> bool:
+        """Order one numerical layer behind its exact readiness fence."""
 
-        event = self.host_preload_event
-        if self.tenant_isolation_enabled and self.host_transfer_pairs:
-            raise RuntimeError(
-                "vLLM host preload cannot bypass finite tenant byte credits"
-            )
-        if event is None:
+        layer_name = self._active_host_layer
+        if layer_name is None:
+            raise RuntimeError("vLLM Host wait ran outside an active layer")
+        acquisition = self.host_acquisition
+        if acquisition is None:
             if self.host_transfer_pairs:
-                raise RuntimeError("vLLM direct host attention has no preload event")
+                raise RuntimeError(
+                    "vLLM direct Host attention has no layer acquisition"
+                )
             return False
-        if self._host_preload_waited:
+        if self.tenant_isolation_enabled and not acquisition.tenant_accounted:
+            raise RuntimeError(
+                "vLLM Host acquisition bypassed finite tenant byte credits"
+            )
+        fence, event = acquisition.fence_for(layer_name)
+        if fence in self._host_waited_fences:
             return False
         stream.wait_event(event)
-        self._host_preload_waited = True
-        self.record_evidence("host_preload_waits")
-        self.record_evidence("host_preload_batches")
-        self.record_evidence("host_transfer_blocks", int(self.host_preload_blocks))
-        self.record_evidence("host_transfer_bytes", int(self.host_preload_bytes))
+        self._host_waited_fences.add(fence)
+        self.record_evidence("host_acquisition_waits")
         return True
 
     def phase_batch(self, start: int, count: int) -> EngineBatch:
@@ -334,6 +336,8 @@ class VllmV1ForwardState:
             raise RuntimeError("vLLM forward evidence was finalized twice")
         if self._active_host_layer is not None:
             raise RuntimeError("vLLM forward ended with an active host layer")
+        if self.host_acquisition is not None and not self.host_acquisition.terminal:
+            raise RuntimeError("vLLM forward ended with unconsumed Host layers")
         return dict(self._forward_evidence)
 
     def commit_evidence(self) -> dict[str, int]:

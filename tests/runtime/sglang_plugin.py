@@ -527,7 +527,7 @@ def main() -> None:
         AcquisitionServiceCurve,
         LayerAcquisitionModel,
     )
-    from nta_runtime.engines.sglang_acquisition import HostLayerAcquisition
+    from nta_runtime.acquisition_scheduler import LayerAcquisition
     from nta_runtime.fixed_range_pool import FixedRangePool
 
     with patch.dict(
@@ -1067,12 +1067,9 @@ def main() -> None:
     assert NtaFlashInferAttnBackend._acquisition_shape_key(
         types.SimpleNamespace(batch_size=2, extend_num_tokens=7)
     ) == ("extend", 7, 2)
-    assert (
-        NtaFlashInferAttnBackend._acquisition_shape_key(
-            types.SimpleNamespace(batch_size=0, rids=(1, 2), extend_num_tokens=7)
-        )
-        == ("extend", 7, 2)
-    )
+    assert NtaFlashInferAttnBackend._acquisition_shape_key(
+        types.SimpleNamespace(batch_size=0, rids=(1, 2), extend_num_tokens=7)
+    ) == ("extend", 7, 2)
     assert (
         NtaFlashInferAttnBackend._acquisition_shape_key(
             types.SimpleNamespace(batch_size=2, extend_num_tokens=0)
@@ -1227,18 +1224,14 @@ def main() -> None:
             )
             == 0
         )
-    with patch.dict(
-        os.environ, {"NTA_EXECUTION_CALIBRATION_PROBES": "0"}, clear=True
-    ):
+    with patch.dict(os.environ, {"NTA_EXECUTION_CALIBRATION_PROBES": "0"}, clear=True):
         assert (
             incremental_calibration_probe_count(
                 execution=auto_execution, host_staged=True
             )
             == 0
         )
-    with patch.dict(
-        os.environ, {"NTA_EXECUTION_CALIBRATION_PROBES": "1"}, clear=True
-    ):
+    with patch.dict(os.environ, {"NTA_EXECUTION_CALIBRATION_PROBES": "1"}, clear=True):
         try:
             incremental_calibration_probe_count(
                 execution=auto_execution, host_staged=True
@@ -1251,9 +1244,7 @@ def main() -> None:
         protocol=types.SimpleNamespace(kind=ProtocolKind.LATE_BOUND),
         host_execution_mode=HostExecutionMode.DIRECT,
     )
-    with patch.dict(
-        os.environ, {"NTA_EXECUTION_CALIBRATION_PROBES": "2"}, clear=True
-    ):
+    with patch.dict(os.environ, {"NTA_EXECUTION_CALIBRATION_PROBES": "2"}, clear=True):
         try:
             incremental_calibration_probe_count(
                 execution=forced_execution, host_staged=True
@@ -1457,13 +1448,8 @@ def main() -> None:
     assert aggregate_curve.copy_samples == 3
     assert aggregate_curve.copy_bandwidth_bytes_per_second == 262_144_000
     assert aggregate_curve.copy_operation_ns == 1_000
-    assert (
-        aggregate_movers._stats["host_mover_complete_calibration_frontiers"] == 1
-    )
-    assert (
-        aggregate_movers._stats["host_mover_complete_calibration_wave_samples"]
-        == 3
-    )
+    assert aggregate_movers._stats["host_mover_complete_calibration_frontiers"] == 1
+    assert aggregate_movers._stats["host_mover_complete_calibration_wave_samples"] == 3
 
     context_stats: dict[str, int] = {}
     context_movers = HostMoverController(
@@ -1551,7 +1537,7 @@ def main() -> None:
         controller=types.SimpleNamespace(layer_num=4),
         transfer_plan=object(),
         prefetched_layers={},
-        acquisition=HostLayerAcquisition(admission_model.layer_bytes),
+        acquisition=LayerAcquisition(admission_model.layer_bytes),
     )
     admission_pending.acquisition.bind_model(admission_model)
     admission_ranges: list[tuple[int, int]] = []
@@ -1566,9 +1552,7 @@ def main() -> None:
         for local_layer in range(first_local_layer, last_local_layer):
             _pending.prefetched_layers[local_layer] = object()
 
-    admission_backend = NtaFlashInferAttnBackend.__new__(
-        NtaFlashInferAttnBackend
-    )
+    admission_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
     admission_backend._stats = {}
     admission_backend._host_transport = types.SimpleNamespace(
         prepare=publish_admission_range

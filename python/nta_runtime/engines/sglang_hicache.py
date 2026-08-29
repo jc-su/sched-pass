@@ -14,13 +14,12 @@ from nta_runtime.engines.sglang_transfer import (
     HostMoverLeasePlan,
     HostTransferLeasePlan,
 )
-from nta_runtime.engines.sglang_acquisition import HostLayerAcquisition
 from nta_runtime.engines.sglang_contracts import (
     LeaseDeviceIndexMap,
     LeaseOperationRange,
     LeaseOperationTransfer,
 )
-from nta_runtime.acquisition_scheduler import LayerAcquisitionModel
+from nta_runtime.acquisition_scheduler import LayerAcquisition, LayerAcquisitionModel
 
 from nta_runtime.progress_frontier import (
     RequestFrontier,
@@ -61,7 +60,7 @@ class PendingHostLoad:
     device_index_map: LeaseDeviceIndexMap | None = None
     transfer_events: tuple[Any, ...] = ()
     selection_accounted: bool = False
-    acquisition: HostLayerAcquisition | None = None
+    acquisition: LayerAcquisition | None = None
 
     def transfers_by_operation(self) -> dict[int, LeaseOperationTransfer]:
         transfers: dict[int, LeaseOperationTransfer] = {}
@@ -669,9 +668,7 @@ class SglangHiCacheBridge:
         if pending.completed_layers == pending.controller.layer_num:
             acquisition = getattr(pending, "acquisition", None)
             if acquisition is not None and not acquisition.queue.terminal:
-                raise RuntimeError(
-                    "HiCache lease completed with live acquisition jobs"
-                )
+                raise RuntimeError("HiCache lease completed with live acquisition jobs")
             stream = torch.cuda.current_stream()
             if pending.host_indices.is_cuda:
                 pending.host_indices.record_stream(stream)

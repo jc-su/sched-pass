@@ -16,9 +16,155 @@ model rather than an optimistic flag.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
+from threading import Lock
+
+
+_UINT64_MAX = (1 << 64) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class TenantCreditCharge:
+    """Exact bytes one transport lease owns on behalf of a tenant."""
+
+    tenant_id: int
+    bytes: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.tenant_id, bool)
+            or isinstance(self.bytes, bool)
+            or not isinstance(self.tenant_id, int)
+            or not isinstance(self.bytes, int)
+            or self.tenant_id < 0
+            or self.tenant_id >= 1 << 32
+            or self.bytes <= 0
+            or self.bytes > _UINT64_MAX
+        ):
+            raise ValueError("tenant acquisition charge is outside the ABI")
+
+
+@dataclass(frozen=True, slots=True)
+class TenantCreditLease:
+    """Opaque all-or-nothing reservation returned by a credit ledger."""
+
+    lease_id: int
+    charges: tuple[TenantCreditCharge, ...]
+
+    def __post_init__(self) -> None:
+        if self.lease_id <= 0 or not self.charges:
+            raise ValueError("tenant credit lease is empty")
+        if tuple(sorted(self.charges, key=lambda charge: charge.tenant_id)) != (
+            self.charges
+        ) or len({charge.tenant_id for charge in self.charges}) != len(self.charges):
+            raise ValueError("tenant credit lease charges are not canonical")
+
+
+class TenantCreditLedger:
+    """Thread-safe control-plane credits for externally issued transfers.
+
+    Device-initiated paths continue to use runtime atomics.  Copy-engine paths
+    have no device acquisition instruction, so their transport owner reserves
+    the same finite byte resource before submission and releases it only after
+    the readiness fence completes. Missing tenant entries retain the runtime's
+    unlimited default.
+    """
+
+    def __init__(self, budgets: Iterable[tuple[int, int]]) -> None:
+        values = tuple((int(tenant), int(limit)) for tenant, limit in budgets)
+        if len({tenant for tenant, _ in values}) != len(values) or any(
+            tenant < 0 or tenant >= 1 << 32 or limit < 0 or limit > _UINT64_MAX
+            for tenant, limit in values
+        ):
+            raise ValueError("tenant credit budgets are invalid")
+        self._budgets = dict(values)
+        self._outstanding: dict[int, int] = {}
+        # Leases are process-local capabilities, not serializable identifiers.
+        # Retaining the returned object lets release reject a lease minted by
+        # another ledger even when both ledgers happen to use the same numeric
+        # sequence and charges.
+        self._leases: dict[int, TenantCreditLease] = {}
+        self._next_lease_id = 1
+        self._lock = Lock()
+
+    @property
+    def finite(self) -> bool:
+        return any(limit != _UINT64_MAX for limit in self._budgets.values())
+
+    @property
+    def active_lease_count(self) -> int:
+        with self._lock:
+            return len(self._leases)
+
+    def outstanding_bytes(self, tenant_id: int) -> int:
+        if tenant_id < 0 or tenant_id >= 1 << 32:
+            raise ValueError("tenant ID is outside the runtime ABI")
+        with self._lock:
+            return self._outstanding.get(tenant_id, 0)
+
+    @staticmethod
+    def _canonical_charges(
+        charges: Iterable[TenantCreditCharge],
+    ) -> tuple[TenantCreditCharge, ...]:
+        totals: dict[int, int] = {}
+        for charge in charges:
+            if not isinstance(charge, TenantCreditCharge):
+                raise TypeError("tenant credit reservations require typed charges")
+            total = totals.get(charge.tenant_id, 0) + charge.bytes
+            if total > _UINT64_MAX:
+                raise OverflowError("tenant acquisition charge exceeds uint64")
+            totals[charge.tenant_id] = total
+        if not totals:
+            raise ValueError("tenant credit reservation is empty")
+        return tuple(
+            TenantCreditCharge(tenant, total)
+            for tenant, total in sorted(totals.items())
+        )
+
+    def try_reserve(
+        self, charges: Iterable[TenantCreditCharge]
+    ) -> TenantCreditLease | None:
+        canonical = self._canonical_charges(charges)
+        with self._lock:
+            for charge in canonical:
+                outstanding = self._outstanding.get(charge.tenant_id, 0)
+                limit = self._budgets.get(charge.tenant_id, _UINT64_MAX)
+                if charge.bytes > limit - outstanding:
+                    return None
+            lease_id = self._next_lease_id
+            self._next_lease_id += 1
+            for charge in canonical:
+                self._outstanding[charge.tenant_id] = (
+                    self._outstanding.get(charge.tenant_id, 0) + charge.bytes
+                )
+            lease = TenantCreditLease(lease_id, canonical)
+            self._leases[lease_id] = lease
+            return lease
+
+    def release(self, lease: TenantCreditLease) -> None:
+        if not isinstance(lease, TenantCreditLease):
+            raise TypeError("tenant credit release requires a typed lease")
+        with self._lock:
+            owned = self._leases.get(lease.lease_id)
+            if owned is not lease:
+                raise RuntimeError("tenant credit lease is stale or foreign")
+            charges = owned.charges
+            # Validate the complete transaction before mutating any tenant.
+            # An invariant failure must not leave a partially released lease.
+            for charge in charges:
+                outstanding = self._outstanding.get(charge.tenant_id, 0)
+                if outstanding < charge.bytes:
+                    raise RuntimeError("tenant credit accounting underflow")
+            for charge in charges:
+                outstanding = self._outstanding[charge.tenant_id]
+                remaining = outstanding - charge.bytes
+                if remaining:
+                    self._outstanding[charge.tenant_id] = remaining
+                else:
+                    self._outstanding.pop(charge.tenant_id, None)
+            self._leases.pop(lease.lease_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,8 +373,7 @@ class AcquisitionQueue:
             )
         self._ordered_job_ids = order
         self._states = {
-            job_id: AcquisitionJobState.PLANNED
-            for job_id in self._ordered_job_ids
+            job_id: AcquisitionJobState.PLANNED for job_id in self._ordered_job_ids
         }
         self._state_counts = {
             state: (len(values) if state is AcquisitionJobState.PLANNED else 0)
@@ -370,6 +515,157 @@ class AcquisitionQueue:
                 f"{state.value} -> {target.value}"
             )
         self._set_state(job_id, target)
+
+
+@dataclass(frozen=True, slots=True)
+class LayerAcquisitionSubmission:
+    """One work-conserving layer submission result."""
+
+    job_count: int
+    ranges: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if self.job_count < 0 or any(
+            begin < 0 or end <= begin for begin, end in self.ranges
+        ):
+            raise ValueError("layer acquisition submission geometry is invalid")
+        if self.job_count != sum(end - begin for begin, end in self.ranges):
+            raise ValueError("layer acquisition ranges do not cover the claimed jobs")
+
+
+class LayerAcquisition:
+    """Own one finite, layer-ordered exact-acquisition lifecycle.
+
+    The owner is independent of CUDA, framework metadata, and tier transport.
+    A backend publishes one readiness primitive for every claimed layer; the
+    numerical adapter retires that layer only after ordering its final
+    consumer. Optional calibrated EDF analysis proves that the structural
+    transformer order remains the correct simultaneous-release order.
+    """
+
+    def __init__(self, layer_bytes: tuple[int, ...]) -> None:
+        if not layer_bytes or any(value <= 0 for value in layer_bytes):
+            raise ValueError("layer acquisition requires positive layer bytes")
+        self._layer_bytes = tuple(layer_bytes)
+        self._model: LayerAcquisitionModel | None = None
+        self.queue = AcquisitionQueue(
+            tuple(
+                AcquisitionWork(layer, payload_bytes)
+                for layer, payload_bytes in enumerate(self._layer_bytes)
+            ),
+            ordered_job_ids=range(len(self._layer_bytes)),
+            # The backend link is already serialized. Publish the complete
+            # finite queue so it cannot idle between framework callbacks;
+            # readiness remains independently observable per layer.
+            max_inflight_jobs=len(self._layer_bytes),
+        )
+
+    @property
+    def model(self) -> "LayerAcquisitionModel | None":
+        return self._model
+
+    def bind_model(self, model: "LayerAcquisitionModel") -> bool:
+        """Attach calibrated feasibility without changing byte ownership."""
+
+        if model.layer_bytes != self._layer_bytes:
+            raise RuntimeError("EDF model changed layer acquisition byte ownership")
+        if schedule_acquisition_jobs(model.admission_jobs()).ordered_job_ids != (
+            self.queue.job_ids
+        ):
+            raise RuntimeError("EDF order disagrees with numerical layer order")
+        if self._model is None:
+            self._model = model
+            return True
+        if self._model != model:
+            raise RuntimeError("layer acquisition changed its calibrated EDF model")
+        return False
+
+    @property
+    def started(self) -> bool:
+        return self.queue.count_states(AcquisitionJobState.PLANNED) != len(
+            self.queue.job_ids
+        )
+
+    @property
+    def fully_published(self) -> bool:
+        return self.queue.count_states(
+            AcquisitionJobState.FENCE_PUBLISHED,
+            AcquisitionJobState.CONSUMED,
+        ) == len(self.queue.job_ids)
+
+    def submit_available(
+        self,
+        *,
+        publish_range: Callable[[int, int], None],
+        published_layers: Mapping[int, object],
+    ) -> LayerAcquisitionSubmission:
+        """Fill available link slots and publish each claimed readiness fence."""
+
+        claimed = self.queue.claim()
+        if not claimed:
+            return LayerAcquisitionSubmission(0, ())
+        claimed_ids = tuple(job.job_id for job in claimed)
+        ranges = _contiguous_ranges(claimed_ids)
+        try:
+            for begin, end in ranges:
+                publish_range(begin, end)
+                for layer in range(begin, end):
+                    if layer not in published_layers:
+                        raise RuntimeError(
+                            "transport returned without publishing layer "
+                            f"{layer}'s readiness fence"
+                        )
+                    self.queue.publish_fence(layer)
+        except BaseException:
+            for job_id in claimed_ids:
+                if self.queue.state(job_id) is AcquisitionJobState.SUBMITTED:
+                    self.queue.fail(job_id)
+            raise
+        return LayerAcquisitionSubmission(len(claimed), ranges)
+
+    def retire(self, layer: int) -> None:
+        """Retire one layer after its numerical consumer has been ordered."""
+
+        if layer not in self.queue.job_ids:
+            raise RuntimeError(f"layer acquisition does not own layer {layer}")
+        state = self.queue.state(layer)
+        if state is not AcquisitionJobState.FENCE_PUBLISHED:
+            raise RuntimeError(
+                f"layer acquisition {layer} reached its consumer in state {state.value}"
+            )
+        self.queue.retire(layer)
+
+    def retire_published(self) -> None:
+        """Retire a fully published graph batch at its stream handoff."""
+
+        for job_id in self.queue.job_ids:
+            state = self.queue.state(job_id)
+            if state is AcquisitionJobState.FENCE_PUBLISHED:
+                self.queue.retire(job_id)
+            elif state is not AcquisitionJobState.CONSUMED:
+                raise RuntimeError(
+                    "graph handoff contains an unpublished acquisition job"
+                )
+
+    def cancel_unfinished(self) -> None:
+        self.queue.cancel_unfinished()
+
+
+def _contiguous_ranges(job_ids: tuple[int, ...]) -> tuple[tuple[int, int], ...]:
+    """Coalesce adjacent acquisition jobs without changing scheduler order."""
+
+    if not job_ids:
+        return ()
+    ranges: list[tuple[int, int]] = []
+    begin = previous = job_ids[0]
+    for job_id in job_ids[1:]:
+        if job_id == previous + 1:
+            previous = job_id
+            continue
+        ranges.append((begin, previous + 1))
+        begin = previous = job_id
+    ranges.append((begin, previous + 1))
+    return tuple(ranges)
 
 
 @dataclass(frozen=True, slots=True)

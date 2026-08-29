@@ -27,9 +27,7 @@ _UINT64_MAX = (1 << 64) - 1
 SUPPORTED_VLLM_VERSION = "0.26.0"
 
 
-def _boolean(
-    values: Mapping[str, str], name: str, *, default: bool = False
-) -> bool:
+def _boolean(values: Mapping[str, str], name: str, *, default: bool = False) -> bool:
     raw = values.get(name, "1" if default else "0").strip()
     if raw not in {"0", "1"}:
         raise RuntimeError(f"{name} must be 0 or 1")
@@ -56,6 +54,24 @@ def _nonnegative(values: Mapping[str, str], name: str, default: int) -> int:
     if value < 0 or value > _UINT64_MAX:
         raise RuntimeError(f"{name} must be a nonnegative 64-bit integer")
     return value
+
+
+def vllm_host_layers_per_wave(
+    environ: Mapping[str, str] | None = None,
+) -> int | None:
+    """Return the explicit Host transport-wave override, if configured.
+
+    An unset value selects one maximally coalesced model-layer wave, the
+    measured production default. The override exists only for deployment
+    calibration and mechanism sweeps; request-time code never consults the
+    environment and no uncalibrated "auto" policy is implied.
+    """
+
+    values = os.environ if environ is None else environ
+    raw = values.get("NTA_VLLM_HOST_LAYERS_PER_WAVE", "").strip().lower()
+    if not raw:
+        return None
+    return _positive(values, "NTA_VLLM_HOST_LAYERS_PER_WAVE", 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,15 +102,11 @@ class VllmWorkerConfig:
         if max_batched_tokens < 0:
             raise ValueError("vLLM maximum batched tokens cannot be negative")
         values = os.environ if environ is None else environ
-        default_work_capacity = max(
-            256, 64 * request_capacity, max_batched_tokens
-        )
+        default_work_capacity = max(256, 64 * request_capacity, max_batched_tokens)
         work_capacity = _positive(
             values, "NTA_VLLM_WORK_TICKET_CAPACITY", default_work_capacity
         )
-        max_dependencies = _positive(
-            values, "NTA_VLLM_MAX_DEPENDENCIES_PER_WORK", 32
-        )
+        max_dependencies = _positive(values, "NTA_VLLM_MAX_DEPENDENCIES_PER_WORK", 32)
         tenant_capacity = _positive(
             values, "NTA_TENANT_CAPACITY", max(1, request_capacity)
         )
@@ -102,12 +114,9 @@ class VllmWorkerConfig:
         for tenant_id, _maximum_bytes in tenant_specs:
             if tenant_id >= tenant_capacity:
                 raise RuntimeError(
-                    f"tenant {tenant_id} exceeds NTA_TENANT_CAPACITY="
-                    f"{tenant_capacity}"
+                    f"tenant {tenant_id} exceeds NTA_TENANT_CAPACITY={tenant_capacity}"
                 )
-        staging_limit = _nonnegative(
-            values, "NTA_STAGING_BYTE_CAPACITY", _UINT64_MAX
-        )
+        staging_limit = _nonnegative(values, "NTA_STAGING_BYTE_CAPACITY", _UINT64_MAX)
         # Validate both the engine's numerical address-space contract and the
         # transport owner's concrete endpoint/catalog configuration now.
         selected_tier = validate_vllm_attention_tier(values)
@@ -159,7 +168,9 @@ class VllmAttentionConfig:
         native_enabled = _boolean(values, "NTA_VLLM_NATIVE")
         serving_tier = validate_vllm_attention_tier(values)
         raw_workspace = values.get("FLASHINFER_WORKSPACE_BASE", "").strip()
-        workspace = Path(raw_workspace).expanduser().resolve() if raw_workspace else None
+        workspace = (
+            Path(raw_workspace).expanduser().resolve() if raw_workspace else None
+        )
         if native_enabled and workspace is None:
             raise RuntimeError(
                 "NTA vLLM native attention requires FLASHINFER_WORKSPACE_BASE; "
@@ -172,9 +183,7 @@ class VllmAttentionConfig:
             verify_execution=_boolean(values, "NTA_VERIFY_EXECUTION"),
             verify_transfer=_boolean(values, "NTA_VLLM_VERIFY_TRANSFER"),
             compare_stock=_boolean(values, "NTA_VLLM_COMPARE_STOCK"),
-            allow_stock_fallback=_boolean(
-                values, "NTA_VLLM_ALLOW_STOCK_FALLBACK"
-            ),
+            allow_stock_fallback=_boolean(values, "NTA_VLLM_ALLOW_STOCK_FALLBACK"),
             workspace_base=workspace,
             workspace_bytes=_positive(
                 values,

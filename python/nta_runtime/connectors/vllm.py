@@ -489,7 +489,7 @@ class NtaVllmConnector(KVConnectorBase_V1, SupportsHMA):
         if self.has_connector_metadata():
             super().clear_connector_metadata()
         if self._host_worker is not None:
-            self._host_worker.clear()
+            self._host_worker.abort()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         del forward_context, kwargs
@@ -584,17 +584,65 @@ class NtaVllmConnector(KVConnectorBase_V1, SupportsHMA):
                 resources = dict(self._host_worker.resources)
                 state.host_transfer_pairs = pairs
                 state.host_resources = resources
-                if pairs and not state.tenant_isolation_enabled:
-                    event = self._host_worker.preload_exact()
-                    if event is None:
+                if pairs:
+                    if state.batch is None or len(metadata.request_ids) != len(
+                        state.batch.bindings
+                    ):
                         raise RuntimeError(
-                            "vLLM host preload omitted an admitted transfer"
+                            "vLLM Host tenant ownership is not aligned to the batch"
                         )
-                    state.host_preload_event = event
-                    state.host_preload_blocks = len(pairs) * len(resources)
-                    state.host_preload_bytes = len(pairs) * sum(
-                        resource.row_bytes for resource in resources.values()
+                    request_tenants = {
+                        request_id: binding.tenant_id
+                        for request_id, binding in zip(
+                            metadata.request_ids,
+                            state.batch.bindings,
+                            strict=True,
+                        )
+                    }
+                    acquisition = self._host_worker.submit_exact_layers(request_tenants)
+                    if acquisition is None:
+                        if not state.tenant_isolation_enabled:
+                            raise RuntimeError(
+                                "vLLM Host scheduler omitted an admitted acquisition"
+                            )
+                        state.record_evidence("host_acquisition_credit_rejections")
+                        state.connector_validated = True
+                        return
+                    state.host_acquisition = acquisition
+                    state.record_evidence("host_acquisition_batches")
+                    state.record_evidence(
+                        "host_acquisition_jobs", acquisition.layer_count
                     )
+                    state.record_evidence(
+                        "host_acquisition_waves", acquisition.wave_count
+                    )
+                    state.record_profile_ns(
+                        "host_acquisition_submission_cpu_ns",
+                        acquisition.submission_cpu_ns,
+                    )
+                    state.record_evidence(
+                        "host_transfer_blocks", acquisition.transfer_blocks
+                    )
+                    state.record_evidence(
+                        "host_transfer_bytes", acquisition.transfer_bytes
+                    )
+                    state.record_evidence(
+                        "host_transfer_runs", acquisition.transfer_runs
+                    )
+                    state.record_evidence(
+                        "host_copy_operations", acquisition.copy_operations
+                    )
+                    state.record_evidence(
+                        "host_copy_submissions", acquisition.copy_submissions
+                    )
+                    if acquisition.tenant_accounted:
+                        state.record_evidence(
+                            "host_acquisition_tenant_accounted_batches"
+                        )
+                        state.record_evidence(
+                            "host_acquisition_tenant_charge_bytes",
+                            acquisition.tenant_charge_bytes,
+                        )
             state.connector_validated = True
         except BaseException:
             self.abort_forward()

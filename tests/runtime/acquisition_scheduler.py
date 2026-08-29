@@ -8,13 +8,60 @@ from nta_runtime.acquisition_scheduler import (
     AcquisitionQueue,
     AcquisitionServiceCurve,
     AcquisitionWork,
+    LayerAcquisition,
     LayerAcquisitionModel,
+    TenantCreditCharge,
+    TenantCreditLedger,
     schedule_acquisition_jobs,
 )
-from nta_runtime.engines.sglang_acquisition import HostLayerAcquisition
 
 
 def main() -> None:
+    credits = TenantCreditLedger(((1, 4096), (2, (1 << 64) - 1)))
+    assert credits.finite and credits.active_lease_count == 0
+    lease = credits.try_reserve(
+        (
+            TenantCreditCharge(1, 1024),
+            TenantCreditCharge(1, 2048),
+            TenantCreditCharge(2, 8192),
+        )
+    )
+    assert lease is not None
+    assert lease.charges == (
+        TenantCreditCharge(1, 3072),
+        TenantCreditCharge(2, 8192),
+    )
+    assert credits.outstanding_bytes(1) == 3072
+    assert credits.outstanding_bytes(2) == 8192
+    assert credits.try_reserve((TenantCreditCharge(1, 2048),)) is None
+
+    # Numeric lease IDs are only diagnostic. A capability minted by another
+    # ledger must neither release nor corrupt the live reservation, even when
+    # both ledgers have the same first ID and exact charge tuple.
+    foreign_credits = TenantCreditLedger(((1, 4096), (2, (1 << 64) - 1)))
+    foreign_lease = foreign_credits.try_reserve(lease.charges)
+    assert foreign_lease is not None and foreign_lease == lease
+    try:
+        credits.release(foreign_lease)
+    except RuntimeError as error:
+        assert "stale or foreign" in str(error)
+    else:
+        raise AssertionError("tenant ledger accepted a foreign capability")
+    assert credits.active_lease_count == 1
+    assert credits.outstanding_bytes(1) == 3072
+    assert credits.outstanding_bytes(2) == 8192
+    foreign_credits.release(foreign_lease)
+
+    credits.release(lease)
+    assert credits.active_lease_count == 0
+    assert credits.outstanding_bytes(1) == credits.outstanding_bytes(2) == 0
+    try:
+        credits.release(lease)
+    except RuntimeError as error:
+        assert "stale or foreign" in str(error)
+    else:
+        raise AssertionError("tenant ledger accepted a duplicate release")
+
     curve = AcquisitionServiceCurve(minimum_samples=3, maximum_samples=4)
     for sample in (2_000, 1_500):
         curve = curve.with_observation(sample)
@@ -110,7 +157,7 @@ def main() -> None:
 
     # The SGLang seam submits the complete finite layer queue in one coalesced
     # range. Fence publication and numerical retirement remain per layer.
-    owner = HostLayerAcquisition(model.layer_bytes)
+    owner = LayerAcquisition(model.layer_bytes)
     assert owner.model is None
     assert owner.bind_model(model)
     assert owner.model == model
@@ -130,15 +177,18 @@ def main() -> None:
     assert submission.ranges == ((0, 3),)
     assert submitted_ranges == [(0, 3)]
     assert owner.started and owner.fully_published
-    assert owner.submit_available(
-        publish_range=publish_range,
-        published_layers=published,
-    ).job_count == 0
+    assert (
+        owner.submit_available(
+            publish_range=publish_range,
+            published_layers=published,
+        ).job_count
+        == 0
+    )
     for layer in range(3):
         owner.retire(layer)
     assert owner.queue.terminal
 
-    missing_fence = HostLayerAcquisition(model.layer_bytes)
+    missing_fence = LayerAcquisition(model.layer_bytes)
     try:
         missing_fence.submit_available(
             publish_range=lambda _begin, _end: None,
@@ -159,7 +209,7 @@ def main() -> None:
     )
     assert tuple(job.job_id for job in unmodeled.claim()) == (0, 1)
     try:
-        HostLayerAcquisition(model.layer_bytes).bind_model(
+        LayerAcquisition(model.layer_bytes).bind_model(
             replace(model, layer_bytes=(4096, 4096, 8192))
         )
     except RuntimeError as error:

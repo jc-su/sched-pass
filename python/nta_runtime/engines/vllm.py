@@ -281,12 +281,11 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         )
 
     @staticmethod
-    def _framework_workspace(
-        stock_wrapper: Any,
-        query: torch.Tensor,
-        required_bytes: int,
-    ) -> tuple[torch.Tensor, AttentionWorkspaceContract]:
-        """Borrow the framework's worker-lifetime FlashInfer workspace."""
+    def _framework_workspace_storage(
+        stock_wrapper: Any, query: torch.Tensor
+    ) -> tuple[torch.Tensor, int]:
+        """Validate and return the framework's worker-lifetime storage."""
+
         workspace = getattr(stock_wrapper, "_float_workspace_buffer", None)
         if not isinstance(workspace, torch.Tensor):
             raise RuntimeError("vLLM stock wrapper has no FlashInfer workspace")
@@ -300,6 +299,18 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 "vLLM stock wrapper workspace is not contiguous uint8 CUDA storage"
             )
         capacity = workspace.numel() * workspace.element_size()
+        return workspace, capacity
+
+    @classmethod
+    def _framework_workspace(
+        cls,
+        stock_wrapper: Any,
+        query: torch.Tensor,
+        required_bytes: int,
+    ) -> tuple[torch.Tensor, AttentionWorkspaceContract]:
+        """Borrow a sufficiently large framework FlashInfer workspace."""
+
+        workspace, capacity = cls._framework_workspace_storage(stock_wrapper, query)
         if capacity < required_bytes:
             raise RuntimeError(
                 "vLLM stock wrapper workspace is smaller than the NTA contract: "
@@ -309,13 +320,12 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             capacity, workspace.data_ptr()
         )
 
-    def _request_bound_ready(self, state: Any, owner: Any) -> bool:
-        """Return whether exact KV is ready for one direct consumer launch.
+    def _request_bound_available(self, state: Any, owner: Any) -> bool:
+        """Return whether exact KV has a direct-consumer readiness contract.
 
-        HBM is resident by construction.  The host connector can establish the
-        same precondition with one typed all-layer batch copy; a host forward
-        with admitted pairs but no completion event must retain the incremental
-        consumer instead of silently reading an incomplete destination.
+        HBM is resident by construction. The Host connector publishes one
+        readiness fence per layer; the direct consumer orders itself on that
+        fence without waiting for the remaining model layers.
         """
 
         if not isinstance(owner, VllmV1WorkerController):
@@ -325,20 +335,20 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         if self._serving_tier != "host_staged":
             return False
         pairs = tuple(getattr(state, "host_transfer_pairs", ()))
-        event = getattr(state, "host_preload_event", None)
+        acquisition = getattr(state, "host_acquisition", None)
         isolation = bool(getattr(state, "tenant_isolation_enabled", False))
         if isolation != owner.tenant_isolation_enabled:
             raise RuntimeError("vLLM tenant-isolation state disagrees with its owner")
         if isolation and pairs:
-            if event is not None:
+            if acquisition is not None and not acquisition.tenant_accounted:
                 raise RuntimeError(
-                    "vLLM host preload bypassed finite tenant byte credits"
+                    "vLLM Host acquisition bypassed finite tenant byte credits"
                 )
-            return False
-        if event is not None:
+            return acquisition is not None
+        if acquisition is not None:
             if not pairs:
                 raise RuntimeError(
-                    "vLLM host preload event has no exact transfer ownership"
+                    "vLLM Host acquisition has no exact transfer ownership"
                 )
             return True
         return not pairs
@@ -513,7 +523,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         ):
             raise RuntimeError("vLLM direct attention has no typed request bindings")
         if self._serving_tier == "host_staged":
-            state.wait_for_host_preload(torch.cuda.current_stream(query.device))
+            state.wait_for_host_layer(torch.cuda.current_stream(query.device))
         kv_cache_for_flashinfer = self._kv_cache_tuple(kv_cache)
         owner = getattr(state, "execution_owner", None)
         record_consumer = getattr(owner, "record_request_binding_consumer", None)
@@ -670,7 +680,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         module_name: str,
-        workspace_bytes: int,
+        workspace: torch.Tensor,
     ) -> Any:
         if self._nta_config.module_override(kind) is not None:
             module_path = _find_module(
@@ -691,9 +701,6 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             head_dim_qk=self.head_size,
             head_dim_vo=self.head_size,
         )
-        # Planning initializes every workspace region consumed by FlashInfer;
-        # zero-filling hundreds of MiB here is pure startup latency.
-        workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=query.device)
         if kind == "decode":
             wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 workspace,
@@ -724,12 +731,17 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         wrapper = getattr(self, attribute)
         if wrapper is None:
             module_name = self._incremental_module_name(kind, query, kv_cache)
+            workspace = torch.empty(
+                self._nta_config.workspace_bytes,
+                dtype=torch.uint8,
+                device=query.device,
+            )
             wrapper = self._build_incremental_wrapper(
                 kind,
                 query,
                 kv_cache,
                 module_name,
-                self._nta_config.workspace_bytes,
+                workspace,
             )
             setattr(self, attribute, wrapper)
             VLLM_STATS["local_incremental_wrapper_builds"] += 1
@@ -1474,6 +1486,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         batch: EngineBatch,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
+        stock_wrapper: Any,
         page_size: int,
         causal: bool,
         plan: Callable[[Any], Any],
@@ -1490,15 +1503,46 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 causal=causal,
                 workspace_bytes=workspace_bytes,
             )
+            if self._nta_config.compare_stock:
+                workspace = None
+                workspace_contract = AttentionWorkspaceContract.worker_owned(
+                    workspace_bytes
+                )
+            else:
+                candidate, capacity = self._framework_workspace_storage(
+                    stock_wrapper, query
+                )
+                if capacity >= workspace_bytes:
+                    workspace = candidate
+                    workspace_contract = AttentionWorkspaceContract.framework_owned(
+                        capacity, candidate.data_ptr()
+                    )
+                else:
+                    # Some unit-sized framework profiles intentionally reserve
+                    # less memory than the deployed NTA module contract. Only
+                    # those profiles need an independent worker allocation.
+                    workspace = None
+                    workspace_contract = AttentionWorkspaceContract.worker_owned(
+                        workspace_bytes
+                    )
+
+            def build_wrapper() -> Any:
+                phase_workspace = workspace
+                if phase_workspace is None:
+                    phase_workspace = torch.empty(
+                        workspace_bytes, dtype=torch.uint8, device=query.device
+                    )
+                return self._build_incremental_wrapper(
+                    kind, query, kv_cache, module_name, phase_workspace
+                )
+
             wrapper, schedule = owner.attention_phase(
                 "incremental",
                 key,
                 batch.epoch,
-                lambda: self._build_incremental_wrapper(
-                    kind, query, kv_cache, module_name, workspace_bytes
-                ),
+                build_wrapper,
                 plan,
-                workspace=AttentionWorkspaceContract.worker_owned(workspace_bytes),
+                workspace=workspace_contract,
             )
             self._nta_program = wrapper._nta_transport_program
             return wrapper, schedule
@@ -1626,7 +1670,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         if page_size <= 0:
             raise RuntimeError("vLLM forward sidecar has no token page size")
         owner = getattr(state, "execution_owner", None)
-        if self._request_bound_ready(state, owner):
+        if self._request_bound_available(state, owner):
             direct_wrapper = self._request_bound_phase(
                 owner=owner,
                 kind="prefill",
@@ -1665,6 +1709,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             batch=prefill_batch,
             query=query,
             kv_cache=kv_cache,
+            stock_wrapper=stock_wrapper,
             page_size=page_size,
             causal=attn_metadata.causal,
             plan=lambda wrapper: self._plan_prefill_wrapper(
@@ -1751,7 +1796,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             raise RuntimeError("vLLM forward sidecar has no token page size")
 
         owner = getattr(state, "execution_owner", None)
-        if self._request_bound_ready(state, owner):
+        if self._request_bound_available(state, owner):
             direct_wrapper = self._request_bound_phase(
                 owner=owner,
                 kind="decode",
@@ -1789,6 +1834,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             batch=decode_batch,
             query=query,
             kv_cache=kv_cache,
+            stock_wrapper=stock_wrapper,
             page_size=page_size,
             causal=False,
             plan=lambda wrapper: self._plan_decode_wrapper(
