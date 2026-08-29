@@ -44,7 +44,6 @@ class SglangHostTransport:
         profile_transfer: bool,
         stats: dict[str, Any],
         transfer_profiles: list[tuple[Any, Any, int, str]],
-        transfer_plan: Callable[[PendingHostLoad], HostTransferLeasePlan],
         transport_program: Callable[[], Any],
         collect_barrier_profiles: Callable[[], None],
     ) -> None:
@@ -68,7 +67,6 @@ class SglangHostTransport:
         self._profile_transfer = profile_transfer
         self._stats = stats
         self._transfer_profiles = transfer_profiles
-        self._transfer_plan = transfer_plan
         self._transport_program = transport_program
         self._collect_barrier_profiles = collect_barrier_profiles
         # CUDA priorities are inverted. Acquisition is deliberately assigned
@@ -99,6 +97,7 @@ class SglangHostTransport:
     def prepare(
         self,
         pending: PendingHostLoad,
+        transfer_plan: HostTransferLeasePlan,
         *,
         first_local_layer: int = 0,
         last_local_layer: int | None = None,
@@ -127,7 +126,8 @@ class SglangHostTransport:
             )
 
         acquired_layer_count = last_local_layer - first_local_layer
-        transfer_plan = self._transfer_plan(pending)
+        if transfer_plan is not pending.transfer_plan:
+            raise RuntimeError("host transport received an unfrozen lease plan")
         mover_plan = transfer_plan.mover
         objects_per_layer = transfer_plan.objects_per_layer
         transfer_count = mover_plan.row_count
@@ -400,40 +400,6 @@ class SglangHostTransport:
             self._stats["pipeline_cpu_ns"] = self._stats.get(
                 "pipeline_cpu_ns", 0
             ) + (time.perf_counter_ns() - pipeline_started)
-
-    def prepare_missing(
-        self,
-        pending: PendingHostLoad,
-        *,
-        exclude: frozenset[int] = frozenset(),
-    ) -> int:
-        """Enqueue every unpublished layer except explicit typed-demand gaps."""
-
-        layer_count = int(pending.controller.layer_num)
-        if any(layer < 0 or layer >= layer_count for layer in exclude):
-            raise RuntimeError("typed-demand exclusion is outside the model")
-        missing = [
-            layer
-            for layer in range(layer_count)
-            if layer not in pending.prefetched_layers and layer not in exclude
-        ]
-        if not missing:
-            return 0
-        ranges: list[tuple[int, int]] = []
-        range_begin = previous = missing[0]
-        for layer in missing[1:]:
-            if layer != previous + 1:
-                ranges.append((range_begin, previous + 1))
-                range_begin = layer
-            previous = layer
-        ranges.append((range_begin, previous + 1))
-        for first_layer, last_layer in ranges:
-            self.prepare(
-                pending,
-                first_local_layer=first_layer,
-                last_local_layer=last_layer,
-            )
-        return len(missing)
 
     def _events_for(
         self,

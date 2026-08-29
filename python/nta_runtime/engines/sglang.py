@@ -29,10 +29,6 @@ from nta_runtime.adapters.sglang import (
 )
 from nta_runtime.execution_core import ExecutionSession
 from nta_runtime.execution_protocol import ProtocolKind
-from nta_runtime.acquisition_scheduler import (
-    AcquisitionServiceCurve,
-    LayerAcquisitionModel,
-)
 from nta_runtime.execution_planner import (
     HostExecutionForm,
     HostExecutionMode,
@@ -43,13 +39,10 @@ from nta_runtime.engines.sglang_hicache import (
     PendingHostLoad,
     SglangHiCacheBridge,
 )
-from nta_runtime.acquisition_scheduler import LayerAcquisition
-from nta_runtime.engines.sglang_transfer import (
-    HostMoverController,
-    HostMoverLeasePlan,
-    HostTransferLeasePlan,
-    build_host_transfer_lease_plan,
+from nta_runtime.engines.sglang_acquisition import (
+    SglangHostAcquisitionCoordinator,
 )
+from nta_runtime.engines.sglang_transfer import HostMoverController
 from nta_runtime.engines.sglang_pipeline import SglangHostTransport
 from nta_runtime.engines.sglang_nvme import SglangNvmeAcquisitionPipeline
 from nta_runtime.engines.sglang_config import (
@@ -85,7 +78,6 @@ from nta_runtime.engines.sglang_semantics import (
 )
 from nta_runtime.engines.sglang_planning import (
     calibration_probe_end as _calibration_probe_end,
-    pipeline_object_id as _pipeline_object_id,
     require_exact_prefetch_layers as _require_exact_prefetch_layers,
 )
 from nta_runtime.engines.sglang_telemetry import (
@@ -499,9 +491,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             profile_transfer=self._profile_transfer,
             stats=self._stats,
             transfer_profiles=self._transfer_profiles,
-            transfer_plan=self._host_transfer_lease_plan,
             transport_program=self._require_kernels().transport_program,
             collect_barrier_profiles=self._collect_barrier_profiles,
+        )
+        self._host_acquisition = SglangHostAcquisitionCoordinator(
+            device_pool=self.token_to_kv_pool,
+            execution_config=self._execution_config,
+            tenant_isolation_enabled=self._tenant_isolation_enabled,
+            model_layer_count=self._model_layer_count,
+            sm_acquisition_waves=self._sm_acquisition_waves,
+            movers=self._host_movers,
+            calibration=self._layer_calibration,
+            transport=self._host_transport,
+            stats=self._stats,
         )
         self._operator_profiles: list[
             tuple[torch.cuda.Event, torch.cuda.Event, str, int]
@@ -563,11 +565,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if self._tier_service.is_host_staged:
             # Capture ownership immediately, but delay the execution form until
             # the exact FlashInfer schedule is available in forward metadata.
-            self._hicache.set_acquire_callback(self._hold_host_load)
-            self._hicache.set_deadline_model_callback(self._admission_deadline_model)
+            self._hicache.set_acquire_callback(self._host_acquisition.capture)
+            self._hicache.set_deadline_model_callback(
+                self._host_acquisition.deadline_model
+            )
             self._hicache.set_admission_acquisition_callbacks(
-                prepare=self._prepare_admission_acquisition,
-                start=self._start_admission_acquisition,
+                prepare=self._host_acquisition.prepare_admission,
+                start=self._host_acquisition.start_admission,
             )
             if tuning.requires_typed_host_modules(bootstrap):
                 self._require_kernels().prepare_typed_execution_modules(
@@ -622,310 +626,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
             self._stats_publisher.publish(setup_report, wait=True)
         atexit.register(self._write_stats)
-
-    def _hold_host_load(self, pending: PendingHostLoad) -> None:
-        """Capture a HiCache lease before selecting its execution form.
-
-        Ownership is captured by the hook before a batch can be admitted.
-        Conventional execution publishes the complete producer immediately.
-        A dense late-bound lease also names every byte that the forward will
-        consume, so its finite transport queue starts immediately rather than
-        waiting for FlashInfer metadata.  The later batch binding supplies only
-        calibrated deadlines and work-unit mappings; it cannot expand physical
-        ownership or restart transport.  Tenant-isolated and device-bulk causal
-        arms still defer until their request/accounting contract is available.
-        """
-
-        if pending.controller.mem_pool_device is not self.token_to_kv_pool:
-            raise RuntimeError("HiCache lease belongs to a different device pool")
-        layer_count = int(pending.controller.layer_num)
-        if layer_count != self._model_layer_count:
-            raise RuntimeError("HiCache load and model layer counts disagree")
-        self._account_tier_selection(pending)
-        conventional = self._execution_config.protocol.kind is ProtocolKind.CONVENTIONAL
-        eager_dense = (
-            not conventional
-            and not self._tenant_isolation_enabled
-            and self._execution_config.host_execution_mode
-            is not HostExecutionMode.DEVICE_BULK
-        )
-        initial_layers = 0
-        if conventional:
-            self._host_transport.prepare(
-                pending,
-                first_local_layer=0,
-                last_local_layer=layer_count,
-            )
-            initial_layers = layer_count
-        elif eager_dense:
-            # Build exact physical descriptors at lease capture.  No active
-            # ForwardBatch exists here; mover choice therefore uses only its
-            # deployment-local link curve, never stale batch state.
-            self._host_transfer_lease_plan(pending)
-            pending.acquisition = LayerAcquisition(pending.layer_bytes)
-            self._stats["host_acquisition_jobs_prepared"] = (
-                self._stats.get("host_acquisition_jobs_prepared", 0) + layer_count
-            )
-            self._stats["lease_acquisition_groups_prepared"] = (
-                self._stats.get("lease_acquisition_groups_prepared", 0) + 1
-            )
-            initial_layers = self._submit_host_acquisition(pending)
-            if initial_layers != layer_count:
-                raise RuntimeError(
-                    "dense HiCache lease did not fill its finite acquisition queue"
-                )
-            self._stats["lease_acquisition_groups_started"] = (
-                self._stats.get("lease_acquisition_groups_started", 0) + 1
-            )
-        self._stats["initial_acquisition_batches"] = (
-            self._stats.get("initial_acquisition_batches", 0) + 1
-        )
-        self._stats["initial_acquisition_layers"] = (
-            self._stats.get("initial_acquisition_layers", 0) + initial_layers
-        )
-        self._stats["initial_typed_gap_layers"] = self._stats.get(
-            "initial_typed_gap_layers", 0
-        ) + (layer_count - initial_layers)
-        if initial_layers == 0:
-            self._stats["schedule_bound_acquisition_batches"] = (
-                self._stats.get("schedule_bound_acquisition_batches", 0) + 1
-            )
-
-    def _admission_deadline_model(
-        self, pending: PendingHostLoad, batch: Any
-    ) -> LayerAcquisitionModel | None:
-        """Build a calibrated EDF model without synchronizing CUDA.
-
-        Admission is allowed to delay a prefill only when both sides of the
-        inequality are deployment observations: completed mover waves provide
-        link service and completed attention-arrival intervals provide compute
-        deadlines.  Missing shape or mover calibration returns ``None`` and the
-        framework releases the batch to the typed partial consumer.
-        """
-
-        acquisition = getattr(pending, "acquisition", None)
-        if acquisition is not None and acquisition.model is not None:
-            return acquisition.model
-        self._host_movers.collect_profiles()
-        self._layer_calibration.collect()
-        mover = pending.mover_plan
-        if mover is None or not pending.layer_bytes or not pending.row_bytes_by_layer:
-            return None
-        curve = self._layer_calibration.curve_for_batch(batch)
-        if curve is None:
-            return None
-        model = self._deadline_model_for_curve(pending, curve)
-        if model is not None and acquisition is not None:
-            acquisition.bind_model(model)
-        return model
-
-    def _deadline_model_for_curve(
-        self,
-        pending: PendingHostLoad,
-        curve: AcquisitionServiceCurve,
-    ) -> LayerAcquisitionModel | None:
-        mover = pending.mover_plan
-        if (
-            mover is None
-            or not curve.calibrated
-            or not pending.layer_bytes
-            or not pending.row_bytes_by_layer
-        ):
-            return None
-        transfer_count = int(pending.device_indices.numel())
-        if transfer_count <= 0 or transfer_count != mover.row_count:
-            raise RuntimeError("HiCache deadline mover geometry changed")
-        if not self._host_movers.lease_calibrated(pending):
-            return None
-        representative_bytes = self._host_movers.representative_wave_bytes(
-            pending.row_bytes_by_layer, transfer_count
-        )
-        service_model = self._host_movers.service_model(representative_bytes)
-        layer_service: list[int] = []
-        for key_row_bytes, value_row_bytes in pending.row_bytes_by_layer:
-            service_ns = service_model.candidate_ns(
-                total_rows=transfer_count,
-                copy_rows=mover.copy_row_count,
-                copy_run_count=len(mover.copy_runs),
-                row_bytes=key_row_bytes + value_row_bytes,
-                copy_operations_per_run=2,
-            )
-            if service_ns is None:
-                return None
-            layer_service.append(service_ns)
-        return LayerAcquisitionModel(
-            layer_bytes=pending.layer_bytes,
-            transfer_service_ns=tuple(layer_service),
-            # The framework exposes no calibrated useful-compute interval
-            # between batch admission and the first attention arrival.  Zero
-            # is the conservative deadline origin; it does not make layer zero
-            # a transport or consumer special case.
-            initial_compute_ns=0,
-            inter_layer_compute_ns=curve.conservative_interval_ns,
-        )
-
-    def _prepare_host_acquisition_owner(
-        self, pending: PendingHostLoad, batch: Any
-    ) -> bool:
-        """Bind one calibrated EDF proof to immutable physical ownership."""
-
-        acquisition = getattr(pending, "acquisition", None)
-        if acquisition is not None and acquisition.model is not None:
-            return True
-        if acquisition is None and pending.prefetched_layers:
-            return False
-        shape_key = self._layer_calibration.shape_key(batch)
-        curve = self._layer_calibration.curve_for_batch(batch)
-        if shape_key is None or curve is None:
-            self._stats["host_acquisition_shape_uncalibrated"] = (
-                self._stats.get("host_acquisition_shape_uncalibrated", 0) + 1
-            )
-            return False
-        active = self._active_batch
-        if active is not None and active.pending_host_load is pending:
-            active.layer_service_key = shape_key
-        self._host_movers.collect_profiles()
-        self._host_transfer_lease_plan(
-            pending,
-            layer_service_key=shape_key,
-            layer_curve=curve,
-        )
-        model = self._deadline_model_for_curve(pending, curve)
-        if model is None:
-            counter = (
-                "host_acquisition_mover_uncalibrated"
-                if not self._host_movers.lease_calibrated(pending)
-                else "host_acquisition_model_rejected"
-            )
-            self._stats[counter] = self._stats.get(counter, 0) + 1
-            return False
-        if acquisition is None:
-            acquisition = LayerAcquisition(pending.layer_bytes)
-            pending.acquisition = acquisition
-            self._stats["host_acquisition_jobs_prepared"] = self._stats.get(
-                "host_acquisition_jobs_prepared", 0
-            ) + len(model.layer_bytes)
-        if acquisition.bind_model(model):
-            self._stats["host_acquisition_models_bound"] = (
-                self._stats.get("host_acquisition_models_bound", 0) + 1
-            )
-        return True
-
-    def _prepare_admission_acquisition(
-        self, pending: PendingHostLoad, batch: Any
-    ) -> bool:
-        """Build the physical acquisition group only when its model is usable."""
-
-        if (
-            self._tenant_isolation_enabled
-            or self._execution_config.host_execution_mode
-            is HostExecutionMode.DEVICE_BULK
-        ):
-            return False
-        already_prepared = getattr(pending, "acquisition", None) is not None
-        ready = self._prepare_host_acquisition_owner(pending, batch)
-        if ready and not already_prepared:
-            self._stats["admission_acquisition_groups_prepared"] = (
-                self._stats.get("admission_acquisition_groups_prepared", 0) + 1
-            )
-        return ready
-
-    def _submit_host_acquisition(self, pending: PendingHostLoad) -> int:
-        """Fill the lease's Host link queue and publish exact layer fences."""
-
-        acquisition = getattr(pending, "acquisition", None)
-        if acquisition is None:
-            raise RuntimeError("HiCache lease has no prepared acquisition owner")
-        submission = acquisition.submit_available(
-            publish_range=lambda begin, end: self._host_transport.prepare(
-                pending,
-                first_local_layer=begin,
-                last_local_layer=end,
-            ),
-            published_layers=pending.prefetched_layers,
-        )
-        if submission.job_count:
-            self._stats["host_acquisition_submission_calls"] = self._stats.get(
-                "host_acquisition_submission_calls", 0
-            ) + len(submission.ranges)
-            self._stats["host_acquisition_jobs_submitted"] = (
-                self._stats.get("host_acquisition_jobs_submitted", 0)
-                + submission.job_count
-            )
-        return submission.job_count
-
-    def _start_admission_acquisition(
-        self, pending: PendingHostLoad, batch: Any
-    ) -> None:
-        """Start the finite EDF queue after admission has bounded its delay."""
-
-        if (
-            pending.transfer_plan is None
-            or pending.prefetched_layers
-            or pending.acquisition is None
-            or pending.acquisition.started
-        ):
-            raise RuntimeError(
-                "HiCache admission acquisition was not prepared exactly once"
-            )
-        if (
-            self._admission_deadline_model(pending, batch) is None
-            or pending.acquisition.model is None
-        ):
-            raise RuntimeError("HiCache admission acquisition lost its calibration")
-        submitted = self._submit_host_acquisition(pending)
-        if submitted != int(pending.controller.layer_num):
-            raise RuntimeError("HiCache admission did not fill its finite link queue")
-        self._stats["admission_acquisition_groups_started"] = (
-            self._stats.get("admission_acquisition_groups_started", 0) + 1
-        )
-
-    def _account_tier_selection(self, pending: PendingHostLoad) -> None:
-        """Count unique logical tier demand once per ownership lease."""
-
-        if pending.selection_accounted:
-            return
-        row_count = int(pending.device_indices.numel())
-        if row_count <= 0:
-            raise RuntimeError("SGLang acquisition lease contains no selected rows")
-        controller = pending.controller
-        host_keys = tuple(controller.mem_pool_host.k_data_refs)
-        host_values = tuple(controller.mem_pool_host.v_data_refs)
-        layer_count = int(controller.layer_num)
-        if (
-            len(host_keys) != layer_count
-            or len(host_values) != layer_count
-            or not host_keys
-        ):
-            raise RuntimeError("SGLang acquisition lease has incomplete layer geometry")
-        row_bytes_by_layer = tuple(
-            (
-                int(key[0].numel()) * key.element_size(),
-                int(value[0].numel()) * value.element_size(),
-            )
-            for key, value in zip(host_keys, host_values, strict=True)
-        )
-        layer_bytes = tuple(
-            row_count * (key_bytes + value_bytes)
-            for key_bytes, value_bytes in row_bytes_by_layer
-        )
-        if pending.layer_bytes and pending.layer_bytes != layer_bytes:
-            raise RuntimeError("SGLang acquisition byte geometry changed after capture")
-        if (
-            pending.row_bytes_by_layer
-            and pending.row_bytes_by_layer != row_bytes_by_layer
-        ):
-            raise RuntimeError("SGLang acquisition row geometry changed after capture")
-        pending.layer_bytes = layer_bytes
-        pending.row_bytes_by_layer = row_bytes_by_layer
-        pending.selection_accounted = True
-        self._stats["tier_selected_leases"] += 1
-        self._stats["tier_selected_rows"] += row_count
-        self._stats["tier_selected_bytes"] += sum(layer_bytes)
-        # SGLang HiCache load-back is an exact-dense source range. Sparse
-        # demand providers may later publish a larger candidate set, but this
-        # framework path neither approximates nor drops any candidate row.
-        self._stats["tier_candidate_bytes"] += sum(layer_bytes)
 
     def _configure_tenant_budgets(self, specs: tuple[tuple[int, int], ...]) -> None:
         for tenant_id, max_bytes in specs:
@@ -1559,7 +1259,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
         if pending is not None:
-            self._account_tier_selection(pending)
+            self._host_acquisition.account_selection(pending)
         # A framework CUDA graph has immutable kernel arguments.  Capturing a
         # request-bound NTA wrapper would freeze the capture-time request slot
         # and silently attribute later replays to the wrong generation.  Graph
@@ -1597,9 +1297,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     "external CUDA-graph prefetch cannot bypass finite tenant budgets"
                 )
             if pending.acquisition is None:
-                self._host_transport.prepare_missing(pending)
+                self._host_acquisition.publish_missing(pending)
             else:
-                self._submit_host_acquisition(pending)
+                self._host_acquisition.submit(pending)
             final_layer = _require_exact_prefetch_layers(
                 pending.prefetched_layers,
                 self._model_layer_count,
@@ -1678,7 +1378,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
         if pending is not None:
-            self._account_tier_selection(pending)
+            self._host_acquisition.account_selection(pending)
         measured_host_selection = (
             pending is not None and self._tier_service.is_host_staged
         )
@@ -1749,7 +1449,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     and not self._tenant_isolation_enabled
                     and self._execution_config.host_execution_mode
                     is not HostExecutionMode.DEVICE_BULK
-                    and self._prepare_host_acquisition_owner(pending, forward_batch)
+                    and self._host_acquisition.prepare_owner(
+                        pending,
+                        forward_batch,
+                        active_batch=self._active_batch,
+                    )
                 ):
                     self._stats["metadata_acquisition_groups_prepared"] = (
                         self._stats.get("metadata_acquisition_groups_prepared", 0) + 1
@@ -1758,7 +1462,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     pending.acquisition is not None
                     and not pending.acquisition.fully_published
                 ):
-                    self._submit_host_acquisition(pending)
+                    self._host_acquisition.submit(pending)
                 prefetch_fully_published = len(pending.prefetched_layers) == (
                     self._model_layer_count
                 )
@@ -1771,7 +1475,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     and selected.selection_reason != "calibration_probe"
                 )
                 if ready_stock_fastpath or not selected.uses_dependency_protocol:
-                    self._host_transport.prepare_missing(pending)
+                    self._host_acquisition.publish_missing(pending)
                     self._stock_forward = True
                     self._activate_stock_prefetch(bindings, pending, count_batch=False)
                     self._stats["host_direct_batches"] = (
@@ -1918,7 +1622,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         bindings: tuple[RequestBinding, ...] | None = None,
         count_batch: bool = True,
     ) -> HostExecutionPlan | None:
-        self._account_tier_selection(pending)
+        self._host_acquisition.account_selection(pending)
         if self._opportunity_trace is not None and count_batch:
             self._active_opportunity_batch = self._opportunity_batch
             self._opportunity_batch += 1
@@ -1945,90 +1649,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._active_batch = planned.batch
         return planned.host_execution
 
-    def _host_mover_lease_plan(
-        self,
-        pending: PendingHostLoad,
-        row_bytes_by_layer: tuple[tuple[int, int], ...],
-        transfer_count: int,
-        *,
-        layer_service_key: tuple[str, int, int] | None = None,
-        layer_curve: AcquisitionServiceCurve | None = None,
-    ) -> HostMoverLeasePlan:
-        return self._host_movers.plan(
-            pending,
-            row_bytes_by_layer,
-            transfer_count,
-            layer_service_key=layer_service_key,
-            layer_curve=layer_curve,
-            collect_layer_profiles=self._layer_calibration.collect,
-        )
-
-    def _host_transfer_lease_plan(
-        self,
-        pending: PendingHostLoad,
-        *,
-        layer_service_key: tuple[str, int, int] | None = None,
-        layer_curve: AcquisitionServiceCurve | None = None,
-    ) -> HostTransferLeasePlan:
-        """Build immutable K/V descriptors once, before any frontier slicing."""
-
-        cached = pending.transfer_plan
-        layer_count = int(pending.controller.layer_num)
-        transfer_count = int(pending.device_indices.numel())
-        if cached is not None:
-            if (
-                cached.mover.row_count != transfer_count
-                or len(cached.layers) != layer_count
-            ):
-                raise RuntimeError("HiCache transfer geometry changed during a lease")
-            self._stats["host_transfer_plan_reuses"] = (
-                self._stats.get("host_transfer_plan_reuses", 0) + 1
-            )
-            return cached
-        if transfer_count <= 0 or transfer_count != int(pending.host_indices.numel()):
-            raise RuntimeError("HiCache host pipeline has no promoted pages")
-        if not pending.row_bytes_by_layer:
-            self._account_tier_selection(pending)
-        if len(pending.row_bytes_by_layer) != layer_count:
-            raise RuntimeError("HiCache acquisition has incomplete row geometry")
-        mover = self._host_mover_lease_plan(
-            pending,
-            pending.row_bytes_by_layer,
-            transfer_count,
-            layer_service_key=layer_service_key,
-            layer_curve=layer_curve,
-        )
-        if pending.lease_id <= 0 or pending.lease_id > 0xFFFFFFFF:
-            raise RuntimeError("HiCache lease version exceeds the runtime ABI")
-        result = build_host_transfer_lease_plan(
-            pending.controller,
-            mover,
-            pending.row_bytes_by_layer,
-            object_id_bases=tuple(
-                _pipeline_object_id(
-                    pending.consumer_index,
-                    layer_count,
-                    local_layer,
-                    self._sm_acquisition_waves,
-                )
-                for local_layer in range(layer_count)
-            ),
-            object_version=pending.lease_id,
-            sm_acquisition_waves=self._sm_acquisition_waves,
-        )
-        layer_bytes = tuple(
-            key_bytes + value_bytes for key_bytes, value_bytes in result.layer_geometry
-        )
-        if pending.layer_bytes != layer_bytes:
-            raise RuntimeError(
-                "HiCache transfer plan changed its captured byte geometry"
-            )
-        pending.transfer_plan = result
-        self._stats["host_transfer_plan_builds"] = (
-            self._stats.get("host_transfer_plan_builds", 0) + 1
-        )
-        return result
-
     def _advance_deadline_frontier(
         self,
         pending: PendingHostLoad,
@@ -2051,14 +1671,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("deadline frontier lost its active HiCache lease")
         acquisition = getattr(pending, "acquisition", None)
         if acquisition is not None:
-            self._retire_host_acquisition_layer(pending, completed_local_layer)
+            self._host_acquisition.retire_layer(pending, completed_local_layer)
             # The current Host backend publishes its complete finite queue at
             # lease capture.  Do not rescan the queue and call the transport
             # submitter after every transformer layer merely to rediscover that
             # no work remains.  A future bounded-inflight backend retains the
             # refill path through the same lifecycle predicate.
             if not acquisition.fully_published:
-                submitted = self._submit_host_acquisition(pending)
+                submitted = self._host_acquisition.submit(pending)
                 self._stats["host_acquisition_refill_jobs"] = (
                     self._stats.get("host_acquisition_refill_jobs", 0) + submitted
                 )
@@ -2082,7 +1702,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 # is queued, so it is outside the next layer's first-dispatch
                 # dependency. Auto may choose one bounded calibration probe
                 # here; admission itself never runs a probe.
-                self._host_transfer_lease_plan(pending)
+                self._host_acquisition.transfer_plan(pending)
             curve = (
                 None
                 if batch.layer_service_key is None
@@ -2091,7 +1711,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             model = (
                 None
                 if curve is None
-                else self._deadline_model_for_curve(pending, curve)
+                else self._host_acquisition.deadline_model_for_curve(pending, curve)
             )
             if model is not None:
                 batch.deadline_model = model
@@ -2112,10 +1732,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 probe_end = _calibration_probe_end(
                     ready_prefix, layer_count, self._frontier_layers_per_wave
                 )
-                self._host_transport.prepare(
-                    pending,
-                    first_local_layer=ready_prefix,
-                    last_local_layer=probe_end,
+                self._host_acquisition.publish_range(
+                    pending, ready_prefix, probe_end
                 )
                 self._stats["deadline_frontier_calibration_layers"] = (
                     self._stats.get("deadline_frontier_calibration_layers", 0)
@@ -2161,10 +1779,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         ):
             publish_begin += 1
         if publish_begin < feasible_end:
-            self._host_transport.prepare(
-                pending,
-                first_local_layer=publish_begin,
-                last_local_layer=feasible_end,
+            self._host_acquisition.publish_range(
+                pending, publish_begin, feasible_end
             )
             self._stats["deadline_frontier_published_layers"] = (
                 self._stats.get("deadline_frontier_published_layers", 0)
@@ -2192,21 +1808,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._stats["deadline_frontier_noop_calls"] = (
                 self._stats.get("deadline_frontier_noop_calls", 0) + 1
             )
-
-    def _retire_host_acquisition_layer(
-        self,
-        pending: PendingHostLoad,
-        local_layer: int,
-    ) -> None:
-        """Retire transport ownership after any numerical consumer is ordered."""
-
-        acquisition = getattr(pending, "acquisition", None)
-        if acquisition is None:
-            return
-        acquisition.retire(local_layer)
-        self._stats["host_acquisition_layers_consumed"] = (
-            self._stats.get("host_acquisition_layers_consumed", 0) + 1
-        )
 
     def _require_host_execution_plan(self) -> HostExecutionPlan:
         batch = self._active_batch
@@ -2816,7 +2417,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._require_materializer().record_host_consumer(
                 torch.cuda.current_stream(), final_layer=final_layer
             )
-            self._retire_host_acquisition_layer(pending, local_layer)
+            self._host_acquisition.retire_layer(pending, local_layer)
             self._hicache.complete_layer(pending, local_layer)
             if final_layer:
                 self._finish_forward(batch)
@@ -2918,7 +2519,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._require_materializer().record_host_consumer(
                 torch.cuda.current_stream(), final_layer=final_layer
             )
-            self._retire_host_acquisition_layer(pending, local_layer)
+            self._host_acquisition.retire_layer(pending, local_layer)
             self._hicache.complete_layer(pending, local_layer)
             if final_layer:
                 self._finish_forward(batch)

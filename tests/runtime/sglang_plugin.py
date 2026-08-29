@@ -527,7 +527,6 @@ def main() -> None:
         AcquisitionServiceCurve,
         LayerAcquisitionModel,
     )
-    from nta_runtime.acquisition_scheduler import LayerAcquisition
     from nta_runtime.fixed_range_pool import FixedRangePool
 
     with patch.dict(
@@ -1080,72 +1079,6 @@ def main() -> None:
         is None
     )
 
-    # A dense exact lease starts transport when physical ownership is captured,
-    # before ForwardBatch metadata or a calibrated EDF proof exists. Tenant
-    # isolation remains deferred because request accounting is not yet bound.
-    lease_pool = object()
-    lease_pending = types.SimpleNamespace(
-        controller=types.SimpleNamespace(mem_pool_device=lease_pool, layer_num=4),
-        layer_bytes=(),
-        prefetched_layers={},
-        transfer_plan=None,
-        acquisition=None,
-    )
-    lease_ranges: list[tuple[int, int]] = []
-    lease_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
-    lease_backend.token_to_kv_pool = lease_pool
-    lease_backend._model_layer_count = 4
-    lease_backend._tenant_isolation_enabled = False
-    lease_backend._execution_config = types.SimpleNamespace(
-        protocol=types.SimpleNamespace(kind=ProtocolKind.LATE_BOUND),
-        host_execution_mode=HostExecutionMode.AUTO,
-    )
-    lease_backend._stats = {}
-
-    def account_lease(pending) -> None:
-        pending.layer_bytes = (1024,) * 4
-
-    def plan_lease(pending, **_kwargs):
-        pending.transfer_plan = object()
-        return pending.transfer_plan
-
-    def publish_lease(
-        pending,
-        *,
-        first_local_layer: int,
-        last_local_layer: int,
-    ) -> None:
-        lease_ranges.append((first_local_layer, last_local_layer))
-        for local_layer in range(first_local_layer, last_local_layer):
-            pending.prefetched_layers[local_layer] = object()
-
-    lease_backend._account_tier_selection = account_lease
-    lease_backend._host_transfer_lease_plan = plan_lease
-    lease_backend._host_transport = types.SimpleNamespace(prepare=publish_lease)
-    lease_backend._hold_host_load(lease_pending)
-    assert lease_ranges == [(0, 4)]
-    assert lease_pending.acquisition.started
-    assert lease_pending.acquisition.model is None
-    assert lease_pending.acquisition.fully_published
-    assert lease_backend._stats["initial_acquisition_layers"] == 4
-    assert lease_backend._stats["initial_typed_gap_layers"] == 0
-    assert lease_backend._stats["lease_acquisition_groups_started"] == 1
-
-    isolated_pending = types.SimpleNamespace(
-        controller=types.SimpleNamespace(mem_pool_device=lease_pool, layer_num=4),
-        layer_bytes=(),
-        prefetched_layers={},
-        transfer_plan=None,
-        acquisition=None,
-    )
-    lease_backend._tenant_isolation_enabled = True
-    lease_backend._stats = {}
-    lease_backend._hold_host_load(isolated_pending)
-    assert isolated_pending.acquisition is None
-    assert not isolated_pending.prefetched_layers
-    assert lease_backend._stats["initial_acquisition_layers"] == 0
-    assert lease_backend._stats["schedule_bound_acquisition_batches"] == 1
-
     assert "_create_decode_wrappers" not in NtaFlashInferAttnBackend.__dict__
     assert "_create_prefill_wrappers" not in NtaFlashInferAttnBackend.__dict__
     assert "_phase_program" not in NtaFlashInferAttnBackend.__dict__
@@ -1528,46 +1461,6 @@ def main() -> None:
         policy="sm", frontier_enabled=True, calibrated=True
     ).lease_calibrated(pending_calibration)
 
-    # Admission starts one finite, coalesced EDF queue. Layer zero is merely
-    # the earliest deadline; it is not the only transport job submitted.
-    admission_model = LayerAcquisitionModel(
-        layer_bytes=(1,) * 4,
-        transfer_service_ns=(50,) * 4,
-        initial_compute_ns=0,
-        inter_layer_compute_ns=100,
-    )
-    admission_pending = types.SimpleNamespace(
-        controller=types.SimpleNamespace(layer_num=4),
-        transfer_plan=object(),
-        prefetched_layers={},
-        acquisition=LayerAcquisition(admission_model.layer_bytes),
-    )
-    admission_pending.acquisition.bind_model(admission_model)
-    admission_ranges: list[tuple[int, int]] = []
-
-    def publish_admission_range(
-        _pending,
-        *,
-        first_local_layer: int,
-        last_local_layer: int,
-    ) -> None:
-        admission_ranges.append((first_local_layer, last_local_layer))
-        for local_layer in range(first_local_layer, last_local_layer):
-            _pending.prefetched_layers[local_layer] = object()
-
-    admission_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
-    admission_backend._stats = {}
-    admission_backend._host_transport = types.SimpleNamespace(
-        prepare=publish_admission_range
-    )
-    admission_backend._admission_deadline_model = (
-        lambda pending, _batch: pending.acquisition.model
-    )
-    admission_backend._start_admission_acquisition(admission_pending, object())
-    assert admission_ranges == [(0, 4)]
-    assert admission_pending.acquisition.fully_published
-    assert admission_backend._stats["host_acquisition_jobs_submitted"] == 4
-
     # Frontier publication is a behavior contract, not a counter convention.
     # Before mover calibration, completing layer zero may enqueue only one
     # bounded probe wave.  Once the frozen EDF model proves the remaining
@@ -1615,9 +1508,8 @@ def main() -> None:
         )
         calls: list[tuple[int, int]] = []
 
-        def prepare(
+        def publish_range(
             _pending,
-            *,
             first_local_layer: int,
             last_local_layer: int,
         ) -> None:
@@ -1626,7 +1518,9 @@ def main() -> None:
                 _pending.prefetched_layers[layer] = object()
             _pending.prefetch_tensors += (object(),)
 
-        backend._host_transport = types.SimpleNamespace(prepare=prepare)
+        backend._host_acquisition = types.SimpleNamespace(
+            publish_range=publish_range
+        )
         backend._advance_deadline_frontier(pending, 0)
         return calls, backend._stats
 

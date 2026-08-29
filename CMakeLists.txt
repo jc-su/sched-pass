@@ -867,6 +867,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_calibration.py
     )
     add_test(
+      NAME nta-sglang-acquisition
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_acquisition.py
+    )
+    add_test(
       NAME nta-sglang-storage-connector
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_storage_connector.py
