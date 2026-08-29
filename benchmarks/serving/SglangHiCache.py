@@ -11,11 +11,17 @@ import os
 import pathlib
 import statistics
 import subprocess
+import sys
 import time
 from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from experiments.atomic_io import atomic_write_text  # noqa: E402
+
 MIN_HICACHE_PREFIX_TOKENS = 64
 
 
@@ -405,10 +411,7 @@ def main() -> int:
         report["median_peer_delay_seconds"] = statistics.median(peer_delay_seconds)
     serialized = json.dumps(report, sort_keys=True)
     if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        temporary = args.output.with_suffix(args.output.suffix + ".tmp")
-        temporary.write_text(serialized + "\n", encoding="utf-8")
-        temporary.replace(args.output)
+        atomic_write_text(args.output, serialized + "\n")
     print(serialized)
     return 0
 

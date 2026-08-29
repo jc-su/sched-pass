@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import importlib.util
 import os
@@ -39,6 +40,13 @@ def check_module(
         )
     module_path = matches[0].resolve()
     library = ctypes.CDLL(str(module_path))
+    typed = "_baseline" not in name
+    if not typed:
+        try:
+            library.nta_jit_operator_contract
+        except AttributeError:
+            return module_path
+        raise RuntimeError("baseline numerical module unexpectedly exports NTA metadata")
     library.nta_jit_abi_version.restype = ctypes.c_uint32
     version = library.nta_jit_abi_version()
     if version != ABI_VERSION:
@@ -56,7 +64,10 @@ def check_module(
         if value
     )
     subprocess.run(
-        [os.path.join(os.environ["NTA_BUILD_DIR"], "nta-jit-phase-load"), module_path],
+        [
+            os.path.join(os.environ["NTA_BUILD_DIR"], "nta-jit-operator-load"),
+            module_path,
+        ],
         check=True,
         stdout=subprocess.DEVNULL,
         env=environment,
@@ -65,6 +76,14 @@ def check_module(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--only",
+        choices=("all", "prefill-baseline", "stream-typed"),
+        default="all",
+        help="materialize only the requested differential artifact",
+    )
+    options = parser.parse_args()
     baseline_name = "nta_batch_decode_default_v2_baseline"
     baseline = gen_customize_batch_decode_module(
         baseline_name,
@@ -114,7 +133,9 @@ def main() -> None:
         VARIANT_DECL,
     )
 
-    def prefill_specification(name: str, dtype: torch.dtype) -> object:
+    def prefill_specification(
+        name: str, dtype: torch.dtype, *, typed: bool = True
+    ) -> object:
         return gen_customize_batch_prefill_module(
             "fa2",
             name,
@@ -124,18 +145,38 @@ def main() -> None:
             torch.int32,
             128,
             128,
-            TENSOR_NAMES,
-            TENSOR_DTYPES,
-            SCALAR_NAMES,
-            SCALAR_DTYPES,
+            TENSOR_NAMES if typed else [],
+            TENSOR_DTYPES if typed else [],
+            SCALAR_NAMES if typed else ["sm_scale"],
+            SCALAR_DTYPES if typed else ["double"],
             VARIANT_NAME,
             VARIANT_DECL,
         )
 
     prefill_name = "nta_batch_prefill_default_v2_hooked"
     prefill = prefill_specification(prefill_name, torch.float16)
+    prefill_baseline_name = "nta_batch_prefill_default_v2_baseline"
+    prefill_baseline = prefill_specification(
+        prefill_baseline_name, torch.float16, typed=False
+    )
     prefill_bf16_name = "nta_batch_prefill_default_v2_hooked_bf16"
     prefill_bf16 = prefill_specification(prefill_bf16_name, torch.bfloat16)
+    if options.only == "prefill-baseline":
+        print(
+            "flashinfer_prefill_baseline_module="
+            f"{check_module(prefill_baseline_name, prefill_baseline, ('ragged_run', 'paged_run'))}"
+        )
+        return
+    if options.only == "stream-typed":
+        stream_typed_name = (
+            "nta_sglang_decode_stream_ordered_v1_demand_acquire_tc_h128_float16_float16"
+        )
+        stream_typed = prefill_specification(stream_typed_name, torch.float16)
+        print(
+            "flashinfer_stream_typed_module="
+            f"{check_module(stream_typed_name, stream_typed, ('ragged_run', 'paged_run'))}"
+        )
+        return
     print(
         f"flashinfer_baseline_module={check_module(baseline_name, baseline, ('run',))}"
     )
@@ -147,6 +188,10 @@ def main() -> None:
     print(
         "flashinfer_prefill_module="
         f"{check_module(prefill_name, prefill, ('ragged_run', 'paged_run'))}"
+    )
+    print(
+        "flashinfer_prefill_baseline_module="
+        f"{check_module(prefill_baseline_name, prefill_baseline, ('ragged_run', 'paged_run'))}"
     )
     print(
         "flashinfer_prefill_bf16_module="

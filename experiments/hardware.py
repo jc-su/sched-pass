@@ -46,6 +46,29 @@ def _command(argv: list[str]) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def platform_identity() -> dict[str, Any]:
+    """Return the boot-qualified identity required by physical-tier results."""
+
+    boot_id = _text(Path("/proc/sys/kernel/random/boot_id"))
+    drivers = _command(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    driver_versions = (
+        sorted({line.strip() for line in drivers.splitlines() if line.strip()})
+        if drivers
+        else []
+    )
+    return {
+        "boot_id": boot_id,
+        "kernel": platform.release(),
+        "nvidia_driver_versions": driver_versions,
+    }
+
+
 def _driver(device: Path) -> str | None:
     try:
         return device.joinpath("driver").resolve().name
@@ -90,6 +113,22 @@ def _nvme_controllers(sysfs_root: Path, dev_root: Path) -> list[dict[str, Any]]:
             }
         )
     return controllers
+
+
+def nvme_controllers(
+    *,
+    sysfs_root: Path = Path("/sys/bus/pci/devices"),
+    dev_root: Path = Path("/dev"),
+) -> list[dict[str, Any]]:
+    """Return NVMe ownership from sysfs without opening any controller.
+
+    Controller CLI discovery can block in uninterruptible kernel I/O while an
+    evaluation device is owned by VFIO or the NTA peer driver.  Hardware
+    provenance only needs the PCI driver, IOMMU group, and visible namespace
+    names, all of which are available read-only in sysfs.
+    """
+
+    return _nvme_controllers(sysfs_root, dev_root)
 
 
 def _dax_devices(dev_root: Path) -> list[dict[str, Any]]:
@@ -198,7 +237,7 @@ def collect(
     dev_root: Path = Path("/dev"),
     cxl_sysfs_root: Path = DEFAULT_CXL_SYSFS_ROOT,
 ) -> dict[str, Any]:
-    nvme = _nvme_controllers(sysfs_root, dev_root)
+    nvme = nvme_controllers(sysfs_root=sysfs_root, dev_root=dev_root)
     dax = _dax_devices(dev_root)
     cxl = _cxl_inventory(dev_root, cxl_sysfs_root)
     vfio_nvme = [entry for entry in nvme if entry["vfio_owned"]]
@@ -209,6 +248,7 @@ def collect(
             "hostname": platform.node(),
             "platform": platform.platform(),
             "kernel": platform.release(),
+            "physical_identity": platform_identity(),
         },
         "gpu": {
             "nvidia_smi": _command(

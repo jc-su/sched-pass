@@ -163,7 +163,8 @@ public:
         backends(nta::abi::BackendCount), intents(Capacity),
         workTickets(Capacity), dependencies(Capacity), intentPool(1),
         intentQueueEntries(Capacity),
-        intentQueueHeads(nta::abi::BackendCount * nta::abi::UrgencyBucketCount),
+        intentQueueControls(nta::abi::BackendCount),
+        intentQueueHeap(nta::abi::BackendCount * Capacity),
         readyWorkTickets(Capacity), readyCount(1), readyHead(1),
         pendingWorkTickets(Capacity), pendingCount(1), ctaCompletions(Capacity),
         objectDependentHeads(Capacity), dependencyNext(Capacity),
@@ -261,10 +262,15 @@ public:
     intent.sequence = 0;
     intents.upload(intent);
     intentPool.upload({0, 0, Capacity, 0, 0, 0, {0, 0, 0, 0}});
+    for (std::uint32_t index = 0; index < Capacity; ++index) {
+      intentQueueEntries.upload({}, index);
+    }
+    for (std::uint32_t index = 0; index < nta::abi::BackendCount; ++index) {
+      intentQueueControls.upload({}, index);
+    }
     for (std::uint32_t index = 0;
-         index < nta::abi::BackendCount * nta::abi::UrgencyBucketCount;
-         ++index) {
-      intentQueueHeads.upload(UINT64_MAX, index);
+         index < nta::abi::BackendCount * Capacity; ++index) {
+      intentQueueHeap.upload({0, nta::abi::InvalidIndex, 0}, index);
     }
     workTickets.upload(
         {0, 0, 0, static_cast<std::uint32_t>(nta::abi::WorkTicketState::New), 0,
@@ -284,7 +290,8 @@ public:
     runtimeValue.dependencies = dependencies.get();
     runtimeValue.intentPool = intentPool.get();
     runtimeValue.intentQueueEntries = intentQueueEntries.get();
-    runtimeValue.intentQueueHeads = intentQueueHeads.get();
+    runtimeValue.intentQueueControls = intentQueueControls.get();
+    runtimeValue.intentQueueHeap = intentQueueHeap.get();
     runtimeValue.readyWorkTickets = readyWorkTickets.get();
     runtimeValue.readyCount = readyCount.get();
     runtimeValue.readyHead = readyHead.get();
@@ -458,7 +465,8 @@ public:
   DeviceArray<nta::abi::WorkDependency> dependencies;
   DeviceArray<nta::abi::IntentPool> intentPool;
   DeviceArray<nta::abi::IntentQueueEntry> intentQueueEntries;
-  DeviceArray<std::uint64_t> intentQueueHeads;
+  DeviceArray<nta::abi::IntentQueueControl> intentQueueControls;
+  DeviceArray<nta::abi::IntentQueueNode> intentQueueHeap;
   DeviceArray<std::uint32_t> readyWorkTickets;
   DeviceArray<std::uint32_t> readyCount;
   DeviceArray<std::uint32_t> readyHead;

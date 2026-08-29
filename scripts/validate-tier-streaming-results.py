@@ -32,7 +32,7 @@ def read_result(path: pathlib.Path) -> dict[str, Any]:
 
 def _canonical_and_exact(result: dict[str, Any]) -> bool:
     return (
-        result.get("schema") == 1
+        result.get("schema") == 2
         and result.get("classification") == "flashinfer-request-aware-tier-streaming"
         and result.get("real_flashinfer_attention") is True
         and result.get("real_flashinfer_online_softmax_merge") is True
@@ -41,6 +41,50 @@ def _canonical_and_exact(result: dict[str, Any]) -> bool:
         and result.get("output_parity") is True
         and result.get("request_semantics_retained") is True
     )
+
+
+def _completion_samples_are_sound(result: dict[str, Any]) -> bool:
+    requests = result.get("requests")
+    medians = result.get("request_completion_us")
+    per_request = result.get("request_completion_samples_us")
+    observed = result.get("completion_observed_streaming_us")
+    batch_samples = observed.get("samples") if isinstance(observed, dict) else None
+    if (
+        not isinstance(requests, list)
+        or not isinstance(medians, dict)
+        or not isinstance(per_request, dict)
+        or not isinstance(batch_samples, list)
+        or not batch_samples
+        or not all(isinstance(value, (int, float)) and value > 0 for value in batch_samples)
+    ):
+        return False
+    request_keys = {
+        str(request.get("request_id"))
+        for request in requests
+        if isinstance(request, dict) and isinstance(request.get("request_id"), int)
+    }
+    if (
+        len(request_keys) != len(requests)
+        or set(medians) != request_keys
+        or set(per_request) != request_keys
+    ):
+        return False
+    for request_key in request_keys:
+        samples = per_request[request_key]
+        if (
+            not isinstance(medians[request_key], (int, float))
+            or not isinstance(samples, list)
+            or len(samples) != len(batch_samples)
+        ):
+            return False
+        if any(
+            not isinstance(completion, (int, float))
+            or completion <= 0
+            or completion > batch
+            for completion, batch in zip(samples, batch_samples, strict=True)
+        ):
+            return False
+    return True
 
 
 def _request_field_count(result: dict[str, Any], field: str) -> int:
@@ -154,9 +198,7 @@ def validate_results(
         {
             "name": "per-request placement and completion",
             "passed": _request_field_count(headline, "resident_tokens") >= 3
-            and isinstance(headline.get("request_completion_us"), dict)
-            and len(set(headline["request_completion_us"].values()))
-            == len(headline.get("requests", [])),
+            and _completion_samples_are_sound(headline),
         },
         {
             "name": "heterogeneous request shapes",

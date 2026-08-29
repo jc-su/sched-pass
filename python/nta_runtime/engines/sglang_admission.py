@@ -22,30 +22,17 @@ def _nonnegative_environment(name: str, default: int) -> int:
     return value
 
 
-def _positive_environment(name: str, default: int) -> int:
-    value = int(os.environ.get(name, default))
-    if value <= 0:
-        raise RuntimeError(f"{name} must be positive")
-    return value
-
-
 @dataclass(frozen=True)
 class AdmissionConfig:
     enabled: bool
-    lead_layers: int
     max_delay_ns: int
-    minimum_bytes: int
 
     @classmethod
     def from_environment(cls) -> "AdmissionConfig":
         return cls(
             enabled=os.environ.get("NTA_EXECUTION_ADMISSION", "1") != "0",
-            lead_layers=_positive_environment("NTA_EXECUTION_ADMISSION_LEAD_LAYERS", 4),
             max_delay_ns=1_000
             * _nonnegative_environment("NTA_EXECUTION_ADMISSION_MAX_DELAY_US", 10_000),
-            minimum_bytes=_nonnegative_environment(
-                "NTA_EXECUTION_ADMISSION_MIN_BYTES", 1 << 20
-            ),
         )
 
 
@@ -154,16 +141,8 @@ class AcquisitionAdmission:
             admission_considered_requests=len(requests),
             admission_external_bytes=external_bytes or progress.total_bytes,
         )
-        if progress.published_layers == 0:
-            # Late-bound ownership deliberately defers transport until exact
-            # FlashInfer work geometry exists.  Holding the batch here would
-            # create a causal cycle: metadata cannot be built before admission,
-            # while no producer can be selected before metadata.  Release the
-            # batch to bind work; this is not a readiness claim.
-            bridge.record_admission(admission_released_for_binding=1)
-            return batch
-        if progress.total_bytes < self._config.minimum_bytes:
-            bridge.record_admission(admission_released_small_batches=1)
+        if progress.complete:
+            bridge.record_admission(admission_released_complete=1)
             return batch
         if not _has_runnable_decode(running):
             bridge.record_admission(admission_released_without_decode=1)
@@ -174,8 +153,40 @@ class AcquisitionAdmission:
                 **{f"admission_released_feedback_{feedback_reason}": 1}
             )
             return batch
-        if self._has_lead(progress.leading_layers, progress.total_layers):
-            bridge.record_admission(admission_released_with_initial_lead=1)
+        unpublished = progress.published_layers == 0
+        if unpublished and not bridge.prepare_admission_acquisition(
+            consumer_index, batch
+        ):
+            # Exact semantic WorkItems are not available until forward metadata.
+            # An uncalibrated physical group therefore stays descriptor-free and
+            # reaches the typed partial path instead of being held speculatively.
+            bridge.record_admission(admission_released_for_binding=1)
+            return batch
+        feasibility = self._feasibility(bridge, batch, progress)
+        if feasibility is None:
+            bridge.record_admission(admission_released_uncalibrated=1)
+            return batch
+        self._record_feasibility(bridge, feasibility)
+        if unpublished and (
+            feasibility.required_initial_slack_ns > self._config.max_delay_ns
+        ):
+            # Starting a finite queue that cannot recover inside the policy's
+            # SLO cap would turn exact metadata binding into avoidable delay.
+            # Leave the link untouched and bind exact work immediately.
+            bridge.record_admission(admission_released_partial_slo=1)
+            return batch
+        if unpublished:
+            bridge.start_admission_acquisition(consumer_index, batch)
+            progress = bridge.progress(consumer_index)
+            if progress is None or progress.published_layers == 0:
+                raise RuntimeError(
+                    "HiCache admission frontier did not publish transfer progress"
+                )
+        if feasibility.feasible:
+            bridge.record_admission(admission_released_feasible=1)
+            return batch
+        if self._config.max_delay_ns == 0:
+            bridge.record_admission(admission_released_slo_cap=1)
             return batch
 
         now = self._clock()
@@ -211,16 +222,26 @@ class AcquisitionAdmission:
             reason = "cancelled"
         elif progress is None:
             reason = "lost"
-        elif self._has_lead(progress.leading_layers, progress.total_layers):
-            reason = "lead"
+        elif progress.complete:
+            reason = "complete"
         elif elapsed >= self._config.max_delay_ns:
-            reason = "deadline"
+            reason = "slo_cap"
         elif not _has_runnable_decode(running):
             reason = "no_decode"
         else:
             feedback_reason = _compiler_feedback_reason(running, staged.bridge)
             if feedback_reason is not None:
                 reason = f"feedback_{feedback_reason}"
+            else:
+                feasibility = self._feasibility(
+                    staged.bridge, staged.batch, progress
+                )
+                if feasibility is None:
+                    reason = "uncalibrated"
+                else:
+                    self._record_feasibility(staged.bridge, feasibility)
+                    if feasibility.feasible:
+                        reason = "feasible"
         if not reason:
             staged.bridge.record_admission(admission_hidden_decode_steps=1)
             return None
@@ -251,10 +272,32 @@ class AcquisitionAdmission:
         staged.force_release = True
         staged.bridge.record_admission(admission_cancelled_requests=len(matches))
 
-    def _has_lead(self, leading_layers: int, total_layers: int) -> bool:
-        return total_layers > 0 and leading_layers >= min(
-            self._config.lead_layers, total_layers
-        )
+    @staticmethod
+    def _feasibility(bridge: Any, batch: Any, progress: Any) -> Any | None:
+        model = bridge.deadline_model(progress.consumer_index, batch)
+        if model is None:
+            return None
+        return model.analyze_admission(ready_prefix_layers=progress.leading_layers)
+
+    @staticmethod
+    def _record_feasibility(bridge: Any, feasibility: Any) -> None:
+        increments = {
+            "admission_feasibility_tests": 1,
+            "admission_feasibility_ready_prefix_layers": (
+                feasibility.ready_prefix_layers
+            ),
+            "admission_feasibility_required_slack_ns": (
+                feasibility.required_initial_slack_ns
+            ),
+        }
+        if feasibility.feasible:
+            increments["admission_feasibility_feasible"] = 1
+        else:
+            increments["admission_feasibility_infeasible"] = 1
+            increments["admission_feasibility_first_missed_layer"] = int(
+                feasibility.first_missed_layer
+            )
+        bridge.record_admission(**increments)
 
 
 def _state(scheduler: Any) -> AcquisitionAdmission:

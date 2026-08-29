@@ -18,6 +18,7 @@ from nta_runtime.adapters.vllm_v1 import (
     validate_vllm_attention_tier,
 )
 from nta_runtime.execution_protocol import ProtocolKind
+from nta_runtime.execution_planner import HostExecutionMode
 from nta_runtime.work_unit import Granularity
 
 
@@ -203,6 +204,32 @@ def main() -> None:
     )
     assert config.protocol.kind is ProtocolKind.PARTIAL
     assert config.protocol.max_inflight_units == 32
+    assert config.host_execution_mode is HostExecutionMode.AUTO
+    forced_config = SglangExecutionConfig.from_environment(
+        {
+            "NTA_EXECUTION_PROTOCOL": "late_bound",
+            "NTA_EXECUTION_HOST_FORM": "dependency_aware",
+        }
+    )
+    assert forced_config.host_execution_mode is HostExecutionMode.DEPENDENCY_AWARE
+    device_bulk_config = SglangExecutionConfig.from_environment(
+        {
+            "NTA_EXECUTION_PROTOCOL": "late_bound",
+            "NTA_EXECUTION_HOST_FORM": "device_bulk",
+        }
+    )
+    assert device_bulk_config.host_execution_mode is HostExecutionMode.DEVICE_BULK
+    try:
+        SglangExecutionConfig.from_environment(
+            {
+                "NTA_EXECUTION_PROTOCOL": "conventional",
+                "NTA_EXECUTION_HOST_FORM": "device_bulk",
+            }
+        )
+    except ValueError as error:
+        assert "typed host execution" in str(error)
+    else:
+        raise AssertionError("conventional execution accepted device-bulk semantics")
 
     runtime = FakeRuntime()
     adapter = VllmAdapter(runtime, 8)

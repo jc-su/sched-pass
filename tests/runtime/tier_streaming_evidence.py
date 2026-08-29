@@ -33,7 +33,7 @@ def fixture(*, heterogeneous: bool) -> dict:
         for index in range(4)
     ]
     return {
-        "schema": 1,
+        "schema": 2,
         "classification": "flashinfer-request-aware-tier-streaming",
         "revision": "revision",
         "dirty": False,
@@ -54,6 +54,10 @@ def fixture(*, heterogeneous: bool) -> dict:
         "request_semantics_retained": True,
         "requests": requests,
         "request_completion_us": {str(index): index + 1 for index in range(4)},
+        "request_completion_samples_us": {
+            str(index): [index + 1] * 10 for index in range(4)
+        },
+        "completion_observed_streaming_us": {"samples": [10] * 10},
         "streaming_speedup_over_atomic": 1.18 if not heterogeneous else 1.12,
         "streaming_speedup_95ci": {
             "confidence": 0.95,

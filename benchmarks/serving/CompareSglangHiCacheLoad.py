@@ -11,16 +11,30 @@ import pathlib
 import random
 import subprocess
 import sys
-import threading
 import time
 from typing import Any
 
-from CompareSglangHiCache import require_clean_mechanism
-
-
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from CompareSglangHiCache import require_clean_mechanism  # noqa: E402
+from experiments.atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
+from experiments.serving_metrics import (  # noqa: E402
+    preregistered_goodput,
+    relative_goodput,
+    relative_thresholds,
+    safe_ratio,
+)
+from experiments.serving_path_evidence import (  # noqa: E402
+    EXERCISED_PATHS,
+    require_exercised_paths,
+    require_frontier_shape,
+)
+from gpu_trial import CotenantSampler, TRIAL_OWNER_ENV, wait_for_free_gpu  # noqa: E402
+
+
 RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
-_TRIAL_OWNER_ENV = "NTA_BENCHMARK_TRIAL_OWNER"
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resident-requests", type=int, default=1)
     parser.add_argument("--resident-tokens", type=int, default=8192)
     parser.add_argument("--resident-output-tokens", type=int, default=128)
-    parser.add_argument("--external-output-tokens", type=int, default=1)
+    parser.add_argument("--external-output-tokens", type=int, default=32)
     parser.add_argument("--request-rate", type=float, default=12.0)
     parser.add_argument("--churn-tokens", type=int, default=12000)
     parser.add_argument("--max-total-tokens", type=int, default=18000)
@@ -68,7 +82,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slo-scale", type=float, default=1.5)
     parser.add_argument("--slo-ttft-seconds", type=float, default=8.0)
     parser.add_argument("--slo-p99-itl-seconds", type=float, default=0.100)
-    parser.add_argument("--admission-lead-layers", type=int, default=36)
     parser.add_argument("--admission-max-delay-us", type=int, default=10000)
     parser.add_argument(
         "--incremental-setup-ns",
@@ -127,6 +140,20 @@ def parse_args() -> argparse.Namespace:
         help="require finite NTA demand-operator graph capture and replay",
     )
     parser.add_argument(
+        "--require-exercised-path",
+        action="append",
+        choices=EXERCISED_PATHS,
+        default=[],
+        help=(
+            "fail unless timed counters prove the requested physical path; "
+            "repeat for compound arms (for example native_demand_sm plus "
+            "prefetch_copy_engine plus partial_consumer)"
+        ),
+    )
+    parser.add_argument("--require-native-frontier-layers", type=int)
+    parser.add_argument("--require-ready-stock-layers", type=int)
+    parser.add_argument("--require-progressive-layers", type=int)
+    parser.add_argument(
         "--output",
         type=pathlib.Path,
         default=RESULTS_ROOT / "serving" / "sglang-hicache-load.json",
@@ -138,7 +165,7 @@ def parse_args() -> argparse.Namespace:
         or args.slo_p99_itl_seconds <= 0
     ):
         parser.error("SLO scale and thresholds must be positive")
-    if args.admission_lead_layers <= 0 or args.admission_max_delay_us < 0:
+    if args.admission_max_delay_us < 0:
         parser.error("admission bounds are invalid")
     if args.eviction_rounds is not None and args.eviction_rounds < 0:
         parser.error("eviction rounds cannot be negative")
@@ -162,56 +189,16 @@ def parse_args() -> argparse.Namespace:
         )
     if args.resident_tokens > args.context_length:
         parser.error("--resident-tokens cannot exceed --context-length")
+    if any(
+        value is not None and value < 0
+        for value in (
+            args.require_native_frontier_layers,
+            args.require_ready_stock_layers,
+            args.require_progressive_layers,
+        )
+    ):
+        parser.error("required frontier layer counts cannot be negative")
     return args
-
-
-def _wait_for_free_gpu(limit_mib: int = 8000, timeout_s: float = 600.0) -> None:
-    """Block until GPU memory drops below limit_mib.
-
-    The previous arm's scheduler subprocesses release device memory a few
-    seconds after their parent exits, and co-tenant jobs on the shared box come
-    and go; launching a server into that window fails its memory profile with a
-    misleading mem-fraction error. Startup ordering only — no timed phase has
-    begun when this runs.
-    """
-    deadline = time.monotonic() + timeout_s
-    while True:
-        probe = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-            stdout=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        try:
-            used_mib = max(int(line) for line in probe.stdout.split() if line.strip())
-        except ValueError:
-            used_mib = None
-        apps = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=pid",
-                "--format=csv,noheader",
-            ],
-            stdout=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        compute_apps = [line for line in apps.stdout.split() if line.strip()]
-        if probe.returncode == 0 and used_mib is not None:
-            # Memory alone misses an idle-but-resident co-tenant process;
-            # a live compute app also disqualifies the device.
-            if used_mib < limit_mib and not compute_apps:
-                return
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"GPU memory still at {used_mib} MiB after {timeout_s:.0f}s; "
-                "refusing to launch a serving arm into an occupied device"
-            )
-        time.sleep(5.0)
 
 
 def _report(output: str) -> dict[str, Any]:
@@ -223,113 +210,6 @@ def _report(output: str) -> dict[str, Any]:
         if value.get("classification") == "sglang-hicache-load":
             return value
     raise RuntimeError("load trial emitted no JSON report")
-
-
-class _CotenantSampler:
-    """Sample foreign GPU compute apps during one arm's run.
-
-    The pre-run wait-gate only proves the GPU was free at launch; on this
-    shared box co-tenant jobs can land mid-trial and arbitrarily inflate
-    whichever arm they overlap. Every report therefore carries the number
-    of one-second samples that saw a compute app outside our process tree,
-    so contaminated trials are identifiable by an objective environmental
-    criterion instead of by their metric values.
-    """
-
-    def __init__(self, owner_token: str, interval_seconds: float = 1.0) -> None:
-        if not owner_token or "\0" in owner_token:
-            raise ValueError("co-tenant sampler owner token is invalid")
-        if interval_seconds <= 0:
-            raise ValueError("co-tenant sampling interval must be positive")
-        self.owner_token = owner_token
-        self.interval_seconds = interval_seconds
-        self.samples = 0
-        self.sampling_errors = 0
-        self.foreign_samples = 0
-        self.foreign_pids: set[int] = set()
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-
-    def _descendants(self) -> set[int]:
-        pids = {os.getpid()}
-        try:
-            children = pathlib.Path("/proc")
-            grew = True
-            while grew:
-                grew = False
-                for stat in children.glob("[0-9]*/stat"):
-                    try:
-                        parts = stat.read_text().rsplit(") ", 1)[1].split()
-                        pid = int(stat.parent.name)
-                        ppid = int(parts[1])
-                    except (OSError, IndexError, ValueError):
-                        continue
-                    if ppid in pids and pid not in pids:
-                        pids.add(pid)
-                        grew = True
-        except OSError:
-            pass
-        return pids
-
-    def _owned_by_trial(self, pid: int, descendants: set[int]) -> bool:
-        if pid in descendants:
-            return True
-        # SGLang workers may daemonize and be reparented after launch. Process
-        # ancestry then stops being an ownership proof even though the worker
-        # is ours. An exact inherited environment token survives reparenting;
-        # unreadable or exited processes remain foreign/fail-closed.
-        try:
-            environment = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(
-                b"\0"
-            )
-        except OSError:
-            return False
-        marker = f"{_TRIAL_OWNER_ENV}={self.owner_token}".encode()
-        return marker in environment
-
-    def _sample_once(self) -> None:
-        try:
-            out = subprocess.run(
-                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if out.returncode != 0:
-                self.sampling_errors += 1
-                return
-            apps = {int(line) for line in out.stdout.split() if line.strip().isdigit()}
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            self.sampling_errors += 1
-            return
-        self.samples += 1
-        descendants = self._descendants()
-        foreign = {
-            pid for pid in apps if not self._owned_by_trial(pid, descendants)
-        }
-        if foreign:
-            self.foreign_samples += 1
-            self.foreign_pids |= foreign
-
-    def _loop(self) -> None:
-        # Sample immediately so a co-tenant that arrived during the launch
-        # gate cannot hide inside the first sampling interval.
-        while not self._stop.is_set():
-            self._sample_once()
-            if self._stop.wait(self.interval_seconds):
-                return
-
-    def __enter__(self) -> "_CotenantSampler":
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self._stop.set()
-        self._thread.join(timeout=7)
-
-    @property
-    def complete(self) -> bool:
-        return not self._thread.is_alive()
 
 
 def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
@@ -406,12 +286,18 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         command.append("--allow-oversubscribed-pool")
     environment = os.environ.copy()
     environment["NTA_EXECUTION_ADMISSION"] = "1"
-    environment["NTA_EXECUTION_ADMISSION_LEAD_LAYERS"] = str(args.admission_lead_layers)
     environment["NTA_EXECUTION_ADMISSION_MAX_DELAY_US"] = str(
         args.admission_max_delay_us
     )
     owner_token = f"{os.getpid()}:{time.monotonic_ns()}:{backend}"
-    environment[_TRIAL_OWNER_ENV] = owner_token
+    environment[TRIAL_OWNER_ENV] = owner_token
+    if backend == "nta_flashinfer":
+        # Execution form is orthogonal to the semantic protocol. ``auto`` is
+        # the production policy; direct/dependency_aware are explicit causal
+        # arms and are carried into the artifact below.
+        environment["NTA_EXECUTION_HOST_FORM"] = os.environ.get(
+            "NTA_COMPARE_EXECUTION_HOST_FORM", "auto"
+        )
     if backend == "nta_flashinfer" and args.batch_mode == "coalesced":
         # Exercise the production selector.  The benchmark must not silently
         # force a one-wave/direct arm: doing so turns a mechanism comparison
@@ -433,8 +319,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
             override = os.environ.get(compare_name)
             if override is not None:
                 environment[runtime_name] = override
-    _wait_for_free_gpu()
-    with _CotenantSampler(owner_token) as sampler:
+    wait_for_free_gpu()
+    with CotenantSampler(owner_token) as sampler:
         completed = subprocess.run(
             command,
             cwd=ROOT,
@@ -444,13 +330,17 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
             stderr=subprocess.STDOUT,
             check=False,
         )
-    # Preserve the complete arm log beside its isolated JIT workspace.  A
+    # Preserve every arm log beside its trial artifact. A
     # failed activation is part of the artifact's diagnosis; reporting only
     # "no engine stats" makes an otherwise reproducible failure impossible to
-    # audit after the parent process exits.
-    log_path = workspace.parent / f"{workspace.name}.{backend}.stdout.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(completed.stdout, encoding="utf-8")
+    # audit after the parent process exits. Including the output stem and seed
+    # prevents a multi-trial campaign from overwriting an earlier arm.
+    log_path = (
+        args.output.resolve().parent
+        / "logs"
+        / f"{args.output.stem}.seed-{args.seed}.{backend}.stdout.log"
+    )
+    atomic_write_text(log_path, completed.stdout)
     failures: list[str] = []
     if not sampler.complete:
         failures.append("co-tenant sampler did not terminate cleanly")
@@ -472,70 +362,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     report["gpu_sampling_errors"] = sampler.sampling_errors
     report["gpu_sampling_complete"] = sampler.complete
     report["cotenant_pids_seen"] = sorted(sampler.foreign_pids)
+    report["arm_log"] = str(log_path)
     return report
-
-
-def _thresholds(stock: dict[str, Any], scale: float) -> dict[str, float]:
-    return {
-        "resident_ttft": scale * float(stock["resident_p95_ttft_seconds"]),
-        "resident_tpot": scale * float(stock["resident_p95_tpot_seconds"]),
-        "resident_itl": scale * float(stock["resident_p99_itl_seconds"]),
-        "external_ttft": scale * float(stock["external_p95_ttft_seconds"]),
-    }
-
-
-def _preregistered_goodput(report: dict[str, Any]) -> dict[str, Any]:
-    """The registered primary metric: completed requests per second whose
-    TTFT <= 8.0s and P99 ITL <= 100ms; both request kinds count and a
-    request violating either threshold contributes zero."""
-    qualified = 0
-    total = 0
-    for record in report["records"]:
-        total += 1
-        if (
-            float(record["ttft_seconds"]) <= 8.0
-            and float(record["p99_itl_seconds"]) <= 0.100
-        ):
-            qualified += 1
-    elapsed = float(report["elapsed_seconds"])
-    return {
-        "qualified_requests": qualified,
-        "total_requests": total,
-        "goodput_requests_per_second": qualified / elapsed,
-    }
-
-
-def _ratio(numerator: float, denominator: float) -> float:
-    """Return a finite neutral ratio for metrics with no interval samples."""
-    if denominator == 0.0:
-        return 1.0 if numerator == 0.0 else float("inf")
-    return numerator / denominator
-
-
-def _goodput(report: dict[str, Any], thresholds: dict[str, float]) -> dict[str, Any]:
-    resident_ok = []
-    external_ok = []
-    for record in report["records"]:
-        if record["kind"] == "resident":
-            resident_ok.append(
-                float(record["ttft_seconds"]) <= thresholds["resident_ttft"]
-                and float(record["tpot_seconds"]) <= thresholds["resident_tpot"]
-                and float(record["p99_itl_seconds"]) <= thresholds["resident_itl"]
-            )
-        else:
-            external_ok.append(
-                float(record["ttft_seconds"]) <= thresholds["external_ttft"]
-            )
-    elapsed = float(report["elapsed_seconds"])
-    passed = sum(resident_ok) + sum(external_ok)
-    return {
-        "passed_requests": passed,
-        "total_requests": len(resident_ok) + len(external_ok),
-        "slo_attainment": passed / (len(resident_ok) + len(external_ok)),
-        "goodput_requests_per_second": passed / elapsed,
-        "resident_slo_attainment": sum(resident_ok) / len(resident_ok),
-        "external_slo_attainment": sum(external_ok) / len(external_ok),
-    }
 
 
 def _write_failed_comparison(
@@ -555,8 +383,7 @@ def _write_failed_comparison(
     }
     if diagnostics:
         failure["diagnostics"] = diagnostics
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(failure, indent=2, sort_keys=True) + "\n")
+    atomic_write_json(output, failure)
 
 
 def main() -> int:
@@ -663,17 +490,35 @@ def main() -> int:
                 f"{backend} reported verification failures",
             )
             raise RuntimeError(f"{backend} reported verification failures")
-        little = report.get("littles_law")
-        if not isinstance(little, dict) or not math.isfinite(
-            float(little.get("residual", float("nan")))
+        accounting = report.get("finite_window_accounting")
+        required_accounting = (
+            "arrival_rate_per_second",
+            "completion_rate_per_second",
+            "mean_in_system",
+            "mean_system_time_seconds",
+            "occupancy_area_request_seconds",
+            "sum_residence_seconds",
+        )
+        if (
+            not isinstance(accounting, dict)
+            or accounting.get("method")
+            != "finite_window_arrival_departure_accounting"
+            or accounting.get("interpretation")
+            != "descriptive_client_timestamp_accounting"
+            or not all(
+                math.isfinite(float(accounting.get(field, float("nan"))))
+                for field in required_accounting
+            )
         ):
             _write_failed_comparison(
                 args.output,
                 reports,
                 order,
-                f"{backend} omitted finite-window Little's Law evidence",
+                f"{backend} omitted finite-window client timestamp accounting",
             )
-            raise RuntimeError(f"{backend} omitted finite-window Little's Law evidence")
+            raise RuntimeError(
+                f"{backend} omitted finite-window client timestamp accounting"
+            )
     if stock["batch_mode"] != args.batch_mode or nta["batch_mode"] != args.batch_mode:
         _write_failed_comparison(
             args.output, reports, order, "requested batch mode was not preserved"
@@ -691,6 +536,8 @@ def main() -> int:
             "manifest_digest"
         ) or stock_workload.get("demand_trace_digest") != nta_workload.get(
             "demand_trace_digest"
+        ) or stock_workload.get("token_input_identity_digest") != nta_workload.get(
+            "token_input_identity_digest"
         ):
             _write_failed_comparison(
                 args.output,
@@ -713,6 +560,25 @@ def main() -> int:
         for entry in nta["engine_stats"]
         if entry.get("backend") == "nta_flashinfer"
     ]
+    try:
+        transport_execution = require_exercised_paths(
+            stats, args.require_exercised_path
+        )
+        require_frontier_shape(
+            transport_execution,
+            native_layers=args.require_native_frontier_layers,
+            ready_stock_layers=args.require_ready_stock_layers,
+            progressive_layers=args.require_progressive_layers,
+        )
+    except ValueError as error:
+        _write_failed_comparison(
+            args.output,
+            reports,
+            order,
+            "required physical execution path was not exercised",
+            {"execution_error": str(error)},
+        )
+        raise
     considered = sum(
         int(entry.get("admission_considered_batches", 0)) for entry in stats
     )
@@ -720,12 +586,7 @@ def main() -> int:
         int(entry.get("admission_external_bytes", 0)) for entry in stats
     )
     delayed = sum(int(entry.get("admission_delayed_batches", 0)) for entry in stats)
-    credit_rows = sum(
-        int(entry.get("external_admission_credit_rows", 0)) for entry in stats
-    )
-    if considered == 0 or (admission_bytes == 0 and credit_rows == 0):
-        # Tiered serving admits external prefixes through pre-allocation
-        # credits rather than transfer-byte accounting.
+    if considered == 0 or admission_bytes == 0:
         _write_failed_comparison(
             args.output,
             reports,
@@ -735,28 +596,28 @@ def main() -> int:
         raise RuntimeError(
             "NTA load trial did not exercise acquisition-aware admission"
         )
-    thresholds = _thresholds(stock, args.slo_scale)
-    stock_goodput = _goodput(stock, thresholds)
-    nta_goodput = _goodput(nta, thresholds)
-    stock_prereg = _preregistered_goodput(stock)
-    nta_prereg = _preregistered_goodput(nta)
+    thresholds = relative_thresholds(stock, args.slo_scale)
+    stock_goodput = relative_goodput(stock, thresholds)
+    nta_goodput = relative_goodput(nta, thresholds)
+    stock_prereg = preregistered_goodput(stock)
+    nta_prereg = preregistered_goodput(nta)
     stock_rate = float(stock["output_token_throughput"])
     nta_rate = float(nta["output_token_throughput"])
     stock_gp = float(stock_goodput["goodput_requests_per_second"])
     nta_gp = float(nta_goodput["goodput_requests_per_second"])
-    resident_ttft_ratio = _ratio(
+    resident_ttft_ratio = safe_ratio(
         float(nta["resident_p95_ttft_seconds"]),
         float(stock["resident_p95_ttft_seconds"]),
     )
-    resident_tpot_ratio = _ratio(
+    resident_tpot_ratio = safe_ratio(
         float(nta["resident_p95_tpot_seconds"]),
         float(stock["resident_p95_tpot_seconds"]),
     )
-    resident_itl_ratio = _ratio(
+    resident_itl_ratio = safe_ratio(
         float(nta["resident_p99_itl_seconds"]),
         float(stock["resident_p99_itl_seconds"]),
     )
-    external_ttft_ratio = _ratio(
+    external_ttft_ratio = safe_ratio(
         float(nta["external_p95_ttft_seconds"]),
         float(stock["external_p95_ttft_seconds"]),
     )
@@ -777,6 +638,9 @@ def main() -> int:
             ),
             "nta_execution_protocol": os.environ.get(
                 "NTA_COMPARE_EXECUTION_PROTOCOL", "late_bound"
+            ),
+            "nta_execution_host_form": os.environ.get(
+                "NTA_COMPARE_EXECUTION_HOST_FORM", "auto"
             ),
             "nta_execution_host_mover": os.environ.get(
                 "NTA_EXECUTION_HOST_MOVER", "auto"
@@ -847,19 +711,18 @@ def main() -> int:
         "nta_p99_itl_seconds": float(nta["p99_itl_seconds"]),
         "stock_preregistered_goodput": stock_prereg,
         "nta_preregistered_goodput": nta_prereg,
-        "output_throughput_ratio": _ratio(nta_rate, stock_rate),
-        "goodput_ratio": nta_gp / stock_gp if stock_gp else None,
-        "preregistered_goodput_ratio": (
-            nta_prereg["goodput_requests_per_second"]
-            / stock_prereg["goodput_requests_per_second"]
-            if stock_prereg["goodput_requests_per_second"]
-            else None
+        "output_throughput_ratio": safe_ratio(nta_rate, stock_rate),
+        "goodput_ratio": safe_ratio(nta_gp, stock_gp),
+        "preregistered_goodput_ratio": safe_ratio(
+            float(nta_prereg["goodput_requests_per_second"]),
+            float(stock_prereg["goodput_requests_per_second"]),
         ),
         "resident_p95_ttft_ratio": resident_ttft_ratio,
         "resident_p95_tpot_ratio": resident_tpot_ratio,
         "resident_p99_itl_ratio": resident_itl_ratio,
         "external_p95_ttft_ratio": external_ttft_ratio,
         "mechanism_activation": activation,
+        "transport_execution": transport_execution,
         "admission_considered_batches": considered,
         "admission_external_bytes": admission_bytes,
         "admission_delayed_batches": delayed,
@@ -873,8 +736,7 @@ def main() -> int:
             int(entry.get("parallel_indexed_progress_layers", 0)) for entry in stats
         ),
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\n")
+    atomic_write_json(args.output, comparison)
     print(json.dumps(comparison, sort_keys=True))
     return 0
 

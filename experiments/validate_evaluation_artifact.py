@@ -11,8 +11,10 @@ from typing import Any
 
 try:
     from .consumer_contract import validate_consumer_contract
+    from .mechanism_arms import ARMS
 except ImportError:  # pragma: no cover - direct script execution
     from consumer_contract import validate_consumer_contract
+    from mechanism_arms import ARMS
 
 
 def _require(condition: bool, message: str) -> None:
@@ -73,10 +75,25 @@ def validate(output: Path) -> dict[str, Any]:
             raise ValueError(
                 f"invalid consumer contract provenance: {error}"
             ) from error
+    demand_digests = provenance.get("workload_demand_digests")
+    workloads = provenance.get("workloads")
     _require(
-        isinstance(provenance.get("workload_demand_digest"), str)
-        and bool(provenance["workload_demand_digest"]),
-        "report has no exact workload/demand digest",
+        isinstance(demand_digests, list)
+        and demand_digests
+        and demand_digests == sorted(set(demand_digests))
+        and all(isinstance(value, str) and value for value in demand_digests),
+        "report has no exact workload/demand identities",
+    )
+    _require(
+        isinstance(workloads, list)
+        and workloads
+        and {
+            str(entry.get("demand_trace_digest"))
+            for entry in workloads
+            if isinstance(entry, dict)
+        }
+        == set(demand_digests),
+        "report workload descriptors disagree with demand identities",
     )
     _require(
         provenance.get("evaluation_profile", "contract") == evaluation_profile,
@@ -86,10 +103,10 @@ def validate(output: Path) -> dict[str, Any]:
         contract = json.loads(
             (output / "evaluation-contract.json").read_text(encoding="utf-8")
         )
-        expected_arms = [f"B{index}" for index in range(7)]
+        expected_arms = list(ARMS)
         _require(
             evaluation_metadata.get("arm_set") == expected_arms,
-            "osdi-complete artifact does not contain exactly B0-B6",
+            "osdi-complete artifact does not contain exactly A0-A3",
         )
         _require(
             isinstance(evaluation_metadata.get("tier_set"), list)
@@ -140,9 +157,8 @@ def validate(output: Path) -> dict[str, Any]:
             "osdi-complete artifact has no native numerical consumer evidence",
         )
     _require(
-        provenance["workload_demand_digest"]
-        == evaluation_metadata.get("workload_demand_digest"),
-        "report demand digest does not match evaluation metadata",
+        workloads == evaluation_metadata.get("workloads"),
+        "report workloads do not match evaluation metadata",
     )
     physical_tiers = {
         str(entry.get("tier"))
@@ -188,18 +204,32 @@ def validate(output: Path) -> dict[str, Any]:
             and all(math.isfinite(float(value)) for value in interval),
             "invalid paired bootstrap interval",
         )
-    for entry in report.get("little_law", []):
-        little = entry.get("report")
-        if little is None:
+    for entry in report.get("finite_window_accounting", []):
+        accounting = entry.get("report")
+        if accounting is None:
             continue
         _require(
-            little.get("method") == "finite_window_arrival_departure_accounting",
-            "unknown Little's Law method",
+            accounting.get("method")
+            == "finite_window_arrival_departure_accounting",
+            "unknown finite-window accounting method",
         )
         _require(
-            math.isfinite(float(little.get("residual", math.nan))),
-            "non-finite Little's Law residual",
+            accounting.get("interpretation")
+            == "descriptive_client_timestamp_accounting",
+            "finite-window accounting is mislabeled",
         )
+        for field in (
+            "arrival_rate_per_second",
+            "completion_rate_per_second",
+            "mean_in_system",
+            "mean_system_time_seconds",
+            "occupancy_area_request_seconds",
+            "sum_residence_seconds",
+        ):
+            _require(
+                math.isfinite(float(accounting.get(field, math.nan))),
+                f"non-finite finite-window accounting field {field}",
+            )
     return report
 
 

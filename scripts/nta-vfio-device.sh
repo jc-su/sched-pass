@@ -11,6 +11,7 @@ depth=${NTA_NVME_QUEUE_DEPTH:-64}
 gpu=${NTA_GPU:-0}
 media_policy=${NTA_NVME_MEDIA_POLICY:-hardware-write-protect}
 dma_target=${NTA_NVME_DMA_TARGET:-hbm-peer}
+hbm_backend=${NTA_NVME_HBM_BACKEND:-auto}
 probe=${NTA_VFIO_PROBE:-$root_dir/build/nta-vfio-nvme-probe}
 benchmark=${NTA_NVME_BENCHMARK:-$root_dir/build/nta-nvme-bench}
 
@@ -230,6 +231,11 @@ require_containment() {
     die "NTA_NVME_MEDIA_POLICY must be hardware-write-protect or trusted-read-only-code"
   [[ $dma_target == hbm-peer || $dma_target == host-mapped ]] ||
     die "NTA_NVME_DMA_TARGET must be hbm-peer or host-mapped"
+  [[ $hbm_backend == auto || $hbm_backend == cuda-dmabuf-ioas ||
+    $hbm_backend == nvidia-peer-pages ]] ||
+    die "NTA_NVME_HBM_BACKEND must be auto, cuda-dmabuf-ioas, or nvidia-peer-pages"
+  [[ $dma_target == hbm-peer || $hbm_backend == auto ]] ||
+    die "an explicit NTA_NVME_HBM_BACKEND requires hbm-peer DMA"
 }
 
 require_rebind_confirmation() {
@@ -261,23 +267,6 @@ require_media_policy() {
     checked=$((checked + 1))
   done
   [[ $checked -gt 0 ]] || die "no active namespace available for media-policy preflight"
-}
-
-require_hbm_peer() {
-  [[ $dma_target == hbm-peer ]] || return 0
-  [[ -d /sys/module/nta_nvme_p2p ]] ||
-    die "nta_nvme_p2p is not loaded; run scripts/nta-nvme-p2p-module.sh load"
-  [[ -c /dev/nta_nvme_p2p ]] ||
-    die "/dev/nta_nvme_p2p is unavailable"
-  if [[ $probe_as_root == 1 ]]; then
-    if ! as_root test -r /dev/nta_nvme_p2p ||
-      ! as_root test -w /dev/nta_nvme_p2p; then
-      die "root cannot access /dev/nta_nvme_p2p"
-    fi
-  else
-    [[ -r /dev/nta_nvme_p2p && -w /dev/nta_nvme_p2p ]] ||
-      die "current user cannot access /dev/nta_nvme_p2p"
-  fi
 }
 
 capture_reference() {
@@ -349,7 +338,6 @@ bind_vfio() {
   require_safe_device
   require_containment
   require_media_policy
-  require_hbm_peer
   snapshot_partitions
   capture_reference
   as_root modprobe iommufd
@@ -381,9 +369,8 @@ preflight)
   require_safe_device
   require_containment
   require_media_policy
-  require_hbm_peer
-  printf 'VFIO preflight passed: bdf=%s nsid=%s depth=%s gpu=%s media_policy=%s dma_target=%s\n' \
-    "$bdf" "$nsid" "$depth" "$gpu" "$media_policy" "$dma_target"
+  printf 'VFIO preflight passed: bdf=%s nsid=%s depth=%s gpu=%s media_policy=%s dma_target=%s hbm_backend=%s\n' \
+    "$bdf" "$nsid" "$depth" "$gpu" "$media_policy" "$dma_target" "$hbm_backend"
   ;;
 bind)
   require_rebind_confirmation
@@ -396,10 +383,10 @@ probe)
   if [[ $probe_as_root == 1 ]]; then
     as_root env LD_LIBRARY_PATH="$(cuda_library_path)" \
       "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy" \
-      "$dma_target"
+      "$dma_target" "$hbm_backend"
   else
     "$probe" "vfio:$bdf" "$gpu" "$nsid" "$depth" "$media_policy" \
-      "$dma_target"
+      "$dma_target" "$hbm_backend"
   fi
   ;;
 bind-and-probe)
@@ -429,9 +416,11 @@ qualify)
   if [[ $(current_driver) == vfio-pci ]]; then
     # Reusing an explicitly owned controller avoids an unnecessary PCI
     # unbind/rebind between qualification runs. The containment and peer-DMA
-    # checks remain mandatory for the persistent-session path.
+    # checks remain mandatory for the persistent-session path. The attached
+    # Auto qualification selects CUDA DMA-BUF/IOAS first and only then the
+    # optional NVIDIA peer-pages module. An explicit backend policy is passed
+    # into native setup and cannot touch the other mapper.
     require_containment
-    require_hbm_peer
     [[ -r $state ]] ||
       die "VFIO controller has no ownership state; use bind first"
   else
@@ -449,6 +438,7 @@ qualify)
     "--queue-depth=$depth"
     "--media-policy=$media_policy"
     "--dma-target=$dma_target"
+    "--hbm-backend=$hbm_backend"
     "--reference=$reference"
     "${@:2}"
   )

@@ -25,7 +25,7 @@ import os
 from pathlib import Path
 import re
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, ClassVar, Mapping
 
 from .abi import bounded_integer
 from .hbm_registration import (
@@ -34,7 +34,6 @@ from .hbm_registration import (
     coalesce_hbm_destinations,
 )
 from .resource_contract import (
-    ResourceContract,
     ResourceKind,
     resource_contract,
 )
@@ -53,6 +52,19 @@ class ServingTier(str, enum.Enum):
     CXL_DAX = "cxl_dax"
 
 
+class NvmeHbmBackendRequirement(str, enum.Enum):
+    """Setup-plane mapping backend accepted by one NVMe deployment.
+
+    This is deliberately independent of the native CUDA binding so frontend
+    configuration and artifact inspection remain import-safe.  ``AUTO`` means
+    either direct-HBM backend is acceptable; it never permits host-mapped DMA.
+    """
+
+    AUTO = "auto"
+    CUDA_DMA_BUF_IOAS = "cuda-dmabuf-ioas"
+    NVIDIA_PEER_PAGES = "nvidia-peer-pages"
+
+
 _RESOURCE_KIND_FOR_SERVING_TIER = {
     ServingTier.HBM: ResourceKind.HBM,
     ServingTier.HOST_MAPPED: ResourceKind.HOST_MAPPED,
@@ -62,6 +74,27 @@ _RESOURCE_KIND_FOR_SERVING_TIER = {
 }
 
 PHYSICAL_SERVING_TIERS = frozenset((ServingTier.NVME, ServingTier.CXL_DAX))
+
+
+def _require_nvme_hbm_backend(
+    requirement: NvmeHbmBackendRequirement, selected: str
+) -> None:
+    if not isinstance(requirement, NvmeHbmBackendRequirement):
+        raise TypeError("NVMe HBM backend requirement must be typed")
+    valid_selected = {
+        NvmeHbmBackendRequirement.CUDA_DMA_BUF_IOAS.value,
+        NvmeHbmBackendRequirement.NVIDIA_PEER_PAGES.value,
+    }
+    if selected not in valid_selected:
+        raise RuntimeError(f"NVMe selected an unknown HBM mapping backend: {selected}")
+    if (
+        requirement is not NvmeHbmBackendRequirement.AUTO
+        and selected != requirement.value
+    ):
+        raise RuntimeError(
+            "NVMe HBM mapping backend does not satisfy the deployment contract: "
+            f"required={requirement.value} selected={selected}"
+        )
 
 
 @dataclass(frozen=True)
@@ -200,6 +233,8 @@ class TierPageCatalog:
             window_bytes = _catalog_uint64(
                 window_bytes, "catalog window_bytes", minimum=1
             )
+        if not records:
+            raise ValueError("tier page catalog cannot be empty")
         by_coordinate: dict[tuple[int, int], _PageRecord] = {}
         ordinal_by_storage_key: dict[str, int] = {}
         storage_key_by_ordinal: dict[int, str] = {}
@@ -296,6 +331,55 @@ class TierPageCatalog:
         self.alignment_bytes = alignment_bytes
         self.window_bytes = window_bytes
         self.digest = digest
+
+    def validate_nvme_geometry(
+        self,
+        *,
+        lba_size: int,
+        max_transfer_bytes: int,
+        namespace_bytes: int,
+    ) -> None:
+        """Qualify every immutable extent against one opened namespace.
+
+        This is a setup-plane gate.  A catalog that could fail alignment,
+        command-size, or namespace bounds must be rejected before any request
+        can publish a partial runtime directory image.
+        """
+
+        lba_size = _catalog_uint64(lba_size, "NVMe LBA size", minimum=1)
+        max_transfer_bytes = _catalog_uint64(
+            max_transfer_bytes, "NVMe max transfer bytes", minimum=1
+        )
+        namespace_bytes = _catalog_uint64(
+            namespace_bytes, "NVMe namespace bytes", minimum=1
+        )
+        if self.tier is not ServingTier.NVME:
+            raise ValueError("NVMe geometry can only qualify an NVMe catalog")
+        if self.window_bytes is not None and self.window_bytes > namespace_bytes:
+            raise ValueError("NVMe catalog window exceeds the opened namespace")
+        for (layer, ordinal), record in self._records.items():
+            for component, extent in record.components.items():
+                if (
+                    extent.offset > namespace_bytes
+                    or extent.bytes > namespace_bytes - extent.offset
+                ):
+                    raise ValueError(
+                        "NVMe catalog extent exceeds the opened namespace: "
+                        f"layer={layer}, ordinal={ordinal}, component={component}"
+                    )
+                try:
+                    _validate_nvme_extent(
+                        extent,
+                        lba_size=lba_size,
+                        max_transfer_bytes=max_transfer_bytes,
+                        kind=component,
+                    )
+                except RuntimeError as error:
+                    raise ValueError(
+                        "NVMe catalog is incompatible with the opened controller: "
+                        f"layer={layer}, ordinal={ordinal}, component={component}: "
+                        f"{error}"
+                    ) from error
 
     @property
     def page_count(self) -> int:
@@ -543,9 +627,7 @@ class TierPageCatalog:
                 and run_extent.bytes + row_bytes <= max_transfer_bytes
             )
             if contiguous:
-                run_extent = PageExtent(
-                    run_extent.offset, run_extent.bytes + row_bytes
-                )
+                run_extent = PageExtent(run_extent.offset, run_extent.bytes + row_bytes)
                 run_rows += 1
                 continue
             runs.append(PageTransferRun(run_extent, run_destination, run_rows))
@@ -570,6 +652,16 @@ class ServingTierConfig:
     progress_rounds: int = 1
     progress_timeout_ns: int = 100_000_000
     trust_read_only_device_code: bool = False
+    nvme_hbm_backend: NvmeHbmBackendRequirement = NvmeHbmBackendRequirement.AUTO
+
+    _NVME_DEFAULTS: ClassVar[dict[str, int]] = {
+        "namespace_id": 1,
+        "queue_depth": 64,
+        "issue_budget": 64,
+        "completion_budget": 64,
+        "progress_rounds": 1,
+        "progress_timeout_ns": 100_000_000,
+    }
 
     def __post_init__(self) -> None:
         if not isinstance(self.tier, ServingTier):
@@ -627,10 +719,33 @@ class ServingTierConfig:
         )
         if not isinstance(self.trust_read_only_device_code, bool):
             raise ValueError("trust_read_only_device_code must be boolean")
-        if self.tier is ServingTier.CXL_DAX and self.window_bytes <= 0:
-            raise ValueError("CXL DAX window_bytes must be positive")
-        if self.tier is ServingTier.NVME and self.window_bytes != 0:
-            raise ValueError("NVMe does not accept a CXL window_bytes value")
+        if not isinstance(self.nvme_hbm_backend, NvmeHbmBackendRequirement):
+            raise ValueError(
+                "nvme_hbm_backend must be a NvmeHbmBackendRequirement value"
+            )
+        if self.tier is ServingTier.CXL_DAX:
+            if self.window_bytes <= 0:
+                raise ValueError("CXL DAX window_bytes must be positive")
+        elif self.window_bytes != 0:
+            raise ValueError("only CXL DAX accepts a window_bytes value")
+        if (
+            self.tier is not ServingTier.NVME
+            and self.nvme_hbm_backend is not NvmeHbmBackendRequirement.AUTO
+        ):
+            raise ValueError("an NVMe HBM backend requirement needs the NVMe tier")
+        if self.tier is not ServingTier.NVME:
+            changed_nvme_fields = [
+                name
+                for name, default in self._NVME_DEFAULTS.items()
+                if getattr(self, name) != default
+            ]
+            if self.trust_read_only_device_code:
+                changed_nvme_fields.append("trust_read_only_device_code")
+            if changed_nvme_fields:
+                raise ValueError(
+                    "NVMe-only configuration was applied to "
+                    f"{self.tier.value}: {', '.join(changed_nvme_fields)}"
+                )
         if self.tier in PHYSICAL_SERVING_TIERS and (
             not self.endpoint or self.catalog_path is None
         ):
@@ -647,11 +762,7 @@ class ServingTierConfig:
         cls, environ: Mapping[str, str] | None = None
     ) -> "ServingTierConfig":
         values = os.environ if environ is None else environ
-        raw_tier = (
-            values.get("NTA_SERVING_TIER", ServingTier.HBM.value)
-            .strip()
-            .lower()
-        )
+        raw_tier = values.get("NTA_SERVING_TIER", ServingTier.HBM.value).strip().lower()
         try:
             tier = ServingTier(raw_tier)
         except ValueError as error:
@@ -684,6 +795,14 @@ class ServingTierConfig:
         device_ordinal = int(values.get("NTA_TIER_DEVICE_ORDINAL", "-1"))
         if device_ordinal < -1:
             raise ValueError("NTA_TIER_DEVICE_ORDINAL must be -1 or nonnegative")
+        raw_hbm_backend = values.get("NTA_NVME_HBM_BACKEND", "auto").strip().lower()
+        try:
+            hbm_backend = NvmeHbmBackendRequirement(raw_hbm_backend)
+        except ValueError as error:
+            raise ValueError(
+                "NTA_NVME_HBM_BACKEND must be auto, cuda-dmabuf-ioas, or "
+                "nvidia-peer-pages"
+            ) from error
         return cls(
             tier=tier,
             endpoint=endpoint,
@@ -710,10 +829,11 @@ class ServingTierConfig:
                 values.get("NTA_NVME_PROGRESS_TIMEOUT_NS", "100000000"),
                 "NTA_NVME_PROGRESS_TIMEOUT_NS",
             ),
-            trust_read_only_device_code=values.get(
-                "NTA_NVME_TRUST_READ_ONLY_DEVICE_CODE", "0"
-            )
-            == "1",
+            trust_read_only_device_code=_binary_flag(
+                values.get("NTA_NVME_TRUST_READ_ONLY_DEVICE_CODE", "0"),
+                "NTA_NVME_TRUST_READ_ONLY_DEVICE_CODE",
+            ),
+            nvme_hbm_backend=hbm_backend,
         )
 
 
@@ -721,6 +841,8 @@ class ServingTierService:
     """Own one selected tier, its catalog, and its native transport."""
 
     def __init__(self, config: ServingTierConfig) -> None:
+        if not isinstance(config, ServingTierConfig):
+            raise TypeError("serving tier service requires a typed configuration")
         self.config = config
         self.contract = resource_contract(_RESOURCE_KIND_FOR_SERVING_TIER[config.tier])
         self.catalog = (
@@ -734,6 +856,7 @@ class ServingTierService:
         self._nvme_hbm_prepared = False
         self._nvme_lba_size: int | None = None
         self._nvme_max_transfer_bytes: int | None = None
+        self._nvme_namespace_bytes: int | None = None
         # Keep catalog validation and experiment tooling independent of CUDA
         # and libnta-runtime.  Native bindings are loaded only when a serving
         # process explicitly opens a physical tier.
@@ -741,6 +864,7 @@ class ServingTierService:
             from .runtime import (
                 CxlDaxOptions,
                 CxlDaxTransport,
+                NvmeHbmMappingPolicy,
                 NvmeOptions,
                 NvmeTransport,
             )
@@ -748,32 +872,56 @@ class ServingTierService:
         if config.tier is ServingTier.NVME:
             if config.endpoint is None or self.catalog is None:
                 raise ValueError("NVMe service requires an endpoint and page catalog")
-            self.nvme = NvmeTransport(
-                NvmeOptions(
-                    endpoint=config.endpoint,
-                    device_ordinal=config.device_ordinal,
-                    namespace_id=config.namespace_id,
-                    queue_depth=config.queue_depth,
-                    trust_read_only_device_code=config.trust_read_only_device_code,
+            mapping_policy = {
+                NvmeHbmBackendRequirement.AUTO: NvmeHbmMappingPolicy.AUTO,
+                NvmeHbmBackendRequirement.CUDA_DMA_BUF_IOAS: (
+                    NvmeHbmMappingPolicy.CUDA_DMA_BUF_IOAS
+                ),
+                NvmeHbmBackendRequirement.NVIDIA_PEER_PAGES: (
+                    NvmeHbmMappingPolicy.NVIDIA_PEER_PAGES
+                ),
+            }[config.nvme_hbm_backend]
+            try:
+                self.nvme = NvmeTransport(
+                    NvmeOptions(
+                        endpoint=config.endpoint,
+                        device_ordinal=config.device_ordinal,
+                        namespace_id=config.namespace_id,
+                        queue_depth=config.queue_depth,
+                        trust_read_only_device_code=(
+                            config.trust_read_only_device_code
+                        ),
+                        hbm_mapping_policy=mapping_policy,
+                    )
                 )
-            )
-            capabilities = self.nvme.capabilities
-            self._nvme_lba_size = int(capabilities.lba_size)
-            self._nvme_max_transfer_bytes = int(capabilities.max_transfer_bytes)
-            if not capabilities.supports_hbm_peer_dma:
-                self.nvme.close()
-                self.nvme = None
-                raise RuntimeError("NVMe endpoint does not support direct HBM peer DMA")
-            if not capabilities.translated_iommu:
-                self.nvme.close()
-                self.nvme = None
-                raise RuntimeError(
-                    "NVMe endpoint is not attached through a translated IOMMU"
+                capabilities = self.nvme.capabilities
+                self._nvme_lba_size = int(capabilities.lba_size)
+                self._nvme_max_transfer_bytes = int(
+                    capabilities.max_transfer_bytes
                 )
-            if not capabilities.gpu_doorbell_mapping_validated:
-                self.nvme.close()
+                self._nvme_namespace_bytes = int(capabilities.namespace_bytes)
+                self.catalog.validate_nvme_geometry(
+                    lba_size=self._nvme_lba_size,
+                    max_transfer_bytes=self._nvme_max_transfer_bytes,
+                    namespace_bytes=self._nvme_namespace_bytes,
+                )
+                if not capabilities.supports_hbm_peer_dma:
+                    raise RuntimeError(
+                        "NVMe endpoint does not support direct HBM peer DMA"
+                    )
+                if not capabilities.translated_iommu:
+                    raise RuntimeError(
+                        "NVMe endpoint is not attached through a translated IOMMU"
+                    )
+                if not capabilities.gpu_doorbell_mapping_validated:
+                    raise RuntimeError("NVMe GPU doorbell mapping was not qualified")
+                selected_backend = capabilities.hbm_mapping_backend.artifact_name
+                _require_nvme_hbm_backend(config.nvme_hbm_backend, selected_backend)
+            except BaseException:
+                if self.nvme is not None:
+                    self.nvme.close()
                 self.nvme = None
-                raise RuntimeError("NVMe GPU doorbell mapping was not qualified")
+                raise
         elif config.tier is ServingTier.CXL_DAX:
             if (
                 config.endpoint is None
@@ -783,6 +931,10 @@ class ServingTierService:
                 raise ValueError(
                     "CXL-DAX service requires an endpoint, catalog, and window"
                 )
+            if self.catalog is None or self.catalog.window_bytes != config.window_bytes:
+                raise ValueError(
+                    "CXL catalog window_bytes must match the configured DAX window"
+                )
             self.cxl = CxlDaxTransport(
                 CxlDaxOptions(
                     endpoint=config.endpoint,
@@ -790,12 +942,6 @@ class ServingTierService:
                     device_ordinal=config.device_ordinal,
                 )
             )
-            if self.catalog is None or self.catalog.window_bytes != config.window_bytes:
-                self.cxl.close()
-                self.cxl = None
-                raise ValueError(
-                    "CXL catalog window_bytes must match the configured DAX window"
-                )
             if not self.cxl.capabilities.direct_device_visible:
                 self.cxl.close()
                 self.cxl = None
@@ -848,10 +994,6 @@ class ServingTierService:
     @property
     def is_hbm(self) -> bool:
         return self.tier is ServingTier.HBM
-
-    @property
-    def is_host_mapped(self) -> bool:
-        return self.tier is ServingTier.HOST_MAPPED
 
     @property
     def is_host_staged(self) -> bool:
@@ -941,11 +1083,6 @@ class ServingTierService:
             registration_bytes=sum(item.registration_bytes for item in groups),
         )
 
-    @property
-    def resource_contract(self) -> ResourceContract:
-        """The immutable setup/data-path contract for the selected tier."""
-        return self.contract
-
     def extent(
         self, layer: int, ordinals: tuple[int, ...], component: str, row_bytes: int
     ) -> PageExtent:
@@ -989,6 +1126,7 @@ class ServingTierService:
             "tier_data_path": self.contract.steady_state_path,
             "resource_contract": self.contract.as_dict(),
             "tier_fallback": False,
+            "required_nvme_hbm_backend": self.config.nvme_hbm_backend.value,
         }
         if self.nvme is not None:
             capabilities = self.nvme.capabilities
@@ -998,9 +1136,10 @@ class ServingTierService:
                 "hbm_peer_dma": capabilities.supports_hbm_peer_dma,
                 "gpu_doorbell_validated": capabilities.gpu_doorbell_mapping_validated,
                 "namespace_read_only": capabilities.namespace_read_only,
-                "mapping_backend": capabilities.hbm_mapping_backend.name.lower(),
+                "mapping_backend": capabilities.hbm_mapping_backend.artifact_name,
                 "lba_size": capabilities.lba_size,
                 "max_transfer_bytes": capabilities.max_transfer_bytes,
+                "namespace_bytes": capabilities.namespace_bytes,
                 "hbm_region_registrations": queue_stats.hbm_region_registrations,
                 "hbm_region_bytes": queue_stats.hbm_region_bytes,
                 "hbm_transfer_views": queue_stats.hbm_transfer_views,
@@ -1027,6 +1166,12 @@ def _positive_int(value: Any, name: str) -> int:
     if result <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return result
+
+
+def _binary_flag(value: Any, name: str) -> bool:
+    if not isinstance(value, str) or value.strip() not in {"0", "1"}:
+        raise ValueError(f"{name} must be 0 or 1")
+    return value.strip() == "1"
 
 
 def _catalog_uint64(value: Any, name: str, *, minimum: int) -> int:
@@ -1069,6 +1214,11 @@ def _validate_nvme_extent(
 ) -> None:
     if lba_size <= 0 or max_transfer_bytes <= 0:
         raise RuntimeError("NVMe controller reported invalid transfer capabilities")
+    if extent.offset % lba_size:
+        raise RuntimeError(
+            f"NVMe {kind} extent offset is not LBA aligned: {extent.offset} bytes "
+            f"(LBA size {lba_size})"
+        )
     if extent.bytes % lba_size:
         raise RuntimeError(
             f"NVMe {kind} extent is not LBA aligned: {extent.bytes} bytes "

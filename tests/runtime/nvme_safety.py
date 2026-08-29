@@ -44,7 +44,7 @@ def main() -> None:
     assert (
         "no namespace block device exists and reference file is absent" in vfio_script
     )
-    assert '.nta-nvme-reference.XXXXXX' in vfio_script
+    assert ".nta-nvme-reference.XXXXXX" in vfio_script
     assert 'chmod 0444 "$temporary"' in vfio_script
     assert 'mv -f "$temporary" "$reference"' in vfio_script
     assert "wait_for_nvme_namespace" in vfio_script
@@ -80,8 +80,17 @@ def main() -> None:
     assert "mappingBackend().mapHbm" not in view
     assert "cudaMalloc" not in view
     assert "externalRegion = impl_" in view
+    assert "mappingKeyBytes" in runtime
+    assert "context.mappingKey >= mappingKey" in runtime
+    assert "externalRegion == nullptr" in runtime
     assert "mappingBackend().mapHost" in runtime
-    assert "NvmeHbmMappingBackend::NvidiaPeerPages" in runtime
+    assert "mappingBackend().hbmMappingBackend()" in runtime
+    preflight_begin = runtime.index("HbmAllocation preflight;")
+    capabilities_begin = runtime.index(
+        "capabilities.supportsHbmPeerDma = true;", preflight_begin
+    )
+    constructor_preflight = runtime[preflight_begin:capabilities_begin]
+    assert "mappingBackend().mapHbm" in constructor_preflight
     assert "cuMemAlloc(&allocation.base" in runtime
     assert "cuMemGetHandleForAddressRange" not in runtime
     assert "CU_GPU_DIRECT_RDMA_WRITES_ORDERING_OWNER" in runtime
@@ -92,10 +101,33 @@ def main() -> None:
     ]
     assert "cudaDeviceSynchronize" not in release_mapping
     assert "retiredMappings" in release_mapping
+    device_acquire = (ROOT / "runtime" / "device" / "Acquire.cuh").read_text(
+        encoding="utf-8"
+    )
+    assert "controllerPageSize) /" in device_acquire
+    assert "sizeof(std::uint64_t) +" in device_acquire
     host_runtime = (ROOT / "runtime" / "host" / "Runtime.cpp").read_text(
         encoding="utf-8"
     )
     assert "installNvmeObjectAsync" in host_runtime
+    assert "installNvmeObjectsAsync" in host_runtime
+    assert "publish NVMe object batch asynchronously" in host_runtime
+    assert "nvmeTransferPageCount(*buffer, bytes, capabilities)" in host_runtime
+    indexed_async = host_runtime[
+        host_runtime.index(
+            "registerIndexedHostObjectsAsyncQuiesced"
+        ) : host_runtime.index(
+            "ObjectHandle HostRuntime::installNvmeObject(",
+            host_runtime.index("registerIndexedHostObjectsAsyncQuiesced"),
+        )
+    ]
+    assert "cudaStreamSynchronize(stream)" in indexed_async
+    nvme_async = host_runtime[
+        host_runtime.index(
+            "ObjectHandle HostRuntime::installNvmeObjectAsync("
+        ) : host_runtime.index("void HostRuntime::bindTensorMaps")
+    ]
+    assert "cudaStreamSynchronize(stream)" in nvme_async
     assert "reapRetiredObjects" in host_runtime
     assert "cudaStreamWaitEvent(stream, priorConsumerEvent, 0)" in host_runtime
     retire_begin = host_runtime.index("void retireObject(")
@@ -104,7 +136,7 @@ def main() -> None:
     assert "const cudaError_t eventStatus" in retirement
     assert "cudaStreamSynchronize(stream)" in retirement
     assert "cudaDeviceSynchronize()" in retirement
-    assert "releaseObject(retired.object)" in retirement
+    assert "releaseObject(owned)" in retirement
     assert "ioctl" not in (ROOT / "runtime" / "device" / "Acquire.cuh").read_text(
         encoding="utf-8"
     )
@@ -125,11 +157,45 @@ def main() -> None:
     assert 'RESULTS_ROOT / "qualification" / "nvme-reference.bin"' in qualification
     assert 'gpu.get("selected_data_path_verified") is True' in qualification
     assert 'gpu.get("destination") == args.dma_target' in qualification
+    assert '"NTA_NVME_HBM_BACKEND": args.require_hbm_backend' in qualification
+    assert 'gpu.get("hbm_mapping_policy") != required_backend' in qualification
+    assert "provenance_ready = not dirty" in qualification
+    assert (
+        "qualified = transport_ready and provenance_ready and performance_qualified"
+        in qualification
+    )
     assert "and iommu_fault_free" in qualification
+    direct_gpu = {
+        "hbm_mapping_policy": "cuda-dmabuf-ioas",
+        "hbm_mapping_backend": "cuda-dmabuf-ioas",
+        "hbm_peer_dma_supported": True,
+    }
+    assert runner.hbm_mapping_contract_ready(
+        dma_target="hbm-peer",
+        required_backend="cuda-dmabuf-ioas",
+        gpu=direct_gpu,
+    )
+    assert not runner.hbm_mapping_contract_ready(
+        dma_target="hbm-peer",
+        required_backend="nvidia-peer-pages",
+        gpu=direct_gpu,
+    )
+    assert not runner.hbm_mapping_contract_ready(
+        dma_target="hbm-peer",
+        required_backend="cuda-dmabuf-ioas",
+        gpu={**direct_gpu, "hbm_mapping_policy": "auto"},
+    )
+    assert runner.hbm_mapping_contract_ready(
+        dma_target="host-mapped",
+        required_backend="auto",
+        gpu={"hbm_mapping_policy": "auto"},
+    )
     cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
     preflight = cmake[cmake.index("add_custom_target(\n  nta-vfio-preflight") :]
     assert "${CMAKE_COMMAND} -E env" in preflight
     assert "${NTA_TEST_NVME_ENVIRONMENT}" in preflight
+    assert "NTA_TEST_NVME_HBM_BACKEND" in cmake
+    assert "--hbm-backend=${NTA_TEST_NVME_HBM_BACKEND}" in cmake
     control_plane = (ROOT / "runtime" / "host" / "NvmeVfioControlPlane.cpp").read_text(
         encoding="utf-8"
     )
@@ -140,6 +206,12 @@ def main() -> None:
         not in control_plane
     )
     assert "mappingBackend_->shutdown()" in control_plane
+    assert "NvmeHbmMappingBackend::CudaDmaBufIoas" in control_plane
+    assert "cuMemGetHandleForAddressRange" in control_plane
+    assert "IOMMU_IOAS_MAP_FILE" in control_plane
+    assert "NvmeMappingToken::Kind::CudaDmaBufIoas" in control_plane
+    assert "policy_ == NvmeHbmMappingPolicy::CudaDmaBufIoas" in control_plane
+    assert "policy_ == NvmeHbmMappingPolicy::NvidiaPeerPages" in control_plane
     assert "std::shared_ptr<NvmeTransport::Impl> owner;" in runtime
     assert "detail::NvmeMapping dmaMapping;" in runtime
     buffer_impl = runtime[runtime.index("struct NvmeBuffer::Impl") :]
@@ -196,6 +268,7 @@ def main() -> None:
     assert "nta_nvme_transport_describe_hbm_region" in runtime_c
     assert "nta_runtime_install_registered_nvme_object" in runtime_c
     assert "nta_runtime_install_registered_nvme_object_async" in runtime_c
+    assert "nta_runtime_install_registered_nvme_objects_async" in runtime_c
     runtime_c_impl = (ROOT / "runtime" / "host" / "RuntimeC.cpp").read_text(
         encoding="utf-8"
     )
@@ -205,9 +278,9 @@ def main() -> None:
     assert "runtime->nvme->allocate" not in install_body
     assert "region->value->view" in install_body
     assert "mapExternalHbm" not in install_body
-    planner = (
-        ROOT / "python" / "nta_runtime" / "hbm_registration.py"
-    ).read_text(encoding="utf-8")
+    planner = (ROOT / "python" / "nta_runtime" / "hbm_registration.py").read_text(
+        encoding="utf-8"
+    )
     assert "begin < mutable[-1]" in planner
     assert "HBM registration plan contains duplicate destination keys" in planner
     epoch = (ROOT / "python" / "nta_runtime" / "epoch.py").read_text(encoding="utf-8")

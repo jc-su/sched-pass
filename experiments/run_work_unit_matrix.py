@@ -2,10 +2,10 @@
 """Execute the dependency-free exact work-unit evaluation matrix.
 
 This runner is a contract and regime test, not a GPU performance result.  It
-uses the same exact demand trace for every arm and exercises the real Python
-work-unit ledger, including generation and epoch rejection.  Serving runners
-consume the same manifest later; they must report their measured counters in
-the same schema.
+uses the same exact demand trace for every diagnostic profile and exercises
+the real Python work-unit ledger, including generation and epoch rejection.
+Its D-prefixed profiles are deliberately separate from the measured A-prefixed
+serving arms.
 """
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ else:
 
 
 @dataclass(frozen=True)
-class ArmDefinition:
-    """The experimentally controlled boundaries of one matched arm."""
+class DiagnosticProfile:
+    """One synthetic component/regime profile; never a serving causal arm."""
 
     protocol: ProtocolKind
     demand_source: str
@@ -44,75 +44,75 @@ class ArmDefinition:
     admission_feedback: bool
 
 
-# B0 is resident *exact* conventional execution.  "Dense" used to describe
-# B0 in the manifest, which made the fairness rule self-contradictory: a dense
-# numerical demand is not the same workload as the sparse arms.  All arms now
-# consume the exact demanded IDs; B0 differs only in residency and protocol.
-ARM_DEFINITIONS = {
-    "B0": ArmDefinition(
+# These D-prefixed profiles belong only to the dependency-free diagnostic
+# matrix.  Formal serving uses the independent A0--A3 mechanism arms in
+# ``experiments.mechanism_arms``.  Keeping the namespaces distinct prevents a
+# synthetic state-machine profile from masquerading as measured causal evidence.
+DIAGNOSTIC_PROFILES = {
+    "D0": DiagnosticProfile(
         ProtocolKind.CONVENTIONAL, "resident", "batch", "manual", False, False
     ),
-    "B1": ArmDefinition(
+    "D1": DiagnosticProfile(
         ProtocolKind.CONVENTIONAL, "host_promotion", "batch", "manual", False, False
     ),
-    "B2": ArmDefinition(
+    "D2": DiagnosticProfile(
         ProtocolKind.CONVENTIONAL, "host_demand", "batch", "manual", False, False
     ),
-    "B3": ArmDefinition(
+    "D3": DiagnosticProfile(
         ProtocolKind.CONVENTIONAL, "device_demand", "batch", "manual", False, False
     ),
-    "B4": ArmDefinition(
+    "D4": DiagnosticProfile(
         ProtocolKind.LATE_BOUND, "device_demand", "work_unit", "typed", True, False
     ),
-    "B5": ArmDefinition(
+    "D5": DiagnosticProfile(
         ProtocolKind.LATE_BOUND, "device_demand", "work_unit", "typed", True, True
     ),
-    "B6": ArmDefinition(
+    "D6": DiagnosticProfile(
         ProtocolKind.PARTIAL, "device_demand", "work_unit", "typed", True, True
     ),
 }
-ARM_PROTOCOLS = {
-    arm: definition.protocol for arm, definition in ARM_DEFINITIONS.items()
+PROFILE_PROTOCOLS = {
+    profile: definition.protocol for profile, definition in DIAGNOSTIC_PROFILES.items()
 }
 
 
 @dataclass(frozen=True)
 class AblationDefinition:
-    """One declared mechanism boundary disabled for its applicable arms."""
+    """One declared mechanism boundary disabled for applicable profiles."""
 
     description: str
-    target_arms: frozenset[str]
+    target_profiles: frozenset[str]
 
 
 ABLATIONS = {
     "full": AblationDefinition("all mechanism boundaries enabled", frozenset()),
     "host_demand": AblationDefinition(
         "materialize exact demand through the host control path",
-        frozenset({"B3", "B4", "B5", "B6"}),
+        frozenset({"D3", "D4", "D5", "D6"}),
     ),
     "batch_readiness": AblationDefinition(
         "replace per-work-unit readiness with one batch barrier",
-        frozenset({"B4", "B5", "B6"}),
+        frozenset({"D4", "D5", "D6"}),
     ),
     "coarse_granularity": AblationDefinition(
         "collapse the selected work into one coarse group",
-        frozenset({"B4", "B5", "B6"}),
+        frozenset({"D4", "D5", "D6"}),
     ),
     "manual_mapping": AblationDefinition(
         "replace typed compiler coordinates with manual coordinates",
-        frozenset({"B4", "B5", "B6"}),
+        frozenset({"D4", "D5", "D6"}),
     ),
     "shadow_generation_checks": AblationDefinition(
         "move generation checks off the hot path into shadow validation",
-        frozenset({"B4", "B5", "B6"}),
+        frozenset({"D4", "D5", "D6"}),
     ),
     "admission_feedback": AblationDefinition(
         "disable engine admission feedback",
-        frozenset({"B5", "B6"}),
+        frozenset({"D5", "D6"}),
     ),
     "unbounded_staging": AblationDefinition(
         "replace bounded staging with full promotion",
-        frozenset({"B4", "B5", "B6"}),
+        frozenset({"D4", "D5", "D6"}),
     ),
 }
 
@@ -159,25 +159,39 @@ def _git_metadata() -> dict[str, Any]:
 
 def _load_manifest(path: Path) -> dict[str, Any]:
     manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("schema") != 3:
+        raise ValueError("diagnostic matrix manifest must use schema 3")
     if manifest.get("status") == "design-only-until-protocol-wired":
         raise ValueError("the experiment manifest is still marked design-only")
     demand = manifest.get("demand", {})
     if demand.get("semantics") != "exact-sparse":
         raise ValueError("the matrix must use exact-sparse demand")
-    if not demand.get("trace_is_shared_across_arms", False):
-        raise ValueError("all arms must share one demand trace")
+    if not demand.get("trace_is_shared_across_profiles", False):
+        raise ValueError("all diagnostic profiles must share one demand trace")
     if demand.get("selection_source") != "shared-exact-trace":
-        raise ValueError("all arms must consume one shared exact demand trace")
-    arms = {arm["id"]: arm for arm in manifest.get("arms", ())}
-    if set(arms) != set(ARM_PROTOCOLS):
-        raise ValueError("manifest arms must be exactly B0 through B6")
-    for arm_id, expected in ARM_PROTOCOLS.items():
-        manifest_protocol = str(arms[arm_id].get("protocol", "")).replace("-", "_")
+        raise ValueError("all diagnostic profiles must consume one exact trace")
+    profiles = {
+        profile["id"]: profile for profile in manifest.get("diagnostic_profiles", ())
+    }
+    if set(profiles) != set(PROFILE_PROTOCOLS):
+        raise ValueError("manifest profiles must be exactly D0 through D6")
+    for profile_id, expected in PROFILE_PROTOCOLS.items():
+        manifest_protocol = str(profiles[profile_id].get("protocol", "")).replace(
+            "-", "_"
+        )
         if manifest_protocol != expected.value:
-            raise ValueError(f"{arm_id} has the wrong protocol in the manifest")
-    manifest_ablations = {item["id"] for item in manifest.get("ablations", ())}
-    if manifest_ablations != set(ABLATIONS):
+            raise ValueError(f"{profile_id} has the wrong protocol in the manifest")
+    manifest_ablations = {
+        item["id"]: frozenset(item.get("target_profiles", ()))
+        for item in manifest.get("ablations", ())
+    }
+    if set(manifest_ablations) != set(ABLATIONS):
         raise ValueError("manifest ablations must describe every executable ablation")
+    for ablation_id, definition in ABLATIONS.items():
+        if manifest_ablations[ablation_id] != definition.target_profiles:
+            raise ValueError(
+                f"{ablation_id} has the wrong diagnostic-profile scope"
+            )
     return manifest
 
 
@@ -259,9 +273,9 @@ def _trace_hash(tiles: tuple[ExecutionTile, ...]) -> str:
 
 
 def _mode(
-    arm_id: str, ablation_id: str
-) -> tuple[ArmDefinition, dict[str, str | bool], bool]:
-    definition = ARM_DEFINITIONS[arm_id]
+    profile_id: str, ablation_id: str
+) -> tuple[DiagnosticProfile, dict[str, str | bool], bool]:
+    definition = DIAGNOSTIC_PROFILES[profile_id]
     mode: dict[str, str | bool] = {
         "demand_source": definition.demand_source,
         "readiness": definition.readiness,
@@ -272,7 +286,7 @@ def _mode(
         "granularity": "case",
     }
     ablation = ABLATIONS[ablation_id]
-    applied = ablation_id != "full" and arm_id in ablation.target_arms
+    applied = ablation_id != "full" and profile_id in ablation.target_profiles
     if applied:
         if ablation_id == "host_demand":
             mode["demand_source"] = "host_demand"
@@ -291,13 +305,13 @@ def _mode(
     return definition, mode, applied
 
 
-def _run_arm(
-    case: dict[str, Any], arm_id: str, seed: int, ablation_id: str
+def _run_profile(
+    case: dict[str, Any], profile_id: str, seed: int, ablation_id: str
 ) -> dict[str, Any]:
-    definition, mode, ablation_applied = _mode(arm_id, ablation_id)
+    definition, mode, ablation_applied = _mode(profile_id, ablation_id)
     granularity = Granularity(case["granularity"])
     kind = definition.protocol
-    # A readiness ablation intentionally removes overlap.  B6 remains an
+    # A readiness ablation intentionally removes overlap.  D6 remains an
     # exact protocol record, but its partial-publication counter is zero in
     # this arm because a batch barrier prevents continuation from helping.
     session_kind = (
@@ -324,7 +338,7 @@ def _run_arm(
         groups = session.runnable_groups()
         if not groups:
             if not blocked:
-                raise RuntimeError(f"{arm_id} deadlocked with no blocked work")
+                raise RuntimeError(f"{profile_id} deadlocked with no blocked work")
             for work_id in session.blocked_work:
                 session.make_ready((work_id,))
             continue
@@ -376,9 +390,9 @@ def _run_arm(
         bandwidth, tier_latency_ns = TIER_PROFILES[tier]
     except KeyError as error:
         raise ValueError(f"unknown experiment tier {tier}") from error
-    if arm_id == "B0":
+    if profile_id == "D0":
         physical_bytes = 0
-    elif arm_id == "B1":
+    elif profile_id == "D1":
         physical_bytes = candidate_units * unit_bytes
     else:
         physical_bytes = selected_bytes
@@ -476,7 +490,7 @@ def _run_arm(
     stats = session.expose_stats()
     stats.update(
         {
-            "arm": arm_id,
+            "diagnostic_profile": profile_id,
             "protocol": kind.value,
             "session_protocol": session_kind.value,
             "ablation": ablation_id,
@@ -620,9 +634,9 @@ def main() -> int:
     ablations = tuple(ABLATIONS) if args.ablation == "all" else (args.ablation,)
     records = [
         {
-            **_run_arm(
+            **_run_profile(
                 case,
-                arm_id,
+                profile_id,
                 manifest["seed"] + repetition,
                 ablation_id,
             ),
@@ -631,12 +645,12 @@ def main() -> int:
         }
         for repetition in range(repetitions)
         for case in cases
-        for arm_id in ARM_PROTOCOLS
+        for profile_id in PROFILE_PROTOCOLS
         for ablation_id in ablations
     ]
     result = {
-        "schema": 2,
-        "classification": "exact-work-unit-contract-matrix",
+        "schema": 3,
+        "classification": "exact-work-unit-diagnostic-matrix",
         "measurement": {
             "kind": "synthetic_regime_contract",
             "serving_evidence": False,
@@ -646,7 +660,7 @@ def main() -> int:
         "provenance": _git_metadata(),
         "cases": len(cases),
         "repetitions": repetitions,
-        "arms": list(ARM_PROTOCOLS),
+        "diagnostic_profiles": list(PROFILE_PROTOCOLS),
         "ablations": list(ablations),
         "records": records,
     }

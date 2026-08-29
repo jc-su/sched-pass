@@ -27,6 +27,17 @@ enum class NvmeDmaTarget {
 enum class NvmeHbmMappingBackend : std::uint32_t {
   Unavailable = 0,
   NvidiaPeerPages = 1,
+  CudaDmaBufIoas = 2,
+};
+
+// Fail-closed setup policy for the HBM mapping lease. Auto may try every
+// compiled backend, while an explicit policy must never touch or fall back to
+// the other backend. Checking the selected backend after an automatic map is
+// too late to prove that a required setup path was enforced.
+enum class NvmeHbmMappingPolicy : std::uint32_t {
+  Auto = 0,
+  NvidiaPeerPages = 1,
+  CudaDmaBufIoas = 2,
 };
 
 struct NvmeTransportOptions {
@@ -39,6 +50,7 @@ struct NvmeTransportOptions {
   std::uint32_t adminTimeoutMs = 10'000;
   NvmeMediaPolicy mediaPolicy = NvmeMediaPolicy::RequireHardwareWriteProtection;
   NvmeDmaTarget dmaTarget = NvmeDmaTarget::HbmPeer;
+  NvmeHbmMappingPolicy hbmMappingPolicy = NvmeHbmMappingPolicy::Auto;
 };
 
 struct NvmeCapabilities {
@@ -75,10 +87,10 @@ struct NvmeQueueStats {
 };
 
 // Native description of the setup-time registration envelope for a
-// caller-owned CUDA slice.  Framework allocators may place several logical
-// tensors in one CUDA allocation and in the same 64 KiB peer page.  Callers
-// use this description to coalesce overlapping envelopes before pinning, so
-// every peer PTE has exactly one mapping owner.
+// caller-owned CUDA slice. Framework allocators may place several logical
+// tensors in one CUDA allocation and in the same 64 KiB registration page.
+// Callers use this description to coalesce overlapping envelopes before
+// pinning, so every DMA mapping has exactly one owner.
 struct NvmeHbmRegistrationRange {
   void *allocationAddress;
   std::size_t allocationBytes;

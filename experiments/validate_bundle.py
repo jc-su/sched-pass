@@ -123,7 +123,15 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             validate_serving_result(serving_report)
             if metadata.get("workload_replay_manifest"):
                 workload_file = bundle / Path(metadata["workload_replay_manifest"])
-                workload_records = workload_file.parent / "records.jsonl"
+                workload_records_name = Path(
+                    str(metadata.get("workload_replay_records", ""))
+                )
+                _require(
+                    not workload_records_name.is_absolute()
+                    and ".." not in workload_records_name.parts,
+                    "unsafe serving workload records path",
+                )
+                workload_records = bundle / workload_records_name
                 reports = [serving_report]
                 if (
                     serving_report.get("classification")
@@ -155,7 +163,12 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             == metadata.get("workload_replay_manifest_digest"),
             "workload replay manifest digest does not match metadata",
         )
-        records_path = workload_path.parent / "records.jsonl"
+        records_name = Path(str(metadata.get("workload_replay_records", "")))
+        _require(
+            not records_name.is_absolute() and ".." not in records_name.parts,
+            "unsafe workload records path",
+        )
+        records_path = bundle / records_name
         _require(records_path.is_file(), "workload replay records are missing")
         _require(
             file_digest(records_path) == metadata.get("workload_replay_records_digest"),
@@ -176,16 +189,87 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             require_all_ablations=True,
         )
     if metadata.get("profile") == "evaluation":
-        rq0_path = bundle / str(metadata.get("rq0_opportunity", ""))
-        _require(rq0_path.is_file(), "evaluation bundle has no RQ0 opportunity report")
+        workload_entries = metadata.get("evaluation_workloads")
         _require(
-            file_digest(rq0_path) == metadata.get("rq0_opportunity_digest"),
-            "RQ0 opportunity report digest does not match metadata",
+            isinstance(workload_entries, list) and bool(workload_entries),
+            "evaluation bundle has no scenario-owned workloads",
         )
-        rq0 = json.loads(rq0_path.read_text(encoding="utf-8"))
+        bundled_workloads: list[dict[str, Any]] = []
+        for entry in workload_entries:
+            _require(isinstance(entry, dict), "invalid evaluation workload entry")
+            manifest_name = Path(str(entry.get("manifest", "")))
+            records_name = Path(str(entry.get("records", "")))
+            _require(
+                not manifest_name.is_absolute()
+                and ".." not in manifest_name.parts
+                and not records_name.is_absolute()
+                and ".." not in records_name.parts,
+                "unsafe evaluation workload path",
+            )
+            workload_path = bundle / manifest_name
+            records_path = bundle / records_name
+            _require(
+                workload_path.is_file() and records_path.is_file(),
+                "evaluation workload payload is missing",
+            )
+            _require(
+                file_digest(workload_path) == entry.get("manifest_digest")
+                and file_digest(records_path) == entry.get("records_digest"),
+                "evaluation workload payload digest does not match metadata",
+            )
+            workload = validate_workload(workload_path)
+            _require(
+                workload.get("demand_trace_digest")
+                == entry.get("demand_trace_digest")
+                == entry.get("scenario", {}).get("demand_trace_digest"),
+                "evaluation workload demand identity is inconsistent",
+            )
+            bundled_workloads.append(entry)
         _require(
-            rq0.get("classification") == "bailian-rq0-opportunity-report",
-            "invalid RQ0 opportunity report",
+            len(
+                {
+                    (entry.get("scenario_id"), entry.get("demand_trace_digest"))
+                    for entry in bundled_workloads
+                }
+            )
+            == len(bundled_workloads),
+            "evaluation workload scenarios are not unique",
+        )
+        rq0_entries = metadata.get("rq0_opportunities")
+        _require(
+            isinstance(rq0_entries, list)
+            and len(rq0_entries) == len(bundled_workloads),
+            "evaluation bundle lacks one RQ0 report per workload scenario",
+        )
+        rq0_identities: set[tuple[object, object]] = set()
+        for entry in rq0_entries:
+            _require(isinstance(entry, dict), "invalid RQ0 metadata entry")
+            rq0_name = Path(str(entry.get("report", "")))
+            _require(
+                not rq0_name.is_absolute() and ".." not in rq0_name.parts,
+                "unsafe RQ0 report path",
+            )
+            rq0_path = bundle / rq0_name
+            _require(rq0_path.is_file(), "evaluation RQ0 report is missing")
+            _require(
+                file_digest(rq0_path) == entry.get("report_digest"),
+                "RQ0 opportunity report digest does not match metadata",
+            )
+            rq0 = json.loads(rq0_path.read_text(encoding="utf-8"))
+            _require(
+                rq0.get("classification") == "bailian-rq0-opportunity-report",
+                "invalid RQ0 opportunity report",
+            )
+            rq0_identities.add(
+                (entry.get("scenario_id"), entry.get("demand_trace_digest"))
+            )
+        _require(
+            rq0_identities
+            == {
+                (entry.get("scenario_id"), entry.get("demand_trace_digest"))
+                for entry in bundled_workloads
+            },
+            "RQ0 reports do not cover the bundled workload scenarios",
         )
         evaluation_output = bundle / "evaluation"
         _require(
@@ -203,12 +287,27 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
         evaluation_metadata = json.loads(
             evaluation_metadata_path.read_text(encoding="utf-8")
         )
+        observed_workloads = evaluation_metadata.get("workloads")
         _require(
-            evaluation_metadata.get("workload_manifest_digest")
-            == metadata.get("workload_replay_manifest_digest")
-            or evaluation_metadata.get("workload_manifest_digest")
-            == file_digest(bundle / "workload/manifest.json"),
-            "evaluation workload digest is not the bundled workload",
+            isinstance(observed_workloads, list)
+            and sorted(
+                (
+                    entry.get("manifest_digest"),
+                    entry.get("demand_trace_digest"),
+                    json.dumps(entry.get("scenario"), sort_keys=True),
+                )
+                for entry in observed_workloads
+                if isinstance(entry, dict)
+            )
+            == sorted(
+                (
+                    entry.get("manifest_digest"),
+                    entry.get("demand_trace_digest"),
+                    json.dumps(entry.get("scenario"), sort_keys=True),
+                )
+                for entry in bundled_workloads
+            ),
+            "evaluation metadata workloads are not the bundled scenarios",
         )
         copied_spec = json.loads(spec_path.read_text(encoding="utf-8"))
         performance_name = metadata.get("performance_evidence")
@@ -266,8 +365,8 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             )
         validate_spec(
             copied_spec,
-            bundle / "workload/manifest.json",
             qualification_path=qualification_file,
+            base_dir=bundle,
         )
     return metadata
 

@@ -98,7 +98,7 @@ defaultTierCapabilities(abi::SourceKind kind) noexcept {
   case abi::SourceKind::HostMapped:
     return TierDirectAddress | TierHostRegistered;
   case abi::SourceKind::HostStaged:
-    return TierIndexedTransfer;
+    return TierHostRegistered | TierIndexedTransfer;
   case abi::SourceKind::Nvme:
     return TierDeviceInitiated | TierPersistentStorage;
   case abi::SourceKind::Cxl:

@@ -5,9 +5,8 @@
 #endif
 
 #include "nta/KernelPolicy.cuh"
-#include "nta/OperatorContract.h"
-#include "runtime/device/TypedInstrumentation.cuh"
 #include "runtime/device/Acquire.cuh"
+#include "runtime/device/OperatorMetadata.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -24,112 +23,6 @@ namespace nta::jit {
 inline cudaError_t launchStatus() { return cudaPeekAtLastError(); }
 
 } // namespace nta::jit
-
-#ifndef NTA_OPERATOR_FAMILY
-#define NTA_OPERATOR_FAMILY 0
-#endif
-#ifndef NTA_OPERATOR_FORM
-#define NTA_OPERATOR_FORM 0
-#endif
-#ifndef NTA_OPERATOR_CAPABILITIES
-#define NTA_OPERATOR_CAPABILITIES 0ULL
-#endif
-#ifndef NTA_OPERATOR_SOURCE_HASH_LOW
-#define NTA_OPERATOR_SOURCE_HASH_LOW 0ULL
-#endif
-#ifndef NTA_OPERATOR_SOURCE_HASH_HIGH
-#define NTA_OPERATOR_SOURCE_HASH_HIGH 0ULL
-#endif
-#ifndef NTA_OPERATOR_SUPPORTED_FORMS
-#define NTA_OPERATOR_SUPPORTED_FORMS 6U
-#endif
-#ifndef NTA_OPERATOR_COORDINATE_MAP
-#define NTA_OPERATOR_COORDINATE_MAP 0U
-#endif
-#ifndef NTA_OPERATOR_PARTIAL_STATE
-#define NTA_OPERATOR_PARTIAL_STATE 0U
-#endif
-#ifndef NTA_OPERATOR_REDUCTION
-#define NTA_OPERATOR_REDUCTION 0U
-#endif
-#ifndef NTA_OPERATOR_PLAN_FLAGS
-#define NTA_OPERATOR_PLAN_FLAGS 0U
-#endif
-#ifndef NTA_OPERATOR_PLAN_HASH_LOW
-#define NTA_OPERATOR_PLAN_HASH_LOW NTA_OPERATOR_SOURCE_HASH_LOW
-#endif
-#ifndef NTA_OPERATOR_PLAN_HASH_HIGH
-#define NTA_OPERATOR_PLAN_HASH_HIGH NTA_OPERATOR_SOURCE_HASH_HIGH
-#endif
-#ifndef NTA_OPERATOR_INSTRUMENTATION_FLAGS
-#define NTA_OPERATOR_INSTRUMENTATION_FLAGS 0ULL
-#endif
-#ifndef NTA_OPERATOR_IDENTITY_BINDING
-#define NTA_OPERATOR_IDENTITY_BINDING 0U
-#endif
-#ifndef NTA_OPERATOR_DEMAND_BINDING
-#define NTA_OPERATOR_DEMAND_BINDING 0U
-#endif
-#ifndef NTA_OPERATOR_ACCESS_PROOF
-#define NTA_OPERATOR_ACCESS_PROOF 0U
-#endif
-#ifndef NTA_OPERATOR_GRANULARITY_BYTES
-#define NTA_OPERATOR_GRANULARITY_BYTES 0U
-#endif
-#ifndef NTA_OPERATOR_TIER_MASK
-#define NTA_OPERATOR_TIER_MASK 0ULL
-#endif
-
-extern "C" __attribute__((visibility("default")))
-const nta::operator_contract::Contract *nta_jit_operator_contract() {
-  static constexpr nta::operator_contract::Contract contract{
-      nta::operator_contract::Magic,
-      nta::operator_contract::SchemaVersion,
-      sizeof(nta::operator_contract::Contract),
-      nta::abi::Version,
-      NTA_OPERATOR_FAMILY,
-      NTA_OPERATOR_FORM,
-      0,
-      NTA_OPERATOR_CAPABILITIES,
-      NTA_OPERATOR_SOURCE_HASH_LOW,
-      NTA_OPERATOR_SOURCE_HASH_HIGH,
-      NTA_OPERATOR_INSTRUMENTATION_FLAGS,
-      NTA_OPERATOR_IDENTITY_BINDING,
-      NTA_OPERATOR_DEMAND_BINDING,
-      NTA_OPERATOR_ACCESS_PROOF,
-      NTA_OPERATOR_GRANULARITY_BYTES,
-      NTA_OPERATOR_TIER_MASK,
-  };
-  return &contract;
-}
-
-extern "C" __attribute__((visibility("default")))
-const nta::operator_contract::Plan *
-nta_jit_operator_plan() {
-  static constexpr nta::operator_contract::Plan plan{
-      nta::operator_contract::PlanMagic,
-      nta::operator_contract::PlanSchemaVersion,
-      sizeof(nta::operator_contract::Plan),
-      nta::abi::Version,
-      NTA_OPERATOR_FAMILY,
-      NTA_OPERATOR_SUPPORTED_FORMS,
-      NTA_OPERATOR_COORDINATE_MAP,
-      NTA_OPERATOR_PARTIAL_STATE,
-      NTA_OPERATOR_REDUCTION,
-      NTA_OPERATOR_PLAN_FLAGS,
-      0,
-      NTA_OPERATOR_SOURCE_HASH_LOW,
-      NTA_OPERATOR_SOURCE_HASH_HIGH,
-      NTA_OPERATOR_PLAN_HASH_LOW,
-      NTA_OPERATOR_PLAN_HASH_HIGH,
-  };
-  return &plan;
-}
-
-extern "C" __attribute__((visibility("default"))) std::uint32_t
-nta_jit_abi_version() {
-  return nta::abi::Version;
-}
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_invalidate_cached_objects(void *runtime, std::uint32_t firstObject,
@@ -203,11 +96,12 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
                   const nta::abi::WorkItem *workItems,
                   const nta::abi::AcquireRequirement *dependencies,
                   std::uint32_t workItemCount) {
+  const std::uint32_t workItem = blockIdx.x * blockDim.x + threadIdx.x;
   if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
-      threadIdx.x != 0 || blockIdx.x >= workItemCount) {
+      workItem >= workItemCount) {
     return;
   }
-  const nta::abi::WorkItem item = workItems[blockIdx.x];
+  const nta::abi::WorkItem item = workItems[workItem];
   if (item.requestSlot >= runtime->requestCapacity ||
       item.workTicket >= runtime->workTicketCapacity ||
       item.reductionGroup >= runtime->workTicketCapacity ||
@@ -225,12 +119,23 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
     ticket.reductionGroup = item.reductionGroup;
     ticket.contributorCount = item.contributorCount;
   }
-  const std::uint32_t generation =
-      runtime->requests[item.requestSlot].generation;
-  const bool available = nta_acquire_set_slow(
+  const nta::abi::RequestContext &request = runtime->requests[item.requestSlot];
+  const std::uint32_t generation = request.generation;
+  std::uint64_t deadlineClock = request.deadlineClock;
+  if (item.readyDeadlineOffsetNs != 0) {
+    const std::uint64_t workDeadline = nta::device::saturatingAdd(
+        runtime->epochStartClock, item.readyDeadlineOffsetNs);
+    if (deadlineClock == 0 || workDeadline < deadlineClock) {
+      deadlineClock = workDeadline;
+    }
+  }
+  // Each thread is the designated leader for one independent work item. The
+  // leader entry point deliberately does not assume physical lane zero; CTA
+  // numerical kernels retain their collective nta_acquire_set_slow contract.
+  const bool available = nta_acquire_set_leader_with_deadline(
       runtime, item.requestSlot, generation,
       dependencies + item.dependencyBegin, item.dependencyCount,
-      item.directDependencyCount, item.workTicket);
+      item.directDependencyCount, item.workTicket, deadlineClock, true);
   if (nta::device::ticketMatches(runtime, ticket, item.requestSlot,
                                  generation)) {
     ticket.logicalTile = item.logicalWork;
@@ -260,6 +165,71 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
   }
 }
 
+namespace nta::jit {
+
+__device__ __forceinline__ void
+queueDiscoveredIntents(abi::RuntimeView *runtime) {
+  if (runtime == nullptr || runtime->intents == nullptr ||
+      runtime->intentPool == nullptr) {
+    return;
+  }
+  for (std::uint32_t index = 0; index < runtime->intentCapacity; ++index) {
+    abi::IntentSlot &slot = runtime->intents[index];
+    if (atomicAdd(&slot.intent.valid, 0U) != 1U ||
+        slot.epoch != device::currentEpoch(runtime)) {
+      continue;
+    }
+    const auto source = static_cast<abi::SourceKind>(slot.sourceKind);
+    if (!device::backendAcceptsIntent(runtime, source)) {
+      continue;
+    }
+    if (!device::queueIntent(runtime, slot, source)) {
+      atomicAdd(&runtime->intentPool->overflow, 1U);
+    }
+  }
+}
+
+} // namespace nta::jit
+
+// Discovery is embarrassingly parallel until intents enter one backend EDF
+// heap. Let discovery threads publish lock-free intent slots, then have one
+// finite builder insert them without thousands of resident threads spinning
+// on the same device mutex. The heap ordering remains the canonical EDF
+// comparator; only construction ownership changes.
+extern "C" __global__ void
+nta_queue_discovered_intents(nta::abi::RuntimeView *runtime) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  nta::jit::queueDiscoveredIntents(runtime);
+}
+
+// Prove that a finite NVMe discovery image is already laid out in the exact
+// EDF/tie-break order used by the generic queue. The proof also requires the
+// collision-free objectSlot==intentSlot mapping produced by typed SGLang
+// acquisition windows. An unsorted or collided image is not an error: it is
+// queued into the generic heap in this same stream-ordered step.
+extern "C" __global__ void nta_validate_ordered_nvme_intents(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
+    std::uint32_t intentCount) {
+  using namespace nta;
+  if (runtime == nullptr || blockIdx.x != 0 || threadIdx.x != 0 ||
+      runtime->intents == nullptr || runtime->intentPool == nullptr ||
+      firstIntent > runtime->intentCapacity ||
+      intentCount > runtime->intentCapacity - firstIntent) {
+    return;
+  }
+  abi::IntentQueueControl *control =
+      device::intentQueueControl(runtime, abi::SourceKind::Nvme);
+  if (control == nullptr) {
+    return;
+  }
+  if (!device::validateOrderedIntentWindow(
+          runtime, abi::SourceKind::Nvme, firstIntent, intentCount)) {
+    nta::jit::queueDiscoveredIntents(runtime);
+  }
+}
+
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_discover_work(void *runtime, const void *workItems,
                       const void *dependencies, std::uint32_t workItemCount,
@@ -268,11 +238,164 @@ nta_jit_discover_work(void *runtime, const void *workItems,
       workItemCount == 0) {
     return cudaErrorInvalidValue;
   }
-  nta_discover_work<<<workItemCount, 1, 0, stream>>>(
+  constexpr std::uint32_t threads = 256;
+  nta_discover_work<<<(workItemCount + threads - 1U) / threads, threads, 0,
+                      stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime),
       static_cast<const nta::abi::WorkItem *>(workItems),
       static_cast<const nta::abi::AcquireRequirement *>(dependencies),
       workItemCount);
+  nta_queue_discovered_intents<<<1, 1, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime));
+  return nta::jit::launchStatus();
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_discover_work_ordered_nvme(
+    void *runtime, const void *workItems, const void *dependencies,
+    std::uint32_t workItemCount, std::uint32_t firstIntent,
+    std::uint32_t intentCount, cudaStream_t stream) {
+  if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
+      workItemCount == 0 || intentCount == 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr std::uint32_t threads = 256;
+  auto *view = static_cast<nta::abi::RuntimeView *>(runtime);
+  nta_discover_work<<<(workItemCount + threads - 1U) / threads, threads, 0,
+                      stream>>>(
+      view, static_cast<const nta::abi::WorkItem *>(workItems),
+      static_cast<const nta::abi::AcquireRequirement *>(dependencies),
+      workItemCount);
+  cudaError_t status = nta::jit::launchStatus();
+  if (status != cudaSuccess) {
+    return status;
+  }
+  nta_validate_ordered_nvme_intents<<<1, 1, 0, stream>>>(
+      view, firstIntent, intentCount);
+  return nta::jit::launchStatus();
+}
+
+// Freeze one exact runnable-queue window on the numerical stream.  readyCount
+// remains producer-owned, so a progress stream may append the next wave while
+// attention consumes [readyHead, readyWindowEnd).  Advancing readyHead here is
+// safe because this launcher is ordered after the preceding numerical kernel
+// on the same stream.
+extern "C" __global__ void
+nta_prepare_ready_window(nta::abi::RuntimeView *runtime,
+                         std::uint32_t maximumWork) {
+  if (blockIdx.x != 0 || threadIdx.x != 0 || runtime == nullptr) {
+    return;
+  }
+  if (maximumWork == 0 || runtime->readyHead == nullptr ||
+      runtime->readyCount == nullptr || runtime->readyWorkTickets == nullptr) {
+    atomicAdd(&runtime->failedCount, 1U);
+    atomicAdd(&runtime->stickyFailedCount, 1U);
+    return;
+  }
+  const std::uint32_t head = atomicAdd(runtime->readyHead, 0U);
+  const std::uint32_t previousEnd = runtime->readyWindowEnd;
+  const std::uint32_t ready = atomicAdd(runtime->readyCount, 0U);
+  if (head > previousEnd || previousEnd > ready ||
+      ready > runtime->workTicketCapacity) {
+    atomicAdd(&runtime->failedCount, 1U);
+    atomicAdd(&runtime->stickyFailedCount, 1U);
+    return;
+  }
+  atomicExch(runtime->readyHead, previousEnd);
+  const std::uint32_t available = ready - previousEnd;
+  runtime->readyWindowEnd =
+      previousEnd + (available < maximumWork ? available : maximumWork);
+  __threadfence();
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_prepare_ready_window(void *runtime, std::uint32_t maximumWork,
+                             cudaStream_t stream) {
+  if (runtime == nullptr || maximumWork == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_prepare_ready_window<<<1, 1, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), maximumWork);
+  return nta::jit::launchStatus();
+}
+
+// Build one immutable, event-ordered consumer partition.  Proactive transport
+// owns data readiness and publishes a CUDA event; the attention plan owns only
+// the exact CTA-to-request map and whether each work item is resident or waits
+// for that event.  Keeping this partition in the existing runnable queue avoids
+// rebuilding object requirements or running dependency discovery for every
+// transformer layer.
+extern "C" __global__ void nta_prepare_event_work_partition(
+    nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *workItems,
+    std::uint32_t workItemCount, std::uint32_t directWorkCount) {
+  if (blockIdx.x != 0 || threadIdx.x != 0 || runtime == nullptr ||
+      workItems == nullptr) {
+    return;
+  }
+  if (workItemCount == 0 || directWorkCount == 0 ||
+      directWorkCount >= workItemCount ||
+      workItemCount > runtime->workTicketCapacity ||
+      runtime->readyWorkTickets == nullptr || runtime->readyCount == nullptr ||
+      runtime->readyHead == nullptr) {
+    atomicAdd(&runtime->failedCount, 1U);
+    atomicAdd(&runtime->stickyFailedCount, 1U);
+    return;
+  }
+
+  std::uint32_t direct = 0;
+  std::uint32_t deferred = directWorkCount;
+  for (std::uint32_t work = 0; work < workItemCount; ++work) {
+    const nta::abi::WorkItem item = workItems[work];
+    if (item.dependencyCount == 0 ||
+        item.directDependencyCount > item.dependencyCount) {
+      atomicAdd(&runtime->failedCount, 1U);
+      atomicAdd(&runtime->stickyFailedCount, 1U);
+      atomicExch(runtime->readyCount, 0U);
+      return;
+    }
+    if (item.directDependencyCount == item.dependencyCount) {
+      if (direct >= directWorkCount) {
+        atomicAdd(&runtime->failedCount, 1U);
+        atomicAdd(&runtime->stickyFailedCount, 1U);
+        atomicExch(runtime->readyCount, 0U);
+        return;
+      }
+      runtime->readyWorkTickets[direct++] = work;
+    } else {
+      if (deferred >= workItemCount) {
+        atomicAdd(&runtime->failedCount, 1U);
+        atomicAdd(&runtime->stickyFailedCount, 1U);
+        atomicExch(runtime->readyCount, 0U);
+        return;
+      }
+      runtime->readyWorkTickets[deferred++] = work;
+    }
+  }
+  if (direct != directWorkCount || deferred != workItemCount) {
+    atomicAdd(&runtime->failedCount, 1U);
+    atomicAdd(&runtime->stickyFailedCount, 1U);
+    atomicExch(runtime->readyCount, 0U);
+    return;
+  }
+  atomicExch(runtime->readyHead, 0U);
+  runtime->readyWindowEnd = workItemCount;
+  __threadfence();
+  atomicExch(runtime->readyCount, workItemCount);
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_prepare_event_work_partition(void *runtime, const void *workItems,
+                                     std::uint32_t workItemCount,
+                                     std::uint32_t directWorkCount,
+                                     cudaStream_t stream) {
+  if (runtime == nullptr || workItems == nullptr || workItemCount == 0 ||
+      directWorkCount == 0 || directWorkCount >= workItemCount) {
+    return cudaErrorInvalidValue;
+  }
+  nta_prepare_event_work_partition<<<1, 1, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime),
+      static_cast<const nta::abi::WorkItem *>(workItems), workItemCount,
+      directWorkCount);
   return nta::jit::launchStatus();
 }
 
@@ -298,6 +421,33 @@ nta_jit_preload_host_pairs(void *runtime, std::uint32_t firstObject,
   nta_preload_indexed_host_pairs<<<pairCount * blocksPerPair, 1024, 0,
                                    stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime), firstObject, pairCount);
+  return nta::jit::launchStatus();
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_preload_host_pairs_ordered(void *runtime,
+                                   std::uint32_t firstObject,
+                                   std::uint32_t pairCount,
+                                   std::uint32_t workerBlocks,
+                                   std::uint32_t *taskHead,
+                                   cudaStream_t stream) {
+  constexpr std::uint32_t maxWorkerBlocks = 64;
+  const std::uint64_t taskCount64 = static_cast<std::uint64_t>(pairCount) * 2U;
+  if (runtime == nullptr || pairCount == 0 || workerBlocks == 0 ||
+      workerBlocks > maxWorkerBlocks || taskHead == nullptr ||
+      taskCount64 > UINT32_MAX) {
+    return cudaErrorInvalidValue;
+  }
+  cudaError_t status = cudaMemsetAsync(taskHead, 0, sizeof(*taskHead), stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const std::uint32_t taskCount = static_cast<std::uint32_t>(taskCount64);
+  const std::uint32_t blocks =
+      workerBlocks < taskCount ? workerBlocks : taskCount;
+  nta_preload_indexed_host_pairs_ordered<<<blocks, 1024, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), firstObject, pairCount,
+      taskHead);
   return nta::jit::launchStatus();
 }
 
@@ -1075,6 +1225,7 @@ nta_jit_progress_validated_indexed_host_range(void *runtime,
                                               std::uint32_t firstObject,
                                               std::uint32_t objectCount,
                                               cudaStream_t stream) {
+  constexpr std::uint32_t claimThreads = 256;
   constexpr std::uint32_t copyThreads = 1024;
   constexpr std::uint32_t objectsPerGroup = 2;
   constexpr std::uint32_t blocksPerObject = 2;
@@ -1083,12 +1234,21 @@ nta_jit_progress_validated_indexed_host_range(void *runtime,
     return cudaErrorInvalidValue;
   }
   auto *view = static_cast<nta::abi::RuntimeView *>(runtime);
+  // Validation proves index bounds only.  Claiming remains an explicit
+  // transport-scheduler operation so a validated object can also flow through
+  // the EDF intent queue without being stolen during discovery.
+  nta_claim_indexed_host_range<<<objectCount, claimThreads, 0, stream>>>(
+      view, firstObject, objectCount);
+  cudaError_t status = nta::jit::launchStatus();
+  if (status != cudaSuccess) {
+    return status;
+  }
   const std::uint32_t objectGroups =
       (objectCount + objectsPerGroup - 1U) / objectsPerGroup;
   nta_copy_indexed_host_range<<<objectGroups * blocksPerObject, copyThreads, 0,
                                 stream>>>(view, firstObject, objectCount,
                                           blocksPerObject);
-  cudaError_t status = nta::jit::launchStatus();
+  status = nta::jit::launchStatus();
   if (status != cudaSuccess) {
     return status;
   }
@@ -1108,6 +1268,7 @@ extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_progress_validated_indexed_host_range_parallel(
     void *runtime, std::uint32_t firstObject, std::uint32_t objectCount,
     std::uint32_t copyBlocksPerGroup, cudaStream_t stream) {
+  constexpr std::uint32_t claimThreads = 256;
   constexpr std::uint32_t copyThreads = 1024;
   constexpr std::uint32_t objectsPerGroup = 2;
   constexpr std::uint32_t finalizeThreads = 256;
@@ -1122,10 +1283,16 @@ nta_jit_progress_validated_indexed_host_range_parallel(
     return cudaErrorInvalidValue;
   }
   auto *view = static_cast<nta::abi::RuntimeView *>(runtime);
+  nta_claim_indexed_host_range<<<objectCount, claimThreads, 0, stream>>>(
+      view, firstObject, objectCount);
+  cudaError_t status = nta::jit::launchStatus();
+  if (status != cudaSuccess) {
+    return status;
+  }
   nta_copy_indexed_host_range<<<objectGroups * copyBlocksPerGroup, copyThreads,
                                 0, stream>>>(view, firstObject, objectCount,
                                              copyBlocksPerGroup);
-  cudaError_t status = nta::jit::launchStatus();
+  status = nta::jit::launchStatus();
   if (status != cudaSuccess) {
     return status;
   }
@@ -1165,6 +1332,22 @@ nta_jit_progress_nvme_until_idle(void *runtime, std::uint32_t issueBudget,
   nta_progress_nvme_until_idle<<<1, 32, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime), issueBudget,
       completionBudget, timeoutNs);
+  return nta::jit::launchStatus();
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_progress_nvme_ordered_until_range_terminal(
+    void *runtime, std::uint32_t firstIntent, std::uint32_t intentCount,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint32_t issueBudget, std::uint32_t completionBudget,
+    std::uint64_t timeoutNs, cudaStream_t stream) {
+  if (runtime == nullptr || intentCount == 0 || objectCount == 0 ||
+      issueBudget == 0 || completionBudget == 0 || timeoutNs == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_progress_nvme_ordered_until_range_terminal<<<1, 32, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), firstIntent, intentCount,
+      firstObject, objectCount, issueBudget, completionBudget, timeoutNs);
   return nta::jit::launchStatus();
 }
 

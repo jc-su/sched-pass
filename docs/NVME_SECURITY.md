@@ -17,7 +17,7 @@ instrumented GPU consumer
   -> GPU-owned NVMe SQ/CQ and doorbell
   -> VFIO-owned NVMe controller
   -> PCIe DMA through a translated IOMMUFD domain
-  -> CUDA HBM pinned with NVIDIA persistent peer pages
+  -> CUDA HBM imported through a typed setup-time mapping lease
 ```
 
 The CPU initializes and tears down the controller. It does not select
@@ -30,17 +30,15 @@ demand to queue submission and consumption.
 implicit fallback for `NvmeDmaTarget::HbmPeer`; direct-HBM construction fails
 closed if any required capability is absent.
 
-## Why this is not the DMA-BUF/PAL design
+## Mapping backends
 
-Linux 7.0 `IOMMU_IOAS_MAP_FILE` does not generically import an NVIDIA CUDA
-DMA-BUF into an attached VFIO device domain. The proposed DMA-BUF Physical
-Address List mapping type is not a usable upstream userspace contract on this
-host, and the NVIDIA exporter does not supply that mapping type. The earlier
-DMA-BUF/VMM prototype could create an export object but the attached-domain map
-failed with `EINVAL`; that is a rejected alternative, not the current path.
+Two implementations sit behind the same typed setup-time mapping lease. Neither
+one participates in queue submission, completion polling, or payload movement
+after a resource has been published.
 
-The narrow `nta_nvme_p2p` bridge instead uses NVIDIA's persistent peer-memory
-API:
+The only implementation with sealed qualification on this platform family is
+`nvidia-peer-pages`. The narrow `nta_nvme_p2p` bridge uses NVIDIA's persistent
+peer-memory API:
 
 1. `nvidia_p2p_get_pages_persistent` pins a 64-KiB-aligned CUDA allocation.
 2. `nvidia_p2p_dma_map_pages` returns peer bus addresses for the selected NVMe
@@ -50,16 +48,37 @@ API:
 4. A typed, per-open-file handle owns the PTEs, NVIDIA DMA mapping, page table,
    and PCI-device reference until explicit unmap or file close.
 
-The explicit PTE step is required. NVIDIA's DMA API does not populate the
-separately attached unmanaged IOMMUFD domain; omitting it produced first-level
-DMAR faults and no HBM payload even though peer-page pinning itself succeeded.
+The fallback's explicit PTE step is required. NVIDIA's DMA API does not
+populate the separately attached unmanaged IOMMUFD domain; omitting it produced
+first-level DMAR faults and no HBM payload even though peer-page pinning itself
+succeeded.
 
-The bridge accepts only a real NVMe PCI class bound to `vfio-pci`, requires an
-IOMMUFD paging-domain cookie, rejects colliding/misaligned/out-of-aperture
-IOVAs, rolls back partial maps, never reuses a wrapped handle, and unmaps IOMMU
-PTEs before releasing NVIDIA peer pages. Its UAPI is deliberately typed to one
-GPU range, one NVMe BDF, and one owned mapping handle; it is not a general
-physical-address export service.
+That bridge accepts only a real NVMe PCI class bound to `vfio-pci`, requires a
+translated paging domain for that function, rejects
+colliding/misaligned/out-of-aperture IOVAs, rolls back partial maps, never
+reuses a wrapped handle, and unmaps IOMMU PTEs before releasing NVIDIA peer
+pages. It does not inspect removed/private IOMMUFD cookie fields. Its UAPI is
+deliberately typed to one GPU range, one NVMe BDF, and one owned mapping handle;
+it is not a general physical-address export service.
+
+`cuda-dmabuf-ioas` is a module-free candidate, not a qualified capability on
+the current platform. It exports a page-aligned CUDA HBM range as a DMA-BUF and
+attempts to import that fd into the controller's private IOAS with
+`IOMMU_IOAS_MAP_FILE`. Linux 7.0's UAPI describes this operation as mapping a
+memfd; the existence of the ioctl is not evidence that an arbitrary CUDA
+DMA-BUF exporter is accepted. On Linux `7.0.0-30-generic` with NVIDIA `595.84`,
+the CUDA export succeeds but the IOAS import is rejected with
+`EOPNOTSUPP`. The proposed DMA-BUF Physical Address List mapping type is a
+separate RFC and is not a contract used by this tree.
+
+The `Auto` policy probes `cuda-dmabuf-ioas` once and then falls back to
+`nvidia-peer-pages`; the successful backend is frozen for the transport.
+Artifact claims should instead select an explicit policy. An explicit policy
+is propagated into native transport construction before the first mapping, so
+`CudaDmaBufIoas` cannot touch peer pages and `NvidiaPeerPages` cannot attempt a
+DMA-BUF import. Support is established only by an end-to-end qualified read,
+not by kernel/CUDA version checks, a successful CUDA export, or a backend label
+observed after construction.
 
 ## Enforced containment
 
@@ -94,12 +113,12 @@ protection, queue-count negotiation, admin commands, and I/O queue
 create/delete. It performs a bounded CPU-issued READ before publication to
 validate queue creation and ordinary IOMMU mappings.
 
-The mapping backend is a typed RAII lease: host IOAS and NVIDIA peer-page
-mapping tokens cannot be interchanged, and leases are created/released only at
-buffer lifetime boundaries. The GPU queue receives the resulting PRP/page-list
-address once; the device acquisition path contains no ioctl or host callback
-per request. Mapping caches reduce repeated setup without moving any payload
-through host memory.
+The mapping backend is a typed RAII lease: host-user, CUDA-DMA-BUF, and NVIDIA
+peer-page tokens cannot be interchanged, and leases are created/released only at
+resource lifetime boundaries. The GPU queue receives the resulting
+PRP/page-list address once; the device acquisition path contains no ioctl or
+host callback per request. Mapping caches reduce repeated setup without moving
+any payload through host memory.
 
 The GPU data plane receives only the engine-neutral `NvmeQueueView`. Before the
 queue becomes usable, the runtime registers the isolated doorbell page with
@@ -124,10 +143,11 @@ HBM/DMA destination until its recorded consumer event completes, so the
 steady-state path does not call `cudaDeviceSynchronize()` or issue a per-request
 mapping ioctl. Whole-device synchronization is reserved for runtime/transport
 destruction and exceptional recovery. Destruction then marks the queue
-inactive, deletes the I/O SQ/CQ, and only then releases peer mappings. A peer
-mapping release removes its PTEs from the still-attached IOMMUFD domain before
-NVIDIA DMA unmap and persistent page release. The mapper file also releases
-every remaining handle on close.
+inactive, deletes the I/O SQ/CQ, and only then releases HBM mappings. A DMA-BUF
+lease first unmaps its IOAS range and then closes the fd. A peer-page fallback
+lease removes its PTEs from the still-attached IOMMUFD domain before NVIDIA DMA
+unmap and persistent page release. The fallback mapper file also releases every
+remaining handle on close.
 
 If queue deletion or an admin operation fails, the runtime disables bus
 mastering and resets the VFIO function before releasing mappings. Whole-queue
@@ -142,8 +162,8 @@ namespace ID.
 
 ## Qualification contract
 
-Build/load the kernel-specific bridge, run read-only preflight, and only then
-authorize a transactional bind:
+Build the mapper required by the current qualified path, run read-only
+preflight, and only then authorize a transactional bind:
 
 ```bash
 ./scripts/nta-nvme-p2p-module.sh build
@@ -157,6 +177,7 @@ python3 scripts/run-nvme-qualification.py \
   --bdf 0000:d8:00.0 \
   --dma-target hbm-peer \
   --media-policy trusted-read-only-code \
+  --require-hbm-backend nvidia-peer-pages \
   --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 100 \
   --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
   --allow-device-rebind --require-ready \
@@ -172,19 +193,22 @@ and after the run, and restores the original driver in all normal/error paths.
 
 `ready` requires all of the following: exact selected data verified, zero
 verification/transport failures, zero outstanding commands, GPU doorbell
-qualification, translated IOMMU, `nvidia-peer-pages` HBM mapping, and no new
-target DMAR faults. `performance_qualified` is a separate comparison against
-the configured matched-`fio` threshold. A correct but slow transport is never
-reported as a performance win.
+qualification, translated IOMMU, native enforcement of the requested mapping
+policy, a matching direct-HBM backend, and no new target DMAR faults.
+`performance_qualified` is a separate comparison against the configured
+matched-`fio` threshold. A correct but slow transport is never reported as a
+performance win. `transport_ready` records the physical correctness result,
+while `provenance_ready` requires a clean, revision-addressable worktree;
+formal `qualified`/`ready` requires both plus the performance threshold.
 
 The rebind flag authorizes temporary driver ownership only. It does not
 authorize media formatting, filesystem creation, writes, discard, sanitize,
 or deletion. The generated application path issues READ commands only, and
 `fio` is invoked with `--readonly --rw=read`.
 
-## Tested qualification baseline
+## Historical tested qualification baseline
 
-The currently qualified platform runs Linux `6.14.0-1009-intel`, NVIDIA driver `595.84`,
+The sealed peer-pages baseline ran Linux `6.14.0-1009-intel`, NVIDIA driver `595.84`,
 CUDA `13.2`, an RTX PRO 6000 Blackwell GPU, and controller `0000:d8:00.0`
 (Dell/KIOXIA CD8P, 1.92 TB). The controller lacks Namespace Write Protection
 (`NWPC=0`), so this run used the explicit trusted READ-only-code policy.
@@ -228,12 +252,12 @@ This is one-platform transport/correctness/performance evidence. It does not
 by itself establish serving-level speedup, topology portability, multi-GPU
 support, or general NVMe-driver robustness.
 
-The peer bridge deliberately uses only module-facing IOMMU interfaces. It does
-not inspect private `iommu_domain` cookie fields that changed across kernel
-releases; the safety boundary is the explicit `vfio-pci` ownership check, a
-translated paging domain, and successful identity-PTE verification for every
-peer DMA address. `scripts/nta-nvme-p2p-module.sh build` is therefore a
-required kernel-header compatibility gate before loading the module.
+The optional peer bridge deliberately uses only module-facing IOMMU interfaces.
+It does not inspect private `iommu_domain` cookie fields that changed across
+kernel releases; the safety boundary is the explicit `vfio-pci` ownership
+check, a translated paging domain, and successful identity-PTE verification
+for every peer DMA address. `scripts/nta-nvme-p2p-module.sh build` is therefore
+a required kernel-header compatibility gate only when selecting that fallback.
 
 ## Deliberate limits
 

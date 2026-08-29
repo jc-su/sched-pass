@@ -33,6 +33,27 @@ set(NTA_TEST_NVME_MEDIA_POLICY "$ENV{NTA_NVME_MEDIA_POLICY}" CACHE STRING
     "NVMe media policy for physical CTest")
 set(NTA_TEST_NVME_DMA_TARGET "$ENV{NTA_NVME_DMA_TARGET}" CACHE STRING
     "NVMe DMA destination for physical CTest")
+set(NTA_TEST_NVME_HBM_BACKEND "$ENV{NTA_NVME_HBM_BACKEND}" CACHE STRING
+    "Required HBM mapper for physical CTest")
+if(NOT NTA_TEST_NVME_HBM_BACKEND)
+  set(NTA_TEST_NVME_HBM_BACKEND "auto" CACHE STRING
+      "Required HBM mapper for physical CTest" FORCE)
+endif()
+set_property(CACHE NTA_TEST_NVME_HBM_BACKEND PROPERTY STRINGS
+             auto cuda-dmabuf-ioas nvidia-peer-pages)
+if(NOT NTA_TEST_NVME_HBM_BACKEND STREQUAL "auto" AND
+   NOT NTA_TEST_NVME_HBM_BACKEND STREQUAL "cuda-dmabuf-ioas" AND
+   NOT NTA_TEST_NVME_HBM_BACKEND STREQUAL "nvidia-peer-pages")
+  message(FATAL_ERROR
+    "NTA_TEST_NVME_HBM_BACKEND must be auto, cuda-dmabuf-ioas, or "
+    "nvidia-peer-pages")
+endif()
+if(NTA_TEST_NVME_DMA_TARGET AND
+   NOT NTA_TEST_NVME_DMA_TARGET STREQUAL "hbm-peer" AND
+   NOT NTA_TEST_NVME_HBM_BACKEND STREQUAL "auto")
+  message(FATAL_ERROR
+    "an explicit NTA_TEST_NVME_HBM_BACKEND requires hbm-peer DMA")
+endif()
 set(NTA_TEST_NVME_USE_SUDO "OFF" CACHE STRING
     "Run explicit physical NVMe CTest commands through sudo -n (OFF or ON)")
 set_property(CACHE NTA_TEST_NVME_USE_SUDO PROPERTY STRINGS OFF ON)
@@ -67,6 +88,8 @@ if(NTA_TEST_NVME_DMA_TARGET)
   list(APPEND NTA_TEST_NVME_ENVIRONMENT
        "NTA_NVME_DMA_TARGET=${NTA_TEST_NVME_DMA_TARGET}")
 endif()
+list(APPEND NTA_TEST_NVME_ENVIRONMENT
+     "NTA_NVME_HBM_BACKEND=${NTA_TEST_NVME_HBM_BACKEND}")
 if(NTA_TEST_NVME_ENDPOINT AND NTA_TEST_NVME_MEDIA_POLICY)
   list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "${NTA_TEST_NVME_MEDIA_POLICY}")
 elseif(NTA_TEST_NVME_ENDPOINT)
@@ -76,6 +99,10 @@ if(NTA_TEST_NVME_ENDPOINT AND NTA_TEST_NVME_DMA_TARGET)
   list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "${NTA_TEST_NVME_DMA_TARGET}")
 elseif(NTA_TEST_NVME_ENDPOINT)
   list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS "hbm-peer")
+endif()
+if(NTA_TEST_NVME_ENDPOINT)
+  list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS
+       "${NTA_TEST_NVME_HBM_BACKEND}")
 endif()
 set(NTA_TEST_NVME_COMMAND_PREFIX)
 if(NTA_TEST_NVME_USE_SUDO STREQUAL "ON")
@@ -282,6 +309,27 @@ add_test(NAME nta-abi COMMAND nta-abi-test)
 
 if(Python3_Interpreter_FOUND)
   add_test(
+    NAME nta-acquisition-scheduler
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/acquisition_scheduler.py
+  )
+  set_tests_properties(
+    nta-acquisition-scheduler PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-flashinfer-jit-materialization
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/flashinfer_jit.py
+  )
+  set_tests_properties(
+    nta-flashinfer-jit-materialization PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    LABELS "contract;jit"
+  )
+  add_test(
     NAME nta-execution-planner
     COMMAND
       ${Python3_EXECUTABLE}
@@ -436,8 +484,38 @@ if(Python3_Interpreter_FOUND)
       ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_lease_topology.py
   )
+  add_test(
+    NAME nta-sglang-execution
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_execution.py
+  )
+  set_tests_properties(
+    nta-sglang-execution PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
   set_tests_properties(
     nta-sglang-lease-topology PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-nvme-materialization
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/nvme_materialization.py
+  )
+  set_tests_properties(
+    nta-nvme-materialization PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+  )
+  add_test(
+    NAME nta-sglang-nvme
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_nvme.py
+  )
+  set_tests_properties(
+    nta-sglang-nvme PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
   )
   add_test(
@@ -644,6 +722,7 @@ if(NTA_ENABLE_CUDA)
     runtime/host/CxlRuntime.cpp
     runtime/host/DeviceWorkPlan.cpp
     runtime/host/FinitePhase.cpp
+    runtime/host/JitOperator.cpp
     runtime/host/JitPhase.cpp
     runtime/host/NvmeRuntime.cpp
     runtime/host/NvmeVfioControlPlane.cpp
@@ -700,15 +779,18 @@ if(NTA_ENABLE_CUDA)
       -I${CMAKE_CURRENT_SOURCE_DIR}/include
       -I${CMAKE_CURRENT_SOURCE_DIR}
       ${CMAKE_CURRENT_SOURCE_DIR}/runtime/device/TransportProgram.cu
+      -L${NTA_CUDA_ROOT}/targets/x86_64-linux/lib
+      -lcudart
       -o "${NTA_TRANSPORT_PROGRAM}"
     DEPENDS
       runtime/device/TransportProgram.cu
       runtime/device/JitRuntime.cuh
-      runtime/device/TypedInstrumentation.cuh
+      runtime/device/OperatorMetadata.cuh
       runtime/device/Acquire.cuh
       include/nta/KernelPolicy.cuh
       include/nta/OperatorContract.h
       include/nta/RuntimeABI.h
+      include/nta/TicketProtocol.cuh
       tools/jit/nvcc_clang.py
       tools/jit/clang_cuda_prelude.h
       tools/jit/cuda_toolkit.py
@@ -809,6 +891,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_evidence.py
     )
     add_test(
+      NAME nta-serving-path-evidence
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_path_evidence.py
+    )
+    add_test(
       NAME nta-stats-publisher
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/stats_publisher.py
@@ -867,7 +954,7 @@ if(NTA_ENABLE_CUDA)
       nta-request-slots nta-sglang-plugin nta-sglang-storage-connector
       nta-bounded-staging
       nta-qualification-runner
-      nta-serving-evidence nta-jit-operator-family
+      nta-serving-evidence nta-serving-path-evidence nta-jit-operator-family
       nta-stats-publisher nta-vllm-lifecycle
       nta-opportunity-analysis
       nta-opportunity-study nta-tier-qualification
@@ -910,6 +997,39 @@ if(NTA_ENABLE_CUDA)
     COMMAND nta-jit-phase-load "${NTA_TRANSPORT_PROGRAM}"
   )
   set_tests_properties(nta-transport-program-load PROPERTIES TIMEOUT 30)
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME nta-transport-program-standalone-load
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/transport_program_standalone.py
+              "${NTA_TRANSPORT_PROGRAM}"
+    )
+    set_tests_properties(nta-transport-program-standalone-load
+                         PROPERTIES TIMEOUT 30)
+  endif()
+  add_executable(nta-jit-operator-load tests/runtime/JitOperatorLoad.cpp)
+  target_link_libraries(nta-jit-operator-load PRIVATE nta-runtime-host)
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-jit-operator-load PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME nta-ordered-host-preload-gpu
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/ordered_host_preload.py
+              "${NTA_TRANSPORT_PROGRAM}"
+    )
+    set_tests_properties(
+      nta-ordered-host-preload-gpu
+      PROPERTIES
+        ENVIRONMENT
+          "NTA_RUNTIME_LIBRARY=$<TARGET_FILE:nta-runtime>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        RUN_SERIAL TRUE
+        TIMEOUT 60
+    )
+  endif()
 
   find_program(
     NTA_PTXAS
@@ -1072,6 +1192,52 @@ if(Python3_Interpreter_FOUND)
     if(NTA_TEST_NVME_ENDPOINT AND NTA_TEST_NVME_REFERENCE AND
        NTA_TEST_NVME_MEDIA_POLICY AND
        NTA_TEST_NVME_DMA_TARGET STREQUAL "hbm-peer")
+      add_test(
+        NAME nta-sglang-nvme-physical
+        COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
+          --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --cache-root ${NTA_TEST_JIT_CACHE_ROOT}
+          --clang ${NTA_CLANG_CUDA}
+          --cuda-path ${NTA_CUDA_ROOT}
+          --
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_nvme_physical.py
+      )
+      set_tests_properties(
+        nta-sglang-nvme-physical PROPERTIES
+        RUN_SERIAL TRUE TIMEOUT 180 RESOURCE_LOCK nta_nvme_physical
+        LABELS "physical;correctness;nvme;sglang;pipeline"
+        PASS_REGULAR_EXPRESSION "sglang_nvme_physical=pass"
+        ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
+      )
+      add_test(
+        NAME nta-sglang-nvme-publication-performance
+        COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
+          --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --cache-root ${NTA_TEST_JIT_CACHE_ROOT}
+          --clang ${NTA_CLANG_CUDA}
+          --cuda-path ${NTA_CUDA_ROOT}
+          --
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/nvme/SglangPipelinePublication.py
+          --warmup=1
+          --trials=3
+          --minimum-publication-prepare-speedup=1.15
+          --minimum-publication-wall-speedup=1.02
+          --minimum-ordered-wall-speedup=1.25
+          --minimum-window-wall-speedup=1.03
+          --output=${CMAKE_CURRENT_BINARY_DIR}/physical-results/profiling/sglang-nvme-publication.json
+      )
+      set_tests_properties(
+        nta-sglang-nvme-publication-performance PROPERTIES
+        RUN_SERIAL TRUE TIMEOUT 300 RESOURCE_LOCK nta_nvme_physical
+        LABELS "physical;performance;nvme;sglang;pipeline"
+        ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
+      )
       add_test(
         NAME nta-flashinfer-nvme-numerical
         COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
@@ -1265,6 +1431,7 @@ if(Python3_Interpreter_FOUND)
         --queue-depth=64
         --media-policy=${NTA_TEST_NVME_MEDIA_POLICY}
         --dma-target=hbm-peer
+        --hbm-backend=${NTA_TEST_NVME_HBM_BACKEND}
         --reference=${NTA_TEST_NVME_REFERENCE}
         --source-offset=512
         --bytes=65536
@@ -1695,7 +1862,7 @@ if(Python3_Interpreter_FOUND)
   )
   set_tests_properties(nta-paged-attention-gpu PROPERTIES TIMEOUT 60)
   add_test(
-    NAME nta-paged-attention-sparse-late-bound-gpu
+    NAME nta-paged-attention-sparse-partial-acquire-gpu
     COMMAND
       $<TARGET_FILE:nta-paged-attention>
       --mode=host-staged
@@ -1703,15 +1870,76 @@ if(Python3_Interpreter_FOUND)
       --min-pages=4
       --max-pages=6
       --sparse-top-k=2
+      --sparse-policy=partial-acquire
+      --iterations=2
+      --progress-rounds=2
+      --request-credit-pages=1
+  )
+  set_tests_properties(
+    nta-paged-attention-sparse-partial-acquire-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "policy=partial-acquire.*work_granularity=selected-page.*verification_failures=0"
+  )
+  add_test(
+    NAME nta-paged-attention-sparse-whole-acquire-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=host-staged
+      --requests=4
+      --min-pages=4
+      --max-pages=6
+      --sparse-top-k=2
+      --sparse-policy=whole-acquire
+      --iterations=2
+      --progress-rounds=2
+      --request-credit-pages=1
+  )
+  set_tests_properties(
+    nta-paged-attention-sparse-whole-acquire-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "policy=whole-acquire.*work_granularity=request-selection.*verification_failures=0"
+  )
+  add_test(
+    NAME nta-paged-attention-sparse-selected-gather-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=host-staged
+      --requests=4
+      --min-pages=4
+      --max-pages=6
+      --sparse-top-k=2
+      --sparse-policy=selected-gather
       --iterations=2
       --progress-rounds=1
       --request-credit-pages=2
   )
   set_tests_properties(
-    nta-paged-attention-sparse-late-bound-gpu PROPERTIES
+    nta-paged-attention-sparse-selected-gather-gpu PROPERTIES
     TIMEOUT 60
     PASS_REGULAR_EXPRESSION
-      "demand_visibility=gpu-cta.*verification_failures=0"
+      "policy=selected-gather.*overfetch_ratio=1.00.*verification_failures=0"
+  )
+  add_test(
+    NAME nta-paged-attention-sparse-selected-partial-gpu
+    COMMAND
+      $<TARGET_FILE:nta-paged-attention>
+      --mode=host-staged
+      --requests=4
+      --min-pages=4
+      --max-pages=6
+      --sparse-top-k=2
+      --sparse-policy=selected-partial
+      --iterations=2
+      --progress-rounds=1
+      --request-credit-pages=2
+  )
+  set_tests_properties(
+    nta-paged-attention-sparse-selected-partial-gpu PROPERTIES
+    TIMEOUT 60
+    PASS_REGULAR_EXPRESSION
+      "policy=selected-partial.*work_granularity=selected-page.*overfetch_ratio=1.00.*verification_failures=0"
   )
   add_test(
     NAME nta-paged-attention-sparse-overfetch-gpu
@@ -1851,7 +2079,7 @@ if(Python3_Interpreter_FOUND)
         --group-tokens 64
         --workspace-mib 64
         --warmup 1
-        --iterations 1
+        --iterations 10
         --trials 1
         --verify-graph
         --verify-lifecycle

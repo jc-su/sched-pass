@@ -44,10 +44,10 @@ The core modules are:
 
 - `python/nta_runtime/work_unit.py`: exact demand, identity, availability,
   and heterogeneous batches;
-- `python/nta_runtime/execution_protocol.py`: protocol state machine and
-  transparent granularity cost model;
-- `python/nta_runtime/execution_core.py`: one execution session for one
-  attention launch;
+- `python/nta_runtime/execution_protocol.py`: protocol configuration and the
+  executable-specification state machine used by tests and verification;
+- `python/nta_runtime/execution_core.py`: immutable production execution plans
+  plus the opt-in semantic verification session;
 - `python/nta_runtime/execution_planner.py`: measured host/device planning;
 - `python/nta_runtime/adapters/`: engine-specific metadata projections;
 - `python/nta_runtime/engines/sglang_state.py`: engine-neutral forward state,

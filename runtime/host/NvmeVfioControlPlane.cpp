@@ -3,6 +3,8 @@
 #include "nta/NvmeP2pUapi.h"
 #include "nta/RuntimeABI.h"
 
+#include <cuda.h>
+
 #include <linux/iommufd.h>
 #include <linux/vfio.h>
 
@@ -156,6 +158,20 @@ private:
   int descriptor_ = -1;
 };
 
+class DmaBufMappingUnavailable final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+std::string cudaFailure(CUresult status) {
+  const char *name = nullptr;
+  const char *description = nullptr;
+  (void)cuGetErrorName(status, &name);
+  (void)cuGetErrorString(status, &description);
+  return std::string(name == nullptr ? "CUDA_ERROR_UNKNOWN" : name) + ": " +
+         (description == nullptr ? "unknown CUDA driver failure" : description);
+}
+
 std::string parseBdf(const std::string &endpoint) {
   constexpr std::string_view prefix = "vfio:";
   if (!endpoint.starts_with(prefix)) {
@@ -269,8 +285,9 @@ struct VfioNvmeMappingContext {
 
 class VfioNvmeMappingBackend final : public NvmeMappingBackend {
 public:
-  explicit VfioNvmeMappingBackend(VfioNvmeMappingContext context)
-      : context_(context) {}
+  explicit VfioNvmeMappingBackend(VfioNvmeMappingContext context,
+                                  NvmeHbmMappingPolicy policy)
+      : context_(context), policy_(policy) {}
 
   ~VfioNvmeMappingBackend() override { shutdown(); }
 
@@ -302,7 +319,61 @@ public:
       throw std::invalid_argument(
           "NVMe HBM peer mapping must be 64 KiB aligned");
     }
-    return mapNvidiaPeerPages(gpuAddress, bytes);
+    switch (hbmBackend_.load(std::memory_order_acquire)) {
+    case NvmeHbmMappingBackend::CudaDmaBufIoas:
+      return mapCudaDmaBufIoas(gpuAddress, bytes);
+    case NvmeHbmMappingBackend::NvidiaPeerPages:
+      return mapNvidiaPeerPages(gpuAddress, bytes);
+    case NvmeHbmMappingBackend::Unavailable:
+      break;
+    }
+
+    if (policy_ == NvmeHbmMappingPolicy::CudaDmaBufIoas) {
+      try {
+        NvmeMapping mapping = mapCudaDmaBufIoas(gpuAddress, bytes);
+        hbmBackend_.store(NvmeHbmMappingBackend::CudaDmaBufIoas,
+                          std::memory_order_release);
+        return mapping;
+      } catch (const DmaBufMappingUnavailable &error) {
+        throw std::runtime_error(
+            "required CUDA DMA-BUF/IOAS HBM mapping is unavailable: " +
+            std::string(error.what()));
+      }
+    }
+    if (policy_ == NvmeHbmMappingPolicy::NvidiaPeerPages) {
+      NvmeMapping mapping = mapNvidiaPeerPages(gpuAddress, bytes);
+      hbmBackend_.store(NvmeHbmMappingBackend::NvidiaPeerPages,
+                        std::memory_order_release);
+      return mapping;
+    }
+    if (policy_ != NvmeHbmMappingPolicy::Auto) {
+      throw std::logic_error("invalid NVMe HBM mapping policy");
+    }
+
+    try {
+      NvmeMapping mapping = mapCudaDmaBufIoas(gpuAddress, bytes);
+      hbmBackend_.store(NvmeHbmMappingBackend::CudaDmaBufIoas,
+                        std::memory_order_release);
+      return mapping;
+    } catch (const DmaBufMappingUnavailable &dmaBufError) {
+      try {
+        NvmeMapping mapping = mapNvidiaPeerPages(gpuAddress, bytes);
+        hbmBackend_.store(NvmeHbmMappingBackend::NvidiaPeerPages,
+                          std::memory_order_release);
+        return mapping;
+      } catch (const std::exception &peerError) {
+        throw std::runtime_error(
+            "no direct NVMe-to-HBM mapping backend is available; CUDA "
+            "DMA-BUF/IOAS: " +
+            std::string(dmaBufError.what()) +
+            "; NVIDIA peer-pages fallback: " + peerError.what());
+      }
+    }
+  }
+
+  [[nodiscard]] NvmeHbmMappingBackend
+  hbmMappingBackend() const noexcept override {
+    return hbmBackend_.load(std::memory_order_acquire);
   }
 
   void release(NvmeMappingToken token) noexcept override {
@@ -322,6 +393,8 @@ public:
       dmaMappings_.erase(mapping);
     } else if (token.kind == NvmeMappingToken::Kind::NvidiaPeerPages) {
       unmapNvidiaPeerPages(token.value);
+    } else if (token.kind == NvmeMappingToken::Kind::CudaDmaBufIoas) {
+      unmapCudaDmaBufIoas(token.value);
     }
   }
 
@@ -335,6 +408,10 @@ public:
       }
     }
     peerMappings_.clear();
+    for (const auto &[iova, mapping] : dmaBufMappings_) {
+      unmapIoas(iova, mapping.bytes);
+    }
+    dmaBufMappings_.clear();
     for (const auto &[iova, bytes] : dmaMappings_) {
       unmapIoas(iova, bytes);
     }
@@ -343,6 +420,11 @@ public:
   }
 
 private:
+  struct DmaBufIoasMapping {
+    std::size_t bytes;
+    FileDescriptor dmaBuf;
+  };
+
   void ensureAvailable(const char *message) const {
     if (context_.quiesced || context_.fatal) {
       throw std::runtime_error(message);
@@ -357,12 +439,14 @@ private:
       }
       throw std::runtime_error("VFIO returned an invalid DMA mapping range");
     }
+    bool insertedMapping = false;
     try {
       const auto [mapping, inserted] = dmaMappings_.emplace(iova, bytes);
       if (!inserted) {
         throw std::runtime_error("VFIO returned a duplicate DMA IOVA");
       }
       (void)mapping;
+      insertedMapping = true;
       std::vector<std::uint64_t> pages;
       pages.reserve(bytes / context_.pageSize);
       for (std::size_t offset = 0; offset < bytes;
@@ -375,7 +459,9 @@ private:
       if (iova != 0) {
         unmapIoas(iova, bytes);
       }
-      dmaMappings_.erase(iova);
+      if (insertedMapping) {
+        dmaMappings_.erase(iova);
+      }
       throw;
     }
   }
@@ -406,7 +492,8 @@ private:
         std::stoul(context_.bdf.substr(8, 2), nullptr, 16));
     request.pci_function = static_cast<std::uint32_t>(
         std::stoul(context_.bdf.substr(11, 1), nullptr, 16));
-    request.dma_addresses = reinterpret_cast<std::uint64_t>(nativeAddresses.data());
+    request.dma_addresses =
+        reinterpret_cast<std::uint64_t>(nativeAddresses.data());
     request.dma_capacity = static_cast<std::uint32_t>(maximumEntries);
     if (::ioctl(peerMapper_.get(), NTA_NVME_P2P_IOCTL_MAP, &request) != 0) {
       throwSystem("NTA_NVME_P2P_IOCTL_MAP");
@@ -461,6 +548,94 @@ private:
     }
   }
 
+  NvmeMapping mapCudaDmaBufIoas(std::uint64_t gpuAddress, std::size_t bytes) {
+#ifdef IOMMU_IOAS_MAP_FILE
+    int descriptor = -1;
+    const CUresult exportStatus = cuMemGetHandleForAddressRange(
+        &descriptor, static_cast<CUdeviceptr>(gpuAddress), bytes,
+        CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+    if (exportStatus == CUDA_ERROR_NOT_SUPPORTED) {
+      throw DmaBufMappingUnavailable(cudaFailure(exportStatus));
+    }
+    if (exportStatus != CUDA_SUCCESS) {
+      throw std::runtime_error("export CUDA HBM as DMA-BUF failed: " +
+                               cudaFailure(exportStatus));
+    }
+    FileDescriptor dmaBuf(descriptor);
+    if (dmaBuf.get() < 0) {
+      throw std::runtime_error(
+          "CUDA DMA-BUF export returned an invalid file descriptor");
+    }
+
+    iommu_ioas_map_file request{};
+    request.size = sizeof(request);
+    request.flags = IOMMU_IOAS_MAP_READABLE | IOMMU_IOAS_MAP_WRITEABLE;
+    request.ioas_id = context_.ioasId;
+    request.fd = dmaBuf.get();
+    request.length = bytes;
+    if (::ioctl(context_.iommufd.get(), IOMMU_IOAS_MAP_FILE, &request) != 0) {
+      const int savedError = errno;
+      if (savedError == EINVAL || savedError == ENOTTY ||
+          savedError == EOPNOTSUPP) {
+        throw DmaBufMappingUnavailable(
+            std::system_error(savedError, std::generic_category(),
+                              "IOMMU_IOAS_MAP_FILE")
+                .what());
+      }
+      throw std::system_error(savedError, std::generic_category(),
+                              "IOMMU_IOAS_MAP_FILE");
+    }
+    const std::uint64_t iova = request.iova;
+    if (iova == 0 || iova % context_.pageSize != 0 || request.length != bytes ||
+        bytes > std::numeric_limits<std::uint64_t>::max() - iova) {
+      if (iova != 0) {
+        unmapIoas(iova, bytes);
+      }
+      throw std::runtime_error("IOMMUFD returned an invalid CUDA DMA-BUF IOVA");
+    }
+
+    bool insertedMapping = false;
+    try {
+      std::vector<std::uint64_t> pages;
+      pages.reserve(bytes / context_.pageSize);
+      for (std::size_t offset = 0; offset < bytes;
+           offset += context_.pageSize) {
+        pages.push_back(iova + offset);
+      }
+      const auto [ignored, inserted] = dmaBufMappings_.emplace(
+          iova, DmaBufIoasMapping{bytes, std::move(dmaBuf)});
+      (void)ignored;
+      if (!inserted) {
+        throw std::runtime_error(
+            "IOMMUFD returned a duplicate CUDA DMA-BUF IOVA");
+      }
+      insertedMapping = true;
+      return makeMapping({NvmeMappingToken::Kind::CudaDmaBufIoas, iova},
+                         std::move(pages));
+    } catch (...) {
+      if (insertedMapping) {
+        dmaBufMappings_.erase(iova);
+      }
+      unmapIoas(iova, bytes);
+      throw;
+    }
+#else
+    (void)gpuAddress;
+    (void)bytes;
+    throw DmaBufMappingUnavailable(
+        "build headers do not expose IOMMU_IOAS_MAP_FILE");
+#endif
+  }
+
+  void unmapCudaDmaBufIoas(std::uint64_t iova) noexcept {
+    const auto mapping = dmaBufMappings_.find(iova);
+    if (mapping == dmaBufMappings_.end()) {
+      return;
+    }
+    unmapIoas(mapping->first, mapping->second.bytes);
+    dmaBufMappings_.erase(mapping);
+  }
+
   void unmapNvidiaPeerPages(std::uint64_t handle) noexcept {
     if (peerMapper_.get() < 0 || peerMappings_.erase(handle) == 0) {
       return;
@@ -502,9 +677,13 @@ private:
   }
 
   VfioNvmeMappingContext context_;
+  NvmeHbmMappingPolicy policy_;
   FileDescriptor peerMapper_;
   std::unordered_map<std::uint64_t, std::size_t> dmaMappings_;
+  std::unordered_map<std::uint64_t, DmaBufIoasMapping> dmaBufMappings_;
   std::unordered_set<std::uint64_t> peerMappings_;
+  std::atomic<NvmeHbmMappingBackend> hbmBackend_{
+      NvmeHbmMappingBackend::Unavailable};
 };
 
 class VfioNvmeControlPlane final : public NvmeControlPlane {
@@ -520,6 +699,19 @@ public:
       throw std::invalid_argument(
           "VFIO namespace, queue depth, and admin timeout must be valid");
     }
+    switch (options.hbmMappingPolicy) {
+    case NvmeHbmMappingPolicy::Auto:
+    case NvmeHbmMappingPolicy::NvidiaPeerPages:
+    case NvmeHbmMappingPolicy::CudaDmaBufIoas:
+      break;
+    default:
+      throw std::invalid_argument("invalid NVMe HBM mapping policy");
+    }
+    if (options.dmaTarget != NvmeDmaTarget::HbmPeer &&
+        options.hbmMappingPolicy != NvmeHbmMappingPolicy::Auto) {
+      throw std::invalid_argument(
+          "an explicit HBM mapping policy requires dmaTarget=hbm-peer");
+    }
     const long systemPage = ::sysconf(_SC_PAGESIZE);
     if (systemPage != static_cast<long>(NvmeIdentifyBytes)) {
       throw std::runtime_error(
@@ -528,7 +720,8 @@ public:
     pageSize_ = static_cast<std::size_t>(systemPage);
     mappingBackend_ = std::make_unique<VfioNvmeMappingBackend>(
         VfioNvmeMappingContext{bdf_, iommufd_, ioasId_, pageSize_, mutex_,
-                               quiesced_, fatal_});
+                               quiesced_, fatal_},
+        options.hbmMappingPolicy);
 
     try {
       openAndAttach();

@@ -12,7 +12,7 @@ it does not define a second runtime state machine or native ABI.
 | RQ0 workload opportunity | `prepare_bailian.py`, `validate_workload.py`, `analyze_workload.py` | structure/demand/arrival digests and explicit arrival provenance |
 | Physical tier capability | `qualify_tiers.py`, `validate_tier_qualification.py` | exact HBM/host/NVMe/DAX qualification; missing hardware is skip |
 | Hardware preflight | `inspect_hardware.py` | read-only GPU/NVMe/CXL/DAX capability inventory; never binds devices |
-| RQ1--RQ3 paired execution | `run_evaluation.py`, `analyze_evaluation.py` | exact demand, paired metadata, six strata, causal comparisons, bootstrap CI, Little's Law |
+| RQ1--RQ3 paired execution | `run_evaluation.py`, `analyze_evaluation.py` | exact demand, paired metadata, six strata, causal comparisons, bootstrap CI, finite-window occupancy accounting |
 | RQ4 cost and regression | `profile.py`, `capture_performance.py`, `check_regression.py`, `validate_performance_artifact.py` | complete profiler + baseline + measured report + digest-bound passing regression gate |
 | Reproduction packaging | `reproduce.py`, `validate_bundle.py` | self-contained external bundle with command and digest provenance |
 
@@ -44,33 +44,35 @@ The machine-readable contracts are `evaluation-manifest.json`,
 `tier-qualification.schema.json`, and `artifact-manifest.json`. A trial that
 does not satisfy these contracts is rejected before its timing can be used.
 
-Generate a complete paired B0--B6 specification from concrete commands with:
+Generate the complete A0--A3 causal specification from concrete commands.
+Each stratum entry points to one normalized workload manifest; formal
+experiments require at least six distinct workload scenarios.
 
 ```bash
+ARM_COMMAND='python benchmarks/serving/RunSglangEvaluationArm.py --arm {arm} --workspace-root /tmp/nta-arm-workspaces --output {trial_output} -- --model /path/to/model --workload-manifest {workload_manifest}'
 python experiments/make_evaluation_spec.py \
-  --workload-manifest /path/to/workload/manifest.json \
+  --strata-file experiments/strata.example.json \
   --tier host_mem --output /tmp/paired-evaluation.json \
-  --arm-command 'B0=...' --arm-command 'B1=...' --arm-command 'B2=...' \
-  --arm-command 'B3=...' --arm-command 'B4=...' --arm-command 'B5=...' \
-  --arm-command 'B6=...' \
-  --arm-consumer-kind B0=framework_reference \
-  --arm-consumer-kind B1=native_work_unit \
-  --arm-consumer-kind B2=native_work_unit \
-  --arm-consumer-kind B3=native_work_unit \
-  --arm-consumer-kind B4=native_work_unit \
-  --arm-consumer-kind B5=native_work_unit \
-  --arm-consumer-kind B6=native_work_unit
+  --arm-command "A0=$ARM_COMMAND" --arm-command "A1=$ARM_COMMAND" \
+  --arm-command "A2=$ARM_COMMAND" --arm-command "A3=$ARM_COMMAND" \
+  --arm-result-contract A0=sglang-serving \
+  --arm-result-contract A1=sglang-serving \
+  --arm-result-contract A2=sglang-serving \
+  --arm-result-contract A3=sglang-serving
 ```
 
-The generator expands the declared strata and the adjacent causal pairs plus
-the two decisive cross-boundary pairs (`B3` vs `B1` for host-control
-round-trip isolation and `B5` vs `B3` for the complete mechanism jump). It
-requires a concrete command for every arm and validates the resulting spec
-before writing it; no missing arm is silently treated as a baseline.
+The generator expands three adjacent causal boundaries: A1/A0 isolates exact
+NTA acquisition from framework bulk control, A2/A1 isolates GPU demand
+discovery with a bulk readiness boundary, and A3/A2 isolates progressive
+work-unit release. It requires a concrete command for every arm and validates
+the resulting spec before writing it; no missing arm is silently treated as a
+baseline.
 Generated specifications carry `evaluation_profile=osdi-complete`. The runner
-requires all B0--B6 arms, every canonical causal boundary in every declared
+requires all A0--A3 arms, all three causal boundaries in every declared
 stratum, at least six strata, and a machine-readable numerical consumer
-contract for every arm for that profile. The checked-in example spec
+contract for every arm. `{trial_output}` is bound to a unique result path for
+every randomized repetition, preventing cross-trial overwrite. The checked-in
+example spec
 is marked `evaluation_profile=contract` because it is only a minimal API
 fixture; it must not be used as an OSDI result.
 
@@ -84,11 +86,12 @@ python experiments/validate_bundle.py /tmp/nta-artifacts/hardware
 
 ## Framework boundary
 
-`benchmarks/serving/CompareSglangHiCacheLoad.py` is the canonical SGLang
-serving comparison driver. It invokes the stock and NTA arms on the same
-normalized workload and emits the structured report checked by
-`validate_serving_report.py`. `SglangHiCacheLoad.py` is its single-backend
-worker.
+`benchmarks/serving/RunSglangEvaluationArm.py` is the canonical formal SGLang
+worker. It executes exactly one A0--A3 arm, proves activation from timed engine
+counters, and emits the structured report checked by the declared result
+contract. `SglangHiCacheLoad.py` is the framework worker it owns.
+`CompareSglangHiCacheLoad.py` remains a useful nested diagnostic, but formal
+randomization and pairing belong to `run_evaluation.py`.
 
 The remaining files under `benchmarks/serving/` are specialized diagnostics
 or operator-level studies used by native/FlashInfer tests. They are not

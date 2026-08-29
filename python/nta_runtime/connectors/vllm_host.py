@@ -190,6 +190,15 @@ def build_indexed_host_resources(
             raise RuntimeError(
                 f"vLLM layer {layer_name!r} has no pinned CPU backing"
             ) from error
+        if (
+            not isinstance(cpu_backing, torch.Tensor)
+            or cpu_backing.is_cuda
+            or not cpu_backing.is_pinned()
+            or not cpu_backing.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"vLLM layer {layer_name!r} has no contiguous pinned CPU backing"
+            )
         source_stride = int(cpu_backing.stride(0)) * int(cpu_backing.element_size())
         destination_stride = int(layer_tensor.stride(0)) * int(
             layer_tensor.element_size()

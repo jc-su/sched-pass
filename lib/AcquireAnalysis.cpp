@@ -6,13 +6,13 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Operator.h"
-
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -152,8 +152,8 @@ bool isNull(Value *value) {
 // and warp identities are not.
 class CtaUniformity {
 public:
-  explicit CtaUniformity(PostDominatorTree &postDominatorTree)
-      : postDominatorTree_(postDominatorTree) {}
+  CtaUniformity(PostDominatorTree &postDominatorTree, LoopInfo &loopInfo)
+      : postDominatorTree_(postDominatorTree), loopInfo_(loopInfo) {}
 
   bool isUniform(Value *value) {
     if (isa<Constant>(value) || isa<Argument>(value) ||
@@ -164,37 +164,116 @@ public:
     if (instruction == nullptr) {
       return false;
     }
+    const bool root = evaluationDepth_ == 0 && !settling_;
+    ++evaluationDepth_;
     const auto found = states_.find(instruction);
     if (found != states_.end()) {
-      if (found->second == Visiting) {
+      if (found->second == Visiting || found->second == Provisional) {
         // Uniform loop-carried values require an optimistic fixed-point seed.
-        // Record that this answer is provisional so no result derived from it
-        // is memoized before the active cycle reaches its fixed point.
-        ++provisionalReads_;
+        // Record the recursive region and settle it as one monotone fixed point
+        // when the outer query returns. Erase-and-recompute makes a length-N
+        // cycle take 2^N classifications and can hang JIT activation.
+        markProvisional(instruction);
+        ++provisionalEpoch_;
+        --evaluationDepth_;
         return true;
       }
-      return found->second == Uniform;
+      const bool uniform = found->second == Uniform;
+      --evaluationDepth_;
+      if (root) {
+        settleProvisional();
+        return states_.lookup(instruction) == Uniform;
+      }
+      return uniform;
     }
-    const std::uint64_t provisionalReadsBefore = provisionalReads_;
+    const std::uint64_t provisionalEpochBefore = provisionalEpoch_;
     states_[instruction] = Visiting;
     const bool uniform = classify(*instruction);
     if (!uniform) {
       // Divergence is monotone and remains sound even when its proof traversed
       // an optimistic recursive edge.
       states_[instruction] = Divergent;
-    } else if (provisionalReads_ == provisionalReadsBefore) {
+    } else if (provisionalEpoch_ == provisionalEpochBefore) {
       states_[instruction] = Uniform;
     } else {
-      // Recompute this node after its enclosing SCC has finalized. Caching it
-      // now could preserve an optimistic Uniform result after another member
-      // of the cycle discovers a divergent seed.
-      states_.erase(instruction);
+      // Every value derived from an optimistic recursive edge belongs to the
+      // same pending fixed-point region. Do not publish its optimistic answer
+      // before that region has stabilized.
+      markProvisional(instruction);
+      states_[instruction] = Provisional;
+    }
+    --evaluationDepth_;
+    if (root) {
+      settleProvisional();
+      return states_.lookup(instruction) == Uniform;
     }
     return uniform;
   }
 
+  Value *divergentControl(BasicBlock *target) {
+    // Post-dominance alone misses loop self-control: a block non-strictly
+    // post-dominates itself even when a lane-varying latch decides how many
+    // times each lane executes it. Every exit condition of an enclosing loop
+    // therefore participates in CTA-uniform control.
+    for (Loop *loop = loopInfo_.getLoopFor(target); loop != nullptr;
+         loop = loop->getParentLoop()) {
+      SmallVector<BasicBlock *, 8> exitingBlocks;
+      loop->getExitingBlocks(exitingBlocks);
+      for (BasicBlock *exiting : exitingBlocks) {
+        if (Value *condition = branchCondition(exiting->getTerminator());
+            condition != nullptr && !isUniform(condition)) {
+          return condition;
+        }
+      }
+    }
+
+    for (BasicBlock &controlBlockValue : *target->getParent()) {
+      BasicBlock *controlBlock = &controlBlockValue;
+      Instruction *terminator = controlBlock->getTerminator();
+      Value *condition = branchCondition(terminator);
+      if (condition == nullptr) {
+        continue;
+      }
+      bool postDominatesSuccessor = false;
+      for (unsigned successor = 0; successor < terminator->getNumSuccessors();
+           ++successor) {
+        postDominatesSuccessor |= postDominatorTree_.dominates(
+            target, terminator->getSuccessor(successor));
+      }
+      if (postDominatesSuccessor &&
+          !postDominatorTree_.dominates(target, controlBlock) &&
+          !isUniform(condition)) {
+        return condition;
+      }
+    }
+    return nullptr;
+  }
+
 private:
-  enum State : unsigned { Visiting, Uniform, Divergent };
+  enum State : unsigned { Visiting, Provisional, Uniform, Divergent };
+
+  static Value *branchCondition(Instruction *terminator) {
+    if (auto *branch = dyn_cast<BranchInst>(terminator);
+        branch != nullptr && branch->isConditional()) {
+      return branch->getCondition();
+    }
+    if (auto *selection = dyn_cast<SwitchInst>(terminator)) {
+      return selection->getCondition();
+    }
+    return nullptr;
+  }
+
+  void markProvisional(Instruction *instruction) {
+    if (provisionalInstructionSet_.insert(instruction).second) {
+      provisionalInstructions_.push_back(instruction);
+    }
+  }
+
+  void markProvisional(AllocaInst *object) {
+    if (provisionalLocalSet_.insert(object).second) {
+      provisionalLocals_.push_back(object);
+    }
+  }
 
   // At -O0, clang keeps the typed work context in local memory and lowers
   // aggregate initialization to memcpy/memset.  The address of an alloca is
@@ -235,18 +314,7 @@ private:
     return false;
   }
 
-  bool localObjectUniform(AllocaInst &object) {
-    const auto found = localStates_.find(&object);
-    if (found != localStates_.end()) {
-      if (found->second == Visiting) {
-        ++provisionalReads_;
-        return true;
-      }
-      return found->second == Uniform;
-    }
-    const std::uint64_t provisionalReadsBefore = provisionalReads_;
-    localStates_[&object] = Visiting;
-
+  bool classifyLocalObject(AllocaInst &object) {
     bool sawWrite = false;
     for (BasicBlock &block : *object.getFunction()) {
       for (Instruction &instruction : block) {
@@ -257,9 +325,9 @@ private:
           const bool uniformValue =
               isUniform(store->getValueOperand()) ||
               uniformLocalAddress(store->getValueOperand());
-          if (store->isAtomic() || !uniformValue ||
-              !hasUniformControl(store->getParent())) {
-            localStates_[&object] = Divergent;
+          if (store->isAtomic() ||
+              !uniformLocalAddress(store->getPointerOperand()) ||
+              !uniformValue || !hasUniformControl(store->getParent())) {
             return false;
           }
           sawWrite = true;
@@ -274,7 +342,6 @@ private:
               !uniformLocalAddress(transfer->getRawDest()) ||
               !isUniform(transfer->getRawSource()) ||
               !hasUniformControl(transfer->getParent())) {
-            localStates_[&object] = Divergent;
             return false;
           }
           sawWrite = true;
@@ -288,7 +355,6 @@ private:
           if (set->isVolatile() || !uniformLocalAddress(set->getRawDest()) ||
               !isUniform(set->getValue()) ||
               !hasUniformControl(set->getParent())) {
-            localStates_[&object] = Divergent;
             return false;
           }
           sawWrite = true;
@@ -305,22 +371,37 @@ private:
              !name.starts_with("llvm.dbg."))) {
           for (Value *argument : call->args()) {
             if (localStorageBase(argument) == &object) {
-              localStates_[&object] = Divergent;
               return false;
             }
           }
         }
       }
     }
+    return sawWrite;
+  }
 
-    if (!sawWrite) {
+  bool localObjectUniform(AllocaInst &object) {
+    const auto found = localStates_.find(&object);
+    if (found != localStates_.end()) {
+      if (found->second == Visiting || found->second == Provisional) {
+        markProvisional(&object);
+        ++provisionalEpoch_;
+        return true;
+      }
+      return found->second == Uniform;
+    }
+    const std::uint64_t provisionalEpochBefore = provisionalEpoch_;
+    localStates_[&object] = Visiting;
+    const bool uniform = classifyLocalObject(object);
+    if (!uniform) {
       localStates_[&object] = Divergent;
-    } else if (provisionalReads_ == provisionalReadsBefore) {
+    } else if (provisionalEpoch_ == provisionalEpochBefore) {
       localStates_[&object] = Uniform;
     } else {
-      localStates_.erase(&object);
+      markProvisional(&object);
+      localStates_[&object] = Provisional;
     }
-    return sawWrite;
+    return uniform;
   }
 
   bool uniformLocalLoad(LoadInst &load) {
@@ -340,32 +421,7 @@ private:
   }
 
   bool hasUniformControl(BasicBlock *target) {
-    for (BasicBlock &controlBlockValue : *target->getParent()) {
-      BasicBlock *controlBlock = &controlBlockValue;
-      Instruction *terminator = controlBlock->getTerminator();
-      Value *condition = nullptr;
-      if (auto *branch = dyn_cast<BranchInst>(terminator);
-          branch != nullptr && branch->isConditional()) {
-        condition = branch->getCondition();
-      } else if (auto *select = dyn_cast<SwitchInst>(terminator)) {
-        condition = select->getCondition();
-      }
-      if (condition == nullptr) {
-        continue;
-      }
-      bool postDominatesSuccessor = false;
-      for (unsigned successor = 0; successor < terminator->getNumSuccessors();
-           ++successor) {
-        postDominatesSuccessor |= postDominatorTree_.dominates(
-            target, terminator->getSuccessor(successor));
-      }
-      if (postDominatesSuccessor &&
-          !postDominatorTree_.dominates(target, controlBlock) &&
-          !isUniform(condition)) {
-        return false;
-      }
-    }
-    return true;
+    return divergentControl(target) == nullptr;
   }
 
   bool classifyCall(CallBase &call) {
@@ -402,8 +458,7 @@ private:
     }
     if (auto *load = dyn_cast<LoadInst>(&instruction)) {
       return !load->isVolatile() && !load->isAtomic() &&
-             (isUniform(load->getPointerOperand()) ||
-              uniformLocalLoad(*load));
+             (isUniform(load->getPointerOperand()) || uniformLocalLoad(*load));
     }
     if (auto *phi = dyn_cast<PHINode>(&instruction)) {
       if (!uniformOperands(*phi)) {
@@ -430,15 +485,65 @@ private:
     return uniformOperands(instruction);
   }
 
+  void settleProvisional() {
+    if (provisionalInstructions_.empty() && provisionalLocals_.empty()) {
+      return;
+    }
+    settling_ = true;
+    std::size_t initializedInstructions = 0;
+    std::size_t initializedLocals = 0;
+    bool changed = false;
+    do {
+      // Classification while settling can expose a previously short-circuited
+      // recursive edge. Admit any such node into the same optimistic region
+      // before the next pass.
+      while (initializedInstructions < provisionalInstructions_.size()) {
+        states_[provisionalInstructions_[initializedInstructions++]] = Uniform;
+      }
+      while (initializedLocals < provisionalLocals_.size()) {
+        localStates_[provisionalLocals_[initializedLocals++]] = Uniform;
+      }
+
+      changed = false;
+      for (Instruction *instruction : provisionalInstructions_) {
+        if (states_.lookup(instruction) == Uniform && !classify(*instruction)) {
+          states_[instruction] = Divergent;
+          changed = true;
+        }
+      }
+      for (AllocaInst *object : provisionalLocals_) {
+        if (localStates_.lookup(object) == Uniform &&
+            !classifyLocalObject(*object)) {
+          localStates_[object] = Divergent;
+          changed = true;
+        }
+      }
+      changed |= initializedInstructions != provisionalInstructions_.size() ||
+                 initializedLocals != provisionalLocals_.size();
+    } while (changed);
+    settling_ = false;
+    provisionalInstructions_.clear();
+    provisionalInstructionSet_.clear();
+    provisionalLocals_.clear();
+    provisionalLocalSet_.clear();
+  }
+
   DenseMap<Instruction *, State> states_;
   DenseMap<AllocaInst *, State> localStates_;
-  std::uint64_t provisionalReads_ = 0;
+  SmallVector<Instruction *, 32> provisionalInstructions_;
+  SmallPtrSet<Instruction *, 32> provisionalInstructionSet_;
+  SmallVector<AllocaInst *, 16> provisionalLocals_;
+  SmallPtrSet<AllocaInst *, 16> provisionalLocalSet_;
+  std::uint64_t provisionalEpoch_ = 0;
+  std::uint32_t evaluationDepth_ = 0;
+  bool settling_ = false;
   PostDominatorTree &postDominatorTree_;
+  LoopInfo &loopInfo_;
 };
 
 std::optional<std::string>
 validateCtaCollective(CallInst &marker, CallInst &binding,
-                      PostDominatorTree &postDominatorTree,
+                      PostDominatorTree &postDominatorTree, LoopInfo &loopInfo,
                       StringRef effectName = "acquisition marker",
                       bool validateControlDependence = true) {
   const CallingConv::ID callingConvention =
@@ -451,7 +556,7 @@ validateCtaCollective(CallInst &marker, CallInst &binding,
     }
     return effectName.str() + " must be inlined into a GPU kernel entry";
   }
-  CtaUniformity uniformity(postDominatorTree);
+  CtaUniformity uniformity(postDominatorTree, loopInfo);
   for (Use &argument : marker.args()) {
     if (!uniformity.isUniform(argument.get())) {
       return effectName.str() + " has a non-CTA-uniform operand";
@@ -467,42 +572,13 @@ validateCtaCollective(CallInst &marker, CallInst &binding,
     return std::nullopt;
   }
 
-  BasicBlock *markerBlock = marker.getParent();
-  // Y is control-dependent on X when Y post-dominates at least one successor of
-  // X but does not post-dominate X. This catches non-dominating divergent edges
-  // without treating every edge that can reach Y as controlling it.
-  for (BasicBlock &controlBlockValue : *marker.getFunction()) {
-    BasicBlock *controlBlock = &controlBlockValue;
-    Instruction *terminator = controlBlock->getTerminator();
-    Value *condition = nullptr;
-    if (auto *branch = dyn_cast<BranchInst>(terminator);
-        branch != nullptr && branch->isConditional()) {
-      condition = branch->getCondition();
-    } else if (auto *select = dyn_cast<SwitchInst>(terminator)) {
-      condition = select->getCondition();
-    }
-    if (condition == nullptr) {
-      continue;
-    }
-    bool postDominatesSuccessor = false;
-    for (unsigned successor = 0; successor < terminator->getNumSuccessors();
-         ++successor) {
-      postDominatesSuccessor |= postDominatorTree.dominates(
-          markerBlock, terminator->getSuccessor(successor));
-    }
-    const bool controlsMarker =
-        postDominatesSuccessor &&
-        !postDominatorTree.dominates(markerBlock, controlBlock);
-    if (controlsMarker && !uniformity.isUniform(condition)) {
-      std::string detail = effectName.str() +
-                           " is control-dependent on a non-CTA-uniform "
-                           "branch";
-      detail += " (" + marker.getFunction()->getName().str() + ":";
-      detail +=
-          (condition->hasName() ? condition->getName().str() : "unnamed");
-      detail += ")";
-      return detail;
-    }
+  if (Value *condition = uniformity.divergentControl(marker.getParent())) {
+    std::string detail =
+        effectName.str() + " is control-dependent on a non-CTA-uniform branch";
+    detail += " (" + marker.getFunction()->getName().str() + ":";
+    detail += condition->hasName() ? condition->getName().str() : "unnamed";
+    detail += ")";
+    return detail;
   }
   return std::nullopt;
 }
@@ -530,12 +606,29 @@ User *onlyLiveUse(Value *value) {
   return live;
 }
 
+bool isCanonicalReadyForward(BasicBlock *ready, BasicBlock *target) {
+  auto *forward = dyn_cast<BranchInst>(ready->getTerminator());
+  return forward != nullptr && !forward->isConditional() &&
+         forward->getSuccessor(0) == target;
+}
+
 Value *valueOnAcquiredEdge(Value *value, const AcquisitionBranch &branch) {
   auto *phi = dyn_cast<PHINode>(value);
-  if (phi == nullptr || phi->getParent() != branch.ready) {
+  if (phi == nullptr) {
     return value;
   }
-  const int incoming = phi->getBasicBlockIndex(branch.condition->getParent());
+  BasicBlock *incomingBlock = branch.condition->getParent();
+  if (phi->getParent() != branch.ready) {
+    // Optimized generated kernels may perform one ready-edge reload before
+    // joining a common numerical block. Accept only that canonical shape: the
+    // ready block must end in one unconditional edge directly to the PHI
+    // block. Arbitrary diamonds or multi-hop value forwarding remain rejected.
+    if (!isCanonicalReadyForward(branch.ready, phi->getParent())) {
+      return value;
+    }
+    incomingBlock = branch.ready;
+  }
+  const int incoming = phi->getBasicBlockIndex(incomingBlock);
   return incoming >= 0 ? phi->getIncomingValue(incoming) : value;
 }
 
@@ -559,6 +652,82 @@ bool sameBinding(CallInst &left, CallInst &right) {
              right.getArgOperand(ir::RequestSlot) &&
          left.getArgOperand(ir::RequestGeneration) ==
              right.getArgOperand(ir::RequestGeneration);
+}
+
+// Generated attention kernels share one large numerical region between the
+// dense and partial paths.  Clang represents the optional begin/commit pair as
+// two triangles guarded by the same immutable SSA predicate:
+//
+//          guard(C)                         guard(C)
+//       marker edge                     marker edge
+//       begin -> join     numerical      commit -> join
+//       bypass -> join      region       bypass -> join
+//
+// Ordinary dominance cannot see that a commit reached with C == P must also
+// have taken the begin edge with C == P, and ordinary post-dominance includes
+// the infeasible opposite edge at the second guard.  Recognize only this
+// canonical, symmetric shape.  Equality of the SSA condition makes the path
+// correlation exact; loop guards are deliberately excluded so one static pair
+// cannot represent multiple dynamic regions.
+struct ConditionalMarkerGuard {
+  BranchInst *branch;
+  BasicBlock *markerBlock;
+  BasicBlock *join;
+  bool markerOnTrue;
+};
+
+std::optional<ConditionalMarkerGuard>
+conditionalMarkerGuard(CallInst &marker) {
+  BasicBlock *markerBlock = marker.getParent();
+  BasicBlock *predecessor = markerBlock->getSinglePredecessor();
+  if (predecessor == nullptr) {
+    return std::nullopt;
+  }
+  auto *guard = dyn_cast<BranchInst>(predecessor->getTerminator());
+  auto *joinBranch = dyn_cast<BranchInst>(markerBlock->getTerminator());
+  if (guard == nullptr || !guard->isConditional() || joinBranch == nullptr ||
+      joinBranch->isConditional()) {
+    return std::nullopt;
+  }
+
+  const bool markerOnTrue = guard->getSuccessor(0) == markerBlock;
+  if (!markerOnTrue && guard->getSuccessor(1) != markerBlock) {
+    return std::nullopt;
+  }
+  BasicBlock *join = joinBranch->getSuccessor(0);
+  const unsigned bypassIndex = markerOnTrue ? 1U : 0U;
+  if (guard->getSuccessor(bypassIndex) != join) {
+    return std::nullopt;
+  }
+  return ConditionalMarkerGuard{guard, markerBlock, join, markerOnTrue};
+}
+
+bool isCorrelatedGuardedRegion(CallInst &begin, CallInst &commit,
+                               DominatorTree &dominatorTree,
+                               PostDominatorTree &postDominatorTree,
+                               LoopInfo &loopInfo) {
+  const std::optional<ConditionalMarkerGuard> beginGuard =
+      conditionalMarkerGuard(begin);
+  const std::optional<ConditionalMarkerGuard> commitGuard =
+      conditionalMarkerGuard(commit);
+  if (!beginGuard.has_value() || !commitGuard.has_value() ||
+      beginGuard->branch->getCondition() !=
+          commitGuard->branch->getCondition() ||
+      beginGuard->markerOnTrue != commitGuard->markerOnTrue) {
+    return false;
+  }
+  if (loopInfo.getLoopFor(beginGuard->branch->getParent()) != nullptr ||
+      loopInfo.getLoopFor(commitGuard->branch->getParent()) != nullptr) {
+    return false;
+  }
+
+  // Every path after begin reaches the second guard.  On that guard the same
+  // SSA value necessarily selects commit.  Conversely, the first guard
+  // dominates the second, so every execution of commit selected begin first.
+  return dominatorTree.dominates(beginGuard->branch,
+                                 commitGuard->branch) &&
+         postDominatorTree.dominates(commitGuard->branch->getParent(),
+                                     beginGuard->markerBlock);
 }
 
 bool reachableWithoutEdges(
@@ -874,6 +1043,7 @@ FunctionPlan analyzeAcquisitions(Function &function) {
 
   DominatorTree dominatorTree(function);
   PostDominatorTree postDominatorTree(function);
+  LoopInfo loopInfo(dominatorTree);
   for (CallInst *marker : acquireMarkers) {
     const bool set = hasName(*marker, ir::AcquireSetMarker);
     if (std::optional<std::string> error =
@@ -888,8 +1058,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           {marker, "no valid request binding dominates acquisition"});
       continue;
     }
-    if (std::optional<std::string> error =
-            validateCtaCollective(*marker, *binding, postDominatorTree)) {
+    if (std::optional<std::string> error = validateCtaCollective(
+            *marker, *binding, postDominatorTree, loopInfo)) {
       plan.rejected.push_back({marker, std::move(*error)});
       continue;
     }
@@ -965,8 +1135,7 @@ FunctionPlan analyzeAcquisitions(Function &function) {
     // launder the pointer past the clause.
     static const char *const derefReason =
         "staged base is dereferenced outside its acquisition marker";
-    static const char *const callReason =
-        "staged base escapes through a call";
+    static const char *const callReason = "staged base escapes through a call";
     static const char *const valueReason =
         "staged base escapes as a stored or converted value";
     SmallVector<Value *, 8> worklist(stagedBases.begin(), stagedBases.end());
@@ -1019,8 +1188,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
         }
         if (isa<AtomicRMWInst>(instruction) ||
             isa<AtomicCmpXchgInst>(instruction)) {
-          reject(instruction, use.getOperandNo() == 0 ? derefReason
-                                                      : valueReason);
+          reject(instruction,
+                 use.getOperandNo() == 0 ? derefReason : valueReason);
           continue;
         }
         if (auto *call = dyn_cast<CallBase>(instruction)) {
@@ -1028,13 +1197,12 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           // intrinsics are not dereferences. Memory intrinsics and every
           // other callee, known or unknown, take the pointer somewhere
           // this clause cannot follow.
-          Function *callee = dyn_cast<Function>(
-              call->getCalledOperand()->stripPointerCasts());
+          Function *callee =
+              dyn_cast<Function>(call->getCalledOperand()->stripPointerCasts());
           const StringRef name =
               callee != nullptr ? callee->getName() : StringRef();
           const bool ntaMarker =
-              name == ir::AcquireMarker ||
-              name == ir::AcquireTensorMapMarker ||
+              name == ir::AcquireMarker || name == ir::AcquireTensorMapMarker ||
               name == ir::AcquireSetMarker || name == ir::DeferMarker ||
               name == ir::BindMarker || name == ir::BeginPartialMarker ||
               name == ir::CommitPartialMarker ||
@@ -1048,8 +1216,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           if (ntaMarker || nonAccessing) {
             continue;
           }
-          reject(instruction, isa<AnyMemIntrinsic>(call) ? derefReason
-                                                         : callReason);
+          reject(instruction,
+                 isa<AnyMemIntrinsic>(call) ? derefReason : callReason);
           continue;
         }
         // Returns, pointer-to-integer conversions, aggregate and vector
@@ -1073,7 +1241,7 @@ FunctionPlan analyzeAcquisitions(Function &function) {
     }
     if (std::optional<std::string> error =
             validateCtaCollective(*marker, *binding, postDominatorTree,
-                                  "partial-region marker", false)) {
+                                  loopInfo, "partial-region marker", false)) {
       plan.rejected.push_back({marker, std::move(*error)});
       continue;
     }
@@ -1094,7 +1262,8 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           acquisition.marker->getArgOperand(runtimeArgument) ==
               marker->getArgOperand(ir::BeginRuntime) &&
           branch.has_value() &&
-          dominatorTree.dominates(branch->ready, marker->getParent()) &&
+          (dominatorTree.dominates(branch->ready, marker->getParent()) ||
+           isCanonicalReadyForward(branch->ready, marker->getParent())) &&
           sameBindingOnAcquiredEdge(*binding, *acquisition.binding, *branch) &&
           sameValueOnAcquiredEdge(
               marker->getArgOperand(ir::BeginWorkTicket),
@@ -1132,9 +1301,9 @@ FunctionPlan analyzeAcquisitions(Function &function) {
           {marker, "no valid request binding dominates partial publication"});
       continue;
     }
-    if (std::optional<std::string> error =
-            validateCtaCollective(*marker, *binding, postDominatorTree,
-                                  "partial-publication marker", false)) {
+    if (std::optional<std::string> error = validateCtaCollective(
+            *marker, *binding, postDominatorTree, loopInfo,
+            "partial-publication marker", false)) {
       plan.rejected.push_back({marker, std::move(*error)});
       continue;
     }
@@ -1151,11 +1320,15 @@ FunctionPlan analyzeAcquisitions(Function &function) {
               marker->getArgOperand(ir::CommitWorkTicket)) {
         continue;
       }
-      if (!dominatorTree.dominates(begin.marker, marker)) {
+      const bool correlatedGuardedRegion = isCorrelatedGuardedRegion(
+          *begin.marker, *marker, dominatorTree, postDominatorTree, loopInfo);
+      if (!dominatorTree.dominates(begin.marker, marker) &&
+          !correlatedGuardedRegion) {
         continue;
       }
       if (!postDominatorTree.dominates(marker->getParent(),
-                                       begin.marker->getParent())) {
+                                       begin.marker->getParent()) &&
+          !correlatedGuardedRegion) {
         regionWithoutPublication = true;
         continue;
       }

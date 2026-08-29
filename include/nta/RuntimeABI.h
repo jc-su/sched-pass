@@ -6,10 +6,9 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 31;
+inline constexpr std::uint32_t Version = 35;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 6;
-inline constexpr std::uint32_t UrgencyBucketCount = 8;
 
 enum class SourceKind : std::uint32_t {
   Hbm = 0,
@@ -218,7 +217,13 @@ struct alignas(128) IntentSlot {
   std::uint64_t sequence;
   std::uint32_t sourceKind;
   std::uint32_t epoch;
-  std::uint64_t reserved[6];
+  // Credits are reserved at dispatch but released by a later kernel for
+  // prevalidated indexed ranges. Persist the actual reservation rather than
+  // inferring it from request liveness at completion: cancellation may change
+  // liveness while the transfer is in flight.
+  std::uint64_t chargedRequestBytes;
+  std::uint64_t chargedBackendBytes;
+  std::uint64_t reserved[4];
 };
 static_assert(sizeof(IntentSlot) == 128);
 
@@ -233,19 +238,55 @@ struct alignas(64) IntentPool {
 };
 static_assert(sizeof(IntentPool) == 64);
 
-// One fixed queue node per intent slot. Queue heads carry a 32-bit mutation
-// tag above the node index, preventing ABA when a credit-limited transfer is
-// popped and requeued without allocating another node.
-struct alignas(32) IntentQueueEntry {
-  std::uint64_t sequence;
-  std::uint32_t next;
+enum class IntentQueueState : std::uint32_t {
+  Free = 0,
+  Queued = 1,
+  Claimed = 2,
+  Preparing = 3,
+};
+
+// Immutable ordering key for one publication of an intent slot. Timed work is
+// ordered by absolute deadline first. Equal deadlines use caller priority,
+// critical service, and stableSequence. deadlineClock == 0 is explicitly
+// best-effort and follows all timed work. intentSequence binds this record to
+// the current IntentSlot lifetime and prevents stale heap nodes from acquiring
+// a reused slot.
+struct alignas(64) IntentQueueEntry {
+  std::uint64_t intentSequence;
+  std::uint64_t stableSequence;
+  std::uint64_t deadlineClock;
+  std::uint64_t criticalServiceNs;
+  std::uint32_t heapIndex;
   std::uint32_t state;
   std::uint32_t epoch;
   std::uint32_t sourceKind;
-  std::uint32_t urgency;
+  std::uint32_t priority;
+  std::uint32_t reserved[3];
+};
+static_assert(sizeof(IntentQueueEntry) == 64);
+
+// Heap nodes retain the complete slot lifetime rather than only an index. A
+// node left behind by cancellation or epoch retirement is therefore a bounded
+// tombstone, never an ABA alias for a later intent in the same slot.
+struct alignas(16) IntentQueueNode {
+  std::uint64_t intentSequence;
+  std::uint32_t slotIndex;
   std::uint32_t reserved;
 };
-static_assert(sizeof(IntentQueueEntry) == 32);
+static_assert(sizeof(IntentQueueNode) == 16);
+
+// One control record per backend. Queue operations are device-linearized by
+// lock; storage is a fixed intentCapacity-node heap per backend. Constrained
+// dispatch may reserve byte credits while holding this lock so that EDF is
+// evaluated over the actually feasible set. The lock is never held across a
+// data movement or I/O operation.
+struct alignas(32) IntentQueueControl {
+  std::uint64_t nextSequence;
+  std::uint32_t size;
+  std::uint32_t lock;
+  std::uint64_t reserved[2];
+};
+static_assert(sizeof(IntentQueueControl) == 32);
 
 // A kernel work item may require several independently resident objects. The
 // compiler treats an array of these records as one finite deferral boundary.
@@ -283,10 +324,13 @@ struct alignas(32) WorkItem {
   std::uint32_t contributorIndex;
   std::uint32_t contributorCount;
   std::uint32_t estimatedComputeNs;
+  // Readiness deadline relative to RuntimeView::epochStartClock. Zero keeps
+  // the request-level absolute deadline. A positive value lets a producer
+  // describe transformer-layer arrival order without translating the GPU
+  // global timer into a host clock domain.
+  std::uint64_t readyDeadlineOffsetNs;
   // Explicit tail padding keeps the C, Python, and device-array stride equal.
   // A non-zero value denotes an ABI extension this runtime cannot interpret.
-  std::uint32_t reserved0;
-  std::uint32_t reserved1;
   std::uint32_t reserved2;
   std::uint32_t reserved3;
 };
@@ -405,7 +449,8 @@ struct alignas(64) RuntimeView {
   WorkDependency *dependencies;
   IntentPool *intentPool;
   IntentQueueEntry *intentQueueEntries;
-  std::uint64_t *intentQueueHeads;
+  IntentQueueControl *intentQueueControls;
+  IntentQueueNode *intentQueueHeap;
   std::uint32_t *readyWorkTickets;
   std::uint32_t *readyCount;
   std::uint32_t *readyHead;
@@ -448,6 +493,12 @@ struct alignas(64) RuntimeView {
   std::uint32_t workTicketCapacity;
   std::uint32_t dependencyCapacity;
   std::uint32_t maxDependenciesPerWorkTicket;
+  // Frozen exclusive end of the runnable queue window consumed by the current
+  // numerical launch.  The compute stream snapshots readyCount here before a
+  // launch, while the progress stream remains free to append later arrivals.
+  // This field intentionally occupies the former alignment padding before the
+  // 64-bit epoch clock, so ABI v33 adds semantics without growing RuntimeView.
+  std::uint32_t readyWindowEnd;
   std::uint64_t epochStartClock;
   // Device-owned epoch and terminal counters. reset_epoch advances epoch after
   // clearing all ticket records; application and progress kernels reject work
@@ -471,6 +522,8 @@ static_assert(std::is_standard_layout_v<AcquireIntent>);
 static_assert(std::is_standard_layout_v<IntentSlot>);
 static_assert(std::is_standard_layout_v<IntentPool>);
 static_assert(std::is_standard_layout_v<IntentQueueEntry>);
+static_assert(std::is_standard_layout_v<IntentQueueNode>);
+static_assert(std::is_standard_layout_v<IntentQueueControl>);
 static_assert(std::is_standard_layout_v<AcquireRequirement>);
 static_assert(std::is_standard_layout_v<WorkDependency>);
 static_assert(std::is_standard_layout_v<WorkItem>);

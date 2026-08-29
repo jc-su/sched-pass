@@ -32,6 +32,7 @@ struct NvmeMappingToken {
     None = 0,
     HostIoas = 1,
     NvidiaPeerPages = 2,
+    CudaDmaBufIoas = 3,
   };
 
   Kind kind = Kind::None;
@@ -101,6 +102,10 @@ public:
   // return DMA addresses valid for this VFIO-owned NVMe function.
   [[nodiscard]] virtual NvmeMapping mapHbm(std::uint64_t gpuAddress,
                                            std::size_t bytes) = 0;
+  // The backend is selected by the first successful qualification map and is
+  // then frozen for the lifetime of the attached controller.
+  [[nodiscard]] virtual NvmeHbmMappingBackend
+  hbmMappingBackend() const noexcept = 0;
   // Stop accepting new mappings and release all mappings owned by the
   // backend.  The control plane calls this only after its queue is quiesced.
   virtual void shutdown() noexcept = 0;

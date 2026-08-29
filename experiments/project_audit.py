@@ -67,6 +67,16 @@ def _files(root: Path, relative_roots: tuple[str, ...]):
         )
 
 
+def _is_protocol_base(node: ast.expr) -> bool:
+    """Recognize ``Protocol`` with or without a generic subscription."""
+
+    while isinstance(node, ast.Subscript):
+        node = node.value
+    return (isinstance(node, ast.Name) and node.id == "Protocol") or (
+        isinstance(node, ast.Attribute) and node.attr == "Protocol"
+    )
+
+
 def _unfinished_findings(root: Path) -> list[str]:
     findings: list[str] = []
     # Keep the audit implementation out of its own marker scan: the regular
@@ -95,10 +105,7 @@ def _unfinished_findings(root: Path) -> list[str]:
             child
             for class_node in ast.walk(tree)
             if isinstance(class_node, ast.ClassDef)
-            and any(
-                isinstance(base, ast.Name) and base.id == "Protocol"
-                for base in class_node.bases
-            )
+            and any(_is_protocol_base(base) for base in class_node.bases)
             for child in ast.walk(class_node)
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
         }

@@ -48,13 +48,22 @@ class ResourcePath(str, Enum):
     MATERIALIZED = "materialized"
 
 
+class ResourceDataPath(str, Enum):
+    HBM_LOAD = "gpu_hbm_load"
+    HOST_MAPPED_LOAD = "gpu_mapped_host_load"
+    HOST_INDEXED_TO_HBM = "host_indexed_copy_to_engine_hbm"
+    NVME_PEER_TO_HBM = "nvme_peer_dma_to_engine_hbm"
+    CXL_DIRECT = "cuda_visible_cxl_direct"
+
+
 @dataclass(frozen=True)
 class ResourceContract:
     """Immutable setup/data-path contract for one resource kind.
 
-    ``requires_catalog`` and ``requires_endpoint`` describe setup-time
-    identity.  ``steady_state_path`` describes the actual consumer path and
-    is deliberately not allowed to imply a fallback through host memory.
+    Physical binding, direct numerical access, and host-proxy use are derived
+    from typed kind/path/capability values rather than stored as duplicate
+    booleans. ``steady_state_path`` names the measured consumer path and is
+    deliberately not allowed to imply a fallback through host memory.
     """
 
     kind: ResourceKind
@@ -83,11 +92,7 @@ class ResourceContract:
     # another.
     numerical_address_owner: ResourceOwner
     directory_owner: ResourceOwner
-    steady_state_path: str
-    requires_catalog: bool
-    requires_endpoint: bool
-    direct_device_visible: bool
-    uses_host_proxy: bool
+    data_path: ResourceDataPath
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ResourceKind):
@@ -114,61 +119,45 @@ class ResourceContract:
             raise TypeError("resource mapping owner must be typed")
         if not isinstance(self.numerical_address_owner, ResourceOwner):
             raise TypeError("resource numerical address owner must be typed")
-        for field in (
-            "requires_catalog",
-            "requires_endpoint",
-            "direct_device_visible",
-            "uses_host_proxy",
-        ):
-            if type(getattr(self, field)) is not bool:
-                raise TypeError(f"resource contract {field} must be bool")
-        if not isinstance(self.steady_state_path, str):
-            raise TypeError("resource steady-state path must be a string")
-        if not self.steady_state_path:
-            raise ValueError("resource steady-state path must be named")
+        if not isinstance(self.data_path, ResourceDataPath):
+            raise TypeError("resource steady-state data path must be typed")
         if self.directory_owner is not ResourceOwner.RUNTIME:
             raise ValueError("native resource directories must be runtime-owned")
-        if self.requires_catalog != self.requires_endpoint:
-            raise ValueError(
-                "physical resource catalog and endpoint requirements must match"
-            )
-        direct = bool(self.capabilities & ResourceCapability.DIRECT_ADDRESS)
-        if direct != self.direct_device_visible:
-            raise ValueError("direct-address capability must match device visibility")
         if self.path is ResourcePath.RESIDENT:
             if (
                 self.source_address_space is not self.numerical_address_space
                 or self.transfer_destination_owner is not None
-                or self.requires_endpoint
+                or self.physical
             ):
                 raise ValueError("resident resources must already be the numerical bytes")
         elif self.path is ResourcePath.DIRECT:
             if (
                 self.source_address_space is not self.numerical_address_space
                 or self.transfer_destination_owner is not None
-                or not self.direct_device_visible
+                or not self.direct_numerical_path
             ):
                 raise ValueError("direct resources must expose their source numerically")
         elif self.path is ResourcePath.MATERIALIZED:
             if (
                 self.source_address_space is self.numerical_address_space
                 or self.transfer_destination_owner is None
-                or self.direct_device_visible
+                or self.direct_numerical_path
             ):
                 raise ValueError(
                     "materialized resources require a distinct non-direct source"
                 )
         if self.kind is ResourceKind.HOST_STAGED:
-            if not self.uses_host_proxy:
-                raise ValueError("host-staged resources require a host proxy")
-            if not (self.capabilities & ResourceCapability.INDEXED_TRANSFER):
-                raise ValueError("host-staged resources require indexed transfer")
-        elif self.uses_host_proxy:
-            raise ValueError("only host-staged resources may use a host proxy")
+            required = (
+                ResourceCapability.HOST_REGISTERED
+                | ResourceCapability.INDEXED_TRANSFER
+            )
+            if self.capabilities & required != required:
+                raise ValueError(
+                    "host-staged resources require registered indexed transfer"
+                )
         if self.kind in (ResourceKind.NVME, ResourceKind.CXL_DAX):
             if (
-                not self.requires_catalog
-                or self.protocol_owner is not ResourceOwner.TRANSPORT
+                self.protocol_owner is not ResourceOwner.TRANSPORT
                 or self.payload_owner is not ResourceOwner.TRANSPORT
                 or self.mapping_owner is not ResourceOwner.TRANSPORT
             ):
@@ -223,7 +212,19 @@ class ResourceContract:
 
     @property
     def physical(self) -> bool:
-        return self.requires_endpoint
+        return self.kind in (ResourceKind.NVME, ResourceKind.CXL_DAX)
+
+    @property
+    def direct_numerical_path(self) -> bool:
+        return bool(self.capabilities & ResourceCapability.DIRECT_ADDRESS)
+
+    @property
+    def uses_host_proxy(self) -> bool:
+        return self.kind is ResourceKind.HOST_STAGED
+
+    @property
+    def steady_state_path(self) -> str:
+        return self.data_path.value
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -248,10 +249,9 @@ class ResourceContract:
             ),
             "numerical_address_owner": self.numerical_address_owner.value,
             "directory_owner": self.directory_owner.value,
-            "steady_state_path": self.steady_state_path,
-            "requires_catalog": self.requires_catalog,
-            "requires_endpoint": self.requires_endpoint,
-            "direct_device_visible": self.direct_device_visible,
+            "steady_state_path": self.data_path.value,
+            "physical_binding_required": self.physical,
+            "direct_numerical_path": self.direct_numerical_path,
             "uses_host_proxy": self.uses_host_proxy,
         }
 
@@ -269,11 +269,7 @@ _CONTRACTS = {
         mapping_owner=None,
         numerical_address_owner=ResourceOwner.ENGINE,
         directory_owner=ResourceOwner.RUNTIME,
-        steady_state_path="gpu_hbm_load",
-        requires_catalog=False,
-        requires_endpoint=False,
-        direct_device_visible=True,
-        uses_host_proxy=False,
+        data_path=ResourceDataPath.HBM_LOAD,
     ),
     ResourceKind.HOST_MAPPED: ResourceContract(
         kind=ResourceKind.HOST_MAPPED,
@@ -288,15 +284,12 @@ _CONTRACTS = {
         mapping_owner=ResourceOwner.ENGINE,
         numerical_address_owner=ResourceOwner.ENGINE,
         directory_owner=ResourceOwner.RUNTIME,
-        steady_state_path="gpu_mapped_host_load",
-        requires_catalog=False,
-        requires_endpoint=False,
-        direct_device_visible=True,
-        uses_host_proxy=False,
+        data_path=ResourceDataPath.HOST_MAPPED_LOAD,
     ),
     ResourceKind.HOST_STAGED: ResourceContract(
         kind=ResourceKind.HOST_STAGED,
-        capabilities=ResourceCapability.INDEXED_TRANSFER,
+        capabilities=ResourceCapability.HOST_REGISTERED
+        | ResourceCapability.INDEXED_TRANSFER,
         source_address_space=ResourceAddressSpace.HOST_MAPPED,
         numerical_address_space=ResourceAddressSpace.HBM,
         path=ResourcePath.MATERIALIZED,
@@ -306,11 +299,7 @@ _CONTRACTS = {
         mapping_owner=None,
         numerical_address_owner=ResourceOwner.ENGINE,
         directory_owner=ResourceOwner.RUNTIME,
-        steady_state_path="host_indexed_copy_to_engine_hbm",
-        requires_catalog=False,
-        requires_endpoint=False,
-        direct_device_visible=False,
-        uses_host_proxy=True,
+        data_path=ResourceDataPath.HOST_INDEXED_TO_HBM,
     ),
     ResourceKind.NVME: ResourceContract(
         kind=ResourceKind.NVME,
@@ -325,11 +314,7 @@ _CONTRACTS = {
         mapping_owner=ResourceOwner.TRANSPORT,
         numerical_address_owner=ResourceOwner.ENGINE,
         directory_owner=ResourceOwner.RUNTIME,
-        steady_state_path="nvme_peer_dma_to_engine_hbm",
-        requires_catalog=True,
-        requires_endpoint=True,
-        direct_device_visible=False,
-        uses_host_proxy=False,
+        data_path=ResourceDataPath.NVME_PEER_TO_HBM,
     ),
     ResourceKind.CXL_DAX: ResourceContract(
         kind=ResourceKind.CXL_DAX,
@@ -344,11 +329,7 @@ _CONTRACTS = {
         mapping_owner=ResourceOwner.TRANSPORT,
         numerical_address_owner=ResourceOwner.TRANSPORT,
         directory_owner=ResourceOwner.RUNTIME,
-        steady_state_path="cuda_visible_cxl_direct",
-        requires_catalog=True,
-        requires_endpoint=True,
-        direct_device_visible=True,
-        uses_host_proxy=False,
+        data_path=ResourceDataPath.CXL_DIRECT,
     ),
 }
 

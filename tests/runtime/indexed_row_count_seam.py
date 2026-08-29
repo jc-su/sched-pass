@@ -8,15 +8,13 @@ asserts the staged rows equal their host sources byte for byte while
 untouched rows stay untouched. Discriminates a transport seam defect from
 an engine-tensor-semantics defect.
 
-Requires a compiled phase module; pass it explicitly or via
-NTA_PHASE_MODULE.
+Requires the runtime-owned transport program built with the project.
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
-import re
 
 import torch
 
@@ -32,64 +30,21 @@ HEADS = 2
 DIM = 128
 
 
-def _runtime_abi_version() -> int:
-    configured = os.environ.get("NTA_ABI_VERSION")
-    if configured:
-        return int(configured)
-    header = pathlib.Path(__file__).resolve().parents[2] / "include/nta/RuntimeABI.h"
-    match = re.search(
-        r"inline constexpr std::uint32_t Version = (\d+);",
-        header.read_text(encoding="utf-8"),
-    )
-    if match is None:
-        raise RuntimeError(f"cannot read the NTA ABI version from {header}")
-    return int(match.group(1))
-
-
 def locate_module() -> pathlib.Path | None:
-    configured = os.environ.get("NTA_PHASE_MODULE")
+    configured = os.environ.get("NTA_TRANSPORT_PROGRAM")
     if configured:
-        path = pathlib.Path(configured)
+        path = pathlib.Path(configured).resolve()
         if not path.exists():
-            raise RuntimeError(f"NTA_PHASE_MODULE does not exist: {path}")
+            raise RuntimeError(f"NTA_TRANSPORT_PROGRAM does not exist: {path}")
         return path
-    roots = []
-    workspace = os.environ.get("FLASHINFER_WORKSPACE_BASE")
-    if workspace:
-        roots.append(pathlib.Path(workspace))
-    roots.extend(
-        (
-            pathlib.Path.cwd() / "flashinfer-jit-cache",
-            pathlib.Path.home() / ".cache/flashinfer",
-        )
-    )
-    abi_prefix = f"nta-abi{_runtime_abi_version()}-"
-    for root in roots:
-        compatible_roots = (
-            [root]
-            if root.name.startswith(abi_prefix)
-            else sorted(
-                (
-                    candidate
-                    for candidate in root.glob(f"{abi_prefix}*")
-                    if candidate.is_dir()
-                ),
-                key=lambda candidate: candidate.stat().st_mtime,
-                reverse=True,
-            )
-        )
-        for compatible_root in compatible_roots:
-            for pattern in (
-                "nta_batch_decode_default_v2_hooked.so",
-                "nta_sglang_decode_demand*.so",
-            ):
-                candidates = sorted(
-                    compatible_root.rglob(pattern),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                if candidates:
-                    return candidates[0]
+    root = pathlib.Path(__file__).resolve().parents[2]
+    for candidate in (
+        pathlib.Path.cwd() / "libnta-transport-program.so",
+        root / "build/libnta-transport-program.so",
+        root / "build-release/libnta-transport-program.so",
+    ):
+        if candidate.is_file():
+            return candidate.resolve()
     return None
 
 
@@ -99,12 +54,8 @@ def main() -> int:
         return 0
     module = locate_module()
     if module is None:
-        print("no compiled phase module in the cache; seam reproducer skipped")
+        print("no built transport program; seam reproducer skipped")
         return 0
-    # Phase modules link against TVM-FFI, whose symbols the serving process
-    # provides by importing flashinfer before loading any module.
-    import flashinfer  # noqa: F401
-
     phases = JitPhaseProgram(module)
     runtime = Runtime(
         RuntimeConfig(

@@ -18,6 +18,10 @@ sys.path.insert(0, str(ROOT / "python"))
 from experiments.validate_serving_result import validate as validate_serving_result  # noqa: E402
 from experiments.validate_vllm_report import validate  # noqa: E402
 from nta_runtime.adapters.base import ConsumerContract  # noqa: E402
+from nta_runtime.engines.vllm import (  # noqa: E402
+    VLLM_STATS,
+    consumer_contract as live_consumer_contract,
+)
 
 
 def _contract(kind: str) -> dict[str, object]:
@@ -93,6 +97,14 @@ def report(backend: str) -> dict[str, object]:
 
 
 def main() -> None:
+    saved_stats = dict(VLLM_STATS)
+    try:
+        VLLM_STATS["native_decode_launches"] = 1
+        VLLM_STATS["reference_fallback_launches"] = 1
+        assert live_consumer_contract()["kind"] == "framework_reference"
+    finally:
+        VLLM_STATS.clear()
+        VLLM_STATS.update(saved_stats)
     stock = report("stock")
     nta = report("nta")
     validate(stock)

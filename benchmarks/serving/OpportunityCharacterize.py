@@ -187,7 +187,7 @@ def merge_profiles(engine_stats: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         profiled_entries += 1
         for key, value in entry.items():
-            if key == "profiled_barrier_stall_by_layer_ms":
+            if key == "profiled_attention_stall_by_layer_ms":
                 for layer, stall in value.items():
                     by_layer[layer] = by_layer.get(layer, 0.0) + float(stall)
                 continue
@@ -203,7 +203,7 @@ def merge_profiles(engine_stats: list[dict[str, Any]]) -> dict[str, Any]:
         )
     merged["profiled_engine_processes"] = profiled_entries
     if by_layer:
-        merged["profiled_barrier_stall_by_layer_ms"] = dict(
+        merged["profiled_attention_stall_by_layer_ms"] = dict(
             sorted(by_layer.items(), key=lambda item: int(item[0]))
         )
     return merged
@@ -216,8 +216,8 @@ def characterize_point(
     report = outcome["report"]
     profiles = merge_profiles(report["engine_stats"])
 
-    stall_ms = float(profiles.get("profiled_barrier_stall_gpu_ms", 0.0))
-    waits = int(profiles.get("profiled_barrier_waits", 0))
+    stall_ms = float(profiles.get("profiled_attention_stall_gpu_ms", 0.0))
+    waits = int(profiles.get("profiled_attention_arrivals", 0))
     if waits == 0:
         raise RuntimeError(
             f"barrier profiling recorded zero waits at {external_tokens} tokens"
@@ -237,17 +237,33 @@ def characterize_point(
     return {
         "external_tokens": external_tokens,
         "barrier_waits": waits,
-        "barrier_stalled_waits": int(profiles.get("profiled_barrier_stalled_waits", 0)),
+        "barrier_stalled_waits": int(
+            profiles.get("profiled_attention_materially_stalled_arrivals", 0)
+        ),
+        "ready_at_arrival": int(
+            profiles.get("profiled_attention_ready_at_arrival", 0)
+        ),
+        "not_ready_at_arrival": int(
+            profiles.get("profiled_attention_not_ready_at_arrival", 0)
+        ),
         "barrier_stall_gpu_ms": stall_ms,
-        "barrier_max_stall_gpu_ms": float(
-            profiles.get("profiled_barrier_max_stall_gpu_ms", 0.0)
+        "barrier_max_layer_stall_gpu_ms": max(
+            (
+                float(value)
+                for value in profiles.get(
+                    "profiled_attention_stall_by_layer_ms", {}
+                ).values()
+            ),
+            default=0.0,
         ),
         "attention_operator_gpu_ms": operator_ms,
         "pipeline_transfer_gpu_ms": transfer_ms,
         "pipeline_transfer_bytes": transfer_bytes,
         "blocked_fraction": blocked_fraction,
         "load_compute_ratio": (transfer_ms / operator_ms) if operator_ms else 0.0,
-        "stall_by_layer_ms": profiles.get("profiled_barrier_stall_by_layer_ms", {}),
+        "stall_by_layer_ms": profiles.get(
+            "profiled_attention_stall_by_layer_ms", {}
+        ),
         "resident_p99_itl_seconds": report.get("resident_p99_itl_seconds"),
         "external_p95_ttft_seconds": report.get("external_p95_ttft_seconds"),
         "engine_processes": int(profiles.get("profiled_engine_processes", 0)),

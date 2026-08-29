@@ -50,7 +50,7 @@ carries resident and external work units together; the qualified vLLM
 consumer has its own resident eager path because vLLM's official
 `AttentionBackend` seam replaces the reference implementation for that
 profile.
-the reference path is not used to hide external work or to change demand.
+The reference path is not used to hide external work or to change demand.
 
 The performance gate follows the same boundary. The request-bound direct form
 is measured against the stock wrapper and must stay within the checked-in
@@ -65,10 +65,12 @@ The native runtime exposes one tier directory for HBM, mapped host memory,
 host-staged memory, NVMe, and CXL DAX. The same descriptor is consumed by
 host admission, device-visible backend metadata, and experiment telemetry.
 The engine-neutral `ServingTierService` is the only serving attachment point:
-host-staged uses indexed host objects, NVMe installs catalog-validated HBM
-objects and runs the finite device progress loop, reusing a slot's mapped HBM
-destination when its capacity is sufficient, and CXL emits catalog-
-validated direct dependencies. The Python resource contract makes protocol
+host-staged uses indexed host objects, while NVMe installs catalog-validated
+HBM objects and runs the finite device progress loop, reusing a slot's mapped
+HBM destination when its capacity is sufficient. The native CXL path emits
+catalog-validated direct dependencies; framework adapters reject it until
+their numerical page tables can bind the same direct address. The Python
+resource contract makes protocol
 ownership, allocation ownership, and runtime directory ownership explicit;
 physical-tier configuration never silently
 falls back to host data movement.

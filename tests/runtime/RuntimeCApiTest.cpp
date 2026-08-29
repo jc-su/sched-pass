@@ -114,7 +114,7 @@ int main() {
     nta_acquire_requirement dependency{
         directBase, 0, 101, 0, 0, 7, 4096, 0,
     };
-    nta_work_item work{0, 0, 3, 11, 0, 1, 1, 0, 0, 0, 1, 2500, 0, 0, 0, 0};
+    nta_work_item work{0, 0, 3, 11, 0, 1, 1, 0, 0, 0, 1, 2500, 0, 0, 0};
     nta_request_work_range request{0, 1, 0, 3};
     requireOk(nta_device_work_plan_upload(plan, &work, 1, &dependency, 1,
                                           &request, 1, 0),
@@ -213,6 +213,10 @@ int main() {
                 nullptr, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, nullptr) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "C API accepted a null registered async NVMe runtime");
+    require(nta_runtime_install_registered_nvme_objects_async(
+                nullptr, nullptr, 0, 0, nullptr) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted a null registered NVMe batch runtime");
     require(nta_nvme_transport_register_hbm_region(nullptr, 0, 0, nullptr) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "C API accepted a null NVMe HBM registration");
@@ -237,12 +241,22 @@ int main() {
     nvme.queue_depth = 64;
     nvme.admin_timeout_ms = 10'000;
     nvme.media_policy = NTA_NVME_REQUIRE_HARDWARE_WRITE_PROTECTION;
+    nvme.dma_target = NTA_NVME_DMA_HBM_PEER;
+    nvme.hbm_mapping_policy = NTA_NVME_HBM_MAPPING_AUTO;
     nta_nvme_transport *transport = nullptr;
     require(nta_nvme_transport_create(&nvme, &transport) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "C API accepted a non-VFIO NVMe endpoint");
     require(transport == nullptr,
             "failed C NVMe creation returned a transport handle");
+
+    nvme.endpoint = "vfio:0000:00:00.0";
+    nvme.hbm_mapping_policy = UINT32_MAX;
+    require(nta_nvme_transport_create(&nvme, &transport) ==
+                NTA_STATUS_INVALID_ARGUMENT,
+            "C API accepted an invalid NVMe HBM mapping policy");
+    require(transport == nullptr,
+            "invalid C HBM mapping policy returned a transport handle");
 
     nta_device_work_plan_destroy(plan);
     nta_runtime_destroy(runtime);

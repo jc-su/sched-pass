@@ -102,9 +102,9 @@ anonymized trace explicitly reports compute/transfer regime as
 `trace_only_not_identifiable`; that regime is measured in native tier reports
 and serving profiles rather than inferred from prompt lengths.  RQ1 is the
 paired serving result against stock SGLang HiCache under identical exact
-demand.  RQ2 is the causal decomposition: resident reference, host promotion,
-host/device demand materialization, conventional gather, late-bound staging,
-bounded heterogeneous work units, and optional exact partial continuation.
+demand. RQ2 is the causal decomposition across framework bulk control, exact
+NTA preacquisition, GPU demand discovery with bulk readiness, and progressive
+heterogeneous work-unit release.
 RQ3 reports request-state, tier, load, arrival, and granularity strata.  RQ4
 reports control and resource overhead with profiler artifacts.
 
@@ -115,14 +115,13 @@ external attention required to be exact and fallback-free. This split prevents
 instrumentation overhead on requests that do not exercise a remote tier while
 keeping the mixed-batch mechanism measurable.
 
-The paired plan includes the adjacent B0--B6 boundaries and two decisive
-cross-boundary checks: B3 versus B1 isolates the host-control round trip, and
-B5 versus B3 isolates the full device-demand/heterogeneous-work-unit
-mechanism from the conventional gather path.
+The paired plan has three adjacent boundaries: A1/A0 for exact acquisition,
+A2/A1 for GPU demand discovery, and A3/A2 for progressive work-unit release.
+All three pairs consume the same exact demand and numerical contract.
 
 The generated trial specification is explicitly marked
 `evaluation_profile=osdi-complete`. This profile is a machine-checked gate,
-not a documentation label: it requires all B0--B6 arms, all eight canonical
+not a documentation label: it requires all A0--A3 arms, all three canonical
 causal boundaries in every declared stratum, and at least six strata. Minimal
 fixtures use `evaluation_profile=contract` and cannot be presented as the
 complete evaluation.
@@ -139,8 +138,8 @@ so the demand digest is not merely an offline annotation.
 Synthetic matrix timing is contract evidence only.  A speedup claim requires a
 structured serving artifact with the same demand trace and correctness digest.
 
-The mandatory serving tiers are HBM reference, host-staged memory, VFIO NVMe,
-and CXL DAX. The current serving path names host memory explicitly as
+The target serving tiers are HBM reference, host-staged memory, VFIO NVMe, and
+CXL DAX. The current serving path names host memory explicitly as
 `host_staged`; it does not silently switch between mapped and staged host
 access. `host_mapped` is retained as a matched NVMe DMA-destination baseline,
 not as another serving tier. NVMe requires the explicit read-only VFIO/IOMMU qualification;
@@ -149,8 +148,11 @@ the NVIDIA peer-page backend, translated-IOMMU containment, no new target DMAR
 fault, and zero outstanding work. A host-mapped destination is a baseline and
 cannot satisfy direct-HBM admission. The matched fio ratio remains a separate
 performance result, and its Boolean classification must agree with the recorded
-ratio and threshold. DAX requires an explicit CUDA-visible `devdax` mapping.
-Missing hardware is a capability-gated `SKIP`, never a fabricated result.
+ratio and threshold. DAX requires an explicit CUDA-visible `devdax` mapping
+and a numerical consumer that can use the mapped resource. That SGLang
+numerical boundary is currently deferred, so DAX is not yet a completed
+serving tier. Missing or deferred capability is a `SKIP`, never a fabricated
+result.
 
 The native tier commands use the same paged-attention workload and correctness
 checks:
@@ -202,15 +204,14 @@ reported per stratum before any aggregate.  Use the existing qualified-trial
 runner for paired commands, and store its raw logs outside the checkout.  For
 hardware profiling:
 
-For a complete OSDI trial matrix, copy
-`experiments/evaluation-trial-spec.example.json`, replace the external model
-commands and workload path, and run:
+For a complete OSDI trial matrix, generate a specification with
+`experiments/make_evaluation_spec.py` from six or more normalized scenarios,
+then run it from a clean revision:
 
 ```bash
 python experiments/run_evaluation.py \
   --spec /path/to/paired-evaluation.json \
-  --output-dir /tmp/nta-artifacts/paired-serving \
-  --allow-dirty
+  --output-dir /tmp/nta-artifacts/paired-serving
 ```
 
 The wrapper reuses the randomized qualified-trial engine and adds exact
@@ -223,7 +224,7 @@ artifact archive:
 python experiments/validate_evaluation_artifact.py /tmp/nta-artifacts/paired-serving
 ```
 
-The serving Little's Law field uses finite-window arrival/departure accounting
+The serving report uses descriptive finite-window arrival/departure accounting
 from measured client timestamps. Its queue scope is explicitly client
 admission delay; it is not an internal scheduler queue claim unless the engine
 exports that queue timestamp.

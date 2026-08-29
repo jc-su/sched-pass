@@ -25,6 +25,9 @@ int main() {
   static_assert(alignof(AcquireIntent) == 64);
   static_assert(alignof(IntentSlot) == 128);
   static_assert(alignof(IntentPool) == 64);
+  static_assert(alignof(IntentQueueEntry) == 64);
+  static_assert(alignof(IntentQueueNode) == 16);
+  static_assert(alignof(IntentQueueControl) == 32);
   static_assert(alignof(AcquireRequirement) == 16);
   static_assert(alignof(WorkDependency) == 16);
   static_assert(alignof(WorkItem) == 32);
@@ -36,12 +39,23 @@ int main() {
   static_assert(offsetof(ObjectEntry, state) == 36);
   static_assert(offsetof(AcquireIntent, valid) == 44);
   static_assert(offsetof(IntentSlot, sourceKind) == 72);
+  static_assert(offsetof(IntentSlot, chargedRequestBytes) == 80);
+  static_assert(offsetof(IntentSlot, chargedBackendBytes) == 88);
+  static_assert(sizeof(IntentQueueEntry) == 64);
+  static_assert(offsetof(IntentQueueEntry, deadlineClock) == 16);
+  static_assert(offsetof(IntentQueueEntry, state) == 36);
+  static_assert(offsetof(IntentQueueEntry, priority) == 48);
+  static_assert(sizeof(IntentQueueNode) == 16);
+  static_assert(offsetof(IntentQueueNode, slotIndex) == 8);
+  static_assert(sizeof(IntentQueueControl) == 32);
+  static_assert(offsetof(IntentQueueControl, size) == 8);
+  static_assert(offsetof(IntentQueueControl, lock) == 12);
   static_assert(offsetof(WorkTicket, state) == 16);
   static_assert(offsetof(WorkTicket, epoch) == 32);
   static_assert(sizeof(WorkItem) == 64);
   static_assert(offsetof(WorkItem, reductionGroup) == 32);
   static_assert(offsetof(WorkItem, estimatedComputeNs) == 44);
-  static_assert(offsetof(WorkItem, reserved0) == 48);
+  static_assert(offsetof(WorkItem, readyDeadlineOffsetNs) == 48);
   static_assert(sizeof(WorkTicket) == 64);
   static_assert(offsetof(WorkTicket, unavailableBytes) == 40);
   static_assert(offsetof(WorkTicket, estimatedComputeNs) == 48);
@@ -55,22 +69,25 @@ int main() {
   static_assert(offsetof(RuntimeView, dependencies) == 64);
   static_assert(offsetof(RuntimeView, intentPool) == 72);
   static_assert(offsetof(RuntimeView, intentQueueEntries) == 80);
-  static_assert(offsetof(RuntimeView, readyWorkTickets) == 96);
-  static_assert(offsetof(RuntimeView, pendingWorkTickets) == 120);
-  static_assert(offsetof(RuntimeView, ctaCompletions) == 136);
-  static_assert(offsetof(RuntimeView, objectDependentHeads) == 144);
-  static_assert(offsetof(RuntimeView, dependencySatisfied) == 160);
-  static_assert(offsetof(RuntimeView, changedQueued) == 184);
-  static_assert(offsetof(RuntimeView, changedOverflow) == 200);
-  static_assert(offsetof(RuntimeView, requestProgress) == 208);
-  static_assert(offsetof(RuntimeView, reductionExpected) == 216);
-  static_assert(offsetof(RuntimeView, reductionCompleted) == 224);
-  static_assert(offsetof(RuntimeView, reductionFailed) == 232);
-  static_assert(offsetof(RuntimeView, requestCapacity) == 240);
-  static_assert(offsetof(RuntimeView, epochStartClock) == 280);
-  static_assert(offsetof(RuntimeView, epoch) == 288);
-  static_assert(offsetof(RuntimeView, abiVersion) == 300);
-  static_assert(offsetof(RuntimeView, stickyFailedCount) == 304);
+  static_assert(offsetof(RuntimeView, intentQueueControls) == 88);
+  static_assert(offsetof(RuntimeView, intentQueueHeap) == 96);
+  static_assert(offsetof(RuntimeView, readyWorkTickets) == 104);
+  static_assert(offsetof(RuntimeView, pendingWorkTickets) == 128);
+  static_assert(offsetof(RuntimeView, ctaCompletions) == 144);
+  static_assert(offsetof(RuntimeView, objectDependentHeads) == 152);
+  static_assert(offsetof(RuntimeView, dependencySatisfied) == 168);
+  static_assert(offsetof(RuntimeView, changedQueued) == 192);
+  static_assert(offsetof(RuntimeView, changedOverflow) == 208);
+  static_assert(offsetof(RuntimeView, requestProgress) == 216);
+  static_assert(offsetof(RuntimeView, reductionExpected) == 224);
+  static_assert(offsetof(RuntimeView, reductionCompleted) == 232);
+  static_assert(offsetof(RuntimeView, reductionFailed) == 240);
+  static_assert(offsetof(RuntimeView, requestCapacity) == 248);
+  static_assert(offsetof(RuntimeView, readyWindowEnd) == 284);
+  static_assert(offsetof(RuntimeView, epochStartClock) == 288);
+  static_assert(offsetof(RuntimeView, epoch) == 296);
+  static_assert(offsetof(RuntimeView, abiVersion) == 308);
+  static_assert(offsetof(RuntimeView, stickyFailedCount) == 312);
   static_assert(sizeof(RuntimeView) == 320);
   static_assert(sourceTransferStride(packTransferStrides(17, 31)) == 17);
   static_assert(destinationTransferStride(packTransferStrides(17, 31)) == 31);
@@ -81,7 +98,7 @@ int main() {
   static_assert(nta::decodeTierCapabilities(nta::encodeTierCapabilities(
                     nta::TierDirectAddress | nta::TierHostRegistered)) ==
                 (nta::TierDirectAddress | nta::TierHostRegistered));
-  if (Version != 31 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
+  if (Version != 35 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

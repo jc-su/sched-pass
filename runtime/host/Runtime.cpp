@@ -42,6 +42,20 @@ void checkCuda(cudaError_t result, const char *operation) {
   }
 }
 
+void checkDriver(CUresult result, const char *operation) {
+  if (result == CUDA_SUCCESS) {
+    return;
+  }
+  const char *name = nullptr;
+  const char *description = nullptr;
+  (void)cuGetErrorName(result, &name);
+  (void)cuGetErrorString(result, &description);
+  throw std::runtime_error(
+      std::string(operation) + ": " +
+      (name == nullptr ? "unknown CUDA driver error" : name) +
+      (description == nullptr ? "" : std::string(" (") + description + ")"));
+}
+
 void validateDeviceVisiblePointer(const void *address, int deviceOrdinal,
                                   const char *description) {
   if (address == nullptr) {
@@ -369,6 +383,29 @@ abi::ObjectEntry makeIndexedHostObject(const IndexedHostObjectSpec &object,
   };
 }
 
+std::uint32_t nvmeTransferPageCount(const NvmeBuffer &buffer,
+                                    std::size_t bytes,
+                                    const NvmeCapabilities &capabilities) {
+  const std::uint64_t firstByteOffset = buffer.dmaFirstByteOffset();
+  const std::uint64_t pageBytes = capabilities.controllerPageSize;
+  if (pageBytes == 0 || firstByteOffset >= pageBytes || bytes == 0 ||
+      bytes > std::numeric_limits<std::uint64_t>::max() - firstByteOffset) {
+    throw std::invalid_argument("NVMe destination has invalid PRP geometry");
+  }
+  const std::uint64_t requiredPages =
+      1U + (firstByteOffset + bytes - 1U) / pageBytes;
+  // PRP1 carries the first page and one controller page can hold the
+  // remaining PRP entries. This includes an MDTS-sized mid-page destination.
+  const std::uint64_t maxPrpPages =
+      pageBytes / sizeof(std::uint64_t) + 1U;
+  if (requiredPages == 0 || requiredPages > buffer.dmaPageCount() ||
+      requiredPages > maxPrpPages || requiredPages > UINT32_MAX) {
+    throw std::invalid_argument(
+        "NVMe destination page table cannot represent the object transfer");
+  }
+  return static_cast<std::uint32_t>(requiredPages);
+}
+
 template <typename T> T *deviceAllocate(std::size_t count) {
   T *pointer = nullptr;
   checkCuda(cudaMalloc(reinterpret_cast<void **>(&pointer), sizeof(T) * count),
@@ -454,7 +491,7 @@ struct HostRuntime::Impl {
   };
 
   struct RetiredObject {
-    OwnedObject object;
+    std::vector<OwnedObject> objects;
     cudaEvent_t complete = nullptr;
   };
 
@@ -475,8 +512,6 @@ struct HostRuntime::Impl {
   explicit Impl(RuntimeConfig runtimeConfig,
                 RuntimeBackends runtimeBackends = {})
       : config(normalizeRuntimeConfig(runtimeConfig)),
-        requestsHost(config.requestCapacity),
-        tenantsHost(config.tenantCapacity),
         requestInstalled(config.requestCapacity, false),
         objectInstalled(config.objectCapacity, false),
         objects(config.objectCapacity), nvme(std::move(runtimeBackends.nvme)),
@@ -495,6 +530,8 @@ struct HostRuntime::Impl {
         config.objectCapacity == 0 || config.intentCapacity == 0 ||
         config.workTicketCapacity == 0 || config.maxReplicasPerObject == 0 ||
         config.maxDependenciesPerWorkTicket == 0 ||
+        config.intentCapacity >
+            std::numeric_limits<std::size_t>::max() / abi::BackendCount ||
         config.objectCapacity > std::numeric_limits<std::uint32_t>::max() /
                                     config.maxReplicasPerObject ||
         config.workTicketCapacity > std::numeric_limits<std::uint32_t>::max() /
@@ -506,6 +543,8 @@ struct HostRuntime::Impl {
     replicaCapacity = config.objectCapacity * config.maxReplicasPerObject;
     dependencyCapacity =
         config.workTicketCapacity * config.maxDependenciesPerWorkTicket;
+    intentHeapCapacity =
+        static_cast<std::size_t>(config.intentCapacity) * abi::BackendCount;
     for (std::uint32_t index = 0; index < abi::BackendCount; ++index) {
       const auto kind = static_cast<abi::SourceKind>(index);
       tierLatencies[index] = configuredTierLatency(kind);
@@ -542,12 +581,22 @@ struct HostRuntime::Impl {
       intentPool = deviceAllocate<abi::IntentPool>(1);
       intentQueueEntries =
           deviceAllocate<abi::IntentQueueEntry>(config.intentCapacity);
-      intentQueueHeads = deviceAllocate<std::uint64_t>(abi::BackendCount *
-                                                       abi::UrgencyBucketCount);
-      checkCuda(cudaMemset(intentQueueHeads, 0xff,
-                           abi::BackendCount * abi::UrgencyBucketCount *
-                               sizeof(std::uint64_t)),
-                "initialize intent queue heads");
+      intentQueueControls =
+          deviceAllocate<abi::IntentQueueControl>(abi::BackendCount);
+      intentQueueHeap =
+          deviceAllocate<abi::IntentQueueNode>(intentHeapCapacity);
+      checkCuda(cudaMemset(intentQueueEntries, 0,
+                           config.intentCapacity *
+                               sizeof(abi::IntentQueueEntry)),
+                "initialize intent queue entries");
+      checkCuda(cudaMemset(intentQueueControls, 0,
+                           abi::BackendCount *
+                               sizeof(abi::IntentQueueControl)),
+                "initialize intent queue controls");
+      checkCuda(cudaMemset(intentQueueHeap, 0xff,
+                           intentHeapCapacity *
+                               sizeof(abi::IntentQueueNode)),
+                "initialize intent queue heap");
       readyWorkTickets =
           deviceAllocate<std::uint32_t>(config.workTicketCapacity);
       readyCount = deviceAllocate<std::uint32_t>(1);
@@ -704,11 +753,10 @@ struct HostRuntime::Impl {
             0,
         };
       }
-      for (abi::TenantContext &tenant : tenantsHost) {
-        tenant = {UINT64_MAX, 0};
-      }
-      checkCuda(cudaMemcpy(tenants, tenantsHost.data(),
-                           tenantsHost.size() * sizeof(tenantsHost.front()),
+      const std::vector<abi::TenantContext> initialTenants(
+          config.tenantCapacity, abi::TenantContext{UINT64_MAX, 0});
+      checkCuda(cudaMemcpy(tenants, initialTenants.data(),
+                           initialTenants.size() * sizeof(initialTenants.front()),
                            cudaMemcpyHostToDevice),
                 "upload tenant directory");
       std::vector<abi::IntentSlot> hostIntentSlots(config.intentCapacity);
@@ -739,7 +787,8 @@ struct HostRuntime::Impl {
           dependencies,
           intentPool,
           intentQueueEntries,
-          intentQueueHeads,
+          intentQueueControls,
+          intentQueueHeap,
           readyWorkTickets,
           readyCount,
           readyHead,
@@ -767,6 +816,7 @@ struct HostRuntime::Impl {
           config.workTicketCapacity,
           dependencyCapacity,
           config.maxDependenciesPerWorkTicket,
+          0,
           0,
           0,
           0,
@@ -812,7 +862,9 @@ struct HostRuntime::Impl {
     auto retired = retiredObjects.begin();
     while (retired != retiredObjects.end()) {
       if (retired->complete == nullptr) {
-        releaseObject(retired->object);
+        for (OwnedObject &object : retired->objects) {
+          releaseObject(object);
+        }
         retired = retiredObjects.erase(retired);
         continue;
       }
@@ -830,7 +882,9 @@ struct HostRuntime::Impl {
         ++retired;
         continue;
       }
-      releaseObject(retired->object);
+      for (OwnedObject &object : retired->objects) {
+        releaseObject(object);
+      }
       (void)cudaEventDestroy(retired->complete);
       retired = retiredObjects.erase(retired);
     }
@@ -847,7 +901,8 @@ struct HostRuntime::Impl {
       throw std::invalid_argument("runtime object retirement requires a stream "
                                   "and prior consumer event");
     }
-    RetiredObject retired{std::move(object), nullptr};
+    RetiredObject retired{{}, nullptr};
+    retired.objects.push_back(std::move(object));
     const cudaError_t eventStatus =
         cudaEventCreateWithFlags(&retired.complete, cudaEventDisableTiming);
     if (eventStatus != cudaSuccess) {
@@ -860,7 +915,9 @@ struct HostRuntime::Impl {
       } else {
         (void)cudaDeviceSynchronize();
       }
-      releaseObject(retired.object);
+      for (OwnedObject &owned : retired.objects) {
+        releaseObject(owned);
+      }
       checkCuda(eventStatus, "create runtime object retirement event");
     }
     bool recorded = false;
@@ -884,7 +941,52 @@ struct HostRuntime::Impl {
         (void)cudaEventDestroy(retired.complete);
         retired.complete = nullptr;
       }
-      releaseObject(retired.object);
+      for (OwnedObject &owned : retired.objects) {
+        releaseObject(owned);
+      }
+      throw;
+    }
+  }
+
+  // Retire a publication transaction with one event. The caller has already
+  // enqueued every old-consumer wait on stream before replacing the device
+  // directory, so one event is a sufficient lifetime edge for all mapping
+  // leases in the transaction.
+  void retireObjectsAfterStream(std::vector<OwnedObject> objects,
+                                cudaStream_t stream) {
+    if (objects.empty()) {
+      return;
+    }
+    if (stream == nullptr) {
+      throw std::invalid_argument(
+          "runtime object batch retirement requires a stream");
+    }
+    RetiredObject retired{std::move(objects), nullptr};
+    const cudaError_t eventStatus =
+        cudaEventCreateWithFlags(&retired.complete, cudaEventDisableTiming);
+    if (eventStatus != cudaSuccess) {
+      // The stream already contains every prior-consumer wait. Quiescing this
+      // stream therefore makes immediate release safe without a device-wide
+      // fence, even on the exceptional event-allocation path.
+      (void)cudaStreamSynchronize(stream);
+      for (OwnedObject &owned : retired.objects) {
+        releaseObject(owned);
+      }
+      checkCuda(eventStatus, "create runtime object batch retirement event");
+    }
+    try {
+      checkCuda(cudaEventRecord(retired.complete, stream),
+                "record runtime object batch retirement event");
+      retiredObjects.push_back(std::move(retired));
+    } catch (...) {
+      (void)cudaStreamSynchronize(stream);
+      if (retired.complete != nullptr) {
+        (void)cudaEventDestroy(retired.complete);
+        retired.complete = nullptr;
+      }
+      for (OwnedObject &owned : retired.objects) {
+        releaseObject(owned);
+      }
       throw;
     }
   }
@@ -943,7 +1045,9 @@ struct HostRuntime::Impl {
       }
     }
     for (RetiredObject &retired : retiredObjects) {
-      releaseObject(retired.object);
+      for (OwnedObject &object : retired.objects) {
+        releaseObject(object);
+      }
       if (retired.complete != nullptr) {
         (void)cudaEventDestroy(retired.complete);
       }
@@ -957,9 +1061,13 @@ struct HostRuntime::Impl {
       (void)cudaFree(intentPool);
       intentPool = nullptr;
     }
-    if (intentQueueHeads != nullptr) {
-      (void)cudaFree(intentQueueHeads);
-      intentQueueHeads = nullptr;
+    if (intentQueueHeap != nullptr) {
+      (void)cudaFree(intentQueueHeap);
+      intentQueueHeap = nullptr;
+    }
+    if (intentQueueControls != nullptr) {
+      (void)cudaFree(intentQueueControls);
+      intentQueueControls = nullptr;
     }
     if (intentQueueEntries != nullptr) {
       (void)cudaFree(intentQueueEntries);
@@ -1138,6 +1246,7 @@ struct HostRuntime::Impl {
   RuntimeConfig config;
   std::uint32_t replicaCapacity = 0;
   std::uint32_t dependencyCapacity = 0;
+  std::size_t intentHeapCapacity = 0;
   abi::RequestContext *requests = nullptr;
   abi::TenantContext *tenants = nullptr;
   abi::ObjectEntry *objectEntries = nullptr;
@@ -1150,7 +1259,8 @@ struct HostRuntime::Impl {
   abi::WorkDependency *dependencies = nullptr;
   abi::IntentPool *intentPool = nullptr;
   abi::IntentQueueEntry *intentQueueEntries = nullptr;
-  std::uint64_t *intentQueueHeads = nullptr;
+  abi::IntentQueueControl *intentQueueControls = nullptr;
+  abi::IntentQueueNode *intentQueueHeap = nullptr;
   std::uint32_t *readyWorkTickets = nullptr;
   std::uint32_t *readyCount = nullptr;
   std::uint32_t *readyHead = nullptr;
@@ -1170,8 +1280,6 @@ struct HostRuntime::Impl {
   std::uint32_t *reductionCompleted = nullptr;
   std::uint32_t *reductionFailed = nullptr;
   abi::RuntimeView *view = nullptr;
-  std::vector<abi::RequestContext> requestsHost;
-  std::vector<abi::TenantContext> tenantsHost;
   std::vector<bool> requestInstalled;
   std::vector<bool> objectInstalled;
   std::vector<std::optional<OwnedObject>> objects;
@@ -1212,14 +1320,13 @@ void HostRuntime::setRequest(std::uint32_t slot, std::uint64_t requestId,
   if (generation == 0) {
     throw std::invalid_argument("request generation must be positive");
   }
-  if (priority >= abi::UrgencyBucketCount) {
-    throw std::invalid_argument("request priority exceeds urgency buckets");
-  }
   if (impl_->requestInstalled[slot]) {
     const abi::RequestContext current = downloadOne(impl_->requests, slot);
     if (current.outstandingBytes != 0) {
-      throw std::logic_error("request slot cannot be reused while acquisition "
-                             "bytes are outstanding");
+      throw std::logic_error(
+          "request slot cannot be reused while " +
+          std::to_string(current.outstandingBytes) +
+          " acquisition bytes are outstanding");
     }
   }
   abi::RequestContext request{
@@ -1232,7 +1339,6 @@ void HostRuntime::setRequest(std::uint32_t slot, std::uint64_t requestId,
       priority,
       0,
   };
-  impl_->requestsHost[slot] = request;
   impl_->requestInstalled[slot] = true;
   uploadOne(impl_->requests, slot, request);
   uploadOne(impl_->requestProgress, slot,
@@ -1254,9 +1360,6 @@ void HostRuntime::publishRequestsAsync(std::span<const RequestSpec> requests,
     }
     if (request.generation == 0) {
       throw std::invalid_argument("request generation must be positive");
-    }
-    if (request.priority >= abi::UrgencyBucketCount) {
-      throw std::invalid_argument("request priority exceeds urgency buckets");
     }
     if (index != 0 && requests[index - 1].slot >= request.slot) {
       throw std::invalid_argument(
@@ -1317,7 +1420,6 @@ void HostRuntime::publishRequestsAsync(std::span<const RequestSpec> requests,
     upload.pending = true;
     for (std::size_t index = 0; index < requests.size(); ++index) {
       const std::uint32_t slot = requests[index].slot;
-      impl_->requestsHost[slot] = upload.requests[index];
       impl_->requestInstalled[slot] = true;
     }
   } catch (...) {
@@ -1340,9 +1442,6 @@ void HostRuntime::setTenantBudget(std::uint32_t tenantId,
     throw std::invalid_argument(
         "tenant budget cannot drop below currently outstanding bytes");
   }
-  abi::TenantContext &hostTenant = impl_->tenantsHost[tenantId];
-  hostTenant.maxOutstandingBytes = maxOutstandingBytes;
-
   // outstandingBytes is a device-owned atomic. Publishing the whole aggregate
   // here can roll the counter back while acquisitions are in flight, so the
   // control-plane update is deliberately scoped to its one host-owned field.
@@ -1368,8 +1467,6 @@ void HostRuntime::cancelRequest(std::uint32_t slot, std::uint32_t generation) {
         "cannot cancel a reused request slot with a stale generation");
   }
   constexpr std::uint32_t cancelled = 1;
-  impl_->requestsHost[slot].cancelled = cancelled;
-
   // outstandingBytes is updated atomically by device acquisition/release.
   // A whole-RequestContext upload would race that counter and can create a
   // stuck credit or an underflow. Cancellation owns exactly one field.
@@ -1781,18 +1878,27 @@ void HostRuntime::registerIndexedHostObjectsAsyncQuiesced(
 
   const std::uint32_t firstReplica =
       firstSlot * impl_->config.maxReplicasPerObject;
-  checkCuda(cudaMemcpyAsync(impl_->replicaEntries + firstReplica,
-                            upload.replicas,
-                            replicaCount * sizeof(abi::ReplicaEntry),
-                            cudaMemcpyHostToDevice, stream),
-            "upload indexed host replicas asynchronously");
-  checkCuda(cudaMemcpyAsync(impl_->objectEntries + firstSlot, upload.objects,
-                            objects.size() * sizeof(abi::ObjectEntry),
-                            cudaMemcpyHostToDevice, stream),
-            "upload indexed host objects asynchronously");
-  checkCuda(cudaEventRecord(upload.complete, stream),
-            "record indexed host directory upload");
-  upload.pending = true;
+  try {
+    checkCuda(cudaMemcpyAsync(impl_->replicaEntries + firstReplica,
+                              upload.replicas,
+                              replicaCount * sizeof(abi::ReplicaEntry),
+                              cudaMemcpyHostToDevice, stream),
+              "upload indexed host replicas asynchronously");
+    checkCuda(cudaMemcpyAsync(impl_->objectEntries + firstSlot, upload.objects,
+                              objects.size() * sizeof(abi::ObjectEntry),
+                              cudaMemcpyHostToDevice, stream),
+              "upload indexed host objects asynchronously");
+    checkCuda(cudaEventRecord(upload.complete, stream),
+              "record indexed host directory upload");
+    upload.pending = true;
+  } catch (...) {
+    // A later enqueue can fail after an earlier copy has started reading this
+    // pinned ring entry. Quiesce before allowing the entry to be recycled;
+    // callers receive the original publication failure and must not consume
+    // the potentially partial directory transaction.
+    (void)cudaStreamSynchronize(stream);
+    throw;
+  }
 
   for (std::size_t index = 0; index < objects.size(); ++index) {
     const std::uint32_t slot = firstSlot + static_cast<std::uint32_t>(index);
@@ -1806,6 +1912,26 @@ void HostRuntime::registerIndexedHostObjectsAsyncQuiesced(
       }
     }
     impl_->objectInstalled[slot] = true;
+  }
+}
+
+void HostRuntime::waitObjectRangeTerminal(std::uint32_t firstSlot,
+                                          std::uint32_t objectCount,
+                                          cudaStream_t stream) const {
+  detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
+  if (objectCount == 0 || firstSlot > impl_->config.objectCapacity ||
+      objectCount > impl_->config.objectCapacity - firstSlot) {
+    throw std::out_of_range("object terminal-wait range exceeds capacity");
+  }
+  for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
+    const CUdeviceptr stateAddress =
+        reinterpret_cast<CUdeviceptr>(impl_->objectEntries + firstSlot + relative) +
+        offsetof(abi::ObjectEntry, state);
+    checkDriver(
+        cuStreamWaitValue32(reinterpret_cast<CUstream>(stream), stateAddress,
+                            static_cast<std::uint32_t>(abi::ObjectState::Ready),
+                            CU_STREAM_WAIT_VALUE_GEQ),
+        "wait for object terminal state");
   }
 }
 
@@ -1850,6 +1976,8 @@ ObjectHandle HostRuntime::installNvmeObject(
   if (buffer == nullptr || bytes > buffer->bytes()) {
     throw std::invalid_argument("NVMe destination is smaller than the object");
   }
+  const std::uint32_t transferPageCount =
+      nvmeTransferPageCount(*buffer, bytes, capabilities);
 
   const abi::ReplicaEntry replica{
       sourceByteOffset,
@@ -1857,7 +1985,7 @@ ObjectHandle HostRuntime::installNvmeObject(
       impl_->tierLatencies[static_cast<std::size_t>(abi::SourceKind::Nvme)],
       impl_->tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Nvme)],
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
-      buffer->dmaPageCount(),
+      transferPageCount,
       static_cast<std::uint32_t>(abi::SourceKind::Nvme),
       abi::ReplicaTransport |
           (buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm
@@ -1910,8 +2038,17 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
     cudaEvent_t priorConsumerEvent, std::unique_ptr<NvmeBuffer> destination) {
+  std::vector<NvmeObjectInstallSpec> objects;
+  objects.push_back({slot, objectId, version, sourceByteOffset, bytes,
+                     priorConsumerEvent, std::move(destination)});
+  std::vector<ObjectHandle> installed =
+      installNvmeObjectsAsync(std::move(objects), stream);
+  return installed.front();
+}
+
+std::vector<ObjectHandle> HostRuntime::installNvmeObjectsAsync(
+    std::vector<NvmeObjectInstallSpec> objects, cudaStream_t stream) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
-  impl_->checkObjectSlot(slot);
   if (stream == nullptr) {
     throw std::invalid_argument(
         "stream-ordered NVMe installation requires a CUDA stream");
@@ -1919,88 +2056,154 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
   if (impl_->nvme == nullptr) {
     throw std::invalid_argument("NVMe transport is required");
   }
-  const NvmeCapabilities &capabilities = impl_->nvme->capabilities();
-  if (bytes == 0 || bytes % capabilities.lbaSize != 0 ||
-      sourceByteOffset % capabilities.lbaSize != 0 ||
-      sourceByteOffset > capabilities.namespaceBytes ||
-      bytes > capabilities.namespaceBytes - sourceByteOffset) {
-    throw std::invalid_argument("NVMe object range is invalid or unaligned");
+  if (objects.empty()) {
+    throw std::invalid_argument("NVMe object publication batch is empty");
   }
+  if (objects.size() > impl_->config.objectCapacity) {
+    throw std::out_of_range("NVMe object publication exceeds capacity");
+  }
+  const std::uint32_t firstSlot = objects.front().slot;
+  if (firstSlot >= impl_->config.objectCapacity ||
+      objects.size() > impl_->config.objectCapacity - firstSlot) {
+    throw std::out_of_range("NVMe object publication range exceeds capacity");
+  }
+
+  const NvmeCapabilities &capabilities = impl_->nvme->capabilities();
+  std::vector<std::uint64_t> objectIds;
+  objectIds.reserve(objects.size());
+  for (std::size_t index = 0; index < objects.size(); ++index) {
+    NvmeObjectInstallSpec &object = objects[index];
+    const auto expectedSlot =
+        firstSlot + static_cast<std::uint32_t>(index);
+    if (object.slot != expectedSlot) {
+      throw std::invalid_argument(
+          "NVMe object publication slots must be contiguous and increasing");
+    }
+    if (object.bytes == 0 || capabilities.lbaSize == 0 ||
+        object.bytes % capabilities.lbaSize != 0 ||
+        object.sourceByteOffset % capabilities.lbaSize != 0 ||
+        object.sourceByteOffset > capabilities.namespaceBytes ||
+        object.bytes > capabilities.namespaceBytes - object.sourceByteOffset) {
+      throw std::invalid_argument(
+          "NVMe object range is invalid or unaligned");
+    }
+    const bool installed = impl_->objectInstalled[object.slot];
+    const bool hasCurrent = impl_->objects[object.slot].has_value();
+    if (installed && !hasCurrent) {
+      throw std::logic_error(
+          "NVMe publication cannot replace a differently owned object slot");
+    }
+    if (hasCurrent && object.priorConsumerEvent == nullptr) {
+      throw std::invalid_argument("replacing an NVMe object asynchronously "
+                                  "requires its prior consumer event");
+    }
+    if (hasCurrent && impl_->objects[object.slot]->nvmeBuffer == nullptr) {
+      throw std::logic_error(
+          "an asynchronous NVMe slot contains a non-NVMe object");
+    }
+    if (object.destination != nullptr &&
+        object.bytes > object.destination->bytes()) {
+      throw std::invalid_argument(
+          "NVMe destination is smaller than the object");
+    }
+    objectIds.push_back(object.objectId);
+  }
+  std::sort(objectIds.begin(), objectIds.end());
+  if (std::adjacent_find(objectIds.begin(), objectIds.end()) !=
+      objectIds.end()) {
+    throw std::invalid_argument("NVMe object publication repeats an identity");
+  }
+
   impl_->reapRetiredObjects();
 
-  const bool hasCurrent = impl_->objects[slot].has_value();
-  if (hasCurrent && priorConsumerEvent == nullptr) {
-    throw std::invalid_argument("replacing an NVMe object asynchronously "
-                                "requires its prior consumer event");
-  }
-  if (hasCurrent && impl_->objects[slot]->nvmeBuffer == nullptr) {
-    throw std::logic_error(
-        "an asynchronous NVMe slot contains a non-NVMe object");
-  }
-
-  NvmeBuffer *buffer = nullptr;
-  bool reuseExisting = false;
-  if (destination == nullptr && hasCurrent &&
-      impl_->objects[slot]->nvmeBuffer != nullptr &&
-      impl_->objects[slot]->nvmeBuffer->bytes() >= bytes) {
-    buffer = impl_->objects[slot]->nvmeBuffer.get();
-    reuseExisting = true;
-  } else if (destination == nullptr) {
-    destination = impl_->nvme->allocate(bytes);
-    buffer = destination.get();
-  } else {
-    NvmeBuffer *current =
-        hasCurrent ? impl_->objects[slot]->nvmeBuffer.get() : nullptr;
-    const bool sameRegisteredView =
-        current != nullptr && !current->ownsDestinationMemory() &&
-        current->deviceAddress() == destination->deviceAddress() &&
-        current->bytes() == destination->bytes() &&
-        current->dmaPageListAddress() == destination->dmaPageListAddress() &&
-        current->dmaPageCount() == destination->dmaPageCount() &&
-        current->dmaFirstByteOffset() == destination->dmaFirstByteOffset();
-    if (sameRegisteredView) {
-      buffer = current;
+  struct PreparedObject {
+    NvmeBuffer *buffer;
+    bool hasCurrent;
+    bool reuseExisting;
+    abi::ReplicaEntry replica;
+    abi::ObjectEntry object;
+  };
+  std::vector<PreparedObject> prepared;
+  prepared.reserve(objects.size());
+  for (NvmeObjectInstallSpec &spec : objects) {
+    const bool hasCurrent = impl_->objects[spec.slot].has_value();
+    NvmeBuffer *buffer = nullptr;
+    bool reuseExisting = false;
+    if (spec.destination == nullptr && hasCurrent &&
+        impl_->objects[spec.slot]->nvmeBuffer->bytes() >= spec.bytes) {
+      buffer = impl_->objects[spec.slot]->nvmeBuffer.get();
       reuseExisting = true;
-      destination.reset();
+    } else if (spec.destination == nullptr) {
+      spec.destination = impl_->nvme->allocate(spec.bytes);
+      buffer = spec.destination.get();
     } else {
-      buffer = destination.get();
+      NvmeBuffer *current =
+          hasCurrent ? impl_->objects[spec.slot]->nvmeBuffer.get() : nullptr;
+      const bool sameRegisteredView =
+          current != nullptr && !current->ownsDestinationMemory() &&
+          current->deviceAddress() == spec.destination->deviceAddress() &&
+          current->bytes() == spec.destination->bytes() &&
+          current->dmaPageListAddress() ==
+              spec.destination->dmaPageListAddress() &&
+          current->dmaPageCount() == spec.destination->dmaPageCount() &&
+          current->dmaFirstByteOffset() ==
+              spec.destination->dmaFirstByteOffset();
+      if (sameRegisteredView) {
+        buffer = current;
+        reuseExisting = true;
+        spec.destination.reset();
+      } else {
+        buffer = spec.destination.get();
+      }
     }
-  }
-  if (buffer == nullptr || bytes > buffer->bytes()) {
-    throw std::invalid_argument("NVMe destination is smaller than the object");
+    if (buffer == nullptr || spec.bytes > buffer->bytes()) {
+      throw std::invalid_argument(
+          "NVMe destination is smaller than the object");
+    }
+    const std::uint32_t transferPageCount =
+        nvmeTransferPageCount(*buffer, spec.bytes, capabilities);
+    const std::uint32_t replicaStart =
+        spec.slot * impl_->config.maxReplicasPerObject;
+    const std::uint32_t dmaFlag =
+        buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm
+                                                       : 0U;
+    prepared.push_back({
+        buffer,
+        hasCurrent,
+        reuseExisting,
+        abi::ReplicaEntry{
+            spec.sourceByteOffset,
+            buffer->dmaPageListAddress(),
+            impl_->tierLatencies[static_cast<std::size_t>(
+                abi::SourceKind::Nvme)],
+            impl_->tierBandwidths[static_cast<std::size_t>(
+                abi::SourceKind::Nvme)],
+            static_cast<std::uint32_t>(abi::SourceKind::Nvme),
+            transferPageCount,
+            static_cast<std::uint32_t>(abi::SourceKind::Nvme),
+            abi::ReplicaTransport | dmaFlag,
+            0,
+            buffer->dmaFirstByteOffset(),
+        },
+        abi::ObjectEntry{
+            spec.objectId,
+            reinterpret_cast<std::uint64_t>(buffer->deviceAddress()),
+            spec.bytes,
+            0,
+            spec.version,
+            static_cast<std::uint32_t>(abi::ObjectState::New),
+            replicaStart,
+            1,
+            abi::InvalidIndex,
+            dmaFlag,
+            0,
+        },
+    });
   }
 
-  const abi::ReplicaEntry replica{
-      sourceByteOffset,
-      buffer->dmaPageListAddress(),
-      impl_->tierLatencies[static_cast<std::size_t>(abi::SourceKind::Nvme)],
-      impl_->tierBandwidths[static_cast<std::size_t>(abi::SourceKind::Nvme)],
-      static_cast<std::uint32_t>(abi::SourceKind::Nvme),
-      buffer->dmaPageCount(),
-      static_cast<std::uint32_t>(abi::SourceKind::Nvme),
-      abi::ReplicaTransport |
-          (buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm
-                                                         : 0U),
-      0,
-      buffer->dmaFirstByteOffset(),
-  };
-  const std::uint32_t replicaStart = slot * impl_->config.maxReplicasPerObject;
-  const abi::ObjectEntry entry{
-      objectId,
-      reinterpret_cast<std::uint64_t>(buffer->deviceAddress()),
-      bytes,
-      0,
-      version,
-      static_cast<std::uint32_t>(abi::ObjectState::New),
-      replicaStart,
-      1,
-      abi::InvalidIndex,
-      buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm : 0U,
-      0,
-  };
-
-  // Reuse the existing pinned directory ring.  The ring event, not a
-  // pageable stack temporary, owns the lifetime of the async source bytes.
+  // One pinned ring entry owns the complete publication source until both
+  // bulk copies retire. A batch therefore consumes one ring generation,
+  // independent of its object count.
   Impl::DirectoryUpload &upload =
       impl_->directoryUploads[impl_->nextDirectoryUpload++ %
                               impl_->directoryUploads.size()];
@@ -2009,43 +2212,80 @@ ObjectHandle HostRuntime::installNvmeObjectAsync(
               "recycle directory upload staging");
     upload.pending = false;
   }
-  if (hasCurrent) {
-    // The old directory entry is still visible to the previous consumer until
-    // this event.  Queue the dependency before overwriting the entry; placing
-    // it after the H2D update would permit a directory/data race.
-    checkCuda(cudaStreamWaitEvent(stream, priorConsumerEvent, 0),
-              "wait before replacing NVMe directory entry");
-  }
-  upload.objects[slot] = entry;
-  upload.replicas[replicaStart] = replica;
-  checkCuda(cudaMemcpyAsync(impl_->replicaEntries + replicaStart,
-                            upload.replicas + replicaStart,
-                            sizeof(abi::ReplicaEntry), cudaMemcpyHostToDevice,
-                            stream),
-            "publish NVMe replica asynchronously");
-  checkCuda(cudaMemcpyAsync(impl_->objectEntries + slot, upload.objects + slot,
-                            sizeof(abi::ObjectEntry), cudaMemcpyHostToDevice,
-                            stream),
-            "publish NVMe object asynchronously");
-  checkCuda(cudaEventRecord(upload.complete, stream),
-            "record NVMe directory upload");
-  upload.pending = true;
 
-  if (!reuseExisting) {
-    Impl::OwnedObject allocation{
-        buffer->deviceAddress(), std::move(destination), {}, 0};
-    std::optional<Impl::OwnedObject> old;
-    if (impl_->objects[slot].has_value()) {
-      old = std::move(*impl_->objects[slot]);
-      impl_->objects[slot].reset();
+  std::vector<cudaEvent_t> priorEvents;
+  priorEvents.reserve(objects.size());
+  for (std::size_t index = 0; index < objects.size(); ++index) {
+    if (!prepared[index].hasCurrent) {
+      continue;
     }
-    impl_->objects[slot] = std::move(allocation);
-    if (old.has_value()) {
-      impl_->retireObject(std::move(*old), stream, priorConsumerEvent);
+    cudaEvent_t prior = objects[index].priorConsumerEvent;
+    if (std::find(priorEvents.begin(), priorEvents.end(), prior) !=
+        priorEvents.end()) {
+      continue;
     }
+    // Queue every old-generation edge before either directory copy. A shared
+    // layer event is waited once even when it protects many object slots.
+    checkCuda(cudaStreamWaitEvent(stream, prior, 0),
+              "wait before replacing NVMe directory batch");
+    priorEvents.push_back(prior);
   }
-  impl_->objectInstalled[slot] = true;
-  return {slot, buffer->deviceAddress()};
+
+  const std::uint32_t firstReplica =
+      firstSlot * impl_->config.maxReplicasPerObject;
+  const std::size_t replicaCount =
+      objects.size() * impl_->config.maxReplicasPerObject;
+  std::memset(upload.replicas + firstReplica, 0,
+              replicaCount * sizeof(abi::ReplicaEntry));
+  for (std::size_t index = 0; index < objects.size(); ++index) {
+    const std::uint32_t slot = objects[index].slot;
+    upload.objects[slot] = prepared[index].object;
+    upload.replicas[slot * impl_->config.maxReplicasPerObject] =
+        prepared[index].replica;
+  }
+  try {
+    checkCuda(cudaMemcpyAsync(impl_->replicaEntries + firstReplica,
+                              upload.replicas + firstReplica,
+                              replicaCount * sizeof(abi::ReplicaEntry),
+                              cudaMemcpyHostToDevice, stream),
+              "publish NVMe replica batch asynchronously");
+    checkCuda(cudaMemcpyAsync(impl_->objectEntries + firstSlot,
+                              upload.objects + firstSlot,
+                              objects.size() * sizeof(abi::ObjectEntry),
+                              cudaMemcpyHostToDevice, stream),
+              "publish NVMe object batch asynchronously");
+    checkCuda(cudaEventRecord(upload.complete, stream),
+              "record NVMe directory batch upload");
+    upload.pending = true;
+  } catch (...) {
+    // Preserve the pinned upload source until every successfully enqueued
+    // prefix operation has retired. This matches request-directory failure
+    // discipline and prevents a later ring reuse from racing an old H2D copy.
+    (void)cudaStreamSynchronize(stream);
+    throw;
+  }
+
+  std::vector<ObjectHandle> installed;
+  installed.reserve(objects.size());
+  std::vector<Impl::OwnedObject> retired;
+  retired.reserve(objects.size());
+  for (std::size_t index = 0; index < objects.size(); ++index) {
+    NvmeObjectInstallSpec &spec = objects[index];
+    PreparedObject &object = prepared[index];
+    if (!object.reuseExisting) {
+      Impl::OwnedObject allocation{
+          object.buffer->deviceAddress(), std::move(spec.destination), {}, 0};
+      if (impl_->objects[spec.slot].has_value()) {
+        retired.push_back(std::move(*impl_->objects[spec.slot]));
+        impl_->objects[spec.slot].reset();
+      }
+      impl_->objects[spec.slot] = std::move(allocation);
+    }
+    impl_->objectInstalled[spec.slot] = true;
+    installed.push_back({spec.slot, object.buffer->deviceAddress()});
+  }
+  impl_->retireObjectsAfterStream(std::move(retired), stream);
+  return installed;
 }
 
 ObjectHandle HostRuntime::installNvmeObject(std::uint32_t slot,
@@ -2069,6 +2309,11 @@ void HostRuntime::bindTensorMaps(std::uint32_t objectSlot,
   }
 
   abi::ObjectEntry object = downloadOne(impl_->objectEntries, objectSlot);
+  if (object.issueCount != 0 || object.selectedReplica != abi::InvalidIndex ||
+      static_cast<abi::ObjectState>(object.state) != abi::ObjectState::New) {
+    throw std::runtime_error(
+        "tensor maps must be bound before object acquisition begins");
+  }
   if (relativeReplica >= object.replicaCount ||
       object.replicaStart > impl_->replicaCapacity ||
       relativeReplica >= impl_->replicaCapacity - object.replicaStart) {

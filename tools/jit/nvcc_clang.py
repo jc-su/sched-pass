@@ -140,6 +140,19 @@ def prefill_has_cta_tile_32(arguments: list[str]) -> bool:
     return "/*CTA_TILE_Q=*/32" in instantiation.read_text(encoding="utf-8")
 
 
+def needs_prefill_cta_tile_32_suppression(arguments: list[str]) -> bool:
+    """Identify a generated prefill binding whose dispatch case has no body.
+
+    This is a source-instantiation property, not an NTA operator-family
+    property. An uninstrumented differential baseline needs the same compile
+    workaround as its typed counterpart.
+    """
+
+    return any(argument.endswith("/batch_prefill.cu") for argument in arguments) and (
+        not prefill_has_cta_tile_32(arguments)
+    )
+
+
 def translate(arguments: list[str], instrument: bool) -> list[str]:
     # FlashInfer/tvm-ffi may have discovered a different CUDA root before the
     # NTA launcher runs.  Keep only the selected toolkit include tree; Clang's
@@ -176,17 +189,16 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
             raise RuntimeError("NTA_PLUGIN must identify the built libNtaPass.so")
         command.append(f"-fpass-plugin={PLUGIN}")
         if os.environ.get("NTA_FLASHINFER_HOOK"):
-            phase_source = matches_filter(arguments, "NTA_JIT_PHASE_SOURCE")
+            metadata_source = matches_filter(
+                arguments, "NTA_JIT_METADATA_SOURCE"
+            )
             request_bound = matches_filter(arguments, "NTA_JIT_REQUEST_BOUND_SOURCE")
-            # JitRuntime is emitted by the one source selected by
-            # NTA_JIT_PHASE_SOURCE.  Request-bound is a module-wide compile
-            # variant, but adding JitRuntime to every request-bound helper TU
-            # would create duplicate exported phase symbols at link time.
-            # The activate launcher supplies a stable phase-source selector;
-            # standalone workers must use that launcher as well.
-            phase_runtime = phase_source
-            stream_ordered_direct = (
-                "nta_sglang_prefill_demand_acquire_tier_v4_" in " ".join(arguments)
+            # Exactly one numerical-kernel translation unit emits the typed
+            # operator metadata. Transport kernels live exclusively in the
+            # precompiled runtime-owned transport program; request-bound is a
+            # module-wide numerical variant and must not reintroduce them.
+            stream_ordered_direct = matches_filter(
+                arguments, "NTA_JIT_STREAM_ORDERED_SOURCE"
             )
             family = operator_family(arguments)
             typed_module = (
@@ -197,9 +209,12 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
                     for token in ("nta_batch_", "nta_sglang_")
                 )
             )
+            emit_metadata = metadata_source and typed_module
             operator_form = 1 if request_bound else 2
             direct_capabilities = (1 << 0) | (1 << 6) | (1 << 7)
             incremental_capabilities = sum(1 << bit for bit in range(8))
+            if stream_ordered_direct:
+                incremental_capabilities |= 1 << 9
             capabilities = (
                 direct_capabilities if request_bound else incremental_capabilities
             )
@@ -229,7 +244,7 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
             plan_hash_high = int.from_bytes(plan_fingerprint[8:16], "little")
             command.extend(
                 [
-                    f"-DNTA_DEVICE_PHASE_KERNELS={1 if phase_runtime else 0}",
+                    "-DNTA_DEVICE_PHASE_KERNELS=0",
                     f"-DNTA_TYPED_OPERATOR_CONTRACT={1 if typed_module else 0}",
                     f"-DNTA_FLASHINFER_REQUEST_BOUND={1 if request_bound else 0}",
                     "-DNTA_FLASHINFER_PREACQUIRED_ONLY=0",
@@ -256,17 +271,17 @@ def translate(arguments: list[str], instrument: bool) -> list[str]:
                     "-include",
                     str(ROOT / "runtime/device/TypedInstrumentation.cuh"),
                     "-include",
-                    str(
-                        ROOT
-                        / (
-                            "runtime/device/JitRuntime.cuh"
-                            if phase_runtime
-                            else "runtime/device/Acquire.cuh"
-                        )
-                    ),
+                    str(ROOT / "runtime/device/Acquire.cuh"),
                 ]
             )
-            if family == 2 and not prefill_has_cta_tile_32(arguments):
+            if emit_metadata:
+                command.extend(
+                    [
+                        "-include",
+                        str(ROOT / "runtime/device/OperatorMetadata.cuh"),
+                    ]
+                )
+            if needs_prefill_cta_tile_32_suppression(arguments):
                 command.append("-DNTA_FLASHINFER_SKIP_CTA_TILE_32=1")
 
     have_standard = False

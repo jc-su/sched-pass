@@ -14,6 +14,15 @@ inline constexpr std::uint64_t Preacquired = 1ULL << 1;
 inline constexpr std::uint64_t BindCurrentGeneration = 1ULL << 2;
 inline constexpr std::uint64_t PlanlessPreacquired = 1ULL << 3;
 inline constexpr std::uint64_t RunnableWork = 1ULL << 4;
+// Consume a device-frozen [readyHead, readyWindowEnd) queue window.  This is
+// distinct from a statically planned RunnableOffset: EDF and tenant ordering
+// determine queue order at runtime, so the host cannot safely name an offset.
+inline constexpr std::uint64_t DynamicRunnableWindow = 1ULL << 5;
+// Event-only producers such as GPU-initiated NVMe cannot surface a logical
+// controller error through CUDA launch status.  Their preacquired consumer
+// therefore checks the runtime's monotone failure latch once per CTA before
+// entering FlashInfer's barrier-bearing numerical body.
+inline constexpr std::uint64_t ValidateRuntimeHealth = 1ULL << 6;
 inline constexpr std::uint64_t RunnableOffsetShift = 32;
 inline constexpr std::uint64_t WorkCountMask = 0xffffffffULL;
 
@@ -65,7 +74,7 @@ template <typename Params>
 struct HasMappedRequestBinding<
     Params,
     std::void_t<decltype(std::declval<const Params &>().nta_runtime),
-                decltype(std::declval<const Params &>().nta_request_slots)>>
+                decltype(std::declval<const Params &>().nta_request_bindings)>>
     : std::true_type {};
 
 template <typename Params>
@@ -169,9 +178,8 @@ validPreacquiredWork(const Params &params, std::uint32_t schedulerIndex,
   } else {
     const std::uint64_t flags =
         static_cast<std::uint64_t>(params.nta_skip_merge);
-    if ((flags & Preacquired) == 0 || (flags & RunnableWork) != 0 ||
-        params.nta_runtime == nullptr || params.nta_work_items == nullptr ||
-        schedulerIndex >= static_cast<std::uint64_t>(workCount(params))) {
+    if ((flags & Preacquired) == 0 || params.nta_runtime == nullptr ||
+        params.nta_work_items == nullptr) {
       return false;
     }
 #if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
@@ -180,12 +188,34 @@ validPreacquiredWork(const Params &params, std::uint32_t schedulerIndex,
     }
 #endif
     auto *runtime = reinterpret_cast<abi::RuntimeView *>(params.nta_runtime);
+    if ((flags & ValidateRuntimeHealth) != 0) {
+      __shared__ std::uint32_t runtimeHealthy;
+      if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        runtimeHealthy =
+            runtime->abiVersion == abi::Version &&
+                    atomicAdd(&runtime->stickyFailedCount, 0U) == 0U
+                ? 1U
+                : 0U;
+      }
+      __syncthreads();
+      if (runtimeHealthy == 0U) {
+        return false;
+      }
+    }
+    const std::uint64_t schedulerLimit =
+        (flags & RunnableWork) != 0
+            ? static_cast<std::uint64_t>(runtime->workTicketCapacity)
+            : static_cast<std::uint64_t>(workCount(params));
+    if (schedulerIndex >= schedulerLimit) {
+      return false;
+    }
     const auto *items =
         reinterpret_cast<const abi::WorkItem *>(params.nta_work_items);
     const abi::WorkItem &item = items[schedulerIndex];
     return runtime->abiVersion == abi::Version &&
            item.requestIndex == requestIndex &&
            item.requestSlot < runtime->requestCapacity &&
+           item.directDependencyCount <= item.dependencyCount &&
            item.contributorCount != 0 &&
            item.contributorIndex < item.contributorCount;
   }
@@ -296,12 +326,22 @@ bindValidatedRequestOnly(const Params &params, abi::RuntimeView *runtime,
     return false;
   } else {
     std::uint64_t requestSlot64 = 0;
+    std::uint32_t expectedGeneration = 0;
     if constexpr (HasMappedRequestBindingV<Params>) {
-      if (params.nta_request_slots == nullptr) {
+      if (params.nta_request_bindings == nullptr) {
         return false;
       }
-      requestSlot64 = static_cast<std::uint64_t>(
-          static_cast<const std::int32_t *>(params.nta_request_slots)[requestIndex]);
+      const auto *bindings =
+          static_cast<const std::int64_t *>(params.nta_request_bindings);
+      const std::int64_t requestSlot = bindings[2U * requestIndex];
+      const std::int64_t generation = bindings[2U * requestIndex + 1U];
+      if (requestSlot < 0 || generation <= 0 ||
+          static_cast<std::uint64_t>(requestSlot) > 0xffffffffULL ||
+          static_cast<std::uint64_t>(generation) > 0xffffffffULL) {
+        return false;
+      }
+      requestSlot64 = static_cast<std::uint64_t>(requestSlot);
+      expectedGeneration = static_cast<std::uint32_t>(generation);
     } else {
       requestSlot64 =
           static_cast<std::uint64_t>(params.nta_request_slot_offset) + requestIndex;
@@ -311,6 +351,11 @@ bindValidatedRequestOnly(const Params &params, abi::RuntimeView *runtime,
     }
     const std::uint32_t requestSlot = static_cast<std::uint32_t>(requestSlot64);
     const std::uint32_t generation = runtime->requests[requestSlot].generation;
+    if constexpr (HasMappedRequestBindingV<Params>) {
+      if (generation != expectedGeneration) {
+        return false;
+      }
+    }
     __nta_bind_request(requestSlot, generation);
     return __nta_acquire_set_marker(runtime, nullptr, 0, 0, abi::InvalidIndex);
   }
@@ -326,6 +371,34 @@ usesRunnableWork(const Params &params) {
     (void)params;
     return false;
   }
+}
+
+template <typename Params>
+[[nodiscard]] __host__ __device__ __forceinline__ bool
+usesDynamicRunnableWindow(const Params &params) {
+  if constexpr (HasWorkPlanV<Params>) {
+    const std::uint64_t flags =
+        static_cast<std::uint64_t>(params.nta_skip_merge);
+    return (flags & (RunnableWork | DynamicRunnableWindow)) ==
+           (RunnableWork | DynamicRunnableWindow);
+  } else {
+    (void)params;
+    return false;
+  }
+}
+
+// A runnable CTA was selected from the exact queue populated by discovery or
+// dependency publication. Consume that proof instead of rediscovering the same
+// dependency cone inside the numerical kernel. Non-runnable launches retain
+// the ordinary acquire path because they have no publication proof.
+template <typename Params>
+[[nodiscard]] __device__ __forceinline__ bool
+acquireCurrentPlannedWork(const Params &params, abi::RuntimeView *runtime,
+                          std::uint32_t workIndex,
+                          kernel::WorkContext &context) {
+  return kernel::acquireCurrentPlannedWork(
+      runtime, workItems(params), dependencies(params), workIndex,
+      usesRunnableWork(params), context);
 }
 
 template <typename Params>
@@ -364,8 +437,14 @@ launchWorkIndex(const Params &params, abi::RuntimeView *runtime,
   }
   // Publication and this launch are stream ordered. No producer mutates the
   // runnable-work set while an application kernel consumes it.
-  const std::uint32_t ready = *runtime->readyCount;
-  const std::uint32_t offset = runnableWorkOffset(params);
+  const bool dynamic = usesDynamicRunnableWindow(params);
+  if (dynamic && runtime->readyHead == nullptr) {
+    return abi::InvalidIndex;
+  }
+  const std::uint32_t offset =
+      dynamic ? *runtime->readyHead : runnableWorkOffset(params);
+  const std::uint32_t ready =
+      dynamic ? runtime->readyWindowEnd : *runtime->readyCount;
   const std::uint64_t queueIndex =
       static_cast<std::uint64_t>(offset) + launchIndex;
   if (offset > ready || queueIndex >= ready ||
@@ -400,6 +479,15 @@ template <typename Params>
 [[nodiscard]] __device__ __forceinline__ bool
 shouldRun(const Params &params, abi::RuntimeView *runtime,
           const kernel::WorkContext &work) {
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  // launchWorkIndex selected this CTA from a frozen published window. The
+  // request-generation guard above is the only per-CTA liveness check needed;
+  // retirement is owned by the following same-stream graph node.
+  (void)params;
+  (void)runtime;
+  (void)work;
+  return true;
+#else
   if (!tracksCompletion(params)) {
     return true;
   }
@@ -413,6 +501,7 @@ shouldRun(const Params &params, abi::RuntimeView *runtime,
   }
   __syncthreads();
   return runDecision != 0;
+#endif
 }
 
 // FlashInfer maps one canonical x-coordinate to one or more y/z head CTAs.

@@ -127,10 +127,11 @@ python experiments/reproduce.py \
   --output /tmp/nta-artifacts/core
 ```
 
-The runner executes a small B0--B6/all-ablation matrix and the validator checks
-shared exact demand traces, activation counters, tier/granularity strata, and
-deterministic blocked-cohort accounting. Little's-law reporting is reserved
-for timestamped serving runs.
+The runner executes a small D0--D6 diagnostic-profile/all-ablation matrix and
+the validator checks shared exact demand traces, activation counters,
+tier/granularity strata, and deterministic blocked-cohort accounting. These D
+profiles are not formal serving arms. Little's-law reporting is reserved for
+timestamped serving runs.
 
 ### Full matrix
 
@@ -225,9 +226,9 @@ permission readiness only and must not be reported as tier qualification.
 
 ### Physical NVMe-to-HBM qualification
 
-The direct NVMe path needs the kernel-specific NVIDIA peer-page bridge in
-addition to the native build. Build and load it against the exact running
-kernel and NVIDIA driver:
+The sealed direct path for this machine family uses the narrow, setup-only
+NVIDIA peer-page bridge. Build and load it against the exact running kernel and
+NVIDIA driver:
 
 ```bash
 ./scripts/nta-nvme-p2p-module.sh load
@@ -243,6 +244,7 @@ python3 scripts/run-nvme-qualification.py \
   --bdf 0000:d8:00.0 \
   --dma-target hbm-peer \
   --media-policy trusted-read-only-code \
+  --require-hbm-backend nvidia-peer-pages \
   --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 100 \
   --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
   --allow-device-rebind --require-ready \
@@ -259,6 +261,14 @@ python3 experiments/validate_tier_qualification.py \
   /tmp/nta-artifacts/nvme/tier-qualification.json
 ```
 
+`cuda-dmabuf-ioas` is retained as an explicit module-free capability probe,
+not assumed from a kernel version. Linux `7.0.0-30-generic` exposes
+`IOMMU_IOAS_MAP_FILE`, but its UAPI describes memfd mappings and the NVIDIA
+`595.84` CUDA DMA-BUF is rejected on this machine. Do not select that policy or
+claim module-free operation unless the same end-to-end command passes with
+`--require-hbm-backend cuda-dmabuf-ioas`; `auto` is useful for discovery but is
+not precise enough for an artifact claim.
+
 When several physical tests will run and the dedicated controller is not being
 used by another process, add `--keep-vfio` to the qualification command. A
 successful run then retains the explicit VFIO ownership so later tests do not
@@ -273,6 +283,7 @@ cmake -S . -B build \
   -DNTA_TEST_NVME_REFERENCE=/tmp/nta-artifacts/nvme/nvme-reference.bin \
   -DNTA_TEST_NVME_MEDIA_POLICY=trusted-read-only-code \
   -DNTA_TEST_NVME_DMA_TARGET=hbm-peer \
+  -DNTA_TEST_NVME_HBM_BACKEND=nvidia-peer-pages \
   -DNTA_TEST_NVME_USE_SUDO=ON \
   -DNTA_TEST_JIT_CACHE_ROOT=/mnt/disk0/$USER/nta-jit-cache/sched-pass
 ctest --test-dir build -R 'nta-(vfio-nvme-probe|paged-attention-nvme-gpu)'
@@ -333,7 +344,8 @@ env LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64 \
   build/nta-paged-attention \
   --mode=nvme --nvme-endpoint=vfio:0000:d8:00.0 \
   --nvme-reference=/path/to/reference.bin \
-  --nvme-media-policy=trusted-read-only-code --json=1
+  --nvme-media-policy=trusted-read-only-code \
+  --nvme-hbm-backend=nvidia-peer-pages --json=1
 ```
 
 The report is only `qualified:true` when the exact attention run submitted and
@@ -351,7 +363,8 @@ model and teardown contract.
 
 ### Serving experiments
 
-Serving is intentionally a supplied workload command because model weights,
+The standalone serving profile is intentionally a supplied workload command
+because model weights,
 SGLang/FlashInfer versions, GPU allocation, and dataset paths are external
 inputs. `--result` is required so a completed serving bundle has a structured,
 machine-checkable report in addition to the raw command log:
@@ -372,9 +385,10 @@ The reproduction profile runs
 `experiments/validate_serving_report.py` after the command and the bundle
 validator runs it again. A serving result must prove exact demand, zero
 verification failures, output digests, finite latency percentiles, SLO
-goodput, Little's Law accounting, engine statistics, and machine metadata.
+goodput, finite-window occupancy accounting, engine statistics, and machine metadata.
 Comparison reports must also prove identical stock/NTA outputs and explicit
-mechanism activation.
+mechanism activation. This profile is diagnostic; formal A0--A3 evidence uses
+the paired evaluation artifact below.
 
 For paper artifacts, pass every non-default variable with `--env` and keep the
 model/configuration manifest beside the copied serving report; never overwrite
@@ -402,6 +416,9 @@ python experiments/reproduce.py \
 
 It runs `run_evaluation.py` and then independently validates
 `evaluation-report.json`, `strata-report.json`, and `causal-report.json`.
+Each formal command that accepts `--output` must use `{trial_output}`; the
+runner binds it to a unique arm/repetition path and verifies that the file and
+final stdout JSON agree before recording its digest.
 
 By default reproduction rejects a dirty worktree. `--allow-dirty` is reserved
 for local debugging and records the dirty state plus a worktree diff digest.

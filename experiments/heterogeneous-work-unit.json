@@ -1,5 +1,5 @@
 {
-  "schema": 2,
+  "schema": 3,
   "status": "executable-contract-matrix",
   "description": "Fair evaluation matrix for exact late-bound heterogeneous work units.",
   "source_of_truth": "docs/EXPERIMENT_DESIGN.md",
@@ -7,7 +7,7 @@
   "seed": 20260824,
   "demand": {
     "semantics": "exact-sparse",
-    "trace_is_shared_across_arms": true,
+    "trace_is_shared_across_profiles": true,
     "selection_source": "shared-exact-trace"
   },
   "workload": {
@@ -31,24 +31,24 @@
     "granularity": ["request", "layer", "page_group", "cta_tile"],
     "staging_capacity_units": [256, 1024, 4096]
   },
-  "arms": [
-    {"id": "B0", "name": "resident-exact-conventional", "protocol": "conventional"},
-    {"id": "B1", "name": "host-promotion-barrier", "protocol": "conventional"},
-    {"id": "B2", "name": "host-split-rebatch", "protocol": "conventional"},
-    {"id": "B3", "name": "device-demand-conventional-gather", "protocol": "conventional"},
-    {"id": "B4", "name": "device-demand-late-bound", "protocol": "late-bound"},
-    {"id": "B5", "name": "heterogeneous-work-unit", "protocol": "late-bound"},
-    {"id": "B6", "name": "exact-partial-continuation", "protocol": "partial"}
+  "diagnostic_profiles": [
+    {"id": "D0", "name": "resident-exact-conventional", "protocol": "conventional"},
+    {"id": "D1", "name": "host-promotion-barrier", "protocol": "conventional"},
+    {"id": "D2", "name": "host-split-rebatch", "protocol": "conventional"},
+    {"id": "D3", "name": "device-demand-conventional-gather", "protocol": "conventional"},
+    {"id": "D4", "name": "device-demand-late-bound", "protocol": "late-bound"},
+    {"id": "D5", "name": "heterogeneous-work-unit", "protocol": "late-bound"},
+    {"id": "D6", "name": "exact-partial-continuation", "protocol": "partial"}
   ],
   "ablations": [
-    {"id": "full", "name": "full-mechanism", "target_arms": []},
-    {"id": "host_demand", "name": "host-demand", "target_arms": ["B3", "B4", "B5", "B6"]},
-    {"id": "batch_readiness", "name": "batch-readiness", "target_arms": ["B4", "B5", "B6"]},
-    {"id": "coarse_granularity", "name": "coarse-granularity", "target_arms": ["B4", "B5", "B6"]},
-    {"id": "manual_mapping", "name": "manual-mapping", "target_arms": ["B4", "B5", "B6"]},
-    {"id": "shadow_generation_checks", "name": "shadow-generation-checks", "target_arms": ["B4", "B5", "B6"]},
-    {"id": "admission_feedback", "name": "no-admission-feedback", "target_arms": ["B5", "B6"]},
-    {"id": "unbounded_staging", "name": "unbounded-staging", "target_arms": ["B4", "B5", "B6"]}
+    {"id": "full", "name": "full-mechanism", "target_profiles": []},
+    {"id": "host_demand", "name": "host-demand", "target_profiles": ["D3", "D4", "D5", "D6"]},
+    {"id": "batch_readiness", "name": "batch-readiness", "target_profiles": ["D4", "D5", "D6"]},
+    {"id": "coarse_granularity", "name": "coarse-granularity", "target_profiles": ["D4", "D5", "D6"]},
+    {"id": "manual_mapping", "name": "manual-mapping", "target_profiles": ["D4", "D5", "D6"]},
+    {"id": "shadow_generation_checks", "name": "shadow-generation-checks", "target_profiles": ["D4", "D5", "D6"]},
+    {"id": "admission_feedback", "name": "no-admission-feedback", "target_profiles": ["D5", "D6"]},
+    {"id": "unbounded_staging", "name": "unbounded-staging", "target_profiles": ["D4", "D5", "D6"]}
   ],
   "required_metrics": [
     "throughput",

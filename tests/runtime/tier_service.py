@@ -13,11 +13,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 from nta_runtime.tier import (  # noqa: E402
+    NvmeHbmBackendRequirement,
     PageExtent,
     ServingTier,
     ServingTierConfig,
     ServingTierService,
     TierPageCatalog,
+    _require_nvme_hbm_backend,
     _validate_nvme_extent,
 )
 from nta_runtime.resource_contract import (  # noqa: E402
@@ -46,15 +48,17 @@ def main() -> None:
     nvme = resource_contract(ResourceKind.NVME)
     cxl = resource_contract(ResourceKind.CXL_DAX)
     assert (
-        hbm.direct_device_visible
+        hbm.direct_numerical_path
         and hbm.protocol_owner is ResourceOwner.ENGINE
         and hbm.payload_owner is ResourceOwner.ENGINE
         and hbm.transfer_destination_owner is None
     )
-    assert host_mapped.direct_device_visible
+    assert host_mapped.direct_numerical_path
     assert host_staged.uses_host_proxy and not host_staged.physical
-    assert nvme.physical and not nvme.direct_device_visible
-    assert cxl.physical and cxl.direct_device_visible
+    assert host_staged.capabilities & ResourceCapability.HOST_REGISTERED
+    assert host_staged.capabilities & ResourceCapability.INDEXED_TRANSFER
+    assert nvme.physical and not nvme.direct_numerical_path
+    assert cxl.physical and cxl.direct_numerical_path
     assert not (cxl.capabilities & ResourceCapability.PERSISTENT_STORAGE)
     assert host_staged.directory_owner is ResourceOwner.RUNTIME
     assert host_staged.protocol_owner is ResourceOwner.RUNTIME
@@ -99,6 +103,15 @@ def main() -> None:
         device_ordinal=-1,
     )
     assert config.staging_byte_capacity == (1 << 64) - 1
+    assert RuntimeResourceConfig(
+        request_capacity=4,
+        object_capacity=8,
+        intent_capacity=8,
+        work_ticket_capacity=8,
+        tenant_capacity=4,
+        device_ordinal=-1,
+        staging_byte_capacity=0,
+    ).staging_byte_capacity == (1 << 64) - 1
 
     class FakeTier:
         contract = host_staged
@@ -148,8 +161,9 @@ def main() -> None:
     partial_resources = runtime_resources.ServingRuntimeResources.__new__(
         runtime_resources.ServingRuntimeResources
     )
-    partial_resources.runtime = CloseProbe(resource_log, "runtime", fail=True)
-    partial_resources.tier = CloseProbe(resource_log, "tier", fail=True)
+    partial_resources._runtime = CloseProbe(resource_log, "runtime", fail=True)
+    partial_resources._tier = CloseProbe(resource_log, "tier", fail=True)
+    partial_resources._config = config
     partial_resources._closed = False
     try:
         partial_resources.close()
@@ -198,6 +212,70 @@ def main() -> None:
         ServingTierConfig.from_environment({"NTA_SERVING_TIER": "host_mapped"}).tier
         is ServingTier.HOST_MAPPED
     )
+    nvme_environment = {
+        "NTA_SERVING_TIER": "nvme",
+        "NTA_NVME_ENDPOINT": "vfio:0000:01:00.0",
+        "NTA_TIER_CATALOG": "/tmp/catalog.json",
+        "NTA_NVME_HBM_BACKEND": "cuda-dmabuf-ioas",
+    }
+    assert (
+        ServingTierConfig.from_environment(nvme_environment).nvme_hbm_backend
+        is NvmeHbmBackendRequirement.CUDA_DMA_BUF_IOAS
+    )
+    _require_nvme_hbm_backend(
+        NvmeHbmBackendRequirement.AUTO, "nvidia-peer-pages"
+    )
+    _require_nvme_hbm_backend(
+        NvmeHbmBackendRequirement.CUDA_DMA_BUF_IOAS, "cuda-dmabuf-ioas"
+    )
+    try:
+        _require_nvme_hbm_backend(
+            NvmeHbmBackendRequirement.CUDA_DMA_BUF_IOAS,
+            "nvidia-peer-pages",
+        )
+    except RuntimeError as error:
+        assert "required=cuda-dmabuf-ioas" in str(error)
+    else:
+        raise AssertionError("a peer-pages fallback satisfied a module-free contract")
+    try:
+        ServingTierConfig.from_environment(
+            {**nvme_environment, "NTA_NVME_HBM_BACKEND": "guess"}
+        )
+    except ValueError as error:
+        assert "NTA_NVME_HBM_BACKEND" in str(error)
+    else:
+        raise AssertionError("an unknown NVMe HBM backend was accepted")
+    try:
+        ServingTierConfig(
+            nvme_hbm_backend=NvmeHbmBackendRequirement.CUDA_DMA_BUF_IOAS
+        )
+    except ValueError as error:
+        assert "NVMe tier" in str(error)
+    else:
+        raise AssertionError("an NVMe backend requirement was applied to HBM")
+    try:
+        ServingTierConfig(issue_budget=32)
+    except ValueError as error:
+        assert "NVMe-only" in str(error) and "issue_budget" in str(error)
+    else:
+        raise AssertionError("an NVMe progress budget was applied to HBM")
+    try:
+        ServingTierConfig(window_bytes=4096)
+    except ValueError as error:
+        assert "only CXL" in str(error)
+    else:
+        raise AssertionError("a CXL window was applied to HBM")
+    try:
+        ServingTierConfig.from_environment(
+            {
+                **nvme_environment,
+                "NTA_NVME_TRUST_READ_ONLY_DEVICE_CODE": "true",
+            }
+        )
+    except ValueError as error:
+        assert "must be 0 or 1" in str(error)
+    else:
+        raise AssertionError("an ambiguous NVMe trust policy was accepted")
     try:
         ServingTierConfig.from_environment({"NTA_SERVING_TIER": "nvme"})
     except ValueError as error:
@@ -299,6 +377,41 @@ def main() -> None:
             ).bytes
             == 8192
         )
+        catalog.validate_nvme_geometry(
+            lba_size=4096,
+            max_transfer_bytes=8192,
+            namespace_bytes=16384,
+        )
+        try:
+            catalog.validate_nvme_geometry(
+                lba_size=4096,
+                max_transfer_bytes=8192,
+                namespace_bytes=12287,
+            )
+        except ValueError as error:
+            assert "opened namespace" in str(error)
+        else:
+            raise AssertionError("an out-of-namespace catalog was accepted")
+        try:
+            catalog.validate_nvme_geometry(
+                lba_size=8192,
+                max_transfer_bytes=8192,
+                namespace_bytes=16384,
+            )
+        except ValueError as error:
+            assert "opened controller" in str(error) and "LBA aligned" in str(error)
+        else:
+            raise AssertionError("a controller-incompatible catalog was accepted")
+        try:
+            catalog.validate_nvme_geometry(
+                lba_size=4096,
+                max_transfer_bytes=2048,
+                namespace_bytes=16384,
+            )
+        except ValueError as error:
+            assert "max transfer" in str(error)
+        else:
+            raise AssertionError("an oversized catalog row was accepted at setup")
         assert (
             catalog.span(
                 layer=0, ordinals=(0, 1), component="value", row_bytes=4096
@@ -393,6 +506,17 @@ def main() -> None:
             max_transfer_bytes=8192,
             kind="key",
         )
+        try:
+            _validate_nvme_extent(
+                PageExtent(512, 4096),
+                lba_size=4096,
+                max_transfer_bytes=8192,
+                kind="key",
+            )
+        except RuntimeError as error:
+            assert "offset" in str(error) and "LBA aligned" in str(error)
+        else:
+            raise AssertionError("misaligned NVMe catalog offset was accepted")
         try:
             _validate_nvme_extent(
                 catalog.span(

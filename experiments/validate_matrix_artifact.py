@@ -3,8 +3,9 @@
 
 The validator deliberately knows nothing about GPU timings.  It checks the
 properties that a dependency-free artifact can prove: one exact trace per
-case/repetition, complete arm coverage, explicit mechanism activation, tier
-and granularity strata, and deterministic blocked-cohort accounting.
+case/repetition, complete diagnostic-profile coverage, explicit mechanism
+activation, tier and granularity strata, and deterministic blocked-cohort
+accounting.  It cannot validate serving-arm performance.
 """
 
 from __future__ import annotations
@@ -20,17 +21,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 _ABLATION_TARGETS = {
     "full": frozenset(),
-    "host_demand": frozenset({"B3", "B4", "B5", "B6"}),
-    "batch_readiness": frozenset({"B4", "B5", "B6"}),
-    "coarse_granularity": frozenset({"B4", "B5", "B6"}),
-    "manual_mapping": frozenset({"B4", "B5", "B6"}),
-    "shadow_generation_checks": frozenset({"B4", "B5", "B6"}),
-    "admission_feedback": frozenset({"B5", "B6"}),
-    "unbounded_staging": frozenset({"B4", "B5", "B6"}),
+    "host_demand": frozenset({"D3", "D4", "D5", "D6"}),
+    "batch_readiness": frozenset({"D4", "D5", "D6"}),
+    "coarse_granularity": frozenset({"D4", "D5", "D6"}),
+    "manual_mapping": frozenset({"D4", "D5", "D6"}),
+    "shadow_generation_checks": frozenset({"D4", "D5", "D6"}),
+    "admission_feedback": frozenset({"D5", "D6"}),
+    "unbounded_staging": frozenset({"D4", "D5", "D6"}),
 }
-_ARMS = ("B0", "B1", "B2", "B3", "B4", "B5", "B6")
+_PROFILES = ("D0", "D1", "D2", "D3", "D4", "D5", "D6")
 _REQUIRED_FIELDS = (
-    "arm",
+    "diagnostic_profile",
     "ablation",
     "demand_trace_hash",
     "candidate_units",
@@ -134,19 +135,19 @@ def _validate_pending_accounting(record: dict[str, Any]) -> None:
 
 
 def _validate_activation(record: dict[str, Any]) -> None:
-    arm = record["arm"]
+    profile = record["diagnostic_profile"]
     ablation = record["ablation"]
-    applied = arm in _ABLATION_TARGETS[ablation]
+    applied = profile in _ABLATION_TARGETS[ablation]
     _require(
         record["ablation_applied"] is applied,
-        f"incorrect ablation scope for {arm}/{ablation}",
+        f"incorrect ablation scope for {profile}/{ablation}",
     )
     mode = record["execution_mode"]
     counters = record["activation_counters"]
     work_units = int(record["work_units"])
     _require(
         counters["exact_demand_bindings"] == work_units,
-        f"exact demand did not execute for {arm}/{ablation}",
+        f"exact demand did not execute for {profile}/{ablation}",
     )
     if not applied:
         return
@@ -213,7 +214,7 @@ def _validate_activation(record: dict[str, Any]) -> None:
 
 
 def validate(artifact: dict[str, Any], *, require_all_ablations: bool) -> None:
-    _require(artifact.get("schema") == 2, "unsupported work-unit artifact schema")
+    _require(artifact.get("schema") == 3, "unsupported work-unit artifact schema")
     measurement = artifact.get("measurement", {})
     _require(
         measurement.get("serving_evidence") is False,
@@ -225,8 +226,11 @@ def validate(artifact: dict[str, Any], *, require_all_ablations: bool) -> None:
     )
     provenance = artifact.get("provenance", {})
     _require(bool(provenance.get("revision")), "artifact has no revision provenance")
-    arms = tuple(artifact.get("arms", ()))
-    _require(arms == _ARMS, "artifact arm order is not the canonical B0-B6 order")
+    profiles = tuple(artifact.get("diagnostic_profiles", ()))
+    _require(
+        profiles == _PROFILES,
+        "artifact profile order is not the canonical D0-D6 order",
+    )
     ablations = tuple(artifact.get("ablations", ()))
     _require(
         set(ablations) <= set(_ABLATION_TARGETS),
@@ -244,6 +248,22 @@ def validate(artifact: dict[str, Any], *, require_all_ablations: bool) -> None:
         manifest_path = ROOT / manifest_path
     _require(manifest_path.is_file(), "artifact manifest is missing")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _require(manifest.get("schema") == 3, "matrix manifest is not schema 3")
+    declared_profiles = tuple(
+        item.get("id") for item in manifest.get("diagnostic_profiles", ())
+    )
+    _require(
+        declared_profiles == _PROFILES,
+        "matrix manifest does not declare canonical diagnostic profiles",
+    )
+    declared_ablations = {
+        item.get("id"): frozenset(item.get("target_profiles", ()))
+        for item in manifest.get("ablations", ())
+    }
+    _require(
+        declared_ablations == _ABLATION_TARGETS,
+        "matrix manifest ablation scopes disagree with the validator",
+    )
     required_metrics = tuple(manifest.get("required_metrics", ()))
     _require(required_metrics, "manifest has no required metric contract")
     grouped: dict[tuple[int, str], list[dict[str, Any]]] = {}
@@ -270,21 +290,22 @@ def validate(artifact: dict[str, Any], *, require_all_ablations: bool) -> None:
             "selected demand exceeds candidate demand",
         )
         _require(
-            record["useful_bytes"] <= record["physical_bytes"] or record["arm"] == "B0",
+            record["useful_bytes"] <= record["physical_bytes"]
+            or record["diagnostic_profile"] == "D0",
             "physical bytes are less than useful bytes",
         )
         _validate_activation(record)
         grouped.setdefault(_case_key(record), []).append(record)
-    expected_per_group = len(arms) * len(ablations)
+    expected_per_group = len(profiles) * len(ablations)
     for key, group in grouped.items():
         _require(
             len(group) == expected_per_group,
-            f"incomplete arm/ablation coverage for {key}",
+            f"incomplete profile/ablation coverage for {key}",
         )
         trace_hashes = {record["demand_trace_hash"] for record in group}
         _require(
             len(trace_hashes) == 1,
-            f"demand trace changed across matched arms for {key}",
+            f"demand trace changed across matched profiles for {key}",
         )
         demand_shapes = {
             (
@@ -296,7 +317,7 @@ def validate(artifact: dict[str, Any], *, require_all_ablations: bool) -> None:
         }
         _require(
             len(demand_shapes) == 1,
-            f"exact demand shape changed across matched arms for {key}",
+            f"exact demand shape changed across matched profiles for {key}",
         )
         tiers = {record["tier"] for record in group}
         _require(len(tiers) == 1, f"tier changed across matched arms for {key}")

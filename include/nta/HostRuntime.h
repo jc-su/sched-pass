@@ -1,5 +1,6 @@
 #pragma once
 
+#include "nta/NvmeRuntime.h"
 #include "nta/RuntimeABI.h"
 #include "nta/Tier.h"
 
@@ -15,8 +16,6 @@ namespace nta {
 
 class DeviceWorkPlan;
 struct WorkPlan;
-class NvmeBuffer;
-class NvmeTransport;
 class CxlDaxTransport;
 
 enum class Placement {
@@ -93,6 +92,20 @@ struct RegisteredReplicaSpec {
 struct ObjectHandle {
   std::uint32_t slot;
   void *directDeviceBase;
+};
+
+// One move-only NVMe directory publication. The destination owns only the
+// mapping/view lease; caller-owned HBM remains owned by the inference engine.
+// A batch is required to use a contiguous, increasing slot range so the host
+// runtime can publish one coherent directory image with two bulk H2D copies.
+struct NvmeObjectInstallSpec {
+  std::uint32_t slot;
+  std::uint64_t objectId;
+  std::uint32_t version;
+  std::uint64_t sourceByteOffset;
+  std::size_t bytes;
+  cudaEvent_t priorConsumerEvent;
+  std::unique_ptr<NvmeBuffer> destination;
 };
 
 struct IndexedHostObjectSpec {
@@ -205,6 +218,14 @@ public:
       std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects,
       cudaStream_t stream, cudaEvent_t priorConsumerEvent,
       const IndexedHostIndexBinding *indexBinding = nullptr);
+  // Enqueue a non-SM-consuming device-memory wait for one object's
+  // terminal state. The caller must first order the directory publication on
+  // this stream (normally with the producer's registration event). Ready and
+  // Failed are both terminal; the numerical work-plan guard distinguishes
+  // them and fails closed before consuming the destination.
+  void waitObjectRangeTerminal(std::uint32_t firstSlot,
+                               std::uint32_t objectCount,
+                               cudaStream_t stream) const;
   // Install an NVMe object using a runtime-owned destination. When the slot
   // already owns a large-enough NVMe buffer, only the source-range directory
   // entry is republished; the HBM allocation and DMA mapping remain alive.
@@ -235,6 +256,16 @@ public:
       std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
       std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
       cudaEvent_t priorConsumerEvent, std::unique_ptr<NvmeBuffer> destination);
+  // Validate the complete image before publication, enqueue each distinct
+  // prior-consumer dependency once, and publish all objects through one
+  // pinned upload-ring entry. This is the serving data-plane API; the scalar
+  // overload above is retained for setup tools and delegates here.
+  std::vector<ObjectHandle>
+  installNvmeObjectsAsync(std::vector<NvmeObjectInstallSpec> objects,
+                          cudaStream_t stream);
+  // Setup-only metadata binding. The object must still be New and unissued;
+  // changing a tensor-map pointer after acquisition begins would race device-
+  // owned state and can invalidate a consumer descriptor.
   void bindTensorMaps(std::uint32_t objectSlot, std::uint32_t relativeReplica,
                       const void *replicaTensorMap,
                       const void *stagingTensorMap = nullptr);

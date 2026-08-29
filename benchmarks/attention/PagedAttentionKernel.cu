@@ -124,7 +124,7 @@ __device__ __forceinline__ void selectSparsePages(
     const std::uint32_t *candidateOffsets, const __half *summaries,
     const __half *queries, std::uint32_t requestIndex, std::uint32_t topK,
     nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
-    std::uint32_t *selectedObjectSlots, bool preacquired) {
+    std::uint32_t *selectedObjectSlots, bool preacquired, bool splitWork) {
   __shared__ float reduction[AttentionHeadDimension];
   __shared__ float topScores[SparseTopKLimit];
   __shared__ std::uint32_t topSlots[SparseTopKLimit];
@@ -185,31 +185,35 @@ __device__ __forceinline__ void selectSparsePages(
     // Discovery changes the selected dependency set only. Request ownership,
     // reduction identity, and the host-calibrated cost remain structural plan
     // metadata and must survive device-side page selection.
-    nta::abi::WorkItem &work = workItems[requestIndex];
-    work.dependencyBegin = dependencyBegin;
-    work.dependencyCount = topK;
-    work.directDependencyCount = directCount;
+    if (splitWork) {
+      for (std::uint32_t rank = 0; rank < topK; ++rank) {
+        const std::uint32_t workIndex = dependencyBegin + rank;
+        nta::abi::WorkItem &work = workItems[workIndex];
+        work.dependencyBegin = workIndex;
+        work.dependencyCount = 1;
+        work.directDependencyCount =
+            requirements[workIndex].directBase != 0 ? 1U : 0U;
+      }
+    } else {
+      nta::abi::WorkItem &work = workItems[requestIndex];
+      work.dependencyBegin = dependencyBegin;
+      work.dependencyCount = topK;
+      work.directDependencyCount = directCount;
+    }
     __threadfence();
   }
   __syncthreads();
 }
 
-__device__ __forceinline__ void runSparseAttention(
+__device__ __forceinline__ void runSelectedSparseAttention(
     nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
-    const std::uint32_t *candidateOffsets, const __half *summaries,
     const __half *queries, std::uint32_t requestIndex,
     std::uint32_t requestCount, std::uint32_t topK,
     nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
-    std::uint32_t *selectedObjectSlots, float *output, bool preacquired) {
-  if (requestIndex >= requestCount || topK == 0 || topK > SparseTopKLimit ||
-      candidateOffsets[requestIndex + 1U] - candidateOffsets[requestIndex] <
-          topK) {
+    const std::uint32_t *selectedObjectSlots, float *output) {
+  if (requestIndex >= requestCount || topK == 0 || topK > SparseTopKLimit) {
     return;
   }
-
-  selectSparsePages(catalog, candidateOffsets, summaries, queries, requestIndex,
-                    topK, workItems, requirements, selectedObjectSlots,
-                    preacquired);
   nta::kernel::WorkContext work{};
   const bool ready = nta::kernel::acquireWork(runtime, workItems, requirements,
                                               requestIndex, work);
@@ -276,10 +280,65 @@ __device__ __forceinline__ void runSparseAttention(
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence();
-    (void)nta::device::completeBoundWorkTicket(
-        runtime, work.item.requestSlot, work.item.generation,
-        work.item.workTicket);
+    (void)nta::device::completeBoundWorkTicket(runtime, work.item.requestSlot,
+                                               work.item.generation,
+                                               work.item.workTicket);
   }
+}
+
+__device__ __forceinline__ void runSparseAttention(
+    nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
+    const std::uint32_t *candidateOffsets, const __half *summaries,
+    const __half *queries, std::uint32_t requestIndex,
+    std::uint32_t requestCount, std::uint32_t topK,
+    nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
+    std::uint32_t *selectedObjectSlots, float *output, bool preacquired) {
+  if (requestIndex >= requestCount || topK == 0 || topK > SparseTopKLimit ||
+      candidateOffsets[requestIndex + 1U] - candidateOffsets[requestIndex] <
+          topK) {
+    return;
+  }
+  selectSparsePages(catalog, candidateOffsets, summaries, queries, requestIndex,
+                    topK, workItems, requirements, selectedObjectSlots,
+                    preacquired, false);
+  runSelectedSparseAttention(runtime, catalog, queries, requestIndex,
+                             requestCount, topK, workItems, requirements,
+                             selectedObjectSlots, output);
+}
+
+__device__ __forceinline__ void runSelectedSparseTile(
+    nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
+    const __half *queries, std::uint32_t taskIndex, std::uint32_t selectedCount,
+    std::uint32_t topK, const nta::abi::WorkItem *workItems,
+    const nta::abi::AcquireRequirement *requirements,
+    const std::uint32_t *selectedObjectSlots, AttentionTilePartial *partials) {
+  if (taskIndex >= selectedCount || topK == 0) {
+    return;
+  }
+  const std::uint32_t catalogIndex = selectedObjectSlots[taskIndex];
+  const AttentionPageDescriptor descriptor = catalog[catalogIndex];
+  const AttentionTileTask task{
+      descriptor.objectSlot,
+      taskIndex / topK,
+      descriptor.tokenCount,
+      0,
+  };
+  nta::kernel::WorkContext work{};
+  const bool ready = nta::kernel::acquireWork(runtime, workItems, requirements,
+                                              taskIndex, work);
+  if (!ready) {
+    nta::kernel::defer(runtime, work);
+    return;
+  }
+  const auto *page =
+      static_cast<const __half *>(nta::kernel::address(runtime, work, 0));
+  if (page == nullptr) {
+    nta::device::failWorkTicket(runtime, work.item.workTicket,
+                                nta::abi::WorkTicketState::Failed);
+    return;
+  }
+  computeAttentionTile(runtime, task, taskIndex, work.item, page, queries,
+                       partials);
 }
 
 __device__ __forceinline__ void
@@ -350,6 +409,30 @@ __device__ __forceinline__ void runAttentionTileTma(
   barrier.wait(static_cast<decltype(token) &&>(token));
   computeAttentionTile(runtime, task, taskIndex, work.item, page, queries,
                        partials);
+}
+
+__device__ __forceinline__ void
+copySparsePage(const AttentionPageDescriptor &descriptor) {
+  if ((descriptor.flags & AttentionPageNeedsStaging) == 0 ||
+      descriptor.sourceBase == 0 || descriptor.consumeBase == 0) {
+    return;
+  }
+  const auto *source = reinterpret_cast<const uint4 *>(descriptor.sourceBase);
+  auto *destination = reinterpret_cast<uint4 *>(descriptor.consumeBase);
+  const std::uint32_t vectors = descriptor.bytes / sizeof(uint4);
+  for (std::uint32_t vector = threadIdx.x; vector < vectors;
+       vector += blockDim.x) {
+    nta::device::storeNoAllocate(destination + vector,
+                                 nta::device::loadNoAllocate(source + vector));
+  }
+  auto *destinationBytes =
+      reinterpret_cast<std::byte *>(descriptor.consumeBase);
+  const auto *sourceBytes =
+      reinterpret_cast<const std::byte *>(descriptor.sourceBase);
+  for (std::uint32_t byte = vectors * sizeof(uint4) + threadIdx.x;
+       byte < descriptor.bytes; byte += blockDim.x) {
+    destinationBytes[byte] = sourceBytes[byte];
+  }
 }
 
 } // namespace
@@ -435,6 +518,81 @@ extern "C" __global__ void nta_sparse_query_kernel(const __half *hidden,
   queries[base + dimension] = __float2half(tanhf(projected));
 }
 
+extern "C" __global__ void nta_sparse_select_kernel(
+    const AttentionPageDescriptor *catalog,
+    const std::uint32_t *candidateOffsets, const __half *summaries,
+    const __half *queries, std::uint32_t requestCount, std::uint32_t topK,
+    nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
+    std::uint32_t *selectedObjectSlots, std::uint32_t preacquired,
+    std::uint32_t splitWork) {
+  const std::uint32_t requestIndex = blockIdx.x;
+  if (blockDim.x != AttentionHeadDimension || requestIndex >= requestCount ||
+      topK == 0 || topK > SparseTopKLimit ||
+      candidateOffsets[requestIndex + 1U] - candidateOffsets[requestIndex] <
+          topK) {
+    return;
+  }
+  selectSparsePages(catalog, candidateOffsets, summaries, queries, requestIndex,
+                    topK, workItems, requirements, selectedObjectSlots,
+                    preacquired != 0, splitWork != 0);
+}
+
+extern "C" __global__ void nta_sparse_selected_consume_kernel(
+    nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
+    const __half *queries, std::uint32_t requestCount, std::uint32_t topK,
+    nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
+    const std::uint32_t *selectedObjectSlots, float *output) {
+  if (blockDim.x == AttentionHeadDimension) {
+    runSelectedSparseAttention(runtime, catalog, queries, blockIdx.x,
+                               requestCount, topK, workItems, requirements,
+                               selectedObjectSlots, output);
+  }
+}
+
+extern "C" __global__ void nta_sparse_partial_kernel(
+    nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
+    const __half *queries, std::uint32_t selectedCount, std::uint32_t topK,
+    const nta::abi::WorkItem *workItems,
+    const nta::abi::AcquireRequirement *requirements,
+    const std::uint32_t *selectedObjectSlots, AttentionTilePartial *partials) {
+  if (blockDim.x == AttentionHeadDimension) {
+    runSelectedSparseTile(runtime, catalog, queries, blockIdx.x, selectedCount,
+                          topK, workItems, requirements, selectedObjectSlots,
+                          partials);
+  }
+}
+
+extern "C" __global__ void nta_sparse_partial_ready_kernel(
+    nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
+    const __half *queries, std::uint32_t selectedCount, std::uint32_t topK,
+    const nta::abi::WorkItem *workItems,
+    const nta::abi::AcquireRequirement *requirements,
+    const std::uint32_t *selectedObjectSlots, AttentionTilePartial *partials) {
+  if (blockDim.x != AttentionHeadDimension) {
+    return;
+  }
+  const std::uint32_t workTicket = popReadyWorkTicket(runtime);
+  if (workTicket >= runtime->workTicketCapacity) {
+    return;
+  }
+  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
+  runSelectedSparseTile(runtime, catalog, queries, taskIndex, selectedCount,
+                        topK, workItems, requirements, selectedObjectSlots,
+                        partials);
+}
+
+extern "C" __global__ void
+nta_sparse_copy_selected_kernel(const AttentionPageDescriptor *catalog,
+                                const std::uint32_t *selectedCatalogIndices,
+                                std::uint32_t selectedCount) {
+  const std::uint32_t selectedIndex = blockIdx.x;
+  if (selectedIndex >= selectedCount) {
+    return;
+  }
+  const std::uint32_t catalogIndex = selectedCatalogIndices[selectedIndex];
+  copySparsePage(catalog[catalogIndex]);
+}
+
 extern "C" __global__ void nta_sparse_attention_kernel(
     nta::abi::RuntimeView *runtime, const AttentionPageDescriptor *catalog,
     const std::uint32_t *candidateOffsets, const __half *summaries,
@@ -456,6 +614,9 @@ extern "C" __global__ void nta_sparse_attention_ready_kernel(
     nta::abi::WorkItem *workItems, nta::abi::AcquireRequirement *requirements,
     std::uint32_t *selectedObjectSlots, float *output,
     std::uint32_t preacquired) {
+  (void)candidateOffsets;
+  (void)summaries;
+  (void)preacquired;
   if (blockDim.x != AttentionHeadDimension) {
     return;
   }
@@ -466,10 +627,9 @@ extern "C" __global__ void nta_sparse_attention_ready_kernel(
   const std::uint32_t requestIndex =
       runtime->workTickets[workTicket].logicalTile;
   if (requestIndex < requestCount) {
-    runSparseAttention(runtime, catalog, candidateOffsets, summaries, queries,
-                       requestIndex, requestCount, topK, workItems,
-                       requirements, selectedObjectSlots, output,
-                       preacquired != 0);
+    runSelectedSparseAttention(runtime, catalog, queries, requestIndex,
+                               requestCount, topK, workItems, requirements,
+                               selectedObjectSlots, output);
   }
 }
 
@@ -480,27 +640,7 @@ nta_sparse_copy_all_kernel(const AttentionPageDescriptor *catalog,
   if (candidate >= candidateCount) {
     return;
   }
-  const AttentionPageDescriptor descriptor = catalog[candidate];
-  if ((descriptor.flags & AttentionPageNeedsStaging) == 0 ||
-      descriptor.sourceBase == 0 || descriptor.consumeBase == 0) {
-    return;
-  }
-  const auto *source = reinterpret_cast<const uint4 *>(descriptor.sourceBase);
-  auto *destination = reinterpret_cast<uint4 *>(descriptor.consumeBase);
-  const std::uint32_t vectors = descriptor.bytes / sizeof(uint4);
-  for (std::uint32_t vector = threadIdx.x; vector < vectors;
-       vector += blockDim.x) {
-    nta::device::storeNoAllocate(destination + vector,
-                                 nta::device::loadNoAllocate(source + vector));
-  }
-  auto *destinationBytes =
-      reinterpret_cast<std::byte *>(descriptor.consumeBase);
-  const auto *sourceBytes =
-      reinterpret_cast<const std::byte *>(descriptor.sourceBase);
-  for (std::uint32_t byte = vectors * sizeof(uint4) + threadIdx.x;
-       byte < descriptor.bytes; byte += blockDim.x) {
-    destinationBytes[byte] = sourceBytes[byte];
-  }
+  copySparsePage(catalog[candidate]);
 }
 
 extern "C" __global__ void

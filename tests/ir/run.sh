@@ -5,6 +5,8 @@ plugin=$1
 opt=$2
 output_dir=$3
 source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+abi_version=$(rg -o '\bVersion = [0-9]+;' \
+  "${source_dir}/../../include/nta/RuntimeABI.h" | rg -o '[0-9]+')
 
 mkdir -p "${output_dir}"
 
@@ -113,11 +115,39 @@ fi
 "${opt}" \
   -load-pass-plugin="${plugin}" \
   -passes=nta-acquire \
+  -S "${source_dir}/partial-forwarded-ready.ll" \
+  -o "${output_dir}/partial-forwarded-ready.lowered.ll"
+rg -q 'call i1 @nta_request_live_cta' \
+  "${output_dir}/partial-forwarded-ready.lowered.ll"
+rg -q '!nta.operator' "${output_dir}/partial-forwarded-ready.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_set_marker|begin_partial_marker|commit_stream_ordered_partial_marker)' \
+  "${output_dir}/partial-forwarded-ready.lowered.ll"; then
+  echo "lowered forwarded-ready module still contains an NTA marker" >&2
+  exit 1
+fi
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
+  -S "${source_dir}/partial-correlated-guard.ll" \
+  -o "${output_dir}/partial-correlated-guard.lowered.ll"
+rg -q 'call i1 @nta_request_live_cta' \
+  "${output_dir}/partial-correlated-guard.lowered.ll"
+rg -q '!nta.operator' "${output_dir}/partial-correlated-guard.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_set_marker|begin_partial_marker|commit_stream_ordered_partial_marker)' \
+  "${output_dir}/partial-correlated-guard.lowered.ll"; then
+  echo "lowered correlated-guard module still contains an NTA marker" >&2
+  exit 1
+fi
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
   -S "${source_dir}/dependency-set.ll" \
   -o "${output_dir}/dependency-set.lowered.ll"
 rg -q 'call i1 @nta_acquire_set_slow' \
   "${output_dir}/dependency-set.lowered.ll"
-rg -Fq '!{!"request-bound", i32 31, !"dependency-set", !"split-phase-cta"}' \
+rg -Fq "!{!\"request-bound\", i32 ${abi_version}, !\"dependency-set\", !\"split-phase-cta\"}" \
   "${output_dir}/dependency-set.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_set_marker|defer_marker)' \
   "${output_dir}/dependency-set.lowered.ll"; then
@@ -147,7 +177,7 @@ fi
   -o "${output_dir}/tensor-map.lowered.ll"
 rg -q 'call ptr @nta_acquire_tensor_map_slow' \
   "${output_dir}/tensor-map.lowered.ll"
-rg -Fq '!{!"request-bound", i32 31, !"tensor-map", !"split-phase-cta"}' \
+rg -Fq "!{!\"request-bound\", i32 ${abi_version}, !\"tensor-map\", !\"split-phase-cta\"}" \
   "${output_dir}/tensor-map.lowered.ll"
 rg -q 'phi ptr \[ null, %entry \], \[ %direct.map, %nta.acquire.direct \]' \
   "${output_dir}/tensor-map.lowered.ll"
@@ -164,7 +194,7 @@ fi
   -o "${output_dir}/late-bound.lowered.ll"
 rg -q 'call ptr @nta_acquire_slow' "${output_dir}/late-bound.lowered.ll"
 rg -q 'and i32 %cta, %catalog.mask' "${output_dir}/late-bound.lowered.ll"
-rg -Fq '!{!"request-bound", i32 31, !"byte-address", !"split-phase-cta"}' \
+rg -Fq "!{!\"request-bound\", i32 ${abi_version}, !\"byte-address\", !\"split-phase-cta\"}" \
   "${output_dir}/late-bound.lowered.ll"
 if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
   "${output_dir}/late-bound.lowered.ll"; then
@@ -182,6 +212,19 @@ rg -q 'call ptr @nta_acquire_slow' \
 if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
   "${output_dir}/uniform-cycle.lowered.ll"; then
   echo "lowered uniform-cycle module still contains an NTA marker" >&2
+  exit 1
+fi
+
+"${opt}" \
+  -load-pass-plugin="${plugin}" \
+  -passes=nta-acquire \
+  -S "${source_dir}/uniform-cycle-deep.ll" \
+  -o "${output_dir}/uniform-cycle-deep.lowered.ll"
+rg -q 'call ptr @nta_acquire_slow' \
+  "${output_dir}/uniform-cycle-deep.lowered.ll"
+if rg -q '__nta_(bind_request|acquire_marker|defer_marker)' \
+  "${output_dir}/uniform-cycle-deep.lowered.ll"; then
+  echo "lowered deep uniform cycle still contains an NTA marker" >&2
   exit 1
 fi
 
@@ -211,12 +254,15 @@ fixtures=(
   "reject-divergent-operand:acquisition marker has a non-CTA-uniform operand"
   "reject-divergent-value-phi:request binding has a non-CTA-uniform operand"
   "reject-divergent-cycle:request binding has a non-CTA-uniform operand"
+  "reject-divergent-loop-trip:request binding has a non-CTA-uniform operand"
+  "reject-divergent-local-write:request binding has a non-CTA-uniform operand"
   "reject-device-helper:acquisition markers must be inlined into a GPU kernel entry"
   "reject-partial-bypass:partial publication must post-dominate its numerical region"
   "reject-partial-without-acquire:partial region is not on an acquired path with the same request binding and work ticket"
   "reject-partial-wrong-ticket:partial region is not on an acquired path with the same request binding and work ticket"
   "reject-partial-nonconvergent:partial-region marker must carry LLVM convergent semantics"
   "reject-partial-acquire-bypass:partial region has a path that bypasses acquisition"
+  "reject-partial-multihop-ready:partial region is not on an acquired path with the same request binding and work ticket"
   "reject-partial-duplicate-commit:partial numerical region publishes more than once"
   "reject-partial-missing-commit:partial numerical region has no publication"
   "reject-partial-commit-wrong-ticket:partial publication is not in a matching numerical region"
@@ -246,6 +292,21 @@ for entry in "${fixtures[@]}"; do
   rg -Fq "NTA acquisition verification failed" \
     "${output_dir}/${fixture}.stderr"
 done
+
+# Loop rotation is part of the production -O3 JIT pipeline. Keep the reachable
+# latch-divergence rejection covered after those transformations, not only in
+# the verifier's source-level fixture shape.
+if "${opt}" \
+    -load-pass-plugin="${plugin}" \
+    -passes='default<O3>' \
+    -S "${source_dir}/reject-divergent-loop-trip.ll" \
+    -o "${output_dir}/reject-divergent-loop-trip.o3.ll" \
+    2>"${output_dir}/reject-divergent-loop-trip.o3.stderr"; then
+  echo "O3 accepted a lane-divergent loop trip count" >&2
+  exit 1
+fi
+rg -Fq "request binding has a non-CTA-uniform operand" \
+  "${output_dir}/reject-divergent-loop-trip.o3.stderr"
 
 echo "NTA IR tests passed"
 

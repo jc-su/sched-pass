@@ -52,6 +52,7 @@ struct Options {
   nta::NvmeMediaPolicy mediaPolicy =
       nta::NvmeMediaPolicy::RequireHardwareWriteProtection;
   nta::NvmeDmaTarget dmaTarget = nta::NvmeDmaTarget::HbmPeer;
+  nta::NvmeHbmMappingPolicy hbmMappingPolicy = nta::NvmeHbmMappingPolicy::Auto;
   bool ctaTryIssue = false;
   bool useExternalDestination = false;
 };
@@ -76,6 +77,20 @@ const char *hbmBackendName(nta::NvmeHbmMappingBackend backend) {
     return "unavailable";
   case nta::NvmeHbmMappingBackend::NvidiaPeerPages:
     return "nvidia-peer-pages";
+  case nta::NvmeHbmMappingBackend::CudaDmaBufIoas:
+    return "cuda-dmabuf-ioas";
+  }
+  return "unknown";
+}
+
+const char *hbmPolicyName(nta::NvmeHbmMappingPolicy policy) {
+  switch (policy) {
+  case nta::NvmeHbmMappingPolicy::Auto:
+    return "auto";
+  case nta::NvmeHbmMappingPolicy::NvidiaPeerPages:
+    return "nvidia-peer-pages";
+  case nta::NvmeHbmMappingPolicy::CudaDmaBufIoas:
+    return "cuda-dmabuf-ioas";
   }
   return "unknown";
 }
@@ -188,6 +203,18 @@ Options parseOptions(int argc, char **argv) {
       } else {
         throw std::invalid_argument(
             "--dma-target must be hbm-peer or host-mapped");
+      }
+    } else if (name == "--hbm-backend") {
+      if (value == "auto") {
+        options.hbmMappingPolicy = nta::NvmeHbmMappingPolicy::Auto;
+      } else if (value == "nvidia-peer-pages") {
+        options.hbmMappingPolicy = nta::NvmeHbmMappingPolicy::NvidiaPeerPages;
+      } else if (value == "cuda-dmabuf-ioas") {
+        options.hbmMappingPolicy = nta::NvmeHbmMappingPolicy::CudaDmaBufIoas;
+      } else {
+        throw std::invalid_argument(
+            "--hbm-backend must be auto, nvidia-peer-pages, or "
+            "cuda-dmabuf-ioas");
       }
     } else if (name == "--cta-try-issue") {
       const std::uint64_t parsed = parseInteger(value, name, true);
@@ -390,6 +417,7 @@ int main(int argc, char **argv) {
     transportOptions.adminTimeoutMs = options.adminTimeoutMs;
     transportOptions.mediaPolicy = options.mediaPolicy;
     transportOptions.dmaTarget = options.dmaTarget;
+    transportOptions.hbmMappingPolicy = options.hbmMappingPolicy;
     auto transport =
         std::make_shared<nta::NvmeTransport>(std::move(transportOptions));
     // Keep BAR qualification and queue setup ahead of benchmark allocations so
@@ -650,6 +678,7 @@ int main(int argc, char **argv) {
         << "destination=" << dmaTargetName(options.dmaTarget)
         << " hbm_mapping_backend="
         << hbmBackendName(capabilities.hbmMappingBackend)
+        << " hbm_mapping_policy=" << hbmPolicyName(options.hbmMappingPolicy)
         << " backend=vfio-iommufd"
         << " media_policy="
         << (options.mediaPolicy == nta::NvmeMediaPolicy::TrustReadOnlyDeviceCode
@@ -709,6 +738,8 @@ int main(int argc, char **argv) {
           << (capabilities.supportsHbmPeerDma ? "true" : "false") << ",\n"
           << "  \"hbm_mapping_backend\": "
           << jsonString(hbmBackendName(capabilities.hbmMappingBackend)) << ",\n"
+          << "  \"hbm_mapping_policy\": "
+          << jsonString(hbmPolicyName(options.hbmMappingPolicy)) << ",\n"
           << "  \"hbm_region_registrations\": " << stats.hbmRegionRegistrations
           << ",\n"
           << "  \"hbm_region_bytes\": " << stats.hbmRegionBytes << ",\n"

@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Validate the shared tenant policy parser used by both engines."""
 
-from nta_runtime.tenant import tenant_budget_specs, tenant_mapper_from_environment
+from nta_runtime.tenant import (
+    tenant_budget_specs,
+    tenant_isolation_required,
+    tenant_mapper_from_environment,
+)
 
 
 def main() -> None:
@@ -9,7 +13,11 @@ def main() -> None:
         "NTA_TENANT_BUDGETS": "7:1048576,11:2097152",
         "NTA_TENANT_REQUEST_PREFIXES": "7:team-a/,11:team-b/",
     }
-    assert tenant_budget_specs(environ) == ((7, 1048576), (11, 2097152))
+    specs = tenant_budget_specs(environ)
+    assert specs == ((7, 1048576), (11, 2097152))
+    assert tenant_isolation_required(specs)
+    assert not tenant_isolation_required(())
+    assert not tenant_isolation_required(((7, (1 << 64) - 1),))
     mapper = tenant_mapper_from_environment(environ)
     assert mapper is not None
     assert mapper("team-a/request-0") == 7

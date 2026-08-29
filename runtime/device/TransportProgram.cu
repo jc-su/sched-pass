@@ -1,7 +1,7 @@
 // Runtime-owned transport phases shared by every typed operator.
 //
 // This module intentionally contains no numerical kernel and is not passed
-// through NtaPass.  It exports the finite transport ABI from JitRuntime.cuh so
+// through NtaPass. It exports the finite transport ABI from JitRuntime.cuh so
 // host staging, NVMe progress, publication, and completion do not depend on a
 // framework-specific FlashInfer shared object.
 

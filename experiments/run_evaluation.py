@@ -18,39 +18,58 @@ import sys
 from typing import Any, Mapping
 
 try:
-    from .validate_workload import validate as validate_workload
+    from .mechanism_arms import (
+        ARMS,
+        ARM_DEFINITIONS,
+        FORMAL_SERVING_METRICS,
+        arm_environment,
+    )
     from .analyze_evaluation import analyze as analyze_evaluation
     from .validate_tier_qualification import (
         validate_file as validate_tier_qualification,
     )
     from .validate_evaluation import validate as validate_evaluation_contract
     from .validate_evaluation_artifact import validate as validate_evaluation_artifact
+    from .result_contracts import result_contract_names
+    from .workload_scenario import validate_workload_scenario
 except ImportError:
-    from validate_workload import validate as validate_workload
+    from mechanism_arms import (
+        ARMS,
+        ARM_DEFINITIONS,
+        FORMAL_SERVING_METRICS,
+        arm_environment,
+    )
     from analyze_evaluation import analyze as analyze_evaluation
     from validate_tier_qualification import validate_file as validate_tier_qualification
     from validate_evaluation import validate as validate_evaluation_contract
     from validate_evaluation_artifact import validate as validate_evaluation_artifact
+    from result_contracts import result_contract_names
+    from workload_scenario import validate_workload_scenario
 
 
 ROOT = Path(__file__).resolve().parents[1]
 QUALIFIED_RUNNER = ROOT / "scripts" / "run-qualified-trials.py"
 EVALUATION_MANIFEST = ROOT / "experiments" / "evaluation-manifest.json"
-REQUIRED_STRATA = {
-    "request_state",
-    "granularity",
-    "load_ratio",
-    "availability_skew",
-    "staging_pressure",
-    "arrival",
-}
 EVALUATION_PROFILES = {"contract", "osdi-complete"}
-CANONICAL_ARMS = {f"B{index}" for index in range(7)}
+CANONICAL_ARMS = set(ARMS)
 FORMAL_CONSUMER_KINDS = {"native_work_unit", "framework_reference"}
+TIER_ENVIRONMENT = {
+    "hbm": "hbm",
+    "host_mem": "host_staged",
+    "nvme": "nvme",
+    "dax": "cxl_dax",
+}
 
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resolve_spec_path(value: str, base_dir: Path | None) -> Path:
+    path = Path(value)
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    return path.resolve()
 
 
 def _required_qualification_tiers(spec: dict[str, Any]) -> set[str]:
@@ -63,10 +82,10 @@ def _required_qualification_tiers(spec: dict[str, Any]) -> set[str]:
 
 def validate_spec(
     spec: dict[str, Any],
-    workload_path: Path,
     *,
     qualification_path: Path | None = None,
-) -> dict[str, Any]:
+    base_dir: Path | None = None,
+) -> dict[str, dict[str, Any]]:
     if spec.get("schema") != 1 or spec.get("classification") != "nta-paired-evaluation":
         raise ValueError(
             "evaluation trial spec must use nta-paired-evaluation schema 1"
@@ -84,9 +103,9 @@ def validate_spec(
     validate_evaluation_contract(contract)
     tiers = {tier["id"] for tier in contract["tiers"]}
     arms = {arm["id"] for arm in contract["arms"]}
-    allowed_strata = contract["strata"]
     identities: dict[tuple[str, str], dict[str, Any]] = {}
     consumer_kinds_by_arm: dict[str, set[str]] = {}
+    workloads: dict[str, dict[str, Any]] = {}
     for trial in trials:
         if not isinstance(trial, dict) or not trial.get("command"):
             raise ValueError("each evaluation trial needs a command")
@@ -108,18 +127,50 @@ def validate_spec(
                     "of native_work_unit or framework_reference"
                 )
             consumer_kinds_by_arm.setdefault(trial["arm"], set()).add(consumer_kind)
-        if not isinstance(trial.get("stratum"), dict) or not REQUIRED_STRATA <= set(
-            trial["stratum"]
-        ):
-            raise ValueError(
-                "each trial needs the complete request/tier/load/arrival strata"
-            )
-        for stratum_name in REQUIRED_STRATA:
-            if trial["stratum"][stratum_name] not in allowed_strata[stratum_name]:
+            definition = ARM_DEFINITIONS[trial["arm"]]
+            if consumer_kind != definition["consumer_kind"]:
                 raise ValueError(
-                    f"trial uses an undeclared {stratum_name} stratum: "
-                    f"{trial['stratum'][stratum_name]!r}"
+                    f"{trial['arm']} consumer_kind diverges from its causal contract"
                 )
+            if trial.get("mechanism_form") != definition["name"]:
+                raise ValueError(
+                    f"{trial['arm']} mechanism_form diverges from its causal contract"
+                )
+            environment = trial.get("environment")
+            expected_environment = arm_environment(trial["arm"])
+            if not isinstance(environment, dict) or any(
+                environment.get(name) != value
+                for name, value in expected_environment.items()
+            ) or environment.get("NTA_SERVING_TIER") != TIER_ENVIRONMENT.get(
+                trial["tier"]
+            ):
+                raise ValueError(
+                    f"{trial['arm']} environment does not select its causal form"
+                )
+            if trial.get("result_contract") not in result_contract_names(
+                formal_only=True
+            ):
+                raise ValueError(
+                    "osdi-complete trials must declare a supported result_contract"
+                )
+        elif trial.get("result_contract") is not None and trial.get(
+            "result_contract"
+        ) not in result_contract_names():
+            raise ValueError("evaluation trial declares an unknown result_contract")
+        workload_value = trial.get("workload_manifest")
+        if not isinstance(workload_value, str) or not workload_value:
+            raise ValueError("each evaluation trial needs a workload_manifest")
+        workload_path = _resolve_spec_path(workload_value, base_dir)
+        stratum = trial.get("stratum")
+        if not isinstance(stratum, dict):
+            raise ValueError("each evaluation trial needs a workload descriptor")
+        descriptor = validate_workload_scenario(stratum, workload_path)
+        prior_descriptor = workloads.get(str(workload_path))
+        if prior_descriptor is not None and prior_descriptor != descriptor:
+            raise ValueError(
+                "one workload manifest was assigned multiple scenario identities"
+            )
+        workloads[str(workload_path)] = descriptor
         metrics = trial.get("metrics")
         if (
             not isinstance(metrics, list)
@@ -127,6 +178,13 @@ def validate_spec(
             or not all(isinstance(metric, str) and metric for metric in metrics)
         ):
             raise ValueError("each evaluation trial needs a non-empty metric contract")
+        if evaluation_profile == "osdi-complete" and not set(
+            FORMAL_SERVING_METRICS
+        ).issubset(metrics):
+            raise ValueError(
+                "osdi-complete trials must report TTFT, TPOT, ITL, throughput, "
+                "admission delay, SLO goodput, and correctness"
+            )
         identity = (trial["name"], trial["variant"])
         if identity in identities:
             raise ValueError(
@@ -143,12 +201,14 @@ def validate_spec(
         reference_key = (
             reference["tier"],
             reference["demand_semantics"],
+            str(_resolve_spec_path(reference["workload_manifest"], base_dir)),
             json.dumps(reference["stratum"], sort_keys=True, separators=(",", ":")),
         )
         for variant in variants[1:]:
             key = (
                 variant["tier"],
                 variant["demand_semantics"],
+                str(_resolve_spec_path(variant["workload_manifest"], base_dir)),
                 json.dumps(variant["stratum"], sort_keys=True, separators=(",", ":")),
             )
             if key != reference_key:
@@ -196,7 +256,7 @@ def validate_spec(
     if evaluation_profile == "osdi-complete":
         declared_arms = {trial["arm"] for trial in identities.values()}
         if declared_arms != CANONICAL_ARMS:
-            raise ValueError("osdi-complete evaluation must contain exactly B0-B6")
+            raise ValueError("osdi-complete evaluation must contain exactly A0-A3")
         if any(
             consumer_kinds_by_arm.get(arm, set())
             and len(consumer_kinds_by_arm[arm]) != 1
@@ -236,6 +296,15 @@ def validate_spec(
         if len(stratum_keys) < 6:
             raise ValueError(
                 "osdi-complete evaluation needs at least six workload strata"
+            )
+        demand_identities = {
+            str(trial["stratum"]["demand_trace_digest"])
+            for trial in identities.values()
+        }
+        if len(demand_identities) < 6:
+            raise ValueError(
+                "osdi-complete evaluation needs at least six distinct consumed "
+                "workload identities"
             )
 
         actual_pairs: set[tuple[str, str, str]] = set()
@@ -280,7 +349,17 @@ def validate_spec(
             qualification_path,
             required_tiers=required_qualification_tiers or {"hbm", "host_mem"},
         )
-    return validate_workload(workload_path)
+    declared_workloads = spec.get("workload_manifests")
+    if (
+        not isinstance(declared_workloads, list)
+        or not all(isinstance(value, str) and value for value in declared_workloads)
+        or sorted(_resolve_spec_path(value, base_dir).as_posix() for value in declared_workloads)
+        != sorted(workloads)
+    ):
+        raise ValueError(
+            "evaluation workload_manifests do not match trial-owned scenarios"
+        )
+    return workloads
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -290,20 +369,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-dirty", action="store_true")
     args = parser.parse_args(argv)
     spec_path = args.spec.resolve()
-    workload_path = None
     qualification_path = None
     try:
         spec = json.loads(spec_path.read_text(encoding="utf-8"))
         if not isinstance(spec, dict):
             raise ValueError("evaluation trial spec is not an object")
-        workload_path = Path(spec.get("workload_manifest", "")).resolve()
         qualification_value = spec.get("tier_qualification")
         if qualification_value is not None:
-            qualification_path = Path(str(qualification_value)).resolve()
-        workload_manifest = validate_spec(
+            qualification_path = _resolve_spec_path(
+                str(qualification_value), spec_path.parent
+            )
+        workload_manifests = validate_spec(
             spec,
-            workload_path,
             qualification_path=qualification_path,
+            base_dir=spec_path.parent,
         )
         output = args.output_dir.resolve()
         if output == ROOT or ROOT in output.parents:
@@ -335,9 +414,17 @@ def main(argv: list[str] | None = None) -> int:
                     "evaluation_profile": spec.get("evaluation_profile", "contract"),
                     "spec": str(spec_path),
                     "spec_digest": _digest(spec_path),
-                    "workload_manifest": str(workload_path),
-                    "workload_manifest_digest": _digest(workload_path),
-                    "workload_demand_digest": workload_manifest["demand_trace_digest"],
+                    "workloads": [
+                        {
+                            "manifest": path,
+                            "manifest_digest": _digest(Path(path)),
+                            "demand_trace_digest": descriptor[
+                                "demand_trace_digest"
+                            ],
+                            "scenario": descriptor,
+                        }
+                        for path, descriptor in sorted(workload_manifests.items())
+                    ],
                     "tier_qualification": str(qualification_path)
                     if qualification_path
                     else None,

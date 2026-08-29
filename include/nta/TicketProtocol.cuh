@@ -259,7 +259,14 @@ __device__ __forceinline__ void failWorkTicket(abi::RuntimeView *runtime,
   const bool changed = previous != abi::WorkTicketState::Initializing;
   if (changed) {
     recordTerminalWork(runtime, ticket, previous, state);
-    recordFailure(runtime);
+    // Cancellation is a normal request-lifecycle terminal state and already
+    // has independent per-request accounting.  Poisoning the runtime-lifetime
+    // failure latch here would make one cancelled fan-out consumer invalidate
+    // unrelated requests that share the same physical acquisition.  Only an
+    // integrity/protocol failure belongs in the sticky failure sequence.
+    if (state != abi::WorkTicketState::Cancelled) {
+      recordFailure(runtime);
+    }
   }
 }
 

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 
 import torch
@@ -15,6 +17,9 @@ from nta_runtime import (
     JitPhaseProgram,
     CxlDaxOptions,
     NvmeOptions,
+    NvmeHbmMappingBackend,
+    NvmeHbmMappingPolicy,
+    NvmeDmaTarget,
     OperatorCapability,
     OperatorContract,
     OperatorFamily,
@@ -41,6 +46,50 @@ from nta_runtime.indexed_transfer import (
 
 
 def main() -> None:
+    normalized = RuntimeConfig(4, 8, 8, 8, tenant_capacity=0, staging_byte_capacity=0)
+    assert normalized.tenant_capacity == 4
+    assert normalized.staging_byte_capacity == (1 << 64) - 1
+    try:
+        RuntimeConfig(4, 8, 8, 8, enable_cta_nvme_try_issue=1)  # type: ignore[arg-type]
+    except ValueError as error:
+        assert "boolean" in str(error)
+    else:
+        raise AssertionError("a non-boolean CTA issue policy was accepted")
+    assert NvmeHbmMappingBackend.CUDA_DMA_BUF_IOAS.artifact_name == "cuda-dmabuf-ioas"
+    assert NvmeHbmMappingBackend.NVIDIA_PEER_PAGES.artifact_name == "nvidia-peer-pages"
+    assert NvmeHbmMappingPolicy.CUDA_DMA_BUF_IOAS.value == 2
+    canonical_nvme = NvmeOptions(
+        "vfio:0000:00:00.0", dma_target=0, hbm_mapping_policy=1
+    )
+    assert canonical_nvme.dma_target is NvmeDmaTarget.HBM_PEER
+    assert canonical_nvme.hbm_mapping_policy is NvmeHbmMappingPolicy.NVIDIA_PEER_PAGES
+    assert (
+        NvmeOptions(
+            "vfio:0000:00:00.0",
+            hbm_mapping_policy=NvmeHbmMappingPolicy.NVIDIA_PEER_PAGES,
+        ).hbm_mapping_policy
+        is NvmeHbmMappingPolicy.NVIDIA_PEER_PAGES
+    )
+    try:
+        NvmeOptions(
+            "vfio:0000:00:00.0",
+            dma_target=NvmeDmaTarget.HOST_MAPPED,
+            hbm_mapping_policy=NvmeHbmMappingPolicy.CUDA_DMA_BUF_IOAS,
+        )
+    except ValueError as error:
+        assert "requires HBM peer DMA" in str(error)
+    else:
+        raise AssertionError("an HBM mapping policy was applied to host DMA")
+    with tempfile.TemporaryDirectory(prefix="nta-jit-digest-") as directory:
+        foreign_module = Path(directory) / "foreign.so"
+        foreign_module.write_bytes(b"not an NTA module")
+        try:
+            JitPhaseProgram(foreign_module, expected_sha256="0" * 64)
+        except RuntimeError as error:
+            assert "activation digest" in str(error)
+        else:
+            raise AssertionError("content-mismatched JIT module was loaded")
+
     for factory in (
         lambda: RuntimeConfig(1 << 32, 1, 1, 1),
         lambda: RequestSpec(0, 1 << 64, 0),
@@ -48,6 +97,7 @@ def main() -> None:
         lambda: RequestSpec(0, 17, 1, priority=8),
         lambda: Replica(1, Placement.HBM, estimated_latency_ns=1 << 64),
         lambda: NvmeOptions("vfio:0000:00:00.0", queue_depth=1 << 32),
+        lambda: NvmeOptions("vfio:0000:00:00.0", hbm_mapping_policy=1 << 32),
         lambda: CxlDaxOptions("/dev/dax0.0", 1 << 64),
     ):
         try:

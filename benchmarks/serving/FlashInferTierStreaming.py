@@ -542,20 +542,28 @@ class TierStreamingFixture:
         self.atomic_key.copy_(self.external_key, non_blocking=True)
         self.atomic_value.copy_(self.external_value, non_blocking=True)
 
-    def completion_times_us(self) -> dict[int, float]:
+    def completion_sample_us(self) -> tuple[float, dict[int, float]]:
+        """Measure request and batch completion on one shared CUDA timeline."""
+
         events = {
             request.key: torch.cuda.Event(enable_timing=True)
             for request in self.requests
         }
         begin = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
         begin.record(self.compute_stream)
         self.streaming_call(events)
-        self.compute_stream.synchronize()
-        return {
+        end.record(self.compute_stream)
+        end.synchronize()
+        batch_us = begin.elapsed_time(end) * 1_000.0
+        request_us = {
             request_id: begin.elapsed_time(events[request.key]) * 1_000.0
             for request in self.requests
             for request_id in (request.request_id,)
         }
+        if any(completion_us > batch_us for completion_us in request_us.values()):
+            raise RuntimeError("request completion exceeded its paired batch completion")
+        return batch_us, request_us
 
     def kv_bytes(self, tokens: int) -> int:
         return (
@@ -605,6 +613,16 @@ def main() -> int:
                 fixture.bulk_copy_call, arguments.iterations, fixture.compute_stream
             )
         )
+
+    completion_batch_samples = SampleSet([])
+    completion_request_samples = {
+        request.request_id: [] for request in fixture.requests
+    }
+    for _ in range(arguments.trials):
+        batch_us, request_us = fixture.completion_sample_us()
+        completion_batch_samples.values_us.append(batch_us)
+        for request_id, completion_us in request_us.items():
+            completion_request_samples[request_id].append(completion_us)
 
     fixture.direct_call()
     torch.cuda.synchronize()
@@ -701,7 +719,10 @@ def main() -> int:
         fixture.streaming.verify_compiler_epoch()
         torch.testing.assert_close(fixture.output, direct_output, rtol=2e-3, atol=2e-3)
 
-    completion_times = fixture.completion_times_us()
+    completion_times = {
+        request_id: statistics.median(values)
+        for request_id, values in completion_request_samples.items()
+    }
     direct_median = statistics.median(samples["direct"].values_us)
     atomic_median = statistics.median(samples["atomic"].values_us)
     streaming_median = statistics.median(samples["streaming"].values_us)
@@ -725,7 +746,7 @@ def main() -> int:
         "streaming": streaming_staging_bytes,
     }[arguments.primary_arm]
     result: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "classification": "flashinfer-request-aware-tier-streaming",
         "revision": git_value("rev-parse", "HEAD"),
         "dirty": bool(git_value("status", "--porcelain")),
@@ -809,6 +830,11 @@ def main() -> int:
             str(request_id): completion_times[request_id]
             for request_id in sorted(completion_times)
         },
+        "request_completion_samples_us": {
+            str(request_id): completion_request_samples[request_id]
+            for request_id in sorted(completion_request_samples)
+        },
+        "completion_observed_streaming_us": completion_batch_samples.report(),
         "group_tokens": arguments.group_tokens,
         "slot_count": arguments.slots,
         "primary_arm": arguments.primary_arm,

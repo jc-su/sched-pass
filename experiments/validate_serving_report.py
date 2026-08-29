@@ -9,11 +9,35 @@ import math
 from pathlib import Path
 from typing import Any
 
+from nta_runtime.resource_contract import resource_contract
+
 try:
     from .consumer_contract import validate_consumer_contract
+    from .serving_metrics import (
+        preregistered_goodput,
+        relative_goodput,
+        relative_thresholds,
+        safe_ratio,
+    )
+    from .serving_path_evidence import (
+        EXERCISED_PATHS,
+        require_frontier_shape,
+        summarize_transport_execution,
+    )
     from .workload_heterogeneity import serving_batch_heterogeneity
 except ImportError:  # pragma: no cover - direct script execution
     from consumer_contract import validate_consumer_contract
+    from serving_metrics import (
+        preregistered_goodput,
+        relative_goodput,
+        relative_thresholds,
+        safe_ratio,
+    )
+    from serving_path_evidence import (
+        EXERCISED_PATHS,
+        require_frontier_shape,
+        summarize_transport_execution,
+    )
     from workload_heterogeneity import serving_batch_heterogeneity
 
 
@@ -38,6 +62,57 @@ def _nonnegative_integer(value: Any, name: str) -> int:
         f"serving report has invalid {name}",
     )
     return value
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[round((len(ordered) - 1) * fraction)]
+
+
+def _close(actual: Any, expected: float, name: str) -> None:
+    value = _finite(actual, name)
+    _require(
+        math.isclose(value, expected, rel_tol=1e-12, abs_tol=1e-12),
+        f"serving report {name} does not match request records",
+    )
+
+
+def _validate_derived_object(actual: Any, expected: dict[str, Any], name: str) -> None:
+    """Require a derived metric object to match its request-record recomputation."""
+
+    _require(isinstance(actual, dict), f"serving report has no {name} object")
+    _require(
+        set(actual) == set(expected),
+        f"serving report {name} has an unexpected field set",
+    )
+    for field, expected_value in expected.items():
+        value = actual[field]
+        field_name = f"{name} {field}"
+        if isinstance(expected_value, dict):
+            _validate_derived_object(value, expected_value, field_name)
+        elif isinstance(expected_value, int):
+            _require(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value == expected_value,
+                f"serving report {field_name} does not match request records",
+            )
+        elif isinstance(expected_value, float):
+            _close(value, expected_value, field_name)
+        else:  # pragma: no cover - metric schema is intentionally closed
+            _require(value == expected_value, f"serving report has invalid {field_name}")
+
+
+def _validate_ratio(actual: Any, expected: float | None, name: str) -> None:
+    if expected is None:
+        _require(
+            actual is None,
+            f"serving report {name} invents a finite ratio with a zero baseline",
+        )
+    else:
+        _close(actual, expected, name)
 
 
 def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> None:
@@ -100,14 +175,30 @@ def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> 
         )
 
 
-def _validate_littles_law(report: dict[str, Any]) -> None:
-    little = report.get("littles_law")
-    _require(isinstance(little, dict), "serving report has no Little's Law report")
+def _validate_finite_window_accounting(report: dict[str, Any]) -> None:
+    accounting = report.get("finite_window_accounting")
     _require(
-        little.get("method") == "finite_window_arrival_departure_accounting",
-        "serving report uses an unknown Little's Law method",
+        isinstance(accounting, dict),
+        "serving report has no finite-window client timestamp accounting",
     )
-    _finite(little.get("residual"), "Little's Law residual")
+    _require(
+        accounting.get("method") == "finite_window_arrival_departure_accounting",
+        "serving report uses an unknown finite-window accounting method",
+    )
+    _require(
+        accounting.get("interpretation")
+        == "descriptive_client_timestamp_accounting",
+        "serving report mislabels finite-window accounting as queueing evidence",
+    )
+    for field in (
+        "arrival_rate_per_second",
+        "completion_rate_per_second",
+        "mean_in_system",
+        "mean_system_time_seconds",
+        "occupancy_area_request_seconds",
+        "sum_residence_seconds",
+    ):
+        _finite(accounting.get(field), f"finite-window accounting {field}")
 
 
 def _validate_workload(report: dict[str, Any]) -> None:
@@ -121,6 +212,13 @@ def _validate_workload(report: dict[str, Any]) -> None:
     _require(
         workload.get("tokenization_errors") == 0,
         "serving workload changed tokenizer length",
+    )
+    _require(
+        workload.get("token_input_adapter")
+        == "collision_free_content_block_tokens_v1"
+        and isinstance(workload.get("token_input_identity_digest"), str)
+        and bool(workload["token_input_identity_digest"]),
+        "serving workload lacks exact token-input identity",
     )
     _require(
         report.get("demand_trace_digest") == workload["demand_trace_digest"],
@@ -211,6 +309,11 @@ def _validate_tier_provenance(report: dict[str, Any]) -> None:
     _require(
         tier in {"host_staged", "nvme", "cxl_dax"}, "serving report has an unknown tier"
     )
+    _require(
+        tier != "cxl_dax",
+        "CXL-DAX has a qualified native direct consumer but no SGLang "
+        "FlashInfer numerical route; it cannot enter a serving artifact",
+    )
     for entry in stats:
         if not isinstance(entry, dict) or "serving_tier" not in entry:
             continue
@@ -218,19 +321,21 @@ def _validate_tier_provenance(report: dict[str, Any]) -> None:
             entry.get("tier_fallback") is False,
             "serving tier fallback was not fail-closed",
         )
+        expected_contract = resource_contract(tier)
+        _require(
+            entry.get("resource_contract") == expected_contract.as_dict(),
+            "serving tier resource contract diverges from the runtime contract",
+        )
+        _require(
+            entry.get("tier_data_path") == expected_contract.steady_state_path,
+            "serving tier data path diverges from the runtime contract",
+        )
         if tier == "host_staged":
             _require(
-                int(entry.get("cxl_direct_work_items", 0)) == 0,
-                "host-staged serving report contains CXL direct work",
+                int(entry.get("tier_host_proxy_bytes", 0)) >= 0,
+                "host-staged serving report has invalid proxy-byte accounting",
             )
         if tier in {"nvme", "cxl_dax"}:
-            expected_path = (
-                "gpu_owned_nvme_to_hbm" if tier == "nvme" else "cuda_visible_cxl_direct"
-            )
-            _require(
-                entry.get("tier_data_path") == expected_path,
-                "physical-tier serving report has an unexpected data path",
-            )
             _require(
                 int(entry.get("tier_host_proxy_bytes", 0)) == 0,
                 "physical-tier serving report used host memory as a data proxy",
@@ -239,6 +344,11 @@ def _validate_tier_provenance(report: dict[str, Any]) -> None:
                 isinstance(entry.get("tier_catalog_digest"), str)
                 and entry["tier_catalog_digest"],
                 "physical-tier serving report has no catalog digest",
+            )
+            _require(
+                int(entry.get("nvme_bytes", 0)) > 0
+                and int(entry.get("nvme_epochs", 0)) > 0,
+                "NVMe serving report has no peer-DMA execution evidence",
             )
             _require(
                 isinstance(entry.get("tier_capabilities"), dict),
@@ -284,7 +394,10 @@ def _validate_consumer_contract(
 
 
 def _validate_single(
-    report: dict[str, Any], *, require_engine_stats: bool = True
+    report: dict[str, Any],
+    *,
+    require_engine_stats: bool = True,
+    require_complete_environment: bool = False,
 ) -> None:
     _require(report.get("schema") == 1, "unsupported serving report schema")
     _require(
@@ -299,9 +412,14 @@ def _validate_single(
         isinstance(report.get("machine"), dict) and report["machine"],
         "serving report has no machine metadata",
     )
+    backend = report.get("attention_backend")
+    _require(
+        backend in {"flashinfer", "nta_flashinfer"},
+        "serving report has no supported attention backend",
+    )
     _require(report.get("demand_semantics") == "exact", "serving demand is not exact")
     _require(report.get("placement_proven") is True, "serving placement was not proven")
-    _validate_environment(report, require_complete=require_engine_stats)
+    _validate_environment(report, require_complete=require_complete_environment)
     _require(
         report.get("verification_failures") == 0,
         "serving report has verification failures",
@@ -327,6 +445,10 @@ def _validate_single(
     )
     for index, record in enumerate(records):
         _require(isinstance(record, dict), f"serving record {index} is not an object")
+        _require(
+            record.get("kind") in {"resident", "external"},
+            f"serving record {index} has an unknown request kind",
+        )
         for field in (
             "kind",
             "arrival_offset_seconds",
@@ -338,6 +460,9 @@ def _validate_single(
             "admission_delay_seconds",
             "system_time_seconds",
             "completion_tokens",
+            "itl_sample_count",
+            "token_timestamps_exact",
+            "token_timestamp_source",
             "input_tokens",
             "host_cached_tokens",
             "device_cached_tokens",
@@ -369,6 +494,18 @@ def _validate_single(
             >= float(record["submitted_offset_seconds"]),
             f"serving record {index} finished before submission",
         )
+        _close(
+            record["admission_delay_seconds"],
+            float(record["submitted_offset_seconds"])
+            - float(record["arrival_offset_seconds"]),
+            f"record {index} admission delay",
+        )
+        _close(
+            record["system_time_seconds"],
+            float(record["finished_offset_seconds"])
+            - float(record["arrival_offset_seconds"]),
+            f"record {index} system time",
+        )
         _require(
             isinstance(record["completion_tokens"], int)
             and not isinstance(record["completion_tokens"], bool)
@@ -376,8 +513,32 @@ def _validate_single(
             f"serving record {index} has invalid completion token count",
         )
         _require(
+            record["token_timestamps_exact"] is True
+            and record["token_timestamp_source"]
+            == "sglang_stream_interval_1_completion_delta",
+            f"serving record {index} lacks exact token timestamp evidence",
+        )
+        _require(
+            isinstance(record["itl_sample_count"], int)
+            and not isinstance(record["itl_sample_count"], bool)
+            and record["itl_sample_count"]
+            == max(0, record["completion_tokens"] - 1)
+            == len(record.get("inter_token_seconds", [])),
+            f"serving record {index} ITL samples do not match completion tokens",
+        )
+        _require(
             isinstance(record["text_sha256"], str) and record["text_sha256"],
             f"serving record {index} has no output digest",
+        )
+        intervals = [float(value) for value in record.get("inter_token_seconds", [])]
+        _require(
+            all(math.isfinite(value) and value >= 0.0 for value in intervals),
+            f"serving record {index} contains an invalid ITL",
+        )
+        _close(
+            record["p99_itl_seconds"],
+            _percentile(intervals, 0.99),
+            f"record {index} p99 ITL",
         )
     engine_stats = report.get("engine_stats")
     _require(
@@ -386,6 +547,13 @@ def _validate_single(
     )
     if require_engine_stats:
         _require(engine_stats, "serving report has no engine statistics")
+    if backend == "flashinfer":
+        _require(
+            not engine_stats,
+            "stock serving report contains NTA engine statistics",
+        )
+    else:
+        _require(engine_stats, "NTA serving report has no engine statistics")
     for field in (
         "p50_ttft_seconds",
         "p95_ttft_seconds",
@@ -433,7 +601,76 @@ def _validate_single(
         and goodput["goodput_requests_per_second"] >= 0,
         "SLO goodput counts or rate are inconsistent",
     )
-    _validate_littles_law(report)
+    elapsed = _finite(report.get("elapsed_seconds"), "elapsed seconds")
+    _require(elapsed > 0.0, "serving elapsed time is not positive")
+    _close(
+        report.get("request_throughput"),
+        len(records) / elapsed,
+        "request throughput",
+    )
+    _close(
+        report.get("output_token_throughput"),
+        sum(int(record["completion_tokens"]) for record in records) / elapsed,
+        "output token throughput",
+    )
+    for field, source, fraction in (
+        ("p50_ttft_seconds", "ttft_seconds", 0.50),
+        ("p95_ttft_seconds", "ttft_seconds", 0.95),
+        ("p99_ttft_seconds", "ttft_seconds", 0.99),
+        ("p50_tpot_seconds", "tpot_seconds", 0.50),
+        ("p95_tpot_seconds", "tpot_seconds", 0.95),
+        ("p99_tpot_seconds", "tpot_seconds", 0.99),
+    ):
+        _close(
+            report[field],
+            _percentile([float(record[source]) for record in records], fraction),
+            field,
+        )
+    all_intervals = [
+        float(interval)
+        for record in records
+        for interval in record["inter_token_seconds"]
+    ] or [0.0]
+    _close(
+        report["p99_itl_seconds"],
+        _percentile(all_intervals, 0.99),
+        "p99_itl_seconds",
+    )
+    thresholds = goodput.get("thresholds_seconds")
+    _require(
+        isinstance(thresholds, dict),
+        "serving SLO goodput has no threshold identity",
+    )
+    ttft_threshold = _finite(thresholds.get("ttft"), "SLO TTFT threshold")
+    itl_threshold = _finite(thresholds.get("p99_itl"), "SLO ITL threshold")
+    _require(
+        ttft_threshold > 0.0 and itl_threshold > 0.0,
+        "serving SLO thresholds are not positive",
+    )
+    token_level_requests = sum(
+        int(record["itl_sample_count"]) > 0
+        and record["token_timestamps_exact"] is True
+        for record in records
+    )
+    qualified = sum(
+        float(record["ttft_seconds"]) <= ttft_threshold
+        and int(record["itl_sample_count"]) > 0
+        and record["token_timestamps_exact"] is True
+        and float(record["p99_itl_seconds"]) <= itl_threshold
+        for record in records
+    )
+    _require(
+        int(goodput["qualified_requests"]) == qualified
+        and goodput.get("requests_with_token_level_itl") == token_level_requests,
+        "serving SLO goodput was not recomputed from exact token timestamps",
+    )
+    _close(goodput.get("attainment"), qualified / len(records), "SLO attainment")
+    _close(
+        goodput["goodput_requests_per_second"],
+        qualified / elapsed,
+        "SLO goodput rate",
+    )
+    _validate_finite_window_accounting(report)
     _validate_workload(report)
     _validate_byte_accounting(report)
     _validate_batch_heterogeneity(report)
@@ -444,7 +681,10 @@ def _validate_single(
 def validate(report: dict[str, Any]) -> dict[str, Any]:
     classification = report.get("classification")
     if classification == "sglang-hicache-load":
-        _validate_single(report)
+        _validate_single(
+            report,
+            require_engine_stats=report.get("attention_backend") == "nta_flashinfer",
+        )
         return report
     _require(
         classification == "sglang-hicache-load-comparison",
@@ -460,13 +700,36 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         isinstance(stock, dict) and isinstance(nta, dict),
         "serving comparison lacks stock or NTA report",
     )
-    _validate_environment(stock, require_complete=True)
-    _validate_environment(nta, require_complete=True)
     # The stock arm intentionally has no NTA plugin statistics.  Its timing,
-    # correctness, placement, and Little's Law fields remain mandatory; only
+    # correctness, placement, and finite-window accounting remain mandatory; only
     # the implementation-specific engine-stat stream is absent.
-    _validate_single(stock, require_engine_stats=False)
-    _validate_single(nta)
+    _validate_single(
+        stock,
+        require_engine_stats=False,
+        require_complete_environment=True,
+    )
+    _validate_single(nta, require_complete_environment=True)
+    comparison_revision = report.get("revision")
+    _require(
+        isinstance(comparison_revision, str)
+        and comparison_revision
+        and comparison_revision == stock.get("revision") == nta.get("revision"),
+        "serving comparison arms do not share the recorded revision",
+    )
+    _require(
+        stock.get("machine") == nta.get("machine"),
+        "serving comparison arms do not share the recorded machine",
+    )
+    _require(
+        isinstance(report.get("harness_args"), dict),
+        "serving comparison has no harness argument identity",
+    )
+    execution_order = report.get("execution_order")
+    _require(
+        isinstance(execution_order, list)
+        and sorted(execution_order) == ["flashinfer", "nta_flashinfer"],
+        "serving comparison has an invalid arm execution order",
+    )
     _require(
         stock.get("demand_trace_digest") == nta.get("demand_trace_digest"),
         "stock and NTA demand digests differ",
@@ -530,14 +793,178 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         + int(activation.get("stock_prefetched_external_launches", 0)),
         "serving comparison external attention accounting is not exact",
     )
-    for field in (
-        "nta_slo_goodput",
-        "stock_slo_goodput",
-        "goodput_ratio",
-        "output_throughput_ratio",
-        "external_p95_ttft_ratio",
+    nta_stats = nta.get("engine_stats")
+    _require(isinstance(nta_stats, list), "NTA serving arm has no engine statistics")
+    try:
+        expected_transport_execution = summarize_transport_execution(nta_stats)
+    except ValueError as error:
+        raise ValueError(f"invalid physical execution counters: {error}") from error
+    _require(
+        report.get("transport_execution") == expected_transport_execution,
+        "serving transport execution evidence disagrees with timed counters",
+    )
+    harness_args = report["harness_args"]
+    required_paths = harness_args.get("require_exercised_path")
+    _require(
+        isinstance(required_paths, list)
+        and all(isinstance(name, str) for name in required_paths)
+        and len(required_paths) == len(set(required_paths))
+        and set(required_paths).issubset(EXERCISED_PATHS),
+        "serving comparison has invalid required execution paths",
+    )
+    _require(
+        all(
+            expected_transport_execution[name]["exercised"] is True
+            for name in required_paths
+        ),
+        "serving comparison did not exercise every required physical path",
+    )
+    try:
+        require_frontier_shape(
+            expected_transport_execution,
+            native_layers=harness_args.get("require_native_frontier_layers"),
+            ready_stock_layers=harness_args.get("require_ready_stock_layers"),
+            progressive_layers=harness_args.get("require_progressive_layers"),
+        )
+    except ValueError as error:
+        raise ValueError(f"invalid serving frontier evidence: {error}") from error
+    scale = _finite(report.get("slo_scale"), "relative SLO scale")
+    _require(scale > 0.0, "serving comparison has a nonpositive SLO scale")
+    thresholds = relative_thresholds(stock, scale)
+    _validate_derived_object(
+        report.get("slo_thresholds_seconds"),
+        thresholds,
+        "relative SLO thresholds",
+    )
+    stock_goodput = relative_goodput(stock, thresholds)
+    nta_goodput = relative_goodput(nta, thresholds)
+    stock_preregistered = preregistered_goodput(stock)
+    nta_preregistered = preregistered_goodput(nta)
+    _validate_derived_object(
+        report.get("stock_goodput"), stock_goodput, "stock relative goodput"
+    )
+    _validate_derived_object(
+        report.get("nta_goodput"), nta_goodput, "NTA relative goodput"
+    )
+    _validate_derived_object(
+        report.get("stock_preregistered_goodput"),
+        stock_preregistered,
+        "stock preregistered goodput",
+    )
+    _validate_derived_object(
+        report.get("nta_preregistered_goodput"),
+        nta_preregistered,
+        "NTA preregistered goodput",
+    )
+    _close(
+        report.get("stock_slo_goodput"),
+        float(stock["slo_goodput"]["goodput_requests_per_second"]),
+        "stock SLO goodput",
+    )
+    _close(
+        report.get("nta_slo_goodput"),
+        float(nta["slo_goodput"]["goodput_requests_per_second"]),
+        "NTA SLO goodput",
+    )
+    for prefix, arm in (("stock", stock), ("nta", nta)):
+        for field in (
+            "p50_ttft_seconds",
+            "p95_ttft_seconds",
+            "p99_ttft_seconds",
+            "p99_itl_seconds",
+        ):
+            _close(
+                report.get(f"{prefix}_{field}"),
+                float(arm[field]),
+                f"{prefix} {field}",
+            )
+    _validate_ratio(
+        report.get("output_throughput_ratio"),
+        safe_ratio(
+            float(nta["output_token_throughput"]),
+            float(stock["output_token_throughput"]),
+        ),
+        "output throughput ratio",
+    )
+    _validate_ratio(
+        report.get("goodput_ratio"),
+        safe_ratio(
+            float(nta_goodput["goodput_requests_per_second"]),
+            float(stock_goodput["goodput_requests_per_second"]),
+        ),
+        "relative-goodput ratio",
+    )
+    _validate_ratio(
+        report.get("preregistered_goodput_ratio"),
+        safe_ratio(
+            float(nta_preregistered["goodput_requests_per_second"]),
+            float(stock_preregistered["goodput_requests_per_second"]),
+        ),
+        "preregistered-goodput ratio",
+    )
+    for field, numerator, denominator in (
+        (
+            "resident_p95_ttft_ratio",
+            nta["resident_p95_ttft_seconds"],
+            stock["resident_p95_ttft_seconds"],
+        ),
+        (
+            "resident_p95_tpot_ratio",
+            nta["resident_p95_tpot_seconds"],
+            stock["resident_p95_tpot_seconds"],
+        ),
+        (
+            "resident_p99_itl_ratio",
+            nta["resident_p99_itl_seconds"],
+            stock["resident_p99_itl_seconds"],
+        ),
+        (
+            "external_p95_ttft_ratio",
+            nta["external_p95_ttft_seconds"],
+            stock["external_p95_ttft_seconds"],
+        ),
     ):
-        _finite(report.get(field), field)
+        _validate_ratio(
+            report.get(field),
+            safe_ratio(float(numerator), float(denominator)),
+            field,
+        )
+    return report
+
+
+def validate_formal_arm(report: dict[str, Any]) -> dict[str, Any]:
+    """Validate one independently timed serving arm for formal evaluation.
+
+    Comparison reports remain useful diagnostics, but they are not one causal
+    arm and therefore cannot satisfy this contract.  Formal TPOT/ITL evidence
+    also requires at least two generated tokens for every measured request;
+    accepting one-token trials would make both metrics structurally vacuous.
+    """
+
+    _require(
+        report.get("classification") == "sglang-hicache-load",
+        "formal serving arm must be one load report, not a nested comparison",
+    )
+    _validate_single(
+        report,
+        require_engine_stats=report.get("attention_backend") == "nta_flashinfer",
+        require_complete_environment=True,
+    )
+    _require(report.get("dirty") is False, "formal serving arm used a dirty revision")
+    records = report.get("records", [])
+    _require(
+        bool(records)
+        and all(int(record.get("completion_tokens", 0)) >= 2 for record in records),
+        "formal serving arm has vacuous one-token TPOT/ITL measurements",
+    )
+    _require(
+        sum(int(record.get("itl_sample_count", 0)) for record in records) > 0,
+        "formal serving arm contains no token-level ITL samples",
+    )
+    _require(
+        report.get("load_warmup_excluded") is True,
+        "formal serving arm did not exclude a shape-faithful load warmup",
+    )
     return report
 
 

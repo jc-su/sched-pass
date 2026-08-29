@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import builtins
 import ctypes
 import ctypes.util
 import dataclasses
 import enum
+import hashlib
 import os
 import pathlib
 import struct
@@ -17,14 +19,15 @@ from .abi import u32 as _u32
 from .abi import u64 as _u64
 from .execution_topology import ExactWorkTopology, WorkDependencySpan
 from .indexed_transfer import (
+    AcquisitionTopology,
     IndexedTensorLane,
-    IndexedTransferTopology,
 )
 from .request_contract import RequestSpec, _RequestSpec
+from .requests import RequestBinding
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 42
+API_VERSION = 50
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -32,7 +35,7 @@ def _device_ordinal(value: int, name: str = "device_ordinal") -> int:
     return _bounded_integer(value, name, minimum=-1, maximum=_INT32_MAX)
 
 
-class RuntimeError(Exception):
+class RuntimeError(builtins.RuntimeError):
     """An error returned by the native NTA runtime."""
 
 
@@ -60,6 +63,25 @@ class NvmeDmaTarget(enum.IntEnum):
 class NvmeHbmMappingBackend(enum.IntEnum):
     UNAVAILABLE = 0
     NVIDIA_PEER_PAGES = 1
+    CUDA_DMA_BUF_IOAS = 2
+
+    @property
+    def artifact_name(self) -> str:
+        """Stable cross-language label used by qualification artifacts."""
+
+        return {
+            NvmeHbmMappingBackend.UNAVAILABLE: "unavailable",
+            NvmeHbmMappingBackend.NVIDIA_PEER_PAGES: "nvidia-peer-pages",
+            NvmeHbmMappingBackend.CUDA_DMA_BUF_IOAS: "cuda-dmabuf-ioas",
+        }[self]
+
+
+class NvmeHbmMappingPolicy(enum.IntEnum):
+    """Fail-closed setup policy for one direct-HBM mapping lease."""
+
+    AUTO = 0
+    NVIDIA_PEER_PAGES = 1
+    CUDA_DMA_BUF_IOAS = 2
 
 
 # Keep the public ABI-facing name while using the same dependency-free typed
@@ -99,6 +121,7 @@ class OperatorCapability(enum.IntFlag):
     GRAPH_REPLAY = 1 << 6
     TYPED_FLASHINFER_FRONTEND = 1 << 7
     PREACQUIRED_PARTIAL_ENTRY = 1 << 8
+    STREAM_ORDERED_RETIREMENT = 1 << 9
 
 
 class OperatorInstrumentation(enum.IntFlag):
@@ -222,7 +245,7 @@ class OperatorContract:
     tier_mask: int = 0
 
     def __post_init__(self) -> None:
-        known_capabilities = (1 << 9) - 1
+        known_capabilities = (1 << 10) - 1
         known_instrumentation = (1 << 4) - 1
         if int(self.capabilities) & ~known_capabilities:
             raise ValueError("JIT operator contract names unknown capabilities")
@@ -325,7 +348,7 @@ class OperatorPlan:
 
 
 def require_operator_pair(
-    direct: "JitPhaseProgram", incremental: "JitPhaseProgram"
+    direct: "JitOperatorModule", incremental: "JitOperatorModule"
 ) -> OperatorPlan:
     """Return the common typed plan or reject an independently generated pair."""
 
@@ -435,8 +458,7 @@ class WorkItem(ctypes.Structure):
         ("contributor_index", ctypes.c_uint32),
         ("contributor_count", ctypes.c_uint32),
         ("estimated_compute_ns", ctypes.c_uint32),
-        ("reserved0", ctypes.c_uint32),
-        ("reserved1", ctypes.c_uint32),
+        ("ready_deadline_offset_ns", ctypes.c_uint64),
         ("reserved2", ctypes.c_uint32),
         ("reserved3", ctypes.c_uint32),
     ]
@@ -462,6 +484,7 @@ class _NvmeOptions(ctypes.Structure):
         ("admin_timeout_ms", ctypes.c_uint32),
         ("media_policy", ctypes.c_uint32),
         ("dma_target", ctypes.c_uint32),
+        ("hbm_mapping_policy", ctypes.c_uint32),
     ]
 
 
@@ -508,6 +531,19 @@ class _NvmeHbmRegistrationRange(ctypes.Structure):
         ("allocation_bytes", ctypes.c_uint64),
         ("registration_address", ctypes.c_uint64),
         ("registration_bytes", ctypes.c_uint64),
+    ]
+
+
+class _RegisteredNvmeObject(ctypes.Structure):
+    _fields_ = [
+        ("object_id", ctypes.c_uint64),
+        ("source_byte_offset", ctypes.c_uint64),
+        ("bytes", ctypes.c_uint64),
+        ("region", ctypes.c_void_p),
+        ("destination_device_address", ctypes.c_uint64),
+        ("prior_consumer_event", ctypes.c_uint64),
+        ("slot", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
     ]
 
 
@@ -593,6 +629,7 @@ def _validate_abi_layouts() -> None:
         ("WorkItem", ctypes.sizeof(WorkItem), 64),
         ("RequestProgress", ctypes.sizeof(_RequestProgress), 96),
         ("RequestSpec", ctypes.sizeof(_RequestSpec), 40),
+        ("RegisteredNvmeObject", ctypes.sizeof(_RegisteredNvmeObject), 56),
     )
     invalid = [
         f"{name}={observed} (expected {expected})"
@@ -601,10 +638,9 @@ def _validate_abi_layouts() -> None:
     ]
     if invalid:
         raise RuntimeError("Python/native ABI layout mismatch: " + ", ".join(invalid))
-    if (
-        _ACQUIRE_REQUIREMENT_PACKER.size != ctypes.sizeof(AcquireRequirement)
-        or _INDEXED_HOST_OBJECT_PACKER.size != ctypes.sizeof(_IndexedHostObject)
-    ):
+    if _ACQUIRE_REQUIREMENT_PACKER.size != ctypes.sizeof(
+        AcquireRequirement
+    ) or _INDEXED_HOST_OBJECT_PACKER.size != ctypes.sizeof(_IndexedHostObject):
         raise RuntimeError("Python packed/native indexed ABI layout mismatch")
 
 
@@ -633,10 +669,33 @@ class RuntimeConfig:
             "max_replicas_per_object",
             "max_dependencies_per_work_ticket",
         ):
-            _u32(getattr(self, name), name, positive=True)
-        _device_ordinal(self.device_ordinal)
-        _u32(self.tenant_capacity, "tenant_capacity")
-        _u64(self.staging_byte_capacity, "staging_byte_capacity")
+            object.__setattr__(
+                self,
+                name,
+                _u32(getattr(self, name), name, positive=True),
+            )
+        object.__setattr__(
+            self, "device_ordinal", _device_ordinal(self.device_ordinal)
+        )
+        if type(self.enable_cta_nvme_try_issue) is not bool:
+            raise ValueError("enable_cta_nvme_try_issue must be boolean")
+        tenant_capacity = _u32(self.tenant_capacity, "tenant_capacity")
+        staging_capacity = _u64(
+            self.staging_byte_capacity, "staging_byte_capacity"
+        )
+        # Mirror native normalization in the immutable Python image.  Policy
+        # telemetry and callers must never observe zero while HostRuntime is
+        # actually enforcing request-capacity tenants or an unlimited budget.
+        object.__setattr__(
+            self,
+            "tenant_capacity",
+            tenant_capacity or self.request_capacity,
+        )
+        object.__setattr__(
+            self,
+            "staging_byte_capacity",
+            staging_capacity or (1 << 64) - 1,
+        )
 
     def native(self) -> _RuntimeConfig:
         return _RuntimeConfig(
@@ -721,6 +780,7 @@ class IndexedHostObject:
             "staging_index_limit",
         ):
             _u32(getattr(self, name), f"indexed {name}", positive=True)
+
     def native(self) -> _IndexedHostObject:
         return _IndexedHostObject(
             self.object_id,
@@ -767,20 +827,26 @@ class IndexedHostIndexBinding:
         )
 
 
-class IndexedHostPlan:
-    """Native-ready directory and dependency image for indexed tensor lanes.
+class IndexedAcquisitionPlan:
+    """Native-ready directory and dependency image for acquisition groups.
 
-    Framework adapters publish exact groups and lane geometry.  This owner
+    Framework adapters publish exact groups and lane geometry. This owner
     expands their Cartesian product directly into ctypes arrays, avoiding a
     per-object Python dataclass graph and retaining one immutable image for the
-    corresponding work-plan upload.
+    corresponding work-plan upload. ``object_id_base`` plus ``object_version``
+    gives every group/lane pair its resource identity. A physical group may
+    serve several request generations (for example a vLLM shared-prefix
+    block), so transfer ownership belongs to the resource/lease while
+    ``group_consumers`` records every authorized request binding. Numerical
+    WorkTickets retain the per-consumer slot and generation.
     """
 
     def __init__(
         self,
-        topology: IndexedTransferTopology,
+        topology: AcquisitionTopology,
         lanes: Iterable[IndexedTensorLane],
         *,
+        work_bindings: Iterable[RequestBinding],
         source_indices_device_address: int,
         staging_indices_device_address: int,
         object_version: int,
@@ -788,15 +854,36 @@ class IndexedHostPlan:
         first_slot: int = 0,
         object_id_base: int = 0x4E54410000000000,
     ) -> None:
-        if not isinstance(topology, IndexedTransferTopology):
-            raise TypeError("indexed host plan requires IndexedTransferTopology")
+        if not isinstance(topology, AcquisitionTopology):
+            raise TypeError("indexed host plan requires AcquisitionTopology")
         lane_values = tuple(lanes)
         if not lane_values or any(
             not isinstance(lane, IndexedTensorLane) for lane in lane_values
         ):
             raise TypeError("indexed host plan requires typed tensor lanes")
+        binding_values = tuple(work_bindings)
+        if len(binding_values) != topology.work_count or any(
+            not isinstance(binding, RequestBinding) for binding in binding_values
+        ):
+            raise ValueError("indexed work bindings do not match the topology")
+        group_consumers: list[list[RequestBinding]] = [[] for _ in topology.groups]
+        for binding, dependencies in zip(
+            binding_values, topology.dependencies_by_work, strict=True
+        ):
+            for dependency in dependencies:
+                consumers = group_consumers[dependency.group_index]
+                if binding not in consumers:
+                    consumers.append(binding)
+        if any(not consumers for consumers in group_consumers):
+            raise ValueError("indexed acquisition group has no request consumer")
         self.topology = topology
         self.lanes = lane_values
+        self.work_bindings = binding_values
+        self.group_consumers = tuple(tuple(consumers) for consumers in group_consumers)
+        self.group_tenant_ids = tuple(
+            tuple(sorted({consumer.tenant_id for consumer in consumers}))
+            for consumers in self.group_consumers
+        )
         self.first_slot = _u32(first_slot, "first indexed object slot")
         self.object_version = _u32(
             object_version, "indexed object version", positive=True
@@ -852,8 +939,7 @@ class IndexedHostPlan:
             raise RuntimeError("indexed host object materialization diverged")
 
         dependency_count = sum(
-            lane_count * max(1, len(work))
-            for work in topology.dependencies_by_work
+            lane_count * max(1, len(work)) for work in topology.dependencies_by_work
         )
         self._dependencies = (AcquireRequirement * dependency_count)()
         spans: list[WorkDependencySpan] = []
@@ -881,10 +967,17 @@ class IndexedHostPlan:
                 direct_count = lane_count
             else:
                 for dependency in work:
+                    group = topology.groups[dependency.group_index]
                     for lane_index, lane in enumerate(lane_values):
                         relative_slot = dependency.group_index * lane_count + lane_index
                         slot = self.first_slot + relative_slot
-                        required_bytes = dependency.row_count * lane.element_bytes
+                        # A dependency names readiness of the shared transfer
+                        # group, not a private copy of this work item's slice.
+                        # The first claimant must therefore issue the complete
+                        # ObjectEntry.  ``AcquisitionSlice`` remains the exact
+                        # numerical coverage proof; every fan-out consumer
+                        # waits for the containing group's single publication.
+                        required_bytes = group.row_count * lane.element_bytes
                         if required_bytes >= 1 << 32:
                             raise ValueError(
                                 "indexed work dependency bytes exceed uint32"
@@ -915,6 +1008,27 @@ class IndexedHostPlan:
         self.external_object_slots = tuple(external_slots)
         self.min_unresolved_dependencies = min(unresolved_counts, default=1)
 
+    def require_single_tenant_groups(self) -> None:
+        """Reject a shared transfer whose byte-credit owner is ambiguous.
+
+        The device reserves one tenant credit for one physical acquisition.
+        Sharing that acquisition across requests in the same tenant is exact
+        and charged once.  A cross-tenant group would make the first CTA to
+        discover it choose the charged tenant nondeterministically, so finite
+        tenant isolation must reject such a topology before publication.
+        """
+
+        ambiguous = tuple(
+            group_index
+            for group_index, tenant_ids in enumerate(self.group_tenant_ids)
+            if len(tenant_ids) != 1
+        )
+        if ambiguous:
+            raise ValueError(
+                "indexed acquisition groups cross tenant credit domains: "
+                f"{ambiguous[:16]}"
+            )
+
     @property
     def object_count(self) -> int:
         return len(self._objects)
@@ -933,23 +1047,28 @@ class IndexedHostPlan:
         return sum(group.row_count * lane_bytes for group in self.topology.groups)
 
     @property
+    def object_transfer_bytes(self) -> tuple[int, ...]:
+        """Physical payload owned by each directory object, in slot order.
+
+        Indexed objects are emitted group-major and lane-minor.  Keeping the
+        same exact byte vector beside the native image lets a consumer split a
+        lookahead prefix from the remaining demand transfer without pretending
+        that an already-completed wave was copied a second time.
+        """
+
+        return tuple(
+            group.row_count * lane.element_bytes
+            for group in self.topology.groups
+            for lane in self.lanes
+        )
+
+    @property
     def max_object_fanout(self) -> int:
         return self.topology.max_group_fanout
 
     @property
     def direct_work_count(self) -> int:
         return self.topology.direct_work_count
-
-    @property
-    def exact_resume_windows(self) -> bool:
-        return (
-            self.direct_work_count == 0
-            and len(self.topology.groups) == self.topology.work_count
-            and all(
-                len(work) == 1 and work[0].group_index == work_id
-                for work_id, work in enumerate(self.topology.dependencies_by_work)
-            )
-        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -961,6 +1080,7 @@ class NvmeOptions:
     admin_timeout_ms: int = 10_000
     trust_read_only_device_code: bool = False
     dma_target: NvmeDmaTarget = NvmeDmaTarget.HBM_PEER
+    hbm_mapping_policy: NvmeHbmMappingPolicy = NvmeHbmMappingPolicy.AUTO
 
     def __post_init__(self) -> None:
         if not self.endpoint:
@@ -972,9 +1092,22 @@ class NvmeOptions:
         if not isinstance(self.trust_read_only_device_code, bool):
             raise ValueError("NVMe read-only trust policy must be boolean")
         try:
-            NvmeDmaTarget(self.dma_target)
+            dma_target = NvmeDmaTarget(self.dma_target)
         except (TypeError, ValueError) as error:
             raise ValueError("NVMe DMA target is invalid") from error
+        try:
+            mapping_policy = NvmeHbmMappingPolicy(self.hbm_mapping_policy)
+        except (TypeError, ValueError) as error:
+            raise ValueError("NVMe HBM mapping policy is invalid") from error
+        if (
+            dma_target is not NvmeDmaTarget.HBM_PEER
+            and mapping_policy is not NvmeHbmMappingPolicy.AUTO
+        ):
+            raise ValueError(
+                "an explicit NVMe HBM mapping policy requires HBM peer DMA"
+            )
+        object.__setattr__(self, "dma_target", dma_target)
+        object.__setattr__(self, "hbm_mapping_policy", mapping_policy)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1432,6 +1565,15 @@ _runtime_install_registered_nvme_object_async = _function(
     ctypes.c_uint64,
     ctypes.POINTER(ctypes.c_uint64),
 )
+_runtime_install_registered_nvme_objects_async = _function(
+    "nta_runtime_install_registered_nvme_objects_async",
+    ctypes.c_int,
+    _Handle,
+    ctypes.POINTER(_RegisteredNvmeObject),
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.POINTER(ctypes.c_uint64),
+)
 _runtime_pending_count = _function(
     "nta_runtime_read_pending_count",
     ctypes.c_int,
@@ -1492,6 +1634,14 @@ _runtime_work_runnable_ns = _function(
 _runtime_device_view = _function("nta_runtime_device_view", ctypes.c_uint64, _Handle)
 _runtime_device_ordinal = _function(
     "nta_runtime_device_ordinal", ctypes.c_int32, _Handle
+)
+_runtime_wait_object_range_terminal = _function(
+    "nta_runtime_wait_object_range_terminal",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
 )
 _plan_create = _function(
     "nta_device_work_plan_create",
@@ -1563,6 +1713,24 @@ _copy_strided_host_runs = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_operator_module_create = _function(
+    "nta_jit_operator_module_create", ctypes.c_int, ctypes.c_char_p, _HandlePointer
+)
+_operator_module_destroy = _function(
+    "nta_jit_operator_module_destroy", None, _Handle
+)
+_operator_module_contract = _function(
+    "nta_jit_operator_module_contract",
+    ctypes.c_int,
+    _Handle,
+    ctypes.POINTER(_OperatorContract),
+)
+_operator_module_plan = _function(
+    "nta_jit_operator_module_plan",
+    ctypes.c_int,
+    _Handle,
+    ctypes.POINTER(_OperatorPlan),
+)
 _phase_create = _function(
     "nta_jit_phase_program_create", ctypes.c_int, ctypes.c_char_p, _HandlePointer
 )
@@ -1595,6 +1763,18 @@ _phase_discover = _function(
     _Handle,
     ctypes.c_uint64,
     ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_discover_ordered_nvme = _function(
+    "nta_jit_phase_discover_ordered_nvme",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
@@ -1654,6 +1834,17 @@ _phase_preload_host_pairs = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
+_phase_preload_host_pairs_ordered = _function(
+    "nta_jit_phase_preload_host_pairs_ordered",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
 _phase_alias_preloaded = _function(
     "nta_jit_phase_alias_preloaded_objects",
     ctypes.c_int,
@@ -1671,6 +1862,24 @@ _phase_host = _function(
     ctypes.c_int,
     _Handle,
     _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_prepare_ready_window = _function(
+    "nta_jit_phase_prepare_ready_window",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_prepare_event_work_partition = _function(
+    "nta_jit_phase_prepare_event_work_partition",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
 )
@@ -1798,6 +2007,20 @@ _phase_nvme_until_idle = _function(
     ctypes.c_int,
     _Handle,
     _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+)
+_phase_nvme_ordered_until_range_terminal = _function(
+    "nta_jit_phase_progress_nvme_ordered_until_range_terminal",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
@@ -2024,6 +2247,90 @@ class NvmeHbmRegion(_Owner):
         self.bytes = bytes
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class RegisteredNvmeObjectInstall:
+    """One typed entry in a stream-ordered registered-HBM publication."""
+
+    slot: int
+    object_id: int
+    version: int
+    source_byte_offset: int
+    bytes: int
+    region: NvmeHbmRegion
+    destination_device_address: int
+    prior_consumer_event: Any = dataclasses.field(
+        default=None, repr=False, compare=False, hash=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "slot", _u32(self.slot, "NVMe object slot"))
+        object.__setattr__(
+            self, "object_id", _u64(self.object_id, "NVMe object identity")
+        )
+        object.__setattr__(
+            self,
+            "version",
+            _u32(self.version, "NVMe object version", positive=True),
+        )
+        object.__setattr__(
+            self,
+            "source_byte_offset",
+            _u64(self.source_byte_offset, "NVMe object source offset"),
+        )
+        object.__setattr__(
+            self, "bytes", _u64(self.bytes, "NVMe object bytes", positive=True)
+        )
+        object.__setattr__(
+            self,
+            "destination_device_address",
+            _u64(
+                self.destination_device_address,
+                "NVMe object destination address",
+                positive=True,
+            ),
+        )
+        try:
+            region_address_value = self.region.address
+            region_bytes_value = self.region.bytes
+        except AttributeError as error:
+            raise TypeError(
+                "registered NVMe object requires an HBM region contract"
+            ) from error
+        if self.source_byte_offset > (1 << 64) - 1 - self.bytes:
+            raise ValueError("NVMe object source extent overflows uint64")
+        region_address = _u64(
+            region_address_value, "registered HBM region address", positive=True
+        )
+        region_bytes = _u64(
+            region_bytes_value, "registered HBM region bytes", positive=True
+        )
+        if (
+            self.destination_device_address < region_address
+            or self.bytes > region_bytes
+            or self.destination_device_address - region_address
+            > region_bytes - self.bytes
+        ):
+            raise ValueError(
+                "NVMe numerical destination exceeds its registered HBM region"
+            )
+    def native(self) -> _RegisteredNvmeObject:
+        if not isinstance(self.region, NvmeHbmRegion) or not self.region._handle:
+            raise ValueError("registered NVMe object requires a live HBM region")
+        prior_consumer_event = _u64(
+            _event_address(self.prior_consumer_event), "prior consumer event"
+        )
+        return _RegisteredNvmeObject(
+            self.object_id,
+            self.source_byte_offset,
+            self.bytes,
+            self.region._handle,
+            self.destination_device_address,
+            prior_consumer_event,
+            self.slot,
+            self.version,
+        )
+
+
 class NvmeTransport(_Owner):
     _destroy = staticmethod(_nvme_destroy)
 
@@ -2040,6 +2347,7 @@ class NvmeTransport(_Owner):
             options.admin_timeout_ms,
             int(options.trust_read_only_device_code),
             int(options.dma_target),
+            int(options.hbm_mapping_policy),
         )
         _check(_nvme_create(ctypes.byref(native), ctypes.byref(self._handle)))
 
@@ -2371,9 +2679,9 @@ class Runtime(_Owner):
             index_binding=index_binding,
         )
 
-    def register_indexed_host_plan(
+    def register_indexed_acquisition_plan(
         self,
-        plan: IndexedHostPlan,
+        plan: IndexedAcquisitionPlan,
         *,
         stream: Any,
         quiescence_event: Any = None,
@@ -2381,8 +2689,8 @@ class Runtime(_Owner):
     ) -> None:
         """Publish one pre-materialized indexed resource/work image."""
 
-        if not isinstance(plan, IndexedHostPlan):
-            raise TypeError("indexed host publication requires IndexedHostPlan")
+        if not isinstance(plan, IndexedAcquisitionPlan):
+            raise TypeError("indexed host publication requires IndexedAcquisitionPlan")
         self._register_indexed_host_native(
             plan.first_slot,
             plan.native_objects,
@@ -2400,9 +2708,10 @@ class Runtime(_Owner):
         quiescence_event: Any,
         index_binding: IndexedHostIndexBinding | None,
     ) -> None:
-        if not isinstance(array, ctypes.Array) or getattr(
-            type(array), "_type_", None
-        ) is not _IndexedHostObject:
+        if (
+            not isinstance(array, ctypes.Array)
+            or getattr(type(array), "_type_", None) is not _IndexedHostObject
+        ):
             raise TypeError("indexed host native objects have an invalid ABI")
         if not len(array):
             raise ValueError("indexed host object batch cannot be empty")
@@ -2422,9 +2731,7 @@ class Runtime(_Owner):
                     len(array),
                     ctypes.byref(native_binding),
                     _stream_address(stream),
-                    0
-                    if quiescence_event is None
-                    else _event_address(quiescence_event),
+                    0 if quiescence_event is None else _event_address(quiescence_event),
                 )
             )
         elif stream is None:
@@ -2469,6 +2776,29 @@ class Runtime(_Owner):
                 relative_replica,
                 replica_tensor_map,
                 staging_tensor_map,
+            )
+        )
+
+    def wait_object_range_terminal(
+        self, first_object_slot: int, object_count: int, stream: Any
+    ) -> None:
+        """Order ``stream`` after a contiguous Ready/Failed object range."""
+
+        if (
+            first_object_slot < 0
+            or object_count <= 0
+            or first_object_slot > self._config.object_capacity
+            or object_count > self._config.object_capacity - first_object_slot
+        ):
+            raise ValueError("object terminal-wait range exceeds object capacity")
+        if stream is None:
+            raise ValueError("object terminal wait requires an explicit stream")
+        _check(
+            _runtime_wait_object_range_terminal(
+                self._handle,
+                first_object_slot,
+                object_count,
+                _stream_address(stream),
             )
         )
 
@@ -2596,6 +2926,60 @@ class Runtime(_Owner):
             )
         )
         return int(destination.value)
+
+    def install_registered_nvme_objects_async(
+        self,
+        objects: Iterable[RegisteredNvmeObjectInstall],
+        stream: Any,
+    ) -> tuple[int, ...]:
+        """Publish one contiguous registered-HBM directory transaction.
+
+        All Python and native validation completes before either bulk H2D
+        directory copy is enqueued. Repeated prior-consumer events are folded
+        by the native runtime, while ownership remains field-scoped per slot.
+        """
+
+        values = tuple(objects)
+        if not values or any(
+            not isinstance(value, RegisteredNvmeObjectInstall) for value in values
+        ):
+            raise ValueError(
+                "registered NVMe batch requires typed object installations"
+            )
+        if stream is None:
+            raise ValueError("asynchronous NVMe installation requires a stream")
+        first_slot = values[0].slot
+        if tuple(value.slot for value in values) != tuple(
+            range(first_slot, first_slot + len(values))
+        ):
+            raise ValueError(
+                "registered NVMe batch slots must be contiguous and increasing"
+            )
+        if len({value.object_id for value in values}) != len(values):
+            raise ValueError("registered NVMe batch repeats an object identity")
+        if self._nvme is None or any(
+            not isinstance(value.region, NvmeHbmRegion)
+            or not value.region._handle
+            or value.region._transport is not self._nvme
+            for value in values
+        ):
+            raise ValueError(
+                "registered NVMe batch regions belong to a different transport"
+            )
+        native = (_RegisteredNvmeObject * len(values))(
+            *(value.native() for value in values)
+        )
+        destinations = (ctypes.c_uint64 * len(values))()
+        _check(
+            _runtime_install_registered_nvme_objects_async(
+                self._handle,
+                native,
+                len(values),
+                _stream_address(stream),
+                destinations,
+            )
+        )
+        return tuple(int(address) for address in destinations)
 
     @property
     def pending_count(self) -> int:
@@ -2823,8 +3207,7 @@ class DeviceWorkPlan(_Owner):
             )
         )
         self._has_external = any(
-            item.direct_dependency_count != item.dependency_count
-            for item in work_items
+            item.direct_dependency_count != item.dependency_count for item in work_items
         )
 
     def upload_exact(
@@ -2847,9 +3230,10 @@ class DeviceWorkPlan(_Owner):
         if not isinstance(topology, ExactWorkTopology):
             raise TypeError("exact work-plan upload requires ExactWorkTopology")
         spans = tuple(dependency_spans)
-        if isinstance(dependencies, ctypes.Array) and getattr(
-            type(dependencies), "_type_", None
-        ) is AcquireRequirement:
+        if (
+            isinstance(dependencies, ctypes.Array)
+            and getattr(type(dependencies), "_type_", None) is AcquireRequirement
+        ):
             native_dependencies = dependencies
         else:
             dependency_values = tuple(dependencies)
@@ -2864,7 +3248,10 @@ class DeviceWorkPlan(_Owner):
         if dependency_total == 0:
             raise ValueError("exact work-plan dependency array cannot be empty")
         for span in spans:
-            if span.begin > dependency_total or span.count > dependency_total - span.begin:
+            if (
+                span.begin > dependency_total
+                or span.count > dependency_total - span.begin
+            ):
                 raise ValueError("exact work dependency span exceeds its array")
 
         work_items = (WorkItem * topology.work_count)()
@@ -2885,6 +3272,7 @@ class DeviceWorkPlan(_Owner):
                     contributor_index,
                     request.work_count,
                     topology.estimated_compute_ns[work_ticket],
+                    topology.ready_deadline_offset_ns[work_ticket],
                 )
         request_values = tuple(
             RequestRange(
@@ -2954,74 +3342,140 @@ class DeviceWorkPlan(_Owner):
         return self._has_external
 
 
+def _verify_module_digest(
+    module_path: pathlib.Path, expected_sha256: str | None
+) -> None:
+    if expected_sha256 is None:
+        return
+    normalized = expected_sha256.strip().lower()
+    if len(normalized) != 64 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError("expected JIT module SHA-256 is invalid")
+    digest = hashlib.sha256(module_path.read_bytes()).hexdigest()
+    if digest != normalized:
+        raise RuntimeError("JIT module content does not match its activation digest")
+
+
+def _read_operator_metadata(
+    handle: _Handle, contract_reader: Any, plan_reader: Any
+) -> tuple[OperatorContract, OperatorPlan]:
+    native = _OperatorContract()
+    _check(contract_reader(handle, ctypes.byref(native)))
+    if native.magic != 0x4F41544E or native.struct_bytes != ctypes.sizeof(native):
+        raise RuntimeError("JIT module returned an invalid operator contract")
+    fingerprint = (
+        int(native.source_fingerprint_low).to_bytes(8, "little")
+        + int(native.source_fingerprint_high).to_bytes(8, "little")
+    ).hex()
+    contract = OperatorContract(
+        int(native.schema_version),
+        int(native.runtime_abi_version),
+        OperatorFamily(native.family),
+        OperatorForm(native.form),
+        OperatorCapability(native.capabilities),
+        fingerprint,
+        OperatorInstrumentation(native.instrumentation_flags),
+        OperatorIdentityBinding(native.identity_binding),
+        OperatorDemandBinding(native.demand_binding),
+        OperatorAccessProof(native.access_proof),
+        int(native.granularity_bytes),
+        int(native.tier_mask),
+    )
+    native_plan = _OperatorPlan()
+    _check(plan_reader(handle, ctypes.byref(native_plan)))
+    if native_plan.magic != 0x5041544E or native_plan.struct_bytes != ctypes.sizeof(
+        native_plan
+    ):
+        raise RuntimeError("JIT module returned an invalid operator plan")
+    source_fingerprint = (
+        int(native_plan.source_fingerprint_low).to_bytes(8, "little")
+        + int(native_plan.source_fingerprint_high).to_bytes(8, "little")
+    ).hex()
+    plan_fingerprint = (
+        int(native_plan.plan_fingerprint_low).to_bytes(8, "little")
+        + int(native_plan.plan_fingerprint_high).to_bytes(8, "little")
+    ).hex()
+    plan = OperatorPlan(
+        int(native_plan.schema_version),
+        int(native_plan.runtime_abi_version),
+        OperatorFamily(native_plan.family),
+        int(native_plan.supported_forms),
+        OperatorCoordinateMap(native_plan.coordinate_map),
+        OperatorPartialState(native_plan.partial_state),
+        OperatorReduction(native_plan.reduction),
+        OperatorPlanFlag(native_plan.flags),
+        source_fingerprint,
+        plan_fingerprint,
+    )
+    if (
+        plan.family != contract.family
+        or not plan.supports(contract.form)
+        or plan.runtime_abi_version != contract.runtime_abi_version
+        or plan.source_fingerprint != contract.source_fingerprint
+        or plan.plan_fingerprint == "0" * 32
+    ):
+        raise RuntimeError("JIT operator plan does not match the module contract")
+    return contract, plan
+
+
+class JitOperatorModule(_Owner):
+    """Verified compiler contract owned independently of transport phases."""
+
+    _destroy = staticmethod(_operator_module_destroy)
+
+    def __init__(
+        self,
+        shared_object: os.PathLike[str] | str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> None:
+        self._handle = _Handle()
+        module_path = pathlib.Path(shared_object).resolve()
+        _verify_module_digest(module_path, expected_sha256)
+        _check(
+            _operator_module_create(
+                os.fsencode(module_path), ctypes.byref(self._handle)
+            )
+        )
+        try:
+            self._operator_contract, self._operator_plan = _read_operator_metadata(
+                self._handle, _operator_module_contract, _operator_module_plan
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def operator_contract(self) -> OperatorContract:
+        return self._operator_contract
+
+    @property
+    def operator_plan(self) -> OperatorPlan:
+        return self._operator_plan
+
+
 class JitPhaseProgram(_Owner):
     _destroy = staticmethod(_phase_destroy)
 
-    def __init__(self, shared_object: os.PathLike[str] | str):
+    def __init__(
+        self,
+        shared_object: os.PathLike[str] | str,
+        *,
+        expected_sha256: str | None = None,
+    ):
         self._handle = _Handle()
-        path = os.fsencode(shared_object)
+        module_path = pathlib.Path(shared_object).resolve()
+        _verify_module_digest(module_path, expected_sha256)
+        path = os.fsencode(module_path)
         _check(_phase_create(path, ctypes.byref(self._handle)))
-        native = _OperatorContract()
-        _check(_phase_operator_contract(self._handle, ctypes.byref(native)))
-        if native.magic != 0x4F41544E or native.struct_bytes != ctypes.sizeof(native):
+        try:
+            self._operator_contract, self._operator_plan = _read_operator_metadata(
+                self._handle, _phase_operator_contract, _phase_operator_plan
+            )
+        except BaseException:
             self.close()
-            raise RuntimeError("JIT module returned an invalid operator contract")
-        fingerprint = (
-            int(native.source_fingerprint_low).to_bytes(8, "little")
-            + int(native.source_fingerprint_high).to_bytes(8, "little")
-        ).hex()
-        self._operator_contract = OperatorContract(
-            int(native.schema_version),
-            int(native.runtime_abi_version),
-            OperatorFamily(native.family),
-            OperatorForm(native.form),
-            OperatorCapability(native.capabilities),
-            fingerprint,
-            OperatorInstrumentation(native.instrumentation_flags),
-            OperatorIdentityBinding(native.identity_binding),
-            OperatorDemandBinding(native.demand_binding),
-            OperatorAccessProof(native.access_proof),
-            int(native.granularity_bytes),
-            int(native.tier_mask),
-        )
-        native_plan = _OperatorPlan()
-        _check(_phase_operator_plan(self._handle, ctypes.byref(native_plan)))
-        if native_plan.magic != 0x5041544E or native_plan.struct_bytes != ctypes.sizeof(
-            native_plan
-        ):
-            self.close()
-            raise RuntimeError("JIT module returned an invalid operator plan")
-        source_fingerprint = (
-            int(native_plan.source_fingerprint_low).to_bytes(8, "little")
-            + int(native_plan.source_fingerprint_high).to_bytes(8, "little")
-        ).hex()
-        plan_fingerprint = (
-            int(native_plan.plan_fingerprint_low).to_bytes(8, "little")
-            + int(native_plan.plan_fingerprint_high).to_bytes(8, "little")
-        ).hex()
-        self._operator_plan = OperatorPlan(
-            int(native_plan.schema_version),
-            int(native_plan.runtime_abi_version),
-            OperatorFamily(native_plan.family),
-            int(native_plan.supported_forms),
-            OperatorCoordinateMap(native_plan.coordinate_map),
-            OperatorPartialState(native_plan.partial_state),
-            OperatorReduction(native_plan.reduction),
-            OperatorPlanFlag(native_plan.flags),
-            source_fingerprint,
-            plan_fingerprint,
-        )
-        if (
-            self._operator_plan.family != self._operator_contract.family
-            or not self._operator_plan.supports(self._operator_contract.form)
-            or self._operator_plan.runtime_abi_version
-            != self._operator_contract.runtime_abi_version
-            or self._operator_plan.source_fingerprint
-            != self._operator_contract.source_fingerprint
-            or self._operator_plan.plan_fingerprint == "0" * 32
-        ):
-            self.close()
-            raise RuntimeError("JIT operator plan does not match the module contract")
+            raise
 
     @property
     def operator_contract(self) -> OperatorContract:
@@ -3067,6 +3521,36 @@ class JitPhaseProgram(_Owner):
                 plan.work_items_address,
                 plan.dependencies_address,
                 plan.work_item_count,
+                _stream_address(stream),
+            )
+        )
+
+    def discover_ordered_nvme(
+        self,
+        runtime: Runtime,
+        plan: DeviceWorkPlan,
+        first_intent: int,
+        intent_count: int,
+        stream: Any = None,
+    ) -> None:
+        """Discover a finite NVMe window with validated static EDF order."""
+        if runtime.device_ordinal != plan.device_ordinal:
+            raise ValueError("runtime and work plan must own the same CUDA device")
+        if (
+            first_intent < 0
+            or intent_count <= 0
+            or first_intent + intent_count > runtime.config.intent_capacity
+        ):
+            raise ValueError("ordered NVMe intent range exceeds runtime capacity")
+        _check(
+            _phase_discover_ordered_nvme(
+                self._handle,
+                runtime._handle,
+                plan.work_items_address,
+                plan.dependencies_address,
+                plan.work_item_count,
+                first_intent,
+                intent_count,
                 _stream_address(stream),
             )
         )
@@ -3146,6 +3630,48 @@ class JitPhaseProgram(_Owner):
     def progress_host(self, runtime: Runtime, blocks: int, stream: Any = None) -> None:
         _check(
             _phase_host(self._handle, runtime._handle, blocks, _stream_address(stream))
+        )
+
+    def prepare_ready_window(
+        self, runtime: Runtime, maximum_work: int, stream: Any = None
+    ) -> None:
+        if maximum_work <= 0 or maximum_work > runtime.config.work_ticket_capacity:
+            raise ValueError("runnable-window work bound exceeds runtime capacity")
+        _check(
+            _phase_prepare_ready_window(
+                self._handle,
+                runtime._handle,
+                maximum_work,
+                _stream_address(stream),
+            )
+        )
+
+    def prepare_event_work_partition(
+        self,
+        runtime: Runtime,
+        plan: DeviceWorkPlan,
+        direct_work_count: int,
+        stream: Any = None,
+    ) -> None:
+        """Publish one exact direct/deferred order for an event-owned mover."""
+
+        if runtime.device_ordinal != plan.device_ordinal:
+            raise ValueError("runtime and work plan must own the same CUDA device")
+        if (
+            direct_work_count <= 0
+            or direct_work_count >= plan.work_item_count
+            or plan.work_item_count > runtime.config.work_ticket_capacity
+        ):
+            raise ValueError("event work partition requires mixed bounded work")
+        _check(
+            _phase_prepare_event_work_partition(
+                self._handle,
+                runtime._handle,
+                plan.work_items_address,
+                plan.work_item_count,
+                direct_work_count,
+                _stream_address(stream),
+            )
         )
 
     def progress_indexed_host_range(
@@ -3551,6 +4077,32 @@ class JitPhaseProgram(_Owner):
             )
         )
 
+    def preload_host_pairs_ordered(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        pair_count: int,
+        worker_blocks: int,
+        task_head: Any,
+        stream: Any = None,
+    ) -> None:
+        """Launch one bounded persistent gather in directory/EDF order."""
+
+        task_head_address = int(task_head.data_ptr())
+        if pair_count <= 0 or worker_blocks <= 0 or task_head_address == 0:
+            raise ValueError("ordered paired preload geometry is invalid")
+        _check(
+            _phase_preload_host_pairs_ordered(
+                self._handle,
+                runtime._handle,
+                first_object,
+                pair_count,
+                worker_blocks,
+                task_head_address,
+                _stream_address(stream),
+            )
+        )
+
     def alias_preloaded_objects(
         self,
         runtime: Runtime,
@@ -3605,6 +4157,48 @@ class JitPhaseProgram(_Owner):
             _phase_nvme_until_idle(
                 self._handle,
                 runtime._handle,
+                issue_budget,
+                completion_budget,
+                timeout_ns,
+                _stream_address(stream),
+            )
+        )
+
+    def progress_nvme_ordered_until_range_terminal(
+        self,
+        runtime: Runtime,
+        first_intent: int,
+        intent_count: int,
+        first_object: int,
+        object_count: int,
+        issue_budget: int,
+        completion_budget: int,
+        timeout_ns: int,
+        stream: Any = None,
+    ) -> None:
+        """Advance one EDF window until a contiguous object range is terminal."""
+        if (
+            first_intent < 0
+            or intent_count <= 0
+            or first_intent + intent_count > runtime.config.intent_capacity
+        ):
+            raise ValueError("ordered NVMe intent range exceeds runtime capacity")
+        if (
+            first_object < 0
+            or object_count <= 0
+            or first_object + object_count > runtime.config.object_capacity
+        ):
+            raise ValueError("NVMe terminal target exceeds object capacity")
+        if timeout_ns <= 0:
+            raise ValueError("NVMe progress timeout must be positive")
+        _check(
+            _phase_nvme_ordered_until_range_terminal(
+                self._handle,
+                runtime._handle,
+                first_intent,
+                intent_count,
+                first_object,
+                object_count,
                 issue_budget,
                 completion_budget,
                 timeout_ns,

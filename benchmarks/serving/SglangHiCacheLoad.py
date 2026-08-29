@@ -25,7 +25,8 @@ try:
         read_jsonl,
         unique_input_page_ids,
     )
-    from experiments.queueing import finite_window_littles_law
+    from experiments.atomic_io import atomic_write_json
+    from experiments.queueing import finite_window_system_accounting
     from experiments.validate_workload import validate as validate_workload
     from experiments.workload_heterogeneity import serving_batch_heterogeneity
 except ModuleNotFoundError:
@@ -36,7 +37,8 @@ except ModuleNotFoundError:
         read_jsonl,
         unique_input_page_ids,
     )
-    from experiments.queueing import finite_window_littles_law
+    from experiments.atomic_io import atomic_write_json
+    from experiments.queueing import finite_window_system_accounting
     from experiments.validate_workload import validate as validate_workload
     from experiments.workload_heterogeneity import serving_batch_heterogeneity
 
@@ -64,13 +66,11 @@ _MEASUREMENT_COUNTERS = frozenset(
         "copy_engine_issue_cpu_ns",
         "copy_engine_layout_cpu_ns",
         "copy_engine_operations",
-        "copy_engine_selected_rows",
-        "copy_engine_selected_runs",
         "copy_engine_submissions",
         "copy_engine_waves",
         "cost_model_transfer_samples",
-        "cross_layer_frontier_batches",
-        "cross_layer_frontier_layers",
+        "admission_acquisition_groups_prepared",
+        "admission_acquisition_groups_started",
         "cta_work_items",
         "decode_launches",
         "demand_graph_captures",
@@ -79,20 +79,43 @@ _MEASUREMENT_COUNTERS = frozenset(
         "demand_graph_replays",
         "demand_graph_warmups",
         "demand_host_layers",
-        "direct_host_layers",
         "direct_staging_bytes",
         "direct_staging_launches",
+        "demand_graph_paged_prefill_captures",
+        "demand_graph_paged_prefill_replays",
         "exact_resume_window_layers",
         "external_launches",
+        "fragment_remaining_rounds",
+        "native_dispatch_prefix_observations",
+        "native_dispatch_nonprefix_batches",
+        "native_demand_sm_bytes",
+        "progressive_consumer_batch_observations",
+        "progressive_consumer_batches",
+        "progressive_consumer_layers",
         "fragment_lookahead_layers",
         "fragment_lookahead_objects",
+        "fragment_lookahead_bytes",
+        "graph_capture_dummy_rows",
         "graph_captures",
         "graph_external_batches",
         "graph_replays",
         "hicache_external_batches",
         "hicache_fallback_batches",
         "host_direct_batches",
-        "host_bound_after_full_publication_batches",
+        "host_bound_after_full_ready_batches",
+        "host_typed_after_full_publication_batches",
+        "host_acquisition_jobs_prepared",
+        "host_acquisition_jobs_submitted",
+        "host_acquisition_submission_calls",
+        "host_acquisition_models_bound",
+        "host_acquisition_layers_consumed",
+        "host_acquisition_refill_jobs",
+        "host_acquisition_shape_uncalibrated",
+        "host_acquisition_mover_uncalibrated",
+        "host_acquisition_model_rejected",
+        "lease_acquisition_groups_prepared",
+        "lease_acquisition_groups_started",
+        "metadata_acquisition_groups_prepared",
         "host_incremental_batches",
         "host_mixed_direct_batches",
         "host_typed_mixed_batches",
@@ -100,6 +123,7 @@ _MEASUREMENT_COUNTERS = frozenset(
         "hybrid_parallel_waves",
         "indexed_host_bytes",
         "indexed_host_objects",
+        "indexed_range_fastpath_layers",
         "indexed_layout_candidate_bytes",
         "indexed_layout_eligible_rows",
         "indexed_layout_profile_cpu_ns",
@@ -135,8 +159,11 @@ _MEASUREMENT_COUNTERS = frozenset(
         "external_rows_heterogeneous_batches",
         "tenant_heterogeneous_batches",
         "priority_heterogeneous_batches",
+        "queued_feasible_edf_layers",
         "deadline_heterogeneous_batches",
         "native_external_attention_launches",
+        "nvme_numerical_alias_bytes",
+        "nvme_numerical_alias_objects",
         "nvme_bytes",
         "nvme_destination_rebinds",
         "nvme_destination_slice_bytes",
@@ -158,14 +185,33 @@ _MEASUREMENT_COUNTERS = frozenset(
         "plan_uploads",
         "prefetched_host_bytes",
         "prefetched_layers",
+        "prefetch_mover_plan_calibration_probe_copy_leases",
+        "prefetch_mover_plan_calibration_probe_sm_leases",
+        "prefetch_mover_plan_copy_engine_leases",
+        "prefetch_mover_plan_copy_rows",
+        "prefetch_mover_plan_copy_runs",
+        "prefetch_mover_plan_hybrid_leases",
+        "prefetch_mover_plan_insufficient_gain_leases",
+        "prefetch_mover_plan_service_cost_leases",
+        "prefetch_mover_plan_sm_leases",
+        "prefetch_mover_plan_sm_rows",
+        "prefetch_mover_plan_uncalibrated_copy_engine_leases",
         "prefill_graph_capture_batches",
         "prefill_graph_served_batches",
         "prefill_launches",
+        "profiled_attention_arrivals",
+        "profiled_attention_materially_stalled_arrivals",
+        "profiled_attention_not_ready_at_arrival",
+        "profiled_attention_ready_at_arrival",
+        "profiled_attention_stall_gpu_ms",
         "prevalidated_indexed_progress_layers",
+        "progress_feedback_skipped_noncontiguous",
+        "progress_feedback_snapshots",
         "progress_snapshots",
         "ready_stock_wrapper_pairs",
         "request_acquisition_groups",
         "request_cancellations",
+        "request_compute_expected_ns",
         "request_retirements",
         "request_compute_completed_ns",
         "request_metadata_updates",
@@ -173,6 +219,13 @@ _MEASUREMENT_COUNTERS = frozenset(
         "request_rebindings",
         "request_work_completed",
         "request_work_failed",
+        "deadline_frontier_plans",
+        "deadline_frontier_published_layers",
+        "deadline_frontier_fragment_layers",
+        "deadline_frontier_model_builds",
+        "deadline_frontier_model_reuses",
+        "deadline_frontier_uncalibrated",
+        "deadline_frontier_cpu_ns",
         "layer_service_plan_key_missing_batches",
         "layer_service_plan_curve_missing_batches",
         "layer_service_plan_curve_uncalibrated_batches",
@@ -180,16 +233,17 @@ _MEASUREMENT_COUNTERS = frozenset(
         "layer_service_retirement_commits",
         "layer_service_profiled_intervals",
         "resident_reference_batches",
-        "work_topology_builds",
-        "work_topology_cache_hits",
-        "work_topology_cpu_ns",
-        "work_topology_items",
+        "semantic_wrapper_plan_builds",
+        "semantic_wrapper_plan_lookups",
+        "semantic_wrapper_plan_cpu_ns",
+        "semantic_wrapper_plan_lookup_cpu_ns",
+        "semantic_wrapper_plan_items",
         "semantic_dense_tiles",
-        "semantic_plan_builds",
+        "semantic_verifier_plan_builds",
         "semantic_plan_cpu_ns",
         "semantic_verifier_sessions",
+        "schedule_bound_acquisition_batches",
         "sm_mover_bytes",
-        "sm_mover_rows",
         "stock_attention_launches",
         "stock_prefetch_metadata_fastpath_batches",
         "stock_prefetched_external_attention_launches",
@@ -197,7 +251,13 @@ _MEASUREMENT_COUNTERS = frozenset(
         "stock_ready_external_attention_launches",
         "stock_resident_attention_launches",
         "stock_resident_batches",
+        "stream_ordered_retirement_batches",
+        "stream_ordered_retirement_layers",
+        "stream_ordered_retirement_launches",
         "ticketed_incremental_launches",
+        "event_ordered_incremental_launches",
+        "event_ordered_wave_launches",
+        "sm_acquisition_wave_submissions",
         "tier_external_layers",
         "tier_host_proxy_bytes",
         "tier_candidate_bytes",
@@ -209,11 +269,19 @@ _MEASUREMENT_COUNTERS = frozenset(
         "typed_acquisition_batches",
         "typed_acquisition_rows",
         "typed_acquisition_work_items",
-        "typed_bulk_attention_launches",
-        "typed_demand_gap_layers",
         "typed_exact_dependency_groups",
         "typed_granularity_constrained_batches",
         "typed_transfer_groups",
+        "reused_flashinfer_plans",
+        "arriving_prefetch_launches",
+        "arriving_prefetch_layers",
+        "arriving_plan_preparations",
+        "arriving_partition_preparations",
+        "arriving_partition_reuses",
+        "opportunity_calibration_kernel_ns",
+        "opportunity_calibration_launches",
+        "predicted_atomic_ns",
+        "predicted_incremental_ns",
     }
 )
 
@@ -249,14 +317,34 @@ def _wait_for_engine_stats(
             return reports
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                "NTA engine statistics did not publish the measurement marker"
+                "NTA engine statistics did not publish the measurement snapshot"
             )
         time.sleep(0.01)
 
 
+def _publish_engine_stats_snapshot(
+    engine: Any,
+    workspace: pathlib.Path,
+    prior_paths: set[pathlib.Path],
+) -> dict[str, dict[str, Any]]:
+    """Take an out-of-band, CUDA-quiescent NTA statistics snapshot."""
+
+    from nta_runtime.plugins.sglang import STATS_SNAPSHOT_RPC_METHOD
+
+    snapshot_started_ns = time.time_ns()
+    engine.collective_rpc(STATS_SNAPSHOT_RPC_METHOD)
+    return _wait_for_engine_stats(
+        workspace,
+        prior_paths,
+        after_unix_ns=snapshot_started_ns,
+    )
+
+
 def _measured_consumer_contract(report: dict[str, Any]) -> dict[str, Any]:
-    native = int(report.get("transformed_direct_launches", 0)) + int(
-        report.get("ticketed_incremental_launches", 0)
+    native = (
+        int(report.get("transformed_direct_launches", 0))
+        + int(report.get("ticketed_incremental_launches", 0))
+        + int(report.get("event_ordered_incremental_launches", 0))
     )
     stock = int(report.get("stock_prefetched_external_attention_launches", 0))
     kind = (
@@ -299,8 +387,10 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
             "stock_prefetched_external_attention_launches",
             "transformed_direct_launches",
             "ticketed_incremental_launches",
+            "event_ordered_incremental_launches",
             "plan_uploads",
-            "work_topology_builds",
+            "semantic_wrapper_plan_builds",
+            "host_acquisition_jobs_submitted",
         )
     }
     direct = counters["host_direct_batches"]
@@ -309,6 +399,7 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
     native_launches = (
         counters["transformed_direct_launches"]
         + counters["ticketed_incremental_launches"]
+        + counters["event_ordered_incremental_launches"]
     )
     if direct and not incremental:
         residual = {
@@ -316,8 +407,9 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
             for name in (
                 "transformed_direct_launches",
                 "ticketed_incremental_launches",
+                "event_ordered_incremental_launches",
                 "plan_uploads",
-                "work_topology_builds",
+                "semantic_wrapper_plan_builds",
             )
             if counters[name]
         }
@@ -332,11 +424,21 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
             )
         kind = "stock_direct"
     elif incremental and not direct:
-        if native_launches == 0:
+        if native_launches:
+            kind = "native_incremental"
+        elif (
+            counters["host_acquisition_jobs_submitted"] > 0
+            and stock_launches > 0
+        ):
+            # Deadline scheduling may complete every exact job before its
+            # numerical arrival.  The optimized ready-stock consumer is then
+            # the intended consume decision, not a mechanism fallback.
+            kind = "scheduled_preacquired"
+        else:
             raise RuntimeError(
-                "incremental host selection did not execute a native work unit"
+                "incremental host selection executed neither native work nor "
+                "a scheduled preacquired consumer"
             )
-        kind = "native_incremental"
     elif direct and incremental:
         kind = "mixed_dispatch"
     else:
@@ -353,7 +455,7 @@ def _measurement_delta(
     counter_names.update(
         name
         for name in set(final) | set(baseline)
-        if name.startswith("admission_") and name != "admission_lead_layers"
+        if name.startswith("admission_")
     )
     counter_names.update(
         name
@@ -363,9 +465,24 @@ def _measurement_delta(
     counter_names.update(
         name
         for name in set(final) | set(baseline)
+        if name.startswith("native_dispatch_prefix_layers_") and name.endswith("_batches")
+    )
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.startswith("progressive_consumer_layers_")
+        and name.endswith("_batches")
+    )
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
         if name.startswith("host_mover_")
         and (
             name.endswith("_batches")
+            or (
+                name.startswith("host_mover_profiled_")
+                and name.endswith(("_bytes", "_gpu_ms"))
+            )
             or name
             in {
                 "host_mover_overlap_compute_ns",
@@ -373,6 +490,17 @@ def _measurement_delta(
                 "host_mover_predicted_selected_ns",
             }
         )
+    )
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.startswith("forward_")
+        and name.endswith(("_count", "_ms_total"))
+    )
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.startswith("observability_degraded_")
     )
     # Profiling and CPU accounting fields are created lazily, so a static
     # allow-list cannot know every operator form in advance.  Only cumulative
@@ -393,7 +521,9 @@ def _measurement_delta(
         for name in set(final) | set(baseline)
         if name.startswith("profiled_")
         and "_max_" not in name
-        and name.endswith(("_batches", "_bytes", "_gpu_ms", "_layers", "_waits"))
+        and name.endswith(
+            ("_batches", "_bytes", "_gpu_ms", "_layers", "_launches", "_waits")
+        )
     )
     for name in counter_names:
         end = final.get(name, 0)
@@ -406,9 +536,43 @@ def _measurement_delta(
         if value < 0:
             raise RuntimeError(f"measurement counter {name} decreased")
         measured[name] = value
+    for map_name in ("profiled_attention_stall_by_layer_ms",):
+        final_map = final.get(map_name, {})
+        baseline_map = baseline.get(map_name, {})
+        if not isinstance(final_map, dict) or not isinstance(baseline_map, dict):
+            raise RuntimeError(f"measurement field {map_name} is not a mapping")
+        projected: dict[str, float] = {}
+        for layer in set(final_map) | set(baseline_map):
+            end = final_map.get(layer, 0.0)
+            begin = baseline_map.get(layer, 0.0)
+            if (
+                isinstance(end, bool)
+                or isinstance(begin, bool)
+                or not isinstance(end, (int, float))
+                or not isinstance(begin, (int, float))
+            ):
+                raise RuntimeError(
+                    f"measurement field {map_name}[{layer!r}] is not numeric"
+                )
+            value = float(end) - float(begin)
+            if value < 0.0:
+                raise RuntimeError(
+                    f"measurement field {map_name}[{layer!r}] decreased"
+                )
+            if value > 0.0:
+                projected[str(layer)] = value
+        measured[map_name] = dict(
+            sorted(projected.items(), key=lambda item: int(item[0]))
+        )
+    # A cumulative maximum cannot be projected by subtraction. Per-window
+    # totals and event-order counts remain exact; omit maxima rather than
+    # leaking warmup history into measured evidence.
+    measured.pop("profiled_barrier_max_stall_gpu_ms", None)
+    measured.pop("profiled_attention_max_stall_gpu_ms", None)
     for prefix in (
         "profiled_transfer",
         "profiled_pipeline_transfer",
+        "profiled_fragment_transfer",
         "profiled_demand_transfer",
     ):
         elapsed_ms = float(measured.get(f"{prefix}_gpu_ms", 0.0))
@@ -536,7 +700,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resident-requests", type=int, default=1)
     parser.add_argument("--resident-tokens", type=int, default=8192)
     parser.add_argument("--resident-output-tokens", type=int, default=128)
-    parser.add_argument("--external-output-tokens", type=int, default=1)
+    parser.add_argument("--external-output-tokens", type=int, default=32)
     parser.add_argument("--request-rate", type=float, default=12.0)
     parser.add_argument("--churn-tokens", type=int, default=12000)
     parser.add_argument("--max-total-tokens", type=int, default=18000)
@@ -678,24 +842,81 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def _tokenized_structure_prompt(tokenizer: Any, row: dict[str, Any]) -> tuple[str, int]:
-    block_size = int(row.get("block_size", 16))
-    token_count = int(row["input_length"])
-    block_ids = input_page_ids(row, block_size=block_size)
-    token_ids: list[int] = []
-    for block_id in block_ids:
-        seed = f"nta-bailian-block-{block_id} "
-        block_text = seed
-        while len(tokenizer.encode(block_text, add_special_tokens=False)) < block_size:
-            block_text += seed
-        block_tokens = tokenizer.encode(block_text, add_special_tokens=False)[
-            :block_size
-        ]
-        token_ids.extend(block_tokens)
-    token_ids = token_ids[:token_count]
-    prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
-    measured = len(tokenizer.encode(prompt, add_special_tokens=False))
-    return prompt, measured
+TokenInput = tuple[int, ...]
+
+
+def _churn_window(
+    prompts: Sequence[TokenInput], ordinal: int, width: int
+) -> Sequence[TokenInput]:
+    """Return one disjoint setup/warmup eviction window."""
+
+    if ordinal < 0 or width < 0:
+        raise ValueError("churn window bounds cannot be negative")
+    begin = ordinal * width
+    end = begin + width
+    if end > len(prompts):
+        raise ValueError("churn prompt allocation does not cover the requested window")
+    return prompts[begin:end]
+
+
+def _structure_token_inputs(
+    tokenizer: Any, rows: Sequence[dict[str, Any]], block_size: int
+) -> tuple[tuple[TokenInput, ...], str]:
+    """Map exact content-block identity to tokenizer-valid input IDs.
+
+    Text decode/encode is not identity preserving under BPE.  The serving API
+    accepts token IDs directly, so each distinct block receives a unique first
+    token and deterministic filler tokens.  This makes equal block hashes
+    byte-for-byte equal while distinct hashes diverge at their first position.
+    """
+
+    vocabulary_size = int(len(tokenizer))
+    special = {int(value) for value in getattr(tokenizer, "all_special_ids", ())}
+    safe_tokens = [
+        token_id for token_id in range(vocabulary_size) if token_id not in special
+    ]
+    page_ids = sorted(
+        {
+            page_id
+            for row in rows
+            for page_id in input_page_ids(row, block_size=block_size)
+        }
+    )
+    if not safe_tokens or len(page_ids) > len(safe_tokens):
+        raise RuntimeError(
+            "Bailian cohort has more distinct pages than collision-free first "
+            "tokens in the tokenizer vocabulary"
+        )
+    block_tokens: dict[str, TokenInput] = {}
+    identity_digest = hashlib.sha256()
+    for ordinal, page_id in enumerate(page_ids):
+        values = [safe_tokens[ordinal]]
+        for position in range(1, block_size):
+            digest = hashlib.sha256(
+                f"{page_id}:{position}".encode("utf-8")
+            ).digest()
+            values.append(
+                safe_tokens[int.from_bytes(digest[:8], "big") % len(safe_tokens)]
+            )
+        encoded = tuple(values)
+        block_tokens[page_id] = encoded
+        identity_digest.update(page_id.encode("utf-8"))
+        identity_digest.update(b"\0")
+        for token_id in encoded:
+            identity_digest.update(int(token_id).to_bytes(8, "little"))
+
+    inputs: list[TokenInput] = []
+    for row in rows:
+        token_count = int(row["input_length"])
+        values = tuple(
+            token_id
+            for page_id in input_page_ids(row, block_size=block_size)
+            for token_id in block_tokens[page_id]
+        )[:token_count]
+        if len(values) != token_count:
+            raise RuntimeError("Bailian token adapter did not cover the full input")
+        inputs.append(values)
+    return tuple(inputs), identity_digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -704,8 +925,8 @@ class LoadedWorkload:
 
     resident_request_ids: tuple[str, ...]
     external_request_ids: tuple[str, ...]
-    resident_prompt_text: tuple[str, ...]
-    external_prompt_text: tuple[str, ...]
+    resident_inputs: tuple[TokenInput, ...]
+    external_inputs: tuple[TokenInput, ...]
     resident_arrival_offsets: tuple[float, ...]
     external_arrival_offsets: tuple[float, ...]
     resident_output_tokens: tuple[int, ...]
@@ -738,21 +959,6 @@ def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
             "add request_state to the normalized workload"
         )
 
-    tokenization_errors = 0
-    structure_only = not bool(
-        manifest["prompt"].get("semantic_representativeness_claim")
-    )
-
-    def prompt(row: dict[str, Any]) -> str:
-        nonlocal tokenization_errors
-        value = row.get("prompt_text")
-        if structure_only or value is None:
-            value, measured = _tokenized_structure_prompt(tokenizer, row)
-            if measured != int(row["input_length"]):
-                tokenization_errors += 1
-            return value
-        return str(value)
-
     origin = min(float(row["arrival_seconds"]) for row in rows)
     resident_offsets = tuple(
         float(row["arrival_seconds"]) - origin for row in resident_rows
@@ -765,6 +971,13 @@ def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
         for row in rows
     }
     block_size = int(manifest["block_size"])
+    inputs, token_identity_digest = _structure_token_inputs(
+        tokenizer, rows, block_size
+    )
+    input_by_request = {
+        str(row["request_id"]): values
+        for row, values in zip(rows, inputs, strict=True)
+    }
     resident_page_ids = unique_input_page_ids(resident_rows, block_size=block_size)
     external_cached_prefix_tokens = [
         int(row["cached_prefix_tokens"]) for row in external_rows
@@ -778,8 +991,6 @@ def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
             : (prefix_tokens + block_size - 1) // block_size
         ]
     )
-    resident_prompt_text = [prompt(row) for row in resident_rows]
-    external_prompt_text = [prompt(row) for row in external_rows]
     metadata = {
         "manifest": str(path.resolve()),
         "manifest_digest": hashlib.sha256(path.resolve().read_bytes()).hexdigest(),
@@ -793,7 +1004,9 @@ def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
         "request_count": len(rows),
         "request_id_order": [str(row["request_id"]) for row in rows],
         "request_arrival_offsets": request_arrival_offsets,
-        "tokenization_errors": tokenization_errors,
+        "tokenization_errors": 0,
+        "token_input_adapter": "collision_free_content_block_tokens_v1",
+        "token_input_identity_digest": token_identity_digest,
         "resident_input_tokens": [int(row["input_length"]) for row in resident_rows],
         "external_input_tokens": [int(row["input_length"]) for row in external_rows],
         # The trace exposes exact shared-prefix block identities.  Only that
@@ -820,8 +1033,12 @@ def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
         external_request_ids=tuple(
             str(row["request_id"]) for row in external_rows
         ),
-        resident_prompt_text=tuple(resident_prompt_text),
-        external_prompt_text=tuple(external_prompt_text),
+        resident_inputs=tuple(
+            input_by_request[str(row["request_id"])] for row in resident_rows
+        ),
+        external_inputs=tuple(
+            input_by_request[str(row["request_id"])] for row in external_rows
+        ),
         resident_arrival_offsets=resident_offsets,
         external_arrival_offsets=external_offsets,
         resident_output_tokens=tuple(metadata["resident_output_tokens"]),
@@ -836,10 +1053,6 @@ def _meta(result: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("SGLang omitted request metadata")
     return meta
 
-
-TokenInput = tuple[int, ...]
-
-
 def _token_input(tokenizer: Any, prompt: str) -> TokenInput:
     token_ids = tuple(
         int(value) for value in tokenizer.encode(prompt, add_special_tokens=False)
@@ -847,6 +1060,22 @@ def _token_input(tokenizer: Any, prompt: str) -> TokenInput:
     if not token_ids:
         raise RuntimeError("serving request tokenized to an empty input")
     return token_ids
+
+
+def _reusable_prefix_tokens(prefix: TokenInput, prompt: TokenInput) -> int:
+    """Return the exact radix rows reusable by the timed SGLang request.
+
+    SGLang retains the final input token as a query when the request is an
+    exact-prefix hit.  A continuation-bearing request can reuse the complete
+    materialized prefix because its first suffix token supplies that query.
+    """
+
+    if not prefix or len(prefix) > len(prompt) or prompt[: len(prefix)] != prefix:
+        raise RuntimeError("external prompt does not extend its materialized prefix")
+    reusable = len(prefix) - int(len(prefix) == len(prompt))
+    if reusable <= 0:
+        raise RuntimeError("external request has no reusable radix prefix")
+    return reusable
 
 
 def _generate_one(
@@ -950,20 +1179,40 @@ async def _stream_request(
     )
     first = 0.0
     token_times: list[float] = []
+    previous_completion_tokens = 0
+    duplicate_stream_events = 0
     final: dict[str, Any] | None = None
     async for result in stream:
         now = time.perf_counter()
-        if first == 0.0:
-            first = now
-            if first_token_event is not None:
-                first_token_event.set()
-        token_times.append(now)
+        meta = _meta(result)
+        completion_tokens = int(meta.get("completion_tokens", 0))
+        token_delta = completion_tokens - previous_completion_tokens
+        if token_delta < 0:
+            raise RuntimeError("SGLang stream completion token count decreased")
+        if token_delta > 1:
+            raise RuntimeError(
+                "SGLang stream coalesced multiple tokens despite stream_interval=1; "
+                "token-level ITL would be invalid"
+            )
+        if token_delta == 1:
+            if first == 0.0:
+                first = now
+                if first_token_event is not None:
+                    first_token_event.set()
+            token_times.append(now)
+            previous_completion_tokens = completion_tokens
+        else:
+            duplicate_stream_events += 1
         final = result
     finished = time.perf_counter()
     if final is None or first == 0.0:
         raise RuntimeError(f"SGLang returned no streamed output for {kind}-{index}")
     meta = _meta(final)
     completion_tokens = int(meta.get("completion_tokens", len(token_times)))
+    if completion_tokens != len(token_times):
+        raise RuntimeError(
+            "SGLang stream events do not provide one timestamp per completion token"
+        )
     intervals = [
         current - previous for previous, current in zip(token_times, token_times[1:])
     ]
@@ -988,11 +1237,15 @@ async def _stream_request(
             0.0, finished - (load_start_seconds + offset_seconds)
         ),
         "tpot_seconds": (
-            (finished - first) / (completion_tokens - 1)
+            (token_times[-1] - first) / (completion_tokens - 1)
             if completion_tokens > 1
             else 0.0
         ),
         "inter_token_seconds": intervals,
+        "itl_sample_count": len(intervals),
+        "token_timestamps_exact": True,
+        "token_timestamp_source": "sglang_stream_interval_1_completion_delta",
+        "duplicate_stream_events": duplicate_stream_events,
         "p99_itl_seconds": _percentile(intervals, 0.99),
         "completion_tokens": completion_tokens,
         "input_tokens": len(input_ids),
@@ -1025,11 +1278,13 @@ async def _run_load(
         # cold.
         "max_new_tokens": args.resident_output_tokens,
         "ignore_eos": True,
+        "stream_interval": 1,
     }
     external_sampling = {
         "temperature": 0,
         "max_new_tokens": args.external_output_tokens,
         "ignore_eos": True,
+        "stream_interval": 1,
     }
 
     async def resident(index: int, prompt: TokenInput) -> dict[str, Any]:
@@ -1149,12 +1404,19 @@ def _slo_goodput(
 ) -> dict[str, Any]:
     qualified = sum(
         float(record["ttft_seconds"]) <= ttft_seconds
+        and int(record["itl_sample_count"]) > 0
+        and record["token_timestamps_exact"] is True
         and float(record["p99_itl_seconds"]) <= p99_itl_seconds
         for record in records
     )
     return {
         "qualified_requests": qualified,
         "total_requests": len(records),
+        "requests_with_token_level_itl": sum(
+            int(record["itl_sample_count"]) > 0
+            and record["token_timestamps_exact"] is True
+            for record in records
+        ),
         "attainment": qualified / len(records),
         "goodput_requests_per_second": qualified / elapsed,
         "thresholds_seconds": {
@@ -1183,8 +1445,8 @@ def main() -> int:
         loaded_workload = _load_workload(args.workload_manifest, tokenizer)
         resident_request_ids = loaded_workload.resident_request_ids
         external_request_ids = loaded_workload.external_request_ids
-        resident_texts = loaded_workload.resident_prompt_text
-        external_texts = loaded_workload.external_prompt_text
+        resident_prompts = list(loaded_workload.resident_inputs)
+        external_prompts = list(loaded_workload.external_inputs)
         resident_offsets = loaded_workload.resident_arrival_offsets
         external_offsets = loaded_workload.external_arrival_offsets
         resident_output_tokens = loaded_workload.resident_output_tokens
@@ -1218,12 +1480,10 @@ def main() -> int:
                 "Bailian input and output lengths exceed the configured context "
                 f"length ({args.context_length})"
             )
-        args.resident_requests = len(resident_texts)
-        args.external_requests = len(external_texts)
+        args.resident_requests = len(resident_prompts)
+        args.external_requests = len(external_prompts)
         args.resident_tokens = max(workload_metadata["resident_input_tokens"])
         args.external_tokens = max(workload_metadata["external_input_tokens"])
-        resident_prompts = [_token_input(tokenizer, value) for value in resident_texts]
-        external_prompts = [_token_input(tokenizer, value) for value in external_texts]
         cached_prefix_lengths = [
             int(value)
             for value in workload_metadata["external_cached_prefix_tokens"]
@@ -1289,9 +1549,15 @@ def main() -> int:
                 max(len(prompt) for prompt in external_prompts),
             ),
         )
-    external_query_rows = [
-        len(prompt) - len(prefix)
+    external_cached_prefix_lengths = [
+        _reusable_prefix_tokens(prefix, prompt)
         for prefix, prompt in zip(external_prefixes, external_prompts, strict=True)
+    ]
+    external_query_rows = [
+        len(prompt) - cached
+        for cached, prompt in zip(
+            external_cached_prefix_lengths, external_prompts, strict=True
+        )
     ]
     if any(
         len(prompt) >= _max_request_input_tokens(args.context_length)
@@ -1393,21 +1659,37 @@ def main() -> int:
     ) as engine:
 
         def warm_residents() -> None:
-            """Materialize and verify the resident working set in bounded batches."""
+            """Materialize, then exactly verify the resident working set."""
 
             for begin in range(0, len(resident_prompts), args.max_running_requests):
                 end = begin + args.max_running_requests
-                results = generation_results(
-                    _generate_many(
-                        engine,
-                        resident_prompts[begin:end],
-                        [dict(setup_sampling)] * len(resident_prompts[begin:end]),
+                prompts = resident_prompts[begin:end]
+                samplings = [dict(setup_sampling)] * len(prompts)
+                results = generation_results(_generate_many(engine, prompts, samplings))
+                if any(
+                    device_cached_tokens(result) != len(prompt) - 1
+                    or host_cached_tokens(result) != 0
+                    for prompt, result in zip(prompts, results, strict=True)
+                ):
+                    # A cold first access creates the radix entry; it is not
+                    # evidence that placement failed. The second access is the
+                    # exact cache-state observation used by the setup gate.
+                    results = generation_results(
+                        _generate_many(
+                            engine,
+                            prompts,
+                            [dict(setup_sampling)] * len(prompts),
+                        )
                     )
-                )
-                for result in results:
-                    if device_cached_tokens(result) <= 0:
+                for prompt, result in zip(prompts, results, strict=True):
+                    actual_device = device_cached_tokens(result)
+                    actual_host = host_cached_tokens(result)
+                    if actual_device != len(prompt) - 1 or actual_host != 0:
                         raise RuntimeError(
-                            "resident warmup did not remain in device cache"
+                            "resident warmup did not establish its exact device "
+                            "prefix: "
+                            f"expected={len(prompt) - 1}, "
+                            f"device={actual_device}, host={actual_host}"
                         )
 
         load_seconds = time.perf_counter() - load_started
@@ -1440,13 +1722,16 @@ def main() -> int:
             )
 
         warm_external_prefixes()
-        for prompt in churn_prompts[:eviction_rounds]:
+        for prompt in _churn_window(churn_prompts, 0, eviction_rounds):
             generated_text(_generate_one(engine, prompt, setup_sampling))
         if workload_metadata is None:
             external_probe = _generate_one(engine, external_prefixes[0], setup_sampling)
             if host_cached_tokens(external_probe) <= 0:
                 raise RuntimeError("external JIT warmup did not load from host cache")
-        for prompt in churn_prompts[eviction_rounds:]:
+        # Window 1 is setup-only.  Windows 2..N are reserved for excluded
+        # load warmups below; consuming the tail here would replay already
+        # cached churn prompts and weaken the intended eviction pressure.
+        for prompt in _churn_window(churn_prompts, 1, eviction_rounds):
             generated_text(_generate_one(engine, prompt, setup_sampling))
         warm_residents()
 
@@ -1524,35 +1809,22 @@ def main() -> int:
                     if record["kind"] == "external"
                 ]
             )
-            begin = (2 + warmup) * eviction_rounds
-            end = begin + eviction_rounds
-            for prompt in churn_prompts[begin:end]:
+            for prompt in _churn_window(
+                churn_prompts, 2 + warmup, eviction_rounds
+            ):
                 generated_text(_generate_one(engine, prompt, setup_sampling))
             if eviction_rounds:
                 warm_residents()
             establish_final_placement()
 
-        # Delimit the timed counter window with a resident-only marker. The
-        # same marker runs in both paired arms; in NTA it also forces the
-        # asynchronous stats publisher past every warmup/calibration event.
-        marker_started_ns = time.time_ns()
-        from nta_runtime.engines.sglang import OBSERVATION_MARKER_REQUEST_PREFIX
-
-        generated_text(
-            _generate_one(
-                engine,
-                resident_prompts[0],
-                setup_sampling,
-                rid=f"{OBSERVATION_MARKER_REQUEST_PREFIX}baseline",
-            )
+        # Delimit the timed counter window with a control-plane snapshot. It
+        # quiesces prior CUDA observations without issuing a model request or
+        # changing cache placement.
+        measurement_baseline = (
+            _publish_engine_stats_snapshot(engine, workspace, prior_stats_paths)
+            if args.attention_backend == "nta_flashinfer"
+            else {}
         )
-        if args.attention_backend == "nta_flashinfer":
-            measurement_baseline = _wait_for_engine_stats(
-                workspace,
-                prior_stats_paths,
-                after_unix_ns=marker_started_ns,
-            )
-
         records, elapsed = engine.loop.run_until_complete(
             _run_load(
                 engine,
@@ -1567,31 +1839,49 @@ def main() -> int:
                 external_request_ids,
             )
         )
+        # The timed wall-clock stops before this out-of-band completion
+        # boundary, so statistics publication is excluded from latency.
+        measurement_final = (
+            _publish_engine_stats_snapshot(engine, workspace, prior_stats_paths)
+            if args.attention_backend == "nta_flashinfer"
+            else {}
+        )
 
     external = [record for record in records if record["kind"] == "external"]
     resident = [record for record in records if record["kind"] == "resident"]
+    expected_external_prefixes = (
+        [int(value) for value in workload_metadata["external_cached_prefix_tokens"]]
+        if workload_metadata is not None
+        else external_cached_prefix_lengths
+    )
     missing_external = [
         {
             "index": record["index"],
+            "expected": expected_external_prefixes[record["index"]],
             "device": record["device_cached_tokens"],
             "host": record["host_cached_tokens"],
         }
         for record in external
         if record["host_cached_tokens"] <= 0
+        or record["host_cached_tokens"] + record["device_cached_tokens"]
+        != expected_external_prefixes[record["index"]]
     ]
     if missing_external:
         raise RuntimeError(
             "a timed external request was not served from host cache: "
             + json.dumps(missing_external, sort_keys=True)
         )
+    expected_resident_prefixes = [len(value) - 1 for value in resident_prompts]
     missing_resident = [
         {
             "index": record["index"],
+            "expected": expected_resident_prefixes[record["index"]],
             "device": record["device_cached_tokens"],
             "host": record["host_cached_tokens"],
         }
         for record in resident
-        if record["device_cached_tokens"] <= 0 or record["host_cached_tokens"] != 0
+        if record["device_cached_tokens"] != expected_resident_prefixes[record["index"]]
+        or record["host_cached_tokens"] != 0
     ]
     minimum_host_prefix = min(record["host_cached_tokens"] for record in external)
     if missing_resident:
@@ -1638,7 +1928,7 @@ def main() -> int:
             and len(calibration_shape_records) == args.load_warmup_iterations
         ),
         "warmup_iterations": len(calibration_shape_records),
-        "cached_prefix_tokens": [len(value) for value in external_prefixes],
+        "cached_prefix_tokens": external_cached_prefix_lengths,
         "uncached_query_rows": external_query_rows,
         "timed_shapes": timed_external_shapes,
     }
@@ -1649,7 +1939,11 @@ def main() -> int:
         record["text_sha256"] = hashlib.sha256(text).hexdigest()
         digest.update(text)
         digest.update(b"\0")
-    cumulative_stats_by_name = _read_engine_stats(workspace, prior_stats_paths)
+    cumulative_stats_by_name = (
+        measurement_final
+        if args.attention_backend == "nta_flashinfer"
+        else _read_engine_stats(workspace, prior_stats_paths)
+    )
     cumulative_stats = list(cumulative_stats_by_name.values())
     if args.attention_backend == "nta_flashinfer":
         if not measurement_baseline or (
@@ -1731,7 +2025,7 @@ def main() -> int:
         for record in records
     )
     admission_delays = [record["admission_delay_seconds"] for record in records]
-    littles_law = finite_window_littles_law(records, elapsed)
+    finite_window_accounting = finite_window_system_accounting(records, elapsed)
     ttft = _latency_percentiles(records, "ttft_seconds")
     tpot = _latency_percentiles(records, "tpot_seconds")
     itl_values = _itl_values(records)
@@ -1760,6 +2054,18 @@ def main() -> int:
         stats
     )
     batch_heterogeneity = serving_batch_heterogeneity(records, stats)
+    if (
+        args.attention_backend == "nta_flashinfer"
+        and args.batch_mode == "coalesced"
+        and resident
+        and external
+        and not batch_heterogeneity["proven"]
+    ):
+        raise RuntimeError(
+            "coalesced workload did not produce a measured heterogeneous "
+            "SGLang ForwardBatch; increase resident decode lifetime or fix "
+            f"arrival shaping: {batch_heterogeneity!r}"
+        )
     report = {
         "schema": 1,
         "classification": "sglang-hicache-load",
@@ -1847,7 +2153,7 @@ def main() -> int:
         "placement_proven": True,
         "verification_failures": 0,
         "correctness": correctness,
-        "littles_law": littles_law,
+        "finite_window_accounting": finite_window_accounting,
         "admission_delay_seconds": {
             "mean": sum(admission_delays) / len(admission_delays),
             "p95": _percentile(admission_delays, 0.95),
@@ -1877,10 +2183,7 @@ def main() -> int:
     if consumer_contract is not None:
         report["consumer_contract"] = consumer_contract
     if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(
-            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        atomic_write_json(args.output, report)
     print(json.dumps(report, sort_keys=True))
     return 0
 

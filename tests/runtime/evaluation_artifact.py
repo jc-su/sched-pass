@@ -13,16 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from experiments.bailian import normalize, write_workload  # noqa: E402
-
-
-STRATUM = {
-    "request_state": "mixed",
-    "granularity": "page_group",
-    "load_ratio": "balanced",
-    "availability_skew": "medium",
-    "staging_pressure": "near_capacity",
-    "arrival": "batch_release",
-}
+from experiments.workload_scenario import describe_workload_scenario  # noqa: E402
 
 
 def _command(goodput: float) -> list[str]:
@@ -32,9 +23,15 @@ def _command(goodput: float) -> list[str]:
         "slo_goodput": goodput,
         "p95_ttft_seconds": 0.1,
         "p99_itl_seconds": 0.01,
-        "littles_law": {
+        "finite_window_accounting": {
             "method": "finite_window_arrival_departure_accounting",
-            "residual": 0.0,
+            "arrival_rate_per_second": 5.0,
+            "completion_rate_per_second": 5.0,
+            "mean_in_system": 0.5,
+            "mean_system_time_seconds": 0.1,
+            "occupancy_area_request_seconds": 0.1,
+            "sum_residence_seconds": 0.1,
+            "interpretation": "descriptive_client_timestamp_accounting",
         },
     }
     code = f"import json; print(json.dumps({result!r}))"
@@ -65,20 +62,44 @@ def main() -> None:
         workload = root / "workload.json"
         records = root / "records.jsonl"
         write_workload(workload, records, manifest, rows)
+        scenario = describe_workload_scenario("fixture", workload)
+        manifest_b, rows_b = normalize(
+            [
+                {
+                    "request_id": "fixture-c",
+                    "input_length": 96,
+                    "output_length": 8,
+                    "hash_ids": ["prefix-b0", "prefix-b1"],
+                },
+                {
+                    "request_id": "fixture-d",
+                    "input_length": 160,
+                    "output_length": 13,
+                    "hash_ids": ["prefix-b0", "prefix-b1", "prefix-b2"],
+                },
+            ],
+            arrival_mode="batch_release",
+            synthesize_prompts=True,
+        )
+        workload_b = root / "workload-b.json"
+        records_b = root / "records-b.jsonl"
+        write_workload(workload_b, records_b, manifest_b, rows_b)
+        scenario_b = describe_workload_scenario("fixture-b", workload_b)
         spec = {
             "schema": 1,
             "classification": "nta-paired-evaluation",
-            "workload_manifest": str(workload),
+            "workload_manifests": [str(workload), str(workload_b)],
             "repetitions": 5,
             "seed": 7,
             "experiments": [
                 {
                     "name": "fixture-pair",
-                    "variant": "B0",
-                    "arm": "B0",
+                    "variant": "A0",
+                    "arm": "A0",
                     "tier": "hbm",
                     "demand_semantics": "exact",
-                    "stratum": STRATUM,
+                    "stratum": scenario,
+                    "workload_manifest": str(workload),
                     "command": _command(1.0),
                     "metrics": [
                         "slo_goodput",
@@ -88,11 +109,12 @@ def main() -> None:
                 },
                 {
                     "name": "fixture-pair",
-                    "variant": "B1",
-                    "arm": "B1",
+                    "variant": "A1",
+                    "arm": "A1",
                     "tier": "hbm",
                     "demand_semantics": "exact",
-                    "stratum": STRATUM,
+                    "stratum": scenario,
+                    "workload_manifest": str(workload),
                     "command": _command(1.2),
                     "metrics": [
                         "slo_goodput",
@@ -105,12 +127,22 @@ def main() -> None:
                 {
                     "name": "fixture-goodput",
                     "experiment": "fixture-pair",
-                    "numerator_variant": "B1",
-                    "denominator_variant": "B0",
+                    "numerator_variant": "A1",
+                    "denominator_variant": "A0",
                     "metric": "slo_goodput",
                 }
             ],
         }
+        for experiment in list(spec["experiments"]):
+            clone = json.loads(json.dumps(experiment))
+            clone["name"] = "fixture-pair-b"
+            clone["stratum"] = scenario_b
+            clone["workload_manifest"] = str(workload_b)
+            spec["experiments"].append(clone)
+        comparison_b = dict(spec["comparisons"][0])
+        comparison_b["name"] = "fixture-goodput-b"
+        comparison_b["experiment"] = "fixture-pair-b"
+        spec["comparisons"].append(comparison_b)
         spec_path = root / "spec.json"
         spec_path.write_text(json.dumps(spec) + "\n", encoding="utf-8")
         output = root / "evaluation"
@@ -139,7 +171,38 @@ def main() -> None:
         metadata = json.loads(
             (output / "evaluation-metadata.json").read_text(encoding="utf-8")
         )
-        assert metadata["workload_demand_digest"] == manifest["demand_trace_digest"]
+        assert len(metadata["workloads"]) == 2
+        assert {
+            entry["demand_trace_digest"] for entry in metadata["workloads"]
+        } == {
+            manifest["demand_trace_digest"],
+            manifest_b["demand_trace_digest"],
+        }
+        artifact = root / "artifact"
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "experiments" / "reproduce.py"),
+                "--profile",
+                "evaluation",
+                "--spec",
+                str(spec_path),
+                "--output",
+                str(artifact),
+                "--allow-dirty",
+            ],
+            cwd=ROOT,
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "experiments" / "validate_bundle.py"),
+                str(artifact),
+            ],
+            cwd=ROOT,
+            check=True,
+        )
     print("evaluation_artifact=pass")
 
 

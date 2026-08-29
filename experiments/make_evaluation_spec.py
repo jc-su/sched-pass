@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the complete paired B0--B6 evaluation specification.
+"""Generate the complete paired causal-mechanism evaluation specification.
 
 The generator requires one concrete command for every arm.  It never invents
 timing commands or silently drops an arm.  Command tokens may use
@@ -17,59 +17,67 @@ import shlex
 from typing import Any, Mapping
 
 try:
+    from .mechanism_arms import (
+        ARMS,
+        ARM_DEFINITIONS,
+        CAUSAL_PAIRS,
+        FORMAL_SERVING_METRICS,
+        arm_environment,
+    )
+    from .result_contracts import result_contract_names
     from .run_evaluation import validate_spec
-    from .validate_workload import validate as validate_workload
+    from .workload_scenario import (
+        describe_workload_scenario,
+        validate_workload_scenario,
+    )
 except ImportError:
+    from mechanism_arms import (
+        ARMS,
+        ARM_DEFINITIONS,
+        CAUSAL_PAIRS,
+        FORMAL_SERVING_METRICS,
+        arm_environment,
+    )
+    from result_contracts import result_contract_names
     from run_evaluation import validate_spec
-    from validate_workload import validate as validate_workload
+    from workload_scenario import describe_workload_scenario, validate_workload_scenario
+
+PAIRS = tuple((numerator, denominator) for numerator, denominator, _ in CAUSAL_PAIRS)
+DEFAULT_METRICS = FORMAL_SERVING_METRICS
+TIER_ENVIRONMENT = {
+    "hbm": "hbm",
+    "host_mem": "host_staged",
+    "nvme": "nvme",
+    "dax": "cxl_dax",
+}
 
 
-ARMS = tuple(f"B{index}" for index in range(7))
-FORMAL_CONSUMER_KINDS = frozenset({"native_work_unit", "framework_reference"})
-# Adjacent pairs expose each boundary. The two cross-boundary pairs are
-# deliberate: B3/B1 seals the host-control round-trip effect, and B5/B3
-# tests the complete device-demand-to-heterogeneous-execution jump.
-PAIRS = (
-    *tuple(zip(ARMS[1:], ARMS[:-1])),
-    ("B3", "B1"),
-    ("B5", "B3"),
-)
-DEFAULT_METRICS = (
-    "slo_goodput",
-    "p95_ttft_seconds",
-    "p99_itl_seconds",
-    "verification_failures",
-)
-STRATUM_FIELDS = (
-    "request_state",
-    "granularity",
-    "load_ratio",
-    "availability_skew",
-    "staging_pressure",
-    "arrival",
-)
-
-
-def _load_strata(path: Path) -> list[dict[str, str]]:
+def _load_strata(path: Path) -> list[dict[str, Any]]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, list) or not value:
         raise ValueError("strata file must contain a non-empty array")
-    result: list[dict[str, str]] = []
+    result: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, entry in enumerate(value):
         if not isinstance(entry, dict):
             raise ValueError(f"stratum {index} is not an object")
-        missing = [
-            field for field in STRATUM_FIELDS if not isinstance(entry.get(field), str)
-        ]
-        if missing:
-            raise ValueError(f"stratum {index} lacks fields: {', '.join(missing)}")
         label = str(entry.get("id", f"stratum-{index}"))
         if re.fullmatch(r"[A-Za-z0-9_.-]+", label) is None or label in seen:
             raise ValueError(f"stratum id is invalid or duplicated: {label!r}")
         seen.add(label)
+        manifest_value = entry.get("workload_manifest")
+        if not isinstance(manifest_value, str) or not manifest_value:
+            raise ValueError(f"stratum {label!r} has no workload_manifest")
+        manifest_path = Path(manifest_value)
+        if not manifest_path.is_absolute():
+            manifest_path = path.resolve().parent / manifest_path
+        manifest_path = manifest_path.resolve()
         result.append(
-            {field: str(entry[field]) for field in STRATUM_FIELDS} | {"id": label}
+            {
+                "id": label,
+                "workload_manifest": str(manifest_path),
+                "descriptor": describe_workload_scenario(label, manifest_path),
+            }
         )
     return result
 
@@ -91,20 +99,21 @@ def _commands(values: list[str]) -> dict[str, str]:
     return result
 
 
-def _consumer_kinds(values: list[str]) -> dict[str, str]:
+def _result_contracts(values: list[str]) -> dict[str, str]:
     result: dict[str, str] = {}
+    supported = result_contract_names(formal_only=True)
     for value in values:
         if "=" not in value:
-            raise ValueError(f"--arm-consumer-kind must use ARM=KIND: {value!r}")
-        arm, kind = value.split("=", 1)
-        if arm not in ARMS or kind not in FORMAL_CONSUMER_KINDS:
-            raise ValueError(f"invalid arm consumer kind: {value!r}")
+            raise ValueError(f"--arm-result-contract must use ARM=CONTRACT: {value!r}")
+        arm, contract = value.split("=", 1)
+        if arm not in ARMS or contract not in supported:
+            raise ValueError(f"invalid arm result contract: {value!r}")
         if arm in result:
-            raise ValueError(f"duplicate consumer kind for {arm}")
-        result[arm] = kind
+            raise ValueError(f"duplicate result contract for {arm}")
+        result[arm] = contract
     missing = [arm for arm in ARMS if arm not in result]
     if missing:
-        raise ValueError("missing consumer kinds for: " + ", ".join(missing))
+        raise ValueError("missing result contracts for: " + ", ".join(missing))
     return result
 
 
@@ -120,11 +129,10 @@ def _format_command_token(token: str, *, arm: str, values: Mapping[str, str]) ->
 
 def build_spec(
     *,
-    workload_manifest: Path,
     tier: str,
     arm_commands: Mapping[str, str],
-    consumer_kinds: Mapping[str, str],
-    strata: list[dict[str, str]],
+    result_contracts: Mapping[str, str],
+    strata: list[dict[str, Any]],
     repetitions: int = 10,
     seed: int = 20260824,
     metrics: tuple[str, ...] = DEFAULT_METRICS,
@@ -135,51 +143,60 @@ def build_spec(
     if repetitions < 5:
         raise ValueError("OSDI evaluation requires at least five repetitions")
     if set(arm_commands) != set(ARMS):
-        raise ValueError("complete B0--B6 arm command set is required")
-    if set(consumer_kinds) != set(ARMS):
-        raise ValueError("complete B0--B6 consumer kind set is required")
-    if any(kind not in FORMAL_CONSUMER_KINDS for kind in consumer_kinds.values()):
-        raise ValueError("formal arms require a numerical consumer kind")
-    validate_workload(workload_manifest.resolve())
+        raise ValueError("complete A0--A3 arm command set is required")
+    if set(result_contracts) != set(ARMS):
+        raise ValueError("complete A0--A3 result contract set is required")
     if tier in {"nvme", "dax"} and tier_qualification is None:
         raise ValueError("NVMe/DAX spec requires --tier-qualification")
     experiments: list[dict[str, Any]] = []
     comparisons: list[dict[str, str]] = []
-    for numerator, denominator in PAIRS:
-        for stratum in strata:
-            label = stratum["id"]
-            name = f"{numerator.lower()}-vs-{denominator.lower()}-{label}"
-            fields = {field: stratum[field] for field in STRATUM_FIELDS}
-            values = {
-                "workload_manifest": str(workload_manifest.resolve()),
-                "tier": tier,
-                "stratum": label,
-            }
-            for arm in (denominator, numerator):
-                command = [
-                    _format_command_token(token, arm=arm, values=values)
-                    for token in shlex.split(arm_commands[arm])
-                ]
-                experiments.append(
-                    {
-                        "name": name,
-                        "variant": arm,
-                        "arm": arm,
-                        "tier": tier,
-                        "demand_semantics": "exact",
-                        "consumer_kind": consumer_kinds[arm],
-                        "stratum": fields,
-                        "command": command,
-                        "metrics": list(metrics),
-                    }
-                )
+    for stratum in strata:
+        label = stratum["id"]
+        workload_manifest = Path(str(stratum["workload_manifest"])).resolve()
+        descriptor = validate_workload_scenario(
+            stratum["descriptor"], workload_manifest
+        )
+        name = f"mechanism-{label}"
+        values = {
+            "workload_manifest": str(workload_manifest.resolve()),
+            "tier": tier,
+            "stratum": label,
+        }
+        for arm in ARMS:
+            command = [
+                _format_command_token(token, arm=arm, values=values)
+                for token in shlex.split(arm_commands[arm])
+            ]
+            experiments.append(
+                {
+                    "name": name,
+                    "variant": arm,
+                    "arm": arm,
+                    "tier": tier,
+                    "demand_semantics": "exact",
+                    "consumer_kind": ARM_DEFINITIONS[arm]["consumer_kind"],
+                    "mechanism_form": ARM_DEFINITIONS[arm]["name"],
+                    "result_contract": result_contracts[arm],
+                    "stratum": descriptor,
+                    "workload_manifest": str(workload_manifest),
+                    "command": command,
+                    "environment": {
+                        **arm_environment(arm),
+                        "NTA_SERVING_TIER": TIER_ENVIRONMENT[tier],
+                    },
+                    "metrics": list(metrics),
+                }
+            )
+        for numerator, denominator in PAIRS:
             comparisons.append(
                 {
-                    "name": f"{name}-goodput",
+                    "name": (
+                        f"{numerator.lower()}-vs-{denominator.lower()}-{label}-goodput"
+                    ),
                     "experiment": name,
                     "numerator_variant": numerator,
                     "denominator_variant": denominator,
-                    "metric": "slo_goodput",
+                    "metric": "slo_goodput_requests_per_second",
                 }
             )
     spec: dict[str, Any] = {
@@ -187,7 +204,9 @@ def build_spec(
         "classification": "nta-paired-evaluation",
         "evaluation_profile": "osdi-complete",
         "generated_by": "experiments/make_evaluation_spec.py",
-        "workload_manifest": str(workload_manifest.resolve()),
+        "workload_manifests": sorted(
+            {str(Path(stratum["workload_manifest"]).resolve()) for stratum in strata}
+        ),
         "tier": tier,
         "repetitions": repetitions,
         "seed": seed,
@@ -198,7 +217,6 @@ def build_spec(
         spec["tier_qualification"] = str(tier_qualification.resolve())
     validate_spec(
         spec,
-        workload_manifest.resolve(),
         qualification_path=tier_qualification.resolve() if tier_qualification else None,
     )
     return spec
@@ -206,11 +224,10 @@ def build_spec(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workload-manifest", type=Path, required=True)
     parser.add_argument(
         "--strata-file",
         type=Path,
-        default=Path(__file__).with_name("strata.example.json"),
+        required=True,
     )
     parser.add_argument(
         "--tier", choices=("hbm", "host_mem", "nvme", "dax"), default="host_mem"
@@ -223,11 +240,11 @@ def main() -> int:
         "--arm-command", action="append", required=True, metavar="ARM=COMMAND"
     )
     parser.add_argument(
-        "--arm-consumer-kind",
+        "--arm-result-contract",
         action="append",
         required=True,
-        metavar="ARM=KIND",
-        help="formal numerical consumer: native_work_unit or framework_reference",
+        metavar="ARM=CONTRACT",
+        help="validated command result schema, for example sglang-serving",
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -236,10 +253,9 @@ def main() -> int:
         parser.error("at least one metric is required")
     try:
         spec = build_spec(
-            workload_manifest=args.workload_manifest,
             tier=args.tier,
             arm_commands=_commands(args.arm_command),
-            consumer_kinds=_consumer_kinds(args.arm_consumer_kind),
+            result_contracts=_result_contracts(args.arm_result_contract),
             strata=_load_strata(args.strata_file),
             repetitions=args.repetitions,
             seed=args.seed,

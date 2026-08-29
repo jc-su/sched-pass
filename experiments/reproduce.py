@@ -32,6 +32,7 @@ from typing import Sequence
 try:
     from .artifact import ArtifactRun, ROOT, file_digest, git_metadata
     from .hardware import validate as validate_hardware
+    from .run_evaluation import validate_spec as validate_evaluation_spec
     from .validate_workload import validate as validate_workload
     from .validate_performance_artifact import validate as validate_performance_artifact
     from .validate_tier_qualification import (
@@ -41,6 +42,7 @@ try:
 except ImportError:  # Direct ``python experiments/reproduce.py`` execution.
     from artifact import ArtifactRun, ROOT, file_digest, git_metadata
     from hardware import validate as validate_hardware
+    from run_evaluation import validate_spec as validate_evaluation_spec
     from validate_workload import validate as validate_workload
     from validate_performance_artifact import validate as validate_performance_artifact
     from validate_tier_qualification import validate_file as validate_tier_qualification
@@ -253,26 +255,64 @@ def _replace_path(value: object, source: Path, destination: Path) -> object:
     return value
 
 
-def _copy_workload(run: ArtifactRun, source: Path) -> Path:
+def _copy_workload_payload(source: Path, destination: Path) -> tuple[Path, Path]:
     manifest = validate_workload(source)
-    source_records = source.parent / str(manifest["records_file"])
-    destination = run.output / "workload"
-    destination.mkdir()
-    shutil.copy2(source_records, destination / "records.jsonl")
-    copied_manifest = dict(manifest)
-    copied_manifest["records_file"] = "records.jsonl"
+    records_relative = Path(str(manifest["records_file"]))
+    source_records = source.parent / records_relative
+    destination.mkdir(parents=True)
+    copied_records_path = destination / records_relative
+    copied_records_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_records, copied_records_path)
     copied_manifest_path = destination / "manifest.json"
-    copied_manifest_path.write_text(
-        json.dumps(copied_manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    shutil.copy2(source, copied_manifest_path)
     validate_workload(copied_manifest_path)
+    return copied_manifest_path, copied_records_path
+
+
+def _copy_workload(run: ArtifactRun, source: Path) -> Path:
+    copied_manifest_path, copied_records_path = _copy_workload_payload(
+        source, run.output / "workload"
+    )
     run.update(
         workload_replay_manifest="workload/manifest.json",
         workload_replay_manifest_digest=file_digest(copied_manifest_path),
-        workload_replay_records_digest=file_digest(destination / "records.jsonl"),
+        workload_replay_records=str(copied_records_path.relative_to(run.output)),
+        workload_replay_records_digest=file_digest(copied_records_path),
     )
     return copied_manifest_path
+
+
+def _copy_evaluation_workloads(
+    run: ArtifactRun,
+    workloads: dict[str, dict[str, object]],
+) -> tuple[dict[Path, Path], list[dict[str, object]]]:
+    """Copy every scenario-owned workload into a relocatable artifact tree."""
+
+    replacements: dict[Path, Path] = {}
+    metadata: list[dict[str, object]] = []
+    for index, (source_value, descriptor) in enumerate(sorted(workloads.items())):
+        source = Path(source_value).resolve()
+        scenario_id = descriptor.get("id")
+        if not isinstance(scenario_id, str):
+            raise RuntimeError("validated workload scenario has no id")
+        relative_directory = Path("workloads") / f"{index:03d}-{scenario_id}"
+        copied_manifest, copied_records = _copy_workload_payload(
+            source, run.output / relative_directory
+        )
+        replacements[source] = copied_manifest
+        metadata.append(
+            {
+                "scenario_id": scenario_id,
+                "manifest": str(relative_directory / "manifest.json"),
+                "manifest_digest": file_digest(copied_manifest),
+                "records": str(copied_records.relative_to(run.output)),
+                "records_digest": file_digest(copied_records),
+                "demand_trace_digest": descriptor["demand_trace_digest"],
+                "scenario": descriptor,
+            }
+        )
+    run.update(evaluation_workloads=metadata)
+    return replacements, metadata
 
 
 def _run_evaluation(
@@ -289,10 +329,23 @@ def _run_evaluation(
     destination = run.output / "evaluation"
     try:
         spec_document = json.loads(spec.read_text(encoding="utf-8"))
-        workload = Path(spec_document["workload_manifest"]).resolve()
-    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        if not isinstance(spec_document, dict):
+            raise TypeError("evaluation specification is not an object")
+        qualification_value = spec_document.get("tier_qualification")
+        qualification_path = None
+        if qualification_value is not None:
+            qualification_path = Path(str(qualification_value))
+            if not qualification_path.is_absolute():
+                qualification_path = spec.parent / qualification_path
+            qualification_path = qualification_path.resolve()
+        workloads = validate_evaluation_spec(
+            spec_document,
+            qualification_path=qualification_path,
+            base_dir=spec.parent,
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise RuntimeError(
-            f"evaluation specification has no readable workload manifest: {error}"
+            f"evaluation specification is not reproducible: {error}"
         ) from error
     evaluation_profile = spec_document.get("evaluation_profile", "contract")
     if evaluation_profile == "osdi-complete" and args.performance_evidence is None:
@@ -300,12 +353,33 @@ def _run_evaluation(
             "osdi-complete evaluation requires --performance-evidence with "
             "successful profiler, baseline, measured report, and regression gate"
         )
-    copied_workload = _copy_workload(run, workload)
-    rewritten_spec = _replace_path(spec_document, workload, copied_workload)
-    qualification = spec_document.get("tier_qualification")
+    workload_replacements, copied_workload_metadata = _copy_evaluation_workloads(
+        run, workloads
+    )
+    rewritten_spec: object = spec_document
+    # Replace both absolute and originally declared spellings.  The copied
+    # specification stores paths relative to itself so the finished artifact
+    # remains valid after it is moved to another host or directory.
+    for source, copied in workload_replacements.items():
+        relative = copied.relative_to(run.output)
+        rewritten_spec = _replace_path(rewritten_spec, source, relative)
+        for declared in spec_document.get("workload_manifests", []):
+            if not isinstance(declared, str):
+                continue
+            declared_path = Path(declared)
+            resolved = (
+                declared_path
+                if declared_path.is_absolute()
+                else spec.parent / declared_path
+            ).resolve()
+            if resolved == source:
+                rewritten_spec = _replace_path(
+                    rewritten_spec, Path(declared), relative
+                )
+    if not isinstance(rewritten_spec, dict):
+        raise RuntimeError("rewritten evaluation specification is not an object")
     copied_qualification: Path | None = None
-    if qualification is not None:
-        qualification_path = Path(str(qualification)).resolve()
+    if qualification_path is not None:
         required_tiers = {
             str(trial["tier"])
             for trial in spec_document.get("experiments", [])
@@ -318,8 +392,16 @@ def _run_evaluation(
         copied_qualification = run.output / "tier-qualification.json"
         shutil.copy2(qualification_path, copied_qualification)
         rewritten_spec = _replace_path(
-            rewritten_spec, qualification_path, copied_qualification
+            rewritten_spec,
+            qualification_path,
+            copied_qualification.relative_to(run.output),
         )
+        if isinstance(qualification_value, str):
+            rewritten_spec = _replace_path(
+                rewritten_spec,
+                Path(qualification_value),
+                copied_qualification.relative_to(run.output),
+            )
         run.update(
             tier_qualification_manifest="tier-qualification.json",
             tier_qualification_manifest_digest=file_digest(copied_qualification),
@@ -329,18 +411,36 @@ def _run_evaluation(
         json.dumps(rewritten_spec, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    rq0 = run.output / "rq0-opportunity.json"
-    run.command(
-        [
-            sys.executable,
-            "experiments/analyze_workload.py",
-            str(copied_workload),
-            "--output",
-            str(rq0),
-        ],
-        name="workload-rq0",
-        environment=environment,
+    validate_evaluation_spec(
+        rewritten_spec,
+        qualification_path=copied_qualification,
+        base_dir=run.output,
     )
+    rq0_metadata: list[dict[str, object]] = []
+    for index, workload_entry in enumerate(copied_workload_metadata):
+        copied_workload = run.output / str(workload_entry["manifest"])
+        rq0 = run.output / "rq0" / f"{index:03d}-{workload_entry['scenario_id']}.json"
+        rq0.parent.mkdir(parents=True, exist_ok=True)
+        run.command(
+            [
+                sys.executable,
+                "experiments/analyze_workload.py",
+                str(copied_workload),
+                "--output",
+                str(rq0),
+            ],
+            name=f"workload-rq0-{index:03d}",
+            environment=environment,
+        )
+        rq0_metadata.append(
+            {
+                "scenario_id": workload_entry["scenario_id"],
+                "report": str(rq0.relative_to(run.output)),
+                "report_digest": file_digest(rq0),
+                "demand_trace_digest": workload_entry["demand_trace_digest"],
+            }
+        )
+    run.update(rq0_opportunities=rq0_metadata)
     if args.performance_evidence is not None:
         source_evidence = args.performance_evidence.resolve()
         if not source_evidence.is_dir():
@@ -377,8 +477,6 @@ def _run_evaluation(
     run.update(
         evaluation_spec="evaluation-spec.json",
         evaluation_spec_digest=file_digest(spec_copy),
-        rq0_opportunity="rq0-opportunity.json",
-        rq0_opportunity_digest=file_digest(rq0),
         evaluation_output="evaluation",
     )
 
@@ -590,26 +688,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise RuntimeError(
                         f"workload manifest does not exist: {source_manifest}"
                     )
-                validate_workload(source_manifest)
-                source_records = (
-                    source_manifest.parent
-                    / json.loads(source_manifest.read_text(encoding="utf-8"))[
-                        "records_file"
-                    ]
-                )
-                destination = run.output / "workload"
-                destination.mkdir()
-                shutil.copy2(source_manifest, destination / "manifest.json")
-                shutil.copy2(source_records, destination / "records.jsonl")
-                run.update(
-                    workload_replay_manifest="workload/manifest.json",
-                    workload_replay_manifest_digest=file_digest(
-                        destination / "manifest.json"
-                    ),
-                    workload_replay_records_digest=file_digest(
-                        destination / "records.jsonl"
-                    ),
-                )
+                _copy_workload(run, source_manifest)
             if args.result is not None:
                 result = args.result.resolve()
                 if not result.is_file():

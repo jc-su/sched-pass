@@ -64,6 +64,20 @@ int main() {
     require(nonVfioNvmeRejected,
             "NVMe transport accepted a non-VFIO ownership endpoint");
 
+    bool invalidHbmPolicyRejected = false;
+    try {
+      nta::NvmeTransportOptions invalidNvme;
+      invalidNvme.endpoint = "vfio:0000:00:00.0";
+      invalidNvme.deviceOrdinal = originalDevice;
+      invalidNvme.hbmMappingPolicy =
+          static_cast<nta::NvmeHbmMappingPolicy>(UINT32_MAX);
+      nta::NvmeTransport invalid(std::move(invalidNvme));
+    } catch (const std::invalid_argument &) {
+      invalidHbmPolicyRejected = true;
+    }
+    require(invalidHbmPolicyRejected,
+            "NVMe transport accepted an invalid HBM mapping policy");
+
     nta::HostRuntime boundedIntentPool({1, 2, 1, 1});
     require(boundedIntentPool.config().intentCapacity == 1,
             "intent pool must be sized by the active acquisition frontier");
@@ -135,14 +149,9 @@ int main() {
     }
     require(zeroGenerationRejected,
             "zero request generation must be rejected at the native boundary");
-    bool outOfRangePriorityRejected = false;
-    try {
-      runtime.setRequest(1, 1002, 1, 0, nta::abi::UrgencyBucketCount);
-    } catch (const std::invalid_argument &) {
-      outOfRangePriorityRejected = true;
-    }
-    require(outOfRangePriorityRejected,
-            "request priority outside urgency buckets must be rejected");
+    runtime.setRequest(1, 1002, 1, 0, UINT32_MAX);
+    require(runtime.readRequest(1).priority == UINT32_MAX,
+            "caller priority must retain its full ABI range");
 
     runtime.setRequest(0, 1001, 7, 2, 3, 9000);
     runtime.setTenantBudget(2, 1ULL << 20U);
@@ -162,6 +171,9 @@ int main() {
                 hostView.dependencyCapacity == 32 &&
                 hostView.dependencies != nullptr &&
                 hostView.workRunnableNs != nullptr &&
+                hostView.intentQueueEntries != nullptr &&
+                hostView.intentQueueControls != nullptr &&
+                hostView.intentQueueHeap != nullptr &&
                 hostView.pendingWorkTickets != nullptr &&
                 hostView.pendingCount != nullptr &&
                 hostView.objectDependentHeads != nullptr &&
@@ -530,6 +542,14 @@ int main() {
     require(runtime.readReplica(2).tensorMapAddress == 0x1000ULL &&
                 runtime.readObject(2).stagingTensorMapAddress == 0x2000ULL,
             "tensor-map binding was not published");
+    bool lateTensorMapRejected = false;
+    try {
+      runtime.bindTensorMaps(0, 0, replicaMap, stagingMap);
+    } catch (const std::runtime_error &) {
+      lateTensorMapRejected = true;
+    }
+    require(lateTensorMapRejected,
+            "tensor-map binding must reject an already-ready object");
     const nta::abi::IntentPool intentPool = runtime.readIntentPool();
     require(intentPool.capacity == runtime.config().intentCapacity,
             "intent pool capacity was not installed");

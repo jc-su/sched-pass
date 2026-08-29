@@ -83,6 +83,7 @@ class ExactWorkTopology:
     unit_bytes: int
     estimated_compute_ns: tuple[int, ...]
     requests: tuple[RequestWorkTopology, ...]
+    ready_deadline_offset_ns: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "epoch", u32(self.epoch, "work epoch"))
@@ -109,6 +110,14 @@ class ExactWorkTopology:
         object.__setattr__(self, "logical_work", logical)
         object.__setattr__(self, "demand_units", demand)
         object.__setattr__(self, "estimated_compute_ns", compute)
+        deadline_values = self.ready_deadline_offset_ns or (0,) * work_count
+        if len(deadline_values) != work_count:
+            raise ValueError("exact work topology deadline array must align")
+        object.__setattr__(
+            self,
+            "ready_deadline_offset_ns",
+            tuple(u64(value, "ready deadline offset") for value in deadline_values),
+        )
         if not self.requests:
             raise ValueError("exact work topology has no request ownership")
         cursor = 0

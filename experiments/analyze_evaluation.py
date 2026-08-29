@@ -20,19 +20,23 @@ from typing import Any, Iterable
 
 try:
     from .consumer_contract import validate_consumer_contract
+    from .mechanism_arms import ARMS, validate_arm_result
+    from .result_contracts import (
+        extract_trial_metrics,
+        result_demand_digest,
+        validate_trial_result,
+    )
 except ImportError:  # pragma: no cover - direct script execution
     from consumer_contract import validate_consumer_contract
+    from mechanism_arms import ARMS, validate_arm_result
+    from result_contracts import (
+        extract_trial_metrics,
+        result_demand_digest,
+        validate_trial_result,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REQUIRED_STRATA = {
-    "request_state",
-    "granularity",
-    "load_ratio",
-    "availability_skew",
-    "staging_pressure",
-    "arrival",
-}
 _BOOTSTRAP_SAMPLES = 10_000
 
 
@@ -129,11 +133,20 @@ def _contract_values(result: dict[str, Any]) -> list[Any]:
 
 
 def _validate_result(
-    record: dict[str, Any], *, required_consumer_kind: str | None = None
+    record: dict[str, Any],
+    *,
+    required_consumer_kind: str | None = None,
+    expected_result_contract: str | None = None,
+    formal: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     result = record.get("result")
     if not isinstance(result, dict):
         raise ValueError("trial result is not a JSON object")
+    validate_trial_result(
+        result,
+        expected_contract=expected_result_contract,
+        formal=formal,
+    )
     classification = result.get("classification")
     if not isinstance(classification, str) or not classification:
         raise ValueError("trial result has no machine-readable classification")
@@ -251,6 +264,7 @@ def analyze(output: Path) -> dict[str, Any]:
 
     seen: set[tuple[str, str, int]] = set()
     workload_digests: set[str] = set()
+    scenario_digests: dict[str, set[str]] = {}
     consumer_contracts: set[str] = set()
     for record in records:
         identity = (
@@ -268,20 +282,24 @@ def analyze(output: Path) -> dict[str, Any]:
             record.get("arm") != declaration.get("arm")
             or record.get("tier") != declaration.get("tier")
             or record.get("stratum") != declaration.get("stratum")
+            or record.get("workload_manifest")
+            != str(Path(declaration.get("workload_manifest", "")).resolve())
         ):
             raise ValueError(
                 f"trial metadata diverges from its declaration: {identity[:2]}"
             )
         if not isinstance(identity[2], int) or not 0 <= identity[2] < repetitions:
             raise ValueError(f"invalid repetition for {identity[:2]}")
-        if record.get("arm") not in {f"B{index}" for index in range(7)}:
-            raise ValueError("trial has no canonical B0-B6 arm")
+        if record.get("arm") not in set(ARMS):
+            raise ValueError("trial has no canonical A0-A3 arm")
         if record.get("demand_semantics") != "exact":
             raise ValueError("trial artifact is not exact-demand")
-        if not isinstance(record.get("stratum"), dict) or not REQUIRED_STRATA <= set(
-            record["stratum"]
+        if (
+            not isinstance(record.get("stratum"), dict)
+            or not isinstance(record["stratum"].get("id"), str)
+            or not isinstance(record["stratum"].get("demand_trace_digest"), str)
         ):
-            raise ValueError("trial artifact is missing required strata")
+            raise ValueError("trial artifact is missing its workload scenario")
         required_consumer_kind = (
             declaration.get("consumer_kind")
             if evaluation_profile == "osdi-complete"
@@ -292,28 +310,66 @@ def analyze(output: Path) -> dict[str, Any]:
             "framework_reference",
         }:
             raise ValueError(f"formal trial {identity[:2]} has no valid consumer_kind")
+        if record.get("result_contract") != declaration.get("result_contract"):
+            raise ValueError(
+                f"trial result contract diverges from its declaration: {identity[:2]}"
+            )
+        formal = evaluation_profile == "osdi-complete"
         for contract in _validate_result(
-            record, required_consumer_kind=required_consumer_kind
+            record,
+            required_consumer_kind=required_consumer_kind,
+            expected_result_contract=declaration.get("result_contract"),
+            formal=formal,
         ):
             consumer_contracts.add(
                 json.dumps(contract, sort_keys=True, separators=(",", ":"))
+            )
+        if formal:
+            activation = validate_arm_result(record["result"], record["arm"])
+            if record.get("arm_activation") != activation:
+                raise ValueError(
+                    f"sealed activation diverges from timed counters: {identity[:2]}"
+                )
+        measured_metrics = extract_trial_metrics(
+            record["result"],
+            declaration.get("metrics", []),
+            expected_contract=declaration.get("result_contract"),
+            formal=formal,
+        )
+        if record.get("metrics") != measured_metrics:
+            raise ValueError(
+                f"sealed trial metrics diverge from result records: {identity[:2]}"
             )
         if physical_tiers:
             if record.get("tier_qualification_digest") != qualification_digest:
                 raise ValueError(
                     "trial qualification digest diverges from evaluation metadata"
                 )
-        digest = _workload_digest(record, evaluation_metadata)
+        digest = (
+            result_demand_digest(record["result"])
+            if formal
+            else _workload_digest(record, evaluation_metadata)
+        )
         if not isinstance(digest, str) or not digest:
             raise ValueError("trial has no exact workload/demand digest")
+        if formal:
+            expected_digest = declaration["stratum"]["demand_trace_digest"]
+            if (
+                digest != expected_digest
+                or record.get("observed_workload_demand_digest") != digest
+            ):
+                raise ValueError(
+                    "formal trial demand digest was not emitted by the measured result"
+                )
         workload_digests.add(digest)
+        scenario_digests.setdefault(record["stratum"]["id"], set()).add(digest)
         for metric in declaration.get("metrics", []):
-            if not _finite(record["result"].get(metric)):
+            if not _finite(record["metrics"].get(metric)):
                 raise ValueError(
                     f"metric {metric} is missing or non-finite in {identity[:2]}"
                 )
-    if len(workload_digests) > 1:
-        raise ValueError("paired trials use different workload/demand digests")
+    if any(len(digests) != 1 for digests in scenario_digests.values()):
+        raise ValueError("one workload scenario used multiple demand identities")
 
     strata: list[dict[str, Any]] = []
     for key, declaration in declared.items():
@@ -334,7 +390,7 @@ def analyze(output: Path) -> dict[str, Any]:
                 "stratum": declaration["stratum"],
                 "repetitions": repetitions,
                 "metrics": {
-                    metric: _summary(record["result"][metric] for record in selected)
+                    metric: _summary(record["metrics"][metric] for record in selected)
                     for metric in declaration.get("metrics", [])
                 },
             }
@@ -372,8 +428,8 @@ def analyze(output: Path) -> dict[str, Any]:
                 raise ValueError(
                     f"comparison {name} is not metadata-matched at repetition {repetition}"
                 )
-            left_value = float(left["result"][metric])
-            right_value = float(right["result"][metric])
+            left_value = float(left["metrics"][metric])
+            right_value = float(right["metrics"][metric])
             if right_value == 0:
                 raise ValueError(f"comparison {name} has a zero denominator")
             deltas.append(left_value - right_value)
@@ -414,10 +470,8 @@ def analyze(output: Path) -> dict[str, Any]:
                 "evaluation_profile", "contract"
             ),
             "spec_digest": evaluation_metadata.get("spec_digest"),
-            "workload_manifest_digest": evaluation_metadata.get(
-                "workload_manifest_digest"
-            ),
-            "workload_demand_digest": next(iter(workload_digests), None),
+            "workloads": evaluation_metadata.get("workloads"),
+            "workload_demand_digests": sorted(workload_digests),
             "tier_qualification_digest": qualification_digest,
             "qualified_physical_tiers": sorted(physical_tiers),
             "trial_count": len(records),
@@ -427,15 +481,15 @@ def analyze(output: Path) -> dict[str, Any]:
         },
         "strata": strata,
         "causal_comparisons": causal,
-        "little_law": [
+        "finite_window_accounting": [
             {
                 "experiment": record["experiment"],
                 "variant": record["variant"],
                 "repetition": record["repetition"],
-                "report": record["result"].get("littles_law"),
+                "report": record["result"].get("finite_window_accounting"),
             }
             for record in records
-            if isinstance(record["result"].get("littles_law"), dict)
+            if isinstance(record["result"].get("finite_window_accounting"), dict)
         ],
     }
     (output / "evaluation-report.json").write_text(

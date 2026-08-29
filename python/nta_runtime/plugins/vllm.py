@@ -41,6 +41,16 @@ def _has_scheduled_work(scheduler_output: Any) -> bool:
     return isinstance(scheduled, Mapping) and bool(scheduled)
 
 
+def _abort_failed_forward(state: Any, failure: BaseException) -> None:
+    """Run every NTA abort hook without hiding the numerical failure."""
+    from nta_runtime.engines.vllm import _abort_forward
+
+    try:
+        _abort_forward(state)
+    except BaseException as abort_failure:
+        failure.add_note(f"vLLM NTA forward abort also failed: {abort_failure!r}")
+
+
 def _patch_v1_runner(runner_class: type[Any]) -> None:
     if getattr(runner_class, "_nta_bridge_patched", False):
         return
@@ -64,12 +74,14 @@ def _patch_v1_runner(runner_class: type[Any]) -> None:
         controller = _controller(self)
         state.scheduler_output = scheduler_output
         state.input_batch = self.input_batch
+        state.execution_owner = controller
+        controller.begin_forward(state)
         state.batch = controller.bind(scheduler_output)
         controller.prepare_physical_destinations()
         state.hook = controller.hook
         state.tier_service = controller.tier_service
-        state.execution_owner = controller
-        state.request_slots_tensor = controller.request_slots_tensor
+        state.tenant_isolation_enabled = controller.tenant_isolation_enabled
+        state.request_bindings_tensor = controller.request_bindings_tensor
         state.page_size = controller.page_size
         return result
 
@@ -79,11 +91,15 @@ def _patch_v1_runner(runner_class: type[Any]) -> None:
         if state is not None and state.reference_warmup:
             return original_execute(self, scheduler_output, intermediate_tensors)
         with vllm_v1_forward_state(scheduler_output) as forward_state:
-            result = original_execute(self, scheduler_output, intermediate_tensors)
-            from nta_runtime.engines.vllm import _commit_forward_evidence
+            try:
+                result = original_execute(self, scheduler_output, intermediate_tensors)
+                from nta_runtime.engines.vllm import _commit_forward
 
-            _commit_forward_evidence(forward_state)
-            return result
+                _commit_forward(forward_state)
+                return result
+            except BaseException as failure:
+                _abort_failed_forward(forward_state, failure)
+                raise
 
     @functools.wraps(original_dummy_run)
     def dummy_run(self, *args, **kwargs):
@@ -144,18 +160,22 @@ def _patch_v2_runner(runner_class: type[Any]) -> None:
                     is_profile,
                 )
         with vllm_v1_forward_state(scheduler_output) as forward_state:
-            result = original_execute(
-                self,
-                scheduler_output,
-                intermediate_tensors,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                is_profile,
-            )
-            from nta_runtime.engines.vllm import _commit_forward_evidence
+            try:
+                result = original_execute(
+                    self,
+                    scheduler_output,
+                    intermediate_tensors,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                    is_profile,
+                )
+                from nta_runtime.engines.vllm import _commit_forward
 
-            _commit_forward_evidence(forward_state)
-            return result
+                _commit_forward(forward_state)
+                return result
+            except BaseException as failure:
+                _abort_failed_forward(forward_state, failure)
+                raise
 
     @functools.wraps(original_prepare_attn)
     def prepare_attn(self, input_batch):
@@ -172,13 +192,17 @@ def _patch_v2_runner(runner_class: type[Any]) -> None:
         from nta_runtime.engines.vllm import _controller
 
         controller = _controller(self)
+        metadata = metadata.aligned_to(input_batch.req_ids)
         state.input_batch = input_batch
-        state.batch = controller.bind_connector(metadata)
+        state.connector_metadata = metadata
+        state.execution_owner = controller
+        controller.begin_forward(state)
+        state.batch = controller.bind_connector(metadata, input_batch)
         controller.prepare_physical_destinations()
         state.hook = controller.hook
         state.tier_service = controller.tier_service
-        state.execution_owner = controller
-        state.request_slots_tensor = controller.request_slots_tensor
+        state.tenant_isolation_enabled = controller.tenant_isolation_enabled
+        state.request_bindings_tensor = controller.request_bindings_tensor
         state.page_size = controller.page_size
         # FlashInferMetadataBuilder now sees the immutable EngineBatch and can
         # select the request-bound wrapper before vLLM performs its one native

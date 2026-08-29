@@ -18,7 +18,7 @@
       "role": "host-staged-serving-tier",
       "backend": "indexed-host-staged",
       "resource_kind": "host_staged",
-      "steady_state_path": "host_indexed_copy",
+      "steady_state_path": "host_indexed_copy_to_engine_hbm",
       "qualification": "cuda_can_register_pinned_host_memory",
       "evidence": ["native_attention_correctness", "native_gpu_timing", "serving"]
     },
@@ -27,7 +27,7 @@
       "role": "persistent-device-initiated-tier",
       "backend": "vfio-nvme",
       "resource_kind": "nvme",
-      "steady_state_path": "gpu_owned_nvme_to_hbm",
+      "steady_state_path": "nvme_peer_dma_to_engine_hbm",
       "qualification": "explicit_vfio_iommu_and_read_only_contract",
       "evidence": ["transport_qualification", "native_acquisition_correctness", "native_gpu_timing"]
     },
@@ -73,7 +73,7 @@
       "id": "RQ3",
       "question": "Does the benefit survive request, tier, load, arrival, and granularity strata?",
       "primary_artifact": "stratified-serving-report",
-      "metrics": ["goodput", "tail_latency", "queue_delay", "admission_delay", "littles_law_residual"]
+      "metrics": ["goodput", "tail_latency", "queue_delay", "admission_delay", "finite_window_occupancy"]
     },
     {
       "id": "RQ4",
@@ -83,31 +83,28 @@
     }
   ],
   "arms": [
-    {"id": "B0", "name": "resident-exact-conventional", "exact_demand": true},
-    {"id": "B1", "name": "host-promotion-batch-barrier", "exact_demand": true},
-    {"id": "B2", "name": "host-demand-conventional-gather", "exact_demand": true},
-    {"id": "B3", "name": "device-demand-conventional-gather", "exact_demand": true},
-    {"id": "B4", "name": "device-demand-late-bound", "exact_demand": true},
-    {"id": "B5", "name": "heterogeneous-bounded-work-units", "exact_demand": true},
-    {"id": "B6", "name": "exact-partial-continuation", "exact_demand": true, "serving_headline": false}
+    {"id": "A0", "name": "framework-bulk", "exact_demand": true},
+    {"id": "A1", "name": "exact-preacquired-stock", "exact_demand": true},
+    {"id": "A2", "name": "device-discovery-bulk", "exact_demand": true},
+    {"id": "A3", "name": "late-bound-work-unit", "exact_demand": true}
   ],
   "causal_pairs": [
-    {"numerator": "B1", "denominator": "B0", "role": "residency_boundary"},
-    {"numerator": "B2", "denominator": "B1", "role": "host_demand_boundary"},
-    {"numerator": "B3", "denominator": "B2", "role": "device_selection_boundary"},
-    {"numerator": "B4", "denominator": "B3", "role": "late_binding_boundary"},
-    {"numerator": "B5", "denominator": "B4", "role": "heterogeneous_work_unit_boundary"},
-    {"numerator": "B6", "denominator": "B5", "role": "partial_protocol_boundary"},
-    {"numerator": "B3", "denominator": "B1", "role": "host_round_trip_isolation"},
-    {"numerator": "B5", "denominator": "B3", "role": "complete_mechanism_isolation"}
+    {"numerator": "A1", "denominator": "A0", "role": "exact_acquisition_boundary"},
+    {"numerator": "A2", "denominator": "A1", "role": "device_discovery_boundary"},
+    {"numerator": "A3", "denominator": "A2", "role": "late_bound_work_unit_boundary"}
   ],
-  "strata": {
-    "request_state": ["resident", "external_ready", "external_blocked", "new_arrival", "mixed"],
-    "granularity": ["request", "layer", "page_group", "cta_tile"],
-    "load_ratio": ["control_dominated", "balanced", "compute_dominated"],
-    "availability_skew": ["low", "medium", "high"],
-    "staging_pressure": ["under_capacity", "near_capacity", "over_capacity"],
-    "arrival": ["batch_release", "calibrated_open_loop", "trace_timestamp", "burst"]
+  "workload_scenario_contract": {
+    "minimum_distinct_scenarios": 6,
+    "identity": ["manifest_sha256", "records_digest", "demand_trace_digest"],
+    "derived_axes": ["request_state_counts", "input_tokens", "output_tokens", "cached_prefix_tokens", "uncached_query_rows", "arrival"],
+    "free_form_stratum_labels": false,
+    "same_scenario_required_within_pair": true
+  },
+  "mechanism_observations": {
+    "not_workload_labels": ["numerical_dispatch", "work_unit_granularity", "availability_skew", "staging_pressure", "transfer_compute_ratio"],
+    "require_result_emitted_evidence": true,
+    "ablation_or_continuous_axis_only": true,
+    "orthogonal_axes": ["frontier_depth", "work_unit_granularity", "transport_engine", "tier", "batch_heterogeneity"]
   },
   "fairness": [
     "same request records and arrival offsets per paired arm",
@@ -123,7 +120,7 @@
     "minimum_repetitions": 5,
     "preferred_repetitions": 10,
     "confidence_interval": "paired-bootstrap-95-percent",
-    "report_per_stratum_before_aggregate": true,
+    "report_per_scenario_before_aggregate": true,
     "reject_cherry_picking": true
   },
   "qualification_rules": {

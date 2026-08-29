@@ -6,10 +6,20 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "python"))
+
+from nta_runtime.resource_contract import resource_contract  # noqa: E402
+from experiments.mechanism_arms import (  # noqa: E402
+    ARMS,
+    ARM_DEFINITIONS,
+    CAUSAL_PAIRS,
+)
 
 
 def validate(document: dict[str, Any]) -> None:
@@ -27,10 +37,13 @@ def validate(document: dict[str, Any]) -> None:
     if not {"hbm", "host_mem", "nvme", "dax"} <= tier_ids:
         raise ValueError("evaluation contract lacks HBM/host/NVMe/DAX tiers")
     expected_resources = {
-        "hbm": ("hbm", "gpu_hbm_load"),
-        "host_mem": ("host_staged", "host_indexed_copy"),
-        "nvme": ("nvme", "gpu_owned_nvme_to_hbm"),
-        "dax": ("cxl_dax", "cuda_visible_cxl_direct"),
+        tier_id: (resource_kind, resource_contract(resource_kind).steady_state_path)
+        for tier_id, resource_kind in {
+            "hbm": "hbm",
+            "host_mem": "host_staged",
+            "nvme": "nvme",
+            "dax": "cxl_dax",
+        }.items()
     }
     tiers = {tier["id"]: tier for tier in document["tiers"]}
     for tier_id, (resource_kind, steady_state_path) in expected_resources.items():
@@ -57,13 +70,17 @@ def validate(document: dict[str, Any]) -> None:
             "baseline, not an ambiguous host serving tier"
         )
     arms = document.get("arms", [])
-    if [arm.get("id") for arm in arms] != [f"B{index}" for index in range(7)]:
-        raise ValueError("evaluation contract must define B0-B6 in order")
+    if [arm.get("id") for arm in arms] != list(ARMS):
+        raise ValueError("evaluation contract must define A0-A3 in order")
     if not all(arm.get("exact_demand") is True for arm in arms):
         raise ValueError("every arm must use exact demand")
-    expected_pairs = tuple((f"B{index}", f"B{index - 1}") for index in range(1, 7)) + (
-        ("B3", "B1"),
-        ("B5", "B3"),
+    if any(
+        arm.get("name") != ARM_DEFINITIONS[arm["id"]]["name"] for arm in arms
+    ):
+        raise ValueError("evaluation arm names diverge from the executable forms")
+    expected_pairs = tuple(
+        (numerator, denominator)
+        for numerator, denominator, _role in CAUSAL_PAIRS
     )
     causal_pairs = document.get("causal_pairs")
     actual_pairs = (
@@ -73,19 +90,33 @@ def validate(document: dict[str, Any]) -> None:
     )
     if actual_pairs != expected_pairs:
         raise ValueError(
-            "evaluation contract must include adjacent and decisive cross-boundary pairs"
+            "evaluation contract must include every executable causal boundary"
         )
-    strata = document.get("strata", {})
-    for name in (
-        "request_state",
-        "granularity",
-        "load_ratio",
-        "availability_skew",
-        "staging_pressure",
-        "arrival",
+    scenarios = document.get("workload_scenario_contract")
+    if (
+        not isinstance(scenarios, dict)
+        or scenarios.get("minimum_distinct_scenarios", 0) < 6
+        or scenarios.get("free_form_stratum_labels") is not False
+        or scenarios.get("same_scenario_required_within_pair") is not True
+        or set(scenarios.get("identity", ()))
+        != {"manifest_sha256", "records_digest", "demand_trace_digest"}
     ):
-        if not strata.get(name):
-            raise ValueError(f"missing evaluation stratum {name}")
+        raise ValueError("evaluation contract lacks typed workload scenarios")
+    observations = document.get("mechanism_observations")
+    if (
+        not isinstance(observations, dict)
+        or observations.get("require_result_emitted_evidence") is not True
+        or observations.get("ablation_or_continuous_axis_only") is not True
+        or set(observations.get("orthogonal_axes", ()))
+        != {
+            "frontier_depth",
+            "work_unit_granularity",
+            "transport_engine",
+            "tier",
+            "batch_heterogeneity",
+        }
+    ):
+        raise ValueError("evaluation contract misclassifies mechanism observations")
     statistics = document.get("statistical_protocol", {})
     if statistics.get("minimum_repetitions", 0) < 5 or not statistics.get(
         "randomized_paired_arm_order"

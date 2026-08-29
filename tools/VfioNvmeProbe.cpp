@@ -1,5 +1,5 @@
-#include "nta/NvmeRuntime.h"
 #include "nta/NvmeDiscovery.h"
+#include "nta/NvmeRuntime.h"
 
 #include <cuda.h>
 
@@ -32,19 +32,35 @@ const char *hbmBackendName(nta::NvmeHbmMappingBackend backend) {
     return "unavailable";
   case nta::NvmeHbmMappingBackend::NvidiaPeerPages:
     return "nvidia-peer-pages";
+  case nta::NvmeHbmMappingBackend::CudaDmaBufIoas:
+    return "cuda-dmabuf-ioas";
   }
   return "unknown";
+}
+
+nta::NvmeHbmMappingPolicy parseHbmPolicy(std::string_view value) {
+  if (value == "auto") {
+    return nta::NvmeHbmMappingPolicy::Auto;
+  }
+  if (value == "nvidia-peer-pages") {
+    return nta::NvmeHbmMappingPolicy::NvidiaPeerPages;
+  }
+  if (value == "cuda-dmabuf-ioas") {
+    return nta::NvmeHbmMappingPolicy::CudaDmaBufIoas;
+  }
+  throw std::invalid_argument("invalid HBM mapping policy");
 }
 
 } // namespace
 
 int main(int argc, char **argv) {
   try {
-    if (argc > 7) {
+    if (argc > 8) {
       throw std::invalid_argument(
           "usage: nta-vfio-nvme-probe [vfio:DDDD:BB:SS.F] [gpu] [nsid] [depth] "
           "[hardware-write-protect|trusted-read-only-code] "
-          "[hbm-peer|host-mapped]");
+          "[hbm-peer|host-mapped] "
+          "[auto|cuda-dmabuf-ioas|nvidia-peer-pages]");
     }
     nta::NvmeTransportOptions options;
     const char *configuredEndpoint = std::getenv("NTA_NVME_ENDPOINT");
@@ -60,7 +76,8 @@ int main(int argc, char **argv) {
                                : "vfio:" + std::string(configuredBdf);
       } else {
         options.endpoint =
-            nta::qualification::discoverVfioNvmeEndpoint().value_or(std::string{});
+            nta::qualification::discoverVfioNvmeEndpoint().value_or(
+                std::string{});
       }
     }
     if (options.endpoint.empty()) {
@@ -103,6 +120,9 @@ int main(int argc, char **argv) {
         throw std::invalid_argument("invalid DMA target");
       }
     }
+    if (argc > 7) {
+      options.hbmMappingPolicy = parseHbmPolicy(argv[7]);
+    }
     CUresult result = cuInit(0);
     if (result != CUDA_SUCCESS) {
       throw std::runtime_error("cuInit failed");
@@ -138,18 +158,15 @@ int main(int argc, char **argv) {
               << (capabilities.namespaceReadOnly ? "hardware-write-protected"
                                                  : "trusted-read-only-code")
               << " destination="
-              << (dmaTarget == nta::NvmeDmaTarget::HbmPeer
-                      ? "hbm-peer"
-                      : "host-mapped")
+              << (dmaTarget == nta::NvmeDmaTarget::HbmPeer ? "hbm-peer"
+                                                           : "host-mapped")
               << " hbm_peer_dma="
-              << (capabilities.supportsHbmPeerDma ? "available"
-                                                     : "unavailable")
+              << (capabilities.supportsHbmPeerDma ? "available" : "unavailable")
               << " hbm_mapping_backend="
               << hbmBackendName(capabilities.hbmMappingBackend)
               << " hbm_dma_map="
-              << (dmaTarget == nta::NvmeDmaTarget::HbmPeer
-                      ? "validated"
-                      : "not-applicable")
+              << (dmaTarget == nta::NvmeDmaTarget::HbmPeer ? "validated"
+                                                           : "not-applicable")
               << " gpu_control_path=validated"
               << " selected_data_io=not-exercised\n";
     return 0;

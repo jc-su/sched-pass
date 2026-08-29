@@ -10,17 +10,28 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 from nta_runtime.engines import vllm as vllm_engine  # noqa: E402
+from nta_runtime.engines import vllm_modules  # noqa: E402
+from nta_runtime.engines import vllm_worker  # noqa: E402
+from nta_runtime.engines.vllm_config import VllmAttentionConfig  # noqa: E402
+from nta_runtime.plugins import vllm as vllm_plugin  # noqa: E402
 from nta_runtime.adapters.base import EngineBatch, ExactDemandProjection  # noqa: E402
 from nta_runtime.adapters.vllm_v1 import (  # noqa: E402
     VllmV1ForwardState,
+    VllmV1Hook,
     vllm_v1_forward_state,
 )
-from nta_runtime.connectors.vllm import NtaVllmConnector  # noqa: E402
+from nta_runtime.connectors.vllm import (  # noqa: E402
+    NtaVllmConnector,
+    NtaVllmExternalLease,
+    NtaVllmForwardAck,
+)
 from nta_runtime.connectors.vllm_host import (  # noqa: E402
     VllmHostWorker,
     _resolve_synchronous_load,
@@ -58,6 +69,24 @@ class FakeResources:
     def close(self) -> None:
         self.closed += 1
         self.runtime.close()
+
+
+class IdentityRuntime:
+    def __init__(self) -> None:
+        self.published: list[tuple[int, int, int]] = []
+        self.cancelled: list[tuple[int, int]] = []
+
+    def set_request(
+        self,
+        slot: int,
+        request_id: int,
+        generation: int,
+        **_policy: int,
+    ) -> None:
+        self.published.append((slot, request_id, generation))
+
+    def cancel_request(self, slot: int, generation: int) -> None:
+        self.cancelled.append((slot, generation))
 
 
 def _connector() -> NtaVllmConnector:
@@ -176,9 +205,7 @@ def _test_physical_storage_identity() -> None:
             block_hashes=[b"hash-0", b"hash-1"],
             num_tokens=8,
         )
-        partial_tokens, asynchronous = connector.get_num_new_matched_tokens(
-            partial, 0
-        )
+        partial_tokens, asynchronous = connector.get_num_new_matched_tokens(partial, 0)
         assert partial_tokens == 4 and not asynchronous
         too_short = SimpleNamespace(
             request_id="too-short",
@@ -204,6 +231,7 @@ def _test_physical_storage_identity() -> None:
                 scheduled={"external": 1},
             )
         )
+        assert metadata.external_lease is not None
         assert metadata.storage_key_tables == (
             (
                 vllm_storage_key(b"hash-0"),
@@ -211,10 +239,95 @@ def _test_physical_storage_identity() -> None:
                 None,
             ),
         )
+        uncommitted_retry = connector.build_connector_meta(
+            _scheduler_output(scheduled={"external": 1})
+        )
+        assert uncommitted_retry.external_lease is not None
+        assert uncommitted_retry.storage_key_tables == metadata.storage_key_tables
+
+        # A worker failure must not acknowledge or consume the scheduler's
+        # exact storage identities. Only a complete numerical forward returns
+        # the lease through KVConnectorWorkerMetadata.
+        worker = _physical_connector(path)
+        worker.bind_connector_metadata(metadata)
+        worker_batch = EngineBatch(
+            "vllm",
+            0,
+            (RequestBinding(0, 0, 1, stable_request_id("external")),),
+            Granularity.PAGE_GROUP,
+            ExactDemandProjection(((10, 11, 12),), 4096),
+        )
+        with vllm_v1_forward_state(SimpleNamespace()) as state:
+            state.batch = worker_batch
+            state.input_batch = SimpleNamespace(req_ids=["external"])
+            worker.start_load_kv(SimpleNamespace())
+            worker.abort_forward()
+        assert worker.build_connector_worker_meta() is None
+        assert not worker.has_connector_metadata()
+
+        # A delayed ACK for the aborted lease cannot consume the newer retry.
+        connector.update_connector_output(
+            SimpleNamespace(
+                kv_connector_worker_meta=NtaVllmForwardAck(metadata.external_lease)
+            )
+        )
+        assert connector._storage_keys_by_block["external"][10] == vllm_storage_key(
+            b"hash-0"
+        )
+        retry_lease = uncommitted_retry.external_lease
+        assert retry_lease is not None
+        conflicting = NtaVllmForwardAck(
+            NtaVllmExternalLease(
+                retry_lease.lease_id,
+                (
+                    (
+                        "external",
+                        (
+                            (10, vllm_storage_key(b"hash-0")),
+                            (11, "conflicting-key"),
+                        ),
+                    ),
+                ),
+            )
+        )
+        try:
+            connector.update_connector_output(
+                SimpleNamespace(kv_connector_worker_meta=conflicting)
+            )
+        except RuntimeError as error:
+            assert "conflicts" in str(error)
+        else:
+            raise AssertionError("conflicting vLLM external ACK was accepted")
+        assert set(connector._storage_keys_by_block["external"]) == {10, 11}
+
+        worker.bind_connector_metadata(uncommitted_retry)
+        with vllm_v1_forward_state(SimpleNamespace()) as state:
+            state.batch = worker_batch
+            state.input_batch = SimpleNamespace(req_ids=["external"])
+            worker.start_load_kv(SimpleNamespace())
+            worker.validate_forward_commit()
+            worker.commit_forward()
+        acknowledgement = worker.build_connector_worker_meta()
+        assert isinstance(acknowledgement, NtaVllmForwardAck)
+        worker.clear_connector_metadata()
+        connector._expected_worker_acks = 2
+        try:
+            connector.update_connector_output(
+                SimpleNamespace(kv_connector_worker_meta=acknowledgement)
+            )
+        except RuntimeError as error:
+            assert "every worker" in str(error)
+        else:
+            raise AssertionError("partial vLLM worker ACK was accepted")
+        acknowledgement = acknowledgement.aggregate(acknowledgement)
+        connector.update_connector_output(
+            SimpleNamespace(kv_connector_worker_meta=acknowledgement)
+        )
         resident = connector.build_connector_meta(
             _scheduler_output(scheduled={"external": 1})
         )
-        assert resident.storage_key_tables == ((None, None, None),)
+        assert resident.external_lease is None
+        assert resident.storage_key_tables == ((),)
 
 
 def _scheduler_output(
@@ -222,6 +335,7 @@ def _scheduler_output(
     new: tuple[tuple[str, tuple[int, ...]], ...] = (),
     scheduled: dict[str, int] | None = None,
     finished: set[str] | None = None,
+    preempted: set[str] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         scheduled_new_reqs=[
@@ -233,7 +347,7 @@ def _scheduler_output(
         ),
         num_scheduled_tokens={} if scheduled is None else scheduled,
         finished_req_ids=set() if finished is None else finished,
-        preempted_req_ids=set(),
+        preempted_req_ids=set() if preempted is None else preempted,
     )
 
 
@@ -245,8 +359,12 @@ def _test_connector_lifecycle() -> None:
             scheduled={"prefill": 8, "decode": 1},
         )
     )
-    assert first.request_ids == ("decode", "prefill")
-    assert first.block_tables == ((20,), (10, 11))
+    assert first.external_lease is None
+    assert all(request.storage_keys == () for request in first.requests)
+    assert first.request_ids == ("prefill", "decode")
+    aligned = first.aligned_to(("decode", "prefill"))
+    assert aligned.request_ids == ("decode", "prefill")
+    assert aligned.block_tables == ((20,), (10, 11))
 
     connector.request_finished(SimpleNamespace(request_id="prefill"), [10, 11])
     connector.request_finished_all_groups(SimpleNamespace(request_id="decode"), ([20],))
@@ -264,6 +382,24 @@ def _test_connector_lifecycle() -> None:
     consumed = connector.build_connector_meta(_scheduler_output(scheduled={"next": 1}))
     assert consumed.finished_request_ids == ()
 
+    # Preemption-only steps also launch no worker forward. They must survive
+    # in connector state and terminate the old runtime generation when the
+    # next numerical batch arrives.
+    preempt_seed = connector.build_connector_meta(
+        _scheduler_output(new=(("victim", (40,)),), scheduled={"victim": 1})
+    )
+    assert preempt_seed.request_ids == ("victim",)
+    preempt_only = connector.build_connector_meta(
+        _scheduler_output(preempted={"victim"})
+    )
+    assert preempt_only.requests == ()
+    assert preempt_only.finished_request_ids == ("victim",)
+    after_preempt = connector.build_connector_meta(
+        _scheduler_output(new=(("after", (50,)),), scheduled={"after": 1})
+    )
+    assert after_preempt.request_ids == ("after",)
+    assert after_preempt.finished_request_ids == ("victim",)
+
     worker = _connector()
     worker.bind_connector_metadata(replayed)
     worker_batch = EngineBatch(
@@ -275,8 +411,11 @@ def _test_connector_lifecycle() -> None:
     )
     with vllm_v1_forward_state(SimpleNamespace()) as state:
         state.batch = worker_batch
+        state.input_batch = SimpleNamespace(req_ids=["next"])
         worker.start_load_kv(SimpleNamespace())
         assert state.connector_validated
+        worker.commit_forward()
+        assert worker.build_connector_worker_meta() is None
         assert worker.has_connector_metadata()
         worker.clear_connector_metadata()
         assert not worker.has_connector_metadata()
@@ -407,10 +546,14 @@ def _test_typed_all_layer_host_preload() -> None:
         first_wait = state.wait_for_host_preload(stream)
         assert first_wait is (layer_name == "layer.0")
         state.finish_host_layer(layer_name)
-    state.record_direct_launch(
-        "prefill", 2, framework_owned=False, serving_tier="host_staged"
+    state.record_native_launch(
+        "prefill",
+        2,
+        form="request_bound",
+        framework_owned=False,
+        serving_tier="host_staged",
     )
-    evidence = state.commit_direct_evidence()
+    evidence = state.commit_evidence()
     assert waits == [event]
     assert evidence["host_preload_waits"] == 1
     assert evidence["host_preload_batches"] == 1
@@ -427,6 +570,17 @@ def _test_typed_all_layer_host_preload() -> None:
     else:
         raise AssertionError("direct host attention accepted an unready transfer")
 
+    isolated = VllmV1ForwardState()
+    isolated.host_transfer_pairs = ((100, 10),)
+    isolated.host_preload_event = event
+    isolated.tenant_isolation_enabled = True
+    try:
+        isolated.wait_for_host_preload(stream)
+    except RuntimeError as error:
+        assert "tenant byte credits" in str(error)
+    else:
+        raise AssertionError("finite tenant credits allowed a bulk host preload")
+
 
 def _test_external_tier_preserves_acquisition_schedule() -> None:
     batch = EngineBatch(
@@ -438,41 +592,136 @@ def _test_external_tier_preserves_acquisition_schedule() -> None:
     )
     with vllm_v1_forward_state(SimpleNamespace()) as state:
         state.batch = batch
-        with patch.dict("os.environ", {"NTA_SERVING_TIER": "hbm"}, clear=False):
-            assert vllm_engine.NtaVllmFlashInferMetadataBuilder._direct_batch() is batch
-        for tier in ("host_staged", "nvme"):
-            with patch.dict(
-                "os.environ", {"NTA_SERVING_TIER": tier}, clear=False
-            ):
-                assert (
-                    vllm_engine.NtaVllmFlashInferMetadataBuilder._direct_batch()
-                    is None
-                )
+        resident = object.__new__(vllm_engine.NtaVllmFlashInferMetadataBuilder)
+        resident._nta_config = VllmAttentionConfig.from_environment(
+            default_workspace_bytes=4096,
+            environ={
+                "NTA_SERVING_TIER": "hbm",
+                "NTA_VLLM_NATIVE": "1",
+                "FLASHINFER_WORKSPACE_BASE": "/tmp/nta-vllm-config-test",
+            },
+        )
+        assert resident._direct_batch() is batch
+
+        external = object.__new__(vllm_engine.NtaVllmFlashInferMetadataBuilder)
+        external._nta_config = VllmAttentionConfig.from_environment(
+            default_workspace_bytes=4096,
+            environ={
+                "NTA_SERVING_TIER": "host_staged",
+                "NTA_VLLM_NATIVE": "1",
+                "FLASHINFER_WORKSPACE_BASE": "/tmp/nta-vllm-config-test",
+            },
+        )
+        assert external._direct_batch() is None
+
+        # Deployment configuration is immutable after builder construction.
+        # A late process-environment mutation cannot switch either numerical
+        # path underneath an already planned forward.
+        with patch.dict(
+            "os.environ",
+            {"NTA_SERVING_TIER": "nvme", "NTA_VLLM_COMPARE_STOCK": "1"},
+            clear=False,
+        ):
+            assert resident._direct_batch() is batch
+            assert external._direct_batch() is None
+
+
+def _test_attention_modules_are_prepared_at_setup() -> None:
+    config = VllmAttentionConfig.from_environment(
+        default_workspace_bytes=4096,
+        environ={
+            "NTA_SERVING_TIER": "host_staged",
+            "NTA_VLLM_NATIVE": "1",
+            "FLASHINFER_WORKSPACE_BASE": "/tmp/nta-vllm-config-test",
+            "NTA_VLLM_DECODE_MODULE": "decode-override",
+            "NTA_VLLM_PREFILL_MODULE": "prefill-override",
+        },
+    )
+    ensured: list[tuple[str, dict[str, object]]] = []
+    resolved: list[str] = []
+
+    def ensure(name, _dtype, _head_size, **kwargs):
+        ensured.append((name, kwargs))
+        return Path(f"/tmp/{name}.so")
+
+    def resolve(name, _workspace):
+        resolved.append(name)
+        return Path(f"/tmp/{name}.so")
+
+    with (
+        patch.object(
+            vllm_modules, "_ensure_default_attention_module", side_effect=ensure
+        ),
+        patch.object(vllm_modules, "_find_module", side_effect=resolve),
+    ):
+        vllm_modules._prepare_attention_modules(
+            config, (torch.float16, torch.float16), 128
+        )
+
+    assert ensured == [
+        (
+            "nta_batch_prefill_vllm_request_bound_v3_binding_fp16",
+            {
+                "workspace": config.require_workspace(),
+                "request_bound": True,
+                "mapped_request_slots": True,
+            },
+        )
+    ]
+    assert resolved == ["decode-override", "prefill-override"]
 
 
 def _test_worker_global_external_directory_lifetime() -> None:
     controller = vllm_engine.VllmV1WorkerController(Runner())
-    first_version, first_event = controller.begin_external_publication()
+    first_state = VllmV1ForwardState()
+    controller.begin_forward(first_state)
+    first_version, first_event = controller.begin_external_publication("layer-0-stream")
     assert first_version == 1 and first_event is None
 
     recorded = []
     event = SimpleNamespace(record=lambda stream: recorded.append(stream))
     with patch.object(vllm_engine.torch.cuda, "Event", return_value=event):
         controller.record_external_consumer("layer-0-stream")
-    second_version, prior_event = controller.begin_external_publication()
+    controller.commit_forward(first_state)
+
+    second_state = VllmV1ForwardState()
+    controller.begin_forward(second_state)
+    second_version, prior_event = controller.begin_external_publication(
+        "layer-1-stream"
+    )
     assert second_version == 2 and prior_event is event
     assert recorded == ["layer-0-stream"]
 
-    # A second layer cannot overwrite an unconsumed fence. This catches the
-    # former per-AttentionImpl ownership bug before it reaches the GPU runtime.
-    with patch.object(vllm_engine.torch.cuda, "Event", return_value=event):
-        controller.record_external_consumer("layer-1-stream")
-        try:
-            controller.record_external_consumer("layer-2-stream")
-        except RuntimeError as error:
-            assert "twice" in str(error)
-        else:
-            raise AssertionError("external consumer fence was silently overwritten")
+    # A publication cannot overlap another one, and abort must fence any
+    # setup already enqueued on its stream before releasing the lease.
+    try:
+        controller.begin_external_publication("layer-2-stream")
+    except RuntimeError as error:
+        assert "overlap" in str(error)
+    else:
+        raise AssertionError("overlapping external publication was accepted")
+    abort_recorded = []
+    abort_event = SimpleNamespace(record=lambda stream: abort_recorded.append(stream))
+    with patch.object(vllm_engine.torch.cuda, "Event", return_value=abort_event):
+        controller.abort_forward(second_state)
+    assert abort_recorded == ["layer-1-stream"]
+
+    third_state = VllmV1ForwardState()
+    controller.begin_forward(third_state)
+    third_version, prior_event = controller.begin_external_publication("layer-2-stream")
+    assert third_version == 3 and prior_event is abort_event
+    final_event = SimpleNamespace(record=lambda _stream: None)
+    with patch.object(vllm_engine.torch.cuda, "Event", return_value=final_event):
+        controller.record_external_consumer("layer-2-stream")
+        controller.commit_forward(third_state)
+
+    # No forward may be committed twice or against another state.
+    try:
+        controller.commit_forward(third_state)
+    except RuntimeError as error:
+        assert "wrong forward" in str(error)
+    else:
+        raise AssertionError("completed external forward was committed twice")
 
 
 def _test_semantic_layer_identity() -> None:
@@ -582,15 +831,193 @@ def _test_worker_attention_phase_ownership() -> None:
     assert controller._attention_workspace_bytes == 0
 
 
+def _test_connector_request_row_identity() -> None:
+    runtime = IdentityRuntime()
+    hook = VllmV1Hook(
+        runtime,
+        2,
+        page_bytes=4096,
+        version_provider=lambda: "0.26.0",
+    )
+    metadata_ids = ("decode", "prefill")
+    block_tables = ((20,), (10, 11))
+    reordered = SimpleNamespace(req_ids=("prefill", "decode"), idx_mapping_np=(7, 3))
+    try:
+        hook.bind_connector_forward(
+            metadata_ids,
+            block_tables,
+            (),
+            input_batch=reordered,
+            epoch=0,
+        )
+    except RuntimeError as error:
+        assert "InputBatch.req_ids" in str(error) and "attention row 0" in str(error)
+    else:
+        raise AssertionError("reordered vLLM request rows were accepted")
+    assert runtime.published == []
+
+    aligned = SimpleNamespace(req_ids=metadata_ids, idx_mapping_np=(3, 7))
+    batch = hook.bind_connector_forward(
+        metadata_ids,
+        block_tables,
+        (),
+        input_batch=aligned,
+        epoch=1,
+    )
+    assert batch.exact_demand == ExactDemandProjection(block_tables, 4096)
+    assert len(runtime.published) == 2
+
+
+def _test_failed_forward_discards_evidence() -> None:
+    before = dict(vllm_engine.VLLM_STATS)
+    controller = vllm_engine.VllmV1WorkerController(Runner())
+    state = VllmV1ForwardState()
+    state.execution_owner = controller
+    connector_aborts: list[bool] = []
+    state.connector_owner = SimpleNamespace(
+        abort_forward=lambda: connector_aborts.append(True)
+    )
+    controller.begin_forward(state)
+    state.record_native_launch(
+        "decode",
+        3,
+        form="incremental",
+        framework_owned=False,
+        serving_tier="nvme",
+    )
+    state.record_evidence("physical_transfer_bytes", 12288)
+    vllm_engine._abort_forward(state)
+    assert connector_aborts == [True]
+    assert dict(vllm_engine.VLLM_STATS) == before
+    try:
+        state.commit_evidence()
+    except RuntimeError as error:
+        assert "finalized" in str(error)
+    else:
+        raise AssertionError("aborted vLLM evidence was committed")
+
+    # The aborted transaction must release the controller for the next step.
+    retry = VllmV1ForwardState()
+    controller.begin_forward(retry)
+    controller.abort_forward(retry)
+
+
+def _test_commit_validation_is_nonmutating() -> None:
+    """A late validation error must leave every owner abortable."""
+
+    class Connector:
+        def __init__(self) -> None:
+            self.validates = 0
+            self.commits = 0
+            self.aborts = 0
+
+        def validate_forward_commit(self) -> None:
+            self.validates += 1
+
+        def commit_forward(self) -> None:
+            self.commits += 1
+
+        def abort_forward(self) -> None:
+            self.aborts += 1
+
+    controller = vllm_engine.VllmV1WorkerController(Runner())
+    connector = Connector()
+    state = VllmV1ForwardState()
+    state.batch = EngineBatch(
+        "vllm",
+        0,
+        (RequestBinding(0, 0, 1, stable_request_id("request")),),
+        Granularity.PAGE_GROUP,
+        ExactDemandProjection(((10,),), 4096),
+    )
+    state.execution_owner = controller
+    state.connector_owner = connector
+    controller.begin_forward(state)
+    state.begin_host_layer("layer.0")
+    try:
+        vllm_engine._commit_forward(state)
+    except RuntimeError as error:
+        assert "active host layer" in str(error)
+    else:
+        raise AssertionError("invalid vLLM forward was committed")
+    assert controller._active_forward_state is state
+    assert connector.validates == connector.commits == 0
+    vllm_engine._abort_forward(state)
+    assert controller._active_forward_state is None
+    assert connector.aborts == 1
+
+
+def _test_runner_failure_injection() -> None:
+    before = dict(vllm_engine.VLLM_STATS)
+
+    class Lease:
+        def __init__(self) -> None:
+            self.aborts = 0
+
+        def abort_forward(self) -> None:
+            self.aborts += 1
+
+    class FailingRunner:
+        def execute_model(
+            self,
+            _scheduler_output,
+            _intermediate_tensors=None,
+            _dummy_run=False,
+            _skip_attn_for_dummy_run=False,
+            _is_profile=False,
+        ) -> None:
+            state = vllm_engine.current_vllm_v1_forward_state()
+            assert state is not None
+            self.controller = vllm_engine.VllmV1WorkerController(self)
+            self.lease = Lease()
+            state.execution_owner = self.controller
+            state.connector_owner = self.lease
+            self.controller.begin_forward(state)
+            state.record_native_launch(
+                "decode",
+                1,
+                form="incremental",
+                framework_owned=False,
+                serving_tier="nvme",
+            )
+            raise RuntimeError("injected numerical failure")
+
+        def prepare_attn(self, _input_batch):
+            raise AssertionError("failure injection should not prepare attention")
+
+        def _dummy_run(self, *_args, **_kwargs):
+            raise AssertionError("failure injection should not run warmup")
+
+        def shutdown(self) -> None:
+            return
+
+    vllm_plugin._patch_v2_runner(FailingRunner)
+    runner = FailingRunner()
+    try:
+        runner.execute_model(SimpleNamespace(num_scheduled_tokens={"r": 1}))
+    except RuntimeError as error:
+        assert str(error) == "injected numerical failure"
+    else:
+        raise AssertionError("injected vLLM worker failure was swallowed")
+    assert runner.lease.aborts == 1
+    assert runner.controller._active_forward_state is None
+    assert dict(vllm_engine.VLLM_STATS) == before
+
+
 def main() -> None:
     _test_connector_lifecycle()
     _test_typed_destination_setup_dispatch()
     _test_synchronous_host_load_binding()
     _test_typed_all_layer_host_preload()
     _test_external_tier_preserves_acquisition_schedule()
+    _test_attention_modules_are_prepared_at_setup()
     _test_worker_global_external_directory_lifetime()
     _test_semantic_layer_identity()
     _test_worker_attention_phase_ownership()
+    _test_connector_request_row_identity()
+    _test_failed_forward_discards_evidence()
+    _test_commit_validation_is_nonmutating()
+    _test_runner_failure_injection()
     _test_physical_storage_identity()
     batch = EngineBatch(
         "vllm",
@@ -604,6 +1031,8 @@ def main() -> None:
     )
     state = VllmV1ForwardState()
     state.batch = batch
+    state.request_bindings_tensor = torch.tensor([0, 1, 1, 1], dtype=torch.int64)
+    assert state.phase_request_bindings(1, 1).tolist() == [1, 1]
     state.storage_key_tables = (
         (None, None, "key-12", "key-13"),
         ("key-20", None),
@@ -637,11 +1066,37 @@ def main() -> None:
         else:
             raise AssertionError("invalid vLLM physical page selection was accepted")
 
+    # An invalid immutable deployment contract is rejected before allocation.
+    with patch.dict("os.environ", {"NTA_TENANT_BUDGETS": "7:4096"}, clear=False):
+        rejected = vllm_engine.VllmV1WorkerController(Runner())
+        with patch.object(
+            vllm_worker,
+            "_build_resources",
+            side_effect=AssertionError("invalid config allocated resources"),
+        ):
+            try:
+                rejected._ensure_hook(
+                    rejected._runner_ref(),
+                    request_capacity=1,
+                    page_size=16,
+                    page_bytes=4096,
+                )
+            except RuntimeError as error:
+                assert "tenant 7" in str(error)
+            else:
+                raise AssertionError("invalid vLLM tenant policy was accepted")
+
+    # A mismatch discovered after native ownership opens must close both
+    # resource and runtime owners exactly once.
     runtime = FakeRuntime()
     resources = FakeResources(runtime)
     controller = vllm_engine.VllmV1WorkerController(Runner())
-    with patch.dict("os.environ", {"NTA_TENANT_BUDGETS": "7:4096"}, clear=False):
-        with patch.object(vllm_engine, "_build_resources", return_value=resources):
+    with patch.dict(
+        "os.environ",
+        {"NTA_TENANT_CAPACITY": "8", "NTA_TENANT_BUDGETS": "7:4096"},
+        clear=False,
+    ):
+        with patch.object(vllm_worker, "_build_resources", return_value=resources):
             try:
                 controller._ensure_hook(
                     controller._runner_ref(),
@@ -652,7 +1107,7 @@ def main() -> None:
             except RuntimeError as error:
                 assert "tenant 7" in str(error)
             else:
-                raise AssertionError("invalid vLLM tenant policy was accepted")
+                raise AssertionError("runtime tenant mismatch was accepted")
     assert resources.closed == 1
     assert runtime.closed == 1
     assert controller._runtime is None

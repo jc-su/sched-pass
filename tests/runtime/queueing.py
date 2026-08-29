@@ -1,5 +1,5 @@
 from experiments.queueing import (
-    finite_window_littles_law,
+    finite_window_system_accounting,
     modeled_blocked_cohort_accounting,
 )
 
@@ -17,11 +17,13 @@ def main() -> None:
             "system_time_seconds": 2.0,
         },
     ]
-    report = finite_window_littles_law(records, 3.0)
+    report = finite_window_system_accounting(records, 3.0)
     assert report["method"] == "finite_window_arrival_departure_accounting"
     assert report["request_count"] == 2
-    assert abs(report["residual"]) < 1.0e-12
-    assert finite_window_littles_law([], 0.0)["request_count"] == 0
+    assert report["occupancy_area_request_seconds"] == 4.0
+    assert report["sum_residence_seconds"] == 4.0
+    assert "residual" not in report and "lhs" not in report and "rhs" not in report
+    assert finite_window_system_accounting([], 0.0)["request_count"] == 0
 
     modeled = modeled_blocked_cohort_accounting(4, 100.0)
     assert modeled["pending_release_count"] == 4

@@ -13,6 +13,11 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from experiments.atomic_io import atomic_write_json  # noqa: E402
+
 RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
 
 
@@ -84,14 +89,17 @@ def require_clean_mechanism(
     ticketed = sum(
         int(entry.get("ticketed_incremental_launches", 0)) for entry in stats
     )
+    event_ordered = sum(
+        int(entry.get("event_ordered_incremental_launches", 0)) for entry in stats
+    )
     total = sum(
         int(entry.get("decode_launches", 0)) + int(entry.get("prefill_launches", 0))
         for entry in stats
     )
-    if total == 0 or transformed + ticketed != total:
+    if total == 0 or transformed + ticketed + event_ordered != total:
         raise RuntimeError(
             "NTA did not account every attention launch to a transformed form "
-            f"({transformed} + {ticketed} != {total})"
+            f"({transformed} + {ticketed} + {event_ordered} != {total})"
         )
     verified_modules = sum(
         int(entry.get("verified_operator_modules", 0)) for entry in stats
@@ -102,17 +110,14 @@ def require_clean_mechanism(
     if verified_modules == 0 or not contracts:
         raise RuntimeError("NTA trial did not verify compiler operator contracts")
     plans = [plan for entry in stats for plan in entry.get("operator_plans", [])]
-    verified_pairs = sum(
-        int(entry.get("verified_operator_pairs", 0)) for entry in stats
-    )
-    verified_plan_pairs = sum(
-        int(entry.get("verified_operator_plan_pairs", 0)) for entry in stats
+    verified_dual_form_plans = sum(
+        int(entry.get("verified_dual_form_operator_plans", 0)) for entry in stats
     )
     if not plans:
         raise RuntimeError("NTA trial did not verify compiler operator plans")
-    if ticketed and (verified_pairs == 0 or verified_plan_pairs == 0):
+    if (ticketed or event_ordered) and verified_dual_form_plans == 0:
         raise RuntimeError(
-            "incremental attention ran without a paired direct execution plan"
+            "incremental attention ran without a verified dual-form execution plan"
         )
     graph_captures = sum(int(entry.get("graph_captures", 0)) for entry in stats)
     graph_replays = sum(int(entry.get("graph_replays", 0)) for entry in stats)
@@ -127,17 +132,18 @@ def require_clean_mechanism(
             for name, count in (
                 ("direct", transformed),
                 ("incremental", ticketed),
+                ("event_ordered_incremental", event_ordered),
             )
             if count > 0
         ],
         "transformed_direct_launches": transformed,
         "ticketed_incremental_launches": ticketed,
+        "event_ordered_incremental_launches": event_ordered,
         "total_attention_launches": total,
         "stock_launches": stock,
         "fallback_batches": fallbacks,
         "verified_operator_modules": verified_modules,
-        "verified_operator_pairs": verified_pairs,
-        "verified_operator_plan_pairs": verified_plan_pairs,
+        "verified_dual_form_operator_plans": verified_dual_form_plans,
         "graph_captures": graph_captures,
         "graph_replays": graph_replays,
     }
@@ -218,10 +224,7 @@ def main() -> int:
         "throughput_ratio": baseline_time / mechanism_time,
         "latency_overhead_fraction": mechanism_time / baseline_time - 1.0,
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    atomic_write_json(args.output, report)
     print(json.dumps(report, sort_keys=True))
     return 0
 

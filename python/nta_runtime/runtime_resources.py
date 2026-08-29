@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 _UINT64_MAX = (1 << 64) - 1
 _UINT32_MAX = (1 << 32) - 1
 _INT32_MAX = (1 << 31) - 1
+_RESOURCE_OWNER_TOKEN = object()
 
 
 def _nonnegative_environment(name: str, default: int) -> int:
@@ -82,15 +83,16 @@ class RuntimeResourceConfig:
                 maximum=_INT32_MAX,
             ),
         )
+        staging_capacity = _bounded_integer(
+            self.staging_byte_capacity,
+            "staging_byte_capacity",
+            minimum=0,
+            maximum=_UINT64_MAX,
+        )
         object.__setattr__(
             self,
             "staging_byte_capacity",
-            _bounded_integer(
-                self.staging_byte_capacity,
-                "staging_byte_capacity",
-                minimum=0,
-                maximum=_UINT64_MAX,
-            ),
+            staging_capacity or _UINT64_MAX,
         )
 
     def native(self) -> "RuntimeConfig":
@@ -133,9 +135,7 @@ class RuntimeResourceConfig:
             tenant_capacity=tenant_capacity,
             device_ordinal=device_ordinal,
             max_dependencies_per_work_ticket=max_dependencies_per_work_ticket,
-            # Native zero means unlimited; expose the normalized value in
-            # stats so policy provenance matches the actual runtime contract.
-            staging_byte_capacity=staging_limit or _UINT64_MAX,
+            staging_byte_capacity=staging_limit,
         )
 
 
@@ -147,11 +147,33 @@ class ServingRuntimeResources:
         tier: ServingTierService,
         runtime: Runtime,
         config: RuntimeResourceConfig,
+        *,
+        _owner_token: object,
     ) -> None:
-        self.tier = tier
-        self.runtime = runtime
-        self.config = config
+        if _owner_token is not _RESOURCE_OWNER_TOKEN:
+            raise RuntimeError(
+                "serving resources must be constructed through the validated open boundary"
+            )
+        self._tier = tier
+        self._runtime = runtime
+        self._config = config
         self._closed = False
+
+    @property
+    def tier(self) -> ServingTierService:
+        return self._tier
+
+    @property
+    def runtime(self) -> Runtime:
+        return self._runtime
+
+    @property
+    def config(self) -> RuntimeResourceConfig:
+        return self._config
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     @classmethod
     def open(
@@ -161,6 +183,11 @@ class ServingRuntimeResources:
         runtime_config: RuntimeResourceConfig,
     ) -> "ServingRuntimeResources":
         from .runtime import TierKind
+
+        if not isinstance(tier_config, ServingTierConfig):
+            raise TypeError("serving tier configuration must be typed")
+        if not isinstance(runtime_config, RuntimeResourceConfig):
+            raise TypeError("runtime resource configuration must be typed")
 
         tier = ServingTierService(tier_config)
         runtime: Runtime | None = None
@@ -201,7 +228,12 @@ class ServingRuntimeResources:
             raise
         if runtime is None:
             raise RuntimeError("runtime construction returned no owner")
-        return cls(tier, runtime, runtime_config)
+        return cls(
+            tier,
+            runtime,
+            runtime_config,
+            _owner_token=_RESOURCE_OWNER_TOKEN,
+        )
 
     def close(self) -> None:
         """Quiesce the consumer runtime before releasing tier transports."""
@@ -222,6 +254,14 @@ class ServingRuntimeResources:
             raise RuntimeError(
                 "serving runtime resource teardown failed"
             ) from first_error
+
+    def __enter__(self) -> "ServingRuntimeResources":
+        if self._closed:
+            raise RuntimeError("serving runtime resources are already closed")
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        self.close()
 
     def __del__(self) -> None:
         # NtaFlashInferAttnBackend can fail during partially initialized

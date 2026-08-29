@@ -117,13 +117,30 @@ def validate(path: Path) -> dict[str, Any]:
         active_budget = selection.get("active_token_budget")
         active_tokens = selection.get("active_tokens")
         context_length = selection.get("context_length")
+        min_input_tokens = selection.get("min_input_tokens")
         max_input_tokens = selection.get("max_input_tokens")
         max_output_tokens = selection.get("max_output_tokens")
+        min_resident_output_tokens = selection.get(
+            "min_resident_output_tokens"
+        )
+        min_external_cached_tokens = selection.get(
+            "min_external_cached_tokens"
+        )
+        min_external_query_rows = selection.get("min_external_query_rows")
         if any(
             not isinstance(value, int) or isinstance(value, bool) or value <= 0
-            for value in (context_length, max_input_tokens, max_output_tokens)
+            for value in (
+                context_length,
+                min_input_tokens,
+                max_input_tokens,
+                max_output_tokens,
+                min_resident_output_tokens,
+                min_external_cached_tokens,
+                min_external_query_rows,
+            )
         ) or not (
-            max_input_tokens < context_length
+            min_input_tokens <= max_input_tokens
+            and max_input_tokens < context_length
             and max_output_tokens < context_length
         ):
             raise ValueError("diverse serving cohort token envelope is invalid")
@@ -142,13 +159,33 @@ def validate(path: Path) -> dict[str, Any]:
         ):
             raise ValueError("diverse serving cohort exceeds its active token budget")
         if any(
-            int(row["input_length"]) > max_input_tokens
+            int(row["input_length"]) < min_input_tokens
+            or int(row["input_length"]) > max_input_tokens
             or max(1, int(row["output_length"])) > max_output_tokens
             or int(row["input_length"]) + max(1, int(row["output_length"]))
             > context_length
             for row in rows
         ):
             raise ValueError("diverse serving cohort violates its token envelope")
+        if any(
+            (
+                row.get("request_state") == "resident"
+                and max(1, int(row["output_length"]))
+                < min_resident_output_tokens
+            )
+            or (
+                row.get("request_state") == "external"
+                and (
+                    int(row["cached_prefix_tokens"])
+                    < min_external_cached_tokens
+                    or int(row["input_length"])
+                    - int(row["cached_prefix_tokens"])
+                    < min_external_query_rows
+                )
+            )
+            for row in rows
+        ):
+            raise ValueError("diverse serving cohort violates its role constraints")
         lineage = manifest.get("lineage")
         if not isinstance(lineage, dict) or any(
             not isinstance(lineage.get(field), str) or not lineage[field]

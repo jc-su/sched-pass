@@ -38,51 +38,65 @@ def main() -> None:
     assert (
         _format_command_token(
             'python -c \'{"arm": "{arm}"}\'',
-            arm="B5",
+            arm="A3",
             values={"tier": "host_mem"},
         )
-        == 'python -c \'{"arm": "B5"}\''
+        == 'python -c \'{"arm": "A3"}\''
     )
     with tempfile.TemporaryDirectory(prefix="nta-evaluation-contract-") as directory:
         root = Path(directory)
-        workload_manifest, rows = normalize(
-            [
+        strata_document = []
+        normalized_workloads = []
+        for index in range(6):
+            workload_manifest, rows = normalize(
+                [
+                    {
+                        "request_id": f"a-{index}",
+                        "input_length": 32 + index * 16,
+                        "output_length": 4 + index,
+                        "hash_ids": ["p0", f"p-{index}"],
+                    },
+                    {
+                        "request_id": f"b-{index}",
+                        "input_length": 48 + index * 16,
+                        "output_length": 5 + index,
+                        "hash_ids": ["p0", f"p-{index}", f"q-{index}"],
+                    },
+                ],
+                arrival_mode="batch_release",
+                synthesize_prompts=True,
+            )
+            scenario_root = root / f"scenario-{index}"
+            manifest_path = scenario_root / "manifest.json"
+            write_workload(
+                manifest_path,
+                scenario_root / "records.jsonl",
+                workload_manifest,
+                rows,
+            )
+            normalized_workloads.append((manifest_path, workload_manifest))
+            strata_document.append(
                 {
-                    "request_id": "a",
-                    "input_length": 32,
-                    "output_length": 4,
-                    "hash_ids": ["p0", "p1"],
-                },
-                {
-                    "request_id": "b",
-                    "input_length": 48,
-                    "output_length": 5,
-                    "hash_ids": ["p0", "p1", "p2"],
-                },
-            ],
-            arrival_mode="batch_release",
-            synthesize_prompts=True,
-        )
-        manifest_path = root / "manifest.json"
-        write_workload(
-            root / "manifest.json", root / "records.jsonl", workload_manifest, rows
-        )
-        strata = _load_strata(ROOT / "experiments" / "strata.example.json")
+                    "id": f"scenario-{index}",
+                    "workload_manifest": str(manifest_path),
+                }
+            )
+        strata_path = root / "strata.json"
+        strata_path.write_text(json.dumps(strata_document), encoding="utf-8")
+        strata = _load_strata(strata_path)
         spec = build_spec(
-            workload_manifest=manifest_path,
             tier="host_mem",
             arm_commands={arm: _fake_command() for arm in ARMS},
-            consumer_kinds={
-                arm: ("framework_reference" if arm == "B0" else "native_work_unit")
-                for arm in ARMS
-            },
+            result_contracts={arm: "sglang-serving" for arm in ARMS},
             strata=strata,
             repetitions=5,
         )
-        validated_manifest = validate_spec(spec, manifest_path)
+        validated_workloads = validate_spec(spec)
+        assert len(validated_workloads) == 6
+        first_path, first_manifest = normalized_workloads[0]
         assert (
-            validated_manifest["demand_trace_digest"]
-            == workload_manifest["demand_trace_digest"]
+            validated_workloads[str(first_path.resolve())]["demand_trace_digest"]
+            == first_manifest["demand_trace_digest"]
         )
         assert (
             _workload_digest(
@@ -98,30 +112,45 @@ def main() -> None:
             _workload_digest({"result": {}}, {"workload_manifest_digest": "file"})
             is None
         )
-        assert len(spec["experiments"]) == len(PAIRS) * len(strata) * 2
+        assert len(spec["experiments"]) == len(ARMS) * len(strata)
         assert len(spec["comparisons"]) == len(PAIRS) * len(strata)
+        assert all(
+            len(
+                {
+                    trial["arm"]
+                    for trial in spec["experiments"]
+                    if trial["name"] == f"mechanism-{stratum['id']}"
+                }
+            )
+            == len(ARMS)
+            for stratum in strata
+        )
         assert spec["evaluation_profile"] == "osdi-complete"
         assert {trial["arm"] for trial in spec["experiments"]} == set(ARMS)
         assert all(
             trial["demand_semantics"] == "exact" for trial in spec["experiments"]
         )
         assert all(
-            set(trial["stratum"])
-            == {
-                "request_state",
-                "granularity",
-                "load_ratio",
-                "availability_skew",
-                "staging_pressure",
+            {
+                "schema",
+                "id",
+                "manifest_sha256",
+                "records_digest",
+                "demand_trace_digest",
+                "request_count",
                 "arrival",
+                "request_state_counts",
+                "statistics",
+                "heterogeneous_axes",
             }
+            == set(trial["stratum"])
             for trial in spec["experiments"]
         )
         try:
             _validate_result(
                 {
                     "experiment": "missing-evidence",
-                    "variant": "B5",
+                    "variant": "A3",
                     "result": {
                         "classification": "fixture",
                         "verification_failures": 0,
@@ -150,7 +179,7 @@ def main() -> None:
             _validate_result(
                 {
                     "experiment": "with-evidence",
-                    "variant": "B5",
+                    "variant": "A3",
                     "result": {
                         "classification": "fixture",
                         "verification_failures": 0,
@@ -165,10 +194,8 @@ def main() -> None:
         command = [
             sys.executable,
             str(ROOT / "experiments" / "make_evaluation_spec.py"),
-            "--workload-manifest",
-            str(manifest_path),
             "--strata-file",
-            str(ROOT / "experiments" / "strata.example.json"),
+            str(strata_path),
             "--tier",
             "host_mem",
             "--repetitions",
@@ -178,12 +205,7 @@ def main() -> None:
         ]
         for arm in ARMS:
             command.extend(("--arm-command", f"{arm}={_fake_command()}"))
-            command.extend(
-                (
-                    "--arm-consumer-kind",
-                    f"{arm}={'framework_reference' if arm == 'B0' else 'native_work_unit'}",
-                )
-            )
+            command.extend(("--arm-result-contract", f"{arm}=sglang-serving"))
         subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         cli_spec = json.loads(cli_output.read_text(encoding="utf-8"))
         assert len(cli_spec["comparisons"]) == len(PAIRS) * len(strata)
@@ -192,13 +214,14 @@ def main() -> None:
             "native_work_unit",
             "framework_reference",
         }
+        assert cli_spec["experiments"][0]["result_contract"] == "sglang-serving"
 
         incomplete = json.loads(json.dumps(spec))
         incomplete["experiments"] = [
-            trial for trial in incomplete["experiments"] if trial["arm"] != "B6"
+            trial for trial in incomplete["experiments"] if trial["arm"] != "A3"
         ]
         try:
-            validate_spec(incomplete, manifest_path)
+            validate_spec(incomplete)
         except ValueError:
             pass
         else:
@@ -207,7 +230,7 @@ def main() -> None:
         missing_consumer_kind = json.loads(json.dumps(spec))
         missing_consumer_kind["experiments"][0].pop("consumer_kind")
         try:
-            validate_spec(missing_consumer_kind, manifest_path)
+            validate_spec(missing_consumer_kind)
         except ValueError as error:
             assert "consumer_kind" in str(error)
         else:

@@ -421,7 +421,6 @@ __device__ __forceinline__ void buildMoePlan(
       0,
       0,
       0,
-      0,
   };
 }
 

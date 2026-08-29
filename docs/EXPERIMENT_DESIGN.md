@@ -8,15 +8,19 @@ and `python/nta_runtime/`. Correctness tests under `tests/` do not own the
 experiment runner or persistent result files. Use
 `docs/ARTIFACT_EVALUATION.md` for the reproducible bundle workflow.
 
-The central question is whether one exact, late-bound work-unit mechanism
+The central question is whether one exact, late-bound acquisition mechanism
 improves execution when a batch contains heterogeneous request state. Every
 arm consumes one demand trace and the same exact consumed identities. Demand
 construction is an input/workload property; selector quality is outside the
-serving claim.
+serving claim. "Exact selected demand" may contain every candidate block, so
+the mechanism is not defined by sparse or approximate attention. Select-then-
+compute workloads are an important high-opportunity stratum, not a different
+system policy.
 
 ## RQ0: map the opportunity before serving
 
-Use `experiments/run_work_unit_matrix.py` to sweep:
+Use `experiments/run_work_unit_matrix.py` to sweep the D0--D6 diagnostic
+profiles:
 
 - candidate and consumed units;
 - resident/ready/blocked/new-arrival fractions;
@@ -24,7 +28,8 @@ Use `experiments/run_work_unit_matrix.py` to sweep:
 - compute per unit and transport bandwidth;
 - granularity and staging capacity.
 
-This runner validates the real WorkBatch, WorkLedger, generation checks, epoch
+The D namespace is intentionally not the serving-arm namespace. This runner
+validates the real WorkBatch, WorkLedger, generation checks, epoch
 checks, partial transitions, and byte accounting. It is a contract/regime
 runner, not a GPU performance result.
 
@@ -48,8 +53,9 @@ pending-unit area, release rate, mean occupancy, mean residence time, and the
 release-process name. The validator recomputes these deterministic quantities,
 but deliberately emits no Little's-law residual: deriving `L`, `lambda`, and
 `W` from the same cohort makes the identity true by construction and is not
-queueing evidence. Serving-side Little's-law fields instead use measured client
-timestamps and disclose their observable queue scope.
+queueing evidence. Serving reports likewise expose measured client arrival,
+departure, residence, and occupancy fields only as descriptive finite-window
+accounting, with their observable scope stated explicitly.
 
 ## RQ1: heterogeneous exact serving
 
@@ -65,36 +71,37 @@ The exact demand trace is generated once and replayed by every arm. The primary
 serving comparison is dense exact attention plus exact demand with the same
 demand IDs, bytes, page order, and output checks.
 
-The SGLang harness is
-`benchmarks/serving/CompareSglangHiCacheLoad.py`. It validates placement,
-fallback freedom, exact attention accounting, compiler contracts, external
-attention coverage, and mechanism counters before reporting SLO/goodput.
+The formal SGLang worker is
+`benchmarks/serving/RunSglangEvaluationArm.py`. It runs one arm per process and
+validates placement, fallback freedom, exact attention accounting, compiler
+contracts, external attention coverage, and result-derived mechanism counters
+before its report enters the randomized paired runner. The older nested
+comparison driver is diagnostic only.
 
 ## RQ2: causal decomposition
 
-Use matched arms:
+Use four matched serving arms:
 
 ```
-B0  resident exact conventional baseline
-B1  host promotion + batch readiness barrier
-B2  host demand materialization + conventional exact gather
-B3  device demand + conventional exact gather
-B4  device demand + late-bound exact staging
-B5  heterogeneous bounded work-unit execution
-B6  exact partial consumer continuation
+A0  framework bulk control (stock SGLang HiCache)
+A1  exact NTA preacquisition + stock numerical consumer
+A2  GPU demand discovery + exact acquisition + one bulk readiness boundary
+A3  the same acquisition path + progressive heterogeneous work-unit release
 ```
 
-B0--B3 isolate residency, host materialization, and device demand while
-retaining the same exact demand IDs. B4--B5 isolate the execution-side
-contribution. B6 is optional evidence for the general partial protocol and is
-not required for the serving headline. B0 is resident exact execution, not a
-dense numerical workload, so the matched-demand fairness rule remains valid.
+A1/A0 measures the exact acquisition boundary. A2/A1 measures device discovery
+without changing the numerical consumer or allowing progressive release.
+A3/A2 measures only the late-bound work-unit boundary. Transport engine,
+frontier depth, granularity, tier, and request heterogeneity are orthogonal
+sweeps; they do not create additional headline mechanisms.
 
-The full paired specification also includes two non-adjacent, pre-registered
-comparisons: B3 versus B1 isolates device-side selection from the host-control
-round trip, and B5 versus B3 measures the complete device-demand to
-heterogeneous-work-unit mechanism jump. These are required because adjacent
-arms alone cannot seal the causal decomposition.
+For a 36-layer model, an observation of frontier depth 1 means all 36 layers
+used the exact external/preacquired contract, but only the first layer reached
+attention before its acquisition completed; the remaining 35 consumed already
+ready data. It is neither "1/36 support" nor evidence that deep frontier
+behavior matters. The evaluation must therefore sweep controlled frontier
+depth (including 0, 1, intermediate values, and all layers) by changing the
+transfer/compute ratio, contention, context length, and batch heterogeneity.
 
 All arms report:
 
@@ -106,10 +113,11 @@ All arms report:
 - request-generation and epoch rejection counts;
 - TTFT, TPOT, ITL, tail SLO, throughput, and goodput.
 
-## RQ3: mechanism ablations
+## RQ3: diagnostic interventions and robustness
 
-Disable exactly one boundary at a time. The executable names are the same as
-the manifest's `ablations` field and can be run with `--ablation all`:
+The D0--D6 synthetic profiles can disable exactly one boundary at a time. The
+executable names are the same as the diagnostic manifest's `ablations` field
+and can be run with `--ablation all`:
 
 1. host-side demand/control instead of device demand;
 2. batch readiness instead of work-unit readiness;
@@ -121,9 +129,10 @@ the manifest's `ablations` field and can be run with `--ablation all`:
 
 Each record includes `execution_mode` and `activation_counters`. An ablation is
 invalid if it is marked applied but the counter for the disabled or replacement
-boundary is zero. The validator only applies this rule to arms for which the
-manifest declares that ablation applicable; unrelated arms remain useful
-matched controls.
+boundary is zero. The validator only applies this rule to profiles for which
+the manifest declares that ablation applicable. These records prove contract
+activation, not serving causality or speedup. Formal serving causality comes
+from A0--A3.
 
 ## RQ4: strata and robustness
 

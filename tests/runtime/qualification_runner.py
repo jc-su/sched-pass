@@ -17,6 +17,16 @@ from experiments.bailian import normalize, write_workload  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+def _result_command(latency_ms: float) -> list[str]:
+    program = (
+        "import json,pathlib,sys; "
+        f"value={{'latency_ms':{latency_ms!r}}}; "
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps(value)); "
+        "print(json.dumps(value))"
+    )
+    return [sys.executable, "-c", program, "{trial_output}"]
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = pathlib.Path(temporary)
@@ -28,21 +38,13 @@ def main() -> None:
                 {
                     "name": "runner-smoke",
                     "variant": "mechanism",
-                    "command": [
-                        sys.executable,
-                        "-c",
-                        "import json; print(json.dumps({'latency_ms': 2.5}))",
-                    ],
+                    "command": _result_command(2.5),
                     "metrics": ["latency_ms"],
                 },
                 {
                     "name": "runner-smoke",
                     "variant": "baseline",
-                    "command": [
-                        sys.executable,
-                        "-c",
-                        "import json; print(json.dumps({'latency_ms': 5.0}))",
-                    ],
+                    "command": _result_command(5.0),
                     "metrics": ["latency_ms"],
                 },
             ],
@@ -79,7 +81,12 @@ def main() -> None:
         assert len(records) == 4
         assert metadata["spec"] == spec
         assert "spec_sha256" not in metadata
-        assert all("log_sha256" not in json.loads(record) for record in records)
+        decoded_records = [json.loads(record) for record in records]
+        assert all("log_sha256" not in record for record in decoded_records)
+        result_paths = {record["structured_result"] for record in decoded_records}
+        assert len(result_paths) == 4
+        assert all(pathlib.Path(path).is_file() for path in result_paths)
+        assert all(record["structured_result_digest"] for record in decoded_records)
         metric = next(
             item for item in summary["summaries"] if item["variant"] == "mechanism"
         )["metrics"]["latency_ms"]
@@ -128,8 +135,9 @@ def main() -> None:
         malformed_document = json.loads(workload_path.read_text(encoding="utf-8"))
         malformed_document["request_count"] = 2
         malformed_manifest.write_text(json.dumps(malformed_document), encoding="utf-8")
-        invalid_spec = dict(spec)
-        invalid_spec["workload_manifest"] = str(malformed_manifest)
+        invalid_spec = json.loads(json.dumps(spec))
+        for experiment in invalid_spec["experiments"]:
+            experiment["workload_manifest"] = str(malformed_manifest)
         invalid_spec_path = root / "invalid-spec.json"
         invalid_spec_path.write_text(json.dumps(invalid_spec), encoding="utf-8")
         refused_manifest = subprocess.run(
@@ -150,6 +158,52 @@ def main() -> None:
         )
         assert refused_manifest.returncode != 0
         assert "failed validation" in refused_manifest.stderr
+
+        fake_formal = {
+            "schema": 1,
+            "evaluation_profile": "osdi-complete",
+            "repetitions": 1,
+            "seed": 11,
+            "experiments": [
+                {
+                    "name": "fake-formal",
+                    "variant": "mechanism",
+                    "command": [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json; print(json.dumps({"
+                            "'classification':'sglang-hicache-load-comparison',"
+                            "'latency_ms':1.0}))"
+                        ),
+                    ],
+                    "metrics": ["latency_ms"],
+                    "result_contract": "sglang-serving",
+                    "workload_manifest": str(workload_path),
+                }
+            ],
+            "comparisons": [],
+        }
+        fake_formal_path = root / "fake-formal.json"
+        fake_formal_path.write_text(json.dumps(fake_formal), encoding="utf-8")
+        refused_result = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/run-qualified-trials.py"),
+                "--spec",
+                str(fake_formal_path),
+                "--output-dir",
+                str(root / "fake-formal-output"),
+                "--allow-dirty",
+            ],
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert refused_result.returncode != 0
+        assert "does not satisfy its declared contract" in refused_result.stderr
 
     print("qualification_runner=pass")
 

@@ -16,7 +16,7 @@ from nta_runtime.indexed_transfer import (
     ContiguousPairRun,
     IndexedMoverServiceModel,
     IndexedPairLayout,
-    select_indexed_mover_runs,
+    select_indexed_mover_candidates,
 )
 
 
@@ -24,7 +24,9 @@ from nta_runtime.indexed_transfer import (
 class TensorIndexedMoverPlan:
     """Exact copy-engine/SM partition retaining the SM remainder on device."""
 
-    layout: IndexedPairLayout
+    total_rows: int
+    total_run_count: int
+    layout: IndexedPairLayout | None
     copy_runs: tuple[ContiguousPairRun, ...]
     sm_source_indices: torch.Tensor
     sm_destination_indices: torch.Tensor
@@ -33,6 +35,13 @@ class TensorIndexedMoverPlan:
     selection_reason: str
 
     def __post_init__(self) -> None:
+        if min(self.total_rows, self.total_run_count) <= 0:
+            raise ValueError("indexed mover plan requires rows and exact runs")
+        if self.layout is not None and (
+            self.layout.row_count != self.total_rows
+            or len(self.layout.runs) != self.total_run_count
+        ):
+            raise ValueError("indexed mover diagnostic layout is incomplete")
         if self.sm_source_indices.device != self.sm_destination_indices.device:
             raise ValueError("indexed mover SM maps must share one device")
         if self.sm_source_indices.dtype is not torch.int32 or (
@@ -43,17 +52,16 @@ class TensorIndexedMoverPlan:
             raise ValueError("indexed mover SM maps must be vectors")
         if self.sm_source_indices.numel() != self.sm_destination_indices.numel():
             raise ValueError("indexed mover SM maps disagree")
-        if self.copy_row_count + self.sm_row_count != self.layout.row_count:
+        if self.copy_row_count + self.sm_row_count != self.total_rows:
             raise ValueError("indexed mover plan does not cover every input row")
         if self.predicted_sm_ns <= 0 or (
-            self.predicted_selected_ns is not None
-            and self.predicted_selected_ns <= 0
+            self.predicted_selected_ns is not None and self.predicted_selected_ns <= 0
         ):
             raise ValueError("indexed tensor mover predictions must be positive")
 
     @property
     def row_count(self) -> int:
-        return self.layout.row_count
+        return self.total_rows
 
     @property
     def copy_row_count(self) -> int:
@@ -92,29 +100,24 @@ def plan_indexed_tensor_mover(
     service_model: IndexedMoverServiceModel,
     policy: str = "auto",
     overlap_compute_ns: int = 0,
+    service_scale_bytes: int | None = None,
     validate_unique_destinations: bool = True,
+    capture_full_layout: bool = True,
 ) -> TensorIndexedMoverPlan:
     """Partition an index map while downloading only maximal-run descriptors.
 
     Adjacency, run IDs, and the disjoint SM remainder are computed on the map's
-    device. The CPU receives three integers per maximal run, independent of
-    the number of rows in long contiguous regions.
+    device. Production planning downloads at most ``maximum_copy_runs`` exact
+    descriptors; a complete decomposition is materialized only for explicit
+    layout profiling. ``service_scale_bytes`` optionally attests the physical
+    wave bucket from which the caller selected its deployment curve; it must
+    not be replaced by aggregate bytes spanning repeated waves.
     """
 
     source = _require_index_vector(source_indices, "source indices")
     destination = _require_index_vector(destination_indices, "destination indices")
     if source.device != destination.device or source.numel() != destination.numel():
         raise ValueError("indexed-transfer maps must share device and length")
-    bounds = torch.stack(
-        (source.min(), destination.min(), source.max(), destination.max())
-    ).to(device="cpu")
-    source_min, destination_min, source_max, destination_max = (
-        int(value) for value in bounds.tolist()
-    )
-    if min(source_min, destination_min) < 0:
-        raise ValueError("indexed-transfer indices cannot be negative")
-    if max(source_max, destination_max) >= 1 << 32:
-        raise ValueError("indexed-transfer indices exceed the uint32 ABI")
     if validate_unique_destinations and destination.numel() > 1:
         ordered_destination = torch.sort(destination).values
         if bool(torch.any(ordered_destination[1:] == ordered_destination[:-1]).item()):
@@ -124,8 +127,8 @@ def plan_indexed_tensor_mover(
     run_starts_mask = torch.empty(row_count, dtype=torch.bool, device=source.device)
     run_starts_mask[0] = True
     if row_count > 1:
-        run_starts_mask[1:] = (source[1:] != source[:-1] + 1) | (
-            destination[1:] != destination[:-1] + 1
+        run_starts_mask[1:] = (source[1:] - source[:-1] != 1) | (
+            destination[1:] - destination[:-1] != 1
         )
     run_starts = torch.nonzero(run_starts_mask, as_tuple=False).flatten()
     run_ends = torch.cat(
@@ -134,50 +137,111 @@ def plan_indexed_tensor_mover(
             torch.tensor((row_count,), dtype=run_starts.dtype, device=source.device),
         )
     )
-    descriptors = torch.stack(
+    run_lengths = run_ends - run_starts
+    total_run_count = int(run_starts.numel())
+    if capture_full_layout:
+        candidate_indices = torch.arange(
+            total_run_count, dtype=run_starts.dtype, device=source.device
+        )
+    elif policy == "sm":
+        candidate_indices = torch.empty(0, dtype=run_starts.dtype, device=source.device)
+    else:
+        candidate_count = min(total_run_count, maximum_copy_runs)
+        candidate_indices = torch.topk(
+            run_lengths,
+            candidate_count,
+            largest=True,
+            sorted=True,
+        ).indices
+    candidate_starts = run_starts.index_select(0, candidate_indices)
+    candidate_descriptors = torch.stack(
         (
-            source.index_select(0, run_starts).to(dtype=torch.int64),
-            destination.index_select(0, run_starts).to(dtype=torch.int64),
-            run_ends - run_starts,
+            candidate_indices.to(dtype=torch.int64),
+            source.index_select(0, candidate_starts).to(dtype=torch.int64),
+            destination.index_select(0, candidate_starts).to(dtype=torch.int64),
+            run_lengths.index_select(0, candidate_indices).to(dtype=torch.int64),
         ),
         dim=1,
-    ).to(device="cpu")
-    runs = tuple(
-        ContiguousPairRun(int(source_first), int(destination_first), int(length))
-        for source_first, destination_first, length in descriptors.tolist()
     )
-    layout = IndexedPairLayout(row_count, runs)
-    selection = select_indexed_mover_runs(
-        layout,
+    bounds = torch.stack(
+        (source.min(), destination.min(), source.max(), destination.max())
+    ).to(dtype=torch.int64, device=source.device)
+    # Bounds and every descriptor the CPU selector can possibly choose share
+    # one bounded D2H synchronization. A second selected-descriptor download
+    # is redundant because selection is restricted to these exact candidates.
+    metadata = torch.cat((bounds.reshape(1, 4), candidate_descriptors), dim=0).to(
+        device="cpu"
+    )
+    metadata_rows = metadata.tolist()
+    source_min, destination_min, source_max, destination_max = (
+        int(value) for value in metadata_rows[0]
+    )
+    if min(source_min, destination_min) < 0:
+        raise ValueError("indexed-transfer indices cannot be negative")
+    if max(source_max, destination_max) >= 1 << 31:
+        raise ValueError("indexed-transfer indices exceed signed int32 storage")
+    descriptor_by_index = {
+        int(run_index): ContiguousPairRun(
+            int(source_first), int(destination_first), int(length)
+        )
+        for run_index, source_first, destination_first, length in metadata_rows[1:]
+    }
+    candidate_runs = tuple(
+        (run_index, run.row_count) for run_index, run in descriptor_by_index.items()
+    )
+    selection = select_indexed_mover_candidates(
+        total_rows=row_count,
+        total_run_count=total_run_count,
+        candidate_runs=candidate_runs,
         row_bytes=row_bytes,
         copy_operations_per_run=copy_operations_per_run,
         maximum_copy_runs=maximum_copy_runs,
         service_model=service_model,
         policy=policy,
         overlap_compute_ns=overlap_compute_ns,
+        service_scale_bytes=service_scale_bytes,
     )
     selected_indices = set(selection.selected_run_indices)
-
-    copy_runs = tuple(
-        run for index, run in enumerate(runs) if index in selected_indices
+    layout = (
+        IndexedPairLayout(
+            row_count,
+            tuple(descriptor_by_index[index] for index in range(total_run_count)),
+        )
+        if capture_full_layout
+        else None
     )
+    copy_runs = tuple(descriptor_by_index[index] for index in sorted(selected_indices))
     if not selected_indices:
         sm_source = source.to(dtype=torch.int32)
         sm_destination = destination.to(dtype=torch.int32)
-    elif len(selected_indices) == len(runs):
+    elif sum(run.row_count for run in copy_runs) == row_count:
         sm_source = torch.empty(0, dtype=torch.int32, device=source.device)
         sm_destination = torch.empty(0, dtype=torch.int32, device=source.device)
     else:
-        selected_run_flags = torch.tensor(
-            tuple(index in selected_indices for index in range(len(runs))),
-            dtype=torch.bool,
-            device=source.device,
+        # Selection is bounded by ``maximum_copy_runs``.  Expanding it into a
+        # Python bool tuple reintroduced O(total runs) interpreter work for a
+        # fully scattered map even though descriptor D2H was bounded. Scatter
+        # only the selected IDs into the device mask and keep the complement
+        # construction on the GPU.
+        selected_run_flags = torch.zeros(
+            total_run_count, dtype=torch.bool, device=source.device
+        )
+        selected_run_flags.index_fill_(
+            0,
+            torch.tensor(
+                tuple(sorted(selected_indices)),
+                dtype=run_starts.dtype,
+                device=source.device,
+            ),
+            True,
         )
         run_ids = torch.cumsum(run_starts_mask.to(dtype=torch.int64), dim=0) - 1
         sm_mask = ~selected_run_flags.index_select(0, run_ids)
         sm_source = source.masked_select(sm_mask).to(dtype=torch.int32)
         sm_destination = destination.masked_select(sm_mask).to(dtype=torch.int32)
     return TensorIndexedMoverPlan(
+        row_count,
+        total_run_count,
         layout,
         copy_runs,
         sm_source.contiguous(),

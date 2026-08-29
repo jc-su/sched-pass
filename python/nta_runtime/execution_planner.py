@@ -9,52 +9,9 @@ quality selector.
 from __future__ import annotations
 
 import dataclasses
+from enum import Enum
 import math
 from typing import Literal
-
-
-@dataclasses.dataclass(frozen=True)
-class LayerDeadlineServiceCurve:
-    """Measured lower envelope of useful compute between attention deadlines.
-
-    A transport wave for layer ``i + 1`` can overlap the stream work between
-    the attention arrivals of layers ``i`` and ``i + 1``.  The curve retains a
-    bounded deployment-local sample window and exposes no slack until enough
-    completed CUDA-event intervals exist.  Using the minimum completed sample
-    is deliberately conservative: scheduler pauses may increase an interval,
-    but can never manufacture optimistic transport slack.
-    """
-
-    samples_ns: tuple[int, ...] = ()
-    minimum_samples: int = 4
-    maximum_samples: int = 32
-
-    def __post_init__(self) -> None:
-        if self.minimum_samples <= 0 or self.maximum_samples < self.minimum_samples:
-            raise ValueError("layer service-curve sample bounds are invalid")
-        if len(self.samples_ns) > self.maximum_samples or any(
-            sample <= 0 for sample in self.samples_ns
-        ):
-            raise ValueError("layer service-curve samples are invalid")
-
-    @property
-    def calibrated(self) -> bool:
-        return len(self.samples_ns) >= self.minimum_samples
-
-    @property
-    def conservative_layer_ns(self) -> int:
-        return min(self.samples_ns) if self.calibrated else 0
-
-    def with_observation(self, elapsed_ns: int) -> "LayerDeadlineServiceCurve":
-        if elapsed_ns <= 0:
-            raise ValueError("layer service observation must be positive")
-        samples = (*self.samples_ns, elapsed_ns)[-self.maximum_samples :]
-        return dataclasses.replace(self, samples_ns=samples)
-
-    def overlap_budget_ns(self, layer_intervals: int) -> int:
-        if layer_intervals < 0:
-            raise ValueError("layer service interval count cannot be negative")
-        return self.conservative_layer_ns * layer_intervals
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,10 +102,7 @@ class HostCostModel:
         bounded = min(max(observed, lower), upper)
         calibrated = max(
             1,
-            round(
-                (1.0 - alpha) * self.bandwidth_bytes_per_second
-                + alpha * bounded
-            ),
+            round((1.0 - alpha) * self.bandwidth_bytes_per_second + alpha * bounded),
         )
         return dataclasses.replace(self, bandwidth_bytes_per_second=calibrated)
 
@@ -182,6 +136,28 @@ class HostCostModel:
         return dataclasses.replace(self, incremental_setup_ns=calibrated)
 
 
+class HostExecutionForm(str, Enum):
+    """Explicit control path; wave count alone cannot identify ownership."""
+
+    DIRECT = "direct"
+    DEVICE_BULK = "device_bulk"
+    DEPENDENCY_AWARE = "dependency_aware"
+
+
+class HostExecutionMode(str, Enum):
+    """Selection mode, kept separate from the form ultimately executed.
+
+    ``AUTO`` is the production policy.  The other values are explicit causal
+    experiment controls and correctness/debugging tools; they are not hidden
+    fallbacks and are reported in the resulting plan.
+    """
+
+    AUTO = "auto"
+    DIRECT = "direct"
+    DEVICE_BULK = "device_bulk"
+    DEPENDENCY_AWARE = "dependency_aware"
+
+
 @dataclasses.dataclass(frozen=True)
 class HostExecutionPlan:
     """One execution-form decision over one or more equivalent layer units.
@@ -194,6 +170,7 @@ class HostExecutionPlan:
     block_counts: tuple[int, ...]
     predicted_atomic_ns: int
     predicted_incremental_ns: int
+    form: HostExecutionForm
     overlap_initial: bool = False
     selection_reason: Literal[
         "conventional",
@@ -201,6 +178,10 @@ class HostExecutionPlan:
         "calibration_probe",
         "insufficient_gain",
         "predicted_gain",
+        "tenant_isolation",
+        "forced_direct",
+        "forced_device_bulk",
+        "forced_dependency_aware",
     ] = "predicted_gain"
     scope_units: int = 1
 
@@ -211,10 +192,33 @@ class HostExecutionPlan:
             or self.predicted_incremental_ns < 0
         ):
             raise ValueError("host execution decision scope is invalid")
+        if not isinstance(self.form, HostExecutionForm):
+            raise TypeError("host execution form has an invalid type")
+        if self.form in {HostExecutionForm.DIRECT, HostExecutionForm.DEVICE_BULK} and (
+            len(self.block_counts) != 1 or self.overlap_initial
+        ):
+            raise ValueError(
+                "direct and device-bulk execution must be one non-overlapped wave"
+            )
 
     @property
     def rounds(self) -> int:
         return len(self.block_counts)
+
+    @property
+    def uses_dependency_protocol(self) -> bool:
+        return self.form in {
+            HostExecutionForm.DEVICE_BULK,
+            HostExecutionForm.DEPENDENCY_AWARE,
+        }
+
+    @property
+    def uses_device_bulk(self) -> bool:
+        return self.form is HostExecutionForm.DEVICE_BULK
+
+    @property
+    def uses_progressive_consumer(self) -> bool:
+        return self.form is HostExecutionForm.DEPENDENCY_AWARE
 
     @property
     def predicted_gain(self) -> float:
@@ -280,6 +284,290 @@ def conservative_resume_counts(
     return tuple(result)
 
 
+@dataclasses.dataclass(frozen=True)
+class RunnableWorkWindows:
+    """Exact disjoint slices of the device-published runnable queue.
+
+    ``initial_count`` is the prefix published by discovery (resident work and
+    dependencies completed by a preloaded fragment).  Every later progress
+    wave appends ``counts[i]`` tickets, so ``offsets[i]`` is the exact queue
+    prefix already consumed by earlier numerical launches.  Counts may be zero
+    when a transport wave completes no work; callers must skip that numerical
+    launch instead of inventing a duplicate one.
+    """
+
+    initial_count: int
+    offsets: tuple[int, ...]
+    counts: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.initial_count < 0
+            or len(self.offsets) != len(self.counts)
+            or any(count < 0 for count in self.counts)
+        ):
+            raise ValueError("runnable work windows have invalid geometry")
+        cursor = self.initial_count
+        for offset, count in zip(self.offsets, self.counts, strict=True):
+            if offset != cursor:
+                raise ValueError("runnable work windows are not contiguous")
+            cursor += count
+
+    @property
+    def work_count(self) -> int:
+        return self.initial_count + sum(self.counts)
+
+    @property
+    def launch_count(self) -> int:
+        return int(self.initial_count != 0) + sum(count != 0 for count in self.counts)
+
+
+def plan_exact_runnable_windows(
+    *,
+    external_object_slots: tuple[tuple[int, ...], ...],
+    first_unresolved_object: int,
+    block_counts: tuple[int, ...],
+) -> RunnableWorkWindows:
+    """Project sequential object completion into exact one-shot work launches.
+
+    The prevalidated indexed-host path completes the contiguous object ranges
+    in ``block_counts`` order. A work ticket becomes runnable in the first wave
+    whose exclusive object boundary covers all of its dependencies. Shared
+    acquisition groups and arbitrary fan-out remain exact because each work
+    ticket is counted once, at its latest dependency. This removes the old
+    one-group-per-work restriction without reading ``readyCount`` on the host.
+    """
+
+    if first_unresolved_object < 0 or not external_object_slots or not block_counts:
+        raise ValueError("exact runnable-window geometry is empty")
+    if any(count <= 0 for count in block_counts):
+        raise ValueError("exact runnable-window progress must be positive")
+
+    boundaries: list[int] = []
+    cursor = first_unresolved_object
+    for count in block_counts:
+        cursor += count
+        boundaries.append(cursor)
+
+    initial_count = 0
+    counts = [0] * len(block_counts)
+    for raw_slots in external_object_slots:
+        slots = tuple(int(slot) for slot in raw_slots)
+        if any(slot < 0 for slot in slots):
+            raise ValueError("runnable work names a negative object slot")
+        unresolved = tuple(slot for slot in slots if slot >= first_unresolved_object)
+        if not unresolved:
+            initial_count += 1
+            continue
+        final_dependency = max(unresolved)
+        for wave, boundary in enumerate(boundaries):
+            if final_dependency < boundary:
+                counts[wave] += 1
+                break
+        else:
+            raise ValueError(
+                "runnable work dependency is not covered by the progress waves"
+            )
+
+    offsets: list[int] = []
+    cursor = initial_count
+    for count in counts:
+        offsets.append(cursor)
+        cursor += count
+    result = RunnableWorkWindows(initial_count, tuple(offsets), tuple(counts))
+    if result.work_count != len(external_object_slots):  # pragma: no cover
+        raise RuntimeError("runnable-window planning lost work")
+    return result
+
+
+@dataclasses.dataclass(frozen=True)
+class HostLayerExecutionTemplate:
+    """Immutable launch geometry shared by equivalent transformer layers.
+
+    Request identity, acquisition-group ownership, and object addresses remain
+    in the uploaded work plan and runtime directory.  This template contains
+    only shape-stable orchestration: finite progress waves, numerical launch
+    windows, and indexed-copy geometry.  Reusing it therefore removes Python
+    planning from each layer without extending any resource lifetime.
+    """
+
+    object_count: int
+    work_count: int
+    direct_work_count: int
+    preloaded_object_count: int
+    queued_feasible_edf: bool
+    progress_blocks: tuple[int, ...]
+    ready_work_counts: tuple[int, ...]
+    ready_work_offsets: tuple[int, ...] | None
+    initial_ready_work_count: int
+    demand_transfer_bytes: int
+    indexed_host_first_object: int | None
+    indexed_host_prevalidated: bool
+    indexed_copy_blocks_per_group: int
+    progressive_consumer: bool
+    exact_resume_windows: bool
+
+    def __post_init__(self) -> None:
+        if (
+            self.object_count <= 0
+            or self.work_count <= 0
+            or not self.progress_blocks
+            or len(self.progress_blocks) != len(self.ready_work_counts)
+            or self.demand_transfer_bytes <= 0
+            or self.initial_ready_work_count < 0
+            or not 0 <= self.direct_work_count < self.work_count
+            or not 0 <= self.preloaded_object_count < self.object_count
+            or self.indexed_copy_blocks_per_group <= 0
+        ):
+            raise ValueError("host layer execution template has invalid geometry")
+        if self.ready_work_offsets is not None and len(self.ready_work_offsets) != len(
+            self.progress_blocks
+        ):
+            raise ValueError("host layer execution offsets do not match progress")
+
+    @property
+    def progress_rounds(self) -> int:
+        return len(self.progress_blocks)
+
+    @property
+    def nonempty_resume_windows(self) -> int:
+        return sum(count != 0 for count in self.ready_work_counts)
+
+
+def plan_host_layer_execution(
+    *,
+    host_execution: HostExecutionPlan,
+    object_count: int,
+    work_count: int,
+    transfer_bytes: int,
+    object_transfer_bytes: tuple[int, ...],
+    external_object_slots: tuple[tuple[int, ...], ...],
+    direct_work_count: int,
+    max_object_fanout: int,
+    min_unresolved_dependencies: int,
+    preloaded_object_count: int,
+    queued_feasible_edf: bool,
+    indexed_copy_target_bytes: int,
+    indexed_copy_max_blocks: int,
+) -> HostLayerExecutionTemplate:
+    """Build one exact host-acquisition/numerical launch template.
+
+    ``DEVICE_BULK`` deliberately withholds all numerical work until its sole
+    acquisition wave completes.  ``DEPENDENCY_AWARE`` exposes either exact
+    disjoint windows for a prevalidated range or conservative device-queue
+    prefixes when EDF/tenant ordering must remain on the GPU.
+    """
+
+    if (
+        min(
+            object_count,
+            work_count,
+            transfer_bytes,
+            max_object_fanout,
+            min_unresolved_dependencies,
+            indexed_copy_target_bytes,
+            indexed_copy_max_blocks,
+        )
+        <= 0
+        or not 0 <= direct_work_count < work_count
+        or not 0 <= preloaded_object_count < object_count
+        or len(object_transfer_bytes) != object_count
+        or sum(object_transfer_bytes) != transfer_bytes
+        or len(external_object_slots) != work_count
+    ):
+        raise ValueError("host layer execution input geometry is incomplete")
+
+    progress_blocks = host_execution.block_counts
+    if preloaded_object_count:
+        if host_execution.uses_device_bulk:
+            raise ValueError("device-bulk execution cannot consume a fragment")
+        if preloaded_object_count != progress_blocks[0]:
+            raise ValueError("preloaded fragment does not match the first wave")
+        progress_blocks = progress_blocks[1:]
+    if not progress_blocks:
+        raise ValueError("host layer execution has no unresolved acquisition wave")
+    if host_execution.uses_device_bulk and (
+        len(progress_blocks) != 1 or progress_blocks[0] != object_count
+    ):
+        raise ValueError("device-bulk execution requires one complete wave")
+
+    demand_transfer_bytes = transfer_bytes - sum(
+        object_transfer_bytes[:preloaded_object_count]
+    )
+    if demand_transfer_bytes <= 0:
+        raise ValueError("host layer execution has no unresolved payload")
+
+    initial_ready_work_count = (
+        0
+        if host_execution.uses_device_bulk
+        else direct_work_count
+        + sum(
+            1
+            for object_slots in external_object_slots
+            if object_slots
+            and all(slot < preloaded_object_count for slot in object_slots)
+        )
+    )
+    if not host_execution.uses_device_bulk and initial_ready_work_count >= work_count:
+        raise ValueError("dependency-aware execution has no deferred work")
+
+    exact_resume_windows = False
+    if host_execution.uses_device_bulk:
+        ready_work_counts = (work_count,)
+        ready_work_offsets: tuple[int, ...] | None = (0,)
+    elif queued_feasible_edf:
+        ready_work_counts = conservative_resume_counts(
+            block_counts=progress_blocks,
+            work_count=work_count - initial_ready_work_count,
+            max_object_fanout=max_object_fanout,
+            min_unresolved_dependencies=min_unresolved_dependencies,
+        )
+        ready_work_offsets = None
+    else:
+        windows = plan_exact_runnable_windows(
+            external_object_slots=external_object_slots,
+            first_unresolved_object=preloaded_object_count,
+            block_counts=progress_blocks,
+        )
+        if (
+            windows.initial_count != initial_ready_work_count
+            or windows.work_count != work_count
+        ):
+            raise ValueError("exact runnable windows disagree with discovered work")
+        ready_work_counts = windows.counts
+        ready_work_offsets = windows.offsets
+        exact_resume_windows = True
+
+    progressive_consumer = host_execution.uses_progressive_consumer and (
+        initial_ready_work_count != 0
+        or sum(count != 0 for count in ready_work_counts) > 1
+    )
+    return HostLayerExecutionTemplate(
+        object_count=object_count,
+        work_count=work_count,
+        direct_work_count=direct_work_count,
+        preloaded_object_count=preloaded_object_count,
+        queued_feasible_edf=queued_feasible_edf,
+        progress_blocks=progress_blocks,
+        ready_work_counts=ready_work_counts,
+        ready_work_offsets=ready_work_offsets,
+        initial_ready_work_count=initial_ready_work_count,
+        demand_transfer_bytes=demand_transfer_bytes,
+        indexed_host_first_object=(
+            None if queued_feasible_edf else preloaded_object_count
+        ),
+        indexed_host_prevalidated=not queued_feasible_edf,
+        indexed_copy_blocks_per_group=indexed_copy_blocks_per_group(
+            transfer_bytes=demand_transfer_bytes,
+            object_count=object_count - preloaded_object_count,
+            target_bytes_per_block=indexed_copy_target_bytes,
+            maximum_blocks=indexed_copy_max_blocks,
+        ),
+        progressive_consumer=progressive_consumer,
+        exact_resume_windows=exact_resume_windows,
+    )
+
+
 def _round_width(object_count: int, rounds: int, dependency_width: int) -> int:
     width = math.ceil(object_count / rounds)
     return min(object_count, math.ceil(width / dependency_width) * dependency_width)
@@ -311,6 +599,32 @@ def _pipeline_ns(
     )
 
 
+def _repeated_stage_pipeline_ns(
+    transfer_ns: int,
+    compute_ns: int,
+    units: int,
+) -> int:
+    """Lower-bound a conventional transfer/compute pipeline.
+
+    SGLang publishes one readiness event per transformer layer on a mover
+    stream while numerical attention runs on the framework stream.  Once the
+    first layer is available, transfer for layer ``i + 1`` can overlap
+    attention for layer ``i``.  Treating every layer as ``transfer + compute``
+    serial work invents ``units - 1`` pipeline bubbles and makes an
+    incremental consumer appear profitable when it is not.
+
+    This max-plus expression is intentionally favorable to the conventional
+    path.  SM movers can contend with attention and real layers are not
+    identical, so measured execution can be slower; an automatic selector
+    must not choose the more expensive dependency protocol by assuming such
+    contention creates free headroom.
+    """
+
+    if min(transfer_ns, compute_ns, units) <= 0:
+        raise ValueError("repeated pipeline geometry must be positive")
+    return transfer_ns + compute_ns + (units - 1) * max(transfer_ns, compute_ns)
+
+
 def prove_atomic_host_execution(
     *,
     object_count: int,
@@ -318,6 +632,7 @@ def prove_atomic_host_execution(
     runnable_tiles: int,
     model: HostCostModel,
     scope_units: int = 1,
+    mode: HostExecutionMode = HostExecutionMode.AUTO,
 ) -> HostExecutionPlan | None:
     """Prove that incremental execution cannot meet the configured gain.
 
@@ -334,27 +649,58 @@ def prove_atomic_host_execution(
     """
 
     model.validate()
+    if not isinstance(mode, HostExecutionMode):
+        raise TypeError("host execution mode has an invalid type")
     if min(object_count, transfer_bytes, runnable_tiles, scope_units) <= 0:
         raise ValueError("host execution proof needs non-empty active work")
-    if model.incremental_setup_ns is None:
-        return None
     transfer_ns = math.ceil(
         transfer_bytes * 1_000_000_000 / model.bandwidth_bytes_per_second
     )
     compute_ns = runnable_tiles * model.tile_compute_ns
-    atomic_ns = scope_units * (transfer_ns + compute_ns)
+    atomic_ns = _repeated_stage_pipeline_ns(
+        transfer_ns,
+        compute_ns,
+        scope_units,
+    )
+    if mode in {HostExecutionMode.DEVICE_BULK, HostExecutionMode.DEPENDENCY_AWARE}:
+        return None
+    if mode is HostExecutionMode.DIRECT:
+        return HostExecutionPlan(
+            block_counts=(object_count,),
+            predicted_atomic_ns=atomic_ns,
+            predicted_incremental_ns=atomic_ns,
+            form=HostExecutionForm.DIRECT,
+            overlap_initial=False,
+            selection_reason="forced_direct",
+            scope_units=scope_units,
+        )
+    if model.incremental_setup_ns is None:
+        # AUTO cannot soundly select a consumer whose recurring setup has not
+        # been observed.  Returning the direct proof here also avoids building
+        # and uploading an exact dependency graph solely to reach the same
+        # fail-closed decision later.
+        return HostExecutionPlan(
+            block_counts=(object_count,),
+            predicted_atomic_ns=atomic_ns,
+            predicted_incremental_ns=atomic_ns,
+            form=HostExecutionForm.DIRECT,
+            overlap_initial=False,
+            selection_reason="uncalibrated_setup",
+            scope_units=scope_units,
+        )
     optimistic_incremental_ns = (
         scope_units * max(transfer_ns, compute_ns) + model.incremental_setup_ns
     )
     if atomic_ns / optimistic_incremental_ns >= model.minimum_predicted_gain:
         return None
     return HostExecutionPlan(
-        (object_count,),
-        atomic_ns,
-        atomic_ns,
-        False,
-        "insufficient_gain",
-        scope_units,
+        block_counts=(object_count,),
+        predicted_atomic_ns=atomic_ns,
+        predicted_incremental_ns=optimistic_incremental_ns,
+        form=HostExecutionForm.DIRECT,
+        overlap_initial=False,
+        selection_reason="insufficient_gain",
+        scope_units=scope_units,
     )
 
 
@@ -367,8 +713,16 @@ def plan_host_execution(
     initial_runnable_tiles: int = 0,
     calibration_probe: bool = False,
     scope_units: int = 1,
+    require_dependency_protocol: bool = False,
+    mode: HostExecutionMode = HostExecutionMode.AUTO,
 ) -> HostExecutionPlan:
     model.validate()
+    if not isinstance(mode, HostExecutionMode):
+        raise TypeError("host execution mode has an invalid type")
+    if require_dependency_protocol and mode is HostExecutionMode.DIRECT:
+        raise ValueError("tenant isolation cannot force direct host execution")
+    if calibration_probe and mode is not HostExecutionMode.AUTO:
+        raise ValueError("calibration probes require automatic host execution")
     if min(object_count, transfer_bytes, runnable_tiles, scope_units) <= 0:
         raise ValueError("host execution planning needs non-empty active work")
     if not 0 <= initial_runnable_tiles < runnable_tiles:
@@ -379,34 +733,60 @@ def plan_host_execution(
     compute_ns = runnable_tiles * model.tile_compute_ns
     initial_compute_ns = initial_runnable_tiles * model.tile_compute_ns
     deferred_compute_ns = compute_ns - initial_compute_ns
-    atomic_unit_ns = transfer_ns + compute_ns
-    atomic_ns = scope_units * atomic_unit_ns
-    best_counts = (object_count,)
-    best_ns = atomic_ns
-    overlap_initial = False
-
-    setup_ns = model.incremental_setup_ns
-    if setup_ns is None and not calibration_probe:
+    atomic_ns = _repeated_stage_pipeline_ns(
+        transfer_ns,
+        compute_ns,
+        scope_units,
+    )
+    if mode is HostExecutionMode.DIRECT:
         return HostExecutionPlan(
-            best_counts,
-            atomic_ns,
-            atomic_ns,
-            False,
-            "uncalibrated_setup",
-            scope_units,
+            block_counts=(object_count,),
+            predicted_atomic_ns=atomic_ns,
+            predicted_incremental_ns=atomic_ns,
+            form=HostExecutionForm.DIRECT,
+            overlap_initial=False,
+            selection_reason="forced_direct",
+            scope_units=scope_units,
+        )
+    if mode is HostExecutionMode.DEVICE_BULK:
+        setup_ns = (
+            0 if model.incremental_setup_ns is None else model.incremental_setup_ns
+        )
+        return HostExecutionPlan(
+            block_counts=(object_count,),
+            predicted_atomic_ns=atomic_ns,
+            predicted_incremental_ns=atomic_ns + setup_ns,
+            form=HostExecutionForm.DEVICE_BULK,
+            overlap_initial=False,
+            selection_reason="forced_device_bulk",
+            scope_units=scope_units,
+        )
+    setup_ns = model.incremental_setup_ns
+    if (
+        setup_ns is None
+        and mode is HostExecutionMode.AUTO
+        and not calibration_probe
+        and not require_dependency_protocol
+    ):
+        return HostExecutionPlan(
+            block_counts=(object_count,),
+            predicted_atomic_ns=atomic_ns,
+            predicted_incremental_ns=atomic_ns,
+            form=HostExecutionForm.DIRECT,
+            overlap_initial=False,
+            selection_reason="uncalibrated_setup",
+            scope_units=scope_units,
         )
     if setup_ns is None:
         setup_ns = 0
 
-    if initial_runnable_tiles:
-        one_wave_unit_ns = (
-            max(transfer_ns, initial_compute_ns)
-            + deferred_compute_ns
-        )
-        one_wave_ns = scope_units * one_wave_unit_ns + setup_ns
-        if atomic_ns / one_wave_ns >= model.minimum_predicted_gain:
-            best_ns = one_wave_ns
-            overlap_initial = True
+    # A one-wave dependency-aware form is semantically distinct from direct
+    # bulk staging: it uses object ownership, request generation, and tenant
+    # credits even when the geometry cannot expose a second wave.
+    one_wave_unit_ns = max(transfer_ns, initial_compute_ns) + deferred_compute_ns
+    best_counts = (object_count,)
+    best_ns = scope_units * one_wave_unit_ns + setup_ns
+    overlap_initial = initial_runnable_tiles != 0
 
     max_rounds = min(model.max_rounds, math.ceil(object_count / model.dependency_width))
     for requested_rounds in range(2, max_rounds + 1):
@@ -428,18 +808,34 @@ def plan_host_execution(
             best_ns = candidate_ns
             overlap_initial = initial_runnable_tiles != 0
 
-    if atomic_ns / best_ns < model.minimum_predicted_gain:
-        best_counts = (object_count,)
-        best_ns = atomic_ns
-        overlap_initial = False
-        reason = "insufficient_gain"
+    selected = (
+        calibration_probe
+        or mode is HostExecutionMode.DEPENDENCY_AWARE
+        or require_dependency_protocol
+        or atomic_ns / best_ns >= model.minimum_predicted_gain
+    )
+    # A probe is an explicitly bounded data-collection epoch, not a normal
+    # policy decision. It must execute the path whose recurring setup cost is
+    # unknown even when the cold prior predicts a loss; otherwise the probe
+    # budget can never retire and AUTO can never become measured.
+    if calibration_probe:
+        reason = "calibration_probe"
+    elif mode is HostExecutionMode.DEPENDENCY_AWARE:
+        reason = "forced_dependency_aware"
+    elif require_dependency_protocol:
+        reason = "tenant_isolation"
+    elif selected:
+        reason = "predicted_gain"
     else:
-        reason = "calibration_probe" if calibration_probe else "predicted_gain"
+        reason = "insufficient_gain"
     return HostExecutionPlan(
-        best_counts,
-        atomic_ns,
-        best_ns,
-        overlap_initial,
-        reason,
-        scope_units,
+        block_counts=best_counts if selected else (object_count,),
+        predicted_atomic_ns=atomic_ns,
+        predicted_incremental_ns=best_ns,
+        form=(
+            HostExecutionForm.DEPENDENCY_AWARE if selected else HostExecutionForm.DIRECT
+        ),
+        overlap_initial=overlap_initial if selected else False,
+        selection_reason=reason,
+        scope_units=scope_units,
     )

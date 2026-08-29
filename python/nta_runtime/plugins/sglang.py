@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+from typing import Callable
 
 
 SUPPORTED_SGLANG_VERSION = "0.5.16"
@@ -54,6 +55,8 @@ _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET = (
 _DECODE_GRAPH_REPLAY_VIEW_TARGET = (
     "sglang.srt.model_executor.runner.decode_cuda_graph_runner.build_replay_fb_view"
 )
+_CONTROL_RPC_TARGET = "sglang.srt.managers.scheduler.Scheduler.handle_rpc_request"
+STATS_SNAPSHOT_RPC_METHOD = "nta_publish_stats_snapshot"
 _REQUIRED_LIFECYCLE_HOOK_TARGETS = (
     _RELEASE_TARGET,
     _HICACHE_LOAD_TARGET,
@@ -68,6 +71,7 @@ _REQUIRED_LIFECYCLE_HOOK_TARGETS = (
     _PREFILL_GRAPH_LOAD_BATCH_TARGET,
     _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
     _DECODE_GRAPH_REPLAY_VIEW_TARGET,
+    _CONTROL_RPC_TARGET,
 )
 
 _ACQUISITION_ATTRIBUTE = "_nta_acquisition_span"
@@ -77,9 +81,34 @@ _ACQUISITION_ATTRIBUTE = "_nta_acquisition_span"
 # mutate HookRegistry's private hook list.
 _REGISTERED_HOOKS: set[tuple[str, int, str]] = set()
 _PROFILE_FORWARD_ENABLED: bool | None = None
+_TENANT_POLICY_INITIALIZED = False
+_TENANT_POLICY_SOURCE = ""
+_TENANT_MAPPER: Callable[[str], int] | None = None
 
 
-_OBSERVABILITY_DEGRADED: dict[str, int] = {}
+def _configured_tenant_mapper() -> Callable[[str], int] | None:
+    """Parse and freeze request-to-tenant policy once per worker process."""
+
+    global _TENANT_MAPPER
+    global _TENANT_POLICY_INITIALIZED
+    global _TENANT_POLICY_SOURCE
+    source = os.environ.get("NTA_TENANT_REQUEST_PREFIXES", "").strip()
+    if _TENANT_POLICY_INITIALIZED:
+        if source != _TENANT_POLICY_SOURCE:
+            raise RuntimeError(
+                "NTA_TENANT_REQUEST_PREFIXES cannot change after plugin startup"
+            )
+        return _TENANT_MAPPER
+    from nta_runtime.tenant import tenant_mapper_from_environment
+
+    try:
+        mapper = tenant_mapper_from_environment()
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    _TENANT_MAPPER = mapper
+    _TENANT_POLICY_SOURCE = source
+    _TENANT_POLICY_INITIALIZED = True
+    return mapper
 
 
 def _required_hook_targets() -> tuple[str, ...]:
@@ -110,13 +139,10 @@ def _observability_degraded(site: str, error: Exception) -> None:
     stance) — but silent degradation is worse than loud, so the count is
     exported through the engine stats as observability_degraded_<site>.
     """
-    from nta_runtime.engines.sglang import FORWARD_PROFILE
+    from nta_runtime.engines.sglang_telemetry import record_observability_degraded
 
-    key = f"observability_degraded_{site}"
-    count = _OBSERVABILITY_DEGRADED.get(site, 0)
-    _OBSERVABILITY_DEGRADED[site] = count + 1
-    FORWARD_PROFILE[key] = float(_OBSERVABILITY_DEGRADED[site])
-    if count == 0:
+    count = record_observability_degraded(site)
+    if count == 1:
         import logging
 
         logging.getLogger(__name__).exception(
@@ -137,7 +163,7 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
     """
     import torch
 
-    from nta_runtime.engines.sglang import record_forward
+    from nta_runtime.engines.sglang_telemetry import record_forward
 
     backend = getattr(runner.model_runner, "attn_backend", None)
     active_batch = getattr(backend, "_active_batch", None)
@@ -202,7 +228,7 @@ def _preserve_prefill_graph_request_metadata() -> None:
 
 def _preserve_prefill_load_batch(original, self, forward_batch, **kwargs):
     """Copy live request metadata into a static prefill graph batch."""
-    from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+    from nta_runtime.engines.sglang_telemetry import record_prefill_graph
     from nta_runtime.adapters.sglang import (
         FORWARD_METADATA_ATTRIBUTE,
         forward_metadata,
@@ -212,13 +238,11 @@ def _preserve_prefill_load_batch(original, self, forward_batch, **kwargs):
     static_batch.rids = getattr(forward_batch, "rids", None)
     metadata = forward_metadata(forward_batch)
     setattr(static_batch, FORWARD_METADATA_ATTRIBUTE, metadata)
-    PREFILL_GRAPH_COUNTERS["prefill_graph_served_batches"] += 1
+    record_prefill_graph("served")
     return static_batch
 
 
-def _preserve_eager_load_batch(
-    original, runner, forward_batch, *args, **kwargs
-):
+def _preserve_eager_load_batch(original, runner, forward_batch, *args, **kwargs):
     """Carry NTA's immutable sidecar through SGLang's eager buffer view."""
 
     from nta_runtime.adapters.sglang import (
@@ -237,7 +261,7 @@ def _preserve_eager_load_batch(
 
 def _preserve_prefill_capture_prepare(original, self, num_tokens, *args, **kwargs):
     """Give graph-capture-only prefill batches stable placeholder identity."""
-    from nta_runtime.engines.sglang import PREFILL_GRAPH_COUNTERS
+    from nta_runtime.engines.sglang_telemetry import record_prefill_graph
     from nta_runtime.adapters.sglang import (
         FORWARD_METADATA_ATTRIBUTE,
         SglangAcquisitionSpan,
@@ -245,7 +269,7 @@ def _preserve_prefill_capture_prepare(original, self, num_tokens, *args, **kwarg
     )
 
     result = original(self, num_tokens, *args, **kwargs)
-    PREFILL_GRAPH_COUNTERS["prefill_graph_capture_batches"] += 1
+    record_prefill_graph("capture")
     forward_batch = result[0] if isinstance(result, tuple) else result
     if not getattr(forward_batch, "rids", None):
         batch_size = int(getattr(forward_batch, "batch_size", 1) or 1)
@@ -380,6 +404,40 @@ def _flush_backend_stats(scheduler, *args, **kwargs) -> None:
         writer = getattr(backend, "_write_stats", None)
         if callable(writer):
             writer()
+
+
+def _route_stats_snapshot_rpc(original, scheduler, recv_req, *args, **kwargs):
+    """Publish a quiescent backend snapshot without issuing model work.
+
+    SGLang's public ``Engine.collective_rpc`` reaches every scheduler process,
+    but 0.5.16 does not expose a custom-RPC registration API. Intercept only
+    NTA's namespaced method through the official hook registry and preserve
+    SGLang's tensor-parallel barrier/response contract. Unlike a reserved
+    inference request, this edge cannot load KV or mutate the radix cache.
+    """
+
+    if getattr(recv_req, "method", None) != STATS_SNAPSHOT_RPC_METHOD:
+        return original(scheduler, recv_req, *args, **kwargs)
+
+    from sglang.srt.managers.io_struct import RpcReqOutput
+    from torch.distributed import barrier
+
+    success = True
+    message = ""
+    try:
+        published = 0
+        for backend in _walk_attention_backends(scheduler):
+            publisher = getattr(backend, "_publish_stats", None)
+            if callable(publisher):
+                publisher(observation_boundary=True, wait=True)
+                published += 1
+        if published == 0:
+            raise RuntimeError("NTA statistics RPC found no publishing backend")
+    except Exception as error:
+        success = False
+        message = str(error)
+    barrier(group=scheduler.tp_group.cpu_group)
+    return RpcReqOutput(success=success, message=message)
 
 
 def _cancel_backend_requests(scheduler, recv_req, *args, **kwargs) -> None:
@@ -545,19 +603,34 @@ def _attach_request_priorities(
         rank = {value: index for index, value in enumerate(ordered)}
         denominator = max(1, len(ordered) - 1)
         priorities = tuple(7 - round(rank[value] * 7 / denominator) for value in raw)
-    request_slots = getattr(forward_batch, "req_pool_indices", None)
-    if request_slots is None:
-        raise RuntimeError("SGLang forward batch omitted request-pool slots")
-    if hasattr(request_slots, "tolist"):
-        request_slots = request_slots.tolist()
+    # ``ForwardBatch.req_pool_indices`` is the device copy used by attention.
+    # Reading it with ``tolist()`` here inserts a D2H synchronization into
+    # every decode token.  The scheduler requests own the same allocation as
+    # ordinary Python integers before ForwardBatch is constructed, so bind
+    # identity from that control-plane source instead.
+    request_slots = tuple(
+        getattr(request, "req_pool_idx", None) for request in requests
+    )
+    if any(slot is None for slot in request_slots):
+        raise RuntimeError("SGLang request omitted its allocated request-pool slot")
     existing = getattr(forward_batch, FORWARD_METADATA_ATTRIBUTE, None)
     if existing is not None and not isinstance(existing, SglangForwardMetadata):
         raise RuntimeError("SGLang forward metadata has an invalid sidecar type")
-    tenant_ids = (
-        (0,) * len(requests)
-        if existing is None
-        else tuple(int(tenant_id) for tenant_id in existing.tenant_ids)
-    )
+    if existing is None:
+        mapper = _configured_tenant_mapper()
+        if mapper is None:
+            tenant_ids = (0,) * len(requests)
+        else:
+            if any(
+                not isinstance(request_id, str) or not request_id
+                for request_id in request_ids
+            ):
+                raise RuntimeError(
+                    "SGLang request-to-tenant policy requires stable request IDs"
+                )
+            tenant_ids = tuple(mapper(request_id) for request_id in request_ids)
+    else:
+        tenant_ids = tuple(int(tenant_id) for tenant_id in existing.tenant_ids)
     acquisitions: list[SglangAcquisitionSpan] = []
     for request in requests:
         acquisition = getattr(
@@ -589,6 +662,7 @@ def register() -> None:
         raise RuntimeError(
             f"NTA supports SGLang {SUPPORTED_SGLANG_VERSION}; found {version}"
         )
+    _configured_tenant_mapper()
 
     from sglang.srt.layers.attention.attention_registry import (
         ATTENTION_BACKENDS,
@@ -659,6 +733,12 @@ def register() -> None:
         HookRegistry,
         _PREFILL_ADMISSION_TARGET,
         route_prefill_admission,
+        HookType.AROUND,
+    )
+    _register_hook(
+        HookRegistry,
+        _CONTROL_RPC_TARGET,
+        _route_stats_snapshot_rpc,
         HookType.AROUND,
     )
     if BACKEND_NAME not in ATTENTION_BACKENDS:

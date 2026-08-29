@@ -103,18 +103,77 @@ acquireCurrentWork(abi::RuntimeView *runtime, const abi::WorkItem *workItems,
 #endif
 }
 
+// Bind a current-generation structural plan through one compiler-visible
+// acquisition site. Work selected from RuntimeView::readyWorkTickets has
+// already had its exact dependency set admitted by discovery/publication, so a
+// zero active count consumes that proof without traversing the cone again. The
+// original requirements pointer remains an operand, preserving provenance for
+// any requirement-address use. A non-published launch retains the full count.
+//
+// The single marker is intentional: it gives the verifier one dominating
+// request guard for the numerical/partial region instead of two conditional
+// acquisition sites. New runnable work is valid because discovery publishes it
+// only after proving every dependency ready; commitPartial installs its ticket
+// identity at retirement, as before.
+[[nodiscard]] __device__ __forceinline__ bool
+acquireCurrentPlannedWork(abi::RuntimeView *runtime,
+                          const abi::WorkItem *workItems,
+                          const abi::AcquireRequirement *dependencies,
+                          std::uint32_t workIndex, bool published,
+                          WorkContext &context) {
+  context.item = workItems[workIndex];
+  context.item.generation =
+      runtime->requests[context.item.requestSlot].generation;
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  context.dependencies = nullptr;
+#else
+  context.dependencies = dependencies + context.item.dependencyBegin;
+#endif
+  __nta_bind_request(context.item.requestSlot, context.item.generation);
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  // This form is admitted only for one finite, fully published ready window.
+  // Discovery already validated every exact dependency and the following
+  // same-stream retirement kernel owns ticket initialization/completion. Do
+  // not re-read or mutate ticket state in every numerical CTA: that would
+  // violate the stream-ordered ownership contract.
+  // launchWorkIndex has already checked the runtime ABI, queue bounds, and
+  // work-ticket index. The uploaded typed plan owns the remaining structural
+  // fields; adding a second conditional here would create a compiler-visible
+  // path around the numerical acquisition region.
+  (void)dependencies;
+  (void)published;
+  return __nta_acquire_set_marker(runtime, nullptr, 0, 0,
+                                  context.item.workTicket);
+#else
+  if (!prepareWorkTicket(runtime, context.item)) {
+    return false;
+  }
+  const std::uint32_t dependencyCount =
+      published ? 0U : context.item.dependencyCount;
+  const std::uint32_t directDependencyCount =
+      published ? 0U : context.item.directDependencyCount;
+  return __nta_acquire_set_marker(runtime, context.dependencies,
+                                  dependencyCount, directDependencyCount,
+                                  context.item.workTicket);
+#endif
+}
+
 // A stream-ordered acquisition event can satisfy the data dependency while the
 // structural work plan still supplies the exact CTA-to-request mapping. Keep
 // the compiler-visible request guard, but do not rediscover dependencies or
 // mutate work-ticket state for this launch.
-[[nodiscard]] __device__ __forceinline__ bool
-acquirePreacquiredWork(abi::RuntimeView *runtime,
-                       const abi::WorkItem *workItems, std::uint32_t workIndex,
-                       WorkContext &context) {
+__device__ __forceinline__ void
+preparePreacquiredWork(const abi::WorkItem *workItems,
+                       const abi::AcquireRequirement *dependencies,
+                       std::uint32_t workIndex, WorkContext &context) {
   context.item = workItems[workIndex];
-  if (context.item.requestSlot >= runtime->requestCapacity) {
-    return false;
-  }
+  context.dependencies =
+      dependencies == nullptr ? nullptr
+                              : dependencies + context.item.dependencyBegin;
+}
+
+[[nodiscard]] __device__ __forceinline__ bool
+acquirePreacquiredWork(abi::RuntimeView *runtime, WorkContext &context) {
   context.item.generation =
       runtime->requests[context.item.requestSlot].generation;
   context.item.workTicket = abi::InvalidIndex;
@@ -122,9 +181,64 @@ acquirePreacquiredWork(abi::RuntimeView *runtime,
   context.item.contributorIndex = 0;
   context.item.contributorCount = 0;
   context.item.estimatedComputeNs = 0;
-  context.dependencies = nullptr;
   __nta_bind_request(context.item.requestSlot, context.item.generation);
   return __nta_acquire_set_marker(runtime, nullptr, 0, 0, abi::InvalidIndex);
+}
+
+// Verify event-published resource identity before crossing the single
+// compiler-visible request acquisition edge. The marker remains the final
+// numerical guard, so its ready edge directly dominates the partial region;
+// stale metadata still fails closed before any staged address is consumed.
+[[nodiscard]] __device__ __forceinline__ bool
+validatePreacquiredWork(abi::RuntimeView *runtime,
+                        const WorkContext &context) {
+  const bool hasExternal =
+      context.item.directDependencyCount < context.item.dependencyCount;
+  if (!hasExternal) {
+    return true;
+  }
+  if (context.dependencies == nullptr) {
+    return false;
+  }
+  __shared__ std::uint32_t exactReady;
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    exactReady = 1U;
+    // directDependencyCount is accounting metadata, not an ordering promise.
+    // Validate every externally acquired requirement so a future plan layout
+    // cannot accidentally hide a stale object behind an interleaved direct
+    // requirement.
+    for (std::uint32_t index = 0; index < context.item.dependencyCount;
+         ++index) {
+      const abi::AcquireRequirement &requirement = context.dependencies[index];
+      if (requirement.directBase != 0) {
+        continue;
+      }
+      if (requirement.objectSlot >= runtime->objectCapacity) {
+        exactReady = 0U;
+        break;
+      }
+      const abi::ObjectEntry &object =
+          runtime->objects[requirement.objectSlot];
+      const auto state = static_cast<abi::ObjectState>(atomicAdd(
+          const_cast<std::uint32_t *>(&object.state), 0U));
+      if (object.objectId != requirement.objectId ||
+          object.version != requirement.objectVersion ||
+          state != abi::ObjectState::Ready ||
+          requirement.offset > object.bytes ||
+          requirement.bytes > object.bytes - requirement.offset) {
+        exactReady = 0U;
+        break;
+      }
+    }
+    if (exactReady == 0U) {
+      device::recordFailure(runtime);
+    }
+  }
+  __syncthreads();
+  if (exactReady == 0U) {
+    return false;
+  }
+  return true;
 }
 
 // Pre-acquired engine batches use requestIndex as a compact runtime slot. The

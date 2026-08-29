@@ -2,52 +2,68 @@
   "schema": 1,
   "classification": "nta-paired-evaluation",
   "evaluation_profile": "contract",
-  "workload_manifest": "/path/to/normalized-bailian/manifest.json",
+  "workload_manifests": ["workloads/chat-burst/manifest.json"],
   "repetitions": 10,
   "seed": 20260824,
   "experiments": [
     {
-      "name": "host-mem-exact",
-      "variant": "stock",
-      "arm": "B1",
+      "name": "host-mem-exact-chat-burst",
+      "variant": "A0",
+      "arm": "A0",
       "tier": "host_mem",
       "demand_semantics": "exact",
+      "consumer_kind": "framework_reference",
+      "mechanism_form": "framework-bulk",
+      "result_contract": "sglang-serving",
+      "workload_manifest": "workloads/chat-burst/manifest.json",
       "stratum": {
-        "request_state": "mixed",
-        "granularity": "page_group",
-        "load_ratio": "balanced",
-        "availability_skew": "medium",
-        "staging_pressure": "near_capacity",
-        "arrival": "trace_timestamp"
+        "schema": 1,
+        "id": "chat-burst",
+        "manifest_sha256": "derived-by-experiments.workload_scenario",
+        "records_digest": "derived-by-experiments.workload_scenario",
+        "demand_trace_digest": "derived-by-experiments.workload_scenario",
+        "request_count": 0,
+        "arrival": {},
+        "request_state_counts": {},
+        "statistics": {},
+        "heterogeneous_axes": []
       },
-      "command": ["/path/to/stock-command", "--workload-manifest", "/path/to/normalized-bailian/manifest.json"],
-      "metrics": ["slo_goodput", "p95_ttft_seconds", "p99_itl_seconds", "verification_failures"]
+      "command": ["python", "benchmarks/serving/RunSglangEvaluationArm.py", "--arm", "A0", "--workspace-root", "/tmp/nta-workspaces", "--output", "{trial_output}", "--", "--model", "/path/to/model", "--workload-manifest", "workloads/chat-burst/manifest.json"],
+      "metrics": ["slo_goodput_requests_per_second", "p95_ttft_seconds", "p99_itl_seconds", "verification_failures"]
     },
     {
-      "name": "host-mem-exact",
-      "variant": "nta",
-      "arm": "B5",
+      "name": "host-mem-exact-chat-burst",
+      "variant": "A1",
+      "arm": "A1",
       "tier": "host_mem",
       "demand_semantics": "exact",
+      "consumer_kind": "framework_reference",
+      "mechanism_form": "exact-preacquired-stock",
+      "result_contract": "sglang-serving",
+      "workload_manifest": "workloads/chat-burst/manifest.json",
       "stratum": {
-        "request_state": "mixed",
-        "granularity": "page_group",
-        "load_ratio": "balanced",
-        "availability_skew": "medium",
-        "staging_pressure": "near_capacity",
-        "arrival": "trace_timestamp"
+        "schema": 1,
+        "id": "chat-burst",
+        "manifest_sha256": "derived-by-experiments.workload_scenario",
+        "records_digest": "derived-by-experiments.workload_scenario",
+        "demand_trace_digest": "derived-by-experiments.workload_scenario",
+        "request_count": 0,
+        "arrival": {},
+        "request_state_counts": {},
+        "statistics": {},
+        "heterogeneous_axes": []
       },
-      "command": ["/path/to/nta-command", "--workload-manifest", "/path/to/normalized-bailian/manifest.json"],
-      "metrics": ["slo_goodput", "p95_ttft_seconds", "p99_itl_seconds", "verification_failures"]
+      "command": ["python", "benchmarks/serving/RunSglangEvaluationArm.py", "--arm", "A1", "--workspace-root", "/tmp/nta-workspaces", "--output", "{trial_output}", "--", "--model", "/path/to/model", "--workload-manifest", "workloads/chat-burst/manifest.json"],
+      "metrics": ["slo_goodput_requests_per_second", "p95_ttft_seconds", "p99_itl_seconds", "verification_failures"]
     }
   ],
   "comparisons": [
     {
-      "name": "nta-over-stock-goodput",
-      "experiment": "host-mem-exact",
-      "numerator_variant": "nta",
-      "denominator_variant": "stock",
-      "metric": "slo_goodput"
+      "name": "a1-over-a0-goodput",
+      "experiment": "host-mem-exact-chat-burst",
+      "numerator_variant": "A1",
+      "denominator_variant": "A0",
+      "metric": "slo_goodput_requests_per_second"
     }
   ]
 }

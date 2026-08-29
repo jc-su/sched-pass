@@ -39,9 +39,13 @@ def _quantiles(values: list[float | int], fractions: tuple[float, ...]) -> dict[
     }
 
 
-def _followup_statistics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    timestamp_by_request: dict[str, float] = {}
+def _followup_statistics(
+    rows: list[dict[str, Any]], block_size: int
+) -> dict[str, Any]:
+    prior_by_request: dict[str, dict[str, Any]] = {}
     gaps: list[float] = []
+    parent_context_tokens: list[int] = []
+    exact_prefix_tokens: list[int] = []
     followups = 0
     unresolved = 0
     for row in rows:
@@ -50,18 +54,38 @@ def _followup_statistics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         parent = row.get("parent_chat_id")
         if parent not in (None, "", -1, "-1"):
             followups += 1
-            parent_timestamp = timestamp_by_request.get(str(parent))
-            if parent_timestamp is None or parent_timestamp > timestamp:
+            parent_row = prior_by_request.get(str(parent))
+            if parent_row is None:
                 unresolved += 1
             else:
+                parent_timestamp = float(parent_row["arrival_seconds"])
+                if parent_timestamp > timestamp:
+                    unresolved += 1
+                    prior_by_request[request_id] = row
+                    continue
                 gaps.append(timestamp - parent_timestamp)
-        timestamp_by_request[request_id] = timestamp
+                parent_context_tokens.append(
+                    int(parent_row["input_length"])
+                    + int(parent_row["output_length"])
+                )
+                exact_prefix_tokens.append(
+                    int(row.get("shared_prefix_blocks", 0)) * block_size
+                )
+        prior_by_request[request_id] = row
     return {
         "requests": followups,
         "request_fraction": followups / len(rows),
         "resolved_parent_links": len(gaps),
         "unresolved_parent_links": unresolved,
         "reuse_gap_seconds": _quantiles(gaps, (0.50, 0.90, 0.99)),
+        # Parent context is a useful capacity upper bound, but only the hash-
+        # verified contiguous prefix can be claimed as directly reusable KV.
+        "parent_context_tokens_upper_bound": _quantiles(
+            parent_context_tokens, (0.50, 0.90, 0.99)
+        ),
+        "exact_followup_prefix_tokens": _quantiles(
+            exact_prefix_tokens, (0.50, 0.90, 0.99)
+        ),
     }
 
 
@@ -190,7 +214,7 @@ def analyze(path: Path) -> dict[str, Any]:
                 else 0.0
             ),
         },
-        "sessions": _followup_statistics(rows),
+        "sessions": _followup_statistics(rows, block_size),
         "block_identity": block_repetition,
         "request_shape_heterogeneity": {
             "distinct_input_lengths": len(set(input_lengths)),

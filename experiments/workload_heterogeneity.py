@@ -154,12 +154,17 @@ def serving_batch_heterogeneity(
             "mixed_dependency_layers",
         )
     }
+    # Workload evidence and mechanism activation are different claims. A
+    # measured ForwardBatch remains heterogeneous when the production selector
+    # correctly chooses the framework/direct consumer; requiring a native
+    # mixed-dependency launch here used to relabel that real batch as merely a
+    # diverse request set. Keep native activation as a separate fact.
     batch_internal = (
         engine["heterogeneous_engine_batches"] > 0
         and engine["sequence_length_heterogeneous_batches"] > 0
         and engine["availability_heterogeneous_batches"] > 0
-        and engine["mixed_dependency_layers"] > 0
     )
+    native_mixed_consumer = engine["mixed_dependency_layers"] > 0
     proven = bool(overlap["resident_external_overlap"] and batch_internal)
     return {
         "schema": 1,
@@ -177,6 +182,7 @@ def serving_batch_heterogeneity(
             engine["availability_heterogeneous_batches"] > 0
         ),
         "batch_internal_proven": batch_internal,
+        "native_mixed_consumer_proven": native_mixed_consumer,
         "proven": proven,
         "scope": "batch_internal" if proven else "request_set_only",
     }

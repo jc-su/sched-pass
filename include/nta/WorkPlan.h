@@ -48,7 +48,8 @@ public:
   std::uint32_t addRequest(RequestBinding request);
   std::uint32_t addWork(std::uint32_t requestIndex, std::uint32_t logicalWork,
                         std::span<const abi::AcquireRequirement> requirements,
-                        std::uint32_t estimatedComputeNs = 0);
+                        std::uint32_t estimatedComputeNs = 0,
+                        std::uint64_t readyDeadlineOffsetNs = 0);
   WorkPlan finish();
 
 private:

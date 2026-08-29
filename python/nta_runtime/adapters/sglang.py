@@ -17,6 +17,7 @@ from .base import (
 )
 from ..abi import MAX_REQUEST_PRIORITY
 from ..execution_protocol import ExecutionProtocolConfig
+from ..execution_planner import HostExecutionMode
 from ..resource_contract import (
     ResourceAddressSpace,
     ResourceOwner,
@@ -56,6 +57,7 @@ class SglangExecutionConfig:
     """Validated SGLang projection of the engine-neutral protocol config."""
 
     protocol: ExecutionProtocolConfig
+    host_execution_mode: HostExecutionMode
 
     @property
     def grouping(self) -> str:
@@ -70,7 +72,28 @@ class SglangExecutionConfig:
     def from_environment(
         cls, environ: dict[str, str] | None = None
     ) -> "SglangExecutionConfig":
-        return cls(ExecutionProtocolConfig.from_environment(environ))
+        import os
+
+        values = os.environ if environ is None else environ
+        protocol = ExecutionProtocolConfig.from_environment(values)
+        raw_mode = values.get("NTA_EXECUTION_HOST_FORM", "auto").strip().lower()
+        try:
+            mode = HostExecutionMode(raw_mode)
+        except ValueError as error:
+            raise ValueError(
+                "NTA_EXECUTION_HOST_FORM must be auto, direct, device_bulk, "
+                "or dependency_aware"
+            ) from error
+        if protocol.kind.value == "conventional" and mode not in {
+            HostExecutionMode.AUTO,
+            HostExecutionMode.DIRECT,
+        }:
+            raise ValueError(
+                "conventional protocol cannot force a typed host execution form"
+            )
+        if protocol.kind.value == "conventional":
+            mode = HostExecutionMode.DIRECT
+        return cls(protocol, mode)
 
 
 @dataclass(frozen=True, slots=True)

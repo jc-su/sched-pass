@@ -154,17 +154,18 @@ DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernel(const 
       }
     } else if (!nta::flashinfer::tracksCompletion(params)) {
       if (!nta::flashinfer::validPreacquiredWork(
-              params, nta_work_index, nta_request_index) ||
-          !nta::kernel::acquirePreacquiredWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta_work_index, nta_work)) return;
+              params, nta_work_index, nta_request_index)) return;
+      nta::kernel::preparePreacquiredWork(
+          nta::flashinfer::workItems(params),
+          nta::flashinfer::dependencies(params), nta_work_index, nta_work);
+      if (!nta::kernel::validatePreacquiredWork(nta_runtime, nta_work)) return;
+      if (!nta::kernel::acquirePreacquiredWork(nta_runtime, nta_work)) return;
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
-      if (!nta::kernel::acquireCurrentWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta::flashinfer::dependencies(params), nta_work_index, nta_work)) {
+      if (!nta::flashinfer::acquireCurrentPlannedWork(
+              params, nta_runtime, nta_work_index, nta_work)) {
 #if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
         nta::kernel::defer(nta_runtime, nta_work);
 #endif
@@ -207,7 +208,11 @@ MLA_DECODE_ANCHOR = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA(Para
 """
 MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   nta::abi::RuntimeView* nta_runtime = nullptr;
-#if !NTA_FLASHINFER_REQUEST_BOUND
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  // Keep only the ticket live across the numerical body. Carrying WorkContext
+  // here makes FlashInfer's register-heavy kernel spill to local memory.
+  uint32_t nta_work_ticket = nta::abi::InvalidIndex;
+#elif !NTA_FLASHINFER_REQUEST_BOUND
   nta::kernel::WorkContext nta_work{};
 #endif
   uint32_t nta_work_index = blockIdx.x;
@@ -231,6 +236,29 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
     if (nta_work_index == nta::abi::InvalidIndex) return;
     if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
     const uint32_t nta_request_index = params.request_indices[nta_work_index];
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+    if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::flashinfer::validPreacquiredWork(
+              params, nta_work_index, nta_request_index)) return;
+    } else if (!nta::flashinfer::validWork(
+                   params, nta_work_index, nta_request_index)) {
+      return;
+    }
+    const nta::abi::WorkItem& nta_work_item =
+        nta::flashinfer::workItems(params)[nta_work_index];
+    const uint32_t nta_request_slot = nta_work_item.requestSlot;
+    const uint32_t nta_generation =
+        nta_runtime->requests[nta_request_slot].generation;
+    nta_work_ticket = nta::flashinfer::tracksCompletion(params)
+                          ? nta_work_item.workTicket
+                          : nta::abi::InvalidIndex;
+    __nta_bind_request(nta_request_slot, nta_generation);
+    if (!__nta_acquire_set_marker(
+            nta_runtime, nullptr, 0, 0, nta_work_ticket)) return;
+    if (nta_work_ticket != nta::abi::InvalidIndex) {
+      __nta_begin_partial_marker(nta_runtime, nta_work_ticket);
+    }
+#else
     if (nta::flashinfer::usesPlanlessPreacquired(params)) {
       if (nta_runtime == nullptr || nta_runtime->abiVersion != nta::abi::Version ||
           nta_request_index >= nta_runtime->requestCapacity) return;
@@ -240,17 +268,18 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
       }
     } else if (!nta::flashinfer::tracksCompletion(params)) {
       if (!nta::flashinfer::validPreacquiredWork(
-              params, nta_work_index, nta_request_index) ||
-          !nta::kernel::acquirePreacquiredWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta_work_index, nta_work)) return;
+              params, nta_work_index, nta_request_index)) return;
+      nta::kernel::preparePreacquiredWork(
+          nta::flashinfer::workItems(params),
+          nta::flashinfer::dependencies(params), nta_work_index, nta_work);
+      if (!nta::kernel::validatePreacquiredWork(nta_runtime, nta_work)) return;
+      if (!nta::kernel::acquirePreacquiredWork(nta_runtime, nta_work)) return;
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
-      if (!nta::kernel::acquireCurrentWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta::flashinfer::dependencies(params), nta_work_index, nta_work)) {
+      if (!nta::flashinfer::acquireCurrentPlannedWork(
+              params, nta_runtime, nta_work_index, nta_work)) {
 #if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
         nta::kernel::defer(nta_runtime, nta_work);
 #endif
@@ -266,6 +295,7 @@ MLA_DECODE_REPLACEMENT = """__global__ void BatchDecodeWithPagedKVCacheKernelMLA
     if (!nta::flashinfer::shouldRun(params, nta_runtime, nta_work)) return;
 #if !NTA_FLASHINFER_PREACQUIRED_ONLY
     nta::kernel::beginPartial(nta_runtime, nta_work);
+#endif
 #endif
   }
 #endif
@@ -284,7 +314,16 @@ MLA_DECODE_EXIT_REPLACEMENT = """#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CU
 #endif
 #if !NTA_FLASHINFER_REQUEST_BOUND
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
-#if !NTA_FLASHINFER_PREACQUIRED_ONLY
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+    if (nta_work_ticket != nta::abi::InvalidIndex) {
+      const nta::abi::WorkItem& nta_work_item =
+          nta::flashinfer::workItems(params)[nta_work_index];
+      __nta_commit_stream_ordered_partial_marker(
+          nta_runtime, nta_work_ticket, nta_work_item.reductionGroup,
+          nta_work_item.contributorIndex, nta_work_item.contributorCount,
+          nta_work_item.estimatedComputeNs);
+    }
+#elif !NTA_FLASHINFER_PREACQUIRED_ONLY
     nta::flashinfer::finish(params, nta_runtime, nta_work);
 #endif
   }
@@ -341,17 +380,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
               nta_runtime, nta_request_index, nta_work)) return;
     } else if (!nta::flashinfer::tracksCompletion(params)) {
       if (!nta::flashinfer::validPreacquiredWork(
-              params, nta_work_index, nta_request_index) ||
-          !nta::kernel::acquirePreacquiredWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta_work_index, nta_work)) return;
+              params, nta_work_index, nta_request_index)) return;
+      nta::kernel::preparePreacquiredWork(
+          nta::flashinfer::workItems(params),
+          nta::flashinfer::dependencies(params), nta_work_index, nta_work);
+      if (!nta::kernel::validatePreacquiredWork(nta_runtime, nta_work)) return;
+      if (!nta::kernel::acquirePreacquiredWork(nta_runtime, nta_work)) return;
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
-      if (!nta::kernel::acquireCurrentWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta::flashinfer::dependencies(params), nta_work_index, nta_work)) {
+      if (!nta::flashinfer::acquireCurrentPlannedWork(
+              params, nta_runtime, nta_work_index, nta_work)) {
 #if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
         nta::kernel::defer(nta_runtime, nta_work);
 #endif
@@ -436,7 +476,11 @@ PAGED_PREFILL_ANCHOR = """__global__ __launch_bounds__(KTraits::NUM_THREADS) voi
 PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
     const __grid_constant__ Params params) {
   nta::abi::RuntimeView* nta_runtime = nullptr;
-#if !NTA_FLASHINFER_REQUEST_BOUND
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+  // Keep only the ticket live across the numerical body. Carrying WorkContext
+  // here makes FlashInfer's register-heavy kernel spill to local memory.
+  uint32_t nta_work_ticket = nta::abi::InvalidIndex;
+#elif !NTA_FLASHINFER_REQUEST_BOUND
   nta::kernel::WorkContext nta_work{};
 #endif
   uint32_t nta_work_index = blockIdx.x;
@@ -460,6 +504,29 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
     if (nta_work_index == nta::abi::InvalidIndex) return;
     if (params.block_valid_mask && !params.block_valid_mask[nta_work_index]) return;
     const uint32_t nta_request_index = params.request_indices[nta_work_index];
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+    if (!nta::flashinfer::tracksCompletion(params)) {
+      if (!nta::flashinfer::validPreacquiredWork(
+              params, nta_work_index, nta_request_index)) return;
+    } else if (!nta::flashinfer::validWork(
+                   params, nta_work_index, nta_request_index)) {
+      return;
+    }
+    const nta::abi::WorkItem& nta_work_item =
+        nta::flashinfer::workItems(params)[nta_work_index];
+    const uint32_t nta_request_slot = nta_work_item.requestSlot;
+    const uint32_t nta_generation =
+        nta_runtime->requests[nta_request_slot].generation;
+    nta_work_ticket = nta::flashinfer::tracksCompletion(params)
+                          ? nta_work_item.workTicket
+                          : nta::abi::InvalidIndex;
+    __nta_bind_request(nta_request_slot, nta_generation);
+    if (!__nta_acquire_set_marker(
+            nta_runtime, nullptr, 0, 0, nta_work_ticket)) return;
+    if (nta_work_ticket != nta::abi::InvalidIndex) {
+      __nta_begin_partial_marker(nta_runtime, nta_work_ticket);
+    }
+#else
     if (nta::flashinfer::usesPlanlessPreacquired(params)) {
       if (nta_runtime == nullptr || nta_runtime->abiVersion != nta::abi::Version ||
           nta_request_index >= nta_runtime->requestCapacity) return;
@@ -469,17 +536,18 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
       }
     } else if (!nta::flashinfer::tracksCompletion(params)) {
       if (!nta::flashinfer::validPreacquiredWork(
-              params, nta_work_index, nta_request_index) ||
-          !nta::kernel::acquirePreacquiredWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta_work_index, nta_work)) return;
+              params, nta_work_index, nta_request_index)) return;
+      nta::kernel::preparePreacquiredWork(
+          nta::flashinfer::workItems(params),
+          nta::flashinfer::dependencies(params), nta_work_index, nta_work);
+      if (!nta::kernel::validatePreacquiredWork(nta_runtime, nta_work)) return;
+      if (!nta::kernel::acquirePreacquiredWork(nta_runtime, nta_work)) return;
     } else if (!nta::flashinfer::validWork(
                    params, nta_work_index, nta_request_index)) {
       return;
     } else if (nta::flashinfer::bindsCurrentGeneration(params)) {
-      if (!nta::kernel::acquireCurrentWork(
-              nta_runtime, nta::flashinfer::workItems(params),
-              nta::flashinfer::dependencies(params), nta_work_index, nta_work)) {
+      if (!nta::flashinfer::acquireCurrentPlannedWork(
+              params, nta_runtime, nta_work_index, nta_work)) {
 #if !NTA_FLASHINFER_STREAM_ORDERED_DIRECT
         nta::kernel::defer(nta_runtime, nta_work);
 #endif
@@ -496,6 +564,7 @@ PAGED_PREFILL_REPLACEMENT = """__global__ __launch_bounds__(KTraits::NUM_THREADS
 #if !NTA_FLASHINFER_PREACQUIRED_ONLY
     nta::kernel::beginPartial(nta_runtime, nta_work);
 #endif
+#endif
   }
 #endif
   extern __shared__ uint8_t smem[];
@@ -509,7 +578,16 @@ PAGED_PREFILL_EXIT_REPLACEMENT = """  auto& smem_storage = reinterpret_cast<type
   BatchPrefillWithPagedKVCacheDevice<KTraits>(params, smem_storage, threadIdx, nta_work_index);
 #if !NTA_FLASHINFER_REQUEST_BOUND
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
-#if !NTA_FLASHINFER_PREACQUIRED_ONLY
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+    if (nta_work_ticket != nta::abi::InvalidIndex) {
+      const nta::abi::WorkItem& nta_work_item =
+          nta::flashinfer::workItems(params)[nta_work_index];
+      __nta_commit_stream_ordered_partial_marker(
+          nta_runtime, nta_work_ticket, nta_work_item.reductionGroup,
+          nta_work_item.contributorIndex, nta_work_item.contributorCount,
+          nta_work_item.estimatedComputeNs);
+    }
+#elif !NTA_FLASHINFER_PREACQUIRED_ONLY
     nta::flashinfer::finish(params, nta_runtime, nta_work);
 #endif
   }
@@ -525,7 +603,16 @@ PAGED_PREFILL_EXIT_REPLACEMENT_V614 = """  auto& smem_storage = reinterpret_cast
   BatchPrefillWithPagedKVCacheDevice<KTraits>(params, smem_storage, threadIdx, nta_work_index);
 #if !NTA_FLASHINFER_REQUEST_BOUND
   if constexpr (nta::flashinfer::HasWorkPlanV<Params>) {
-#if !NTA_FLASHINFER_PREACQUIRED_ONLY
+#if NTA_FLASHINFER_STREAM_ORDERED_DIRECT
+    if (nta_work_ticket != nta::abi::InvalidIndex) {
+      const nta::abi::WorkItem& nta_work_item =
+          nta::flashinfer::workItems(params)[nta_work_index];
+      __nta_commit_stream_ordered_partial_marker(
+          nta_runtime, nta_work_ticket, nta_work_item.reductionGroup,
+          nta_work_item.contributorIndex, nta_work_item.contributorCount,
+          nta_work_item.estimatedComputeNs);
+    }
+#elif !NTA_FLASHINFER_PREACQUIRED_ONLY
     nta::flashinfer::finish(params, nta_runtime, nta_work);
 #endif
   }

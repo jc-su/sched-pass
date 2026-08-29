@@ -57,14 +57,16 @@ def modeled_blocked_cohort_accounting(
     }
 
 
-def finite_window_littles_law(
+def finite_window_system_accounting(
     records: list[dict[str, Any]], elapsed_seconds: float
 ) -> dict[str, Any]:
-    """Compute measured arrival/departure accounting and its residual.
+    """Describe measured arrivals, departures, residence, and occupancy.
 
-    Both sides use the same finite observation window.  The residual is a
-    timestamp-consistency check, not an independent queueing performance
-    estimate.  Callers must identify the queue scope they actually observe.
+    The residence sum and occupancy integral are generated from the same client
+    timestamps.  They are useful artifact-integrity checks but are not an
+    independent Little's-law measurement.  Deliberately expose the underlying
+    quantities without an ``L = lambda W`` residual so callers cannot promote a
+    timestamp identity into queueing evidence.
     """
 
     if not records:
@@ -73,9 +75,15 @@ def finite_window_littles_law(
             "request_count": 0,
             "window_seconds": 0.0,
             "arrival_rate_per_second": 0.0,
+            "completion_rate_per_second": 0.0,
             "mean_in_system": 0.0,
             "mean_system_time_seconds": 0.0,
-            "residual": 0.0,
+            "occupancy_area_request_seconds": 0.0,
+            "sum_residence_seconds": 0.0,
+            "interpretation": "descriptive_client_timestamp_accounting",
+            "queue_metric_scope": (
+                "client-visible system residence; internal engine queue is not exposed"
+            ),
         }
     window_start = min(float(record["arrival_seconds"]) for record in records)
     window_end = max(float(record["finished_offset_seconds"]) for record in records)
@@ -92,9 +100,8 @@ def finite_window_littles_law(
             area += occupancy * (clipped - previous)
         occupancy += delta
         previous = clipped
-    mean_system_time = sum(
-        float(record["system_time_seconds"]) for record in records
-    ) / len(records)
+    sum_residence = sum(float(record["system_time_seconds"]) for record in records)
+    mean_system_time = sum_residence / len(records)
     arrival_rate = len(records) / window
     mean_in_system = area / window
     return {
@@ -104,10 +111,13 @@ def finite_window_littles_law(
         "window_end_seconds": window_end,
         "window_seconds": window,
         "arrival_rate_per_second": arrival_rate,
+        "completion_rate_per_second": len(records) / window,
         "mean_in_system": mean_in_system,
         "mean_system_time_seconds": mean_system_time,
-        "lhs": mean_in_system,
-        "rhs": arrival_rate * mean_system_time,
-        "residual": abs(mean_in_system - arrival_rate * mean_system_time),
-        "queue_metric_scope": "client_admission_delay; internal engine queue is not exposed",
+        "occupancy_area_request_seconds": area,
+        "sum_residence_seconds": sum_residence,
+        "interpretation": "descriptive_client_timestamp_accounting",
+        "queue_metric_scope": (
+            "client-visible system residence; internal engine queue is not exposed"
+        ),
     }

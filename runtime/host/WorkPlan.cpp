@@ -39,7 +39,8 @@ std::uint32_t WorkPlanBuilder::addRequest(RequestBinding request) {
 std::uint32_t WorkPlanBuilder::addWork(
     std::uint32_t requestIndex, std::uint32_t logicalWork,
     std::span<const abi::AcquireRequirement> requirements,
-    std::uint32_t estimatedComputeNs) {
+    std::uint32_t estimatedComputeNs,
+    std::uint64_t readyDeadlineOffsetNs) {
   if (finished_) {
     throw std::logic_error("cannot append to a finished work plan");
   }
@@ -91,8 +92,7 @@ std::uint32_t WorkPlanBuilder::addWork(
       range.workCount,
       0,
       estimatedComputeNs,
-      0,
-      0,
+      readyDeadlineOffsetNs,
       0,
       0,
   });

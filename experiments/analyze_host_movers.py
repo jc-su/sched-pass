@@ -87,33 +87,46 @@ def main() -> int:
             "copy_engine_bytes": int(engine.get("copy_engine_bytes", 0)),
             "sm_bytes": int(engine.get("sm_mover_bytes", 0)),
             "copy_engine_operations": int(engine.get("copy_engine_operations", 0)),
-            "selected_copy_runs": int(engine.get("copy_engine_selected_runs", 0)),
-            "selected_copy_rows": int(engine.get("copy_engine_selected_rows", 0)),
+            "planned_copy_runs": int(
+                engine.get("prefetch_mover_plan_copy_runs", 0)
+            ),
+            "planned_copy_rows": int(
+                engine.get("prefetch_mover_plan_copy_rows", 0)
+            ),
             "layout_runs": int(engine.get("indexed_layout_runs", 0)),
             "layout_rows": int(engine.get("indexed_layout_rows", 0)),
-            "selected_mover_batches": {
-                mover: int(engine.get(f"host_mover_{mover}_batches", 0))
+            "planned_mover_leases": {
+                mover: int(
+                    engine.get(f"prefetch_mover_plan_{mover}_leases", 0)
+                )
                 for mover in ("sm", "copy_engine", "hybrid")
             },
-            "uncalibrated_copy_engine_batches": int(
-                engine.get("host_mover_uncalibrated_copy_engine_batches", 0)
+            "uncalibrated_copy_engine_leases": int(
+                engine.get(
+                    "prefetch_mover_plan_uncalibrated_copy_engine_leases", 0
+                )
             ),
-            "insufficient_gain_batches": int(
-                engine.get("host_mover_insufficient_gain_batches", 0)
+            "insufficient_gain_leases": int(
+                engine.get("prefetch_mover_plan_insufficient_gain_leases", 0)
             ),
-            "service_cost_batches": int(
-                engine.get("host_mover_service_cost_batches", 0)
+            "service_cost_leases": int(
+                engine.get("prefetch_mover_plan_service_cost_leases", 0)
             ),
         }
 
     endpoint_ms = min(rows["sm"]["pipeline_gpu_ms"], rows["copy_engine"]["pipeline_gpu_ms"])
     auto_ms = rows["auto"]["pipeline_gpu_ms"]
-    auto_rows = rows["auto"]["selected_copy_rows"]
+    auto_rows = rows["auto"]["planned_copy_rows"]
     total_rows = rows["auto"]["layout_rows"]
-    auto_activations = rows["auto"]["selected_mover_batches"]
-    active_auto_movers = sorted(
-        mover for mover, batches in auto_activations.items() if batches > 0
+    auto_plans = rows["auto"]["planned_mover_leases"]
+    planned_auto_movers = sorted(
+        mover for mover, leases in auto_plans.items() if leases > 0
     )
+    executed_auto_movers = [
+        mover
+        for mover, byte_field in (("sm", "sm_bytes"), ("copy_engine", "copy_engine_bytes"))
+        if rows["auto"][byte_field] > 0
+    ]
     result = {
         "schema": 1,
         "classification": "sglang-host-mover-diagnostic",
@@ -126,7 +139,8 @@ def main() -> int:
         "best_promotion_mover": min(
             rows, key=lambda name: rows[name]["promotion_median_ms"]
         ),
-        "auto_selected_movers": active_auto_movers,
+        "auto_planned_movers": planned_auto_movers,
+        "auto_executed_movers": executed_auto_movers,
         "auto_speedup_over_best_forced_mover": endpoint_ms / auto_ms,
         "auto_copy_row_fraction": (
             auto_rows / total_rows if total_rows > 0 else 0.0

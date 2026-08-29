@@ -49,6 +49,12 @@ def tenant_budget_specs(
     return tuple(specs)
 
 
+def tenant_isolation_required(specs: tuple[tuple[int, int], ...]) -> bool:
+    """Return whether byte-credit accounting is a hard execution constraint."""
+
+    return any(max_bytes != _UINT64_MAX for _, max_bytes in specs)
+
+
 def tenant_mapper_from_environment(
     environ: Mapping[str, str] | None = None,
 ) -> TenantMapper | None:

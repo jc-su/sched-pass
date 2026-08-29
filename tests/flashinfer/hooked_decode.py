@@ -16,6 +16,7 @@ from nta_runtime import (
     DeviceWorkPlan,
     FlashInferLayerEpoch,
     IndexedHostObject,
+    JitOperatorModule,
     JitPhaseProgram,
     OperatorAccessProof,
     OperatorCapability,
@@ -43,9 +44,11 @@ from nta_runtime.flashinfer import (
     BIND_CURRENT_GENERATION,
     RUNNABLE_OFFSET_SHIFT,
     RUNNABLE_WORK,
+    enqueue_event_partitioned_attention,
     request_bound_attention_jit_args,
 )
 from nta_runtime.flashinfer_schedule import decode_schedule, paged_prefill_schedule
+from nta_runtime.transport_program import load_activated_transport_program
 
 
 OBJECT_ID = 0xC001
@@ -268,12 +271,19 @@ class RuntimeFixture:
 
 
 class PhaseFunctions:
+    _transport: JitPhaseProgram | None = None
+
     def __init__(self, module_name: str = "nta_batch_decode_default_v2_hooked") -> None:
         workspace = pathlib.Path(os.environ["FLASHINFER_WORKSPACE_BASE"])
         modules = list(workspace.rglob(f"{module_name}.so"))
         if len(modules) != 1:
             raise RuntimeError(f"expected one hooked decode module, found {modules}")
-        self.program = JitPhaseProgram(modules[0])
+        self.operator = JitOperatorModule(modules[0])
+        if PhaseFunctions._transport is None:
+            PhaseFunctions._transport, _path, _digest = (
+                load_activated_transport_program()
+            )
+        self.program = PhaseFunctions._transport
         family = (
             OperatorFamily.FLASHINFER_DECODE
             if "decode" in module_name
@@ -298,7 +308,7 @@ class PhaseFunctions:
                 | OperatorCapability.COMPLETE_CONTRIBUTOR_MERGE
                 | OperatorCapability.RUNNABLE_COMPACTION
             )
-        self.program.operator_contract.require(
+        self.operator.operator_contract.require(
             family=family,
             form=form,
             capabilities=required,
@@ -313,7 +323,7 @@ class PhaseFunctions:
             access_proof=OperatorAccessProof.TYPED_FRONTEND,
             tier_mask=(1 << 6) - 1,
         )
-        self.program.operator_plan.require(
+        self.operator.operator_plan.require(
             family=family,
             forms=(OperatorForm.DIRECT, OperatorForm.INCREMENTAL),
             coordinate_map=OperatorCoordinateMap.FLASHINFER_REQUEST_CONTIGUOUS,
@@ -520,6 +530,22 @@ def benchmark(callable_: object, iterations: int = 2_000) -> float:
     end.record()
     end.synchronize()
     return start.elapsed_time(end) * 1_000.0 / iterations
+
+
+def paired_overhead_percent(
+    reference_samples: list[float], candidate_samples: list[float]
+) -> float:
+    if not reference_samples or len(reference_samples) != len(candidate_samples):
+        raise ValueError("paired benchmark arms must have equal nonzero samples")
+    return (
+        statistics.median(
+            candidate / reference
+            for reference, candidate in zip(
+                reference_samples, candidate_samples, strict=True
+            )
+        )
+        - 1.0
+    ) * 100.0
 
 
 def run_hooked(
@@ -919,28 +945,25 @@ def main() -> None:
     with torch.cuda.stream(arriving_stream):
         phases.program.preload_host(arriving.native_runtime, 0, 1, arriving_stream)
         arriving_ready.record(arriving_stream)
-    arriving_epoch = FlashInferLayerEpoch(
+    enqueue_event_partitioned_attention(
         arriving.native_runtime,
         arriving.plan,
         phases.program,
-        object_count=0,
-        max_progress_rounds=1,
-    )
-    arriving_passes = arriving_epoch.enqueue_arriving_host(
         hooked,
         mixed_q,
         arriving_staging_kv,
         arriving_output,
-        ready_event=arriving_ready,
-        initial_ready_work_count=1,
+        ready_events=(arriving_ready,),
+        ready_object_slots=(),
+        registration_event=None,
+        direct_work_count=1,
+        wave_work_counts=(1,),
+        prepare_partition=True,
         stream=torch.cuda.current_stream(),
     )
-    arriving_result = arriving_epoch.check(arriving_passes, torch.cuda.current_stream())
-    if arriving_result.progress_rounds != 1:
-        raise RuntimeError(
-            f"unexpected arriving-host progress rounds: {arriving_result}"
-        )
-    arriving.assert_all_states(3)
+    torch.cuda.synchronize()
+    if arriving.native_runtime.sticky_failed_count != 0:
+        raise RuntimeError("event-partitioned FlashInfer preparation failed")
     torch.testing.assert_close(arriving_staging_kv, mixed_reference_kv, rtol=0, atol=0)
     torch.testing.assert_close(arriving_output, mixed_expected, rtol=2e-3, atol=2e-3)
 
@@ -1041,6 +1064,45 @@ def main() -> None:
         or torch.count_nonzero(indexed_staging[3]).item() != 0
     ):
         raise RuntimeError("indexed host acquisition overwrote an unselected row")
+
+    # Index validation is a safety proof, not a transport-ownership decision.
+    # A prevalidated object must remain queued after discovery so the generic
+    # EDF/credit-governed progress backend can claim and complete it.  This is
+    # the serving path used for multi-request and finite-tenant batches.
+    queued_indexed_staging = torch.zeros_like(reference_kv)
+    queued_indexed = RuntimeFixture(
+        queued_indexed_staging,
+        host_kv,
+        source_indices=torch.tensor([3, 1], dtype=torch.int32),
+        destination_indices=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    phases.program.validate_indexed_host_range(
+        queued_indexed.native_runtime, 0, 1, torch.cuda.current_stream()
+    )
+    phases.call("nta_jit_reset_epoch", queued_indexed, 1, 1)
+    queued_indexed_output = torch.full_like(expected, math.nan)
+    run_hooked(
+        hooked,
+        q,
+        queued_indexed_staging,
+        queued_indexed,
+        queued_indexed_output,
+    )
+    phases.call("nta_jit_progress_host", queued_indexed, 1)
+    phases.call("nta_jit_publish_ready", queued_indexed, 1)
+    torch.cuda.synchronize()
+    queued_indexed.assert_all_states(2)
+    torch.testing.assert_close(
+        queued_indexed_staging[0], reference_kv[3], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        queued_indexed_staging[2], reference_kv[1], rtol=0, atol=0
+    )
+    if (
+        torch.count_nonzero(queued_indexed_staging[1]).item() != 0
+        or torch.count_nonzero(queued_indexed_staging[3]).item() != 0
+    ):
+        raise RuntimeError("queued indexed acquisition overwrote an unselected row")
 
     preload_rows = 513
     preload_host = torch.randn(
@@ -1521,7 +1583,7 @@ def main() -> None:
     request_bound_prefill = make_request_bound_prefill_wrapper(request_bound_module)
     plan_prefill(request_bound_prefill, 1, 4)
     request_bound_phases = PhaseFunctions(request_bound_module)
-    require_operator_pair(request_bound_phases.program, prefill_phases.program)
+    require_operator_pair(request_bound_phases.operator, prefill_phases.operator)
     tiny_schedule = paged_prefill_schedule(request_bound_prefill)
     tiny_runtime = RuntimeFixture(
         reference_kv,
@@ -1608,7 +1670,7 @@ def main() -> None:
         request_bound_decode_module
     )
     request_bound_decode_phases = PhaseFunctions(request_bound_decode_module)
-    require_operator_pair(request_bound_decode_phases.program, phases.program)
+    require_operator_pair(request_bound_decode_phases.operator, phases.operator)
     plan_uniform_batch(baseline, benchmark_batch, benchmark_pages)
     plan_uniform_batch(hooked, benchmark_batch, benchmark_pages)
     plan_uniform_batch(request_bound_decode, benchmark_batch, benchmark_pages)
@@ -1658,7 +1720,10 @@ def main() -> None:
     baseline_samples = []
     direct_samples = []
     hooked_samples = []
-    for sample in range(5):
+    # Keep AB and BA order balanced. This kernel is only about 11 us, so an
+    # odd number of long measurement blocks can turn a clock transition into
+    # a systematic arm bias even though calls within each block are stable.
+    for sample in range(6):
         if sample % 2 == 0:
             baseline_samples.append(
                 benchmark(baseline_call, 2 if options.sanitizer else 2_000)
@@ -1684,7 +1749,7 @@ def main() -> None:
     hooked_us = statistics.median(hooked_samples)
     torch.testing.assert_close(direct_output, baseline_output, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(hooked_output, baseline_output, rtol=2e-3, atol=2e-3)
-    direct_overhead = (direct_us / baseline_us - 1.0) * 100.0
+    direct_overhead = paired_overhead_percent(baseline_samples, direct_samples)
     incremental_overhead = (hooked_us / baseline_us - 1.0) * 100.0
     if not options.sanitizer and direct_overhead > 5.0:
         # A single five-sample block can cross this tight gate when the shared
@@ -1694,7 +1759,7 @@ def main() -> None:
         # suite flaky.
         confirm_baseline = []
         confirm_direct = []
-        for sample in range(3):
+        for sample in range(4):
             if sample % 2 == 0:
                 confirm_baseline.append(benchmark(baseline_call, 2_000))
                 confirm_direct.append(benchmark(direct_call, 2_000))
@@ -1703,7 +1768,7 @@ def main() -> None:
                 confirm_baseline.append(benchmark(baseline_call, 2_000))
         confirmed_baseline_us = statistics.median(confirm_baseline)
         confirmed_direct_us = statistics.median(confirm_direct)
-        direct_overhead = (confirmed_direct_us / confirmed_baseline_us - 1.0) * 100.0
+        direct_overhead = paired_overhead_percent(confirm_baseline, confirm_direct)
         if direct_overhead > 5.0:
             raise RuntimeError(
                 f"resident direct-form overhead {direct_overhead:.2f}% exceeds 5% "

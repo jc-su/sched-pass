@@ -34,6 +34,7 @@ enum Capability : std::uint64_t {
   GraphReplay = 1ULL << 6,
   TypedFlashInferFrontend = 1ULL << 7,
   PreacquiredPartialEntry = 1ULL << 8,
+  StreamOrderedRetirement = 1ULL << 9,
 };
 
 enum class CoordinateMap : std::uint32_t {
@@ -137,7 +138,8 @@ inline void validate(const Contract &contract) {
   constexpr std::uint64_t validCapabilities =
       RequestBinding | ObjectDependencies | FiniteDeferral |
       PartialPublication | CompleteContributorMerge | RunnableCompaction |
-      GraphReplay | TypedFlashInferFrontend | PreacquiredPartialEntry;
+      GraphReplay | TypedFlashInferFrontend | PreacquiredPartialEntry |
+      StreamOrderedRetirement;
   constexpr std::uint64_t validInstrumentationFlags =
       TypedAccessLowering | ExactDemand | GenerationSafeIdentity |
       TierOwnership;

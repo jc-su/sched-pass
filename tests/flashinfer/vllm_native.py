@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 import math
 import os
@@ -27,6 +28,11 @@ from nta_runtime.engines.vllm import (
     VllmV1WorkerController,
     _new_request_bound_wrapper,
 )
+from nta_runtime.engines.vllm_config import VllmAttentionConfig
+from nta_runtime.engines.vllm_modules import (
+    _default_workspace_bytes,
+    _prepare_attention_modules,
+)
 from nta_runtime.connectors.vllm_host import build_indexed_host_resources
 from nta_runtime.runtime import Runtime, RuntimeConfig
 
@@ -45,6 +51,7 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the vLLM native consumer test")
     os.environ["NTA_VLLM_NATIVE"] = "1"
+    workspace_base = Path(os.environ["FLASHINFER_WORKSPACE_BASE"]).resolve()
 
     device = torch.device("cuda")
     page_size = 16
@@ -56,6 +63,15 @@ def main() -> int:
     num_heads = 16
     head_size = 128
     scale = 1.0 / math.sqrt(head_size)
+    # Exercise the production lifecycle: typed numerical modules are
+    # materialized once during backend setup and execution only loads them.
+    _prepare_attention_modules(
+        VllmAttentionConfig.from_environment(
+            default_workspace_bytes=_default_workspace_bytes()
+        ),
+        (torch.float16,),
+        head_size,
+    )
 
     key = torch.randn(
         (num_pages, page_size, num_kv_heads, head_size),
@@ -122,28 +138,20 @@ def main() -> int:
     )
     causal_value = torch.randn_like(causal_key)
     causal_kv_cache = (
-        torch.cat((causal_key, causal_value), dim=-1)
-        .permute(0, 2, 1, 3)
-        .contiguous()
+        torch.cat((causal_key, causal_value), dim=-1).permute(0, 2, 1, 3).contiguous()
     )
     causal_query = torch.randn(
         (causal_tokens, num_heads, head_size),
         device=device,
         dtype=torch.float16,
     )
-    causal_workspace = torch.empty(
-        64 * 1024 * 1024, dtype=torch.uint8, device=device
-    )
-    causal_stock_prefill = BatchPrefillWithPagedKVCacheWrapper(
-        causal_workspace, "NHD"
-    )
+    causal_workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
+    causal_stock_prefill = BatchPrefillWithPagedKVCacheWrapper(causal_workspace, "NHD")
     causal_qo_indptr = torch.tensor(
         [0, causal_tokens], dtype=torch.int32, device=device
     )
     causal_kv_indptr = torch.tensor([0, causal_pages], dtype=torch.int32)
-    causal_indices = torch.arange(
-        1, causal_pages + 1, dtype=torch.int32, device=device
-    )
+    causal_indices = torch.arange(1, causal_pages + 1, dtype=torch.int32, device=device)
     causal_last_page_len = torch.tensor([4], dtype=torch.int32)
     causal_stock_prefill.plan(
         causal_qo_indptr,
@@ -163,9 +171,7 @@ def main() -> int:
         # reference intentionally preserves the framework plan choice.
         disable_split_kv=False,
     )
-    causal_expected = causal_stock_prefill.run(
-        causal_query, (causal_key, causal_value)
-    )
+    causal_expected = causal_stock_prefill.run(causal_query, (causal_key, causal_value))
     mixed_decode = BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
     mixed_decode.plan(
         torch.tensor([0, 2], dtype=torch.int32),
@@ -365,9 +371,7 @@ def main() -> int:
                     get_numpy_array=lambda: np.arange(
                         1, causal_pages + 1, dtype=np.int32
                     ).reshape(1, causal_pages),
-                    num_blocks_per_row=np.asarray(
-                        [causal_pages], dtype=np.int32
-                    ),
+                    num_blocks_per_row=np.asarray([causal_pages], dtype=np.int32),
                 )
                 causal_input = SimpleNamespace(
                     req_ids=["causal"],
@@ -467,6 +471,140 @@ def main() -> int:
                 maximum,
                 (mixed_output - mixed_expected).abs().max().item(),
             )
+
+            # Exercise the request-bound direct ABI with the same mixed
+            # decode+prefill phase split. FlashInfer restarts requestIndex at
+            # zero for the prefill wrapper, so its launch must receive row 1 of
+            # the full-forward binding table rather than decode row 0.
+            mixed_direct_decode = _new_request_bound_wrapper(
+                "decode",
+                torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device),
+                query_dtype=query.dtype,
+                kv_dtype=kv_cache.dtype,
+                head_size=head_size,
+                workspace_base=workspace_base,
+            )
+            mixed_direct_decode.plan(
+                torch.tensor([0, 2], dtype=torch.int32),
+                indices[:2],
+                torch.tensor([page_size], dtype=torch.int32),
+                num_heads,
+                num_kv_heads,
+                head_size,
+                page_size,
+                q_data_type=query.dtype,
+                kv_data_type=kv_cache.dtype,
+                sm_scale=scale,
+                disable_split_kv=True,
+            )
+            mixed_direct_prefill = _new_request_bound_wrapper(
+                "prefill",
+                torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device),
+                query_dtype=query.dtype,
+                kv_dtype=kv_cache.dtype,
+                head_size=head_size,
+                workspace_base=workspace_base,
+            )
+            mixed_direct_prefill.plan(
+                torch.tensor([0, 2], dtype=torch.int32, device=device),
+                torch.tensor([0, 2], dtype=torch.int32),
+                indices[2:4],
+                torch.tensor([page_size], dtype=torch.int32),
+                num_heads,
+                num_kv_heads,
+                head_size,
+                page_size,
+                q_data_type=query.dtype,
+                kv_data_type=kv_cache.dtype,
+                sm_scale=scale,
+                causal=False,
+                disable_split_kv=True,
+            )
+            mixed_direct_output = torch.empty_like(mixed_expected)
+            mixed_binding_values = tuple(
+                value
+                for binding in mixed_batch.bindings
+                for value in (binding.request_slot, binding.generation)
+            )
+            with vllm_v1_forward_state(SimpleNamespace()):
+                state = current_vllm_v1_forward_state()
+                assert state is not None
+                state.batch = mixed_batch
+                state.hook = hook
+                state.connector_validated = True
+                state.page_size = page_size
+                state.request_bindings_tensor = torch.tensor(
+                    mixed_binding_values, dtype=torch.int64, device=device
+                )
+                state.execution_owner = SimpleNamespace(
+                    record_request_binding_consumer=lambda *_args: None
+                )
+                implementation._run_request_bound(
+                    state,
+                    state.phase_batch(0, 1),
+                    mixed_direct_decode,
+                    mixed_decode,
+                    query[:1],
+                    kv_cache,
+                    mixed_direct_output[:1],
+                    kind="decode",
+                    framework_owned=True,
+                    phase_start=0,
+                )
+                implementation._run_request_bound(
+                    state,
+                    state.phase_batch(1, 1),
+                    mixed_direct_prefill,
+                    mixed_prefill,
+                    prefill_query[:2],
+                    kv_cache,
+                    mixed_direct_output[1:],
+                    kind="prefill",
+                    framework_owned=True,
+                    phase_start=1,
+                )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                mixed_direct_output, mixed_expected, rtol=2e-3, atol=2e-3
+            )
+            maximum = max(
+                maximum,
+                (mixed_direct_output - mixed_expected).abs().max().item(),
+            )
+
+            # A stale expected generation must suppress the direct kernel; the
+            # old self-validating guard would read the same slot's current
+            # generation and incorrectly execute it.
+            stale_output = torch.full_like(mixed_prefill_expected, float("nan"))
+            stale_values = list(mixed_binding_values)
+            stale_values[3] += 1
+            with vllm_v1_forward_state(SimpleNamespace()):
+                state = current_vllm_v1_forward_state()
+                assert state is not None
+                state.batch = mixed_batch
+                state.hook = hook
+                state.connector_validated = True
+                state.page_size = page_size
+                state.request_bindings_tensor = torch.tensor(
+                    stale_values, dtype=torch.int64, device=device
+                )
+                state.execution_owner = SimpleNamespace(
+                    record_request_binding_consumer=lambda *_args: None
+                )
+                implementation._run_request_bound(
+                    state,
+                    state.phase_batch(1, 1),
+                    mixed_direct_prefill,
+                    mixed_prefill,
+                    prefill_query[:2],
+                    kv_cache,
+                    stale_output,
+                    kind="prefill",
+                    framework_owned=True,
+                    phase_start=1,
+                )
+            torch.cuda.synchronize()
+            assert torch.isnan(stale_output).all()
             maximum = max(
                 maximum,
                 run_batch(scheduler_output, input_batch, query, expected, epoch=3),
@@ -517,6 +655,7 @@ def main() -> int:
                 query_dtype=query.dtype,
                 kv_dtype=kv_cache.dtype,
                 head_size=head_size,
+                workspace_base=workspace_base,
             )
             mapped_wrapper.plan(
                 indptr,
@@ -546,8 +685,18 @@ def main() -> int:
                 state.hook = hook
                 state.connector_validated = True
                 state.page_size = page_size
-                state.request_slots_tensor = torch.tensor(
-                    [3, 1, -1, -1], dtype=torch.int32, device=device
+                state.request_bindings_tensor = torch.tensor(
+                    [
+                        3,
+                        mapped_batch.bindings[0].generation,
+                        1,
+                        mapped_batch.bindings[1].generation,
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                state.execution_owner = SimpleNamespace(
+                    record_request_binding_consumer=lambda *_args: None
                 )
                 implementation._run_request_bound(
                     state,
@@ -559,6 +708,7 @@ def main() -> int:
                     mapped_output,
                     kind="decode",
                     framework_owned=True,
+                    phase_start=0,
                 )
             torch.cuda.synchronize()
             torch.testing.assert_close(
@@ -584,8 +734,7 @@ def main() -> int:
             )
             host_kv_cache = packed_destination[
                 :,
-                packed_offset_elements : packed_offset_elements
-                + logical_row_elements,
+                packed_offset_elements : packed_offset_elements + logical_row_elements,
             ].view((num_pages, *kv_cache.shape[1:]))
             host_kv_cache.zero_()
             packed_source = torch.zeros(
@@ -596,8 +745,7 @@ def main() -> int:
             )
             packed_source[
                 :,
-                packed_offset_elements : packed_offset_elements
-                + logical_row_elements,
+                packed_offset_elements : packed_offset_elements + logical_row_elements,
             ].copy_(kv_cache.detach().cpu().view(num_pages, logical_row_elements))
             host_resources = build_indexed_host_resources(
                 {"model.layers.0.self_attn": host_kv_cache},
@@ -633,9 +781,7 @@ def main() -> int:
             layer = SimpleNamespace(layer_name="model.layers.0.self_attn")
             runner = type("HostRunner", (), {})()
             runner.kv_cache_config = SimpleNamespace(
-                kv_cache_groups=(
-                    SimpleNamespace(layer_names=(layer.layer_name,)),
-                )
+                kv_cache_groups=(SimpleNamespace(layer_names=(layer.layer_name,)),)
             )
             host_owner = VllmV1WorkerController(runner)
             with vllm_v1_forward_state(host_scheduler):
@@ -648,33 +794,37 @@ def main() -> int:
                 state.host_transfer_pairs = ((0, 0), (1, 1), (2, 2), (3, 3))
                 state.host_resources = host_resources
                 state.execution_owner = host_owner
-                host_implementation.forward(
-                    layer,
-                    mixed_query,
-                    torch.empty(
-                        (3, num_kv_heads, head_size),
-                        device=device,
-                        dtype=mixed_query.dtype,
-                    ),
-                    torch.empty(
-                        (3, num_kv_heads, head_size),
-                        device=device,
-                        dtype=mixed_query.dtype,
-                    ),
-                    host_kv_cache,
-                    mixed_metadata,
-                    host_output,
-                )
+                host_owner.begin_forward(state)
+                try:
+                    host_implementation.forward(
+                        layer,
+                        mixed_query,
+                        torch.empty(
+                            (3, num_kv_heads, head_size),
+                            device=device,
+                            dtype=mixed_query.dtype,
+                        ),
+                        torch.empty(
+                            (3, num_kv_heads, head_size),
+                            device=device,
+                            dtype=mixed_query.dtype,
+                        ),
+                        host_kv_cache,
+                        mixed_metadata,
+                        host_output,
+                    )
+                    host_owner.commit_forward(state)
+                    state.commit_evidence()
+                except BaseException:
+                    host_owner.abort_forward(state)
+                    state.abort_evidence()
+                    raise
             torch.cuda.synchronize()
-            torch.testing.assert_close(
-                host_kv_cache, kv_cache, rtol=0, atol=0
-            )
+            torch.testing.assert_close(host_kv_cache, kv_cache, rtol=0, atol=0)
             torch.testing.assert_close(
                 host_output, mixed_expected, rtol=2e-3, atol=2e-3
             )
-            assert torch.all(
-                packed_destination[:, :packed_offset_elements] == 7
-            ).item()
+            assert torch.all(packed_destination[:, :packed_offset_elements] == 7).item()
             assert torch.all(
                 packed_destination[
                     :,

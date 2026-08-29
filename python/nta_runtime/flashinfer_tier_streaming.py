@@ -25,6 +25,7 @@ from .runtime import (
     AcquireRequirement,
     DeviceWorkPlan,
     IndexedHostObject,
+    JitOperatorModule,
     JitPhaseProgram,
     OperatorCapability,
     OperatorAccessProof,
@@ -46,6 +47,7 @@ from .runtime import (
     require_operator_pair,
 )
 from .tier_streaming import TierStreamingSchedule
+from .transport_program import load_activated_transport_program
 
 
 RequestKey = tuple[int, int]
@@ -80,8 +82,8 @@ class _CompiledWorkPlan:
 
 
 @dataclass(frozen=True)
-class _AcquisitionGroup:
-    """One request-owned K/V segment and its wave-local staging slice."""
+class _StreamingWaveBinding:
+    """Bind one finite streaming wave to its numerical ticket and staging slice."""
 
     wave_index: int
     request_index: int
@@ -212,7 +214,11 @@ class FlashInferTierStreamingExecutor:
         candidate = (self._event_cursor + 1) % len(self._event_sets)
         events = self._event_sets[candidate]
         if self._event_set_used[candidate] and not events.finished.query():
-            raise RuntimeError("tier-streaming in-flight epoch capacity was exhausted")
+            # The event ring is a bounded submission window, not a workload
+            # limit. Apply backpressure before reusing one epoch's events so a
+            # fast producer cannot either alias live events or fail an
+            # otherwise valid execution.
+            events.finished.synchronize()
         if previous is not None:
             self.copy_stream.wait_event(previous.finished)
         self._event_cursor = candidate
@@ -431,12 +437,15 @@ class FlashInferTierStreamingOperator:
         self._compiled_host_indices: list[torch.Tensor] = []
         self._compiled_plans: dict[int, _CompiledWorkPlan] = {}
         self._compiled_epoch_plan: DeviceWorkPlan | None = None
-        self._compiled_acquisition_groups: tuple[_AcquisitionGroup, ...] = ()
+        self._compiled_acquisition_groups: tuple[_StreamingWaveBinding, ...] = ()
         self._compiled_wave_object_ranges: tuple[tuple[int, int], ...] = ()
         self._wrapper_forms: dict[int, OperatorForm] = {}
         self._wrapper_request_counts: dict[int, int] = {}
         self._wrapper_request_slots: dict[int, tuple[int, ...]] = {}
-        self._compiler_programs: tuple[JitPhaseProgram, JitPhaseProgram] | None = None
+        self._compiler_modules: (
+            tuple[JitOperatorModule, JitOperatorModule] | None
+        ) = None
+        self._transport_program: JitPhaseProgram | None = None
         self._operator_plan: OperatorPlan | None = None
         self._direct_jit_args: list[Any] | None = None
         self._incremental_jit_args: list[Any] | None = None
@@ -474,7 +483,7 @@ class FlashInferTierStreamingOperator:
 
     @property
     def compiler_transformed(self) -> bool:
-        return self._compiler_programs is not None
+        return self._compiler_modules is not None
 
     @property
     def operator_plan(self) -> OperatorPlan | None:
@@ -483,7 +492,7 @@ class FlashInferTierStreamingOperator:
     @property
     def compiler_runtime_protocol_active(self) -> bool:
         return (
-            self._compiler_programs is not None and self._last_compiled_work_count > 0
+            self._compiler_modules is not None and self._last_compiled_work_count > 0
         )
 
     @property
@@ -617,7 +626,7 @@ class FlashInferTierStreamingOperator:
 
         ordered_groups = sorted(raw_groups, key=lambda group: (group[1], group[0]))
         groups = tuple(
-            _AcquisitionGroup(
+            _StreamingWaveBinding(
                 wave_index,
                 request_index,
                 work_ticket,
@@ -677,7 +686,7 @@ class FlashInferTierStreamingOperator:
         self._compiled_epoch_plan = self._build_epoch_plan(groups)
 
     def _build_epoch_plan(
-        self, groups: tuple[_AcquisitionGroup, ...]
+        self, groups: tuple[_StreamingWaveBinding, ...]
     ) -> DeviceWorkPlan:
         runtime = self._compiled_runtime
         if runtime is None:
@@ -728,10 +737,6 @@ class FlashInferTierStreamingOperator:
                     group.request_index,
                     contributor_index,
                     contributor_counts[group.request_index],
-                    0,
-                    0,
-                    0,
-                    0,
                     0,
                 )
             )
@@ -847,10 +852,6 @@ class FlashInferTierStreamingOperator:
                     contributor_indices[request_index],
                     counts[request_index],
                     0,
-                    0,
-                    0,
-                    0,
-                    0,
                 )
             )
             contributor_indices[request_index] += 1
@@ -879,8 +880,8 @@ class FlashInferTierStreamingOperator:
 
     def _enable_gpu_initiated_host(self) -> None:
         runtime = self._compiled_runtime
-        programs = self._compiler_programs
-        if runtime is None or programs is None:
+        transport = self._transport_program
+        if runtime is None or transport is None:
             raise RuntimeError("GPU-initiated host acquisition has no runtime")
         objects: list[IndexedHostObject] = []
         for group in sorted(
@@ -923,7 +924,7 @@ class FlashInferTierStreamingOperator:
                     )
                 )
         runtime.register_indexed_host_objects(0, objects)
-        programs[1].validate_indexed_host_range(
+        transport.validate_indexed_host_range(
             runtime,
             0,
             self._compiled_object_count,
@@ -936,13 +937,13 @@ class FlashInferTierStreamingOperator:
         self, wave_index: int, stream: torch.cuda.Stream
     ) -> None:
         runtime = self._compiled_runtime
-        programs = self._compiler_programs
-        if runtime is None or programs is None:
+        transport = self._transport_program
+        if runtime is None or transport is None:
             raise RuntimeError("GPU-initiated host wave has no runtime")
         if wave_index < 0 or wave_index >= len(self._compiled_wave_object_ranges):
             raise RuntimeError("GPU-initiated host wave is outside the finite plan")
         first_object, object_count = self._compiled_wave_object_ranges[wave_index]
-        programs[1].progress_indexed_host_range(
+        transport.progress_indexed_host_range(
             runtime,
             first_object,
             object_count,
@@ -951,17 +952,18 @@ class FlashInferTierStreamingOperator:
 
     def _load_compiler_pair(self) -> None:
         workspace = pathlib.Path(os.environ["FLASHINFER_WORKSPACE_BASE"])
-        programs: list[JitPhaseProgram] = []
+        operator_modules: list[JitOperatorModule] = []
+        transport: JitPhaseProgram | None = None
         try:
             for name in self._compiler_module_names:
-                modules = sorted(workspace.rglob(f"{name}.so"))
-                if len(modules) != 1:
+                matches = sorted(workspace.rglob(f"{name}.so"))
+                if len(matches) != 1:
                     raise RuntimeError(
                         f"expected one compiled FlashInfer module {name}.so; "
-                        f"found {len(modules)}"
+                        f"found {len(matches)}"
                     )
-                programs.append(JitPhaseProgram(modules[0]))
-            direct, incremental = programs
+                operator_modules.append(JitOperatorModule(matches[0]))
+            direct, incremental = operator_modules
             direct.operator_contract.require(
                 family=OperatorFamily.FLASHINFER_PAGED_PREFILL,
                 form=OperatorForm.DIRECT,
@@ -1014,11 +1016,15 @@ class FlashInferTierStreamingOperator:
                 reduction=OperatorReduction.ORDERED_MERGE_STATE,
                 flags=_COMPILED_PLAN_FLAGS,
             )
+            transport, _path, _digest = load_activated_transport_program()
         except Exception:
-            for program in programs:
-                program.close()
+            for module in operator_modules:
+                module.close()
+            if transport is not None:
+                transport.close()
             raise
-        self._compiler_programs = (direct, incremental)
+        self._compiler_modules = (direct, incremental)
+        self._transport_program = transport
         self._operator_plan = plan
 
     def _build_resident_runs(self) -> tuple[_ResidentRun, ...]:
@@ -1174,7 +1180,7 @@ class FlashInferTierStreamingOperator:
             compiled = self._compiled_plans.get(id(wrapper))
             if compiled is None:
                 raise RuntimeError("incremental FlashInfer wrapper has no work plan")
-            if self._compiler_programs is None:
+            if self._compiler_modules is None or self._transport_program is None:
                 raise RuntimeError(
                     "incremental FlashInfer wrapper has no phase program"
                 )
@@ -1265,27 +1271,30 @@ class FlashInferTierStreamingOperator:
     ) -> None:
         """Enqueue the complete finite incremental operator."""
 
-        if self._compiler_programs is not None:
+        if self._compiler_modules is not None:
             if (
                 self._compiled_runtime is None
                 or self._compiled_epoch_plan is None
                 or self._compiled_epoch_work_count <= 0
             ):
                 raise RuntimeError("compiled FlashInfer operator has no finite epoch")
-            self._compiler_programs[1].reset(
+            transport = self._transport_program
+            if transport is None:
+                raise RuntimeError("compiled FlashInfer operator has no transport program")
+            transport.reset(
                 self._compiled_runtime,
                 self._compiled_object_count,
                 self._compiled_epoch_work_count,
                 self.executor.compute_stream,
             )
             if self._gpu_initiated_host:
-                self._compiler_programs[1].invalidate_cached_objects(
+                transport.invalidate_cached_objects(
                     self._compiled_runtime,
                     0,
                     self._compiled_object_count,
                     self.executor.compute_stream,
                 )
-            self._compiler_programs[1].discover(
+            transport.discover(
                 self._compiled_runtime,
                 self._compiled_epoch_plan,
                 self.executor.compute_stream,
@@ -1321,12 +1330,15 @@ class FlashInferTierStreamingOperator:
             ),
             completion_events=completion_events,
         )
-        if self._compiler_programs is not None:
+        if self._compiler_modules is not None:
             if self._compiled_runtime is None or self._compiled_epoch_plan is None:
                 raise RuntimeError(
                     "compiled FlashInfer operator has no completion plan"
                 )
-            self._compiler_programs[1].complete_stream_ordered(
+            transport = self._transport_program
+            if transport is None:
+                raise RuntimeError("compiled FlashInfer operator has no transport program")
+            transport.complete_stream_ordered(
                 self._compiled_runtime,
                 self._compiled_epoch_plan,
                 self.executor.compute_stream,

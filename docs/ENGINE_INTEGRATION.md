@@ -98,9 +98,11 @@ queue. The FlashInfer KV chunk therefore
 must be small enough for both K/V extents to satisfy that limit; an oversized
 exact group fails closed before any object is installed. The host HiCache load
 is used only as a lifetime and request-metadata signal in this mode; its bytes
-never become a data proxy. `cxl_dax` requires an explicit devdax endpoint,
-matching window, and catalog; its K/V extents become direct device
-dependencies in the work plan.
+never become a data proxy. The runtime also has a native direct `cxl_dax`
+resource, but the SGLang adapter rejects it before opening the endpoint because
+FlashInfer's page table currently names engine-owned HBM rather than the
+transport-owned DAX mapping. A native CXL qualification is therefore not a
+SGLang serving result.
 
 There is no physical-tier fallback. Endpoint, catalog, mapping, IOMMU, or
 device-visibility failure aborts the selected serving profile. Engine stats
@@ -112,9 +114,9 @@ The selected service exposes the same typed resource contract used by the
 native tier descriptor: resource kind, capability set, protocol owner,
 payload owner, transfer-destination owner, runtime-owned directory, setup
 requirements, and steady-state path. `NTA_STAGING_BYTE_CAPACITY` limits the
-runtime-owned HBM destination of the host-staged path; the engine-owned pinned
-HiCache payload remains under the framework allocator's quota and is borrowed
-only until the explicit CUDA completion fence.
+in-flight bytes admitted to the host-staged path; both the pinned HiCache
+payload and HBM destination remain engine-owned and are borrowed only until
+the explicit CUDA completion fence.
 
 ## vLLM
 
@@ -168,9 +170,20 @@ The vLLM plugin has two distinct responsibilities:
 2. `NtaVllmFlashInferImpl.forward` is the numerical consumer. vLLM's enclosing
    `Attention` layer owns the framework KV-cache update; this implementation
    reads the resulting exact demand from the pinned worker projection, resets
-   one finite NTA epoch, builds an `ExecutionSession`/`DeviceWorkPlan`, and
+   one finite NTA epoch, uploads a `DeviceWorkPlan`, and
    calls the instrumented FlashInfer wrapper with the NTA runtime/work-plan
-   ABI. It never performs a duplicate cache write.
+   ABI. Opt-in semantic verification constructs an `ExecutionSession`; the
+   production path does not pay that Python ledger cost. It never performs a
+   duplicate cache write.
+
+The implementation boundary is split by ownership rather than framework
+version: `engines/vllm_worker.py` owns runner/runtime/publication lifetime,
+`engines/vllm_config.py` freezes deployment settings, `engines/vllm_modules.py`
+owns setup-time typed-module materialization, and
+`engines/vllm_execution.py` validates host geometry and exact schedule
+preparations. `engines/vllm.py` is the registered numerical composition root.
+No bind, metadata-build, or per-layer path reads deployment environment
+variables.
 
 The pinned vLLM 0.26 profile uses the `vllm.v1` API with the V2 GPU model
 runner. Its bridge intercepts block-table allocation writes into an
@@ -187,27 +200,36 @@ FlashInfer module (the defaults are the tensor-core
 `nta_batch_decode_default_v2_hooked*` artifacts are retained for the
 non-tensor-core decode profile).
 
+All modules reachable by the selected resident/host/NVMe profile are resolved
+or materialized when the metadata builder is initialized. A cold content hash
+may therefore add setup latency after a code or ABI change, but prompt content,
+request identity, and sequence length do not change that hash. Forward-time
+wrapper construction performs lookup only and fails closed if a prepared
+artifact disappears; it cannot initiate a 95-second request-time compile.
+
 The native vLLM consumer is qualified for one KV group, pure prefill or
 single-token decode, FA2 (non-TRTLLM), and eager mode. It is opt-in with
 `NTA_VLLM_NATIVE=1`; the default is vLLM's reference attention because a
 resident-only run does not exercise a remote-tier dependency and must not pay
-the NTA protocol overhead. When `NTA_SERVING_TIER=nvme` or `cxl_dax`, the same
-native consumer resolves vLLM's exact current block-table pages through the
-immutable tier catalog: NVMe installs runtime-owned HBM destination objects,
-while CXL emits direct device-visible dependencies. This catalog-replay
-profile additionally requires `NTA_VLLM_PHYSICAL_CATALOG=1`; it is a deliberate
+the NTA protocol overhead. When `NTA_SERVING_TIER=nvme`, the same native
+consumer resolves vLLM's exact current block-table pages through the immutable
+tier catalog and installs engine-owned HBM destination objects. Direct
+`cxl_dax` is rejected because the vLLM numerical page table does not name the
+transport-owned mapping. The NVMe catalog-replay profile additionally requires
+`NTA_VLLM_PHYSICAL_CATALOG=1`; it is a deliberate
 boundary because the current project does not yet own vLLM's dynamic
 prefix-cache write-back/eviction lifecycle. The physical profile is still
 hardware-qualified separately and has no stock-attention fallback.
 The builder reports no CUDA-graph support until plan upload/replay has its own
-graph-stability gate. Mixed batches and TRTLLM remain explicit fail-closed
-boundaries; pure prefill uses the same exact paged-work-unit contract as
-decode, while external NVMe/CXL loads additionally require the physical
-catalog and tier qualification. `NTA_VLLM_ALLOW_STOCK_FALLBACK=1` is a
+graph-stability gate. Heterogeneous mixed decode/prefill batches are included
+in the native numerical gate; TRTLLM remains an explicit fail-closed boundary.
+Pure prefill and mixed prefill rows use the same exact paged-work-unit contract
+as decode, while external NVMe loads additionally require the physical catalog
+and tier qualification. `NTA_VLLM_ALLOW_STOCK_FALLBACK=1` is a
 debugging reference only and is invalid for native artifacts.
 
 Consequently, a vLLM artifact can claim native NTA execution for the resident
-profile or for a catalog-backed physical prefill/decode profile only when its evidence
+profile or for a catalog-backed NVMe prefill/decode profile only when its evidence
 contains the corresponding native launches and tier capability proof. The
 shared vLLM/SGLang runtime and tenant contract are integrated. This direct
 attention path deliberately does not claim implementation of vLLM's upstream

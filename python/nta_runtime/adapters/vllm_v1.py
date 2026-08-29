@@ -95,10 +95,12 @@ class VllmV1ForwardState:
     scheduler_output: Any | None = None
     input_batch: Any | None = None
     batch: EngineBatch | None = None
+    connector_metadata: Any | None = None
     hook: "VllmV1Hook | None" = None
     tier_service: Any | None = None
     execution_owner: Any | None = None
-    request_slots_tensor: Any | None = None
+    connector_owner: Any | None = None
+    request_bindings_tensor: Any | None = None
     connector_validated: bool = False
     page_size: int = 0
     storage_key_tables: tuple[tuple[str | None, ...], ...] = ()
@@ -107,6 +109,7 @@ class VllmV1ForwardState:
     host_preload_event: Any | None = None
     host_preload_blocks: int = 0
     host_preload_bytes: int = 0
+    tenant_isolation_enabled: bool = False
     host_index_tensors: dict[
         tuple[int, tuple[int, ...], tuple[int, ...]], tuple[Any, Any]
     ] = field(default_factory=dict)
@@ -114,10 +117,11 @@ class VllmV1ForwardState:
     _phase_batches: dict[tuple[int, int], EngineBatch] = field(
         default_factory=dict, init=False, repr=False
     )
-    _direct_evidence: dict[str, int] = field(
+    _forward_evidence: dict[str, int] = field(
         default_factory=dict, init=False, repr=False
     )
-    _direct_evidence_committed: bool = field(default=False, init=False, repr=False)
+    _evidence_committed: bool = field(default=False, init=False, repr=False)
+    _evidence_aborted: bool = field(default=False, init=False, repr=False)
     _active_host_layer: str | None = field(default=None, init=False, repr=False)
     _host_consumed_destinations: set[int] = field(
         default_factory=set, init=False, repr=False
@@ -157,9 +161,7 @@ class VllmV1ForwardState:
     ) -> None:
         if self._active_host_layer != layer_name:
             raise RuntimeError("vLLM host schedule belongs to the wrong layer")
-        if not (
-            len(request_indices) == len(kv_tile_indices) == len(selected_pages)
-        ):
+        if not (len(request_indices) == len(kv_tile_indices) == len(selected_pages)):
             raise RuntimeError("vLLM host schedule diagnostics are misaligned")
         self._host_schedule_observations.append(
             (chunk_tokens, request_indices, kv_tile_indices, selected_pages)
@@ -204,6 +206,10 @@ class VllmV1ForwardState:
         """Order the model stream behind one typed all-layer transfer."""
 
         event = self.host_preload_event
+        if self.tenant_isolation_enabled and self.host_transfer_pairs:
+            raise RuntimeError(
+                "vLLM host preload cannot bypass finite tenant byte credits"
+            )
         if event is None:
             if self.host_transfer_pairs:
                 raise RuntimeError("vLLM direct host attention has no preload event")
@@ -212,15 +218,10 @@ class VllmV1ForwardState:
             return False
         stream.wait_event(event)
         self._host_preload_waited = True
-        values = self._direct_evidence
-        values["host_preload_waits"] = values.get("host_preload_waits", 0) + 1
-        values["host_preload_batches"] = values.get("host_preload_batches", 0) + 1
-        values["host_transfer_blocks"] = values.get("host_transfer_blocks", 0) + int(
-            self.host_preload_blocks
-        )
-        values["host_transfer_bytes"] = values.get("host_transfer_bytes", 0) + int(
-            self.host_preload_bytes
-        )
+        self.record_evidence("host_preload_waits")
+        self.record_evidence("host_preload_batches")
+        self.record_evidence("host_transfer_blocks", int(self.host_preload_blocks))
+        self.record_evidence("host_transfer_bytes", int(self.host_preload_bytes))
         return True
 
     def phase_batch(self, start: int, count: int) -> EngineBatch:
@@ -233,6 +234,24 @@ class VllmV1ForwardState:
             phase = self.batch.phase(start, count)
             self._phase_batches[key] = phase
         return phase
+
+    def phase_request_bindings(self, start: int, count: int) -> Any:
+        """Return the phase-local ``(slot, generation)`` device table.
+
+        FlashInfer resets its request index within each decode/prefill phase.
+        Narrowing here keeps that local index aligned with the same immutable
+        :class:`EngineBatch.phase` range used by the numerical wrapper.
+        """
+
+        self.phase_batch(start, count)
+        bindings = self.request_bindings_tensor
+        if bindings is None:
+            raise RuntimeError("vLLM forward sidecar has no request bindings")
+        if getattr(bindings, "ndim", None) != 1 or getattr(
+            bindings, "numel", lambda: 0
+        )() < 2 * (start + count):
+            raise RuntimeError("vLLM request-binding table is incomplete")
+        return bindings.narrow(0, 2 * start, 2 * count)
 
     def storage_keys_for(
         self, phase: EngineBatch
@@ -260,47 +279,79 @@ class VllmV1ForwardState:
                 "vLLM phase contains a request absent from connector metadata"
             ) from error
 
-    def record_direct_launch(
+    def record_native_launch(
         self,
         kind: str,
         work_items: int,
         *,
+        form: str,
         framework_owned: bool,
         serving_tier: str = "hbm",
     ) -> None:
-        """Accumulate direct-path evidence without global per-layer updates."""
+        """Stage numerical evidence until the complete worker forward commits."""
         if kind not in {"decode", "prefill"}:
-            raise ValueError(f"unknown vLLM direct phase {kind!r}")
+            raise ValueError(f"unknown vLLM attention phase {kind!r}")
+        if form not in {"request_bound", "incremental"}:
+            raise ValueError(f"unknown vLLM numerical form {form!r}")
         if work_items <= 0:
-            raise ValueError("vLLM direct launch must contain work")
-        values = self._direct_evidence
-        for key, increment in (
+            raise ValueError("vLLM native launch must contain work")
+        if self._evidence_committed or self._evidence_aborted:
+            raise RuntimeError("vLLM forward evidence is already finalized")
+        values = self._forward_evidence
+        increments = [
             (f"native_{kind}_launches", 1),
-            (f"request_bound_{kind}_launches", 1),
             (f"native_{kind}_work_items", work_items),
             ("semantic_dense_tiles", work_items),
-        ):
+            (f"{form}_{kind}_launches", 1),
+        ]
+        if serving_tier in {"nvme", "cxl_dax"}:
+            increments.append((f"physical_{kind}_launches", 1))
+        elif serving_tier == "host_staged":
+            increments.append((f"host_{kind}_launches", 1))
+        for key, increment in increments:
             values[key] = values.get(key, 0) + increment
         if framework_owned:
             key = f"framework_owned_{kind}_launches"
             values[key] = values.get(key, 0) + 1
-        if serving_tier == "host_staged":
-            key = f"host_{kind}_launches"
-            values[key] = values.get(key, 0) + 1
+
+    def record_evidence(self, name: str, increment: int = 1) -> None:
+        """Stage a nonnegative per-forward counter for atomic publication."""
+        if not name or increment < 0:
+            raise ValueError("vLLM evidence requires a name and nonnegative value")
+        if self._evidence_committed or self._evidence_aborted:
+            raise RuntimeError("vLLM forward evidence is already finalized")
+        self._forward_evidence[name] = self._forward_evidence.get(name, 0) + increment
 
     def record_profile_ns(self, name: str, elapsed_ns: int) -> None:
         """Accumulate opt-in CPU timing at the same forward boundary."""
         if not name.endswith("_cpu_ns") or elapsed_ns < 0:
             raise ValueError("vLLM CPU profile counters must be nonnegative *_cpu_ns")
-        values = self._direct_evidence
-        values[name] = values.get(name, 0) + elapsed_ns
+        self.record_evidence(name, elapsed_ns)
 
-    def commit_direct_evidence(self) -> dict[str, int]:
+    def validate_evidence_commit(self) -> dict[str, int]:
+        """Validate and snapshot evidence without changing transaction state."""
+        if self._evidence_committed or self._evidence_aborted:
+            raise RuntimeError("vLLM forward evidence was finalized twice")
+        if self._active_host_layer is not None:
+            raise RuntimeError("vLLM forward ended with an active host layer")
+        return dict(self._forward_evidence)
+
+    def commit_evidence(self) -> dict[str, int]:
         """Return this forward's counters exactly once at its owner boundary."""
-        if self._direct_evidence_committed:
-            raise RuntimeError("vLLM forward evidence was committed twice")
-        self._direct_evidence_committed = True
-        return dict(self._direct_evidence)
+        values = self.validate_evidence_commit()
+        self._evidence_committed = True
+        return values
+
+    def abort_evidence(self) -> None:
+        """Discard every staged counter when numerical execution fails."""
+        if self._evidence_committed:
+            raise RuntimeError("committed vLLM evidence cannot be aborted")
+        if self._evidence_aborted:
+            return
+        if self._active_host_layer is not None:
+            self.abort_host_layer(self._active_host_layer)
+        self._forward_evidence.clear()
+        self._evidence_aborted = True
 
 
 _FORWARD_STATE: contextvars.ContextVar[VllmV1ForwardState | None] = (
@@ -377,6 +428,19 @@ def _exact_integer(value: Any, description: str) -> int:
     return int(normalized)
 
 
+def _retired_request_ids(scheduler_output: Any) -> tuple[str, ...]:
+    """Return every request whose runtime generation must end this step."""
+
+    retired = {
+        str(request_id)
+        for field in ("finished_req_ids", "preempted_req_ids")
+        for request_id in (getattr(scheduler_output, field, ()) or ())
+    }
+    if any(not request_id for request_id in retired):
+        raise RuntimeError("vLLM retired request IDs must be non-empty")
+    return tuple(sorted(retired))
+
+
 @dataclass(frozen=True)
 class VllmV1SchedulerProjection:
     """Exact NTA projection extracted from one vLLM V1 worker step."""
@@ -422,11 +486,10 @@ class VllmV1SchedulerProjection:
             )
         if any(not request_id for request_id in request_ids):
             raise RuntimeError("vLLM V1 scheduled request IDs must be non-empty")
-        finished = getattr(scheduler_output, "finished_req_ids", frozenset())
-        finished_ids = {str(request_id) for request_id in finished}
-        if finished_ids.intersection(request_ids):
+        retired_ids = set(_retired_request_ids(scheduler_output))
+        if retired_ids.intersection(request_ids):
             raise RuntimeError(
-                "vLLM V1 output finishes and schedules the same request ID; "
+                "vLLM V1 output retires and schedules the same request ID; "
                 "the hook cannot disambiguate generations"
             )
 
@@ -550,6 +613,10 @@ class VllmV1SchedulerProjection:
             raise RuntimeError(
                 "vLLM V2 input batch and scheduler output disagree on scheduled "
                 "request IDs"
+            )
+        if set(_retired_request_ids(scheduler_output)).intersection(request_ids):
+            raise RuntimeError(
+                "vLLM V2 output retires and schedules the same request ID"
             )
         if len(block_tables) != 1 or len(num_blocks) != 1:
             raise RuntimeError(
@@ -735,6 +802,7 @@ class VllmV1Hook:
         priority_for_request: Callable[[str], int] | None = None,
         deadline_for_request: Callable[[str], int] | None = None,
         consumer: VllmV1NumericalConsumer | None = None,
+        profile_cpu: bool = False,
     ) -> None:
         if page_bytes <= 0:
             raise ValueError("vLLM V1 page_bytes must be positive")
@@ -755,6 +823,7 @@ class VllmV1Hook:
         self._priority_for_request = priority_for_request
         self._deadline_for_request = deadline_for_request
         self._consumer = consumer
+        self._profile_cpu = bool(profile_cpu)
         self._native_launches = 0
         self._last_bind_profile: dict[str, int] = {}
 
@@ -826,13 +895,10 @@ class VllmV1Hook:
             input_batch,
             page_bytes=self._page_bytes,
         )
-        finished = tuple(
-            str(request_id)
-            for request_id in getattr(scheduler_output, "finished_req_ids", ())
-        )
-        for request_id in finished:
+        retired = _retired_request_ids(scheduler_output)
+        for request_id in retired:
             self._adapter.retire_request(request_id)
-        slots = self._slots.assign(projection.request_ids, finished)
+        slots = self._slots.assign(projection.request_ids, retired)
         priorities = (
             None
             if self._priority_for_request is None
@@ -881,7 +947,7 @@ class VllmV1Hook:
         granularity: Granularity = Granularity.PAGE_GROUP,
     ) -> EngineBatch:
         """Bind vLLM V2's request batch through its typed CPU table mirror."""
-        profiling = os.environ.get("NTA_PROFILE_CPU") == "1"
+        profiling = self._profile_cpu
         phase_started = time.perf_counter_ns()
         profile: dict[str, int] = {}
 
@@ -900,11 +966,8 @@ class VllmV1Hook:
             page_bytes=self._page_bytes,
         )
         finish_phase("bridge_projection_cpu_ns")
-        finished = tuple(
-            str(request_id)
-            for request_id in getattr(scheduler_output, "finished_req_ids", ())
-        )
-        for request_id in finished:
+        retired = _retired_request_ids(scheduler_output)
+        for request_id in retired:
             self._adapter.retire_request(request_id)
         finish_phase("bridge_finished_retire_cpu_ns")
         replacements = self._slots.replacements(
@@ -915,7 +978,7 @@ class VllmV1Hook:
         finish_phase("bridge_replacement_retire_cpu_ns")
         slots = self._slots.assign(
             projection.request_ids,
-            finished,
+            retired,
             projection.request_rows,
         )
         finish_phase("bridge_slot_assign_cpu_ns")
@@ -967,20 +1030,69 @@ class VllmV1Hook:
         block_tables: Sequence[Sequence[int]],
         finished_request_ids: Sequence[str],
         *,
+        input_batch: Any,
         epoch: int,
         stream: Any = None,
         granularity: Granularity = Granularity.PAGE_GROUP,
     ) -> EngineBatch:
-        """Bind exact scheduler-owned metadata from vLLM's KVConnector seam."""
+        """Bind connector demand only after proving its numerical row order."""
+        framework_ids = getattr(input_batch, "req_ids", None)
+        framework_rows = getattr(input_batch, "idx_mapping_np", None)
+        if not isinstance(framework_ids, Sequence) or isinstance(
+            framework_ids, (str, bytes)
+        ):
+            raise RuntimeError("vLLM connector input batch has no request row order")
+        if framework_rows is None or isinstance(framework_rows, (str, bytes)):
+            raise RuntimeError("vLLM connector input batch has no allocation rows")
+        try:
+            actual_ids = tuple(str(request_id) for request_id in framework_ids)
+            actual_rows = tuple(
+                _nonnegative_integer(row, "allocation row") for row in framework_rows
+            )
+        except TypeError:
+            raise RuntimeError(
+                "vLLM connector input batch has no allocation rows"
+            ) from None
+        metadata_ids = tuple(str(request_id) for request_id in request_ids)
+        if any(not request_id for request_id in actual_ids + metadata_ids):
+            raise RuntimeError("vLLM connector request IDs must be non-empty")
+        if len(set(actual_ids)) != len(actual_ids):
+            raise RuntimeError("vLLM input batch contains duplicate request rows")
+        if len(actual_ids) != len(actual_rows):
+            raise RuntimeError("vLLM request IDs and allocation rows are misaligned")
+        if metadata_ids != actual_ids:
+            mismatch = next(
+                (
+                    index
+                    for index, (metadata_id, actual_id) in enumerate(
+                        zip(metadata_ids, actual_ids, strict=False)
+                    )
+                    if metadata_id != actual_id
+                ),
+                min(len(metadata_ids), len(actual_ids)),
+            )
+            raise RuntimeError(
+                "vLLM connector request order does not match InputBatch.req_ids "
+                f"at attention row {mismatch}: metadata={metadata_ids!r}, "
+                f"input_batch={actual_ids!r}"
+            )
         projection = VllmV1SchedulerProjection(
-            tuple(request_ids),
+            actual_ids,
             tuple(tuple(row) for row in block_tables),
             self._page_bytes,
+            actual_rows,
         )
         finished = tuple(str(request_id) for request_id in finished_request_ids)
         for request_id in finished:
             self._adapter.retire_request(request_id)
-        slots = self._slots.assign(projection.request_ids, finished)
+        replacements = self._slots.replacements(
+            projection.request_ids, projection.request_rows
+        )
+        for request_id in replacements:
+            self._adapter.retire_request(request_id)
+        slots = self._slots.assign(
+            projection.request_ids, finished, projection.request_rows
+        )
         priorities = (
             None
             if self._priority_for_request is None

@@ -280,6 +280,11 @@ struct NvmeTransport::Impl {
     std::uint64_t *devicePageList = nullptr;
     detail::NvmeMapping dmaMapping;
     std::uint64_t mappingKey = 0;
+    // A registered HBM region owns one page table shared by offset views.
+    // Device command contexts identify the exact first page used by a view,
+    // so retirement must cover the complete address range rather than compare
+    // only the page-table base.
+    std::size_t mappingKeyBytes = 0;
     CUdeviceptr hbmBase = 0;
     CUdeviceptr hbmAddress = 0;
     std::size_t hbmAllocationBytes = 0;
@@ -293,6 +298,7 @@ struct NvmeTransport::Impl {
     bool cacheable = true;
     bool ownsDestinationMemory = true;
   };
+  static_assert(std::is_nothrow_move_constructible_v<RetiredMapping>);
 
   static constexpr std::size_t MappingCacheCapacity = 256;
   static constexpr std::size_t MappingCacheBytes = 256U * 1024U * 1024U;
@@ -317,6 +323,12 @@ struct NvmeTransport::Impl {
       capabilities.deviceOrdinal = deviceOrdinal;
       capabilities.supportsHbmPeerDma = false;
       capabilities.hbmMappingBackend = NvmeHbmMappingBackend::Unavailable;
+      contextSnapshot.resize(capabilities.queueDepth);
+      // At most queueDepth distinct mappings can be active at once. Reserving
+      // the retirement set up front keeps a noexcept mapping destructor from
+      // allocating while it is preserving an in-flight DMA lease.
+      retiredMappings.reserve(capabilities.queueDepth);
+      cachedMappings.reserve(MappingCacheCapacity);
       if (dmaTarget == NvmeDmaTarget::HbmPeer) {
         HbmAllocation preflight;
         detail::NvmeMapping preflightMapping;
@@ -333,7 +345,12 @@ struct NvmeTransport::Impl {
           releaseHbmAllocation(preflight);
           capabilities.supportsHbmPeerDma = true;
           capabilities.hbmMappingBackend =
-              NvmeHbmMappingBackend::NvidiaPeerPages;
+              controlPlane->mappingBackend().hbmMappingBackend();
+          if (capabilities.hbmMappingBackend ==
+              NvmeHbmMappingBackend::Unavailable) {
+            throw std::runtime_error(
+                "HBM mapper did not publish its selected backend");
+          }
         } catch (const std::exception &error) {
           releaseHbmAllocation(preflight);
           throw std::runtime_error(
@@ -490,20 +507,27 @@ struct NvmeTransport::Impl {
     controlPlane.reset();
   }
 
-  bool mappingInFlight(std::uint64_t mappingKey) noexcept {
-    if (mappingKey == 0 || contexts == nullptr ||
-        capabilities.queueDepth == 0) {
+  bool mappingInFlight(std::uint64_t mappingKey,
+                       std::size_t mappingKeyBytes) noexcept {
+    if (mappingKey == 0 || mappingKeyBytes == 0 || contexts == nullptr ||
+        contextSnapshot.size() != capabilities.queueDepth) {
       return false;
     }
-    std::vector<abi::NvmeCommandContext> hostContexts(capabilities.queueDepth);
-    if (cudaMemcpy(hostContexts.data(), contexts,
-                   hostContexts.size() * sizeof(hostContexts.front()),
+    if (mappingKeyBytes >
+        std::numeric_limits<std::uint64_t>::max() - mappingKey) {
+      return true;
+    }
+    const std::uint64_t mappingEnd = mappingKey + mappingKeyBytes;
+    if (cudaMemcpy(contextSnapshot.data(), contexts,
+                   contextSnapshot.size() * sizeof(contextSnapshot.front()),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
       return true;
     }
-    return std::ranges::any_of(hostContexts, [mappingKey](const auto &context) {
-      return context.active != 0 && context.mappingKey == mappingKey;
-    });
+    return std::ranges::any_of(
+        contextSnapshot, [mappingKey, mappingEnd](const auto &context) {
+          return context.active != 0 && context.mappingKey >= mappingKey &&
+                 context.mappingKey < mappingEnd;
+        });
   }
 
   void releaseMappingResources(RetiredMapping &mapping) noexcept {
@@ -587,7 +611,7 @@ struct NvmeTransport::Impl {
     std::scoped_lock lock(mappingMutex);
     auto mapping = retiredMappings.begin();
     while (mapping != retiredMappings.end()) {
-      if (mappingInFlight(mapping->mappingKey)) {
+      if (mappingInFlight(mapping->mappingKey, mapping->mappingKeyBytes)) {
         ++mapping;
         continue;
       }
@@ -605,12 +629,29 @@ struct NvmeTransport::Impl {
     // a later allocation/statistics pass.  Transport shutdown remains the
     // explicit whole-device quiescence boundary in ``release``.
     std::scoped_lock lock(mappingMutex);
-    if (mappingInFlight(mapping.mappingKey)) {
-      try {
-        retiredMappings.push_back(std::move(mapping));
-      } catch (...) {
-        releaseMappingResources(mapping);
+    if (mappingInFlight(mapping.mappingKey, mapping.mappingKeyBytes)) {
+      if (retiredMappings.size() == retiredMappings.capacity()) {
+        // At most queueDepth distinct leases can be active. Reaching the
+        // pre-reserved bound means completed leases have not yet been reaped.
+        // Reclaim those leases before inserting, without a device-wide fence.
+        auto retired = retiredMappings.begin();
+        while (retired != retiredMappings.end()) {
+          if (mappingInFlight(retired->mappingKey,
+                              retired->mappingKeyBytes)) {
+            ++retired;
+            continue;
+          }
+          cacheMappingResourcesLocked(std::move(*retired));
+          retired = retiredMappings.erase(retired);
+        }
+        // With one context per command, queueDepth+1 distinct active leases is
+        // impossible. Terminating on an invariant violation is safer than
+        // unmapping memory that a controller may still own.
+        if (retiredMappings.size() == retiredMappings.capacity()) {
+          std::terminate();
+        }
       }
+      retiredMappings.push_back(std::move(mapping));
     } else {
       cacheMappingResourcesLocked(std::move(mapping));
     }
@@ -627,6 +668,7 @@ struct NvmeTransport::Impl {
   abi::NvmeCommandContext *contexts = nullptr;
   abi::NvmeQueueView *deviceQueue = nullptr;
   std::mutex mappingMutex;
+  std::vector<abi::NvmeCommandContext> contextSnapshot;
   std::vector<RetiredMapping> retiredMappings;
   std::vector<RetiredMapping> cachedMappings;
   std::size_t cachedBytes = 0;
@@ -639,11 +681,30 @@ struct NvmeHbmRegion::Impl {
   ~Impl() {
     detail::NoexceptCudaDeviceGuard deviceGuard(
         owner == nullptr ? 0 : owner->deviceOrdinal);
-    if (devicePageList != nullptr) {
-      (void)cudaFree(devicePageList);
+    if (owner != nullptr && (dmaMapping || devicePageList != nullptr)) {
+      NvmeTransport::Impl::RetiredMapping mapping;
+      mapping.devicePageList = devicePageList;
+      mapping.dmaMapping = std::move(dmaMapping);
+      mapping.mappingKey = reinterpret_cast<std::uint64_t>(devicePageList);
+      mapping.mappingKeyBytes =
+          static_cast<std::size_t>(pageCount) * sizeof(std::uint64_t);
+      mapping.allocationBytes = logicalBytes;
+      mapping.resourceBytes = peerBytes;
+      mapping.pageCount = pageCount;
+      mapping.target = NvmeDmaTarget::HbmPeer;
+      mapping.deviceAddress = reinterpret_cast<void *>(logicalAddress);
+      mapping.cacheable = false;
+      mapping.ownsDestinationMemory = false;
+      owner->releaseMapping(std::move(mapping));
       devicePageList = nullptr;
+      dmaMapping = {};
+    } else {
+      if (devicePageList != nullptr) {
+        (void)cudaFree(devicePageList);
+        devicePageList = nullptr;
+      }
+      dmaMapping = {};
     }
-    dmaMapping = {};
   }
 
   // Keep the transport/control plane alive until every transfer view has
@@ -663,12 +724,17 @@ struct NvmeBuffer::Impl {
   ~Impl() {
     detail::NoexceptCudaDeviceGuard deviceGuard(
         owner == nullptr ? 0 : owner->deviceOrdinal);
-    if (owner != nullptr) {
+    // External views borrow one region-wide mapping. Their shared region lease
+    // is destroyed after this body and performs range-aware retirement once;
+    // a view must not retire its interior page-table pointer independently.
+    if (owner != nullptr && externalRegion == nullptr) {
       NvmeTransport::Impl::RetiredMapping mapping;
       mapping.hostAllocation = hostAllocation;
       mapping.devicePageList = devicePageList;
       mapping.dmaMapping = std::move(dmaMapping);
       mapping.mappingKey = reinterpret_cast<std::uint64_t>(devicePageList);
+      mapping.mappingKeyBytes =
+          static_cast<std::size_t>(pageCount) * sizeof(std::uint64_t);
       mapping.hbmBase = hbmBase;
       mapping.hbmAddress = hbmAddress;
       mapping.hbmAllocationBytes = hbmAllocationBytes;
@@ -966,9 +1032,10 @@ NvmeTransport::describeExternalHbm(void *deviceAddress,
         "described HBM NVMe region exceeds its CUDA allocation");
   }
 
-  // NVIDIA peer-pages pins 64 KiB-aligned ranges. Register the minimal
-  // containing envelope once; MDTS-bounded views borrow controller-page slices
-  // from the immutable page table below.
+  // Keep one 64 KiB-aligned registration contract across CUDA DMA-BUF/IOAS and
+  // the optional NVIDIA peer-pages fallback. Register the minimal containing
+  // envelope once; MDTS-bounded views borrow controller-page slices from the
+  // immutable page table below.
   const CUdeviceptr peerBegin = targetAddress & ~(peerAlignment - 1U);
   const CUdeviceptr targetEnd = targetAddress + bytes;
   const CUdeviceptr peerEnd = static_cast<CUdeviceptr>(

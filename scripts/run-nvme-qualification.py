@@ -10,11 +10,17 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from experiments.hardware import platform_identity  # noqa: E402
+
 RESULTS_ROOT = pathlib.Path(
     os.environ.get(
         "NTA_RESULTS_DIR", pathlib.Path(tempfile.gettempdir()) / "nta-results"
@@ -67,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.9,
         help="minimum direct-HBM/fio bandwidth ratio for qualification",
+    )
+    parser.add_argument(
+        "--require-hbm-backend",
+        choices=("auto", "cuda-dmabuf-ioas", "nvidia-peer-pages"),
+        default="auto",
+        help=(
+            "set the native setup-time HBM mapping policy; auto may select "
+            "either qualified direct-HBM backend"
+        ),
     )
     parser.add_argument("--cta-try-issue", action="store_true")
     parser.add_argument("--require-ready", action="store_true")
@@ -147,6 +162,14 @@ def revision() -> tuple[str, bool]:
     value = run(["git", "rev-parse", "HEAD"]).strip()
     dirty = bool(run(["git", "status", "--porcelain"]).strip())
     return value, dirty
+
+
+def runtime_abi_version() -> int:
+    header = (ROOT / "include" / "nta" / "RuntimeABI.h").read_text(encoding="utf-8")
+    match = re.search(r"\bVersion\s*=\s*([0-9]+)\s*;", header)
+    if match is None:
+        raise RuntimeError("cannot read the native runtime ABI version")
+    return int(match.group(1))
 
 
 def namespace_block_device(bdf: str, namespace: int) -> pathlib.Path:
@@ -247,6 +270,29 @@ def iommu_fault_count(bdf: str) -> int:
     return sum(marker in line for line in output.splitlines())
 
 
+def hbm_mapping_contract_ready(
+    *, dma_target: str, required_backend: str, gpu: dict[str, Any]
+) -> bool:
+    """Verify that native policy enforcement and the selected mapper agree.
+
+    The policy field is emitted by the native benchmark from the options used
+    to construct the transport.  Requiring it here prevents a post-hoc backend
+    label from being mistaken for proof that an explicit fail-closed policy was
+    active before the first HBM mapping attempt.
+    """
+
+    if gpu.get("hbm_mapping_policy") != required_backend:
+        return False
+    if dma_target != "hbm-peer":
+        return required_backend == "auto"
+    selected = gpu.get("hbm_mapping_backend")
+    return (
+        gpu.get("hbm_peer_dma_supported") is True
+        and selected in {"cuda-dmabuf-ioas", "nvidia-peer-pages"}
+        and (required_backend == "auto" or selected == required_backend)
+    )
+
+
 def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     raw_output = args.output.with_name(f"{args.output.stem}-gpu.json")
@@ -257,6 +303,7 @@ def gpu_read(args: argparse.Namespace, git_revision: str) -> dict[str, Any]:
         "NTA_GPU": str(args.gpu),
         "NTA_NVME_MEDIA_POLICY": args.media_policy,
         "NTA_NVME_DMA_TARGET": args.dma_target,
+        "NTA_NVME_HBM_BACKEND": args.require_hbm_backend,
         "NTA_NVME_REFERENCE": str(args.reference),
         "NTA_NVME_REFERENCE_BYTES": str(args.bytes * args.requests),
         "NTA_ALLOW_DEVICE_REBIND": "1",
@@ -294,6 +341,8 @@ def write_report(
         "tier": "nvme",
         "revision": git_revision,
         "dirty": dirty,
+        "runtime_abi": runtime_abi_version(),
+        "platform_identity": platform_identity(),
         "media_policy": args.media_policy,
         "read_only_contract": args.media_policy == "trusted-read-only-code",
         **fields,
@@ -311,7 +360,12 @@ def main() -> int:
             "refusing NVMe qualification without --allow-device-rebind; "
             "review the read-only preflight and explicitly authorize VFIO rebinding"
         )
+    if args.dma_target != "hbm-peer" and args.require_hbm_backend != "auto":
+        raise SystemExit(
+            "an explicit --require-hbm-backend requires --dma-target hbm-peer"
+        )
     git_revision, dirty = revision()
+    expected_abi = runtime_abi_version()
     args.reference = args.reference.expanduser().resolve()
     if args.reference.exists() and not args.reference.is_file():
         raise SystemExit(f"NVMe reference is not a regular file: {args.reference}")
@@ -330,18 +384,20 @@ def main() -> int:
         ratio = float(gpu["end_to_end_mib_per_second"]) / float(
             baseline["bandwidth_mib_per_second"]
         )
+        selected_hbm_backend = gpu.get("hbm_mapping_backend")
+        reported_hbm_policy = gpu.get("hbm_mapping_policy")
+        hbm_backend_ready = hbm_mapping_contract_ready(
+            dma_target=args.dma_target,
+            required_backend=args.require_hbm_backend,
+            gpu=gpu,
+        )
         transport_ready = (
             gpu.get("revision") == git_revision
+            and int(gpu.get("runtime_abi", -1)) == expected_abi
             and gpu.get("verified") is True
             and gpu.get("selected_data_path_verified") is True
             and gpu.get("destination") == args.dma_target
-            and (
-                args.dma_target != "hbm-peer"
-                or (
-                    gpu.get("hbm_peer_dma_supported") is True
-                    and gpu.get("hbm_mapping_backend") == "nvidia-peer-pages"
-                )
-            )
+            and hbm_backend_ready
             and gpu.get("translated_iommu") is True
             and gpu.get("gpu_doorbell_mapping_validated") is True
             and iommu_fault_free
@@ -349,21 +405,27 @@ def main() -> int:
             and int(gpu.get("failed", 1)) == 0
             and int(gpu.get("outstanding", 1)) == 0
         )
+        provenance_ready = not dirty
         performance_qualified = ratio >= args.minimum_bandwidth_ratio
+        qualified = transport_ready and provenance_ready and performance_qualified
         raw_output = args.output.with_name(f"{args.output.stem}-gpu.json")
         write_report(
             args,
             git_revision=git_revision,
             dirty=dirty,
             fields={
-                "ready": transport_ready,
+                "ready": qualified,
                 "transport_ready": transport_ready,
-                "qualified": transport_ready,
-                "status": "qualified" if transport_ready else "not_qualified",
+                "provenance_ready": provenance_ready,
+                "qualified": qualified,
+                "status": "qualified" if qualified else "not_qualified",
                 "demand_semantics": "exact",
                 "minimum_bandwidth_ratio": args.minimum_bandwidth_ratio,
                 "matched_bandwidth_ratio": ratio,
                 "performance_qualified": performance_qualified,
+                "required_hbm_backend": args.require_hbm_backend,
+                "reported_hbm_mapping_policy": reported_hbm_policy,
+                "selected_hbm_backend": selected_hbm_backend,
                 "iommu_fault_free": iommu_fault_free,
                 "iommu_fault_count_before": faults_before,
                 "iommu_fault_count_after": faults_after,
@@ -372,7 +434,7 @@ def main() -> int:
                 "raw_gpu_result": str(raw_output.resolve()),
             },
         )
-        if args.require_ready and not transport_ready:
+        if args.require_ready and not qualified:
             return 2
         return 0
     except (RuntimeError, OSError, ValueError) as error:

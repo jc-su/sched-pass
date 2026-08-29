@@ -11,25 +11,67 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
 try:
     from cuda_toolkit import nvcc_path, resolve_cuda_home
 except ModuleNotFoundError:
-    # Installed activation lives in ``bin`` while the JIT helpers live beside
-    # the installed NTA data root.
-    _installed_jit = (
-        pathlib.Path(__file__).resolve().parent.parent
-        / "share"
-        / "nta"
-        / "tools"
-        / "jit"
+    # A source-tree module import does not automatically add this script's
+    # directory to sys.path; installed activation instead lives in ``bin``.
+    _script_jit = pathlib.Path(__file__).resolve().parent
+    _installed_jit = _script_jit.parent / "share" / "nta" / "tools" / "jit"
+    _jit_helpers = (
+        _script_jit
+        if (_script_jit / "cuda_toolkit.py").is_file()
+        else _installed_jit
     )
-    if not (_installed_jit / "cuda_toolkit.py").is_file():
+    if not (_jit_helpers / "cuda_toolkit.py").is_file():
         raise
-    sys.path.insert(0, str(_installed_jit))
+    sys.path.insert(0, str(_jit_helpers))
     from cuda_toolkit import nvcc_path, resolve_cuda_home
+
+
+NUMERICAL_CACHE_SCHEMA = "nta-numerical-v1"
+DEFAULT_JIT_ONLY = "generated/"
+DEFAULT_METADATA_SOURCE = (
+    "batch_decode_kernel.cu,batch_prefill_paged_kernel_mask_0.cu"
+)
+DEFAULT_REQUEST_BOUND_SOURCE = (
+    "nta_sglang_decode_request_bound,"
+    "nta_sglang_prefill_request_bound,"
+    "nta_batch_prefill_vllm_request_bound"
+)
+DEFAULT_STREAM_ORDERED_SOURCE = (
+    "nta_sglang_decode_stream_ordered,"
+    "nta_sglang_prefill_stream_ordered,"
+    "nta_sglang_prefill_demand_acquire_tier_v4_"
+)
+
+
+def numerical_fingerprint_inputs(
+    root: pathlib.Path,
+    plugin: pathlib.Path,
+    shim: pathlib.Path,
+    abi_header: pathlib.Path,
+) -> list[pathlib.Path]:
+    """Return only files that can change a typed numerical artifact."""
+
+    return [
+        plugin,
+        shim,
+        root / "tools/jit/clang_cuda_prelude.h",
+        abi_header,
+        root / "include/nta/OperatorContract.h",
+        root / "include/nta/TicketProtocol.cuh",
+        root / "include/nta/DeviceAPI.cuh",
+        root / "include/nta/KernelPolicy.cuh",
+        root / "include/nta/FlashInferKernelPolicy.cuh",
+        root / "runtime/device/TypedInstrumentation.cuh",
+        root / "runtime/device/Acquire.cuh",
+        root / "runtime/device/OperatorMetadata.cuh",
+    ]
 
 
 def project_layout(
@@ -65,11 +107,51 @@ def first_file(candidates: list[pathlib.Path], description: str) -> pathlib.Path
     raise RuntimeError(f"{description} not found; checked {rendered}")
 
 
-def fingerprint(paths: list[pathlib.Path]) -> str:
+def file_sha256(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
-    for path in paths:
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def executable_path(value: str, description: str) -> pathlib.Path:
+    candidate = pathlib.Path(value).expanduser()
+    if candidate.is_file():
+        return candidate.resolve()
+    resolved = shutil.which(value)
+    if resolved is None:
+        raise RuntimeError(f"{description} not found: {value}")
+    return pathlib.Path(resolved).resolve()
+
+
+def tool_identity(executable: pathlib.Path) -> str:
+    try:
+        result = subprocess.run(
+            [str(executable), "--version"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(f"cannot query toolchain identity: {executable}") from error
+    return f"{executable}\n{result.stdout.strip()}"
+
+
+def fingerprint(paths: list[pathlib.Path], identities: list[str] | None = None) -> str:
+    digest = hashlib.sha256()
+    for index, path in enumerate(paths):
+        if not path.is_file():
+            raise RuntimeError(f"JIT fingerprint input is missing: {path}")
+        digest.update(index.to_bytes(8, "little"))
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
         digest.update(path.read_bytes())
-    return digest.hexdigest()[:12]
+    for identity in identities or ():
+        digest.update(b"\0tool\0")
+        digest.update(identity.encode("utf-8"))
+    return digest.hexdigest()[:24]
 
 
 def runtime_abi_version(header: pathlib.Path) -> int:
@@ -152,24 +234,32 @@ def main() -> int:
     try:
         cuda_home = resolve_cuda_home(options.cuda_path)
         real_nvcc = first_file([nvcc_path(cuda_home)], "CUDA nvcc")
+        clang = executable_path(options.clang, "Clang CUDA compiler")
+        toolchain_identities = [
+            tool_identity(clang),
+            tool_identity(real_nvcc),
+            f"cuda_home={cuda_home.resolve()}",
+        ]
     except RuntimeError as error:
         parser.error(str(error))
     abi_header = root / "include/nta/RuntimeABI.h"
     abi_version = runtime_abi_version(abi_header)
-    integration_inputs = [
-        script,
-        plugin,
-        shim,
-        root / "tools/jit/clang_cuda_prelude.h",
-        abi_header,
-        root / "include/nta/OperatorContract.h",
-        root / "include/nta/DeviceAPI.cuh",
-        root / "include/nta/KernelPolicy.cuh",
-        root / "include/nta/FlashInferKernelPolicy.cuh",
-        root / "runtime/device/Acquire.cuh",
-        root / "runtime/device/JitRuntime.cuh",
-        root / "runtime/device/TransportProgram.cu",
-    ]
+    # Only inputs capable of changing the numerical operator or its verified
+    # contract belong to the FlashInfer workspace identity. Runtime transport
+    # and host-library artifacts carry independent ABI/content checks below;
+    # hashing them here would force a 95+ second attention rebuild after an
+    # unrelated copy/progress change.
+    numerical_inputs = numerical_fingerprint_inputs(root, plugin, shim, abi_header)
+    jit_only = os.environ.get("NTA_JIT_ONLY", DEFAULT_JIT_ONLY)
+    metadata_source = os.environ.get(
+        "NTA_JIT_METADATA_SOURCE", DEFAULT_METADATA_SOURCE
+    )
+    request_bound_source = os.environ.get(
+        "NTA_JIT_REQUEST_BOUND_SOURCE", DEFAULT_REQUEST_BOUND_SOURCE
+    )
+    stream_ordered_source = os.environ.get(
+        "NTA_JIT_STREAM_ORDERED_SOURCE", DEFAULT_STREAM_ORDERED_SOURCE
+    )
     flashinfer_version = ""
     flashinfer_include = None
     if options.flashinfer_hook:
@@ -183,15 +273,32 @@ def main() -> int:
         flashinfer_include = (
             pathlib.Path(spec.origin).resolve().parent / "data" / "include"
         )
-        integration_inputs.extend(
-            [
-                flashinfer_include / "flashinfer/attention/decode.cuh",
-                flashinfer_include / "flashinfer/attention/prefill.cuh",
-                root / "tools/flashinfer/prepare_overlay.py",
-            ]
+        numerical_inputs.append(root / "tools/flashinfer/prepare_overlay.py")
+        numerical_inputs.extend(
+            sorted(
+                path
+                for path in (flashinfer_include / "flashinfer").rglob("*")
+                if path.is_file() and path.suffix in {".cuh", ".h", ".hpp"}
+            )
         )
     version_tag = f"-fi{flashinfer_version}" if flashinfer_version else ""
-    tag = f"nta-abi{abi_version}{version_tag}-{fingerprint(integration_inputs)}"
+    numerical_identities = [
+        *toolchain_identities,
+        f"cache_schema={NUMERICAL_CACHE_SCHEMA}",
+        f"jit_only={jit_only}",
+        f"metadata_source={metadata_source}",
+        f"request_bound_source={request_bound_source}",
+        f"stream_ordered_source={stream_ordered_source}",
+        f"strip_arch={os.environ.get('NTA_STRIP_ARCH', '')}",
+        f"staging_streaming={os.environ.get('NTA_STAGING_STREAMING', '')}",
+    ]
+    source_fingerprint = fingerprint(numerical_inputs, numerical_identities)
+    policy_tag = "-stream" if os.environ.get("NTA_STAGING_STREAMING") == "1" else ""
+    tag = f"nta-abi{abi_version}{version_tag}{policy_tag}-{source_fingerprint}"
+    transport_digest = file_sha256(transport_program)
+    toolchain_digest = hashlib.sha256(
+        "\n\0\n".join(toolchain_identities).encode("utf-8")
+    ).hexdigest()
     cache_root_base = pathlib.Path(
         options.cache_root
         or os.environ.get(
@@ -211,7 +318,7 @@ def main() -> int:
         "FLASHINFER_WORKSPACE_BASE": str(workspace),
         "NTA_PROJECT_ROOT": str(root),
         "NTA_PLUGIN": str(plugin),
-        "NTA_CLANG": options.clang,
+        "NTA_CLANG": str(clang),
         "NTA_CUDA_PATH": str(cuda_home),
         "NTA_REAL_NVCC": str(real_nvcc),
         "CUDA_HOME": str(cuda_home),
@@ -221,6 +328,8 @@ def main() -> int:
         "NTA_BUILD_DIR": str(build),
         "NTA_RUNTIME_LIBRARY": str(runtime_library),
         "NTA_TRANSPORT_PROGRAM": str(transport_program),
+        "NTA_TRANSPORT_PROGRAM_SHA256": transport_digest,
+        "NTA_JIT_TOOLCHAIN_SHA256": toolchain_digest,
         "PYTHONPATH": os.pathsep.join(
             value
             for value in (
@@ -256,20 +365,10 @@ def main() -> int:
             {
                 "NTA_FLASHINFER_HOOK": "1",
                 "NTA_FLASHINFER_OVERLAY": str(overlay),
-                "NTA_JIT_ONLY": os.environ.get(
-                    "NTA_JIT_ONLY",
-                    "generated/",
-                ),
-                "NTA_JIT_PHASE_SOURCE": os.environ.get(
-                    "NTA_JIT_PHASE_SOURCE",
-                    "batch_decode_kernel.cu,batch_prefill_paged_kernel_mask_0.cu",
-                ),
-                "NTA_JIT_REQUEST_BOUND_SOURCE": os.environ.get(
-                    "NTA_JIT_REQUEST_BOUND_SOURCE",
-                    "nta_sglang_decode_request_bound,"
-                    "nta_sglang_prefill_request_bound,"
-                    "nta_batch_prefill_vllm_request_bound",
-                ),
+                "NTA_JIT_ONLY": jit_only,
+                "NTA_JIT_METADATA_SOURCE": metadata_source,
+                "NTA_JIT_REQUEST_BOUND_SOURCE": request_bound_source,
+                "NTA_JIT_STREAM_ORDERED_SOURCE": stream_ordered_source,
             }
         )
     if options.print_env:

@@ -7,11 +7,12 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 42U
+#define NTA_RUNTIME_C_API_VERSION 50U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
 typedef struct nta_device_work_plan nta_device_work_plan;
+typedef struct nta_jit_operator_module nta_jit_operator_module;
 typedef struct nta_jit_phase_program nta_jit_phase_program;
 typedef struct nta_nvme_transport nta_nvme_transport;
 typedef struct nta_nvme_hbm_region nta_nvme_hbm_region;
@@ -44,7 +45,14 @@ typedef enum nta_nvme_dma_target {
 typedef enum nta_nvme_hbm_mapping_backend {
   NTA_NVME_HBM_MAPPING_UNAVAILABLE = 0,
   NTA_NVME_HBM_MAPPING_NVIDIA_PEER_PAGES = 1,
+  NTA_NVME_HBM_MAPPING_CUDA_DMA_BUF_IOAS = 2,
 } nta_nvme_hbm_mapping_backend;
+
+typedef enum nta_nvme_hbm_mapping_policy {
+  NTA_NVME_HBM_MAPPING_AUTO = 0,
+  NTA_NVME_HBM_MAPPING_REQUIRE_NVIDIA_PEER_PAGES = 1,
+  NTA_NVME_HBM_MAPPING_REQUIRE_CUDA_DMA_BUF_IOAS = 2,
+} nta_nvme_hbm_mapping_policy;
 
 typedef enum nta_tier_owner {
   NTA_TIER_OWNER_NONE = 0,
@@ -142,8 +150,7 @@ typedef struct nta_work_item {
   uint32_t contributor_index;
   uint32_t contributor_count;
   uint32_t estimated_compute_ns;
-  uint32_t reserved0;
-  uint32_t reserved1;
+  uint64_t ready_deadline_offset_ns;
   uint32_t reserved2;
   uint32_t reserved3;
 } nta_work_item;
@@ -165,6 +172,7 @@ typedef struct nta_nvme_transport_options {
   uint32_t admin_timeout_ms;
   uint32_t media_policy;
   uint32_t dma_target;
+  uint32_t hbm_mapping_policy;
 } nta_nvme_transport_options;
 
 typedef struct nta_nvme_capabilities {
@@ -206,6 +214,21 @@ typedef struct nta_nvme_hbm_registration_range {
   uint64_t registration_address;
   uint64_t registration_bytes;
 } nta_nvme_hbm_registration_range;
+
+// C API v48: one entry in an all-or-nothing host-validated, stream-ordered
+// registered-HBM directory publication. Entries must name a contiguous,
+// strictly increasing slot range. The region is a setup-time mapping lease;
+// publication performs no allocation, pin, map, or per-I/O ioctl.
+typedef struct nta_registered_nvme_object {
+  uint64_t object_id;
+  uint64_t source_byte_offset;
+  uint64_t bytes;
+  nta_nvme_hbm_region *region;
+  uint64_t destination_device_address;
+  uint64_t prior_consumer_event;
+  uint32_t slot;
+  uint32_t version;
+} nta_registered_nvme_object;
 
 typedef struct nta_cxl_dax_options {
   uint32_t struct_size;
@@ -394,8 +417,14 @@ nta_status nta_runtime_register_indexed_host_objects_async_quiesced(
 nta_status nta_runtime_register_indexed_host_objects_async_bound(
     nta_runtime *runtime, uint32_t first_slot,
     const nta_indexed_host_object *objects, uint32_t object_count,
-    const nta_indexed_host_index_binding *index_binding,
-    uint64_t cuda_stream, uint64_t prior_consumer_event);
+    const nta_indexed_host_index_binding *index_binding, uint64_t cuda_stream,
+    uint64_t prior_consumer_event);
+/* Enqueue a device-memory wait for Ready-or-Failed without a host poll or an
+ * SM-resident waiter. Directory publication must already be ordered on
+ * cuda_stream. */
+nta_status nta_runtime_wait_object_range_terminal(
+    nta_runtime *runtime, uint32_t first_object_slot, uint32_t object_count,
+    uint64_t cuda_stream);
 nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
                                         uint32_t object_slot,
                                         uint32_t relative_replica,
@@ -422,6 +451,10 @@ nta_status nta_runtime_install_registered_nvme_object_async(
     uint64_t source_byte_offset, uint64_t bytes, nta_nvme_hbm_region *region,
     uint64_t destination_device_address, uint64_t cuda_stream,
     uint64_t prior_consumer_event, uint64_t *destination_device_address_out);
+nta_status nta_runtime_install_registered_nvme_objects_async(
+    nta_runtime *runtime, const nta_registered_nvme_object *objects,
+    uint32_t object_count, uint64_t cuda_stream,
+    uint64_t *destination_device_addresses_out);
 nta_status nta_runtime_read_pending_count(const nta_runtime *runtime,
                                           uint32_t *pending_count);
 nta_status nta_runtime_read_epoch_status(const nta_runtime *runtime,
@@ -491,6 +524,14 @@ uint32_t
 nta_device_work_plan_dependency_count(const nta_device_work_plan *plan);
 int32_t nta_device_work_plan_device_ordinal(const nta_device_work_plan *plan);
 
+nta_status nta_jit_operator_module_create(
+    const char *shared_object, nta_jit_operator_module **module_out);
+void nta_jit_operator_module_destroy(nta_jit_operator_module *module);
+nta_status nta_jit_operator_module_contract(
+    const nta_jit_operator_module *module, nta_operator_contract *contract_out);
+nta_status nta_jit_operator_module_plan(const nta_jit_operator_module *module,
+                                        nta_operator_plan *plan_out);
+
 nta_status nta_jit_phase_program_create(const char *shared_object,
                                         nta_jit_phase_program **program_out);
 void nta_jit_phase_program_destroy(nta_jit_phase_program *program);
@@ -507,6 +548,12 @@ nta_status nta_jit_phase_discover(const nta_jit_phase_program *program,
                                   uint64_t dependencies,
                                   uint32_t work_item_count,
                                   uint64_t cuda_stream);
+/* C API v50: validate a finite typed NVMe intent image and use its static EDF
+ * order when sound; validation falls back to the generic heap on device. */
+nta_status nta_jit_phase_discover_ordered_nvme(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint64_t work_items, uint64_t dependencies, uint32_t work_item_count,
+    uint32_t first_intent, uint32_t intent_count, uint64_t cuda_stream);
 nta_status nta_jit_phase_invalidate_cached_objects(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
@@ -530,6 +577,13 @@ nta_status
 nta_jit_phase_preload_host_pairs(const nta_jit_phase_program *program,
                                  nta_runtime *runtime, uint32_t first_object,
                                  uint32_t pair_count, uint64_t cuda_stream);
+/* C API v46: run a bounded persistent, directory-ordered paired gather.
+ * task_head is a caller-owned uint32 CUDA scalar retained through cuda_stream.
+ */
+nta_status nta_jit_phase_preload_host_pairs_ordered(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t pair_count, uint32_t worker_blocks,
+    uint64_t task_head, uint64_t cuda_stream);
 nta_status nta_jit_phase_alias_preloaded_objects(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t source_first, uint32_t destination_first, uint32_t object_count,
@@ -537,6 +591,17 @@ nta_status nta_jit_phase_alias_preloaded_objects(
 nta_status nta_jit_phase_progress_host(const nta_jit_phase_program *program,
                                        nta_runtime *runtime, uint32_t blocks,
                                        uint64_t cuda_stream);
+/* C API v44: freeze an exact device-owned runnable queue window without a
+ * device-to-host ready-count read. */
+nta_status nta_jit_phase_prepare_ready_window(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t maximum_work, uint64_t cuda_stream);
+/* C API v45: publish one stable direct/deferred work partition for a
+ * producer-event-owned proactive acquisition. */
+nta_status nta_jit_phase_prepare_event_work_partition(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint64_t work_items, uint32_t work_item_count, uint32_t direct_work_count,
+    uint64_t cuda_stream);
 nta_status nta_jit_phase_progress_indexed_host_range(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
@@ -603,6 +668,11 @@ nta_status nta_jit_phase_progress_nvme_until_idle(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t issue_budget, uint32_t completion_budget, uint64_t timeout_ns,
     uint64_t cuda_stream);
+nta_status nta_jit_phase_progress_nvme_ordered_until_range_terminal(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_intent, uint32_t intent_count, uint32_t first_object,
+    uint32_t object_count, uint32_t issue_budget, uint32_t completion_budget,
+    uint64_t timeout_ns, uint64_t cuda_stream);
 nta_status nta_jit_phase_publish(const nta_jit_phase_program *program,
                                  nta_runtime *runtime, uint32_t pending_budget,
                                  uint64_t cuda_stream);

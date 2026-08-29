@@ -34,6 +34,22 @@ public:
                 const abi::WorkItem *workItems,
                 const abi::AcquireRequirement *dependencies,
                 std::uint32_t workItemCount) const;
+  // Use the O(1)-cursor NVMe path only after device-side validation proves
+  // this finite intent image is already in EDF order. Validation falls back
+  // to the generic heap without host synchronization.
+  void discoverOrderedNvme(cudaStream_t stream, abi::RuntimeView *runtime,
+                           const abi::WorkItem *workItems,
+                           const abi::AcquireRequirement *dependencies,
+                           std::uint32_t workItemCount,
+                           std::uint32_t firstIntent,
+                           std::uint32_t intentCount) const;
+  void prepareReadyWindow(cudaStream_t stream, abi::RuntimeView *runtime,
+                          std::uint32_t maximumWork) const;
+  void prepareEventWorkPartition(cudaStream_t stream,
+                                 abi::RuntimeView *runtime,
+                                 const abi::WorkItem *workItems,
+                                 std::uint32_t workItemCount,
+                                 std::uint32_t directWorkCount) const;
   void invalidateCachedObjects(cudaStream_t stream, abi::RuntimeView *runtime,
                                std::uint32_t firstObject,
                                std::uint32_t objectCount) const;
@@ -55,6 +71,11 @@ public:
   void preloadHostPairs(cudaStream_t stream, abi::RuntimeView *runtime,
                         std::uint32_t firstObject,
                         std::uint32_t pairCount) const;
+  void preloadHostPairsOrdered(cudaStream_t stream, abi::RuntimeView *runtime,
+                               std::uint32_t firstObject,
+                               std::uint32_t pairCount,
+                               std::uint32_t workerBlocks,
+                               std::uint32_t *taskHead) const;
   void aliasPreloadedObjects(cudaStream_t stream, abi::RuntimeView *runtime,
                              std::uint32_t sourceFirst,
                              std::uint32_t destinationFirst,
@@ -116,6 +137,12 @@ public:
                              std::uint32_t issueBudget,
                              std::uint32_t completionBudget,
                              std::uint64_t timeoutNs) const;
+  void progressNvmeOrderedUntilRangeTerminal(
+      cudaStream_t stream, abi::RuntimeView *runtime,
+      std::uint32_t firstIntent, std::uint32_t intentCount,
+      std::uint32_t firstObject, std::uint32_t objectCount,
+      std::uint32_t issueBudget, std::uint32_t completionBudget,
+      std::uint64_t timeoutNs) const;
   void publish(cudaStream_t stream, abi::RuntimeView *runtime,
                std::uint32_t pendingBudget) const;
   void complete(cudaStream_t stream, abi::RuntimeView *runtime,

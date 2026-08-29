@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from math import ceil, isfinite
 from typing import Any, Iterable
 
 from .abi import u32, u64
@@ -51,8 +52,8 @@ class IndexedHostResource:
 
 
 @dataclass(frozen=True, slots=True)
-class IndexedTransferGroup:
-    """One exact transport object as a slice of a retained device index map."""
+class AcquisitionGroup:
+    """One shared transfer/readiness owner in a retained device index map."""
 
     index_offset: int
     row_count: int
@@ -71,8 +72,8 @@ class IndexedTransferGroup:
 
 
 @dataclass(frozen=True, slots=True)
-class IndexedWorkDependency:
-    """The exact rows one work item consumes within a transfer group."""
+class AcquisitionSlice:
+    """The exact rows one numerical work item consumes from a group."""
 
     group_index: int
     row_offset: int
@@ -82,9 +83,7 @@ class IndexedWorkDependency:
         object.__setattr__(
             self, "group_index", u32(self.group_index, "transfer group index")
         )
-        object.__setattr__(
-            self, "row_offset", u32(self.row_offset, "work row offset")
-        )
+        object.__setattr__(self, "row_offset", u32(self.row_offset, "work row offset"))
         object.__setattr__(
             self, "row_count", u32(self.row_count, "work row count", positive=True)
         )
@@ -95,21 +94,19 @@ class IndexedWorkDependency:
 
 
 @dataclass(frozen=True, slots=True)
-class IndexedTransferTopology:
-    """Framework-neutral exact mapping from work to indexed transfer groups.
+class AcquisitionTopology:
+    """Framework-neutral exact mapping from work to acquisition groups.
 
-    Transfer groups own readiness granularity; work dependencies retain the
-    exact numerical subset inside each group.  A group may serve many work
-    items, and a work item may require many groups. Empty work dependencies
-    are the canonical direct/resident representation.
+    Acquisition groups own transfer, readiness, and resource accounting;
+    slices retain the exact numerical subset consumed by each work item. A
+    group may fan out to many work items, and a work item may reference many
+    groups. Empty slice tuples are the canonical direct/resident form.
     """
 
     index_count: int
-    groups: tuple[IndexedTransferGroup, ...]
-    dependencies_by_work: tuple[tuple[IndexedWorkDependency, ...], ...]
-    _group_fanout: tuple[int, ...] = field(
-        init=False, repr=False, compare=False
-    )
+    groups: tuple[AcquisitionGroup, ...]
+    dependencies_by_work: tuple[tuple[AcquisitionSlice, ...], ...]
+    _group_fanout: tuple[int, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -117,9 +114,7 @@ class IndexedTransferTopology:
         )
         if not self.dependencies_by_work:
             raise ValueError("indexed transfer topology has no work")
-        ordered = sorted(
-            enumerate(self.groups), key=lambda item: item[1].index_offset
-        )
+        ordered = sorted(enumerate(self.groups), key=lambda item: item[1].index_offset)
         previous_end = 0
         for position, (_group_index, group) in enumerate(ordered):
             if group.index_end > self.index_count:
@@ -185,7 +180,9 @@ class IndexedTensorLane:
             "staging_index_limit",
         ):
             object.__setattr__(
-                self, name, u32(getattr(self, name), f"indexed lane {name}", positive=True)
+                self,
+                name,
+                u32(getattr(self, name), f"indexed lane {name}", positive=True),
             )
         if self.element_bytes > min(
             self.source_stride_bytes, self.staging_stride_bytes
@@ -249,7 +246,9 @@ class IndexedDependencyRun:
         if self.row_count <= 0 or not self.work_ids:
             raise ValueError("indexed dependency runs require rows and consumers")
         if tuple(sorted(set(self.work_ids))) != self.work_ids:
-            raise ValueError("indexed dependency run work IDs must be unique and sorted")
+            raise ValueError(
+                "indexed dependency run work IDs must be unique and sorted"
+            )
 
 
 @dataclass(frozen=True)
@@ -294,15 +293,17 @@ class IndexedMoverPlan:
 
     def __post_init__(self) -> None:
         copy_rows = sum(run.row_count for run in self.copy_runs)
-        if self.row_count <= 0 or copy_rows + len(self.sm_source_indices) != self.row_count:
+        if (
+            self.row_count <= 0
+            or copy_rows + len(self.sm_source_indices) != self.row_count
+        ):
             raise ValueError("indexed mover plan does not cover every input row")
         if len(self.sm_source_indices) != len(self.sm_destination_indices):
             raise ValueError("indexed mover SM maps disagree")
         if len(set(self.sm_destination_indices)) != len(self.sm_destination_indices):
             raise ValueError("indexed mover SM destinations overlap")
         if self.predicted_sm_ns <= 0 or (
-            self.predicted_selected_ns is not None
-            and self.predicted_selected_ns <= 0
+            self.predicted_selected_ns is not None and self.predicted_selected_ns <= 0
         ):
             raise ValueError("indexed mover predictions must be positive")
         if self.selection_reason not in {
@@ -310,7 +311,10 @@ class IndexedMoverPlan:
             "forced_copy_engine",
             "calibration_probe_sm",
             "calibration_probe_copy",
+            "uncalibrated_sm_reference",
             "uncalibrated_copy_engine",
+            "uncalibrated_transfer_scale",
+            "candidate_optimality_unproven",
             "insufficient_gain",
             "service_cost",
         }:
@@ -343,12 +347,18 @@ class IndexedMoverServiceModel:
     """Deployment-calibrated service costs for one shared host link.
 
     Copy-engine DMA and SM gathers are different issuers, but both consume the
-    same host-to-GPU link. SM gathers additionally consume execution capacity
-    needed by the numerical kernel, while copy-engine work can overlap useful
-    compute. Candidate makespan therefore serializes SM service with compute
-    and overlaps copy service with compute; a hybrid never pretends the two
-    movers are independent physical links. Missing copy-engine calibration
-    fails closed to the SM path instead of reviving a hidden byte threshold.
+    same host-to-GPU link. SM gather also consumes execution capacity needed by
+    the numerical kernel. The model therefore serializes SM and copy link
+    service, serializes SM gather and compute, and overlaps copy with compute
+    only after deployment observations calibrate that overlap. Copy CUDA-event
+    service already contains descriptor-submission starvation; scheduler issue
+    demand is a second resource bound, not an additive copy of the same time.
+
+    One instance is either an externally supplied deployment curve
+    (``calibration_scale_bucket is None``) or an online curve for exactly one
+    power-of-two total-wave bucket. Auto selection requires enough SM and copy
+    samples at that scale. Forced policies remain diagnostic arms and may use
+    uncalibrated estimates without authorizing ``auto``.
     """
 
     sm_bandwidth_bytes_per_second: int
@@ -358,6 +368,10 @@ class IndexedMoverServiceModel:
     minimum_gain: float = 1.03
     sm_samples: int = 0
     copy_samples: int = 0
+    minimum_calibration_samples: int = 3
+    calibration_scale_bucket: int | None = None
+    copy_compute_overlap_efficiency: float = 0.0
+    overlap_samples: int = 0
 
     def __post_init__(self) -> None:
         if self.sm_bandwidth_bytes_per_second <= 0:
@@ -374,16 +388,69 @@ class IndexedMoverServiceModel:
             or self.copy_operation_ns < 0
         ):
             raise ValueError("copy-engine mover calibration is invalid")
-        if self.hybrid_join_ns < 0 or self.minimum_gain < 1.0:
+        if (
+            self.hybrid_join_ns < 0
+            or not isfinite(self.minimum_gain)
+            or self.minimum_gain < 1.0
+        ):
             raise ValueError("mover join cost and minimum gain are invalid")
-        if min(self.sm_samples, self.copy_samples) < 0:
+        if min(self.sm_samples, self.copy_samples, self.overlap_samples) < 0:
             raise ValueError("mover calibration sample counts cannot be negative")
-        if self.copy_samples != 0 and not self.copy_calibrated:
+        if self.minimum_calibration_samples <= 0:
+            raise ValueError("mover minimum calibration samples must be positive")
+        if self.calibration_scale_bucket is not None and (
+            self.calibration_scale_bucket < 0
+        ):
+            raise ValueError("mover calibration scale bucket cannot be negative")
+        if self.copy_samples != 0 and not self.copy_estimate_available:
             raise ValueError("copy-engine samples require a complete calibration")
+        if not isfinite(self.copy_compute_overlap_efficiency) or not (
+            0.0 <= self.copy_compute_overlap_efficiency <= 1.0
+        ):
+            raise ValueError("copy/compute overlap efficiency must be in [0, 1]")
+
+    @property
+    def copy_estimate_available(self) -> bool:
+        return self.copy_bandwidth_bytes_per_second is not None
+
+    @property
+    def sm_calibrated(self) -> bool:
+        return self.sm_samples >= self.minimum_calibration_samples
 
     @property
     def copy_calibrated(self) -> bool:
-        return self.copy_bandwidth_bytes_per_second is not None
+        return self.copy_estimate_available and (
+            self.copy_samples >= self.minimum_calibration_samples
+        )
+
+    @property
+    def overlap_calibrated(self) -> bool:
+        return self.overlap_samples >= self.minimum_calibration_samples
+
+    @property
+    def effective_copy_compute_overlap(self) -> float:
+        return self.copy_compute_overlap_efficiency if self.overlap_calibrated else 0.0
+
+    @staticmethod
+    def _scale_bucket(transfer_bytes: int) -> int:
+        if transfer_bytes <= 0:
+            raise ValueError("mover calibration bytes must be positive")
+        return transfer_bytes.bit_length() - 1
+
+    def _observation_scale_bucket(self, transfer_bytes: int) -> int:
+        bucket = self._scale_bucket(transfer_bytes)
+        if (
+            self.calibration_scale_bucket is not None
+            and self.calibration_scale_bucket != bucket
+        ):
+            raise ValueError("one mover service model cannot mix transfer-size buckets")
+        return bucket
+
+    def supports_transfer_scale(self, transfer_bytes: int) -> bool:
+        """Return whether this curve covers one total-wave size class."""
+
+        bucket = self._scale_bucket(transfer_bytes)
+        return self.calibration_scale_bucket in {None, bucket}
 
     @staticmethod
     def _bounded_ewma(
@@ -408,6 +475,7 @@ class IndexedMoverServiceModel:
         self,
         *,
         transfer_bytes: int,
+        service_scale_bytes: int | None = None,
         elapsed_ns: int,
         alpha: float = 0.25,
         minimum_sample_bytes: int = 64 * 1024,
@@ -425,23 +493,35 @@ class IndexedMoverServiceModel:
             raise ValueError("SM mover calibration geometry must be positive")
         if transfer_bytes < minimum_sample_bytes:
             return self
+        scale_bytes = (
+            transfer_bytes if service_scale_bytes is None else service_scale_bytes
+        )
+        if scale_bytes < transfer_bytes:
+            raise ValueError("SM mover service scale is below its physical transfer")
+        bucket = self._observation_scale_bucket(scale_bytes)
         observed = max(1, transfer_bytes * 1_000_000_000 // elapsed_ns)
-        bandwidth = self._bounded_ewma(
-            self.sm_bandwidth_bytes_per_second,
-            observed,
-            alpha=alpha,
-            maximum_step_ratio=maximum_step_ratio,
+        bandwidth = (
+            observed
+            if self.sm_samples == 0
+            else self._bounded_ewma(
+                self.sm_bandwidth_bytes_per_second,
+                observed,
+                alpha=alpha,
+                maximum_step_ratio=maximum_step_ratio,
+            )
         )
         return replace(
             self,
             sm_bandwidth_bytes_per_second=bandwidth,
             sm_samples=self.sm_samples + 1,
+            calibration_scale_bucket=bucket,
         )
 
     def with_copy_observation(
         self,
         *,
         transfer_bytes: int,
+        service_scale_bytes: int | None = None,
         elapsed_ns: int,
         operation_count: int,
         issue_cpu_ns: int,
@@ -449,40 +529,46 @@ class IndexedMoverServiceModel:
         minimum_sample_bytes: int = 64 * 1024,
         maximum_step_ratio: float = 2.0,
     ) -> "IndexedMoverServiceModel":
-        """Calibrate copy-DMA byte service and per-operation issue cost.
+        """Calibrate end-to-end copy service and descriptor issue cost.
 
-        CUDA events bound the stream-visible completion interval while the CPU
-        timer measures descriptor issue.  Separating them prevents a fragmented
-        layout from looking like low link bandwidth and lets the same model
-        compare bulk, scattered, and hybrid candidates without a byte cutoff.
+        The start event executes before the host finishes submitting a batch,
+        so its stream-visible interval includes both DMA and any device-idle
+        submission gap. Subtracting the complete CPU interval is unsound when
+        descriptor issue pipelines with earlier copies: it can manufacture a
+        bandwidth above the physical link. Keep the observed end-to-end rate
+        and model scheduler-thread issue separately and conservatively.
         """
 
-        if min(
-            transfer_bytes,
-            elapsed_ns,
-            operation_count,
-            minimum_sample_bytes,
-        ) <= 0 or issue_cpu_ns < 0:
+        if (
+            min(
+                transfer_bytes,
+                elapsed_ns,
+                operation_count,
+                minimum_sample_bytes,
+            )
+            <= 0
+            or issue_cpu_ns < 0
+        ):
             raise ValueError("copy-engine calibration geometry must be positive")
         if transfer_bytes < minimum_sample_bytes:
             return self
-        transfer_ns = max(1, elapsed_ns - min(issue_cpu_ns, elapsed_ns - 1))
-        observed_bandwidth = max(
-            1, transfer_bytes * 1_000_000_000 // transfer_ns
+        scale_bytes = (
+            transfer_bytes if service_scale_bytes is None else service_scale_bytes
         )
+        if scale_bytes < transfer_bytes:
+            raise ValueError("copy-engine service scale is below its physical transfer")
+        bucket = self._observation_scale_bucket(scale_bytes)
+        observed_bandwidth = max(1, transfer_bytes * 1_000_000_000 // elapsed_ns)
         observed_operation_ns = max(0, issue_cpu_ns // operation_count)
-        if self.copy_bandwidth_bytes_per_second is None:
-            # The SM service rate is a deployment-local prior for the same
-            # physical link. It bounds a noisy first DMA observation without
-            # assuming that the two issuers have equal service.
-            bandwidth = self._bounded_ewma(
-                self.sm_bandwidth_bytes_per_second,
-                observed_bandwidth,
-                alpha=1.0,
-                maximum_step_ratio=4.0,
-            )
+        if self.copy_samples == 0:
+            # A prior is not a measurement. Once the minimum sample geometry
+            # is met, the first deployment observation establishes the curve;
+            # later samples are bounded to reject transient outliers.
+            bandwidth = observed_bandwidth
             operation_ns = observed_operation_ns
         else:
+            if not self.copy_estimate_available:
+                raise RuntimeError("copy samples exist without a service estimate")
             assert self.copy_operation_ns is not None
             bandwidth = self._bounded_ewma(
                 self.copy_bandwidth_bytes_per_second,
@@ -505,22 +591,127 @@ class IndexedMoverServiceModel:
             copy_bandwidth_bytes_per_second=bandwidth,
             copy_operation_ns=operation_ns,
             copy_samples=self.copy_samples + 1,
+            calibration_scale_bucket=bucket,
+        )
+
+    def with_copy_compute_overlap_observation(
+        self,
+        *,
+        transfer_bytes: int,
+        isolated_copy_ns: int,
+        isolated_compute_ns: int,
+        concurrent_ns: int,
+        alpha: float = 0.25,
+    ) -> "IndexedMoverServiceModel":
+        """Update overlap from isolated and concurrent deployment timings.
+
+        Efficiency is the fraction of the ideal overlap window actually saved:
+        ``(copy + compute - concurrent) / min(copy, compute)``. Zero denotes
+        serial execution and one denotes perfect overlap. A concurrent sample
+        faster than the physical ``max(copy, compute)`` lower bound is rejected;
+        contention slower than serial execution conservatively records zero.
+        """
+
+        if (
+            min(transfer_bytes, isolated_copy_ns, isolated_compute_ns, concurrent_ns)
+            <= 0
+        ):
+            raise ValueError("mover overlap observations must be positive")
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("mover overlap alpha must be in (0, 1]")
+        bucket = self._observation_scale_bucket(transfer_bytes)
+        ideal_lower_bound = max(isolated_copy_ns, isolated_compute_ns)
+        if concurrent_ns < ideal_lower_bound:
+            raise ValueError("copy/compute overlap sample violates its lower bound")
+        overlap_window = min(isolated_copy_ns, isolated_compute_ns)
+        saved_ns = max(0, isolated_copy_ns + isolated_compute_ns - concurrent_ns)
+        observed = min(1.0, saved_ns / overlap_window)
+        efficiency = (
+            observed
+            if self.overlap_samples == 0
+            else (1.0 - alpha) * self.copy_compute_overlap_efficiency + alpha * observed
+        )
+        return replace(
+            self,
+            copy_compute_overlap_efficiency=efficiency,
+            overlap_samples=self.overlap_samples + 1,
+            calibration_scale_bucket=bucket,
         )
 
     @staticmethod
-    def _transfer_ns(bytes: int, bandwidth_bytes_per_second: int) -> int:
-        if bytes <= 0 or bandwidth_bytes_per_second <= 0:
+    def _transfer_ns(transfer_bytes: int, bandwidth_bytes_per_second: int) -> int:
+        if transfer_bytes <= 0 or bandwidth_bytes_per_second <= 0:
             raise ValueError("mover service geometry must be positive")
         return max(
             1,
-            (bytes * 1_000_000_000 + bandwidth_bytes_per_second - 1)
+            (transfer_bytes * 1_000_000_000 + bandwidth_bytes_per_second - 1)
             // bandwidth_bytes_per_second,
         )
 
     def sm_only_ns(self, transfer_bytes: int) -> int:
-        return self._transfer_ns(
-            transfer_bytes, self.sm_bandwidth_bytes_per_second
+        return self._transfer_ns(transfer_bytes, self.sm_bandwidth_bytes_per_second)
+
+    def _copy_service_ns(
+        self, *, transfer_bytes: int, operation_count: int
+    ) -> int | None:
+        """Return copy completion without double charging descriptor issue.
+
+        CUDA-event elapsed time is an end-to-end copy-stream observation: when
+        host submission starves the stream, that delay is already reflected in
+        effective bandwidth. Independently measured scheduler demand can still
+        dominate a more fragmented candidate, so the two resource bounds are
+        combined with ``max`` rather than added.
+        """
+
+        if transfer_bytes <= 0 or operation_count <= 0:
+            raise ValueError("copy service geometry must be positive")
+        if not self.copy_estimate_available:
+            return None
+        assert self.copy_bandwidth_bytes_per_second is not None
+        assert self.copy_operation_ns is not None
+        transfer_ns = self._transfer_ns(
+            transfer_bytes, self.copy_bandwidth_bytes_per_second
         )
+        issue_ns = operation_count * self.copy_operation_ns
+        return max(transfer_ns, issue_ns)
+
+    def _copy_compute_ns(self, copy_ns: int, compute_ns: int) -> int:
+        if copy_ns <= 0 or compute_ns < 0:
+            raise ValueError("copy/compute service geometry is invalid")
+        if compute_ns == 0:
+            return copy_ns
+        saved_ns = int(self.effective_copy_compute_overlap * min(copy_ns, compute_ns))
+        return copy_ns + compute_ns - saved_ns
+
+    def longest_run_prefix_is_complete(self) -> bool:
+        """Return whether longest-run prefixes contain the auto optimum.
+
+        For a fixed number of runs, descriptor demand is constant. If copy byte
+        service is no slower than SM byte service, replacing more SM rows cannot
+        increase makespan, so the largest runs dominate every shorter subset.
+        With no copy/compute overlap, a slower copy can never beat SM and the SM
+        answer is also complete. The remaining case is non-monotone and a
+        bounded top-k descriptor view cannot prove global optimality.
+        """
+
+        if not self.copy_estimate_available:
+            return False
+        assert self.copy_bandwidth_bytes_per_second is not None
+        return (
+            self.copy_bandwidth_bytes_per_second >= self.sm_bandwidth_bytes_per_second
+            or self.effective_copy_compute_overlap == 0.0
+        )
+
+    def meets_selection_margin(self, reference_ns: int, candidate_ns: int) -> bool:
+        """Apply ``minimum_gain`` after optimization, in units of time.
+
+        This is a multiplicative policy safety margin, not a transfer-size
+        cutoff: it never changes candidate costs or the candidate optimum.
+        """
+
+        if min(reference_ns, candidate_ns) <= 0:
+            raise ValueError("mover selection predictions must be positive")
+        return reference_ns >= ceil(candidate_ns * self.minimum_gain)
 
     def candidate_ns(
         self,
@@ -544,28 +735,75 @@ class IndexedMoverServiceModel:
             # Conservatively treat SM gather and numerical work as sharing one
             # execution resource. This is the no-copy reference makespan, not
             # merely the mover's isolated service time.
-            return (
-                self.sm_only_ns(total_rows * row_bytes) + overlap_compute_ns
-            )
-        if not self.copy_calibrated:
+            return self.sm_only_ns(total_rows * row_bytes) + overlap_compute_ns
+        if not self.copy_estimate_available:
             return None
-        assert self.copy_bandwidth_bytes_per_second is not None
-        assert self.copy_operation_ns is not None
-        copy_ns = self._transfer_ns(
-            copy_rows * row_bytes, self.copy_bandwidth_bytes_per_second
-        ) + copy_run_count * copy_operations_per_run * self.copy_operation_ns
+        copy_service_ns = self._copy_service_ns(
+            transfer_bytes=copy_rows * row_bytes,
+            operation_count=copy_run_count * copy_operations_per_run,
+        )
+        if copy_service_ns is None:  # pragma: no cover - availability invariant
+            raise RuntimeError("copy estimate disappeared during candidate analysis")
         sm_rows = total_rows - copy_rows
         if sm_rows == 0:
-            return max(copy_ns, overlap_compute_ns)
-        # Copy DMA may cover useful compute, but the SM remainder competes for
-        # execution capacity. The additive link bound also prevents a hybrid
-        # from claiming the sum of two independently calibrated bandwidths.
+            return self._copy_compute_ns(copy_service_ns, overlap_compute_ns)
+        # SM and copy consume one host link and are therefore serialized. SM
+        # gather also serializes with numerical compute. Only the copy/compute
+        # pair may overlap, and only by its measured efficiency.
         return (
-            self._transfer_ns(
-                sm_rows * row_bytes, self.sm_bandwidth_bytes_per_second
-            )
-            + max(copy_ns, overlap_compute_ns)
+            self._transfer_ns(sm_rows * row_bytes, self.sm_bandwidth_bytes_per_second)
+            + self._copy_compute_ns(copy_service_ns, overlap_compute_ns)
             + self.hybrid_join_ns
+        )
+
+    def ideal_copy_can_qualify(
+        self,
+        *,
+        total_rows: int,
+        row_bytes: int,
+        copy_operations_per_run: int,
+        overlap_compute_ns: int = 0,
+        service_scale_bytes: int | None = None,
+    ) -> bool:
+        """Whether an optimistic one-run copy can meet the gain contract.
+
+        One contiguous run covering every row is a lower bound on copy-engine
+        service for any real layout: it has the fewest descriptors, no SM
+        remainder, and no hybrid join. If that idealized plan cannot beat the
+        SM reference by ``minimum_gain``, run decomposition cannot change the
+        decision and should stay off the scheduler hot path.
+        """
+
+        if not (
+            self.sm_calibrated
+            and self.copy_calibrated
+            and self.longest_run_prefix_is_complete()
+        ):
+            return False
+        if service_scale_bytes is not None and not self.supports_transfer_scale(
+            service_scale_bytes
+        ):
+            return False
+        predicted_sm_ns = self.candidate_ns(
+            total_rows=total_rows,
+            copy_rows=0,
+            copy_run_count=0,
+            row_bytes=row_bytes,
+            copy_operations_per_run=copy_operations_per_run,
+            overlap_compute_ns=overlap_compute_ns,
+        )
+        ideal_copy_ns = self.candidate_ns(
+            total_rows=total_rows,
+            copy_rows=total_rows,
+            copy_run_count=1,
+            row_bytes=row_bytes,
+            copy_operations_per_run=copy_operations_per_run,
+            overlap_compute_ns=overlap_compute_ns,
+        )
+        return (
+            ideal_copy_ns is not None
+            and predicted_sm_ns is not None
+            and (self.meets_selection_margin(predicted_sm_ns, ideal_copy_ns))
         )
 
 
@@ -577,28 +815,65 @@ class IndexedMoverSelection:
     reason: str
 
 
-def select_indexed_mover_runs(
-    layout: IndexedPairLayout,
+def select_indexed_mover_candidates(
     *,
+    total_rows: int,
+    total_run_count: int,
+    candidate_runs: Iterable[tuple[int, int]],
     row_bytes: int,
     copy_operations_per_run: int,
     maximum_copy_runs: int,
     service_model: IndexedMoverServiceModel,
     policy: str = "auto",
     overlap_compute_ns: int = 0,
+    service_scale_bytes: int | None = None,
 ) -> IndexedMoverSelection:
-    """Choose the exact partition minimizing resource-aware stage makespan."""
+    """Select from the longest exact runs without materializing every run.
 
-    if min(row_bytes, copy_operations_per_run, maximum_copy_runs) <= 0:
+    ``candidate_runs`` contains ``(run_index, row_count)`` pairs. For auto and
+    probe policies it must contain the longest ``maximum_copy_runs`` runs.
+    Equal per-run descriptor demand makes those prefixes complete only under
+    the service-model dominance proof checked below; otherwise auto fails
+    closed. ``service_scale_bytes`` is the physical wave geometry used to pick
+    an online curve; it is intentionally distinct from aggregate lease bytes.
+    Forced copy execution must provide the complete decomposition.
+    """
+
+    if (
+        min(
+            total_rows,
+            total_run_count,
+            row_bytes,
+            copy_operations_per_run,
+            maximum_copy_runs,
+        )
+        <= 0
+    ):
         raise ValueError("indexed mover service geometry must be positive")
     if overlap_compute_ns < 0:
         raise ValueError("indexed mover overlap compute cannot be negative")
+    if service_scale_bytes is not None and service_scale_bytes <= 0:
+        raise ValueError("indexed mover service scale must be positive")
     if policy not in {"auto", "sm", "copy_engine", "probe_copy"}:
         raise ValueError(
             "indexed mover policy must be auto, sm, copy_engine, or probe_copy"
         )
+    candidates = tuple((int(index), int(rows)) for index, rows in candidate_runs)
+    candidate_rows = sum(rows for _, rows in candidates)
+    if (
+        total_run_count > total_rows
+        or any(
+            index < 0 or index >= total_run_count or rows <= 0
+            for index, rows in candidates
+        )
+        or len({index for index, _ in candidates}) != len(candidates)
+        or candidate_rows > total_rows
+        or (len(candidates) == total_run_count and candidate_rows != total_rows)
+        or (len(candidates) < total_run_count and candidate_rows >= total_rows)
+    ):
+        raise ValueError("indexed mover candidate runs are invalid")
     predicted_sm_ns = service_model.candidate_ns(
-        total_rows=layout.row_count,
+        total_rows=total_rows,
         copy_rows=0,
         copy_run_count=0,
         row_bytes=row_bytes,
@@ -609,16 +884,29 @@ def select_indexed_mover_runs(
         raise RuntimeError("SM-only mover produced no service estimate")
     if policy == "sm":
         return IndexedMoverSelection((), predicted_sm_ns, predicted_sm_ns, "forced_sm")
+
+    ordered = tuple(
+        index
+        for index, _ in sorted(candidates, key=lambda item: (-item[1], item[0]))[
+            :maximum_copy_runs
+        ]
+    )
+    rows_by_index = dict(candidates)
     if policy == "copy_engine":
-        if len(layout.runs) > maximum_copy_runs:
+        if total_run_count > maximum_copy_runs:
             raise ValueError("copy-engine index map exceeds the operation bound")
-        selected = tuple(range(len(layout.runs)))
+        if (
+            len(candidates) != total_run_count
+            or sum(rows_by_index.values()) != total_rows
+        ):
+            raise ValueError("forced copy-engine plan requires every exact run")
+        selected = tuple(sorted(rows_by_index))
         return IndexedMoverSelection(
             selected,
             predicted_sm_ns,
             service_model.candidate_ns(
-                total_rows=layout.row_count,
-                copy_rows=layout.row_count,
+                total_rows=total_rows,
+                copy_rows=total_rows,
                 copy_run_count=len(selected),
                 row_bytes=row_bytes,
                 copy_operations_per_run=copy_operations_per_run,
@@ -627,20 +915,39 @@ def select_indexed_mover_runs(
             "forced_copy_engine",
         )
     if policy == "probe_copy":
-        # Probe the longest representable runs so the copy engine contributes
-        # a measurable byte interval while every omitted row remains on the SM
-        # mover. Per-engine CUDA events make the hybrid observation separable.
-        ordered = sorted(
-            range(len(layout.runs)),
-            key=lambda index: (-layout.runs[index].row_count, index),
-        )[:maximum_copy_runs]
-        if not ordered:  # pragma: no cover - non-empty layout invariant
+        if not ordered:
             raise RuntimeError("copy-engine calibration has no candidate run")
+        required_candidates = min(total_run_count, maximum_copy_runs)
+        if len(candidates) < required_candidates:
+            raise ValueError(
+                "indexed mover selection is missing longest-run candidates"
+            )
+        probe_rows = sum(rows_by_index[index] for index in ordered)
         return IndexedMoverSelection(
             tuple(sorted(ordered)),
             predicted_sm_ns,
-            predicted_sm_ns,
+            service_model.candidate_ns(
+                total_rows=total_rows,
+                copy_rows=probe_rows,
+                copy_run_count=len(ordered),
+                row_bytes=row_bytes,
+                copy_operations_per_run=copy_operations_per_run,
+                overlap_compute_ns=overlap_compute_ns,
+            ),
             "calibration_probe_copy",
+        )
+    required_candidates = min(total_run_count, maximum_copy_runs)
+    if len(candidates) < required_candidates:
+        raise ValueError("indexed mover selection is missing longest-run candidates")
+    if not service_model.sm_calibrated:
+        return IndexedMoverSelection(
+            (), predicted_sm_ns, predicted_sm_ns, "uncalibrated_sm_reference"
+        )
+    if service_scale_bytes is not None and not service_model.supports_transfer_scale(
+        service_scale_bytes
+    ):
+        return IndexedMoverSelection(
+            (), predicted_sm_ns, predicted_sm_ns, "uncalibrated_transfer_scale"
         )
     if not service_model.copy_calibrated:
         return IndexedMoverSelection(
@@ -649,40 +956,72 @@ def select_indexed_mover_runs(
             predicted_sm_ns,
             "uncalibrated_copy_engine",
         )
+    if not service_model.longest_run_prefix_is_complete():
+        return IndexedMoverSelection(
+            (),
+            predicted_sm_ns,
+            predicted_sm_ns,
+            "candidate_optimality_unproven",
+        )
 
-    ordered = sorted(
-        range(len(layout.runs)),
-        key=lambda index: (-layout.runs[index].row_count, index),
-    )[:maximum_copy_runs]
     selected_rows = 0
+    prefix_indices: tuple[int, ...] = ()
     best_indices: tuple[int, ...] = ()
     best_ns = predicted_sm_ns
     for run_index in ordered:
-        selected_rows += layout.runs[run_index].row_count
-        candidate_indices = (*best_indices, run_index)
+        selected_rows += rows_by_index[run_index]
+        prefix_indices = (*prefix_indices, run_index)
         candidate_ns = service_model.candidate_ns(
-            total_rows=layout.row_count,
+            total_rows=total_rows,
             copy_rows=selected_rows,
-            copy_run_count=len(candidate_indices),
+            copy_run_count=len(prefix_indices),
             row_bytes=row_bytes,
             copy_operations_per_run=copy_operations_per_run,
             overlap_compute_ns=overlap_compute_ns,
         )
         if candidate_ns is None:  # pragma: no cover - calibrated invariant
             raise RuntimeError("calibrated mover produced no service estimate")
-        # For the additive model, runs are ordered by non-increasing byte
-        # benefit and every run has the same operation cost. Once a prefix no
-        # longer improves the objective, no shorter remaining run can do so.
-        if candidate_ns >= best_ns:
-            break
-        best_indices = candidate_indices
-        best_ns = candidate_ns
-    if not best_indices or predicted_sm_ns < best_ns * service_model.minimum_gain:
+        # A fixed hybrid join can make the first run lose even when a longer
+        # prefix amortizes it, so every bounded prefix must be evaluated.
+        if candidate_ns < best_ns:
+            best_indices = prefix_indices
+            best_ns = candidate_ns
+    if not best_indices or not service_model.meets_selection_margin(
+        predicted_sm_ns, best_ns
+    ):
         return IndexedMoverSelection(
             (), predicted_sm_ns, predicted_sm_ns, "insufficient_gain"
         )
     return IndexedMoverSelection(
         tuple(sorted(best_indices)), predicted_sm_ns, best_ns, "service_cost"
+    )
+
+
+def select_indexed_mover_runs(
+    layout: IndexedPairLayout,
+    *,
+    row_bytes: int,
+    copy_operations_per_run: int,
+    maximum_copy_runs: int,
+    service_model: IndexedMoverServiceModel,
+    policy: str = "auto",
+    overlap_compute_ns: int = 0,
+    service_scale_bytes: int | None = None,
+) -> IndexedMoverSelection:
+    """Choose the exact partition minimizing resource-aware stage makespan."""
+    return select_indexed_mover_candidates(
+        total_rows=layout.row_count,
+        total_run_count=len(layout.runs),
+        candidate_runs=tuple(
+            (index, run.row_count) for index, run in enumerate(layout.runs)
+        ),
+        row_bytes=row_bytes,
+        copy_operations_per_run=copy_operations_per_run,
+        maximum_copy_runs=maximum_copy_runs,
+        service_model=service_model,
+        policy=policy,
+        overlap_compute_ns=overlap_compute_ns,
+        service_scale_bytes=service_scale_bytes,
     )
 
 
@@ -783,7 +1122,10 @@ def plan_indexed_dependencies(
     optimization from making one work item wait for unrelated bytes.
     """
 
-    rows = tuple(tuple((int(source), int(destination)) for source, destination in pairs) for pairs in work_pairs)
+    rows = tuple(
+        tuple((int(source), int(destination)) for source, destination in pairs)
+        for pairs in work_pairs
+    )
     consumers_by_destination: dict[int, set[int]] = {}
     source_by_destination: dict[int, int] = {}
     for work_id, pairs in enumerate(rows):
@@ -857,6 +1199,7 @@ def plan_indexed_mover(
     service_model: IndexedMoverServiceModel,
     policy: str = "auto",
     overlap_compute_ns: int = 0,
+    service_scale_bytes: int | None = None,
 ) -> IndexedMoverPlan:
     """Partition one exact map without changing row or destination ownership."""
 
@@ -871,6 +1214,7 @@ def plan_indexed_mover(
         service_model=service_model,
         policy=policy,
         overlap_compute_ns=overlap_compute_ns,
+        service_scale_bytes=service_scale_bytes,
     )
     selected_indices = set(selection.selected_run_indices)
 

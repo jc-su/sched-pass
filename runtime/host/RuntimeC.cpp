@@ -3,6 +3,7 @@
 #include "nta/CxlRuntime.h"
 #include "nta/DeviceWorkPlan.h"
 #include "nta/HostRuntime.h"
+#include "nta/JitOperator.h"
 #include "nta/JitPhase.h"
 #include "nta/NvmeRuntime.h"
 #include "nta/WorkPlan.h"
@@ -43,6 +44,10 @@ struct nta_device_work_plan {
   std::unique_ptr<nta::DeviceWorkPlan> value;
 };
 
+struct nta_jit_operator_module {
+  std::unique_ptr<nta::JitOperatorModule> value;
+};
+
 struct nta_jit_phase_program {
   std::unique_ptr<nta::JitPhaseProgram> value;
 };
@@ -52,6 +57,8 @@ namespace {
 static_assert(sizeof(nta_work_item) == sizeof(nta::abi::WorkItem));
 static_assert(offsetof(nta_work_item, estimated_compute_ns) ==
               offsetof(nta::abi::WorkItem, estimatedComputeNs));
+static_assert(offsetof(nta_work_item, ready_deadline_offset_ns) ==
+              offsetof(nta::abi::WorkItem, readyDeadlineOffsetNs));
 static_assert(sizeof(nta_request_progress) ==
               sizeof(nta::abi::RequestProgress));
 static_assert(offsetof(nta_request_progress, dropped_attributions) ==
@@ -68,6 +75,11 @@ static_assert(sizeof(nta_request_spec) == 40);
 static_assert(sizeof(nta_contiguous_copy_run) == 16);
 static_assert(sizeof(nta_strided_copy_group) == 40);
 static_assert(sizeof(nta_nvme_hbm_registration_range) == 32);
+static_assert(sizeof(nta_registered_nvme_object) == 56);
+static_assert(offsetof(nta_registered_nvme_object, region) == 24);
+static_assert(offsetof(nta_registered_nvme_object,
+                       destination_device_address) == 32);
+static_assert(offsetof(nta_registered_nvme_object, slot) == 48);
 static_assert(offsetof(nta_request_spec, request_id) == 0);
 static_assert(offsetof(nta_request_spec, deadline_clock) == 8);
 static_assert(offsetof(nta_request_spec, max_outstanding_bytes) == 16);
@@ -207,10 +219,10 @@ indexedHostObjects(const nta_indexed_host_object *objects,
             static_cast<std::uintptr_t>(object.source_device_address)),
         reinterpret_cast<void *>(
             static_cast<std::uintptr_t>(object.staging_device_address)),
-        reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
-            object.source_indices_device_address)),
-        reinterpret_cast<const std::uint32_t *>(static_cast<std::uintptr_t>(
-            object.staging_indices_device_address)),
+        reinterpret_cast<const std::uint32_t *>(
+            static_cast<std::uintptr_t>(object.source_indices_device_address)),
+        reinterpret_cast<const std::uint32_t *>(
+            static_cast<std::uintptr_t>(object.staging_indices_device_address)),
         object.index_count,
         object.element_bytes,
         object.source_stride_bytes,
@@ -227,6 +239,48 @@ void checkCuda(cudaError_t status, const char *operation) {
     throw std::runtime_error(std::string(operation) + ": " +
                              cudaGetErrorString(status));
   }
+}
+
+nta_operator_contract
+operatorContract(const nta::operator_contract::Contract &contract) {
+  return {
+      contract.magic,
+      contract.schemaVersion,
+      contract.structBytes,
+      contract.runtimeAbiVersion,
+      contract.family,
+      contract.form,
+      contract.reserved,
+      contract.capabilities,
+      contract.sourceFingerprintLow,
+      contract.sourceFingerprintHigh,
+      contract.instrumentationFlags,
+      contract.identityBinding,
+      contract.demandBinding,
+      contract.accessProof,
+      contract.granularityBytes,
+      contract.tierMask,
+  };
+}
+
+nta_operator_plan operatorPlan(const nta::operator_contract::Plan &plan) {
+  return {
+      plan.magic,
+      plan.schemaVersion,
+      plan.structBytes,
+      plan.runtimeAbiVersion,
+      plan.family,
+      plan.supportedForms,
+      plan.coordinateMap,
+      plan.partialState,
+      plan.reduction,
+      plan.flags,
+      plan.reserved,
+      plan.sourceFingerprintLow,
+      plan.sourceFingerprintHigh,
+      plan.planFingerprintLow,
+      plan.planFingerprintHigh,
+  };
 }
 
 nta::WorkPlan makeWorkPlan(const nta_work_item *workItems,
@@ -247,8 +301,7 @@ nta::WorkPlan makeWorkPlan(const nta_work_item *workItems,
   result.requests.reserve(requestCount);
   for (std::uint32_t index = 0; index < workItemCount; ++index) {
     const nta_work_item &source = workItems[index];
-    if (source.reserved0 != 0 || source.reserved1 != 0 ||
-        source.reserved2 != 0 || source.reserved3 != 0) {
+    if (source.reserved2 != 0 || source.reserved3 != 0) {
       throw std::invalid_argument("work-item reserved fields must be zero");
     }
     result.workItems.push_back(
@@ -256,7 +309,8 @@ nta::WorkPlan makeWorkPlan(const nta_work_item *workItems,
          source.logical_work, source.dependency_begin, source.dependency_count,
          source.direct_dependency_count, source.work_ticket,
          source.reduction_group, source.contributor_index,
-         source.contributor_count, source.estimated_compute_ns, 0, 0, 0, 0});
+         source.contributor_count, source.estimated_compute_ns,
+         source.ready_deadline_offset_ns, 0, 0});
   }
   for (std::uint32_t index = 0; index < dependencyCount; ++index) {
     const nta_acquire_requirement &source = dependencies[index];
@@ -325,6 +379,19 @@ nta_status nta_nvme_transport_create(const nta_nvme_transport_options *options,
       break;
     default:
       throw std::invalid_argument("NVMe DMA target is invalid");
+    }
+    switch (options->hbm_mapping_policy) {
+    case NTA_NVME_HBM_MAPPING_AUTO:
+      native.hbmMappingPolicy = nta::NvmeHbmMappingPolicy::Auto;
+      break;
+    case NTA_NVME_HBM_MAPPING_REQUIRE_NVIDIA_PEER_PAGES:
+      native.hbmMappingPolicy = nta::NvmeHbmMappingPolicy::NvidiaPeerPages;
+      break;
+    case NTA_NVME_HBM_MAPPING_REQUIRE_CUDA_DMA_BUF_IOAS:
+      native.hbmMappingPolicy = nta::NvmeHbmMappingPolicy::CudaDmaBufIoas;
+      break;
+    default:
+      throw std::invalid_argument("NVMe HBM mapping policy is invalid");
     }
     auto handle = std::make_unique<nta_nvme_transport>();
     handle->value = std::make_shared<nta::NvmeTransport>(std::move(native));
@@ -897,6 +964,80 @@ nta_status nta_runtime_install_registered_nvme_object_async(
   });
 }
 
+nta_status nta_runtime_install_registered_nvme_objects_async(
+    nta_runtime *runtime, const nta_registered_nvme_object *objects,
+    std::uint32_t objectCount, std::uint64_t cudaStream,
+    std::uint64_t *destinationDeviceAddressesOut) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    if (runtime->nvme == nullptr) {
+      throw std::invalid_argument(
+          "runtime was not created with an NVMe transport");
+    }
+    if (objects == nullptr || objectCount == 0 || cudaStream == 0) {
+      throw std::invalid_argument(
+          "registered NVMe batch requires objects and a CUDA stream");
+    }
+
+    // Validate every opaque resource and scalar field before deriving the
+    // first mapping view. A rejected descriptor therefore cannot leave a
+    // partially published runtime directory.
+    const std::uint32_t firstSlot = objects[0].slot;
+    for (std::uint32_t index = 0; index < objectCount; ++index) {
+      const nta_registered_nvme_object &object = objects[index];
+      requireHandle(object.region, "NVMe HBM region");
+      if (object.slot != firstSlot + index) {
+        throw std::invalid_argument(
+            "registered NVMe batch slots must be contiguous and increasing");
+      }
+      if (object.destination_device_address == 0) {
+        throw std::invalid_argument("registered NVMe destination is null");
+      }
+      if (runtime->nvme != object.region->transport) {
+        throw std::invalid_argument(
+            "NVMe HBM region belongs to a different transport");
+      }
+      (void)checkedSize(object.bytes, "NVMe object bytes");
+    }
+
+    std::vector<nta::NvmeObjectInstallSpec> native;
+    native.reserve(objectCount);
+    for (std::uint32_t index = 0; index < objectCount; ++index) {
+      const nta_registered_nvme_object &object = objects[index];
+      const std::size_t nativeBytes =
+          checkedSize(object.bytes, "NVMe object bytes");
+      auto destination = object.region->value->view(
+          reinterpret_cast<void *>(static_cast<std::uintptr_t>(
+              object.destination_device_address)),
+          nativeBytes);
+      native.push_back({
+          object.slot,
+          object.object_id,
+          object.version,
+          object.source_byte_offset,
+          nativeBytes,
+          event(object.prior_consumer_event),
+          std::move(destination),
+      });
+    }
+
+    std::vector<nta::ObjectHandle> installed =
+        runtime->value->installNvmeObjectsAsync(std::move(native),
+                                                stream(cudaStream));
+    if (installed.size() != objectCount) {
+      throw std::logic_error(
+          "registered NVMe batch returned incomplete installation results");
+    }
+    if (destinationDeviceAddressesOut != nullptr) {
+      for (std::uint32_t index = 0; index < objectCount; ++index) {
+        destinationDeviceAddressesOut[index] =
+            reinterpret_cast<std::uintptr_t>(
+                installed[index].directDeviceBase);
+      }
+    }
+  });
+}
+
 nta_status nta_runtime_read_pending_count(const nta_runtime *runtime,
                                           std::uint32_t *pendingCount) {
   return protect([&] {
@@ -1056,6 +1197,16 @@ std::int32_t nta_runtime_device_ordinal(const nta_runtime *runtime) {
   return runtime == nullptr || runtime->value == nullptr
              ? NTA_RUNTIME_USE_CURRENT_DEVICE
              : runtime->value->deviceOrdinal();
+}
+
+nta_status nta_runtime_wait_object_range_terminal(
+    nta_runtime *runtime, std::uint32_t firstObjectSlot,
+    std::uint32_t objectCount, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(runtime, "runtime");
+    runtime->value->waitObjectRangeTerminal(firstObjectSlot, objectCount,
+                                             stream(cudaStream));
+  });
 }
 
 nta_status nta_device_pointer_dlpack(std::uint64_t deviceAddress,
@@ -1425,6 +1576,49 @@ nta_device_work_plan_device_ordinal(const nta_device_work_plan *plan) {
              : plan->value->deviceOrdinal();
 }
 
+nta_status nta_jit_operator_module_create(
+    const char *sharedObject, nta_jit_operator_module **moduleOut) {
+  if (moduleOut != nullptr) {
+    *moduleOut = nullptr;
+  }
+  return protect([&] {
+    if (sharedObject == nullptr || sharedObject[0] == '\0' ||
+        moduleOut == nullptr) {
+      throw std::invalid_argument(
+          "JIT operator creation needs a shared object and output handle");
+    }
+    auto handle = std::make_unique<nta_jit_operator_module>();
+    handle->value = std::make_unique<nta::JitOperatorModule>(sharedObject);
+    *moduleOut = handle.release();
+  });
+}
+
+void nta_jit_operator_module_destroy(nta_jit_operator_module *module) {
+  delete module;
+}
+
+nta_status nta_jit_operator_module_contract(
+    const nta_jit_operator_module *module, nta_operator_contract *contractOut) {
+  return protect([&] {
+    requireHandle(module, "JIT operator module");
+    if (contractOut == nullptr) {
+      throw std::invalid_argument("JIT operator contract output is null");
+    }
+    *contractOut = operatorContract(module->value->operatorContract());
+  });
+}
+
+nta_status nta_jit_operator_module_plan(const nta_jit_operator_module *module,
+                                        nta_operator_plan *planOut) {
+  return protect([&] {
+    requireHandle(module, "JIT operator module");
+    if (planOut == nullptr) {
+      throw std::invalid_argument("JIT operator plan output is null");
+    }
+    *planOut = operatorPlan(module->value->operatorPlan());
+  });
+}
+
 nta_status nta_jit_phase_program_create(const char *sharedObject,
                                         nta_jit_phase_program **programOut) {
   if (programOut != nullptr) {
@@ -1453,26 +1647,7 @@ nta_status nta_jit_phase_operator_contract(const nta_jit_phase_program *program,
     if (contractOut == nullptr) {
       throw std::invalid_argument("JIT operator contract output is null");
     }
-    const nta::operator_contract::Contract &contract =
-        program->value->operatorContract();
-    *contractOut = {
-        contract.magic,
-        contract.schemaVersion,
-        contract.structBytes,
-        contract.runtimeAbiVersion,
-        contract.family,
-        contract.form,
-        contract.reserved,
-        contract.capabilities,
-        contract.sourceFingerprintLow,
-        contract.sourceFingerprintHigh,
-        contract.instrumentationFlags,
-        contract.identityBinding,
-        contract.demandBinding,
-        contract.accessProof,
-        contract.granularityBytes,
-        contract.tierMask,
-    };
+    *contractOut = operatorContract(program->value->operatorContract());
   });
 }
 
@@ -1483,24 +1658,7 @@ nta_status nta_jit_phase_operator_plan(const nta_jit_phase_program *program,
     if (planOut == nullptr) {
       throw std::invalid_argument("JIT operator plan output is null");
     }
-    const nta::operator_contract::Plan &plan = program->value->operatorPlan();
-    *planOut = {
-        plan.magic,
-        plan.schemaVersion,
-        plan.structBytes,
-        plan.runtimeAbiVersion,
-        plan.family,
-        plan.supportedForms,
-        plan.coordinateMap,
-        plan.partialState,
-        plan.reduction,
-        plan.flags,
-        plan.reserved,
-        plan.sourceFingerprintLow,
-        plan.sourceFingerprintHigh,
-        plan.planFingerprintLow,
-        plan.planFingerprintHigh,
-    };
+    *planOut = operatorPlan(program->value->operatorPlan());
   });
 }
 
@@ -1529,6 +1687,22 @@ nta_status nta_jit_phase_discover(const nta_jit_phase_program *program,
         reinterpret_cast<const nta::abi::WorkItem *>(workItems),
         reinterpret_cast<const nta::abi::AcquireRequirement *>(dependencies),
         workItemCount);
+  });
+}
+
+nta_status nta_jit_phase_discover_ordered_nvme(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint64_t workItems, std::uint64_t dependencies,
+    std::uint32_t workItemCount, std::uint32_t firstIntent,
+    std::uint32_t intentCount, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->discoverOrderedNvme(
+        stream(cudaStream), runtime->value->deviceView(),
+        reinterpret_cast<const nta::abi::WorkItem *>(workItems),
+        reinterpret_cast<const nta::abi::AcquireRequirement *>(dependencies),
+        workItemCount, firstIntent, intentCount);
   });
 }
 
@@ -1564,8 +1738,8 @@ nta_status nta_jit_phase_warmup_indexed_host_validation(
   return protect([&] {
     requireHandle(program, "JIT phase program");
     requireHandle(runtime, "runtime");
-    program->value->warmupIndexedHostValidation(
-        stream(cudaStream), runtime->value->deviceView());
+    program->value->warmupIndexedHostValidation(stream(cudaStream),
+                                                runtime->value->deviceView());
   });
 }
 
@@ -1610,6 +1784,22 @@ nta_status nta_jit_phase_preload_host_pairs(
   });
 }
 
+nta_status nta_jit_phase_preload_host_pairs_ordered(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t pairCount,
+    std::uint32_t workerBlocks, std::uint64_t taskHead,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->preloadHostPairsOrdered(
+        stream(cudaStream), runtime->value->deviceView(), firstObject,
+        pairCount, workerBlocks,
+        reinterpret_cast<std::uint32_t *>(
+            static_cast<std::uintptr_t>(taskHead)));
+  });
+}
+
 nta_status nta_jit_phase_alias_preloaded_objects(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     std::uint32_t sourceFirst, std::uint32_t destinationFirst,
@@ -1633,6 +1823,31 @@ nta_status nta_jit_phase_progress_host(const nta_jit_phase_program *program,
     requireHandle(runtime, "runtime");
     program->value->progressHost(stream(cudaStream),
                                  runtime->value->deviceView(), blocks);
+  });
+}
+
+nta_status nta_jit_phase_prepare_ready_window(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t maximumWork, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->prepareReadyWindow(
+        stream(cudaStream), runtime->value->deviceView(), maximumWork);
+  });
+}
+
+nta_status nta_jit_phase_prepare_event_work_partition(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint64_t workItems, std::uint32_t workItemCount,
+    std::uint32_t directWorkCount, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->prepareEventWorkPartition(
+        stream(cudaStream), runtime->value->deviceView(),
+        reinterpret_cast<const nta::abi::WorkItem *>(workItems), workItemCount,
+        directWorkCount);
   });
 }
 
@@ -1799,6 +2014,22 @@ nta_status nta_jit_phase_progress_nvme_until_idle(
     program->value->progressNvmeUntilIdle(
         stream(cudaStream), runtime->value->deviceView(), issueBudget,
         completionBudget, timeoutNs);
+  });
+}
+
+nta_status nta_jit_phase_progress_nvme_ordered_until_range_terminal(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstIntent, std::uint32_t intentCount,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint32_t issueBudget, std::uint32_t completionBudget,
+    std::uint64_t timeoutNs, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->progressNvmeOrderedUntilRangeTerminal(
+        stream(cudaStream), runtime->value->deviceView(), firstIntent,
+        intentCount, firstObject, objectCount, issueBudget, completionBudget,
+        timeoutNs);
   });
 }
 

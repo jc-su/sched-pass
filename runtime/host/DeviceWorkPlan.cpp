@@ -75,8 +75,7 @@ void validate(const WorkPlan &plan) {
         work.directDependencyCount > work.dependencyCount ||
         work.dependencyBegin > dependencyCount ||
         work.dependencyCount > dependencyCount - work.dependencyBegin ||
-        work.reserved0 != 0 || work.reserved1 != 0 || work.reserved2 != 0 ||
-        work.reserved3 != 0) {
+        work.reserved2 != 0 || work.reserved3 != 0) {
       throw std::invalid_argument("work plan contains an invalid work item");
     }
     std::uint32_t directCount = 0;

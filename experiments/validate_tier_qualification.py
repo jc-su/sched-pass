@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 
@@ -48,6 +49,31 @@ def _read_report(path: Path) -> dict[str, Any]:
 
 def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _validate_physical_identity(report: dict[str, Any], tier: str) -> None:
+    identity = report.get("platform_identity")
+    _require(isinstance(identity, dict), f"{tier} report has no platform identity")
+    _require(
+        isinstance(identity.get("boot_id"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            identity["boot_id"],
+        )
+        is not None,
+        f"{tier} report has no valid boot identity",
+    )
+    _require(
+        isinstance(identity.get("kernel"), str) and bool(identity["kernel"]),
+        f"{tier} report has no kernel identity",
+    )
+    drivers = identity.get("nvidia_driver_versions")
+    _require(
+        isinstance(drivers, list)
+        and bool(drivers)
+        and all(isinstance(value, str) and value for value in drivers),
+        f"{tier} report has no NVIDIA driver identity",
+    )
 
 
 def _validate_native(report: dict[str, Any], tier: str) -> None:
@@ -117,6 +143,18 @@ def _validate_entry(entry: dict[str, Any], tier: str) -> None:
         classification == "nta-vfio-nvme-qualification",
         "NVMe report is not the VFIO qualification report",
     )
+    _validate_physical_identity(report, tier)
+    _require(
+        isinstance(report.get("revision"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", report["revision"]) is not None,
+        "NVMe report has no immutable git revision",
+    )
+    _require(report.get("dirty") is False, "NVMe report was produced from dirty code")
+    if "provenance_ready" in report:
+        _require(
+            report.get("provenance_ready") is True,
+            "NVMe qualification provenance is not ready",
+        )
     _require(
         report.get("demand_semantics") == "exact", "NVMe report is not exact-demand"
     )
@@ -127,6 +165,17 @@ def _validate_entry(entry: dict[str, Any], tier: str) -> None:
     )
     gpu = report.get("gpu_controlled")
     _require(isinstance(gpu, dict), "NVMe report has no GPU-controlled result")
+    runtime_abi = report.get("runtime_abi")
+    _require(
+        isinstance(runtime_abi, int)
+        and runtime_abi > 0
+        and gpu.get("runtime_abi") == runtime_abi,
+        "NVMe report does not match its runtime ABI",
+    )
+    _require(
+        gpu.get("revision") == report.get("revision"),
+        "NVMe GPU result does not match its qualification revision",
+    )
     for field in (
         "verified",
         "selected_data_path_verified",
@@ -140,8 +189,27 @@ def _validate_entry(entry: dict[str, Any], tier: str) -> None:
         "NVMe qualification is not the direct-HBM data path",
     )
     _require(
-        gpu.get("hbm_mapping_backend") == "nvidia-peer-pages",
-        "NVMe report does not prove the peer-page mapping backend",
+        gpu.get("hbm_mapping_backend") in {"cuda-dmabuf-ioas", "nvidia-peer-pages"},
+        "NVMe report does not prove a direct-HBM mapping backend",
+    )
+    required_backend = report.get("required_hbm_backend")
+    selected_backend = report.get("selected_hbm_backend")
+    _require(
+        required_backend in {"auto", "cuda-dmabuf-ioas", "nvidia-peer-pages"},
+        "NVMe report has no valid native HBM mapping requirement",
+    )
+    _require(
+        report.get("reported_hbm_mapping_policy") == required_backend
+        and gpu.get("hbm_mapping_policy") == required_backend,
+        "NVMe report does not prove its HBM policy was enforced natively",
+    )
+    _require(
+        selected_backend == gpu.get("hbm_mapping_backend"),
+        "NVMe report contradicts its selected HBM mapping backend",
+    )
+    _require(
+        required_backend == "auto" or selected_backend == required_backend,
+        "NVMe selected backend does not satisfy its explicit mapping policy",
     )
     _require(
         report.get("iommu_fault_free") is True,
@@ -170,6 +238,10 @@ def _validate_entry(entry: dict[str, Any], tier: str) -> None:
             report["performance_qualified"] == (float(ratio) >= float(threshold)),
             "NVMe performance qualification contradicts its matched ratio",
         )
+    _require(
+        report.get("performance_qualified") is True,
+        "NVMe qualification does not meet its performance threshold",
+    )
 
 
 def validate(

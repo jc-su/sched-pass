@@ -55,11 +55,13 @@ directory, `payload_owner` owns the bytes in the selected tier, and
 `transfer_destination_owner` owns a temporary or device destination when the
 path materializes one. A `None` destination means the resource is consumed
 directly. This avoids treating a set of permitted allocators as the owner of
-one actual transfer: host-staged payload is engine-owned and its bounded HBM
-destination is runtime-owned, while NVMe media and its direct-HBM destination
-are transport-owned and CXL-DAX is consumed directly from transport-owned
-mapped storage. NVMe and CXL-DAX steady-state paths never include a host proxy
-or a per-request control ioctl.
+one actual transfer: host-staged payload and its bounded HBM destination are
+engine-owned; NVMe media and its IOMMU mapping are transport-owned while its
+DMA destination is engine-owned HBM; and native CXL-DAX consumers dereference
+transport-owned mapped storage directly. NVMe and native CXL-DAX steady-state
+paths never include a host proxy or a per-request control ioctl. Framework
+adapters reject direct CXL until their numerical page tables can name that
+mapped address; native resource support is not mislabeled as serving support.
 
 ## 3. Execution flow
 
