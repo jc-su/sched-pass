@@ -74,6 +74,7 @@ from nta_runtime.engines.vllm_modules import (
     _prepare_attention_modules,
 )
 from nta_runtime.engines.vllm_worker import (
+    AttentionWorkspaceContract,
     VllmV1WorkerController,
     _PhysicalLayerDestination,
     _abort_forward,
@@ -259,7 +260,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         kind: str,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
-        workspace_bytes: int,
+        workspace: torch.Tensor,
     ) -> Any:
         if isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype not in {
             "auto",
@@ -270,7 +271,6 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 "native vLLM direct attention does not support quantized KV "
                 f"cache dtype {self.kv_cache_dtype!r}"
             )
-        workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=query.device)
         return _new_request_bound_wrapper(
             kind,
             workspace,
@@ -278,6 +278,35 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             kv_dtype=kv_cache.dtype,
             head_size=self.head_size,
             workspace_base=self._nta_config.require_workspace(),
+        )
+
+    @staticmethod
+    def _framework_workspace(
+        stock_wrapper: Any,
+        query: torch.Tensor,
+        required_bytes: int,
+    ) -> tuple[torch.Tensor, AttentionWorkspaceContract]:
+        """Borrow the framework's worker-lifetime FlashInfer workspace."""
+        workspace = getattr(stock_wrapper, "_float_workspace_buffer", None)
+        if not isinstance(workspace, torch.Tensor):
+            raise RuntimeError("vLLM stock wrapper has no FlashInfer workspace")
+        if (
+            workspace.dtype != torch.uint8
+            or not workspace.is_cuda
+            or not workspace.is_contiguous()
+            or workspace.device != query.device
+        ):
+            raise RuntimeError(
+                "vLLM stock wrapper workspace is not contiguous uint8 CUDA storage"
+            )
+        capacity = workspace.numel() * workspace.element_size()
+        if capacity < required_bytes:
+            raise RuntimeError(
+                "vLLM stock wrapper workspace is smaller than the NTA contract: "
+                f"{capacity} < {required_bytes}"
+            )
+        return workspace, AttentionWorkspaceContract.framework_owned(
+            capacity, workspace.data_ptr()
         )
 
     def _request_bound_ready(self, state: Any, owner: Any) -> bool:
@@ -1164,9 +1193,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 kv_cache,
                 int(state.page_size),
             )
-            return VllmSchedulePublication(
-                plan, object_count, has_external_transfer
-            )
+            return VllmSchedulePublication(plan, object_count, has_external_transfer)
         return VllmSchedulePublication(
             self._upload_plan(context.topology, schedule, state.hook.runtime),
             0,
@@ -1393,6 +1420,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         batch: EngineBatch,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
+        stock_wrapper: Any,
         page_size: int,
         causal: bool,
         plan: Callable[[Any], None],
@@ -1410,15 +1438,31 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             causal=causal,
             workspace_bytes=workspace_bytes,
         )
+        if self._nta_config.compare_stock:
+            workspace = None
+            workspace_contract = AttentionWorkspaceContract.worker_owned(
+                workspace_bytes
+            )
+        else:
+            workspace, workspace_contract = self._framework_workspace(
+                stock_wrapper, query, workspace_bytes
+            )
+
+        def build_wrapper() -> Any:
+            phase_workspace = workspace
+            if phase_workspace is None:
+                phase_workspace = torch.empty(
+                    workspace_bytes, dtype=torch.uint8, device=query.device
+                )
+            return self._request_bound_wrapper(kind, query, kv_cache, phase_workspace)
+
         wrapper, _ = owner.attention_phase(
             "request_bound",
             key,
             batch.epoch,
-            lambda: self._request_bound_wrapper(
-                kind, query, kv_cache, workspace_bytes
-            ),
+            build_wrapper,
             plan,
-            workspace_bytes=workspace_bytes,
+            workspace=workspace_contract,
         )
         return wrapper
 
@@ -1454,7 +1498,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                     kind, query, kv_cache, module_name, workspace_bytes
                 ),
                 plan,
-                workspace_bytes=workspace_bytes,
+                workspace=AttentionWorkspaceContract.worker_owned(workspace_bytes),
             )
             self._nta_program = wrapper._nta_transport_program
             return wrapper, schedule
@@ -1577,9 +1621,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 framework_owned=True,
                 phase_start=attn_metadata.num_decodes,
             )
-        buffers = require_prefill_buffers(
-            stock_wrapper, attn_metadata.num_prefills
-        )
+        buffers = require_prefill_buffers(stock_wrapper, attn_metadata.num_prefills)
         page_size = int(getattr(state, "page_size", 0) or 0)
         if page_size <= 0:
             raise RuntimeError("vLLM forward sidecar has no token page size")
@@ -1591,6 +1633,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 batch=prefill_batch,
                 query=query,
                 kv_cache=kv_cache,
+                stock_wrapper=stock_wrapper,
                 page_size=page_size,
                 causal=attn_metadata.causal,
                 plan=lambda wrapper: self._plan_prefill_wrapper(
@@ -1715,6 +1758,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 batch=decode_batch,
                 query=query,
                 kv_cache=kv_cache,
+                stock_wrapper=stock_wrapper,
                 page_size=page_size,
                 causal=False,
                 plan=lambda wrapper: self._plan_decode_wrapper(
@@ -1858,10 +1902,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
         except RuntimeError:
             if host_layer_name is not None:
                 state.abort_host_layer(host_layer_name)
-            if (
-                self._serving_tier != "hbm"
-                or not self._nta_config.allow_stock_fallback
-            ):
+            if self._serving_tier != "hbm" or not self._nta_config.allow_stock_fallback:
                 raise
             state.record_evidence("reference_fallback_launches")
             return super().forward(

@@ -765,7 +765,7 @@ def _test_worker_attention_phase_ownership() -> None:
         7,
         build,
         first_plan,
-        workspace_bytes=4096,
+        workspace=vllm_worker.AttentionWorkspaceContract.worker_owned(4096),
     )
     reused, reused_schedule = controller.attention_phase(
         "incremental",
@@ -777,7 +777,7 @@ def _test_worker_attention_phase_ownership() -> None:
         lambda _resource: (_ for _ in ()).throw(
             AssertionError("same-epoch phase repeated planner/readback work")
         ),
-        workspace_bytes=4096,
+        workspace=vllm_worker.AttentionWorkspaceContract.worker_owned(4096),
     )
     assert reused is first
     assert reused_schedule is first_schedule
@@ -793,7 +793,7 @@ def _test_worker_attention_phase_ownership() -> None:
         8,
         build,
         second_plan,
-        workspace_bytes=4096,
+        workspace=vllm_worker.AttentionWorkspaceContract.worker_owned(4096),
     )
     assert replanned is first
     assert second_schedule != first_schedule
@@ -807,10 +807,57 @@ def _test_worker_attention_phase_ownership() -> None:
         8,
         lambda: SimpleNamespace(identity="direct"),
         lambda _resource: None,
-        workspace_bytes=4096,
+        workspace=vllm_worker.AttentionWorkspaceContract.worker_owned(4096),
     )
     assert direct is not first
     assert controller._attention_workspace_bytes == 8192
+
+    # Two logical wrappers can share one framework allocation without
+    # inflating either owned-byte or borrowed-byte accounting.
+    borrowed = vllm_worker.AttentionWorkspaceContract.framework_owned(4096, 1234)
+    controller.attention_phase(
+        "request_bound",
+        ("decode", "fp16", 128),
+        8,
+        lambda: SimpleNamespace(identity="borrowed-decode"),
+        lambda _resource: None,
+        workspace=borrowed,
+    )
+    controller.attention_phase(
+        "request_bound",
+        ("prefill", "bf16", 128),
+        8,
+        lambda: SimpleNamespace(identity="borrowed-prefill"),
+        lambda _resource: None,
+        workspace=borrowed,
+    )
+    assert controller._attention_workspace_bytes == 8192
+    assert controller._attention_borrowed_workspace_bytes == 4096
+
+    # Replacing vLLM's framework workspace rebuilds both logical wrappers and
+    # retires the old allocation only after its final dependent is replaced.
+    replacement = vllm_worker.AttentionWorkspaceContract.framework_owned(4096, 5678)
+    replaced_decode, _ = controller.attention_phase(
+        "request_bound",
+        ("decode", "fp16", 128),
+        9,
+        lambda: SimpleNamespace(identity="replacement-decode"),
+        lambda _resource: None,
+        workspace=replacement,
+    )
+    assert replaced_decode.identity == "replacement-decode"
+    assert controller._attention_borrowed_workspace_bytes == 8192
+    replaced_prefill, _ = controller.attention_phase(
+        "request_bound",
+        ("prefill", "bf16", 128),
+        9,
+        lambda: SimpleNamespace(identity="replacement-prefill"),
+        lambda _resource: None,
+        workspace=replacement,
+    )
+    assert replaced_prefill.identity == "replacement-prefill"
+    assert controller._attention_borrowed_workspace_bytes == 4096
+    assert 1234 not in controller._attention_borrowed_workspace_refs
 
     try:
         controller.attention_phase(
@@ -819,7 +866,7 @@ def _test_worker_attention_phase_ownership() -> None:
             6,
             build,
             first_plan,
-            workspace_bytes=4096,
+            workspace=vllm_worker.AttentionWorkspaceContract.worker_owned(4096),
         )
     except RuntimeError as error:
         assert "backwards" in str(error)
@@ -829,6 +876,8 @@ def _test_worker_attention_phase_ownership() -> None:
     controller.close()
     assert not controller._attention_phases
     assert controller._attention_workspace_bytes == 0
+    assert controller._attention_borrowed_workspace_bytes == 0
+    assert not controller._attention_borrowed_workspace_refs
 
 
 def _test_connector_request_row_identity() -> None:

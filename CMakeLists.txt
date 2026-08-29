@@ -449,6 +449,12 @@ if(Python3_Interpreter_FOUND)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/vllm_report.py
   )
   add_test(
+    NAME nta-jit-environment
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/jit_environment.py
+  )
+  add_test(
     NAME nta-exact-native-bridge
     COMMAND
       ${Python3_EXECUTABLE}

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import time
-from typing import Any
+from typing import Any, Literal
 import weakref
 
 import torch
@@ -47,9 +47,7 @@ def _build_resources(
             object_capacity=config.object_capacity,
             intent_capacity=config.object_capacity,
             work_ticket_capacity=config.work_ticket_capacity,
-            max_dependencies_per_work_ticket=(
-                config.max_dependencies_per_work_ticket
-            ),
+            max_dependencies_per_work_ticket=(config.max_dependencies_per_work_ticket),
             device_ordinal=device_ordinal,
             tenant_capacity=config.tenant_capacity,
             staging_byte_capacity=config.staging_byte_capacity,
@@ -59,12 +57,51 @@ def _build_resources(
 
 @dataclass
 class _WorkerAttentionPhase:
-    """One worker-owned FlashInfer resource and its epoch-scoped plan result."""
+    """One worker-scoped FlashInfer resource and its epoch-scoped plan result."""
 
     resource: Any
-    workspace_bytes: int
+    workspace: "AttentionWorkspaceContract"
     planned_epoch: int | None = None
     plan_result: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionWorkspaceContract:
+    """Physical ownership of one FlashInfer float-workspace binding.
+
+    Framework-owned buffers may be shared by multiple wrappers because vLLM
+    already serializes their plans and launches on one worker stream. Worker-
+    owned buffers are reserved for differential execution, where the stock and
+    custom wrappers must remain independent.
+    """
+
+    capacity_bytes: int
+    ownership: Literal["worker", "framework"]
+    identity: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.capacity_bytes <= 0:
+            raise ValueError("vLLM attention workspace must be positive")
+        if self.ownership == "worker":
+            if self.identity is not None:
+                raise ValueError("worker-owned workspace cannot borrow an identity")
+        elif self.ownership == "framework":
+            if self.identity is None or self.identity <= 0:
+                raise ValueError(
+                    "framework-owned workspace requires a physical identity"
+                )
+        else:
+            raise ValueError(f"unknown vLLM workspace owner {self.ownership!r}")
+
+    @classmethod
+    def worker_owned(cls, capacity_bytes: int) -> "AttentionWorkspaceContract":
+        return cls(capacity_bytes, "worker")
+
+    @classmethod
+    def framework_owned(
+        cls, capacity_bytes: int, identity: int
+    ) -> "AttentionWorkspaceContract":
+        return cls(capacity_bytes, "framework", identity)
 
 
 @dataclass
@@ -179,7 +216,12 @@ class VllmV1WorkerController:
         # layer with the same batch metadata, so a per-impl owner multiplies
         # workspace residency and planner/readback cost by the layer count.
         self._attention_phases: dict[tuple[Any, ...], _WorkerAttentionPhase] = {}
+        # Only worker-owned bytes are additional HBM. Framework-owned
+        # workspaces are reference-counted by allocation identity so prefill
+        # and decode wrappers sharing vLLM's one buffer are not double-counted.
         self._attention_workspace_bytes = 0
+        self._attention_borrowed_workspace_bytes = 0
+        self._attention_borrowed_workspace_refs: dict[int, tuple[int, int]] = {}
         self._request_binding_buffers: list[_RequestBindingBuffer] = []
         self._request_binding_cursor = 0
         self._request_bindings_device: torch.Tensor | None = None
@@ -562,7 +604,7 @@ class VllmV1WorkerController:
         build: Callable[[], Any],
         plan: Callable[[Any], Any],
         *,
-        workspace_bytes: int,
+        workspace: AttentionWorkspaceContract,
     ) -> tuple[Any, Any]:
         """Acquire one worker-shared wrapper and plan it once per batch epoch.
 
@@ -578,21 +620,27 @@ class VllmV1WorkerController:
             raise ValueError(f"unknown vLLM attention form {form!r}")
         if epoch < 0:
             raise ValueError("vLLM attention phase epoch cannot be negative")
-        if workspace_bytes <= 0:
-            raise ValueError("vLLM attention workspace must be positive")
         phase_key = (form, *key)
         phase = self._attention_phases.get(phase_key)
+        if phase is not None and phase.workspace != workspace:
+            # A framework metadata builder may replace its workspace between
+            # forwards. Rebuild this logical phase instead of retaining a
+            # wrapper that pins stale framework storage indefinitely.
+            self._release_attention_workspace(phase.workspace)
+            del self._attention_phases[phase_key]
+            phase = None
         if phase is None:
-            phase = _WorkerAttentionPhase(build(), workspace_bytes)
+            phase = _WorkerAttentionPhase(build(), workspace)
             self._attention_phases[phase_key] = phase
-            self._attention_workspace_bytes += workspace_bytes
+            self._retain_attention_workspace(workspace)
             prefix = f"worker_{form}"
             VLLM_STATS[f"{prefix}_wrapper_builds"] += 1
-            VLLM_STATS[f"{prefix}_workspace_allocated_bytes"] += workspace_bytes
-            VLLM_STATS["worker_attention_workspace_peak_bytes"] = max(
-                VLLM_STATS["worker_attention_workspace_peak_bytes"],
-                self._attention_workspace_bytes,
-            )
+            if workspace.ownership == "worker":
+                VLLM_STATS[f"{prefix}_workspace_allocated_bytes"] += (
+                    workspace.capacity_bytes
+                )
+            else:
+                VLLM_STATS[f"{prefix}_workspace_borrowed_bindings"] += 1
         if phase.planned_epoch == epoch:
             VLLM_STATS[f"worker_{form}_plan_reuses"] += 1
             return phase.resource, phase.plan_result
@@ -602,6 +650,61 @@ class VllmV1WorkerController:
         phase.planned_epoch = epoch
         VLLM_STATS[f"worker_{form}_plan_builds"] += 1
         return phase.resource, phase.plan_result
+
+    def _retain_attention_workspace(
+        self, workspace: AttentionWorkspaceContract
+    ) -> None:
+        if workspace.ownership == "worker":
+            self._attention_workspace_bytes += workspace.capacity_bytes
+            VLLM_STATS["worker_attention_workspace_peak_bytes"] = max(
+                VLLM_STATS["worker_attention_workspace_peak_bytes"],
+                self._attention_workspace_bytes,
+            )
+            return
+        assert workspace.identity is not None
+        prior = self._attention_borrowed_workspace_refs.get(workspace.identity)
+        if prior is None:
+            self._attention_borrowed_workspace_refs[workspace.identity] = (
+                workspace.capacity_bytes,
+                1,
+            )
+            self._attention_borrowed_workspace_bytes += workspace.capacity_bytes
+            VLLM_STATS["worker_attention_borrowed_workspace_peak_bytes"] = max(
+                VLLM_STATS["worker_attention_borrowed_workspace_peak_bytes"],
+                self._attention_borrowed_workspace_bytes,
+            )
+            return
+        capacity, references = prior
+        if capacity != workspace.capacity_bytes:
+            raise RuntimeError("vLLM framework workspace identity changed capacity")
+        self._attention_borrowed_workspace_refs[workspace.identity] = (
+            capacity,
+            references + 1,
+        )
+
+    def _release_attention_workspace(
+        self, workspace: AttentionWorkspaceContract
+    ) -> None:
+        if workspace.ownership == "worker":
+            self._attention_workspace_bytes -= workspace.capacity_bytes
+            if self._attention_workspace_bytes < 0:
+                raise RuntimeError("vLLM worker workspace accounting underflow")
+            return
+        assert workspace.identity is not None
+        prior = self._attention_borrowed_workspace_refs.get(workspace.identity)
+        if prior is None:
+            raise RuntimeError("vLLM borrowed workspace accounting underflow")
+        capacity, references = prior
+        if capacity != workspace.capacity_bytes:
+            raise RuntimeError("vLLM borrowed workspace capacity changed")
+        if references == 1:
+            del self._attention_borrowed_workspace_refs[workspace.identity]
+            self._attention_borrowed_workspace_bytes -= capacity
+        else:
+            self._attention_borrowed_workspace_refs[workspace.identity] = (
+                capacity,
+                references - 1,
+            )
 
     def begin_forward(self, state: Any) -> None:
         """Open one worker transaction before identity or acquisition binding."""
@@ -694,8 +797,12 @@ class VllmV1WorkerController:
         self._page_size = 0
         self._page_bytes = 0
         self._request_capacity = 0
+        for phase in self._attention_phases.values():
+            self._release_attention_workspace(phase.workspace)
         self._attention_phases.clear()
         self._attention_workspace_bytes = 0
+        self._attention_borrowed_workspace_bytes = 0
+        self._attention_borrowed_workspace_refs.clear()
         self._request_binding_buffers.clear()
         self._request_binding_cursor = 0
         self._request_bindings_device = None
@@ -824,8 +931,8 @@ def _abort_forward(state: Any) -> None:
         raise primary
 
 
-
 __all__ = [
+    "AttentionWorkspaceContract",
     "VllmV1WorkerController",
     "_PhysicalLayerDestination",
     "_controller",

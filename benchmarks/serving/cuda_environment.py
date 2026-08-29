@@ -40,6 +40,26 @@ def _resolve_host_cxx(requested: pathlib.Path | None) -> pathlib.Path:
     return candidate
 
 
+def _activation_cache_root(workspace: pathlib.Path) -> pathlib.Path:
+    """Normalize either a cache root or an already activated workspace.
+
+    Experiment reports expose the resolved content-addressed workspace.  It is
+    natural to pass that path back into a later run, but ``activate.py`` takes
+    the parent cache root and adds ``uid-*/nta-abi*`` itself.  Detect the
+    activated form by its overlay manifest so repeated runs are idempotent.
+    """
+
+    resolved = workspace.expanduser().resolve()
+    overlay_manifest = resolved / "nta-flashinfer-overlay" / "manifest.json"
+    if (
+        overlay_manifest.is_file()
+        and resolved.name.startswith("nta-abi")
+        and resolved.parent.name == f"uid-{os.getuid()}"
+    ):
+        return resolved.parent.parent
+    return resolved
+
+
 def configure_jit_environment(
     *,
     root: pathlib.Path,
@@ -128,7 +148,7 @@ def configure_jit_environment(
                 "--build-dir",
                 str(root / "build"),
                 "--cache-root",
-                str(workspace.resolve()),
+                str(_activation_cache_root(workspace)),
                 "--cuda-path",
                 str(resolved_cuda_home),
                 "--flashinfer-hook",

@@ -44,22 +44,17 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "short", "long_prefix"),
         default="auto",
         help=(
-            "prompt shape; auto selects long_prefix for host reload and short "
-            "otherwise"
+            "prompt shape; auto selects long_prefix for host reload and short otherwise"
         ),
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
-    parser.add_argument(
-        "--serving-tier", choices=("hbm", "host_staged"), default="hbm"
-    )
+    parser.add_argument("--serving-tier", choices=("hbm", "host_staged"), default="hbm")
     parser.add_argument(
         "--kv-cache-memory-bytes",
         type=int,
         help="explicit vLLM HBM KV capacity for deterministic tier tests",
     )
-    parser.add_argument(
-        "--host-cache-bytes", type=int, default=512 * 1024 * 1024
-    )
+    parser.add_argument("--host-cache-bytes", type=int, default=512 * 1024 * 1024)
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument("--cuda-home", type=pathlib.Path)
     parser.add_argument("--cuda-host-cxx", type=pathlib.Path)
@@ -284,7 +279,10 @@ def main() -> int:
                 started = time.perf_counter()
                 current = engine.generate(prompts, sampling)
                 elapsed = time.perf_counter() - started
-                if tuple(output_token_ids(result) for result in current) != baseline_tokens:
+                if (
+                    tuple(output_token_ids(result) for result in current)
+                    != baseline_tokens
+                ):
                     raise RuntimeError("vLLM host reload changed generated token IDs")
                 if iteration >= args.warmup_iterations:
                     samples.append(elapsed)
@@ -433,9 +431,20 @@ def main() -> int:
         int(stats.get("worker_request_bound_workspace_allocated_bytes", 0))
         for stats in native_worker_stats
     )
+    worker_request_bound_workspace_borrowed_bindings = sum(
+        int(stats.get("worker_request_bound_workspace_borrowed_bindings", 0))
+        for stats in native_worker_stats
+    )
     worker_attention_workspace_peak_bytes = max(
         (
             int(stats.get("worker_attention_workspace_peak_bytes", 0))
+            for stats in native_worker_stats
+        ),
+        default=0,
+    )
+    worker_attention_borrowed_workspace_peak_bytes = max(
+        (
+            int(stats.get("worker_attention_borrowed_workspace_peak_bytes", 0))
             for stats in native_worker_stats
         ),
         default=0,
@@ -452,12 +461,10 @@ def main() -> int:
                 "vLLM host smoke completed without evidenced host materialization"
             )
         expected_phases_per_worker = 2 if args.max_new_tokens > 1 else 1
-        expected_wrapper_builds = (
-            expected_phases_per_worker * len(native_worker_stats)
-        )
+        expected_wrapper_builds = expected_phases_per_worker * len(native_worker_stats)
         if worker_request_bound_wrapper_builds != expected_wrapper_builds:
             raise RuntimeError(
-                "vLLM host smoke did not preserve worker-owned FlashInfer "
+                "vLLM host smoke did not preserve worker-scoped FlashInfer "
                 "workspace lifetime: "
                 f"expected {expected_wrapper_builds} wrappers, observed "
                 f"{worker_request_bound_wrapper_builds}"
@@ -466,12 +473,14 @@ def main() -> int:
             worker_incremental_wrapper_builds != 0
             or worker_request_bound_plan_builds <= 0
             or worker_request_bound_plan_reuses <= 0
-            or worker_request_bound_workspace_allocated_bytes <= 0
-            or worker_attention_workspace_peak_bytes <= 0
+            or worker_request_bound_workspace_allocated_bytes != 0
+            or worker_request_bound_workspace_borrowed_bindings <= 0
+            or worker_attention_workspace_peak_bytes != 0
+            or worker_attention_borrowed_workspace_peak_bytes <= 0
         ):
             raise RuntimeError(
                 "vLLM optimized host smoke did not use only the worker-shared "
-                "request-bound planner/workspace"
+                "request-bound planner with framework-owned workspace"
             )
     revision, dirty = repository_metadata()
     median_seconds = statistics.median(samples)
@@ -501,8 +510,14 @@ def main() -> int:
         "worker_request_bound_workspace_allocated_bytes": (
             worker_request_bound_workspace_allocated_bytes
         ),
+        "worker_request_bound_workspace_borrowed_bindings": (
+            worker_request_bound_workspace_borrowed_bindings
+        ),
         "worker_attention_workspace_peak_bytes": (
             worker_attention_workspace_peak_bytes
+        ),
+        "worker_attention_borrowed_workspace_peak_bytes": (
+            worker_attention_borrowed_workspace_peak_bytes
         ),
         "stock_fallback_enabled": (
             args.backend == "nta"
