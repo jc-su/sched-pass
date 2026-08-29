@@ -1,9 +1,9 @@
 """Forward-scoped semantic planning for SGLang FlashInfer metadata.
 
 This component translates one framework metadata snapshot into an immutable
-``_ActiveBatch``.  It owns no CUDA stream, runtime directory, transport, or
-framework lifecycle state, so the resulting plan can be inspected and tested
-without entering numerical execution.
+``SglangForwardPlan`` wrapped by a fresh execution epoch. It owns no CUDA
+stream, runtime directory, transport, or framework lifecycle service, so the
+semantic result can be inspected without entering numerical execution.
 """
 
 from __future__ import annotations
@@ -40,7 +40,11 @@ from nta_runtime.engines.sglang_semantics import (
     work_page_pairs,
     wrapper_page_layout,
 )
-from nta_runtime.engines.sglang_state import _ActiveBatch, _SemanticWrapperPlan
+from nta_runtime.engines.sglang_state import (
+    SglangForwardEpoch,
+    SglangForwardPlan,
+    _SemanticWrapperPlan,
+)
 from nta_runtime.engines.sglang_topology import (
     capacity_constrained_acquisition_groups,
     group_external_pages_by_request,
@@ -52,7 +56,7 @@ from nta_runtime.engines.sglang_topology import (
 
 @dataclass(frozen=True, slots=True)
 class SglangMetadataPlan:
-    batch: _ActiveBatch
+    batch: SglangForwardEpoch
     host_execution: HostExecutionPlan | None
 
 
@@ -151,12 +155,14 @@ class SglangMetadataPlanner:
         if bounded_direct is not None:
             self._record_direct_mixed_heterogeneity(forward_batch, bindings)
             result = SglangMetadataPlan(
-                _ActiveBatch(
-                    bindings=bindings,
-                    semantic_plans={},
-                    pending_host_load=pending,
-                    host_execution=bounded_direct,
-                    grouping=self._grouping,
+                SglangForwardEpoch(
+                    plan=SglangForwardPlan(
+                        bindings=bindings,
+                        semantic_plans={},
+                        pending_host_load=pending,
+                        host_execution=bounded_direct,
+                        grouping=self._grouping,
+                    ),
                 ),
                 bounded_direct,
             )
@@ -360,13 +366,15 @@ class SglangMetadataPlanner:
             self._stats.get("typed_transfer_group_max_rows", 0), max(rows)
         )
         return SglangMetadataPlan(
-            _ActiveBatch(
-                bindings=bindings,
-                semantic_plans=semantic_plans,
-                pending_host_load=pending,
-                host_execution=host_execution,
-                grouping="request",
-                lease_transfer_rows=lease_rows,
+            SglangForwardEpoch(
+                plan=SglangForwardPlan(
+                    bindings=bindings,
+                    semantic_plans=semantic_plans,
+                    pending_host_load=pending,
+                    host_execution=host_execution,
+                    grouping="request",
+                    lease_transfer_rows=lease_rows,
+                ),
             ),
             host_execution,
         )
@@ -428,19 +436,21 @@ class SglangMetadataPlanner:
                 raise RuntimeError("request execution omitted request grouping")
             page_pairs = request_page_pairs
         return SglangMetadataPlan(
-            _ActiveBatch(
-                bindings=bindings,
-                semantic_plans={
-                    wrapper_id: semantic_plan(
-                        schedule=schedule,
-                        dependency_kind="physical_pages",
-                        page_pairs=page_pairs[wrapper_id],
-                    )
-                    for wrapper_id, schedule in schedules.items()
-                },
-                pending_host_load=pending,
-                host_execution=None,
-                grouping=self._grouping,
+            SglangForwardEpoch(
+                plan=SglangForwardPlan(
+                    bindings=bindings,
+                    semantic_plans={
+                        wrapper_id: semantic_plan(
+                            schedule=schedule,
+                            dependency_kind="physical_pages",
+                            page_pairs=page_pairs[wrapper_id],
+                        )
+                        for wrapper_id, schedule in schedules.items()
+                    },
+                    pending_host_load=pending,
+                    host_execution=None,
+                    grouping=self._grouping,
+                ),
             ),
             None,
         )

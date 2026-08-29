@@ -15,7 +15,7 @@ from typing import Any
 import torch
 
 from nta_runtime.acquisition_scheduler import AcquisitionServiceCurve
-from nta_runtime.engines.sglang_state import _ActiveBatch
+from nta_runtime.engines.sglang_state import SglangForwardEpoch
 
 
 LayerServiceKey = tuple[str, int, int]
@@ -139,7 +139,7 @@ class SglangLayerServiceCalibration:
     def record(
         self,
         *,
-        batch: _ActiveBatch | None,
+        batch: SglangForwardEpoch | None,
         phase: str,
         query: torch.Tensor,
         global_layer: int,

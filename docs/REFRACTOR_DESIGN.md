@@ -71,7 +71,9 @@ For SGLang:
 scheduler forward
   -> SglangAdapter: rids + real request-pool slots
   -> SglangHiCacheBridge: owns exact host load, physical page mapping, and fence
-  -> _ActiveBatch: schedules, exact work topology, and indexed resource topology
+  -> SglangForwardPlan: immutable request, schedule, and resource identity
+  -> SglangForwardEpoch: mutable numerical/acquisition progress for that plan
+  -> SglangForwardLifecycle: sole owner of the live epoch and wrapper aliases
   -> IndexedHostPlan + DeviceWorkPlan.upload_exact: checked native ABI image
   -> compiler-instrumented FlashInfer wrapper
   -> optional ExecutionSession verifier + HiCache layer retirement

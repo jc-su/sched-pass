@@ -37,7 +37,7 @@ from nta_runtime.execution_planner import (
 from nta_runtime.opportunity import OperatorArrival, TileArrival, append_json_line
 from nta_runtime.engines.sglang_graphs import DemandGraphCache, demand_graph_key
 from nta_runtime.engines.sglang_planning import requires_feasible_edf
-from nta_runtime.engines.sglang_state import _ActiveBatch, _BarrierProfile
+from nta_runtime.engines.sglang_state import SglangForwardEpoch, _BarrierProfile
 from nta_runtime.engines.sglang_nvme import SglangNvmeAcquisitionPipeline
 
 
@@ -263,7 +263,7 @@ class SglangAttentionExecutor:
         demand_graph_cache: DemandGraphCache,
         progress_stream: torch.cuda.Stream,
         stats: dict[str, Any],
-        stock_wrapper_for_typed: dict[int, Any],
+        stock_wrapper: Callable[[int], Any | None],
         transfer_profiles: list[tuple[torch.cuda.Event, torch.cuda.Event, int, str]],
         operator_profiles: list[tuple[torch.cuda.Event, torch.cuda.Event, str, int]],
         barrier_profiles: list[_BarrierProfile],
@@ -278,7 +278,7 @@ class SglangAttentionExecutor:
         self._demand_graph_cache = demand_graph_cache
         self._progress_stream = progress_stream
         self._stats = stats
-        self._stock_wrapper_for_typed = stock_wrapper_for_typed
+        self._stock_wrapper = stock_wrapper
         self._transfer_profiles = transfer_profiles
         self._operator_profiles = operator_profiles
         self._barrier_profiles = barrier_profiles
@@ -291,7 +291,7 @@ class SglangAttentionExecutor:
     def prepare_nvme_batch(
         self,
         *,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrappers: tuple[Any, ...],
         ordering_stream: torch.cuda.Stream,
         kv_cache_for_layer: Callable[[int], tuple[torch.Tensor, torch.Tensor]],
@@ -364,7 +364,7 @@ class SglangAttentionExecutor:
 
     def _upload_plan(
         self,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         layer_id: int,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -382,7 +382,7 @@ class SglangAttentionExecutor:
     def prepare_arriving_plans(
         self,
         *,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrappers: tuple[Any, ...],
         layer_id: int,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -410,7 +410,7 @@ class SglangAttentionExecutor:
 
     def run_preacquired(
         self,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -500,7 +500,7 @@ class SglangAttentionExecutor:
         self,
         *,
         dispatch: AttentionDispatch,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -568,7 +568,7 @@ class SglangAttentionExecutor:
         self,
         *,
         dispatch: AttentionDispatch,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -688,7 +688,7 @@ class SglangAttentionExecutor:
         self,
         *,
         dispatch: AttentionDispatch,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -713,7 +713,7 @@ class SglangAttentionExecutor:
     def _execute_nvme(
         self,
         *,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -787,7 +787,7 @@ class SglangAttentionExecutor:
         self,
         *,
         dispatch: AttentionDispatch,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -882,7 +882,7 @@ class SglangAttentionExecutor:
         self,
         *,
         dispatch: AttentionDispatch,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         layer: Any,
@@ -1069,7 +1069,7 @@ class SglangAttentionExecutor:
 
     def _progress_publisher(
         self,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         local_layer: int,
     ) -> Callable[[Any], None] | None:
         if local_layer != 0 or not self._hicache.progress_publication_available():
@@ -1105,7 +1105,7 @@ class SglangAttentionExecutor:
         self,
         *,
         prepared: _PreparedHostLayer,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -1279,7 +1279,7 @@ class SglangAttentionExecutor:
     def _account_host_progress(
         self,
         prepared: _PreparedHostLayer,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         host_cost_model: HostCostModel,
     ) -> None:
         if not prepared.collect_progress:
@@ -1344,7 +1344,7 @@ class SglangAttentionExecutor:
     def _record_opportunity(
         self,
         prepared: _PreparedHostLayer,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         q: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -1429,7 +1429,7 @@ class SglangAttentionExecutor:
 
         if work_count <= 0 or not self._kernels.is_instrumented(wrapper):
             raise RuntimeError("compute calibration requires instrumented CTA work")
-        stock = self._stock_wrapper_for_typed.get(id(wrapper))
+        stock = self._stock_wrapper(id(wrapper))
         if stock is None:
             raise RuntimeError(
                 "compute calibration requires the paired stock numerical wrapper"

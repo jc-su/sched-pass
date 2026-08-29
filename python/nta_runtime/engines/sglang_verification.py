@@ -10,7 +10,7 @@ from flashinfer import (
     BatchPrefillWithPagedKVCacheWrapper,
 )
 
-from nta_runtime.engines.sglang_state import _ActiveBatch
+from nta_runtime.engines.sglang_state import SglangForwardEpoch
 
 
 class SglangAttentionVerifier:
@@ -113,7 +113,7 @@ class SglangAttentionVerifier:
 
     @staticmethod
     def verify_layer_transfer(
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         layer_id: int,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
     ) -> None:

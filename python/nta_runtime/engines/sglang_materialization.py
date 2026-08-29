@@ -20,7 +20,7 @@ from nta_runtime.engines.sglang_planning import (
     DEMAND_OBJECT_ID_BASE,
     MAX_ABI_BYTES,
 )
-from nta_runtime.engines.sglang_state import _ActiveBatch
+from nta_runtime.engines.sglang_state import SglangForwardEpoch
 from nta_runtime.execution_planner import HostExecutionPlan
 from nta_runtime.execution_topology import WorkDependencySpan
 from nta_runtime.execution_topology import ExactWorkTopology
@@ -180,7 +180,7 @@ class SglangPlanMaterializer:
 
     def upload_preacquired_plan(
         self,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         schedule: Schedule,
         topology: ExactWorkTopology,
@@ -265,7 +265,7 @@ class SglangPlanMaterializer:
 
     def _record_demand_plan_stats(
         self,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         schedule: Schedule,
         object_count: int,
         transfer_bytes: int,
@@ -316,7 +316,7 @@ class SglangPlanMaterializer:
 
     def upload_plan(
         self,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         layer_id: int,
         kv_cache: tuple[torch.Tensor, torch.Tensor],
@@ -943,7 +943,7 @@ class SglangPlanMaterializer:
 
     def prepare_arriving_plan(
         self,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         wrapper: Any,
         layer_id: int,
         kv_cache: tuple[torch.Tensor, torch.Tensor],

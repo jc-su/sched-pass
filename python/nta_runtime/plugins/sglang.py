@@ -152,6 +152,54 @@ def _observability_degraded(site: str, error: Exception) -> None:
         )
 
 
+def _forward_profile_owners(runner, forward_batch):
+    """Snapshot every lifecycle owner used by this eager invocation.
+
+    PDMux routes decode through ``decode_attn_backend``. TBO initializes its
+    primary plus each non-empty child batch. Profiling is optional, but silently
+    reading the unused top-level backend would turn external work into a false
+    ``plain`` sample, so routing is reproduced explicitly here.
+    """
+
+    model_runner = runner.model_runner
+    mode = getattr(forward_batch, "forward_mode", None)
+    if (
+        bool(getattr(runner, "enable_pdmux", False))
+        and mode is not None
+        and mode.is_decode()
+    ):
+        backend = getattr(model_runner, "decode_attn_backend", None)
+        if backend is None:
+            raise RuntimeError("PDMux decode has no selected attention backend")
+    else:
+        backend = getattr(model_runner, "attn_backend", None)
+
+    targets = [backend]
+    primary = getattr(backend, "primary", None)
+    children = getattr(backend, "children", None)
+    if primary is not None and isinstance(children, (list, tuple)):
+        targets = [primary]
+        child_batches = getattr(forward_batch, "tbo_children", None)
+        if child_batches is not None:
+            for child, child_batch in zip(children, child_batches, strict=True):
+                if int(getattr(child_batch, "batch_size", 0) or 0) > 0:
+                    targets.append(child)
+
+    owners = []
+    seen: set[int] = set()
+    for target in targets:
+        if target is None or id(target) in seen:
+            continue
+        seen.add(id(target))
+        cursor_fn = getattr(target, "forward_profile_cursor", None)
+        classify_fn = getattr(target, "external_forward_since", None)
+        if callable(cursor_fn) != callable(classify_fn):
+            raise RuntimeError("SGLang profiling lifecycle API is incomplete")
+        if callable(cursor_fn):
+            owners.append((classify_fn, cursor_fn()))
+    return tuple(owners)
+
+
 def _profile_forward(original, runner, forward_batch, *args, **kwargs):
     """Time one forward and attribute it to a batch-composition class.
 
@@ -165,19 +213,13 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
 
     from nta_runtime.engines.sglang_telemetry import record_forward
 
-    backend = getattr(runner.model_runner, "attn_backend", None)
-    active_batch = getattr(backend, "_active_batch", None)
-    staging = int(getattr(active_batch, "pending_host_load", None) is not None)
-    mode = getattr(forward_batch, "forward_mode", None)
-    is_mixed = bool(mode is not None and mode.is_mixed())
-    if staging and is_mixed:
-        kind = "staging_mixed"
-    elif staging:
-        kind = "staging_pure"
-    elif is_mixed:
-        kind = "mixed_nostage"
-    else:
-        kind = "plain"
+    try:
+        owners = _forward_profile_owners(runner, forward_batch)
+        mode = getattr(forward_batch, "forward_mode", None)
+        is_mixed = bool(mode is not None and mode.is_mixed())
+    except Exception as error:
+        _observability_degraded("forward_profile_classification", error)
+        return original(runner, forward_batch, *args, **kwargs)
 
     # An observation hook must never take down serving, and event synchronize
     # is illegal inside a captured graph. Degrade loudly once, count the
@@ -194,10 +236,30 @@ def _profile_forward(original, runner, forward_batch, *args, **kwargs):
     finally:
         try:
             end.record()
-            end.synchronize()
-            record_forward(kind, start.elapsed_time(end))
         except Exception as error:
             _observability_degraded("forward_profile", error)
+        else:
+            try:
+                classifications = tuple(
+                    classify(cursor) for classify, cursor in owners
+                )
+                staging = int(any(classifications))
+                if staging and is_mixed:
+                    kind = "staging_mixed"
+                elif staging:
+                    kind = "staging_pure"
+                elif is_mixed:
+                    kind = "mixed_nostage"
+                else:
+                    kind = "plain"
+            except Exception as error:
+                _observability_degraded("forward_profile_classification", error)
+            else:
+                try:
+                    end.synchronize()
+                    record_forward(kind, start.elapsed_time(end))
+                except Exception as error:
+                    _observability_degraded("forward_profile", error)
 
 
 def _preserve_prefill_graph_request_metadata() -> None:

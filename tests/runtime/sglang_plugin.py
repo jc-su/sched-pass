@@ -219,6 +219,7 @@ def main() -> None:
         _PREFILL_FINISH_TARGET,
         _PREBUILT_FINISH_TARGET,
         _attach_request_priorities,
+        _profile_forward,
         _require_hooks_installed,
         _retire_prefill_finished_requests,
         _retire_finished_request,
@@ -238,6 +239,208 @@ def main() -> None:
 
     for target in (_EXECUTE_EXTEND_TARGET, _EXECUTE_DECODE_TARGET):
         assert target not in HookRegistry._hooks
+
+    class ProfileEvent:
+        def record(self) -> None:
+            self.recorded = True
+
+        def synchronize(self) -> None:
+            self.synchronized = True
+
+        def elapsed_time(self, _end) -> float:
+            return 1.25
+
+    profile_order = []
+
+    class ProfileBackend:
+        def __init__(self) -> None:
+            self.serial = 0
+
+        def forward_profile_cursor(self) -> int:
+            return self.serial
+
+        def external_forward_since(self, cursor: int) -> bool:
+            profile_order.append("classify")
+            assert self.serial == cursor + 1
+            assert profile_order == ["original", "classify"]
+            return True
+
+    profile_backend = ProfileBackend()
+    profiled_runner = types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(attn_backend=profile_backend)
+    )
+    profiled_batch = types.SimpleNamespace(
+        forward_mode=types.SimpleNamespace(is_mixed=lambda: False)
+    )
+    forward_result = object()
+
+    def profiled_original(*_args, **_kwargs):
+        profile_order.append("original")
+        profile_backend.serial += 1
+        return forward_result
+
+    with (
+        patch("torch.cuda.Event", side_effect=(ProfileEvent(), ProfileEvent())),
+        patch("nta_runtime.engines.sglang_telemetry.record_forward") as record_forward,
+    ):
+        assert (
+            _profile_forward(
+                profiled_original,
+                profiled_runner,
+                profiled_batch,
+            )
+            is forward_result
+        )
+    record_forward.assert_called_once_with("staging_pure", 1.25)
+
+    class RoutedBackend:
+        def __init__(self, *, external: bool) -> None:
+            self.serial = 0
+            self.external = external
+            self.cursor_calls = 0
+            self.classify_calls = 0
+
+        def forward_profile_cursor(self) -> int:
+            self.cursor_calls += 1
+            return self.serial
+
+        def external_forward_since(self, cursor: int) -> bool:
+            self.classify_calls += 1
+            assert self.serial == cursor + 1
+            return self.external
+
+        def activate(self) -> None:
+            self.serial += 1
+
+    top_backend = RoutedBackend(external=False)
+    decode_backend = RoutedBackend(external=True)
+    pdmux_runner = types.SimpleNamespace(
+        enable_pdmux=True,
+        model_runner=types.SimpleNamespace(
+            attn_backend=top_backend,
+            decode_attn_backend=decode_backend,
+        ),
+    )
+    decode_batch = types.SimpleNamespace(
+        forward_mode=types.SimpleNamespace(
+            is_decode=lambda: True,
+            is_mixed=lambda: False,
+        )
+    )
+    with (
+        patch("torch.cuda.Event", side_effect=(ProfileEvent(), ProfileEvent())),
+        patch("nta_runtime.engines.sglang_telemetry.record_forward") as record_forward,
+    ):
+        assert (
+            _profile_forward(
+                lambda *_args, **_kwargs: (
+                    decode_backend.activate(),
+                    forward_result,
+                )[1],
+                pdmux_runner,
+                decode_batch,
+            )
+            is forward_result
+        )
+    record_forward.assert_called_once_with("staging_pure", 1.25)
+    assert (top_backend.cursor_calls, top_backend.classify_calls) == (0, 0)
+    assert (decode_backend.cursor_calls, decode_backend.classify_calls) == (1, 1)
+
+    primary_backend = RoutedBackend(external=False)
+    first_child_backend = RoutedBackend(external=True)
+    empty_child_backend = RoutedBackend(external=True)
+    tbo_runner = types.SimpleNamespace(
+        enable_pdmux=False,
+        model_runner=types.SimpleNamespace(
+            attn_backend=types.SimpleNamespace(
+                primary=primary_backend,
+                children=[first_child_backend, empty_child_backend],
+            )
+        ),
+    )
+    tbo_batch = types.SimpleNamespace(
+        forward_mode=types.SimpleNamespace(is_mixed=lambda: True),
+        tbo_children=(
+            types.SimpleNamespace(batch_size=2),
+            types.SimpleNamespace(batch_size=0),
+        ),
+    )
+
+    def tbo_original(*_args, **_kwargs):
+        primary_backend.activate()
+        first_child_backend.activate()
+        return forward_result
+
+    with (
+        patch("torch.cuda.Event", side_effect=(ProfileEvent(), ProfileEvent())),
+        patch("nta_runtime.engines.sglang_telemetry.record_forward") as record_forward,
+    ):
+        assert (
+            _profile_forward(tbo_original, tbo_runner, tbo_batch) is forward_result
+        )
+    record_forward.assert_called_once_with("staging_mixed", 1.25)
+    assert (primary_backend.cursor_calls, primary_backend.classify_calls) == (1, 1)
+    assert (
+        first_child_backend.cursor_calls,
+        first_child_backend.classify_calls,
+    ) == (1, 1)
+    assert (empty_child_backend.cursor_calls, empty_child_backend.classify_calls) == (
+        0,
+        0,
+    )
+
+    throwing_runner = types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(
+            attn_backend=types.SimpleNamespace(
+                forward_profile_cursor=lambda: (_ for _ in ()).throw(
+                    RuntimeError("classification fault")
+                ),
+                external_forward_since=lambda _cursor: False,
+            )
+        )
+    )
+    with (
+        patch("nta_runtime.plugins.sglang._observability_degraded") as degraded,
+        patch(
+            "torch.cuda.Event",
+            side_effect=AssertionError("classification failure created CUDA events"),
+        ),
+    ):
+        assert (
+            _profile_forward(
+                lambda *_args, **_kwargs: forward_result,
+                throwing_runner,
+                profiled_batch,
+            )
+            is forward_result
+        )
+    assert degraded.call_args.args[0] == "forward_profile_classification"
+
+    post_classification_runner = types.SimpleNamespace(
+        model_runner=types.SimpleNamespace(
+            attn_backend=types.SimpleNamespace(
+                forward_profile_cursor=lambda: 0,
+                external_forward_since=lambda _cursor: (_ for _ in ()).throw(
+                    RuntimeError("post-forward classification fault")
+                ),
+            )
+        )
+    )
+    with (
+        patch("torch.cuda.Event", side_effect=(ProfileEvent(), ProfileEvent())),
+        patch("nta_runtime.plugins.sglang._observability_degraded") as degraded,
+        patch("nta_runtime.engines.sglang_telemetry.record_forward") as record_forward,
+    ):
+        assert (
+            _profile_forward(
+                lambda *_args, **_kwargs: forward_result,
+                post_classification_runner,
+                profiled_batch,
+            )
+            is forward_result
+        )
+    assert degraded.call_args.args[0] == "forward_profile_classification"
+    record_forward.assert_not_called()
 
     from nta_runtime.plugins.sglang import (
         _ABORT_TARGET,
@@ -1024,8 +1227,10 @@ def main() -> None:
     )
     from nta_runtime.execution_protocol import ProtocolKind
     from nta_runtime.engines.sglang_state import (
-        _ActiveBatch,
+        SglangForwardEpoch,
+        SglangForwardPlan,
     )
+    from nta_runtime.engines.sglang_lifecycle import SglangForwardLifecycle
     from nta_runtime.engines.sglang_graphs import (
         DemandGraphCache,
         demand_graph_key,
@@ -1061,6 +1266,28 @@ def main() -> None:
     from nta_runtime.nvme_materialization import NvmeSlotLifetime
     from nta_runtime.resource_contract import ResourceCapability
     from nta_runtime.flashinfer_schedule import Schedule
+
+    def forward_epoch(
+        *,
+        bindings=(),
+        semantic_plans=None,
+        pending_host_load=None,
+        host_execution=None,
+        grouping="request",
+        lease_transfer_rows=0,
+        **execution_state,
+    ):
+        return SglangForwardEpoch(
+            plan=SglangForwardPlan(
+                bindings=bindings,
+                semantic_plans={} if semantic_plans is None else semantic_plans,
+                pending_host_load=pending_host_load,
+                host_execution=host_execution,
+                grouping=grouping,
+                lease_transfer_rows=lease_transfer_rows,
+            ),
+            **execution_state,
+        )
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
     assert SglangLayerServiceCalibration.shape_key(
@@ -1230,72 +1457,104 @@ def main() -> None:
             del self.live[pending.consumer_index]
             return True
 
+    class LifecycleRequestAdapter:
+        last_publish_count = 0
+        last_metadata_publish_count = 0
+
+    def install_lifecycle(
+        backend,
+        batch,
+        hicache,
+        *,
+        stats,
+        wrapper_aliases=(),
+    ):
+        lifecycle = SglangForwardLifecycle(
+            request_adapter=LifecycleRequestAdapter(),
+            hicache=hicache,
+            granularity=object(),
+            model_layer_count=36,
+            stats=stats,
+        )
+        lifecycle.activate(batch)
+        lifecycle._engine_batch = object()
+        lifecycle._wrapper_aliases.update(wrapper_aliases)
+        backend._forward_lifecycle = lifecycle
+        return lifecycle
+
     def lifecycle_backend(batch, hicache):
         backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
-        backend._active_batch = batch
-        backend._current_engine_batch = object()
-        backend._stock_wrapper_for_typed = {17: object()}
         backend._hicache = hicache
+        backend._nvme_pipeline = None
         backend._cuda_graph_mode = False
         backend._stats = {
             "forward_lifecycle_completions": 0,
             "forward_lifecycle_aborts": 0,
         }
+        install_lifecycle(
+            backend,
+            batch,
+            hicache,
+            stats=backend._stats,
+            wrapper_aliases=((17, object()),),
+        )
         return backend
 
-    unfinished_batch = _ActiveBatch(
+    unfinished_batch = forward_epoch(
         bindings=(),
         semantic_plans={},
         pending_host_load=None,
         stream_ordered_epoch=object(),
     )
     unfinished_backend = lifecycle_backend(unfinished_batch, LifecycleHiCache())
-    unfinished_engine_batch = unfinished_backend._current_engine_batch
+    unfinished_lifecycle = unfinished_backend._forward_lifecycle
+    unfinished_engine_batch = unfinished_lifecycle.engine_batch
     try:
         unfinished_backend._begin_forward()
     except RuntimeError as error:
         assert "stream-ordered work window" in str(error)
     else:
         raise AssertionError("a new forward replaced an unfinished work epoch")
-    assert unfinished_backend._active_batch is unfinished_batch
-    assert unfinished_backend._current_engine_batch is unfinished_engine_batch
-    assert unfinished_backend._stock_wrapper_for_typed
+    assert unfinished_lifecycle.active is unfinished_batch
+    assert unfinished_lifecycle.engine_batch is unfinished_engine_batch
+    assert unfinished_lifecycle.wrapper_alias_count == 1
 
     live_pending = types.SimpleNamespace(consumer_index=23)
-    live_batch = _ActiveBatch(
+    live_batch = forward_epoch(
         bindings=(),
         semantic_plans={},
         pending_host_load=live_pending,
     )
     live_hicache = LifecycleHiCache(live_pending)
     live_backend = lifecycle_backend(live_batch, live_hicache)
-    live_engine_batch = live_backend._current_engine_batch
+    live_lifecycle = live_backend._forward_lifecycle
+    live_engine_batch = live_lifecycle.engine_batch
     try:
         live_backend._begin_forward()
     except RuntimeError as error:
         assert "HiCache acquisition lease" in str(error)
     else:
         raise AssertionError("a new forward replaced a live HiCache lease")
-    assert live_backend._active_batch is live_batch
-    assert live_backend._current_engine_batch is live_engine_batch
+    assert live_lifecycle.active is live_batch
+    assert live_lifecycle.engine_batch is live_engine_batch
     assert live_hicache.get(live_pending.consumer_index) is live_pending
 
     retired_pending = types.SimpleNamespace(consumer_index=29)
-    finished_batch = _ActiveBatch(
+    finished_batch = forward_epoch(
         bindings=(),
         semantic_plans={},
         pending_host_load=retired_pending,
     )
     finished_backend = lifecycle_backend(finished_batch, LifecycleHiCache())
     finished_backend._finish_forward(finished_batch)
-    assert finished_backend._active_batch is None
-    assert finished_backend._current_engine_batch is None
-    assert finished_backend._stock_wrapper_for_typed == {}
+    assert finished_backend._forward_lifecycle.active is None
+    assert finished_backend._forward_lifecycle.engine_batch is None
+    assert finished_backend._forward_lifecycle.wrapper_alias_count == 0
     assert finished_backend._stats["forward_lifecycle_completions"] == 1
     assert finished_backend._stats["forward_lifecycle_aborts"] == 0
 
     aborted_pending = types.SimpleNamespace(consumer_index=31)
-    aborted_batch = _ActiveBatch(
+    aborted_batch = forward_epoch(
         bindings=(),
         semantic_plans={},
         pending_host_load=aborted_pending,
@@ -1312,9 +1571,9 @@ def main() -> None:
     synchronize.assert_called_once_with()
     assert aborted_hicache.retire_calls == [(aborted_pending, abort_stream)]
     assert aborted_hicache.get(aborted_pending.consumer_index) is None
-    assert aborted_backend._active_batch is None
-    assert aborted_backend._current_engine_batch is None
-    assert aborted_backend._stock_wrapper_for_typed == {}
+    assert aborted_backend._forward_lifecycle.active is None
+    assert aborted_backend._forward_lifecycle.engine_batch is None
+    assert aborted_backend._forward_lifecycle.wrapper_alias_count == 0
     assert aborted_backend._stats["forward_lifecycle_aborts"] == 1
     assert aborted_backend._stats["forward_lifecycle_completions"] == 0
 
@@ -1520,12 +1779,18 @@ def main() -> None:
     wrapper_registry_backend = NtaFlashInferAttnBackend.__new__(
         NtaFlashInferAttnBackend
     )
-    wrapper_registry_backend._stock_wrapper_for_typed = {}
+    wrapper_registry_epoch = forward_epoch(bindings=(), semantic_plans={})
+    install_lifecycle(
+        wrapper_registry_backend,
+        wrapper_registry_epoch,
+        LifecycleHiCache(),
+        stats={},
+    )
     wrapper_registry_owner = SglangPlanMaterializer.__new__(SglangPlanMaterializer)
     wrapper_registry_owner._stock_wrapper_available = (
         wrapper_registry_backend._has_stock_wrapper
     )
-    wrapper_registry_backend._stock_wrapper_for_typed = {17: object()}
+    wrapper_registry_backend._forward_lifecycle._wrapper_aliases[17] = object()
     assert wrapper_registry_owner._stock_wrapper_available(17)
 
     try:
@@ -1635,7 +1900,7 @@ def main() -> None:
     )
     assert adopted_semantic.topology.work_count == 1
     assert adopted_semantic.indexed_topology is not None
-    adopted_batch = _ActiveBatch(
+    adopted_batch = forward_epoch(
         bindings=(adopted_binding,),
         semantic_plans={101: adopted_semantic},
         pending_host_load=None,
@@ -2122,12 +2387,18 @@ def main() -> None:
 
     validation_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
     validation_wrapper = types.SimpleNamespace()
-    validation_backend._active_batch = _ActiveBatch(
+    validation_epoch = forward_epoch(
         bindings=(adopted_binding,),
         semantic_plans={id(validation_wrapper): adopted_semantic},
         pending_host_load=object(),
     )
     validation_backend._stats = {"semantic_wrapper_plan_lookups": 0}
+    install_lifecycle(
+        validation_backend,
+        validation_epoch,
+        LifecycleHiCache(),
+        stats=validation_backend._stats,
+    )
     geometry = (TensorGeometry(1, 8), TensorGeometry(1, 8))
     for _ in range(3):
         assert (
@@ -2148,6 +2419,14 @@ def main() -> None:
         "hicache_external_batches": 0,
         "stock_prefetched_external_batches": 0,
     }
+    stock_lifecycle = SglangForwardLifecycle(
+        request_adapter=LifecycleRequestAdapter(),
+        hicache=LifecycleHiCache(),
+        granularity=object(),
+        model_layer_count=2,
+        stats=stock_backend._stats,
+    )
+    stock_backend._forward_lifecycle = stock_lifecycle
     prefetched = {0: object(), 1: object()}
     stock_pending = types.SimpleNamespace(
         prefetched_layers=prefetched,
@@ -2157,9 +2436,17 @@ def main() -> None:
         ),
     )
     stock_binding = RequestBinding(0, 0, 1, stable_request_id("stock"))
+    planned_stock_epoch = forward_epoch(
+        bindings=(stock_binding,),
+        semantic_plans={17: object()},
+        pending_host_load=stock_pending,
+        host_execution=object(),
+    )
+    stock_lifecycle.activate(planned_stock_epoch)
     stock_backend._activate_stock_prefetch((stock_binding,), stock_pending)
-    assert stock_backend._active_batch.semantic_plans == {}
-    assert stock_backend._active_batch.pending_host_load is stock_pending
+    assert stock_lifecycle.active is not planned_stock_epoch
+    assert stock_lifecycle.active.semantic_plans == {}
+    assert stock_lifecycle.active.pending_host_load is stock_pending
     assert stock_backend._stats["stock_prefetch_metadata_fastpath_batches"] == 1
     try:
         stock_backend._activate_stock_prefetch(
@@ -2186,7 +2473,7 @@ def main() -> None:
             self.arguments = args
 
     binding = types.SimpleNamespace(request_slot=0)
-    active_batch = _ActiveBatch(
+    active_batch = forward_epoch(
         bindings=(binding,),
         semantic_plans={},
         pending_host_load=None,
@@ -2242,7 +2529,7 @@ def main() -> None:
         mark_consumed=lambda stream: None,
     )
     execution_owner._kernels.modules[id(demand_wrapper)] = "instrumented_demand_acquire"
-    active_batch = _ActiveBatch(
+    active_batch = forward_epoch(
         bindings=(binding,),
         semantic_plans={
             id(demand_wrapper): types.SimpleNamespace(schedule=demand_schedule)

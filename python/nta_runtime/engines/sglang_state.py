@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -194,18 +195,67 @@ class _SemanticWrapperPlan:
             raise ValueError("semantic work topology disagrees with dependencies")
 
 
-@dataclass(kw_only=True)
-class _ActiveBatch:
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SglangForwardPlan:
+    """Immutable semantic and resource identity for one framework forward."""
+
     bindings: tuple[RequestBinding, ...]
-    semantic_plans: dict[int, _SemanticWrapperPlan]
+    semantic_plans: Mapping[int, _SemanticWrapperPlan]
     pending_host_load: PendingHostLoad | None
-    nvme_acquisition: NvmeBatchAcquisition | None = None
     host_execution: HostExecutionPlan | None = None
     grouping: str = "request"
     # Exact operation-local interval required by each FlashInfer work unit.
-    # ``None`` is the canonical resident/direct value. Transport ownership
-    # remains one lease; repeated CTA/head work shares the same typed interval.
+    # Transport ownership remains one lease; repeated CTA/head work shares the
+    # same typed interval.
     lease_transfer_rows: int = 0
+
+    def __post_init__(self) -> None:
+        if self.grouping not in {"request", "tile"}:
+            raise ValueError("SGLang forward plan has an invalid grouping")
+        if self.lease_transfer_rows < 0:
+            raise ValueError("SGLang forward plan has negative lease rows")
+        object.__setattr__(self, "bindings", tuple(self.bindings))
+        object.__setattr__(
+            self,
+            "semantic_plans",
+            MappingProxyType(dict(self.semantic_plans)),
+        )
+
+    def with_wrapper_identity(
+        self, source_to_target: Mapping[int, int]
+    ) -> SglangForwardPlan:
+        """Return the same semantic plan keyed by adopted wrapper identity."""
+
+        mapping = dict(source_to_target)
+        source_ids = set(mapping)
+        target_ids = set(mapping.values())
+        if not mapping or len(target_ids) != len(mapping):
+            raise RuntimeError(
+                "FlashInfer wrapper adoption must be non-empty and injective"
+            )
+        if set(self.semantic_plans) != source_ids:
+            raise RuntimeError(
+                "FlashInfer wrapper adoption does not cover its semantic plans"
+            )
+        remapped = {
+            mapping[source]: value for source, value in self.semantic_plans.items()
+        }
+        return SglangForwardPlan(
+            bindings=self.bindings,
+            semantic_plans=remapped,
+            pending_host_load=self.pending_host_load,
+            host_execution=self.host_execution,
+            grouping=self.grouping,
+            lease_transfer_rows=self.lease_transfer_rows,
+        )
+
+
+@dataclass(kw_only=True, slots=True)
+class SglangForwardEpoch:
+    """Sole mutable execution state for one immutable forward plan."""
+
+    plan: SglangForwardPlan
+    nvme_acquisition: NvmeBatchAcquisition | None = None
     fragment_lookahead: dict[int, _FragmentLookahead] = field(default_factory=dict)
     # One transport submission can publish the same completion fence for
     # several adjacent layers. Once that fence is ordered on the numerical
@@ -264,6 +314,64 @@ class _ActiveBatch:
     stream_ordered_progress_rounds: int = 0
     stream_ordered_layers: int = 0
 
+    @property
+    def bindings(self) -> tuple[RequestBinding, ...]:
+        return self.plan.bindings
+
+    @property
+    def semantic_plans(self) -> Mapping[int, _SemanticWrapperPlan]:
+        return self.plan.semantic_plans
+
+    @property
+    def pending_host_load(self) -> PendingHostLoad | None:
+        return self.plan.pending_host_load
+
+    @property
+    def host_execution(self) -> HostExecutionPlan | None:
+        return self.plan.host_execution
+
+    @property
+    def grouping(self) -> str:
+        return self.plan.grouping
+
+    @property
+    def lease_transfer_rows(self) -> int:
+        return self.plan.lease_transfer_rows
+
+    def require_unstarted(self, operation: str) -> None:
+        """Reject an identity transition after numerical execution can observe it."""
+
+        if not operation:
+            raise ValueError("forward epoch operation must be named")
+        if (
+            self.nvme_acquisition is not None
+            or self.fragment_lookahead
+            or self.ordered_prefetch_event_ids
+            or self.host_layer_templates
+            or self.arriving_partition_key is not None
+            or self.execution is not None
+            or self.verification_session is not None
+            or self.incremental_metadata_setup_ns != 0
+            or self.incremental_setup_observed
+            or self.incremental_setup_observation_ns != 0
+            or self.layer_arrival_event is not None
+            or self.layer_arrival_local_layer != -1
+            or self.deadline_model is not None
+            or self.deadline_model_initialized
+            or self.deadline_frontier is not None
+            or self.native_dispatch_external_layers != 0
+            or self.framework_dispatch_external_layers != 0
+            or self.progressive_consumer_external_layers != 0
+            or self.external_last_local_layer != -1
+            or self.framework_dispatch_seen
+            or self.native_dispatch_nonprefix_seen
+            or self.external_dispatch_recorded
+            or self.stream_ordered_epoch is not None
+            or self.stream_ordered_progress_rounds != 0
+            or self.stream_ordered_layers != 0
+        ):
+            raise RuntimeError(f"SGLang cannot {operation} after execution began")
+
     def adopt_wrapper_identity(self, source_to_target: Mapping[int, int]) -> None:
         """Re-key a validated plan after zero-copy numerical-module adoption.
 
@@ -275,35 +383,5 @@ class _ActiveBatch:
         created; fail closed if that lifecycle boundary has already passed.
         """
 
-        mapping = dict(source_to_target)
-        source_ids = set(mapping)
-        target_ids = set(mapping.values())
-        if not mapping or len(target_ids) != len(mapping):
-            raise RuntimeError(
-                "FlashInfer wrapper adoption must be non-empty and injective"
-            )
-        if set(self.semantic_plans) != source_ids:
-            raise RuntimeError(
-                "FlashInfer wrapper adoption does not cover its semantic plans"
-            )
-        if (
-            self.execution is not None
-            or self.verification_session is not None
-            or self.fragment_lookahead
-            or self.ordered_prefetch_event_ids
-            or self.host_layer_templates
-            or self.arriving_partition_key is not None
-            or self.nvme_acquisition is not None
-        ):
-            raise RuntimeError(
-                "FlashInfer wrapper identity changed after execution began"
-            )
-
-        def remap(values: dict[int, Any], label: str) -> dict[int, Any]:
-            if values and set(values) != source_ids:
-                raise RuntimeError(
-                    f"FlashInfer wrapper adoption does not cover {label}"
-                )
-            return {mapping[source]: value for source, value in values.items()}
-
-        self.semantic_plans = remap(self.semantic_plans, "semantic wrapper plans")
+        self.require_unstarted("adopt FlashInfer wrapper identity")
+        self.plan = self.plan.with_wrapper_identity(source_to_target)

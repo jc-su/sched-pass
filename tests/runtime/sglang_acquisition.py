@@ -9,7 +9,7 @@ from nta_runtime.acquisition_scheduler import LayerAcquisition, LayerAcquisition
 from nta_runtime.engines.sglang_acquisition import (
     SglangHostAcquisitionCoordinator,
 )
-from nta_runtime.engines.sglang_state import _ActiveBatch
+from nta_runtime.engines.sglang_state import SglangForwardEpoch, SglangForwardPlan
 from nta_runtime.execution_planner import HostExecutionMode
 from nta_runtime.execution_protocol import ProtocolKind
 
@@ -178,10 +178,12 @@ def main() -> None:
             if calibrated
             else None
         )
-        batch = _ActiveBatch(
-            bindings=(),
-            semantic_plans={},
-            pending_host_load=frontier_pending,
+        batch = SglangForwardEpoch(
+            plan=SglangForwardPlan(
+                bindings=(),
+                semantic_plans={},
+                pending_host_load=frontier_pending,
+            ),
             deadline_model=model,
             deadline_model_initialized=calibrated,
         )
@@ -197,6 +199,32 @@ def main() -> None:
     modeled_ranges, modeled_stats = exercise_frontier(calibrated=True)
     assert modeled_ranges == [(1, 36)]
     assert modeled_stats["deadline_frontier_published_layers"] == 35
+
+    # A fully published direct/eager lease must not enter calibration or EDF
+    # analysis on every layer.  This is the resident launch thread's stock
+    # external fast path, so even collecting a profile here is a regression.
+    full_owner, _pool, full_transport = coordinator(layer_count=4)
+    full_owner._movers = types.SimpleNamespace(
+        collect_profiles=lambda: (_ for _ in ()).throw(
+            AssertionError("fully published lease entered frontier analysis")
+        )
+    )
+    fully_published = types.SimpleNamespace(
+        controller=types.SimpleNamespace(layer_num=4),
+        prefetched_layers={layer: object() for layer in range(4)},
+        acquisition=None,
+    )
+    full_batch = SglangForwardEpoch(
+        plan=SglangForwardPlan(
+            bindings=(),
+            semantic_plans={},
+            pending_host_load=fully_published,
+        )
+    )
+    for layer in range(4):
+        full_owner.advance_after_attention(fully_published, full_batch, layer)
+    assert full_transport.ranges == []
+    assert full_owner._stats == {}
 
     # Every public publication edge passes the exact frozen plan into the data
     # path; the transport never calls back into planning or allocation.

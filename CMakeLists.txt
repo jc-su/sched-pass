@@ -872,6 +872,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_acquisition.py
     )
     add_test(
+      NAME nta-sglang-lifecycle
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_lifecycle.py
+    )
+    add_test(
       NAME nta-sglang-storage-connector
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_storage_connector.py
@@ -968,6 +973,7 @@ if(NTA_ENABLE_CUDA)
     )
     set_tests_properties(
       nta-request-slots nta-sglang-plugin nta-sglang-calibration
+      nta-sglang-lifecycle
       nta-sglang-storage-connector
       nta-bounded-staging
       nta-qualification-runner
@@ -989,6 +995,10 @@ if(NTA_ENABLE_CUDA)
     )
     set_tests_properties(nta-sglang-calibration PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    )
+    set_tests_properties(nta-sglang-lifecycle PROPERTIES
+      ENVIRONMENT
+        "NTA_RUNTIME_LIBRARY=$<TARGET_FILE:nta-runtime>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
     )
     set_tests_properties(nta-sglang-storage-connector PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"

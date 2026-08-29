@@ -319,51 +319,72 @@ def main() -> None:
         raise AssertionError("coalesced stream events were accepted as token ITL")
 
     sys.path.insert(0, str(ROOT / "python"))
-    from nta_runtime.engines.sglang import NtaFlashInferAttnBackend
-    from nta_runtime.engines.sglang_state import _ActiveBatch
+    from nta_runtime.engines.sglang_lifecycle import SglangForwardLifecycle
+    from nta_runtime.engines.sglang_state import (
+        SglangForwardEpoch,
+        SglangForwardPlan,
+    )
 
-    backend = object.__new__(NtaFlashInferAttnBackend)
-    backend._model_layer_count = 4
-    backend._stats = {
+    dispatch_stats = {
         "native_dispatch_prefix_observations": 0,
         "native_dispatch_nonprefix_batches": 0,
         "progressive_consumer_batch_observations": 0,
         "progressive_consumer_layers": 0,
     }
-    frontier = _ActiveBatch(
-        bindings=(),
-        semantic_plans={},
-        pending_host_load=None,
+    frontier = SglangForwardEpoch(
+        plan=SglangForwardPlan(
+            bindings=(),
+            semantic_plans={},
+            pending_host_load=None,
+        ),
     )
+    frontier_lifecycle = SglangForwardLifecycle(
+        request_adapter=object(),
+        hicache=object(),
+        granularity=object(),
+        model_layer_count=4,
+        stats=dispatch_stats,
+    )
+    frontier_lifecycle.activate(frontier)
     for layer, native in enumerate((True, True, False, False)):
-        backend._record_external_layer_execution(
+        frontier_lifecycle.record_external_dispatch(
             frontier,
             layer,
             native_dispatch=native,
             progressive_consumer=native,
             final_layer=layer == 3,
         )
-    assert backend._stats["native_dispatch_prefix_observations"] == 1
-    assert backend._stats["native_dispatch_prefix_layers_2_batches"] == 1
-    assert backend._stats["progressive_consumer_batch_observations"] == 1
-    assert backend._stats["progressive_consumer_layers"] == 2
-    assert backend._stats["progressive_consumer_layers_2_batches"] == 1
-    nonprefix = _ActiveBatch(
-        bindings=(),
-        semantic_plans={},
-        pending_host_load=None,
+    assert dispatch_stats["native_dispatch_prefix_observations"] == 1
+    assert dispatch_stats["native_dispatch_prefix_layers_2_batches"] == 1
+    assert dispatch_stats["progressive_consumer_batch_observations"] == 1
+    assert dispatch_stats["progressive_consumer_layers"] == 2
+    assert dispatch_stats["progressive_consumer_layers_2_batches"] == 1
+    nonprefix = SglangForwardEpoch(
+        plan=SglangForwardPlan(
+            bindings=(),
+            semantic_plans={},
+            pending_host_load=None,
+        ),
     )
+    nonprefix_lifecycle = SglangForwardLifecycle(
+        request_adapter=object(),
+        hicache=object(),
+        granularity=object(),
+        model_layer_count=4,
+        stats=dispatch_stats,
+    )
+    nonprefix_lifecycle.activate(nonprefix)
     for layer, native in enumerate((False, True, False, True)):
-        backend._record_external_layer_execution(
+        nonprefix_lifecycle.record_external_dispatch(
             nonprefix,
             layer,
             native_dispatch=native,
             progressive_consumer=native,
             final_layer=layer == 3,
         )
-    assert backend._stats["native_dispatch_nonprefix_batches"] == 1
-    assert backend._stats["native_dispatch_nonprefix_layers_2_batches"] == 1
-    assert backend._stats["native_dispatch_prefix_observations"] == 1
+    assert dispatch_stats["native_dispatch_nonprefix_batches"] == 1
+    assert dispatch_stats["native_dispatch_nonprefix_layers_2_batches"] == 1
+    assert dispatch_stats["native_dispatch_prefix_observations"] == 1
 
     churn = tuple((index,) for index in range(12))
     assert tuple(serving._churn_window(churn, 0, 3)) == churn[0:3]

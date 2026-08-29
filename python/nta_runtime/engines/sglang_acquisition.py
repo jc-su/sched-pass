@@ -37,7 +37,7 @@ from nta_runtime.execution_planner import HostExecutionMode
 from nta_runtime.execution_protocol import ProtocolKind
 
 if TYPE_CHECKING:
-    from nta_runtime.engines.sglang_state import _ActiveBatch
+    from nta_runtime.engines.sglang_state import SglangForwardEpoch
 
 
 class SglangHostAcquisitionCoordinator:
@@ -204,7 +204,7 @@ class SglangHostAcquisitionCoordinator:
         pending: PendingHostLoad,
         batch: Any,
         *,
-        active_batch: _ActiveBatch | None = None,
+        active_batch: SglangForwardEpoch | None = None,
     ) -> bool:
         """Bind one calibrated EDF proof to immutable physical ownership."""
 
@@ -458,7 +458,7 @@ class SglangHostAcquisitionCoordinator:
     def advance_after_attention(
         self,
         pending: PendingHostLoad,
-        batch: _ActiveBatch,
+        batch: SglangForwardEpoch,
         completed_local_layer: int,
         *,
         enqueue_fragment: Callable[[], bool] | None = None,
@@ -483,6 +483,12 @@ class SglangHostAcquisitionCoordinator:
             if not acquisition.fully_published:
                 submitted = self.submit(pending)
                 self._add("host_acquisition_refill_jobs", submitted)
+            return
+        # A direct/eager producer has already published every exact layer and
+        # owns no finite acquisition queue. There is nothing for EDF to admit
+        # or refill; rebuilding the same model once per attention layer is pure
+        # launch-thread overhead on the stock fast path.
+        if len(pending.prefetched_layers) == self._model_layer_count:
             return
         if not self._frontier_enabled:
             return
