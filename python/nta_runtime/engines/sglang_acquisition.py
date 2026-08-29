@@ -573,6 +573,21 @@ class SglangHostAcquisitionCoordinator:
                 feasible_end - publish_begin,
             )
 
+        # The frozen service model says this whole prefix completes before its
+        # attention deadlines even if it starts at the current consumer edge.
+        # Previously the dispatcher discarded that result and queried the event
+        # from a CPU thread running many layers ahead of the GPU. Preserve the
+        # model decision explicitly; execution still waits on each producer
+        # fence, so this can affect only consumer form and performance.
+        modeled_ready = set(range(ready_prefix, feasible_end))
+        if not modeled_ready.issubset(pending.prefetched_layers):
+            raise RuntimeError(
+                "deadline-feasible acquisition prefix was not fully published"
+            )
+        newly_modeled = modeled_ready - batch.modeled_ready_by_attention_layers
+        batch.modeled_ready_by_attention_layers.update(modeled_ready)
+        self._add("deadline_frontier_modeled_ready_layers", len(newly_modeled))
+
         fragment_enqueued = False
         if (
             feasible_end == ready_prefix

@@ -1880,16 +1880,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("NTA attention ran without request metadata")
 
         pending = batch.pending_host_load
+        local_layer = int(layer.layer_id) - self._model_start_layer
         prefetched = (
             None
             if pending is None
-            else pending.prefetched_layers.get(
-                int(layer.layer_id) - self._model_start_layer
-            )
+            else pending.prefetched_layers.get(local_layer)
         )
         prefetch_event_ordered = (
             prefetched is not None
             and id(prefetched.ready_event) in batch.ordered_prefetch_event_ids
+        )
+        modeled_ready_by_attention = (
+            prefetched is not None
+            and local_layer in batch.modeled_ready_by_attention_layers
         )
         dispatch = select_attention_dispatch(
             pending=pending,
@@ -1897,7 +1900,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             tier_is_nvme=self._tier_service.is_nvme,
             layer_id=int(layer.layer_id),
             prefetch_event_ordered=prefetch_event_ordered,
+            modeled_ready_by_attention=modeled_ready_by_attention,
         )
+        if modeled_ready_by_attention:
+            self._stats["deadline_frontier_modeled_stock_dispatches"] = (
+                self._stats.get("deadline_frontier_modeled_stock_dispatches", 0) + 1
+            )
         if dispatch.prefetched is not None:
             event_id = id(dispatch.prefetched.ready_event)
             if prefetch_event_ordered:

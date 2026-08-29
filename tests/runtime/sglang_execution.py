@@ -83,6 +83,19 @@ def main() -> None:
     assert not use_preloaded_stock_alias(selected, alias_available=True)
     assert not use_preloaded_stock_alias(selected, alias_available=False)
 
+    # A calibrated EDF result is about the future GPU attention deadline, not
+    # host-side readiness at dispatch time. Preserve that decision and let the
+    # stock stream wait enforce correctness without a racing event query.
+    selected = select_attention_dispatch(
+        pending=pending({2: arriving}),
+        host_execution=execution(dependency=True, overlap=True),
+        tier_is_nvme=False,
+        layer_id=6,
+        modeled_ready_by_attention=True,
+    )
+    assert selected.kind is AttentionDispatchKind.PRELOADED
+    assert arriving_event.queries == 1
+
     # A shared producer fence already ordered on the numerical stream is
     # stronger than a racing host-side query. It must not create a second
     # partial consumer for a later layer in the same transport submission.

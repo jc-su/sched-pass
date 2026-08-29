@@ -514,6 +514,9 @@ def main() -> None:
         "progressive_consumer_batches": 2,
         "progressive_consumer_layers": 2,
         "progressive_consumer_layers_1_batches": 2,
+        "deadline_frontier_modeled_ready_layers": 70,
+        "deadline_frontier_modeled_stock_dispatches": 70,
+        "deadline_frontier_first_missed_layer_sum": 140,
         "profiled_attention_stall_by_layer_ms": {"0": 1.0, "1": 2.0},
         "profiled_attention_max_stall_gpu_ms": 2.0,
     }
@@ -564,6 +567,9 @@ def main() -> None:
         "progressive_consumer_batches": 3,
         "progressive_consumer_layers": 3,
         "progressive_consumer_layers_1_batches": 3,
+        "deadline_frontier_modeled_ready_layers": 105,
+        "deadline_frontier_modeled_stock_dispatches": 105,
+        "deadline_frontier_first_missed_layer_sum": 210,
         "profiled_attention_stall_by_layer_ms": {"0": 1.5, "1": 2.0},
         "profiled_attention_max_stall_gpu_ms": 2.0,
     }
@@ -616,6 +622,9 @@ def main() -> None:
     assert measured["progressive_consumer_batch_observations"] == 1
     assert measured["progressive_consumer_layers"] == 1
     assert measured["progressive_consumer_layers_1_batches"] == 1
+    assert measured["deadline_frontier_modeled_ready_layers"] == 35
+    assert measured["deadline_frontier_modeled_stock_dispatches"] == 35
+    assert measured["deadline_frontier_first_missed_layer_sum"] == 70
     assert measured["profiled_attention_stall_by_layer_ms"] == {"0": 0.5}
     assert "profiled_attention_max_stall_gpu_ms" not in measured
     expected_gib_per_second = 1_189_011_456 / (1 << 30) / 0.028

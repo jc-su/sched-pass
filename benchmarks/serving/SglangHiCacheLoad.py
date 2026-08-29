@@ -475,6 +475,14 @@ def _measurement_delta(
         if name.startswith("progressive_consumer_layers_")
         and name.endswith("_batches")
     )
+    # Frontier fields are all monotone work/accounting counters. Keep this
+    # family-based so adding one scheduler observation cannot silently leak
+    # warmup history into a timed serving window.
+    counter_names.update(
+        name
+        for name in set(final) | set(baseline)
+        if name.startswith("deadline_frontier_")
+    )
     counter_names.update(
         name
         for name in set(final) | set(baseline)

@@ -156,6 +156,7 @@ def select_attention_dispatch(
     tier_is_nvme: bool,
     layer_id: int,
     prefetch_event_ordered: bool = False,
+    modeled_ready_by_attention: bool = False,
 ) -> AttentionDispatch:
     """Select exactly one layer path without submitting CUDA work."""
 
@@ -182,6 +183,7 @@ def select_attention_dispatch(
             and host_execution.uses_dependency_protocol
             and host_execution.overlap_initial
             and not prefetch_event_ordered
+            and not modeled_ready_by_attention
             and not prefetched.ready_event.query()
         )
         return AttentionDispatch(

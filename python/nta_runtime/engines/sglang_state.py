@@ -262,6 +262,14 @@ class SglangForwardEpoch:
     # stream, a racing CPU Event.query must not create another partial
     # consumer for a later layer in the group.
     ordered_prefetch_event_ids: set[int] = field(default_factory=set)
+    # Layers published by the calibrated EDF frontier are predicted to finish
+    # before their numerical deadline.  This is a performance contract, not a
+    # readiness assertion: the stock consumer still orders the producer event,
+    # so model error can add a wait but can never expose incomplete KV.  Keeping
+    # this decision on the forward epoch prevents a launch-ahead CPU
+    # ``Event.query`` from selecting an expensive partial consumer for work that
+    # will be ready when the GPU actually reaches attention.
+    modeled_ready_by_attention_layers: set[int] = field(default_factory=set)
     # Pure orchestration geometry is invariant across layers for one FlashInfer
     # wrapper.  Object addresses and versions are rebound separately by the
     # materializer, so caching this template does not retain tier resources.
@@ -347,6 +355,7 @@ class SglangForwardEpoch:
             self.nvme_acquisition is not None
             or self.fragment_lookahead
             or self.ordered_prefetch_event_ids
+            or self.modeled_ready_by_attention_layers
             or self.host_layer_templates
             or self.arriving_partition_key is not None
             or self.execution is not None

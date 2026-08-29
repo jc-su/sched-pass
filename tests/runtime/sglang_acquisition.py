@@ -151,7 +151,7 @@ def main() -> None:
     # can publish the complete feasible suffix in one transition.
     def exercise_frontier(
         *, calibrated: bool
-    ) -> tuple[list[tuple[int, int]], dict[str, int]]:
+    ) -> tuple[list[tuple[int, int]], dict[str, int], set[int]]:
         frontier_owner, _pool, frontier_transport = coordinator(layer_count=36)
         frontier_owner._movers = types.SimpleNamespace(
             collect_profiles=lambda: None,
@@ -191,14 +191,21 @@ def main() -> None:
             lambda item, **_kwargs: item.transfer_plan
         )
         frontier_owner.advance_after_attention(frontier_pending, batch, 0)
-        return frontier_transport.ranges, frontier_owner._stats
+        return (
+            frontier_transport.ranges,
+            frontier_owner._stats,
+            batch.modeled_ready_by_attention_layers,
+        )
 
-    probe_ranges, probe_stats = exercise_frontier(calibrated=False)
+    probe_ranges, probe_stats, probe_modeled = exercise_frontier(calibrated=False)
     assert probe_ranges == [(1, 5)]
     assert probe_stats["deadline_frontier_calibration_layers"] == 4
-    modeled_ranges, modeled_stats = exercise_frontier(calibrated=True)
+    assert not probe_modeled
+    modeled_ranges, modeled_stats, modeled_layers = exercise_frontier(calibrated=True)
     assert modeled_ranges == [(1, 36)]
     assert modeled_stats["deadline_frontier_published_layers"] == 35
+    assert modeled_stats["deadline_frontier_modeled_ready_layers"] == 35
+    assert modeled_layers == set(range(1, 36))
 
     # A fully published direct/eager lease must not enter calibration or EDF
     # analysis on every layer.  This is the resident launch thread's stock
