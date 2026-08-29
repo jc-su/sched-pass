@@ -1537,11 +1537,20 @@ def main() -> None:
     )
     quiescence_owner._indexed_object_quiescence_event = FakeEvent()
     quiescence_owner._indexed_object_quiescence_recorded = False
-    quiescence_owner.record_host_consumer(fake_stream, final_layer=False)
+    quiescence_owner.record_host_consumer(
+        fake_stream, indexed_objects=False, final_layer=False
+    )
     assert not quiescence_owner._indexed_object_quiescence_recorded
-    quiescence_owner.record_host_consumer(fake_stream, final_layer=True)
+    quiescence_owner.record_host_consumer(
+        fake_stream, indexed_objects=True, final_layer=False
+    )
     assert quiescence_owner._indexed_object_quiescence_recorded
     assert quiescence_owner._indexed_object_quiescence_event.stream is fake_stream
+    quiescence_owner._indexed_object_quiescence_recorded = False
+    quiescence_owner.record_host_consumer(
+        fake_stream, indexed_objects=False, final_layer=True
+    )
+    assert quiescence_owner._indexed_object_quiescence_recorded
 
     # An arriving consumer shares the proactive acquisition's objects and
     # fence.  Consumer activation must not fabricate a second physical copy,

@@ -249,6 +249,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "progressive_consumer_batch_observations",
             "progressive_consumer_batches",
             "progressive_consumer_layers",
+            "request_acquisition_groups",
             "prefetch_mover_plan_calibration_probe_sm_leases",
             "prefetch_mover_plan_calibration_probe_copy_leases",
             "verified_operator_modules",
@@ -299,6 +300,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["native_external_attention_launches"] > 0
             and counters["stock_prefetched_external_attention_launches"] == 0
             and counters["ticketed_incremental_launches"] > 0
+            and counters["request_acquisition_groups"] > 0
             and counters["event_ordered_incremental_launches"] == 0
             and counters["progressive_consumer_batches"] == 0
             and counters["progressive_consumer_layers"] == 0
@@ -311,11 +313,12 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["host_direct_batches"] == 0
             and counters["host_device_bulk_batches"] == 0
             and counters["native_external_attention_launches"] > 0
-            and (
-                counters["ticketed_incremental_launches"]
-                + counters["event_ordered_incremental_launches"]
-                > 0
-            )
+            # A proactive wave event is a useful partial-consumer path, but it
+            # does not prove A3's device-scheduled acquisition boundary.  At
+            # least one layer must materialize exact request acquisition groups
+            # and submit them through the ticketed runtime.
+            and counters["ticketed_incremental_launches"] > 0
+            and counters["request_acquisition_groups"] > 0
             and counters["mixed_dependency_layers"] > 0
             and counters["progressive_consumer_batch_observations"] > 0
             and counters["progressive_consumer_batches"] > 0

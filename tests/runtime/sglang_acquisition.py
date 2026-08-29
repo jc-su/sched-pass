@@ -30,14 +30,18 @@ class FakeTransport:
         for local_layer in range(first_local_layer, last_local_layer):
             pending.prefetched_layers[local_layer] = object()
 
-def coordinator(*, isolated: bool = False):
+def coordinator(
+    *,
+    isolated: bool = False,
+    mode: HostExecutionMode = HostExecutionMode.AUTO,
+):
     pool = object()
     transport = FakeTransport()
     owner = SglangHostAcquisitionCoordinator(
         device_pool=pool,
         execution_config=types.SimpleNamespace(
             protocol=types.SimpleNamespace(kind=ProtocolKind.LATE_BOUND),
-            host_execution_mode=HostExecutionMode.AUTO,
+            host_execution_mode=mode,
         ),
         tenant_isolation_enabled=isolated,
         model_layer_count=4,
@@ -84,6 +88,23 @@ def main() -> None:
     assert owner._stats["initial_acquisition_layers"] == 4
     assert owner._stats["initial_typed_gap_layers"] == 0
     assert owner._stats["lease_acquisition_groups_started"] == 1
+
+    # The explicit dependency-aware causal form cannot be preempted by an
+    # eager whole-layer producer. Its first exact groups are bound only after
+    # typed FlashInfer metadata exists.
+    typed_owner, typed_pool, typed_transport = coordinator(
+        mode=HostExecutionMode.DEPENDENCY_AWARE
+    )
+    typed = pending(typed_pool)
+    typed_owner.account_selection = account
+    typed_owner.transfer_plan = freeze
+    typed_owner.capture(typed)
+    assert typed.acquisition is None
+    assert not typed.prefetched_layers
+    assert not typed_transport.ranges
+    assert typed_owner._stats["initial_acquisition_layers"] == 0
+    assert typed_owner._stats["schedule_bound_acquisition_batches"] == 1
+    assert not typed_owner.prepare_admission(typed, object())
 
     # Tenant accounting must be bound before transport, so capture remains
     # claim-free and publishes no layer for an isolated lease.

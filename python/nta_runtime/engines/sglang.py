@@ -992,20 +992,30 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._stats["semantic_wrapper_plan_lookups"] += 1
         return semantic_elapsed
 
-    def _record_execution_layer(self, layer: Any, *, final_layer: bool) -> None:
+    def _record_execution_layer(
+        self,
+        layer: Any,
+        *,
+        indexed_object_count: int,
+        final_layer: bool,
+    ) -> None:
         """Commit the semantic work boundary after native attention returns."""
         if self._active_batch is None:
             raise RuntimeError("attention returned without a typed work topology")
+        if indexed_object_count < 0:
+            raise ValueError("indexed object count cannot be negative")
         local_layer = int(layer.layer_id) - self._model_start_layer
         verifier = self._active_batch.verification_session
         if verifier is not None:
             self._stats.update(verifier.record_layer_completion(local_layer))
-        # NVMe slots need a predecessor event after every layer; host-indexed
-        # objects need the final consumer edge.  The physical-plan owner
-        # publishes the exact token required by its selected resource.
+        # Native host objects publish a consumer edge before their directory
+        # identity can be replaced. Event-owned layers need only the final
+        # lease edge. The physical-plan owner records exactly that lifetime.
         if self._tier_service.is_host_staged:
             self._require_materializer().record_host_consumer(
-                torch.cuda.current_stream(), final_layer=final_layer
+                torch.cuda.current_stream(),
+                indexed_objects=indexed_object_count != 0,
+                final_layer=final_layer,
             )
 
     def _begin_forward(self) -> None:
@@ -1446,9 +1456,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 if (
                     (pending.acquisition is None or pending.acquisition.model is None)
                     and selected.uses_dependency_protocol
-                    and not self._tenant_isolation_enabled
-                    and self._execution_config.host_execution_mode
-                    is not HostExecutionMode.DEVICE_BULK
+                    and self._host_acquisition.proactive_layer_queue_enabled
                     and self._host_acquisition.prepare_owner(
                         pending,
                         forward_batch,
@@ -2194,7 +2202,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 window_left=window_left,
             )
 
-        self._record_execution_layer(layer, final_layer=final_layer)
+        self._record_execution_layer(
+            layer,
+            indexed_object_count=outcome.indexed_object_count,
+            final_layer=final_layer,
+        )
         if pending is not None:
             self._stats["external_launches"] += 1
             self._stats["native_external_attention_launches"] += 1
@@ -2343,7 +2355,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         self._advance_deadline_frontier(pending, local_layer)
         self._require_materializer().record_host_consumer(
-            stream, final_layer=final_layer
+            stream, indexed_objects=False, final_layer=final_layer
         )
         self._hicache.complete_layer(pending, local_layer)
         if final_layer:
@@ -2415,7 +2427,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 final_layer=final_layer,
             )
             self._require_materializer().record_host_consumer(
-                torch.cuda.current_stream(), final_layer=final_layer
+                torch.cuda.current_stream(),
+                indexed_objects=False,
+                final_layer=final_layer,
             )
             self._host_acquisition.retire_layer(pending, local_layer)
             self._hicache.complete_layer(pending, local_layer)
@@ -2517,7 +2531,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 final_layer=final_layer,
             )
             self._require_materializer().record_host_consumer(
-                torch.cuda.current_stream(), final_layer=final_layer
+                torch.cuda.current_stream(),
+                indexed_objects=False,
+                final_layer=final_layer,
             )
             self._host_acquisition.retire_layer(pending, local_layer)
             self._hicache.complete_layer(pending, local_layer)

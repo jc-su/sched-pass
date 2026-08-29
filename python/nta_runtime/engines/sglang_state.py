@@ -256,9 +256,10 @@ class _ActiveBatch:
     framework_dispatch_seen: bool = False
     native_dispatch_nonprefix_seen: bool = False
     external_dispatch_recorded: bool = False
-    # Stream-ordered numerical kernels consume one immutable work topology for
-    # the whole forward. The latest epoch owns the device ticket window; one
-    # final launch retires it after every same-stream layer has completed.
+    # Event-owned numerical kernels can consume one immutable work topology for
+    # the whole forward without rebinding runtime objects. Native indexed
+    # acquisition instead retires per layer before its directory slots are
+    # reused, so it never installs an epoch here.
     stream_ordered_epoch: FlashInferLayerEpoch | None = None
     stream_ordered_progress_rounds: int = 0
     stream_ordered_layers: int = 0

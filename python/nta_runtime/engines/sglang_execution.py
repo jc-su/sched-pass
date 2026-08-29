@@ -65,6 +65,7 @@ class AttentionDispatchOutcome:
     """Execution facts consumed by the framework-owned layer lifecycle."""
 
     epoch: FlashInferLayerEpoch | None = None
+    indexed_object_count: int = 0
     progress_rounds: int = 0
     progressive_consumer: bool = False
     output: torch.Tensor | None = None
@@ -869,6 +870,7 @@ class SglangAttentionExecutor:
         )
         return AttentionDispatchOutcome(
             epoch=prepared.epoch,
+            indexed_object_count=prepared.object_count,
             progress_rounds=prepared.progress_rounds,
             progressive_consumer=prepared.template.progressive_consumer,
             output=output,
@@ -1003,6 +1005,11 @@ class SglangAttentionExecutor:
         )
         coalesce_stream_retirement = (
             self._config.stream_ordered_retirement
+            # Native indexed acquisition owns per-layer object issue counts,
+            # work tickets, and request/tenant byte credits. Those states must
+            # complete before the directory slots are rebound. Only an
+            # event-owned arriving consumer has no object state to retire.
+            and object_count == 0
             and not collect_progress
             and not verify_transfer
         )

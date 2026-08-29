@@ -65,6 +65,27 @@ class SglangHostAcquisitionCoordinator:
         self._transport = transport
         self._stats = stats
 
+    @property
+    def proactive_layer_queue_enabled(self) -> bool:
+        """Return whether capture may submit whole-layer Host transfers.
+
+        AUTO retains the production eager fast path: a later metadata decision
+        may consume a completed layer through the stock alias or attach typed
+        work to an in-flight producer.  DIRECT is explicitly that same physical
+        path.  DEVICE_BULK and DEPENDENCY_AWARE are causal execution forms whose
+        demand must be discovered and acquired by the typed runtime; eagerly
+        publishing every layer would erase the boundary those forms claim to
+        measure.  Tenant isolation likewise requires request accounting before
+        transport can reserve bytes.
+        """
+
+        return (
+            self._execution_config.protocol.kind is ProtocolKind.LATE_BOUND
+            and not self._tenant_isolation_enabled
+            and self._execution_config.host_execution_mode
+            in {HostExecutionMode.AUTO, HostExecutionMode.DIRECT}
+        )
+
     def capture(self, pending: PendingHostLoad) -> None:
         """Capture physical ownership and start any unconditional acquisition."""
 
@@ -75,17 +96,11 @@ class SglangHostAcquisitionCoordinator:
             raise RuntimeError("HiCache load and model layer counts disagree")
         self.account_selection(pending)
         conventional = self._execution_config.protocol.kind is ProtocolKind.CONVENTIONAL
-        eager_dense = (
-            not conventional
-            and not self._tenant_isolation_enabled
-            and self._execution_config.host_execution_mode
-            is not HostExecutionMode.DEVICE_BULK
-        )
         initial_layers = 0
         if conventional:
             self.publish_range(pending, 0, layer_count)
             initial_layers = layer_count
-        elif eager_dense:
+        elif self.proactive_layer_queue_enabled:
             # Descriptor ownership is frozen before submission.  No active
             # ForwardBatch exists at this edge, so mover selection can use only
             # deployment-local observations and never stale batch state.
@@ -219,11 +234,7 @@ class SglangHostAcquisitionCoordinator:
     def prepare_admission(self, pending: PendingHostLoad, batch: Any) -> bool:
         """Prepare descriptors only when admission has a usable model."""
 
-        if (
-            self._tenant_isolation_enabled
-            or self._execution_config.host_execution_mode
-            is HostExecutionMode.DEVICE_BULK
-        ):
+        if not self.proactive_layer_queue_enabled:
             return False
         already_prepared = pending.acquisition is not None
         ready = self.prepare_owner(pending, batch)

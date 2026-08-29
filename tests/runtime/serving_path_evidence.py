@@ -53,9 +53,10 @@ def _arm_report(arm: str) -> dict:
             36 if arm == "A1" else 35 if arm == "A3" else 0
         ),
         "ticketed_incremental_launches": (
-            0 if arm in {"A1", "A3"} else 36
+            0 if arm == "A1" else 1 if arm == "A3" else 36
         ),
         "event_ordered_incremental_launches": 1 if arm == "A3" else 0,
+        "request_acquisition_groups": 0 if arm == "A1" else 1,
         "mixed_dependency_layers": 1 if arm == "A3" else 0,
         "progressive_consumer_batch_observations": 1,
         "progressive_consumer_batches": 1 if arm == "A3" else 0,
@@ -79,6 +80,23 @@ def main() -> None:
         assert "A2" in str(error)
     else:
         raise AssertionError("a progressive run passed as device-bulk")
+    ungrouped_bulk = _arm_report("A2")
+    ungrouped_bulk["engine_stats"][0]["request_acquisition_groups"] = 0
+    try:
+        validate_arm_result(ungrouped_bulk, "A2")
+    except ValueError as error:
+        assert "A2" in str(error)
+    else:
+        raise AssertionError("an ungrouped bulk launch passed as exact A2")
+    event_only = _arm_report("A3")
+    event_only["engine_stats"][0]["ticketed_incremental_launches"] = 0
+    event_only["engine_stats"][0]["request_acquisition_groups"] = 0
+    try:
+        validate_arm_result(event_only, "A3")
+    except ValueError as error:
+        assert "A3" in str(error)
+    else:
+        raise AssertionError("an event-only proactive prefetch passed as A3")
     calibration = _arm_report("A3")
     calibration["engine_stats"][0][
         "prefetch_mover_plan_calibration_probe_sm_leases"

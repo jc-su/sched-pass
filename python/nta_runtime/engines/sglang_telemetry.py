@@ -400,7 +400,11 @@ def initial_engine_stats(
         "host_execution_selection": "measured_direct_or_incremental",
         "overlap_enabled": config.overlap_enabled,
         "frontier_enabled": config.frontier_enabled,
-        "layer_scheduler": "deadline_edf",
+        # Layer deadlines are strictly ordered by transformer execution, so
+        # EDF proves feasibility but does not create a different layer order.
+        # Fine-grained request/group arbitration lives in the typed runtime.
+        "layer_scheduler": "structural_layer_order",
+        "layer_feasibility_test": "simultaneous_release_edf",
         "fragment_enabled": config.fragment_enabled,
         "demand_overlap_policy": config.demand_overlap_policy,
         "stream_ordered_retirement_enabled": config.stream_ordered_retirement_enabled,

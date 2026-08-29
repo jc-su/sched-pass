@@ -343,6 +343,7 @@ def main() -> None:
     )
     assert host_outcome.output == "host-output"
     assert host_outcome.epoch is host_epoch
+    assert host_outcome.indexed_object_count == 3
     assert host_outcome.progress_rounds == 2
     assert host_outcome.progressive_consumer
     assert host_outcome.setup_dispatch_elapsed_ns == 17

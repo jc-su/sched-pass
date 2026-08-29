@@ -242,11 +242,15 @@ class SglangPlanMaterializer:
         return tuple(errors)
 
     def record_host_consumer(
-        self, stream: torch.cuda.Stream, *, final_layer: bool
+        self,
+        stream: torch.cuda.Stream,
+        *,
+        indexed_objects: bool,
+        final_layer: bool,
     ) -> None:
-        """Fence the final host-indexed directory consumer."""
+        """Publish stream-ordered indexed-object reuse and final lifetime."""
 
-        if final_layer:
+        if indexed_objects or final_layer:
             self._require_indexed_quiescence_event().record(stream)
             self._indexed_object_quiescence_recorded = True
 
