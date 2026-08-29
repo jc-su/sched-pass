@@ -1041,6 +1041,9 @@ def main() -> None:
         SglangVerificationConfig,
         incremental_calibration_probe_count,
     )
+    from nta_runtime.engines.sglang_calibration import (
+        SglangLayerServiceCalibration,
+    )
     from nta_runtime.engines.sglang_execution import SglangAttentionExecutor
     from nta_runtime.engines.sglang_semantics import (
         build_semantic_wrapper_plan,
@@ -1061,17 +1064,17 @@ def main() -> None:
     from nta_runtime.flashinfer_schedule import Schedule
 
     assert NtaFlashInferAttnBackend.__name__ == "NtaFlashInferAttnBackend"
-    assert NtaFlashInferAttnBackend._acquisition_shape_key(
+    assert SglangLayerServiceCalibration.shape_key(
         types.SimpleNamespace(reqs=(object(), object()), extend_num_tokens=7)
     ) == ("extend", 7, 2)
-    assert NtaFlashInferAttnBackend._acquisition_shape_key(
+    assert SglangLayerServiceCalibration.shape_key(
         types.SimpleNamespace(batch_size=2, extend_num_tokens=7)
     ) == ("extend", 7, 2)
-    assert NtaFlashInferAttnBackend._acquisition_shape_key(
+    assert SglangLayerServiceCalibration.shape_key(
         types.SimpleNamespace(batch_size=0, rids=(1, 2), extend_num_tokens=7)
     ) == ("extend", 7, 2)
     assert (
-        NtaFlashInferAttnBackend._acquisition_shape_key(
+        SglangLayerServiceCalibration.shape_key(
             types.SimpleNamespace(batch_size=2, extend_num_tokens=0)
         )
         is None
@@ -1606,7 +1609,10 @@ def main() -> None:
             collect_profiles=lambda: None,
             lease_calibrated=lambda _pending: False,
         )
-        backend._collect_layer_service_profiles = lambda: None
+        backend._layer_calibration = types.SimpleNamespace(
+            collect=lambda: None,
+            curve=lambda _key: None,
+        )
         calls: list[tuple[int, int]] = []
 
         def prepare(
@@ -1714,14 +1720,26 @@ def main() -> None:
         def pending_profile_count(self) -> int:
             return len(self.profiles)
 
+    class PendingLayerProfiles:
+        def __init__(self, profiles, collect) -> None:
+            self.profiles = profiles
+            self._collect = collect
+
+        @property
+        def pending_count(self) -> int:
+            return len(self.profiles)
+
+        def collect(self) -> None:
+            self._collect()
+
     boundary_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
     boundary_movers = PendingMoverProfiles()
     boundary_backend._host_movers = boundary_movers
     boundary_backend._transfer_profiles = [object()]
     boundary_backend._operator_profiles = [object()]
-    boundary_backend._layer_service_profiles = [object()]
     boundary_backend._barrier_profiles = [object()]
     boundary_calls = []
+    boundary_layer_profiles = [object()]
 
     def retire_transfer_profiles() -> None:
         boundary_calls.append("transfer")
@@ -1731,7 +1749,7 @@ def main() -> None:
 
     def retire_layer_profiles() -> None:
         boundary_calls.append("layer")
-        boundary_backend._layer_service_profiles.clear()
+        boundary_layer_profiles.clear()
 
     def retire_barrier_profiles(*, already_synchronized: bool = False) -> None:
         assert already_synchronized
@@ -1739,7 +1757,9 @@ def main() -> None:
         boundary_backend._barrier_profiles.clear()
 
     boundary_backend._collect_transfer_profiles = retire_transfer_profiles
-    boundary_backend._collect_layer_service_profiles = retire_layer_profiles
+    boundary_backend._layer_calibration = PendingLayerProfiles(
+        boundary_layer_profiles, retire_layer_profiles
+    )
     boundary_backend._collect_barrier_profiles = retire_barrier_profiles
     with patch("torch.cuda.synchronize", lambda: boundary_calls.append("sync")):
         boundary_backend._quiesce_observation_boundary()
@@ -1749,10 +1769,9 @@ def main() -> None:
     stale_boundary._host_movers = PendingMoverProfiles()
     stale_boundary._transfer_profiles = []
     stale_boundary._operator_profiles = []
-    stale_boundary._layer_service_profiles = []
     stale_boundary._barrier_profiles = []
     stale_boundary._collect_transfer_profiles = lambda: None
-    stale_boundary._collect_layer_service_profiles = lambda: None
+    stale_boundary._layer_calibration = PendingLayerProfiles([], lambda: None)
     stale_boundary._collect_barrier_profiles = lambda **_kwargs: None
     with patch("torch.cuda.synchronize", lambda: None):
         try:

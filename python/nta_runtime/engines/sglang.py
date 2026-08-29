@@ -62,8 +62,8 @@ from nta_runtime.engines.sglang_state import (
     _ActiveBatch,
     _BarrierProfile,
     _FragmentLookahead,
-    _LayerServiceProfile,
 )
+from nta_runtime.engines.sglang_calibration import SglangLayerServiceCalibration
 from nta_runtime.engines.sglang_graphs import DemandGraphCache
 from nta_runtime.engines.sglang_execution import (
     AttentionDispatchKind,
@@ -285,11 +285,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         host_mover_policy = tuning.host_mover_policy
         host_mover_default_service_model = tuning.host_mover_default_service_model
         host_mover_calibration_samples = tuning.host_mover_calibration_samples
-        self._layer_service_minimum_samples = tuning.layer_service_minimum_samples
-        self._layer_service_maximum_samples = tuning.layer_service_maximum_samples
-        self._layer_service_curves: dict[
-            tuple[str, int, int], AcquisitionServiceCurve
-        ] = {}
+        layer_service_minimum_samples = tuning.layer_service_minimum_samples
+        layer_service_maximum_samples = tuning.layer_service_maximum_samples
         self._copy_engine_max_operations = tuning.copy_engine_max_operations
         self._indexed_copy_target_bytes = tuning.indexed_copy_target_bytes
         self._indexed_copy_max_blocks = tuning.indexed_copy_max_blocks
@@ -361,8 +358,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 host_mover_copy_operation_ns=mover_model.copy_operation_ns,
                 host_mover_hybrid_join_ns=mover_model.hybrid_join_ns,
                 host_mover_minimum_gain=mover_model.minimum_gain,
-                layer_service_minimum_samples=self._layer_service_minimum_samples,
-                layer_service_maximum_samples=self._layer_service_maximum_samples,
+                layer_service_minimum_samples=layer_service_minimum_samples,
+                layer_service_maximum_samples=layer_service_maximum_samples,
                 indexed_copy_target_bytes=self._indexed_copy_target_bytes,
                 indexed_copy_max_blocks=self._indexed_copy_max_blocks,
                 frontier_layers_per_wave=self._frontier_layers_per_wave,
@@ -373,6 +370,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 revision=observability.revision,
             ),
             self._tier_service.stats(),
+        )
+        self._layer_calibration = SglangLayerServiceCalibration(
+            enabled=self._tier_service.is_host_staged,
+            minimum_samples=layer_service_minimum_samples,
+            maximum_samples=layer_service_maximum_samples,
+            model_start_layer=self._model_start_layer,
+            model_layer_count=self._model_layer_count,
+            stats=self._stats,
         )
         self._attention_verifier = SglangAttentionVerifier(
             decode_use_tensor_cores=self.decode_use_tensor_cores,
@@ -498,7 +503,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             transport_program=self._require_kernels().transport_program,
             collect_barrier_profiles=self._collect_barrier_profiles,
         )
-        self._layer_service_profiles: list[_LayerServiceProfile] = []
         self._operator_profiles: list[
             tuple[torch.cuda.Event, torch.cuda.Event, str, int]
         ] = []
@@ -703,11 +707,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if acquisition is not None and acquisition.model is not None:
             return acquisition.model
         self._host_movers.collect_profiles()
-        self._collect_layer_service_profiles()
+        self._layer_calibration.collect()
         mover = pending.mover_plan
         if mover is None or not pending.layer_bytes or not pending.row_bytes_by_layer:
             return None
-        curve = self._admission_shape_curve(batch)
+        curve = self._layer_calibration.curve_for_batch(batch)
         if curve is None:
             return None
         model = self._deadline_model_for_curve(pending, curve)
@@ -760,28 +764,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             inter_layer_compute_ns=curve.conservative_interval_ns,
         )
 
-    def _admission_shape_curve(self, batch: Any) -> AcquisitionServiceCurve | None:
-        key = self._acquisition_shape_key(batch)
-        if key is None:
-            return None
-        curve = self._layer_service_curves.get(key)
-        return curve if curve is not None and curve.calibrated else None
-
-    @staticmethod
-    def _acquisition_shape_key(batch: Any) -> tuple[str, int, int] | None:
-        """Resolve the same extend key at scheduler and ForwardBatch seams."""
-
-        requests = tuple(getattr(batch, "reqs", ()) or ())
-        query_rows = getattr(batch, "extend_num_tokens", None)
-        batch_size = len(requests)
-        if batch_size == 0:
-            batch_size = int(getattr(batch, "batch_size", 0) or 0)
-        if batch_size == 0:
-            batch_size = len(tuple(getattr(batch, "rids", ()) or ()))
-        if batch_size <= 0 or query_rows is None or int(query_rows) <= 0:
-            return None
-        return ("extend", int(query_rows), batch_size)
-
     def _prepare_host_acquisition_owner(
         self, pending: PendingHostLoad, batch: Any
     ) -> bool:
@@ -792,8 +774,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             return True
         if acquisition is None and pending.prefetched_layers:
             return False
-        shape_key = self._acquisition_shape_key(batch)
-        curve = self._admission_shape_curve(batch)
+        shape_key = self._layer_calibration.shape_key(batch)
+        curve = self._layer_calibration.curve_for_batch(batch)
         if shape_key is None or curve is None:
             self._stats["host_acquisition_shape_uncalibrated"] = (
                 self._stats.get("host_acquisition_shape_uncalibrated", 0) + 1
@@ -973,7 +955,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # invisible to the measured plan (and left shutdown as the first point
         # that committed them).
         committed_before = int(self._stats["layer_service_profiled_intervals"])
-        self._collect_layer_service_profiles()
+        self._layer_calibration.collect()
         self._stats["layer_service_retirement_commits"] += (
             int(self._stats["layer_service_profiled_intervals"]) - committed_before
         )
@@ -1021,13 +1003,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
         torch.cuda.synchronize()
         self._collect_transfer_profiles()
-        self._collect_layer_service_profiles()
+        self._layer_calibration.collect()
         self._collect_barrier_profiles(already_synchronized=True)
         pending = {
             "mover": self._host_movers.pending_profile_count,
             "transfer": len(self._transfer_profiles),
             "operator": len(self._operator_profiles),
-            "layer_service": len(self._layer_service_profiles),
+            "layer_service": self._layer_calibration.pending_count,
             "barrier": len(self._barrier_profiles),
         }
         pending = {name: count for name, count in pending.items() if count}
@@ -1963,78 +1945,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._active_batch = planned.batch
         return planned.host_execution
 
-    def _collect_layer_service_profiles(self) -> None:
-        """Retire completed attention-arrival gaps without synchronizing."""
-
-        pending: list[_LayerServiceProfile] = []
-        for profile in self._layer_service_profiles:
-            if not profile.finish.query():
-                pending.append(profile)
-                continue
-            elapsed_ns = max(
-                1, round(profile.start.elapsed_time(profile.finish) * 1_000_000.0)
-            )
-            curve = self._layer_service_curves.get(
-                profile.key,
-                AcquisitionServiceCurve(
-                    minimum_samples=self._layer_service_minimum_samples,
-                    maximum_samples=self._layer_service_maximum_samples,
-                ),
-            ).with_observation(elapsed_ns)
-            self._layer_service_curves[profile.key] = curve
-            self._stats["layer_service_profiled_intervals"] += 1
-        self._layer_service_profiles = pending
-        calibrated = tuple(
-            curve for curve in self._layer_service_curves.values() if curve.calibrated
-        )
-        self._stats["layer_service_calibrated_shapes"] = len(calibrated)
-
-    def _record_layer_arrival(
-        self, phase: str, query: torch.Tensor, layer: Any
-    ) -> None:
-        """Sample bounded per-layer compute slack for one exact forward shape."""
-
-        batch = self._active_batch
-        if (
-            batch is None
-            or batch.pending_host_load is None
-            or not self._tier_service.is_host_staged
-        ):
-            return
-        query_rows = int(query.shape[0])
-        key = (phase, query_rows, len(batch.bindings))
-        if min(query_rows, len(batch.bindings)) <= 0:
-            raise RuntimeError("layer service calibration has an empty forward")
-        if batch.layer_service_key is not None and batch.layer_service_key != key:
-            raise RuntimeError("attention shape changed within one model forward")
-        batch.layer_service_key = key
-        curve = self._layer_service_curves.get(
-            key,
-            AcquisitionServiceCurve(
-                minimum_samples=self._layer_service_minimum_samples,
-                maximum_samples=self._layer_service_maximum_samples,
-            ),
-        )
-        inflight = sum(profile.key == key for profile in self._layer_service_profiles)
-        if len(curve.samples_ns) + inflight >= curve.maximum_samples:
-            batch.layer_arrival_event = None
-            return
-
-        local_layer = int(layer.layer_id) - self._model_start_layer
-        if not 0 <= local_layer < self._model_layer_count:
-            raise RuntimeError("attention layer is outside the local model range")
-        arrival = torch.cuda.Event(enable_timing=True)
-        arrival.record(torch.cuda.current_stream())
-        previous = batch.layer_arrival_event
-        if previous is not None:
-            if batch.layer_arrival_local_layer + 1 != local_layer:
-                raise RuntimeError("attention layers did not arrive in model order")
-            self._layer_service_profiles.append(
-                _LayerServiceProfile(previous, arrival, key)
-            )
-        batch.layer_arrival_event = arrival
-        batch.layer_arrival_local_layer = local_layer
-
     def _host_mover_lease_plan(
         self,
         pending: PendingHostLoad,
@@ -2050,7 +1960,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             transfer_count,
             layer_service_key=layer_service_key,
             layer_curve=layer_curve,
-            collect_layer_profiles=self._collect_layer_service_profiles,
+            collect_layer_profiles=self._layer_calibration.collect,
         )
 
     def _host_transfer_lease_plan(
@@ -2166,7 +2076,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         frontier_plan_built = False
         if not batch.deadline_model_initialized:
             self._host_movers.collect_profiles()
-            self._collect_layer_service_profiles()
+            self._layer_calibration.collect()
             if pending.mover_plan is None:
                 # Descriptor preparation is issued only after current attention
                 # is queued, so it is outside the next layer's first-dispatch
@@ -2176,7 +2086,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             curve = (
                 None
                 if batch.layer_service_key is None
-                else self._layer_service_curves.get(batch.layer_service_key)
+                else self._layer_calibration.curve(batch.layer_service_key)
             )
             model = (
                 None
@@ -2857,7 +2767,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "dispatch is disabled"
             )
         if batch.pending_host_load is not None:
-            self._record_layer_arrival("decode", q, layer)
+            self._layer_calibration.record(
+                batch=self._active_batch,
+                phase="decode",
+                query=q,
+                global_layer=int(layer.layer_id),
+            )
         if self._stock_forward:
             pending = batch.pending_host_load
             if pending is None:
@@ -2954,7 +2869,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "dispatch is disabled"
             )
         if batch.pending_host_load is not None:
-            self._record_layer_arrival("extend", q, layer)
+            self._layer_calibration.record(
+                batch=self._active_batch,
+                phase="extend",
+                query=q,
+                global_layer=int(layer.layer_id),
+            )
         if self._stock_forward:
             pending = batch.pending_host_load
             if pending is None:
@@ -3173,20 +3093,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
     def _stats_report(self, *, lifecycle: str = "served") -> dict[str, Any]:
         self._collect_transfer_profiles()
-        self._collect_layer_service_profiles()
+        self._layer_calibration.collect()
         self._collect_barrier_profiles()
         report = dict(self._stats)
         report.update(self._tier_service.stats())
-        report["layer_service_curves"] = [
-            {
-                "phase": key[0],
-                "query_rows": key[1],
-                "batch_size": key[2],
-                "samples": len(curve.samples_ns),
-                "conservative_interval_ns": curve.conservative_interval_ns,
-            }
-            for key, curve in sorted(self._layer_service_curves.items())
-        ]
+        report["layer_service_curves"] = self._layer_calibration.report()
         consumer_contract = _consumer_contract_for_stats(
             report,
             engine_version=self._engine_version,

@@ -102,20 +102,6 @@ class _PrefetchedLayer:
 
 
 @dataclass(frozen=True)
-class _LayerServiceProfile:
-    """One completed attention-arrival interval for a stable forward shape."""
-
-    start: torch.cuda.Event
-    finish: torch.cuda.Event
-    key: tuple[str, int, int]
-
-    def __post_init__(self) -> None:
-        phase, query_rows, batch_size = self.key
-        if phase not in {"decode", "extend"} or min(query_rows, batch_size) <= 0:
-            raise ValueError("layer service profile has an invalid shape key")
-
-
-@dataclass(frozen=True)
 class _BarrierProfile:
     """CUDA event ordering at an explicit producer/consumer wait."""
 
