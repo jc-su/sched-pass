@@ -61,6 +61,7 @@ def _candidate(
     min_resident_output_tokens: int,
     min_external_cached_tokens: int,
     min_external_query_rows: int,
+    max_external_query_rows: int | None,
     external_source: str,
 ) -> dict[str, Any] | None:
     input_tokens = int(row["input_length"])
@@ -85,9 +86,14 @@ def _candidate(
         )
         if cached <= 0:
             return None
+        query_rows = input_tokens - cached
         if (
             cached < min_external_cached_tokens
-            or input_tokens - cached < min_external_query_rows
+            or query_rows < min_external_query_rows
+            or (
+                max_external_query_rows is not None
+                and query_rows > max_external_query_rows
+            )
         ):
             return None
     else:  # pragma: no cover - internal caller invariant
@@ -137,6 +143,7 @@ def _select_diverse(
     min_resident_output_tokens: int,
     min_external_cached_tokens: int,
     min_external_query_rows: int,
+    max_external_query_rows: int | None,
     external_source: str,
 ) -> tuple[list[dict[str, Any]], float]:
     if resident_requests <= 0 or external_requests <= 0:
@@ -157,6 +164,7 @@ def _select_diverse(
                     min_resident_output_tokens=min_resident_output_tokens,
                     min_external_cached_tokens=min_external_cached_tokens,
                     min_external_query_rows=min_external_query_rows,
+                    max_external_query_rows=max_external_query_rows,
                     external_source=external_source,
                 )
             )
@@ -370,6 +378,7 @@ def build_cohort(
     min_resident_output_tokens: int = 1,
     min_external_cached_tokens: int = 1,
     min_external_query_rows: int = 1,
+    max_external_query_rows: int | None = None,
     arrival_mode: str,
     target_rate: float | None = None,
     time_scale: float = 1.0,
@@ -395,6 +404,10 @@ def build_cohort(
         or min_resident_output_tokens <= 0
         or min_external_cached_tokens <= 0
         or min_external_query_rows <= 0
+        or (
+            max_external_query_rows is not None
+            and max_external_query_rows < min_external_query_rows
+        )
         or min_input_tokens > max_input_tokens
         or max_input_tokens >= context_length
         or max_output_tokens >= context_length
@@ -413,6 +426,7 @@ def build_cohort(
         min_resident_output_tokens=min_resident_output_tokens,
         min_external_cached_tokens=min_external_cached_tokens,
         min_external_query_rows=min_external_query_rows,
+        max_external_query_rows=max_external_query_rows,
         external_source=external_source,
     )
     arrival = _assign_arrivals(
@@ -446,6 +460,7 @@ def build_cohort(
             "min_resident_output_tokens": min_resident_output_tokens,
             "min_external_cached_tokens": min_external_cached_tokens,
             "min_external_query_rows": min_external_query_rows,
+            "max_external_query_rows": max_external_query_rows,
             "active_token_budget": active_token_budget,
             "active_tokens": total_active,
             "algorithm": "deterministic_joint_shape_spread_v1",
@@ -512,6 +527,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-resident-output-tokens", type=int, default=1)
     parser.add_argument("--min-external-cached-tokens", type=int, default=1)
     parser.add_argument("--min-external-query-rows", type=int, default=1)
+    parser.add_argument(
+        "--max-external-query-rows",
+        type=int,
+        help=(
+            "optional pre-execution frontier-opportunity bound; records the "
+            "selection as controlled rather than distribution representative"
+        ),
+    )
     parser.add_argument("--active-token-budget", type=int, required=True)
     parser.add_argument("--arrival-mode", choices=ARRIVAL_MODES, required=True)
     parser.add_argument("--target-rate", type=float)
@@ -534,6 +557,7 @@ def main(argv: list[str] | None = None) -> int:
             min_resident_output_tokens=args.min_resident_output_tokens,
             min_external_cached_tokens=args.min_external_cached_tokens,
             min_external_query_rows=args.min_external_query_rows,
+            max_external_query_rows=args.max_external_query_rows,
             arrival_mode=args.arrival_mode,
             target_rate=args.target_rate,
             time_scale=args.time_scale,

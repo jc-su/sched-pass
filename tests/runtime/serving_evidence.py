@@ -423,6 +423,21 @@ def main() -> None:
         == 3
     )
 
+    materialized, materialization_forbidden = (
+        serving._exact_prefix_materialization_inputs(
+            _Tokenizer(),
+            (prefix, (21, 22)),
+            (measured_input, (21, 22, 99, 14)),
+        )
+    )
+    assert tuple(len(value) for value in materialized) == (len(prefix) + 1, 3)
+    assert materialized[0][: len(prefix)] == prefix
+    assert materialized[1][:2] == (21, 22)
+    assert materialized[0][len(prefix)] not in {14, 99}
+    assert materialized[1][2] not in {14, 99}
+    assert materialized[0][len(prefix)] != materialized[1][2]
+    assert {14, 99}.issubset(materialization_forbidden)
+
     baseline = {
         "backend": "nta_flashinfer",
         "snapshot_unix_ns": 100,

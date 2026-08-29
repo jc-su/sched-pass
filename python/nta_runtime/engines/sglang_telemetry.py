@@ -176,6 +176,8 @@ _ZERO_COUNTERS = (
     "stream_ordered_retirement_layers",
     "stream_ordered_retirement_launches",
     "stream_ordered_retirement_batches",
+    "stream_ordered_prefetch_events",
+    "stream_ordered_prefetch_event_reuses",
     "incremental_setup_samples",
     "incremental_initialization_samples",
     "incremental_initialization_setup_ns",

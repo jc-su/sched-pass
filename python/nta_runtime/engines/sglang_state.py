@@ -221,6 +221,11 @@ class _ActiveBatch:
     # remains one lease; repeated CTA/head work shares the same typed interval.
     lease_transfer_rows: int = 0
     fragment_lookahead: dict[int, _FragmentLookahead] = field(default_factory=dict)
+    # One transport submission can publish the same completion fence for
+    # several adjacent layers. Once that fence is ordered on the numerical
+    # stream, a racing CPU Event.query must not create another partial
+    # consumer for a later layer in the group.
+    ordered_prefetch_event_ids: set[int] = field(default_factory=set)
     # Pure orchestration geometry is invariant across layers for one FlashInfer
     # wrapper.  Object addresses and versions are rebound separately by the
     # materializer, so caching this template does not retain tier resources.
@@ -298,6 +303,7 @@ class _ActiveBatch:
             self.execution is not None
             or self.verification_session is not None
             or self.fragment_lookahead
+            or self.ordered_prefetch_event_ids
             or self.host_layer_templates
             or self.arriving_partition_key is not None
             or self.nvme_acquisition is not None

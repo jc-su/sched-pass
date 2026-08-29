@@ -21,6 +21,7 @@ from nta_runtime.flashinfer_schedule import (
     require_supported_version,
 )
 from nta_runtime.hbm_registration import HbmDestinationSlice
+from nta_runtime.indexed_transfer_torch import warm_indexed_tensor_mover
 from nta_runtime.adapters.base import EngineBatch
 from nta_runtime.adapters.sglang import (
     SglangAdapter,
@@ -442,30 +443,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         configured_stats = observability.stats_file
         self._stats_publisher: StatsPublisher | None = None
-        if configured_stats is not None:
-            stats_path = configured_stats
-            if stats_path.suffix:
-                stats_path = stats_path.with_name(
-                    f"{stats_path.stem}.{os.getpid()}{stats_path.suffix}"
-                )
-            else:
-                stats_path = stats_path / f"nta-sglang-{os.getpid()}.json"
-            self._stats_publisher = StatsPublisher(stats_path)
-            # SGLang terminates model workers with a signal on some otherwise
-            # clean Engine shutdown paths, so Python atexit is not a reliable
-            # setup-evidence boundary.  Persist a clearly typed setup snapshot
-            # synchronously; the first served-batch/final report atomically
-            # replaces it with numerical-consumer evidence.
-            setup_report = dict(self._stats)
-            setup_report.update(self._tier_service.stats())
-            setup_report.update(
-                {
-                    "stats_lifecycle": "setup",
-                    "stats_process_id": os.getpid(),
-                    "snapshot_unix_ns": time.time_ns(),
-                }
-            )
-            self._stats_publisher.publish(setup_report, wait=True)
         self._profile_transfer = observability.profile_transfer
         self._profile_index_layout = observability.profile_index_layout
         self._profile_index_min_bytes = observability.profile_index_min_bytes
@@ -594,6 +571,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     host_staged=True,
                     stream=torch.cuda.current_stream(),
                 )
+            if host_mover_policy != "sm":
+                planner_warmup_ns = warm_indexed_tensor_mover(
+                    self.token_to_kv_pool.device,
+                    maximum_rows=int(self.token_to_kv_pool.size),
+                    maximum_copy_runs=self._copy_engine_max_operations // 2,
+                )
+                self._stats["indexed_mover_setup_warmup_ns"] = planner_warmup_ns
+                self._stats["indexed_mover_setup_warmup_rows"] = min(
+                    int(self.token_to_kv_pool.size), 1 << 16
+                )
+                self._stats["indexed_mover_setup_warmup_runs"] = min(
+                    self._copy_engine_max_operations // 2,
+                    int(self.token_to_kv_pool.size),
+                )
         elif self._tier_service.is_nvme:
             # NVMe has no framework-reference numerical fallback: every
             # external batch requires the compiler-verified native consumer.
@@ -604,6 +595,28 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 host_staged=False,
                 stream=torch.cuda.current_stream(),
             )
+        if configured_stats is not None:
+            stats_path = configured_stats
+            if stats_path.suffix:
+                stats_path = stats_path.with_name(
+                    f"{stats_path.stem}.{os.getpid()}{stats_path.suffix}"
+                )
+            else:
+                stats_path = stats_path / f"nta-sglang-{os.getpid()}.json"
+            self._stats_publisher = StatsPublisher(stats_path)
+            # Persist setup evidence only after every setup action, including
+            # typed-module loading and mover-kernel initialization, has either
+            # completed or failed construction.
+            setup_report = dict(self._stats)
+            setup_report.update(self._tier_service.stats())
+            setup_report.update(
+                {
+                    "stats_lifecycle": "setup",
+                    "stats_process_id": os.getpid(),
+                    "snapshot_unix_ns": time.time_ns(),
+                }
+            )
+            self._stats_publisher.publish(setup_report, wait=True)
         atexit.register(self._write_stats)
 
     def _hold_host_load(self, pending: PendingHostLoad) -> None:
@@ -2460,12 +2473,35 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError("NTA attention ran without request metadata")
 
         pending = batch.pending_host_load
+        prefetched = (
+            None
+            if pending is None
+            else pending.prefetched_layers.get(
+                int(layer.layer_id) - self._model_start_layer
+            )
+        )
+        prefetch_event_ordered = (
+            prefetched is not None
+            and id(prefetched.ready_event) in batch.ordered_prefetch_event_ids
+        )
         dispatch = select_attention_dispatch(
             pending=pending,
             host_execution=batch.host_execution,
             tier_is_nvme=self._tier_service.is_nvme,
             layer_id=int(layer.layer_id),
+            prefetch_event_ordered=prefetch_event_ordered,
         )
+        if dispatch.prefetched is not None:
+            event_id = id(dispatch.prefetched.ready_event)
+            if prefetch_event_ordered:
+                self._stats["stream_ordered_prefetch_event_reuses"] = (
+                    self._stats.get("stream_ordered_prefetch_event_reuses", 0) + 1
+                )
+            else:
+                batch.ordered_prefetch_event_ids.add(event_id)
+                self._stats["stream_ordered_prefetch_events"] = (
+                    self._stats.get("stream_ordered_prefetch_events", 0) + 1
+                )
         typed_observation_required = (
             batch.host_execution is not None
             and batch.host_execution.selection_reason == "calibration_probe"

@@ -247,6 +247,8 @@ _MEASUREMENT_COUNTERS = frozenset(
         "stock_attention_launches",
         "stock_prefetch_metadata_fastpath_batches",
         "stock_prefetched_external_attention_launches",
+        "stream_ordered_prefetch_events",
+        "stream_ordered_prefetch_event_reuses",
         "stock_prefetched_external_batches",
         "stock_ready_external_attention_launches",
         "stock_resident_attention_launches",
@@ -1153,6 +1155,55 @@ def _exact_calibration_input(
     return candidate
 
 
+def _exact_prefix_materialization_inputs(
+    tokenizer: Any,
+    prefixes: Sequence[Sequence[int]],
+    measured_inputs: Sequence[Sequence[int]],
+) -> tuple[tuple[TokenInput, ...], set[int]]:
+    """Create one-token branches that materialize every exact timed prefix.
+
+    Submitting a prefix by itself can leave its final input token outside the
+    reusable radix boundary.  A distinct one-token continuation makes the
+    complete prefix reusable without inserting the timed continuation.  One
+    shared forbidden set also prevents materialization and calibration
+    branches from colliding across requests or warmup iterations.
+    """
+
+    if len(prefixes) != len(measured_inputs):
+        raise RuntimeError("prefix materialization inputs disagree")
+    forbidden_first_tokens: set[int] = set()
+    for prefix, measured in zip(prefixes, measured_inputs, strict=True):
+        prefix_ids = tuple(int(value) for value in prefix)
+        measured_ids = tuple(int(value) for value in measured)
+        if (
+            not prefix_ids
+            or measured_ids[: len(prefix_ids)] != prefix_ids
+            or len(measured_ids) <= len(prefix_ids)
+        ):
+            raise RuntimeError(
+                "prefix materialization requires an exact prefix and continuation"
+            )
+        forbidden_first_tokens.add(measured_ids[len(prefix_ids)])
+
+    materialization_inputs: list[TokenInput] = []
+    for index, (prefix, measured) in enumerate(
+        zip(prefixes, measured_inputs, strict=True)
+    ):
+        prefix_ids = tuple(int(value) for value in prefix)
+        measured_ids = tuple(int(value) for value in measured)
+        one_row_shape = prefix_ids + (measured_ids[len(prefix_ids)],)
+        materialization_inputs.append(
+            _exact_calibration_input(
+                tokenizer,
+                prefix_ids,
+                one_row_shape,
+                label=f"prefix-materialization-{index}",
+                forbidden_first_tokens=forbidden_first_tokens,
+            )
+        )
+    return tuple(materialization_inputs), forbidden_first_tokens
+
+
 async def _stream_request(
     engine: Any,
     input_ids: TokenInput,
@@ -1559,6 +1610,12 @@ def main() -> int:
             external_cached_prefix_lengths, external_prompts, strict=True
         )
     ]
+    (
+        external_materialization_prompts,
+        calibration_forbidden_first_tokens,
+    ) = _exact_prefix_materialization_inputs(
+        tokenizer, external_prefixes, external_prompts
+    )
     if any(
         len(prompt) >= _max_request_input_tokens(args.context_length)
         for prompt in [*resident_prompts, *external_prompts]
@@ -1609,14 +1666,13 @@ def main() -> int:
         # SGLang's reusable radix/HiCache prefix is the request input. The
         # generated completion is not itself a prefix of the next request, so
         # it does not provide reliable pressure for this placement phase.
-        # Force at least one page beyond the combined logical working set when
-        # it fits.  If it already exceeds the pool, one churn request is still
-        # retained as an explicit placement perturbation; the subsequent
-        # resident warmup establishes the final device/host split.
-        required_placement_pressure = max(
-            block_size,
-            args.max_total_tokens - combined_cache_tokens + block_size,
-        )
+        # The cohort labels every external request as a host-tier dependency.
+        # Merely crossing the combined working-set size evicts an arbitrary LRU
+        # suffix and can leave a short external prefix entirely on device.  A
+        # pool-sized unique pressure window makes every non-shared external
+        # page older than the eviction frontier.  Warming residents afterwards
+        # then restores only the exact pages shared with the resident set.
+        required_placement_pressure = args.max_total_tokens + block_size
         remaining = max(args.churn_tokens, required_placement_pressure)
         maximum_prompt_tokens = _max_request_input_tokens(args.context_length) - 1
         while remaining > 0:
@@ -1709,15 +1765,15 @@ def main() -> int:
             generation_results(
                 _generate_many(
                     engine,
-                    external_prefixes,
-                    [dict(setup_sampling)] * len(external_prefixes),
+                    external_materialization_prompts,
+                    [dict(setup_sampling)] * len(external_materialization_prompts),
                 )
             )
             generation_results(
                 _generate_many(
                     engine,
-                    external_prefixes,
-                    [dict(setup_sampling)] * len(external_prefixes),
+                    external_materialization_prompts,
+                    [dict(setup_sampling)] * len(external_materialization_prompts),
                 )
             )
 
@@ -1742,11 +1798,27 @@ def main() -> int:
             path as the timed load, but they also perturb the device LRU.  A
             timed external request must not accidentally become a device hit
             merely because a graph warmup touched it.  Repeat the explicit
-            pressure-and-resident-warm protocol after every excluded warmup so
-            placement is a property of the timed phase, not of incidental
-            setup order.
+            placement protocol after every excluded warmup so placement is a
+            property of the timed phase, not of incidental setup order.
+
+            A normalized Bailian cohort has an exact placement contract.  LRU
+            pressure alone cannot reconstruct that contract: a completed
+            calibration may leave a different subset of one shared prefix on
+            device even when the same number of tokens is evicted.  Rebuild
+            the cohort from an empty radix/HiCache state before applying the
+            deterministic pressure sequence.  This is outside the timed
+            window and is applied identically to every causal arm.
             """
 
+            if workload_metadata is not None:
+                flush_result = engine.flush_cache()
+                if not bool(getattr(flush_result, "success", False)):
+                    message = str(getattr(flush_result, "message", ""))
+                    raise RuntimeError(
+                        "failed to reset SGLang cache before rebuilding the "
+                        f"measured placement: {message}"
+                    )
+                warm_external_prefixes()
             for prompt in placement_eviction_prompts:
                 generated_text(_generate_one(engine, prompt, setup_sampling))
             if placement_eviction_prompts:
@@ -1754,12 +1826,6 @@ def main() -> int:
 
         establish_final_placement()
 
-        calibration_first_tokens = [
-            ({prompt[len(prefix)]} if len(prompt) > len(prefix) else set())
-            for prefix, prompt in zip(
-                external_prefixes, external_prompts, strict=True
-            )
-        ]
         calibration_shape_records: list[list[dict[str, int]]] = []
         for warmup in range(args.load_warmup_iterations):
             # Demand graphs warm on the first occurrence and capture on the
@@ -1776,7 +1842,7 @@ def main() -> int:
                         prefix,
                         prompt,
                         label=f"load-calibration-suffix-{warmup}-{index}",
-                        forbidden_first_tokens=calibration_first_tokens[index],
+                        forbidden_first_tokens=calibration_forbidden_first_tokens,
                     )
                 )
                 for index, (prefix, prompt) in enumerate(

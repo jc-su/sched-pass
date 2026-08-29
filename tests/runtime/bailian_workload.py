@@ -414,6 +414,7 @@ def main() -> None:
             context_length=64,
             max_input_tokens=56,
             max_output_tokens=8,
+            max_external_query_rows=16,
             active_token_budget=96,
             arrival_mode="batch_release",
         )
@@ -436,6 +437,12 @@ def main() -> None:
             "resident",
             "external",
         }
+        assert validated_cohort["selection"]["max_external_query_rows"] == 16
+        assert all(
+            row["request_state"] != "external"
+            or row["input_length"] - row["cached_prefix_tokens"] <= 16
+            for row in cohort_rows
+        )
         assert all(row["arrival_seconds"] == 0.0 for row in cohort_rows)
         loaded_cohort = _load_workload(cohort_path, LossyTokenizer())
         assert loaded_cohort.resident_arrival_offsets == (0.0,)

@@ -276,20 +276,43 @@ class SglangHostTransport:
                         self._stats["hybrid_parallel_waves"] += 1
                     if profile_finish is not None and wave_end == last_local_layer:
                         profile_finish.record(self._prefetch_stream)
+                    # A paired one-wave SM launch (and every copy-engine wave)
+                    # completes this whole adjacent layer group at one stream
+                    # position. Publish one shared fence so the consumer sees
+                    # the physical submission boundary rather than several
+                    # equivalent host-polling identities.
+                    shared_completion = (
+                        not use_sm_mover
+                        or transfer_plan.sm_waves_per_layer <= 1
+                    )
+                    shared_ready_event = (
+                        ready_events[wave_end - 1][
+                            max(1, transfer_plan.sm_waves_per_layer) - 1
+                        ]
+                        if shared_completion
+                        else None
+                    )
+                    if shared_ready_event is not None:
+                        shared_ready_event.record(self._prefetch_stream)
                     for ready_layer in range(local_layer, wave_end):
                         key_bytes, value_bytes = layer_geometry[ready_layer]
                         layer_events = ready_events[ready_layer]
                         layer_transfer = transfer_plan.layers[ready_layer]
-                        if (
-                            transfer_plan.sm_waves_per_layer <= 1
-                            or ordered_sm_waves
-                        ):
+                        if shared_ready_event is None and ordered_sm_waves:
+                            # Object-owned waves can complete independently
+                            # inside the persistent mover. Waiting for one
+                            # layer's objects does not order the whole group,
+                            # so retain a distinct full-layer fence identity.
                             layer_events[
-                                max(1, transfer_plan.sm_waves_per_layer) - 1
+                                transfer_plan.sm_waves_per_layer - 1
                             ].record(self._prefetch_stream)
-                        ready_event = layer_events[
-                            max(1, transfer_plan.sm_waves_per_layer) - 1
-                        ]
+                        ready_event = (
+                            shared_ready_event
+                            if shared_ready_event is not None
+                            else layer_events[
+                                max(1, transfer_plan.sm_waves_per_layer) - 1
+                            ]
+                        )
                         layer_first_slot = (
                             None
                             if not use_sm_mover
@@ -318,7 +341,10 @@ class SglangHostTransport:
                                 ()
                                 if ordered_sm_waves
                                 else (
-                                    layer_events[
+                                    (ready_event,)
+                                    if shared_ready_event is not None
+                                    and transfer_plan.sm_waves_per_layer == 1
+                                    else layer_events[
                                         : transfer_plan.sm_waves_per_layer
                                     ]
                                     if use_sm_mover

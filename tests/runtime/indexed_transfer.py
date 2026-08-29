@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate exact paired-run decomposition for transfer profiling/planning."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from itertools import combinations
 from types import SimpleNamespace
@@ -16,7 +17,10 @@ from nta_runtime.indexed_transfer import (
     plan_indexed_mover,
     select_indexed_mover_candidates,
 )
-from nta_runtime.indexed_transfer_torch import plan_indexed_tensor_mover
+from nta_runtime.indexed_transfer_torch import (
+    plan_indexed_tensor_mover,
+    warm_indexed_tensor_mover,
+)
 from nta_runtime.engines.sglang_transfer import (
     HostMoverController,
     HostMoverLeasePlan,
@@ -794,6 +798,36 @@ def main() -> None:
         bounded_tensor_plan.sm_destination_indices,
         tensor_plan.sm_destination_indices,
     )
+    bounded_hybrid_tensor_plan = plan_indexed_tensor_mover(
+        torch.tensor(source_indices, dtype=torch.int32),
+        torch.tensor(destination_indices, dtype=torch.int64),
+        row_bytes=1024,
+        copy_operations_per_run=1,
+        maximum_copy_runs=1,
+        service_model=service_model,
+        policy="probe_copy",
+        capture_full_layout=False,
+    )
+    assert bounded_hybrid_tensor_plan.kind == "hybrid"
+    assert bounded_hybrid_tensor_plan.copy_row_count == probe.copy_row_count
+    assert bounded_hybrid_tensor_plan.sm_row_count == probe.sm_row_count
+    assert warm_indexed_tensor_mover(
+        "cpu", maximum_rows=8, maximum_copy_runs=3
+    ) > 0
+    assert (
+        warm_indexed_tensor_mover("cpu", maximum_rows=8, maximum_copy_runs=3)
+        == 0
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        concurrent_warmups = tuple(
+            pool.map(
+                lambda _index: warm_indexed_tensor_mover(
+                    "cpu", maximum_rows=9, maximum_copy_runs=2
+                ),
+                range(4),
+            )
+        )
+    assert sum(elapsed_ns > 0 for elapsed_ns in concurrent_warmups) == 1
     compute_aware_tensor = plan_indexed_tensor_mover(
         torch.tensor(source_indices, dtype=torch.int32),
         torch.tensor(destination_indices, dtype=torch.int64),

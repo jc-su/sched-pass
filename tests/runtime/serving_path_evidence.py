@@ -60,7 +60,9 @@ def _arm_report(arm: str) -> dict:
         "progressive_consumer_batch_observations": 1,
         "progressive_consumer_batches": 1 if arm == "A3" else 0,
         "progressive_consumer_layers": 1 if arm == "A3" else 0,
-        "verified_operator_modules": 2,
+        "prefetch_mover_plan_calibration_probe_sm_leases": 0,
+        "prefetch_mover_plan_calibration_probe_copy_leases": 0,
+        "verified_operator_modules": 0 if arm == "A1" else 2,
     }
     report["engine_stats"] = [counters]
     return report
@@ -77,6 +79,16 @@ def main() -> None:
         assert "A2" in str(error)
     else:
         raise AssertionError("a progressive run passed as device-bulk")
+    calibration = _arm_report("A3")
+    calibration["engine_stats"][0][
+        "prefetch_mover_plan_calibration_probe_sm_leases"
+    ] = 1
+    try:
+        validate_arm_result(calibration, "A3")
+    except ValueError as error:
+        assert "calibration probe" in str(error)
+    else:
+        raise AssertionError("a timed host-mover probe passed a causal arm")
 
     exercised_stats = [
         {

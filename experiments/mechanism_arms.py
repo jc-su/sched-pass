@@ -82,12 +82,14 @@ def arm_environment(arm: str) -> dict[str, str]:
         return {
             "NTA_EXECUTION_PROTOCOL": "late_bound",
             "NTA_EXECUTION_HOST_FORM": "direct",
+            "NTA_EXECUTION_HOST_MOVER": "sm",
             "NTA_EXECUTION_CALIBRATION_PROBES": "0",
         }
     if arm == "A2":
         return {
             "NTA_EXECUTION_PROTOCOL": "late_bound",
             "NTA_EXECUTION_HOST_FORM": "device_bulk",
+            "NTA_EXECUTION_HOST_MOVER": "sm",
             "NTA_EXECUTION_CALIBRATION_PROBES": "0",
             "NTA_EXECUTION_MAX_ROUNDS": "1",
         }
@@ -95,6 +97,7 @@ def arm_environment(arm: str) -> dict[str, str]:
         return {
             "NTA_EXECUTION_PROTOCOL": "late_bound",
             "NTA_EXECUTION_HOST_FORM": "dependency_aware",
+            "NTA_EXECUTION_HOST_MOVER": "sm",
             "NTA_EXECUTION_CALIBRATION_PROBES": "0",
         }
     raise ValueError(f"unknown mechanism arm: {arm!r}")
@@ -246,6 +249,8 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "progressive_consumer_batch_observations",
             "progressive_consumer_batches",
             "progressive_consumer_layers",
+            "prefetch_mover_plan_calibration_probe_sm_leases",
+            "prefetch_mover_plan_calibration_probe_copy_leases",
             "verified_operator_modules",
         )
     }
@@ -258,7 +263,13 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
         + counters["stock_prefetched_external_attention_launches"]
     ):
         raise ValueError(f"{arm} external numerical accounting is not exact")
-    if counters["verified_operator_modules"] <= 0:
+    if (
+        counters["prefetch_mover_plan_calibration_probe_sm_leases"]
+        + counters["prefetch_mover_plan_calibration_probe_copy_leases"]
+        != 0
+    ):
+        raise ValueError(f"{arm} timed a host-mover calibration probe")
+    if arm in {"A2", "A3"} and counters["verified_operator_modules"] <= 0:
         raise ValueError(f"{arm} did not verify its compiler/operator contract")
 
     protocol = _identity(stats, "execution_protocol")

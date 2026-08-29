@@ -9,6 +9,8 @@ Python objects merely to discover O(runs) contiguous regions.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
+import time
 
 import torch
 
@@ -88,6 +90,89 @@ def _require_index_vector(tensor: torch.Tensor, name: str) -> torch.Tensor:
     if tensor.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"{name} must use int32 or int64 storage")
     return tensor.detach().contiguous()
+
+
+_WARMED_PLANNERS: set[tuple[str, int, int]] = set()
+_WARMING_PLANNERS: dict[tuple[str, int, int], threading.Event] = {}
+_WARMED_PLANNERS_LOCK = threading.Lock()
+
+
+def warm_indexed_tensor_mover(
+    device: torch.device | str,
+    *,
+    maximum_rows: int,
+    maximum_copy_runs: int,
+) -> int:
+    """Pay one-time tensor-kernel initialization before serving requests.
+
+    PyTorch lazily initializes the CUDA implementations used by run discovery
+    and top-k selection. On a loaded serving process that one-time cost can be
+    two orders of magnitude larger than steady-state planning. Exercise the
+    production bounded-candidate path at the deployment's largest row shape
+    and return its visible setup cost. The cache is process-local because CUDA
+    initialization is process-local; callers expose the cost in setup
+    telemetry rather than hiding it in a request warmup.
+    """
+
+    if maximum_rows <= 0 or maximum_copy_runs <= 0:
+        raise ValueError("indexed mover warmup geometry must be positive")
+    target = torch.device(device)
+    row_count = min(maximum_rows, 1 << 16)
+    copy_run_count = min(maximum_copy_runs, row_count)
+    key = (str(target), row_count, copy_run_count)
+    while True:
+        with _WARMED_PLANNERS_LOCK:
+            if key in _WARMED_PLANNERS:
+                return 0
+            completion = _WARMING_PLANNERS.get(key)
+            owns_warmup = completion is None
+            if owns_warmup:
+                completion = threading.Event()
+                _WARMING_PLANNERS[key] = completion
+        if owns_warmup:
+            break
+        # Concurrent engine construction must not mistake an in-progress CUDA
+        # warmup for a completed one. If the owner fails, one waiter retries.
+        completion.wait()
+    started = time.perf_counter_ns()
+    try:
+        source = torch.arange(row_count, dtype=torch.int32, device=target)
+        # Every destination discontinuity is an exact one-row run. This
+        # exercises the maximum bounded candidate set and the SM complement,
+        # a strict superset of the kernels needed by dense maps.
+        destination = source * 2
+        service_model = IndexedMoverServiceModel(
+            sm_bandwidth_bytes_per_second=1_000_000_000,
+            copy_bandwidth_bytes_per_second=1_000_000_000,
+            copy_operation_ns=1,
+            sm_samples=3,
+            copy_samples=3,
+        )
+        plan = plan_indexed_tensor_mover(
+            source,
+            destination,
+            row_bytes=1,
+            copy_operations_per_run=1,
+            maximum_copy_runs=copy_run_count,
+            service_model=service_model,
+            policy="probe_copy",
+            validate_unique_destinations=False,
+            capture_full_layout=False,
+        )
+        if plan.total_run_count != row_count:
+            raise RuntimeError("indexed mover warmup produced an invalid layout")
+        if target.type == "cuda":
+            torch.cuda.synchronize(target)
+    except BaseException:
+        with _WARMED_PLANNERS_LOCK:
+            completion = _WARMING_PLANNERS.pop(key)
+            completion.set()
+        raise
+    with _WARMED_PLANNERS_LOCK:
+        _WARMED_PLANNERS.add(key)
+        completion = _WARMING_PLANNERS.pop(key)
+        completion.set()
+    return time.perf_counter_ns() - started
 
 
 def plan_indexed_tensor_mover(
