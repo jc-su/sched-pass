@@ -639,8 +639,9 @@ def main() -> None:
     assert extrapolated_scale.selection_reason == "uncalibrated_transfer_scale"
 
     # With measured copy/compute overlap but slower copy byte service, subset
-    # cost can be non-monotone. A bounded longest-run view cannot prove the
-    # global optimum, so auto fails closed while forced diagnostics remain.
+    # cost can be non-monotone. Auto evaluates its bounded exact-candidate
+    # family and accepts only candidates that independently beat the SM margin;
+    # it does not require an irrelevant proof over every possible subset.
     nonmonotone = _calibrated_model(
         sm_bandwidth=4_000_000_000,
         copy_bandwidth=1_000_000_000,
@@ -661,7 +662,31 @@ def main() -> None:
         overlap_compute_ns=100_000,
     )
     assert unproven.kind == "sm"
-    assert unproven.selection_reason == "candidate_optimality_unproven"
+    assert unproven.selection_reason == "insufficient_gain"
+
+    overlap_candidate = select_indexed_mover_candidates(
+        total_rows=1_000,
+        total_run_count=3,
+        candidate_runs=((0, 700), (1, 200), (2, 100)),
+        row_bytes=4_096,
+        copy_operations_per_run=1,
+        maximum_copy_runs=3,
+        service_model=replace(
+            _calibrated_model(
+                sm_bandwidth=4_000_000_000,
+                copy_bandwidth=3_000_000_000,
+                copy_operation_ns=0,
+            ),
+            copy_compute_overlap_efficiency=1.0,
+            overlap_samples=3,
+        ),
+        overlap_compute_ns=1_000_000,
+    )
+    assert overlap_candidate.selected_run_indices == (0,)
+    assert overlap_candidate.reason == "service_cost"
+    assert overlap_candidate.predicted_selected_ns < (
+        overlap_candidate.predicted_sm_ns
+    )
     output = _apply_plan(source_values, destination_indices, auto)
     for source_row, destination_row in zip(
         source_indices, destination_indices, strict=True

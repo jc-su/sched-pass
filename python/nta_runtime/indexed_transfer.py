@@ -314,7 +314,6 @@ class IndexedMoverPlan:
             "uncalibrated_sm_reference",
             "uncalibrated_copy_engine",
             "uncalibrated_transfer_scale",
-            "candidate_optimality_unproven",
             "insufficient_gain",
             "service_cost",
         }:
@@ -683,25 +682,6 @@ class IndexedMoverServiceModel:
         saved_ns = int(self.effective_copy_compute_overlap * min(copy_ns, compute_ns))
         return copy_ns + compute_ns - saved_ns
 
-    def longest_run_prefix_is_complete(self) -> bool:
-        """Return whether longest-run prefixes contain the auto optimum.
-
-        For a fixed number of runs, descriptor demand is constant. If copy byte
-        service is no slower than SM byte service, replacing more SM rows cannot
-        increase makespan, so the largest runs dominate every shorter subset.
-        With no copy/compute overlap, a slower copy can never beat SM and the SM
-        answer is also complete. The remaining case is non-monotone and a
-        bounded top-k descriptor view cannot prove global optimality.
-        """
-
-        if not self.copy_estimate_available:
-            return False
-        assert self.copy_bandwidth_bytes_per_second is not None
-        return (
-            self.copy_bandwidth_bytes_per_second >= self.sm_bandwidth_bytes_per_second
-            or self.effective_copy_compute_overlap == 0.0
-        )
-
     def meets_selection_margin(self, reference_ns: int, candidate_ns: int) -> bool:
         """Apply ``minimum_gain`` after optimization, in units of time.
 
@@ -765,19 +745,19 @@ class IndexedMoverServiceModel:
         overlap_compute_ns: int = 0,
         service_scale_bytes: int | None = None,
     ) -> bool:
-        """Whether an optimistic one-run copy can meet the gain contract.
+        """Whether an optimistic mover lower bound can meet the gain contract.
 
-        One contiguous run covering every row is a lower bound on copy-engine
-        service for any real layout: it has the fewest descriptors, no SM
-        remainder, and no hybrid join. If that idealized plan cannot beat the
-        SM reference by ``minimum_gain``, run decomposition cannot change the
-        decision and should stay off the scheduler hot path.
+        Before downloading run descriptors, pretend every byte uses the faster
+        calibrated link rate, pays no descriptor or join cost, and enjoys the
+        measured copy/compute overlap. This is deliberately more optimistic
+        than every realizable SM/copy partition. If even this lower bound cannot
+        beat the SM reference by ``minimum_gain``, layout analysis cannot change
+        the decision and safely stays off the scheduler hot path.
         """
 
         if not (
             self.sm_calibrated
             and self.copy_calibrated
-            and self.longest_run_prefix_is_complete()
         ):
             return False
         if service_scale_bytes is not None and not self.supports_transfer_scale(
@@ -792,14 +772,15 @@ class IndexedMoverServiceModel:
             copy_operations_per_run=copy_operations_per_run,
             overlap_compute_ns=overlap_compute_ns,
         )
-        ideal_copy_ns = self.candidate_ns(
-            total_rows=total_rows,
-            copy_rows=total_rows,
-            copy_run_count=1,
-            row_bytes=row_bytes,
-            copy_operations_per_run=copy_operations_per_run,
-            overlap_compute_ns=overlap_compute_ns,
+        assert self.copy_bandwidth_bytes_per_second is not None
+        ideal_link_ns = self._transfer_ns(
+            total_rows * row_bytes,
+            max(
+                self.sm_bandwidth_bytes_per_second,
+                self.copy_bandwidth_bytes_per_second,
+            ),
         )
+        ideal_copy_ns = self._copy_compute_ns(ideal_link_ns, overlap_compute_ns)
         return (
             ideal_copy_ns is not None
             and predicted_sm_ns is not None
@@ -832,10 +813,12 @@ def select_indexed_mover_candidates(
 
     ``candidate_runs`` contains ``(run_index, row_count)`` pairs. For auto and
     probe policies it must contain the longest ``maximum_copy_runs`` runs.
-    Equal per-run descriptor demand makes those prefixes complete only under
-    the service-model dominance proof checked below; otherwise auto fails
-    closed. ``service_scale_bytes`` is the physical wave geometry used to pick
-    an online curve; it is intentionally distinct from aggregate lease bytes.
+    The bounded longest-run prefixes are a candidate family, not a claim of a
+    globally optimal subset: each selected exact partition must independently
+    beat the all-SM reference by the calibrated policy margin. This keeps the
+    scheduler cost bounded while avoiding the exponential subset problem.
+    ``service_scale_bytes`` is the physical wave geometry used to pick an online
+    curve; it is intentionally distinct from aggregate lease bytes.
     Forced copy execution must provide the complete decomposition.
     """
 
@@ -956,14 +939,6 @@ def select_indexed_mover_candidates(
             predicted_sm_ns,
             "uncalibrated_copy_engine",
         )
-    if not service_model.longest_run_prefix_is_complete():
-        return IndexedMoverSelection(
-            (),
-            predicted_sm_ns,
-            predicted_sm_ns,
-            "candidate_optimality_unproven",
-        )
-
     selected_rows = 0
     prefix_indices: tuple[int, ...] = ()
     best_indices: tuple[int, ...] = ()
