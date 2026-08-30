@@ -37,6 +37,26 @@ def main() -> None:
     assert setup.incremental_setup_ns == 2_000_000
     setup = setup.with_incremental_setup_observation(elapsed_ns=4_000_000, alpha=0.5)
     assert setup.incremental_setup_ns == 3_000_000
+    service = setup.with_incremental_service_observation(
+        predicted_ns=1_000_000,
+        predicted_scale=1.0,
+        elapsed_ns=3_000_000,
+    )
+    assert service.incremental_service_scale == 3.0
+    service = service.with_incremental_service_observation(
+        predicted_ns=3_000_000,
+        predicted_scale=3.0,
+        elapsed_ns=6_000_000,
+        alpha=0.5,
+    )
+    assert service.incremental_service_scale == 4.5
+    stale = service.with_incremental_service_observation(
+        predicted_ns=3_000_000,
+        predicted_scale=3.0,
+        elapsed_ns=3_000_000,
+        alpha=1.0,
+    )
+    assert stale.incremental_service_scale == 3.0
     assert (
         calibrated.with_transfer_observation(
             transfer_bytes=1024,
@@ -129,6 +149,7 @@ def main() -> None:
         bandwidth_bytes_per_second=20_000_000_000,
         round_overhead_ns=20_000,
         incremental_setup_ns=0,
+        incremental_service_scale=1.0,
         tile_compute_ns=4_000,
         max_rounds=4,
         minimum_predicted_gain=1.03,

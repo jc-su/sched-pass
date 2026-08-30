@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 from dataclasses import replace
+import math
 import os
 import time
 from typing import Any
@@ -56,6 +57,7 @@ from nta_runtime.engines.sglang_state import (
     SglangForwardPlan,
     _BarrierProfile,
     _FragmentLookahead,
+    _OperatorProfile,
 )
 from nta_runtime.engines.sglang_calibration import SglangLayerServiceCalibration
 from nta_runtime.engines.sglang_graphs import DemandGraphCache
@@ -274,6 +276,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._incremental_calibration_probes_remaining,
         )
         self._incremental_setup_samples = 0
+        self._incremental_service_samples = 0
         host_mover_policy = tuning.host_mover_policy
         host_mover_default_service_model = tuning.host_mover_default_service_model
         host_mover_calibration_samples = tuning.host_mover_calibration_samples
@@ -326,6 +329,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 max_host_rounds=self._host_cost_model.max_rounds,
                 minimum_predicted_gain=self._host_cost_model.minimum_predicted_gain,
                 incremental_setup_ns=self._host_cost_model.incremental_setup_ns,
+                incremental_service_scale=(
+                    self._host_cost_model.incremental_service_scale
+                ),
                 incremental_calibration_probes_remaining=(
                     self._incremental_calibration_probes_remaining
                 ),
@@ -513,9 +519,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             transport=self._host_transport,
             stats=self._stats,
         )
-        self._operator_profiles: list[
-            tuple[torch.cuda.Event, torch.cuda.Event, str, int]
-        ] = []
+        self._operator_profiles: list[_OperatorProfile] = []
         self._barrier_profiles: list[_BarrierProfile] = []
         self._barrier_stall_by_layer: dict[int, float] = {}
         self._stats.update(
@@ -1188,7 +1192,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if self._runtime.sticky_failed_count != 0:
             raise RuntimeError("an asynchronous acquisition epoch failed")
         if profile is not None:
-            self._operator_profiles.append((*profile, "stream_retirement", layers))
+            self._operator_profiles.append(
+                _OperatorProfile(*profile, "stream_retirement", layers)
+            )
         self._stats["stream_ordered_retirement_launches"] += 1
         self._stats["stream_ordered_retirement_batches"] += 1
         batch.stream_ordered_epoch = None
@@ -1983,8 +1989,18 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             int(layer.layer_id) - self._model_start_layer + 1 == self._model_layer_count
         )
         enqueue_started = time.perf_counter_ns()
+        service_probe = (
+            batch.host_execution is not None
+            and batch.host_execution.selection_reason == "calibration_probe"
+            and not batch.incremental_setup_observed
+            and dispatch.kind
+            in {
+                AttentionDispatchKind.HOST_INCREMENTAL,
+                AttentionDispatchKind.ARRIVING_PREFETCH,
+            }
+        )
         gpu_profile = None
-        if self._profile_gpu:
+        if self._profile_gpu or service_probe:
             gpu_profile = (
                 torch.cuda.Event(enable_timing=True),
                 torch.cuda.Event(enable_timing=True),
@@ -2067,7 +2083,31 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
         if gpu_profile is not None:
             gpu_profile[1].record(stream)
-            self._operator_profiles.append((*gpu_profile, dispatch.kind.value, 1))
+            service_prediction_ns = None
+            service_prediction_scale = None
+            if service_probe:
+                execution = batch.host_execution
+                if execution is None:  # pragma: no cover - guarded above
+                    raise RuntimeError("service probe lost its execution plan")
+                setup_per_unit_ns = math.ceil(
+                    (self._host_cost_model.incremental_setup_ns or 0)
+                    / execution.scope_units
+                )
+                service_prediction_ns = max(
+                    1,
+                    execution.predicted_incremental_per_unit_ns
+                    - setup_per_unit_ns,
+                )
+                service_prediction_scale = execution.incremental_service_scale
+            self._operator_profiles.append(
+                _OperatorProfile(
+                    *gpu_profile,
+                    dispatch.kind.value,
+                    1,
+                    service_prediction_ns,
+                    service_prediction_scale,
+                )
+            )
 
         if (
             pending is not None
@@ -2232,7 +2272,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         if profile is not None:
             profile[1].record(stream)
-            self._operator_profiles.append((*profile, "preloaded_stock", 1))
+            self._operator_profiles.append(
+                _OperatorProfile(*profile, "preloaded_stock", 1)
+            )
         self._stats["stock_attention_launches"] += 1
         self._stats["lookahead_bound_launches"] += 1
         if self._verification.transfer:
@@ -2507,17 +2549,39 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     / (1 << 30)
                     / (kind_milliseconds / 1_000.0)
                 )
-        pending_operators: list[
-            tuple[torch.cuda.Event, torch.cuda.Event, str, int]
-        ] = []
-        for start, finish, kind, covered_layers in self._operator_profiles:
-            if not finish.query():
-                pending_operators.append((start, finish, kind, covered_layers))
+        pending_operators: list[_OperatorProfile] = []
+        for profile in self._operator_profiles:
+            if not profile.finish.query():
+                pending_operators.append(profile)
                 continue
-            milliseconds = start.elapsed_time(finish)
-            prefix = f"profiled_{kind}_operator"
+            milliseconds = profile.start.elapsed_time(profile.finish)
+            if profile.service_prediction_ns is not None:
+                elapsed_ns = max(1, round(milliseconds * 1_000_000.0))
+                first_sample = self._incremental_service_samples == 0
+                self._host_cost_model = (
+                    self._host_cost_model.with_incremental_service_observation(
+                        predicted_ns=profile.service_prediction_ns,
+                        predicted_scale=profile.service_prediction_scale,
+                        elapsed_ns=elapsed_ns,
+                        alpha=1.0 if first_sample else 0.25,
+                        maximum_step_ratio=64.0 if first_sample else 4.0,
+                    )
+                )
+                self._incremental_service_samples += 1
+                self._stats["incremental_service_samples"] = (
+                    self._incremental_service_samples
+                )
+                self._stats["incremental_service_scale"] = (
+                    self._host_cost_model.incremental_service_scale
+                )
+                self._stats["incremental_service_calibrated"] = True
+                self._stats["incremental_service_observed_ns_total"] = (
+                    self._stats.get("incremental_service_observed_ns_total", 0)
+                    + elapsed_ns
+                )
+            prefix = f"profiled_{profile.kind}_operator"
             self._stats[f"{prefix}_layers"] = (
-                self._stats.get(f"{prefix}_layers", 0) + covered_layers
+                self._stats.get(f"{prefix}_layers", 0) + profile.covered_layers
             )
             self._stats[f"{prefix}_launches"] = (
                 self._stats.get(f"{prefix}_launches", 0) + 1

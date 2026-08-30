@@ -22,6 +22,11 @@ class HostCostModel:
     # must not make the automatic selector assume that typed metadata,
     # discovery, and the first incremental dispatch are free.
     incremental_setup_ns: int | None = None
+    # Closed-loop correction for the complete device-side incremental
+    # operator (discovery, transfer progress, numerical windows, and merge).
+    # ``None`` is fail-closed for AUTO: transfer bandwidth and Python setup
+    # alone cannot predict the cost of the typed numerical consumer.
+    incremental_service_scale: float | None = None
     tile_compute_ns: int = 3_000
     max_rounds: int = 4
     minimum_predicted_gain: float = 1.03
@@ -38,6 +43,7 @@ class HostCostModel:
             "NTA_TIER_HOST_STAGED_BANDWIDTH_BPS", cls.bandwidth_bytes_per_second
         )
         setup_value = values.get(f"{prefix}_INCREMENTAL_SETUP_NS")
+        service_scale = values.get(f"{prefix}_INCREMENTAL_SERVICE_SCALE")
         return cls(
             bandwidth_bytes_per_second=int(
                 values.get(f"{prefix}_HOST_BANDWIDTH_BPS", calibrated_bandwidth)
@@ -46,6 +52,9 @@ class HostCostModel:
                 values.get(f"{prefix}_ROUND_OVERHEAD_NS", cls.round_overhead_ns)
             ),
             incremental_setup_ns=None if setup_value is None else int(setup_value),
+            incremental_service_scale=(
+                None if service_scale is None else float(service_scale)
+            ),
             tile_compute_ns=int(
                 values.get(f"{prefix}_TILE_COMPUTE_NS", cls.tile_compute_ns)
             ),
@@ -70,6 +79,11 @@ class HostCostModel:
             raise ValueError("host execution overhead and gain are invalid")
         if self.incremental_setup_ns is not None and self.incremental_setup_ns < 0:
             raise ValueError("incremental setup cost cannot be negative")
+        if (
+            self.incremental_service_scale is not None
+            and not 0.125 <= self.incremental_service_scale <= 64.0
+        ):
+            raise ValueError("incremental service scale is outside its safe range")
 
     def with_transfer_observation(
         self,
@@ -135,6 +149,51 @@ class HostCostModel:
         calibrated = max(1, round((1.0 - alpha) * previous + alpha * bounded))
         return dataclasses.replace(self, incremental_setup_ns=calibrated)
 
+    def with_incremental_service_observation(
+        self,
+        *,
+        predicted_ns: int,
+        predicted_scale: float,
+        elapsed_ns: int,
+        alpha: float = 0.25,
+        maximum_step_ratio: float = 4.0,
+    ) -> "HostCostModel":
+        """Calibrate the device-side incremental service prediction.
+
+        ``predicted_ns`` is the already-scaled prediction attached to the
+        immutable execution decision, and ``predicted_scale`` is the scale
+        that decision used. The pair reconstructs an absolute correction
+        against the analytical base model even when CUDA completion is
+        collected after a later decision has updated this model. The update
+        is bounded because one CUDA scheduling interruption must not
+        permanently disable an otherwise useful execution form.
+        """
+
+        if min(predicted_ns, elapsed_ns) <= 0:
+            raise ValueError("incremental service observation must be positive")
+        if not 0.125 <= predicted_scale <= 64.0:
+            raise ValueError("incremental prediction scale is outside its safe range")
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError("incremental service alpha must be in (0, 1]")
+        if maximum_step_ratio < 1.0:
+            raise ValueError(
+                "incremental service step ratio must be at least one"
+            )
+        previous = self.incremental_service_scale
+        observed = predicted_scale * elapsed_ns / predicted_ns
+        observed = min(64.0, max(0.125, observed))
+        if previous is None:
+            calibrated = observed
+        else:
+            lower = max(0.125, previous / maximum_step_ratio)
+            upper = min(64.0, previous * maximum_step_ratio)
+            bounded = min(max(observed, lower), upper)
+            calibrated = (1.0 - alpha) * previous + alpha * bounded
+        return dataclasses.replace(
+            self,
+            incremental_service_scale=min(64.0, max(0.125, calibrated)),
+        )
+
 
 class HostExecutionForm(str, Enum):
     """Explicit control path; wave count alone cannot identify ownership."""
@@ -184,12 +243,17 @@ class HostExecutionPlan:
         "forced_dependency_aware",
     ] = "predicted_gain"
     scope_units: int = 1
+    # Scale used when ``predicted_incremental_ns`` was constructed. Keeping
+    # this on the immutable decision makes delayed CUDA observations
+    # unambiguous even if a newer forward has recalibrated the model.
+    incremental_service_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if (
             self.scope_units <= 0
             or self.predicted_atomic_ns < 0
             or self.predicted_incremental_ns < 0
+            or not 0.125 <= self.incremental_service_scale <= 64.0
         ):
             raise ValueError("host execution decision scope is invalid")
         if not isinstance(self.form, HostExecutionForm):
@@ -627,6 +691,25 @@ def _repeated_stage_pipeline_ns(
     return transfer_ns + compute_ns + (units - 1) * max(transfer_ns, compute_ns)
 
 
+def _incremental_service_ns(base_ns: int, model: HostCostModel) -> int:
+    """Apply a completed device-service calibration to an analytical cost."""
+
+    scale = (
+        1.0
+        if model.incremental_service_scale is None
+        else model.incremental_service_scale
+    )
+    return max(1, math.ceil(base_ns * scale))
+
+
+def _incremental_service_scale(model: HostCostModel) -> float:
+    return (
+        1.0
+        if model.incremental_service_scale is None
+        else model.incremental_service_scale
+    )
+
+
 def prove_atomic_host_execution(
     *,
     object_count: int,
@@ -675,8 +758,12 @@ def prove_atomic_host_execution(
             overlap_initial=False,
             selection_reason="forced_direct",
             scope_units=scope_units,
+            incremental_service_scale=_incremental_service_scale(model),
         )
-    if model.incremental_setup_ns is None:
+    if (
+        model.incremental_setup_ns is None
+        or model.incremental_service_scale is None
+    ):
         # AUTO cannot soundly select a consumer whose recurring setup has not
         # been observed.  Returning the direct proof here also avoids building
         # and uploading an exact dependency graph solely to reach the same
@@ -689,9 +776,12 @@ def prove_atomic_host_execution(
             overlap_initial=False,
             selection_reason="uncalibrated_setup",
             scope_units=scope_units,
+            incremental_service_scale=_incremental_service_scale(model),
         )
     optimistic_incremental_ns = (
-        scope_units * max(transfer_ns, compute_ns) + model.incremental_setup_ns
+        scope_units
+        * _incremental_service_ns(max(transfer_ns, compute_ns), model)
+        + model.incremental_setup_ns
     )
     if atomic_ns / optimistic_incremental_ns >= model.minimum_predicted_gain:
         return None
@@ -703,6 +793,7 @@ def prove_atomic_host_execution(
         overlap_initial=False,
         selection_reason="insufficient_gain",
         scope_units=scope_units,
+        incremental_service_scale=_incremental_service_scale(model),
     )
 
 
@@ -749,6 +840,7 @@ def plan_host_execution(
             overlap_initial=False,
             selection_reason="forced_direct",
             scope_units=scope_units,
+            incremental_service_scale=_incremental_service_scale(model),
         )
     if mode is HostExecutionMode.DEVICE_BULK:
         setup_ns = (
@@ -762,10 +854,11 @@ def plan_host_execution(
             overlap_initial=False,
             selection_reason="forced_device_bulk",
             scope_units=scope_units,
+            incremental_service_scale=_incremental_service_scale(model),
         )
     setup_ns = model.incremental_setup_ns
     if (
-        setup_ns is None
+        (setup_ns is None or model.incremental_service_scale is None)
         and mode is HostExecutionMode.AUTO
         and not calibration_probe
         and not require_dependency_protocol
@@ -778,6 +871,7 @@ def plan_host_execution(
             overlap_initial=False,
             selection_reason="uncalibrated_setup",
             scope_units=scope_units,
+            incremental_service_scale=_incremental_service_scale(model),
         )
     if setup_ns is None:
         setup_ns = 0
@@ -787,7 +881,7 @@ def plan_host_execution(
     # credits even when the geometry cannot expose a second wave.
     one_wave_unit_ns = max(transfer_ns, initial_compute_ns) + deferred_compute_ns
     best_counts = (object_count,)
-    best_ns = scope_units * one_wave_unit_ns + setup_ns
+    best_ns = scope_units * _incremental_service_ns(one_wave_unit_ns, model) + setup_ns
     overlap_initial = initial_runnable_tiles != 0
 
     max_rounds = min(model.max_rounds, math.ceil(object_count / model.dependency_width))
@@ -804,7 +898,9 @@ def plan_host_execution(
                 0,
             ),
         )
-        candidate_ns = scope_units * candidate_unit_ns + setup_ns
+        candidate_ns = (
+            scope_units * _incremental_service_ns(candidate_unit_ns, model) + setup_ns
+        )
         if candidate_ns < best_ns:
             best_counts = counts
             best_ns = candidate_ns
@@ -840,4 +936,5 @@ def plan_host_execution(
         overlap_initial=overlap_initial if selected else False,
         selection_reason=reason,
         scope_units=scope_units,
+        incremental_service_scale=_incremental_service_scale(model),
     )

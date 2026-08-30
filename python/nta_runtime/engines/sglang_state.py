@@ -117,6 +117,35 @@ class _BarrierProfile:
 
 
 @dataclass(frozen=True)
+class _OperatorProfile:
+    """One asynchronously collected CUDA operator observation.
+
+    Service predictions are attached only to bounded AUTO calibration probes.
+    Their scale is frozen with the decision so delayed collection cannot
+    accidentally compound a newer model update.
+    """
+
+    start: torch.cuda.Event
+    finish: torch.cuda.Event
+    kind: str
+    covered_layers: int
+    service_prediction_ns: int | None = None
+    service_prediction_scale: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.kind or self.covered_layers <= 0:
+            raise ValueError("operator profile geometry is invalid")
+        has_prediction = self.service_prediction_ns is not None
+        if has_prediction != (self.service_prediction_scale is not None):
+            raise ValueError("operator service prediction is incomplete")
+        if has_prediction and (
+            self.service_prediction_ns <= 0
+            or not 0.125 <= self.service_prediction_scale <= 64.0
+        ):
+            raise ValueError("operator service prediction is invalid")
+
+
+@dataclass(frozen=True)
 class _FragmentLookahead:
     layer_id: int
     wrapper_id: int

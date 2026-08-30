@@ -79,6 +79,7 @@ class SglangTelemetryConfig:
     max_host_rounds: int
     minimum_predicted_gain: float
     incremental_setup_ns: int | None
+    incremental_service_scale: float | None
     incremental_calibration_probes_remaining: int
     cost_model_bandwidth_bps: int
     host_mover: str
@@ -183,6 +184,7 @@ _ZERO_COUNTERS = (
     "incremental_setup_samples",
     "incremental_initialization_samples",
     "incremental_initialization_setup_ns",
+    "incremental_service_samples",
     "cost_model_transfer_samples",
     "native_demand_sm_bytes",
     "prefetch_mover_plan_calibration_probe_sm_leases",
@@ -444,6 +446,10 @@ def initial_engine_stats(
         "minimum_predicted_gain": config.minimum_predicted_gain,
         "incremental_setup_ns": config.incremental_setup_ns,
         "incremental_setup_calibrated": config.incremental_setup_ns is not None,
+        "incremental_service_scale": config.incremental_service_scale,
+        "incremental_service_calibrated": (
+            config.incremental_service_scale is not None
+        ),
         "incremental_calibration_probes_remaining": (
             config.incremental_calibration_probes_remaining
         ),

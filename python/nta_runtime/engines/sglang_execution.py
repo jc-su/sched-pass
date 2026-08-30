@@ -37,7 +37,11 @@ from nta_runtime.execution_planner import (
 from nta_runtime.opportunity import OperatorArrival, TileArrival, append_json_line
 from nta_runtime.engines.sglang_graphs import DemandGraphCache, demand_graph_key
 from nta_runtime.engines.sglang_planning import requires_feasible_edf
-from nta_runtime.engines.sglang_state import SglangForwardEpoch, _BarrierProfile
+from nta_runtime.engines.sglang_state import (
+    SglangForwardEpoch,
+    _BarrierProfile,
+    _OperatorProfile,
+)
 from nta_runtime.engines.sglang_nvme import SglangNvmeAcquisitionPipeline
 
 
@@ -267,7 +271,7 @@ class SglangAttentionExecutor:
         stats: dict[str, Any],
         stock_wrapper: Callable[[int], Any | None],
         transfer_profiles: list[tuple[torch.cuda.Event, torch.cuda.Event, int, str]],
-        operator_profiles: list[tuple[torch.cuda.Event, torch.cuda.Event, str, int]],
+        operator_profiles: list[_OperatorProfile],
         barrier_profiles: list[_BarrierProfile],
         config: SglangAttentionExecutionConfig,
     ) -> None:
@@ -1274,15 +1278,19 @@ class SglangAttentionExecutor:
             )
         if prepared.discovery_profile is not None:
             self._operator_profiles.append(
-                (*prepared.discovery_profile, "work_discovery", 1)
+                _OperatorProfile(*prepared.discovery_profile, "work_discovery", 1)
             )
         if prepared.consumer_profile is not None:
             self._operator_profiles.append(
-                (*prepared.consumer_profile, "incremental_ready_consumer", 1)
+                _OperatorProfile(
+                    *prepared.consumer_profile,
+                    "incremental_ready_consumer",
+                    1,
+                )
             )
         if prepared.retirement_profile is not None:
             self._operator_profiles.append(
-                (*prepared.retirement_profile, "stream_retirement", 1)
+                _OperatorProfile(*prepared.retirement_profile, "stream_retirement", 1)
             )
         return output, setup_dispatch_elapsed_ns
 

@@ -61,7 +61,7 @@ def main() -> None:
     from nta_runtime.engines.sglang_metadata import SglangMetadataPlanner
     from nta_runtime.engines.sglang_pipeline import bounded_sm_pair_worker_grid
     from nta_runtime.engines.sglang_transfer import HostMoverController, MoverProfile
-    from nta_runtime.execution_planner import HostExecutionMode
+    from nta_runtime.execution_planner import HostCostModel, HostExecutionMode
     from nta_runtime.indexed_transfer import IndexedMoverServiceModel
     from nta_runtime.requests import RequestBinding
 
@@ -1277,6 +1277,7 @@ def main() -> None:
     from nta_runtime.engines.sglang_state import (
         SglangForwardEpoch,
         SglangForwardPlan,
+        _OperatorProfile,
     )
     from nta_runtime.engines.sglang_lifecycle import SglangForwardLifecycle
     from nta_runtime.engines.sglang_graphs import (
@@ -1949,6 +1950,53 @@ def main() -> None:
     with patch("torch.cuda.synchronize", lambda: boundary_calls.append("sync")):
         boundary_backend._quiesce_observation_boundary()
     assert boundary_calls == ["sync", "transfer", "layer", "barrier"]
+
+    class CompletedProfileEvent:
+        def query(self) -> bool:
+            return True
+
+        def elapsed_time(self, _finish) -> float:
+            return 2.0
+
+    class EmptyMoverProfiles:
+        def __init__(self) -> None:
+            self.collect_count = 0
+
+        def collect_profiles(self) -> None:
+            self.collect_count += 1
+
+    profile_backend = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
+    profile_backend._host_movers = EmptyMoverProfiles()
+    profile_backend._transfer_profiles = []
+    profile_backend._operator_profiles = [
+        _OperatorProfile(
+            CompletedProfileEvent(),
+            CompletedProfileEvent(),
+            "incremental",
+            1,
+            1_000_000,
+            1.0,
+        ),
+        _OperatorProfile(
+            CompletedProfileEvent(),
+            CompletedProfileEvent(),
+            "preloaded_stock",
+            1,
+        ),
+    ]
+    profile_backend._host_cost_model = HostCostModel(
+        incremental_setup_ns=0,
+        incremental_service_scale=None,
+    )
+    profile_backend._incremental_service_samples = 0
+    profile_backend._stats = {}
+    profile_backend._collect_transfer_profiles()
+    assert profile_backend._host_movers.collect_count == 1
+    assert profile_backend._operator_profiles == []
+    assert profile_backend._host_cost_model.incremental_service_scale == 2.0
+    assert profile_backend._stats["incremental_service_samples"] == 1
+    assert profile_backend._stats["profiled_incremental_operator_launches"] == 1
+    assert profile_backend._stats["profiled_preloaded_stock_operator_launches"] == 1
 
     stale_boundary = NtaFlashInferAttnBackend.__new__(NtaFlashInferAttnBackend)
     stale_boundary._host_movers = PendingMoverProfiles()

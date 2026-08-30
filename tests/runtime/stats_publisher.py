@@ -43,6 +43,7 @@ def _telemetry_config() -> SglangTelemetryConfig:
         max_host_rounds=4,
         minimum_predicted_gain=1.03,
         incremental_setup_ns=None,
+        incremental_service_scale=None,
         incremental_calibration_probes_remaining=0,
         cost_model_bandwidth_bps=30_000_000_000,
         host_mover="auto",
