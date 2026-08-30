@@ -230,6 +230,8 @@ def main() -> None:
     assert exact_template.ready_work_counts == (2, 1, 1)
     assert exact_template.progressive_consumer
     assert exact_template.exact_resume_windows
+    assert exact_template.indexed_host_range_prevalidated
+    assert exact_template.indexed_host_order_prevalidated
 
     queued_template = plan_host_layer_execution(
         host_execution=dependency_form,
@@ -248,7 +250,8 @@ def main() -> None:
     )
     assert queued_template.ready_work_offsets is None
     assert queued_template.progressive_consumer
-    assert not queued_template.indexed_host_prevalidated
+    assert not queued_template.indexed_host_range_prevalidated
+    assert not queued_template.indexed_host_order_prevalidated
     forced_dependency = plan_host_execution(
         object_count=2,
         transfer_bytes=64 * 1024,

@@ -77,11 +77,21 @@ def mover_layout_required(policy: str, profile_layout: bool) -> bool:
 def requires_feasible_edf(
     bindings: tuple[RequestBinding, ...], *, tenant_isolation: bool
 ) -> bool:
-    """Return whether descriptor order cannot replace device EDF ordering."""
+    """Return whether descriptor order cannot replace device EDF ordering.
+
+    Equal request deadlines and priorities form one EDF-equivalence class, so
+    canonical request/segment order is a valid deterministic tie break.  The
+    indexed Host path may then avoid materializing a queue that it never
+    consumes.  Distinct policy keys, or tenant credit isolation, retain the
+    dynamic queue so issue order and feasibility remain device governed.
+    """
 
     if not bindings:
         raise ValueError("host acquisition has no request bindings")
-    return tenant_isolation or len(bindings) > 1
+    policy_keys = {
+        (binding.deadline_clock, binding.priority) for binding in bindings
+    }
+    return tenant_isolation or len(policy_keys) > 1
 
 
 def positive_environment(name: str, default: int) -> int:

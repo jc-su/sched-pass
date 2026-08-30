@@ -309,6 +309,7 @@ _ZERO_COUNTERS = (
     "host_progress_rounds",
     "parallel_indexed_progress_layers",
     "indexed_range_fastpath_layers",
+    "unqueued_host_discovery_layers",
     "queued_feasible_edf_layers",
     "fragment_lookahead_layers",
     "fragment_lookahead_objects",

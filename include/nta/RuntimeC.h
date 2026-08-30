@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 50U
+#define NTA_RUNTIME_C_API_VERSION 51U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -548,6 +548,12 @@ nta_status nta_jit_phase_discover(const nta_jit_phase_program *program,
                                   uint64_t dependencies,
                                   uint32_t work_item_count,
                                   uint64_t cuda_stream);
+/* C API v51: omit generic EDF-heap construction for a statically ordered Host
+ * indexed range with homogeneous request policy and unconstrained credits. */
+nta_status nta_jit_phase_discover_unqueued_host(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint64_t work_items, uint64_t dependencies, uint32_t work_item_count,
+    uint64_t cuda_stream);
 /* C API v50: validate a finite typed NVMe intent image and use its static EDF
  * order when sound; validation falls back to the generic heap on device. */
 nta_status nta_jit_phase_discover_ordered_nvme(

@@ -27,7 +27,7 @@ from .requests import RequestBinding
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 50
+API_VERSION = 51
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -1758,6 +1758,16 @@ _phase_reset = _function(
 )
 _phase_discover = _function(
     "nta_jit_phase_discover",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_discover_unqueued_host = _function(
+    "nta_jit_phase_discover_unqueued_host",
     ctypes.c_int,
     _Handle,
     _Handle,
@@ -3516,6 +3526,24 @@ class JitPhaseProgram(_Owner):
             raise ValueError("runtime and work plan must own the same CUDA device")
         _check(
             _phase_discover(
+                self._handle,
+                runtime._handle,
+                plan.work_items_address,
+                plan.dependencies_address,
+                plan.work_item_count,
+                _stream_address(stream),
+            )
+        )
+
+    def discover_unqueued_host(
+        self, runtime: Runtime, plan: DeviceWorkPlan, stream: Any = None
+    ) -> None:
+        """Discover a statically safe Host range without building an EDF heap."""
+
+        if runtime.device_ordinal != plan.device_ordinal:
+            raise ValueError("runtime and work plan must own the same CUDA device")
+        _check(
+            _phase_discover_unqueued_host(
                 self._handle,
                 runtime._handle,
                 plan.work_items_address,

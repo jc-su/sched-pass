@@ -138,6 +138,15 @@ def main() -> None:
         direct_proof.assert_not_called()
     assert not _requires_feasible_edf((binding,), tenant_isolation=False)
     assert _requires_feasible_edf((binding,), tenant_isolation=True)
+    homogeneous_peer = RequestBinding(
+        request_index=1,
+        request_slot=4,
+        generation=1,
+        request_id=8,
+    )
+    assert not _requires_feasible_edf(
+        (binding, homogeneous_peer), tenant_isolation=False
+    )
     assert _requires_feasible_edf(
         (
             binding,
@@ -146,6 +155,20 @@ def main() -> None:
                 request_slot=4,
                 generation=1,
                 request_id=8,
+                deadline_clock=1,
+            ),
+        ),
+        tenant_isolation=False,
+    )
+    assert _requires_feasible_edf(
+        (
+            binding,
+            RequestBinding(
+                request_index=1,
+                request_slot=4,
+                generation=1,
+                request_id=8,
+                priority=1,
             ),
         ),
         tenant_isolation=False,

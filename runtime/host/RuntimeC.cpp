@@ -1690,6 +1690,21 @@ nta_status nta_jit_phase_discover(const nta_jit_phase_program *program,
   });
 }
 
+nta_status nta_jit_phase_discover_unqueued_host(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint64_t workItems, std::uint64_t dependencies,
+    std::uint32_t workItemCount, std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->discoverUnqueuedHost(
+        stream(cudaStream), runtime->value->deviceView(),
+        reinterpret_cast<const nta::abi::WorkItem *>(workItems),
+        reinterpret_cast<const nta::abi::AcquireRequirement *>(dependencies),
+        workItemCount);
+  });
+}
+
 nta_status nta_jit_phase_discover_ordered_nvme(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     std::uint64_t workItems, std::uint64_t dependencies,

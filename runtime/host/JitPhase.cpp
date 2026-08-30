@@ -138,6 +138,8 @@ struct JitPhaseProgram::Impl {
       operator_contract::validate(plan, contract);
       reset = load<Reset>(library, "nta_jit_reset_epoch");
       discover = load<Discover>(library, "nta_jit_discover_work");
+      discoverUnqueuedHost = load<Discover>(
+          library, "nta_jit_discover_work_unqueued_host");
       discoverOrderedNvme = load<DiscoverOrderedNvme>(
           library, "nta_jit_discover_work_ordered_nvme");
       prepareReadyWindow = load<PrepareReadyWindow>(
@@ -204,6 +206,7 @@ struct JitPhaseProgram::Impl {
   void *library = nullptr;
   Reset reset = nullptr;
   Discover discover = nullptr;
+  Discover discoverUnqueuedHost = nullptr;
   DiscoverOrderedNvme discoverOrderedNvme = nullptr;
   PrepareReadyWindow prepareReadyWindow = nullptr;
   PrepareEventWorkPartition prepareEventWorkPartition = nullptr;
@@ -300,6 +303,21 @@ void JitPhaseProgram::discover(cudaStream_t stream, abi::RuntimeView *runtime,
   check(
       impl_->discover(runtime, workItems, dependencies, workItemCount, stream),
       "nta_jit_discover_work");
+}
+
+void JitPhaseProgram::discoverUnqueuedHost(
+    cudaStream_t stream, abi::RuntimeView *runtime,
+    const abi::WorkItem *workItems,
+    const abi::AcquireRequirement *dependencies,
+    std::uint32_t workItemCount) const {
+  if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
+      workItemCount == 0) {
+    throw std::invalid_argument(
+        "unqueued Host discovery needs runtime work items and dependencies");
+  }
+  check(impl_->discoverUnqueuedHost(runtime, workItems, dependencies,
+                                    workItemCount, stream),
+        "nta_jit_discover_work_unqueued_host");
 }
 
 void JitPhaseProgram::discoverOrderedNvme(

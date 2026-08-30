@@ -34,6 +34,13 @@ public:
                 const abi::WorkItem *workItems,
                 const abi::AcquireRequirement *dependencies,
                 std::uint32_t workItemCount) const;
+  // Skip generic EDF-heap construction only for a statically ordered Host
+  // indexed range with homogeneous request policy and unconstrained credits.
+  void discoverUnqueuedHost(
+      cudaStream_t stream, abi::RuntimeView *runtime,
+      const abi::WorkItem *workItems,
+      const abi::AcquireRequirement *dependencies,
+      std::uint32_t workItemCount) const;
   // Use the O(1)-cursor NVMe path only after device-side validation proves
   // this finite intent image is already in EDF order. Validation falls back
   // to the generic heap without host synchronization.

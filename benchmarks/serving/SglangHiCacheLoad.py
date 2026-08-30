@@ -124,6 +124,7 @@ _MEASUREMENT_COUNTERS = frozenset(
         "indexed_host_bytes",
         "indexed_host_objects",
         "indexed_range_fastpath_layers",
+        "unqueued_host_discovery_layers",
         "indexed_layout_candidate_bytes",
         "indexed_layout_eligible_rows",
         "indexed_layout_profile_cpu_ns",

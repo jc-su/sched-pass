@@ -100,6 +100,11 @@ class _Phases:
     def discover(self, runtime: object, plan: object, stream: object) -> None:
         self.calls.append(("discover", stream))
 
+    def discover_unqueued_host(
+        self, runtime: object, plan: object, stream: object
+    ) -> None:
+        self.calls.append(("discover_unqueued_host", stream))
+
     def prepare_ready_window(
         self, runtime: object, maximum_work: int, stream: object
     ) -> None:
@@ -185,7 +190,8 @@ def _check_stream_ordered_multiwave() -> None:
             ready_work_offsets=(0, 2),
             sm_scale=1.0,
             indexed_host_first_object=0,
-            indexed_host_prevalidated=True,
+            indexed_host_range_prevalidated=True,
+            indexed_host_order_prevalidated=True,
             indexed_host_copy_blocks_per_group=4,
             stream=compute,
             progress_stream=progress,
@@ -205,7 +211,7 @@ def _check_stream_ordered_multiwave() -> None:
         ]
         assert [call[0] for call in phases.calls] == [
             "reset",
-            "discover",
+            "discover_unqueued_host",
             "progress",
             "progress",
         ]
@@ -237,7 +243,7 @@ def _check_stream_ordered_multiwave() -> None:
             ready_work_counts=(2, 4),
             sm_scale=1.0,
             indexed_host_first_object=0,
-            indexed_host_prevalidated=True,
+            indexed_host_range_prevalidated=True,
             stream=compute,
             progress_stream=progress,
             sync_events=(discovery, arrivals),
@@ -287,7 +293,8 @@ def _check_stream_ordered_multiwave() -> None:
                 ready_work_offsets=(0, 0),
                 sm_scale=1.0,
                 indexed_host_first_object=0,
-                indexed_host_prevalidated=True,
+                indexed_host_range_prevalidated=True,
+                indexed_host_order_prevalidated=True,
                 stream=compute,
                 progress_stream=progress,
                 sync_events=(discovery, arrivals),
@@ -296,6 +303,27 @@ def _check_stream_ordered_multiwave() -> None:
             assert "runnable launch windows" in str(error)
         else:
             raise AssertionError("stream-ordered execution accepted overlapping waves")
+
+        try:
+            invalid.enqueue_host(
+                _NumericalWrapper(),
+                object(),
+                object(),
+                object(),
+                progress_blocks=(2, 2),
+                ready_work_counts=(2, 2),
+                ready_work_offsets=(0, 2),
+                sm_scale=1.0,
+                indexed_host_first_object=0,
+                indexed_host_order_prevalidated=True,
+                stream=compute,
+                progress_stream=progress,
+                sync_events=(discovery, arrivals),
+            )
+        except ValueError as error:
+            assert "prevalidated indexed object range" in str(error)
+        else:
+            raise AssertionError("static Host order accepted an unsafe object range")
 
         event_plan = _Plan()
         event_phases = _Phases()

@@ -250,6 +250,31 @@ nta_jit_discover_work(void *runtime, const void *workItems,
   return nta::jit::launchStatus();
 }
 
+// Discover exact Host-indexed acquisition intents without materializing the
+// generic device EDF heap.  This entry point is deliberately narrower than
+// nta_jit_discover_work: its caller must subsequently claim a statically safe
+// object range whose request policy keys are identical and whose tenant/backend
+// credits are unconstrained.  The range progress kernels retain all request-
+// generation, object-version, credit, and readiness transitions; only the
+// unused O(intentCapacity) heap construction is omitted.
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_discover_work_unqueued_host(
+    void *runtime, const void *workItems, const void *dependencies,
+    std::uint32_t workItemCount, cudaStream_t stream) {
+  if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
+      workItemCount == 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr std::uint32_t threads = 256;
+  nta_discover_work<<<(workItemCount + threads - 1U) / threads, threads, 0,
+                      stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime),
+      static_cast<const nta::abi::WorkItem *>(workItems),
+      static_cast<const nta::abi::AcquireRequirement *>(dependencies),
+      workItemCount);
+  return nta::jit::launchStatus();
+}
+
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_discover_work_ordered_nvme(
     void *runtime, const void *workItems, const void *dependencies,

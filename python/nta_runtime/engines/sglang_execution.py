@@ -984,6 +984,9 @@ class SglangAttentionExecutor:
             ) + (schedule.work_count - template.initial_ready_work_count)
         else:
             self._stats["indexed_range_fastpath_layers"] += 1
+            self._stats["unqueued_host_discovery_layers"] += int(
+                template.indexed_host_order_prevalidated
+            )
         self._stats["exact_resume_window_layers"] += int(template.exact_resume_windows)
         self._stats["compact_resume_launches"] += template.nonempty_resume_windows
         self._stats["compact_resume_cta_bound"] += sum(template.ready_work_counts)
@@ -1143,7 +1146,12 @@ class SglangAttentionExecutor:
                 ready_work_offsets=template.ready_work_offsets,
                 initial_ready_work_count=template.initial_ready_work_count,
                 indexed_host_first_object=template.indexed_host_first_object,
-                indexed_host_prevalidated=template.indexed_host_prevalidated,
+                indexed_host_range_prevalidated=(
+                    template.indexed_host_range_prevalidated
+                ),
+                indexed_host_order_prevalidated=(
+                    template.indexed_host_order_prevalidated
+                ),
                 indexed_host_copy_blocks_per_group=(
                     template.indexed_copy_blocks_per_group
                 ),

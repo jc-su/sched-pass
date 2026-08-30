@@ -1281,7 +1281,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                     sm_scale=self.scale,
                     stream=stream,
                     indexed_host_first_object=0,
-                    indexed_host_prevalidated=True,
+                    indexed_host_range_prevalidated=True,
                     indexed_host_copy_blocks_per_group=(
                         self._nta_config.host_copy_blocks_per_group
                     ),

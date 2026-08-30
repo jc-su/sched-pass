@@ -98,7 +98,7 @@ int main() {
   static_assert(nta::decodeTierCapabilities(nta::encodeTierCapabilities(
                     nta::TierDirectAddress | nta::TierHostRegistered)) ==
                 (nta::TierDirectAddress | nta::TierHostRegistered));
-  if (Version != 35 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
+  if (Version != 36 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;
   }

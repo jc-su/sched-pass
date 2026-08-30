@@ -607,7 +607,8 @@ class FlashInferLayerEpoch:
         ready_work_offsets: tuple[int, ...] | None = None,
         initial_ready_work_count: int = 0,
         indexed_host_first_object: int | None = None,
-        indexed_host_prevalidated: bool = False,
+        indexed_host_range_prevalidated: bool = False,
+        indexed_host_order_prevalidated: bool = False,
         indexed_host_copy_blocks_per_group: int = 2,
         sync_events: tuple[Any, tuple[Any, ...]] | None = None,
         discovery_profile: tuple[Any, Any] | None = None,
@@ -728,6 +729,12 @@ class FlashInferLayerEpoch:
         )
         if next_indexed_object is not None and next_indexed_object < 0:
             raise ValueError("indexed host object offset must be nonnegative")
+        if indexed_host_order_prevalidated and (
+            next_indexed_object is None or not indexed_host_range_prevalidated
+        ):
+            raise ValueError(
+                "static Host order requires a prevalidated indexed object range"
+            )
         indexed_host_copy_blocks_per_group = int(indexed_host_copy_blocks_per_group)
         if not 1 <= indexed_host_copy_blocks_per_group <= 64:
             raise ValueError(
@@ -739,7 +746,7 @@ class FlashInferLayerEpoch:
             if next_indexed_object is None:
                 self.epoch.phases.progress_host(self.runtime, blocks, target_stream)
                 return
-            if indexed_host_prevalidated:
+            if indexed_host_range_prevalidated:
                 self.epoch.phases.progress_validated_indexed_host_range_parallel(
                     self.runtime,
                     next_indexed_object,
@@ -891,7 +898,12 @@ class FlashInferLayerEpoch:
 
         if discovery_profile is not None:
             discovery_profile[0].record(stream)
-        self.epoch.phases.discover(self.runtime, self.plan, stream)
+        if indexed_host_order_prevalidated:
+            self.epoch.phases.discover_unqueued_host(
+                self.runtime, self.plan, stream
+            )
+        else:
+            self.epoch.phases.discover(self.runtime, self.plan, stream)
         if discovery_profile is not None:
             discovery_profile[1].record(stream)
         if on_discovered is not None:

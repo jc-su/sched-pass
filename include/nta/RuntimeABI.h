@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 35;
+inline constexpr std::uint32_t Version = 36;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 6;
 

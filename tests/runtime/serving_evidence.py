@@ -480,6 +480,7 @@ def main() -> None:
         "admission_considered_batches": 8,
         "hybrid_parallel_waves": 59,
         "indexed_range_fastpath_layers": 140,
+        "unqueued_host_discovery_layers": 140,
         "queued_feasible_edf_layers": 4,
         "stream_ordered_retirement_layers": 280,
         "stream_ordered_retirement_launches": 8,
@@ -540,6 +541,7 @@ def main() -> None:
         "admission_considered_batches": 9,
         "hybrid_parallel_waves": 69,
         "indexed_range_fastpath_layers": 175,
+        "unqueued_host_discovery_layers": 175,
         "queued_feasible_edf_layers": 5,
         "stream_ordered_retirement_layers": 316,
         "stream_ordered_retirement_launches": 9,
@@ -597,6 +599,7 @@ def main() -> None:
     assert measured["admission_considered_batches"] == 1
     assert measured["hybrid_parallel_waves"] == 10
     assert measured["indexed_range_fastpath_layers"] == 35
+    assert measured["unqueued_host_discovery_layers"] == 35
     assert measured["queued_feasible_edf_layers"] == 1
     assert measured["stream_ordered_retirement_layers"] == 36
     assert measured["stream_ordered_retirement_launches"] == 1

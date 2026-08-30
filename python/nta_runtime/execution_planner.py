@@ -402,7 +402,8 @@ class HostLayerExecutionTemplate:
     initial_ready_work_count: int
     demand_transfer_bytes: int
     indexed_host_first_object: int | None
-    indexed_host_prevalidated: bool
+    indexed_host_range_prevalidated: bool
+    indexed_host_order_prevalidated: bool
     indexed_copy_blocks_per_group: int
     progressive_consumer: bool
     exact_resume_windows: bool
@@ -556,7 +557,8 @@ def plan_host_layer_execution(
         indexed_host_first_object=(
             None if queued_feasible_edf else preloaded_object_count
         ),
-        indexed_host_prevalidated=not queued_feasible_edf,
+        indexed_host_range_prevalidated=not queued_feasible_edf,
+        indexed_host_order_prevalidated=not queued_feasible_edf,
         indexed_copy_blocks_per_group=indexed_copy_blocks_per_group(
             transfer_bytes=demand_transfer_bytes,
             object_count=object_count - preloaded_object_count,
