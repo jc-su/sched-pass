@@ -2134,25 +2134,32 @@ def copy_strided_host_runs_async(groups: Any, runs: Any, stream: Any = None) -> 
         )
     )
     maximum_copies = 1 << 16
+    # Every group shares the same exact run layout.  Reduce its bounds once
+    # instead of walking the Cartesian product in Python; the native boundary
+    # still validates every concrete operation before submission.  Large
+    # HiCache leases can contain hundreds of runs across dozens of K/V layer
+    # groups, so the redundant O(groups * runs) interpreter loop otherwise
+    # becomes visible in TTFT even though CUDA receives one batched copy.
+    maximum_source_row = max(
+        run.source_first + run.row_count for run in run_values
+    )
+    minimum_destination_row = min(run.destination_first for run in run_values)
+    maximum_destination_row = max(
+        run.destination_first + run.row_count for run in run_values
+    )
     batches: list[list[tuple[StridedCopyGroup, tuple[int, int]]]] = []
     for group in group_values:
-        for run in run_values:
-            if (
-                run.source_first + run.row_count > group.source_rows
-                or run.destination_first + run.row_count > group.destination_rows
-            ):
-                raise ValueError("strided host-copy run exceeds group geometry")
+        if (
+            maximum_source_row > group.source_rows
+            or maximum_destination_row > group.destination_rows
+        ):
+            raise ValueError("strided host-copy run exceeds group geometry")
         span = (
             group.destination_address
-            + min(run.destination_first for run in run_values)
-            * group.destination_stride_bytes,
+            + minimum_destination_row * group.destination_stride_bytes,
             group.destination_address
-            + max(
-                (run.destination_first + run.row_count - 1)
-                * group.destination_stride_bytes
-                + group.row_bytes
-                for run in run_values
-            ),
+            + (maximum_destination_row - 1) * group.destination_stride_bytes
+            + group.row_bytes,
         )
         if span[1] >= 1 << 64:
             raise ValueError("strided host-copy address geometry exceeds uint64")
