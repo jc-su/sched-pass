@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -305,8 +305,6 @@ class SglangForwardLifecycle:
     def abort(
         self,
         pending: PendingHostLoad | None = None,
-        *,
-        abort_nvme: Callable[[Any], None] | None = None,
     ) -> bool:
         """Quiesce and retire one abnormal forward exactly once."""
 
@@ -330,18 +328,14 @@ class SglangForwardLifecycle:
             # Preserve the entire epoch so a later abort can retry quiescence.
             raise
 
-        nvme_complete = True
-        if epoch is not None and epoch.nvme_acquisition is not None:
-            if abort_nvme is None:
-                errors.append(RuntimeError("NVMe forward abort has no pipeline owner"))
-                nvme_complete = False
-            else:
-                try:
-                    abort_nvme(epoch.nvme_acquisition)
-                    epoch.nvme_acquisition = None
-                except BaseException as error:
-                    errors.append(error)
-                    nvme_complete = False
+        acquisition_complete = True
+        if epoch is not None and epoch.acquisition is not None:
+            try:
+                epoch.acquisition.abort_after_quiescence()
+                epoch.acquisition = None
+            except BaseException as error:
+                errors.append(error)
+                acquisition_complete = False
 
         retired = False
         retire_complete = not target_live
@@ -363,7 +357,7 @@ class SglangForwardLifecycle:
                 errors.append(error)
                 retire_complete = False
 
-        cleanup_complete = nvme_complete and retire_complete
+        cleanup_complete = acquisition_complete and retire_complete
         if cleanup_complete:
             self._release()
             self._stats["forward_lifecycle_aborts"] += 1

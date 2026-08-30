@@ -37,19 +37,26 @@ from nta_runtime.execution_planner import (
 from nta_runtime.opportunity import OperatorArrival, TileArrival, append_json_line
 from nta_runtime.engines.sglang_graphs import DemandGraphCache, demand_graph_key
 from nta_runtime.engines.sglang_planning import requires_feasible_edf
+from nta_runtime.engines.sglang_acquisition_contract import (
+    AcquisitionConsumerPlan,
+    AcquisitionTier,
+    SglangLayerAcquisition,
+)
 from nta_runtime.engines.sglang_state import (
     SglangForwardEpoch,
     _BarrierProfile,
     _OperatorProfile,
 )
-from nta_runtime.engines.sglang_nvme import SglangNvmeAcquisitionPipeline
+from nta_runtime.engines.sglang_nvme import (
+    NvmeForwardAcquisition,
+    SglangNvmeAcquisitionPipeline,
+)
 
 
 class AttentionDispatchKind(str, Enum):
     PREACQUIRED = "direct"
     ARRIVING_PREFETCH = "arriving"
     PRELOADED = "preloaded"
-    NVME = "nvme"
     HOST_INCREMENTAL = "incremental"
     HOST_DEVICE_BULK = "device_bulk"
 
@@ -60,7 +67,7 @@ class AttentionDispatch:
 
     kind: AttentionDispatchKind
     local_layer: int
-    prefetched: Any | None
+    acquisition: SglangLayerAcquisition | None
     host_execution: HostExecutionPlan | None
 
 
@@ -157,7 +164,7 @@ def select_attention_dispatch(
     *,
     pending: Any | None,
     host_execution: HostExecutionPlan | None,
-    tier_is_nvme: bool,
+    acquisition: SglangLayerAcquisition | None,
     layer_id: int,
     prefetch_event_ordered: bool = False,
     modeled_ready_by_attention: bool = False,
@@ -165,8 +172,8 @@ def select_attention_dispatch(
     """Select exactly one layer path without submitting CUDA work."""
 
     if pending is None:
-        if host_execution is not None:
-            raise RuntimeError("resident attention retained a host execution plan")
+        if host_execution is not None or acquisition is not None:
+            raise RuntimeError("resident attention retained external acquisition state")
         return AttentionDispatch(
             AttentionDispatchKind.PREACQUIRED,
             -1,
@@ -178,39 +185,46 @@ def select_attention_dispatch(
     local_layer = int(layer_id) - start_layer
     if local_layer < 0:
         raise RuntimeError("attention layer precedes its HiCache owner partition")
-    prefetched = pending.prefetched_layers.get(local_layer)
-    if prefetched is not None:
-        if prefetched.transfer_first_slot is not None and host_execution is None:
-            raise RuntimeError("SM-prefetched attention has no host execution decision")
+    if acquisition is not None:
+        if (
+            acquisition.local_layer != local_layer
+            or acquisition.layer_id != int(layer_id)
+        ):
+            raise RuntimeError("attention acquisition has inconsistent layer identity")
+        if (
+            acquisition.tier is AcquisitionTier.NVME
+            and host_execution is not None
+        ):
+            raise RuntimeError("NVMe attention retained a Host execution plan")
+        if (
+            acquisition.tier is AcquisitionTier.HOST_STAGED
+            and acquisition.progressive
+            and host_execution is None
+        ):
+            raise RuntimeError("progressive Host attention has no execution decision")
         arriving = (
-            prefetched.transfer_first_slot is not None
+            acquisition.progressive
+            and host_execution is not None
             and host_execution.uses_dependency_protocol
             and host_execution.overlap_initial
             and not prefetch_event_ordered
             and not modeled_ready_by_attention
-            and not prefetched.ready_event.query()
+            and not acquisition.ready_event.query()
         )
         return AttentionDispatch(
             AttentionDispatchKind.ARRIVING_PREFETCH
             if arriving
             else AttentionDispatchKind.PRELOADED,
             local_layer,
-            prefetched,
+            acquisition,
             host_execution,
         )
 
-    if tier_is_nvme:
-        if host_execution is not None:
-            raise RuntimeError("NVMe attention retained a host execution plan")
-        return AttentionDispatch(
-            AttentionDispatchKind.NVME,
-            local_layer,
-            None,
-            None,
-        )
-
     if host_execution is None:
-        raise RuntimeError("host-staged attention has no execution decision")
+        raise RuntimeError(
+            "external attention has neither a published acquisition nor a Host "
+            "execution decision"
+        )
     if not host_execution.uses_dependency_protocol:
         raise RuntimeError(
             "direct host execution reached a typed wrapper; metadata selection "
@@ -306,7 +320,7 @@ class SglangAttentionExecutor:
         """Bind exact consumers and enqueue every layer's NVMe producer."""
 
         pipeline = self._nvme_pipeline
-        if pipeline is None or batch.nvme_acquisition is not None:
+        if pipeline is None or batch.acquisition is not None:
             raise RuntimeError("NVMe acquisition pipeline is unavailable or reused")
         if not wrappers or {id(wrapper) for wrapper in wrappers} != set(
             batch.semantic_plans
@@ -335,7 +349,7 @@ class SglangAttentionExecutor:
                         "event-ready NVMe consumer retained transport ownership"
                     )
 
-        batch.nvme_acquisition = pipeline.prepare(
+        backend_acquisition = pipeline.prepare(
             semantic_plans=batch.semantic_plans,
             bindings=batch.bindings,
             ordering_stream=ordering_stream,
@@ -343,6 +357,7 @@ class SglangAttentionExecutor:
             kv_cache_for_layer=kv_cache_for_layer,
             inter_layer_compute_ns=inter_layer_compute_ns,
         )
+        batch.acquisition = NvmeForwardAcquisition(pipeline, backend_acquisition)
 
     def clear(self) -> None:
         """Release reusable event topology after all CUDA work is quiescent."""
@@ -554,20 +569,6 @@ class SglangAttentionExecutor:
                 stream=stream,
                 run_options=run_options,
             )
-        if dispatch.kind is AttentionDispatchKind.NVME:
-            return self._execute_nvme(
-                batch=batch,
-                wrapper=wrapper,
-                q=q,
-                kv_cache=kv_cache,
-                output=output,
-                layer=layer,
-                stream=stream,
-                run_options=run_options,
-                final_layer=final_layer,
-                verify_execution=verify_execution,
-                verify_transfer=verify_transfer,
-            )
         raise RuntimeError("host-demand attention reached the non-host executor")
 
     def _execute_arriving_prefetch(
@@ -588,10 +589,13 @@ class SglangAttentionExecutor:
         tile_compute_ns: int,
     ) -> AttentionDispatchOutcome:
         pending = batch.pending_host_load
-        prefetched = dispatch.prefetched
-        if pending is None or prefetched is None:
+        acquisition = dispatch.acquisition
+        publication = (
+            None if acquisition is None else acquisition.partial_publication
+        )
+        if pending is None or acquisition is None or publication is None:
             raise RuntimeError("arriving dispatch lost its HiCache readiness")
-        self._record_barrier_arrival(prefetched.ready_event, layer, stream)
+        self._record_barrier_arrival(acquisition.ready_event, layer, stream)
         (
             plan,
             schedule,
@@ -608,7 +612,7 @@ class SglangAttentionExecutor:
         )
         if (
             object_count != 0
-            or ready_event is not prefetched.ready_event
+            or ready_event is not acquisition.ready_event
             or preloaded_object_count != 0
             or host_execution is None
             or not host_execution.uses_dependency_protocol
@@ -622,7 +626,7 @@ class SglangAttentionExecutor:
         if (
             not allocation.event_partitioned
             or not 0 < initial_ready_work_count < schedule.work_count
-            or len(wave_work_counts) != prefetched.wave_count
+            or len(wave_work_counts) != publication.wave_count
             or initial_ready_work_count + sum(wave_work_counts) != schedule.work_count
             or nonempty_wave_count <= 0
         ):
@@ -637,6 +641,11 @@ class SglangAttentionExecutor:
             wave_work_counts,
         )
         prepare_partition = batch.arriving_partition_key != partition_key
+        acquisition.owner.consume_layer(
+            acquisition,
+            stream,
+            wait_for_ready=False,
+        )
         enqueue_event_partitioned_attention(
             self._runtime,
             plan,
@@ -645,9 +654,9 @@ class SglangAttentionExecutor:
             q,
             kv_cache,
             output,
-            ready_events=prefetched.wave_events,
-            ready_object_slots=prefetched.wave_object_slots,
-            registration_event=prefetched.registration_event,
+            ready_events=publication.wave_events,
+            ready_object_slots=publication.wave_object_slots,
+            registration_event=publication.registration_event,
             direct_work_count=initial_ready_work_count,
             wave_work_counts=wave_work_counts,
             prepare_partition=prepare_partition,
@@ -703,51 +712,27 @@ class SglangAttentionExecutor:
         stream: torch.cuda.Stream,
         run_options: dict[str, Any],
     ) -> AttentionDispatchOutcome:
-        pending = batch.pending_host_load
-        prefetched = dispatch.prefetched
-        if pending is None or prefetched is None:
-            raise RuntimeError("preloaded dispatch lost its HiCache readiness")
-        self._record_barrier_arrival(prefetched.ready_event, layer, stream)
-        stream.wait_event(prefetched.ready_event)
-        # A pure-preloaded batch is legal, so materialization cannot rely on
-        # an earlier mixed layer having populated this structural plan.
-        self._upload_plan(batch, wrapper, int(layer.layer_id), kv_cache)
-        self.run_preacquired(batch, wrapper, q, kv_cache, output, layer, run_options)
-        self._stats["lookahead_bound_launches"] += 1
-        return AttentionDispatchOutcome()
-
-    def _execute_nvme(
-        self,
-        *,
-        batch: SglangForwardEpoch,
-        wrapper: Any,
-        q: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
-        output: torch.Tensor,
-        layer: Any,
-        stream: torch.cuda.Stream,
-        run_options: dict[str, Any],
-        final_layer: bool,
-        verify_execution: bool,
-        verify_transfer: bool,
-    ) -> AttentionDispatchOutcome:
-        pipeline = self._nvme_pipeline
-        acquisition = batch.nvme_acquisition
-        if batch.pending_host_load is None or pipeline is None or acquisition is None:
-            raise RuntimeError("NVMe dispatch lost its proactive acquisition")
-        local_layer = int(layer.layer_id) - acquisition.layers[0].layer_id
-        acquired = acquisition.layer(local_layer)
-        self._record_barrier_arrival(acquired.ready_event, layer, stream)
-        pipeline.wait_layer(acquisition, acquired, stream)
-        allocation = self._materializer.require_allocation(wrapper)
-        semantic = batch.semantic_plans.get(id(wrapper))
-        if (
-            semantic is None
-            or allocation.plan.has_external
-            or allocation.object_count != 0
-            or allocation.plan.work_item_count != semantic.schedule.work_count
-        ):
-            raise RuntimeError("NVMe event-ready consumer plan is incomplete")
+        acquisition = dispatch.acquisition
+        if batch.pending_host_load is None or acquisition is None:
+            raise RuntimeError("preloaded dispatch lost its acquisition readiness")
+        self._record_barrier_arrival(acquisition.ready_event, layer, stream)
+        acquisition.owner.consume_layer(acquisition, stream, wait_for_ready=True)
+        validate_runtime_health = acquisition.tier is AcquisitionTier.NVME
+        if acquisition.consumer_plan is AcquisitionConsumerPlan.HOST_MATERIALIZED:
+            # A pure-preloaded batch is legal, so materialization cannot rely on
+            # an earlier mixed layer having populated this structural plan.
+            self._upload_plan(batch, wrapper, int(layer.layer_id), kv_cache)
+            self._stats["lookahead_bound_launches"] += 1
+        else:
+            allocation = self._materializer.require_allocation(wrapper)
+            semantic = batch.semantic_plans.get(id(wrapper))
+            if (
+                semantic is None
+                or allocation.plan.has_external
+                or allocation.object_count != 0
+                or allocation.plan.work_item_count != semantic.schedule.work_count
+            ):
+                raise RuntimeError("preacquired consumer plan is incomplete")
         self.run_preacquired(
             batch,
             wrapper,
@@ -756,18 +741,15 @@ class SglangAttentionExecutor:
             output,
             layer,
             run_options,
-            validate_runtime_health=True,
+            validate_runtime_health=validate_runtime_health,
         )
-        schedule = semantic.schedule
-        self._stats["request_work_completed"] += schedule.work_count
-        self._stats["tier_external_layers"] += 1
-        self._stats["nvme_preacquired_launches"] = (
-            self._stats.get("nvme_preacquired_launches", 0) + 1
-        )
-        if final_layer:
-            pipeline.record_consumer(acquisition, stream)
-        if final_layer and self._runtime.sticky_failed_count != 0:
-            raise RuntimeError("the proactive NVMe acquisition pipeline failed")
+        if acquisition.tier is AcquisitionTier.NVME:
+            semantic = batch.semantic_plans[id(wrapper)]
+            self._stats["request_work_completed"] += semantic.schedule.work_count
+            self._stats["tier_external_layers"] += 1
+            self._stats["nvme_preacquired_launches"] = (
+                self._stats.get("nvme_preacquired_launches", 0) + 1
+            )
         return AttentionDispatchOutcome()
 
     def _record_barrier_arrival(

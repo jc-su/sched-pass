@@ -45,6 +45,10 @@ from nta_runtime.engines.sglang_acquisition import (
 from nta_runtime.engines.sglang_transfer import HostMoverController
 from nta_runtime.engines.sglang_pipeline import SglangHostTransport
 from nta_runtime.engines.sglang_nvme import SglangNvmeAcquisitionPipeline
+from nta_runtime.engines.sglang_acquisition_contract import (
+    AcquisitionTier,
+    HostForwardAcquisition,
+)
 from nta_runtime.engines.sglang_config import (
     AUTO_INCREMENTAL_INITIALIZATION_PROBES,
     SglangBootstrapConfig,
@@ -835,20 +839,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self.prefill_wrappers_paged = list(wrappers.prefill_paged)
         self.prefill_wrappers_verify = list(wrappers.prefill_verify)
 
-    def _current_forward_wrappers(self) -> tuple[Any, ...]:
-        """Return the exact wrapper set represented by ForwardBatch metadata."""
-
-        metadata = self.forward_metadata
-        if hasattr(metadata, "decode_wrappers"):
-            wrappers = tuple(metadata.decode_wrappers)
-        else:
-            if metadata.use_ragged:
-                raise RuntimeError("NVMe acquisition requires paged prefill")
-            wrappers = tuple(metadata.prefill_wrappers)
-        if not wrappers:
-            raise RuntimeError("FlashInfer forward metadata contains no wrappers")
-        return wrappers
-
     def _adopt_typed_forward_metadata(
         self, forward_batch: Any, stock_metadata: Any
     ) -> tuple[Any, ...]:
@@ -1035,7 +1025,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # Native host objects publish a consumer edge before their directory
         # identity can be replaced. Event-owned layers need only the final
         # lease edge. The physical-plan owner records exactly that lifetime.
-        if self._tier_service.is_host_staged:
+        acquisition = self._forward_lifecycle.active.acquisition
+        if (
+            acquisition is not None
+            and acquisition.tier is AcquisitionTier.HOST_STAGED
+        ):
             self._require_materializer().record_host_consumer(
                 torch.cuda.current_stream(),
                 indexed_objects=indexed_object_count != 0,
@@ -1067,6 +1061,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
         if self._forward_lifecycle.active is not batch:
             raise RuntimeError("external layer commit lost its forward epoch")
+        acquisition = batch.acquisition
+        if acquisition is None:
+            raise RuntimeError("external layer commit has no acquisition owner")
         try:
             final_layer = local_layer + 1 == self._model_layer_count
             validated_dispatch = self._forward_lifecycle.validate_external_dispatch(
@@ -1082,7 +1079,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     indexed_object_count=indexed_object_count,
                     final_layer=final_layer,
                 )
-            elif self._tier_service.is_host_staged:
+            elif acquisition.tier is AcquisitionTier.HOST_STAGED:
                 self._require_materializer().record_host_consumer(
                     torch.cuda.current_stream(),
                     indexed_objects=False,
@@ -1097,6 +1094,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     batch,
                     torch.cuda.current_stream(),
                 )
+                acquisition.finish(torch.cuda.current_stream())
+                if (
+                    acquisition.tier is AcquisitionTier.NVME
+                    and self._runtime.sticky_failed_count != 0
+                ):
+                    raise RuntimeError("the proactive NVMe acquisition pipeline failed")
 
             self._forward_lifecycle.commit_external_dispatch(validated_dispatch)
             self._stats["external_launches"] += 1
@@ -1107,16 +1110,17 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
             self._stats[dispatch_counter] += 1
 
-            frontier_started = time.perf_counter_ns() if self._profile_cpu else 0
-            self._advance_deadline_frontier(
-                pending,
-                local_layer,
-                fragment=fragment,
-            )
-            if self._profile_cpu:
-                self._stats["deadline_frontier_cpu_ns"] = self._stats.get(
-                    "deadline_frontier_cpu_ns", 0
-                ) + (time.perf_counter_ns() - frontier_started)
+            if acquisition.tier is AcquisitionTier.HOST_STAGED:
+                frontier_started = time.perf_counter_ns() if self._profile_cpu else 0
+                self._advance_deadline_frontier(
+                    pending,
+                    local_layer,
+                    fragment=fragment,
+                )
+                if self._profile_cpu:
+                    self._stats["deadline_frontier_cpu_ns"] = self._stats.get(
+                        "deadline_frontier_cpu_ns", 0
+                    ) + (time.perf_counter_ns() - frontier_started)
 
             self._hicache.complete_layer(pending, local_layer)
             if not final_layer:
@@ -1157,11 +1161,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         them finish would permit source reuse under DMA.
         """
 
-        pipeline = self._nvme_pipeline
-        return self._forward_lifecycle.abort(
-            pending,
-            abort_nvme=None if pipeline is None else pipeline.abort,
-        )
+        return self._forward_lifecycle.abort(pending)
 
     def _finalize_stream_ordered_batch(
         self, batch: SglangForwardEpoch, stream: torch.cuda.Stream
@@ -1344,6 +1344,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         semantic_plans={},
                         pending_host_load=pending,
                     ),
+                    acquisition=HostForwardAcquisition(pending),
                 )
             )
             if self._profile_barrier:
@@ -1393,6 +1394,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 semantic_plans={},
                 pending_host_load=pending,
             ),
+            acquisition=HostForwardAcquisition(pending),
         )
         active = self._forward_lifecycle.active
         if active is None:
@@ -1430,7 +1432,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if pending is None:
             self._stock_forward = True
             self._activate_wrapper_set(self._require_kernels().stock_wrappers)
-        elif measured_host_selection:
+        elif measured_host_selection or self._tier_service.is_nvme:
             # The stock plan supplies the exact schedule for a no-overhead
             # direct decision. A typed plan is built later only if measured
             # overlap justifies unresolved work.
@@ -1602,14 +1604,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         self._stats.get("host_typed_mixed_batches", 0) + 1
                     )
                 return
+            stock_metadata = self.forward_metadata
             self._init_external_metadata(forward_batch, pending, bindings=bindings)
             if self._tier_service.is_nvme:
                 batch = self._forward_lifecycle.active
                 if batch is None:
                     raise RuntimeError("NVMe metadata produced no active batch")
+                self._activate_wrapper_set(self._require_kernels().typed_wrappers())
+                typed_wrappers = self._adopt_typed_forward_metadata(
+                    forward_batch, stock_metadata
+                )
                 self._require_attention_executor().prepare_nvme_batch(
                     batch=batch,
-                    wrappers=self._current_forward_wrappers(),
+                    wrappers=typed_wrappers,
                     ordering_stream=torch.cuda.current_stream(),
                     tile_compute_ns=self._host_cost_model.tile_compute_ns,
                     kv_cache_for_layer=lambda layer_id: (
@@ -1690,6 +1697,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             ),
             count_batch=count_batch,
         )
+        if self._tier_service.is_host_staged:
+            planned.batch.acquisition = HostForwardAcquisition(pending)
         self._forward_lifecycle.activate(planned.batch)
         return planned.host_execution
 
@@ -1890,23 +1899,21 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
         pending = batch.pending_host_load
         local_layer = int(layer.layer_id) - self._model_start_layer
-        prefetched = (
-            None
-            if pending is None
-            else pending.prefetched_layers.get(local_layer)
+        acquisition = (
+            None if batch.acquisition is None else batch.acquisition.layer(local_layer)
         )
         prefetch_event_ordered = (
-            prefetched is not None
-            and id(prefetched.ready_event) in batch.ordered_prefetch_event_ids
+            acquisition is not None
+            and id(acquisition.ready_event) in batch.ordered_prefetch_event_ids
         )
         modeled_ready_by_attention = (
-            prefetched is not None
+            acquisition is not None
             and local_layer in batch.modeled_ready_by_attention_layers
         )
         dispatch = select_attention_dispatch(
             pending=pending,
             host_execution=batch.host_execution,
-            tier_is_nvme=self._tier_service.is_nvme,
+            acquisition=acquisition,
             layer_id=int(layer.layer_id),
             prefetch_event_ordered=prefetch_event_ordered,
             modeled_ready_by_attention=modeled_ready_by_attention,
@@ -1915,8 +1922,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._stats["deadline_frontier_modeled_stock_dispatches"] = (
                 self._stats.get("deadline_frontier_modeled_stock_dispatches", 0) + 1
             )
-        if dispatch.prefetched is not None:
-            event_id = id(dispatch.prefetched.ready_event)
+        if dispatch.acquisition is not None:
+            event_id = id(dispatch.acquisition.ready_event)
             if prefetch_event_ordered:
                 self._stats["stream_ordered_prefetch_event_reuses"] = (
                     self._stats.get("stream_ordered_prefetch_event_reuses", 0) + 1
@@ -2111,7 +2118,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
         if (
             pending is not None
-            and self._tier_service.is_host_staged
+            and batch.acquisition is not None
+            and batch.acquisition.tier is AcquisitionTier.HOST_STAGED
             and verify_transfer
         ):
             self._require_attention_verifier().verify_layer_transfer(
@@ -2211,15 +2219,16 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
 
     def _wait_for_stock_external_layer(
-        self, pending: PendingHostLoad, layer: Any
+        self, batch: SglangForwardEpoch, layer: Any
     ) -> int:
         """Join the producer event before stock attention consumes a page."""
 
-        local_layer = int(layer.layer_id) - int(
-            getattr(pending.controller.mem_pool_device, "start_layer", 0)
-        )
-        prefetched = pending.prefetched_layers.get(local_layer)
-        if prefetched is None:
+        acquisition = batch.acquisition
+        if acquisition is None:
+            raise RuntimeError("stock external attention has no acquisition owner")
+        local_layer = int(layer.layer_id) - self._model_start_layer
+        published = acquisition.layer(local_layer)
+        if published is None:
             raise RuntimeError(
                 "stock external attention reached a layer without an exact "
                 f"prefetch event: {layer.layer_id}"
@@ -2231,12 +2240,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._barrier_profiles.append(
                 _BarrierProfile(
                     arrive,
-                    prefetched.ready_event,
+                    published.ready_event,
                     int(layer.layer_id),
                     "attention_layer",
                 )
             )
-        stream.wait_event(prefetched.ready_event)
+        acquisition.consume_layer(published, stream, wait_for_ready=True)
         return local_layer
 
     def _run_preloaded_stock_layer(
@@ -2253,7 +2262,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if batch is None or batch.pending_host_load is None:
             raise RuntimeError("preloaded stock layer has no external lease")
         pending = batch.pending_host_load
-        local_layer = self._wait_for_stock_external_layer(pending, layer)
+        local_layer = self._wait_for_stock_external_layer(batch, layer)
         profile = None
         stream = torch.cuda.current_stream()
         if self._profile_gpu:
@@ -2277,7 +2286,26 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
         self._stats["stock_attention_launches"] += 1
         self._stats["lookahead_bound_launches"] += 1
-        if self._verification.transfer:
+        if (
+            batch.acquisition is not None
+            and batch.acquisition.tier is AcquisitionTier.NVME
+        ):
+            semantic = batch.semantic_plans.get(id(typed_wrapper))
+            if semantic is None:
+                raise RuntimeError("NVMe stock alias lost its exact semantic plan")
+            self._stats["request_work_completed"] += semantic.schedule.work_count
+            self._stats["tier_external_layers"] += 1
+            self._stats["nvme_preacquired_launches"] = (
+                self._stats.get("nvme_preacquired_launches", 0) + 1
+            )
+            self._stats["nvme_ready_stock_launches"] = (
+                self._stats.get("nvme_ready_stock_launches", 0) + 1
+            )
+        if (
+            self._verification.transfer
+            and batch.acquisition is not None
+            and batch.acquisition.tier is AcquisitionTier.HOST_STAGED
+        ):
             self._require_attention_verifier().verify_layer_transfer(
                 batch,
                 int(layer.layer_id),
@@ -2335,7 +2363,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._finish_forward(batch)
                 return output
             self._stats["stock_attention_launches"] += 1
-            local_layer = self._wait_for_stock_external_layer(pending, layer)
+            local_layer = self._wait_for_stock_external_layer(batch, layer)
             self._stats["decode_launches"] += 1
             output = FlashInferAttnBackend.forward_decode(
                 self,
@@ -2428,7 +2456,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._finish_forward(batch)
                 return output
             self._stats["stock_attention_launches"] += 1
-            local_layer = self._wait_for_stock_external_layer(pending, layer)
+            local_layer = self._wait_for_stock_external_layer(batch, layer)
             self._stats["prefill_launches"] += 1
             output = FlashInferAttnBackend.forward_extend(
                 self,

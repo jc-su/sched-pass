@@ -21,6 +21,9 @@ from nta_runtime.engines.sglang_contracts import (
     LeaseAcquisitionSlice,
     PagePair,
 )
+from nta_runtime.engines.sglang_acquisition_contract import (
+    SglangForwardAcquisition,
+)
 from nta_runtime.engines.sglang_hicache import PendingHostLoad
 from nta_runtime.execution_core import ExecutionPlan, ExecutionSession
 from nta_runtime.execution_topology import ExactWorkTopology
@@ -35,71 +38,6 @@ from nta_runtime.requests import RequestBinding
 
 if TYPE_CHECKING:
     from nta_runtime.flashinfer import FlashInferLayerEpoch
-    from nta_runtime.engines.sglang_nvme import NvmeBatchAcquisition
-
-
-@dataclass(frozen=True)
-class _PrefetchedLayer:
-    key_bytes: int
-    value_bytes: int
-    ready_event: torch.cuda.Event
-    # SM movers use runtime object slots. Copy-engine movers are ordered only
-    # by the CUDA event and therefore own no acquisition-directory entry.
-    transfer_first_slot: int | None
-    transfer_object_id_base: int | None
-    transfer_object_version: int | None
-    registration_event: torch.cuda.Event | None
-    wave_events: tuple[torch.cuda.Event, ...]
-    wave_object_slots: tuple[int, ...]
-    wave_row_ends: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if min(self.key_bytes, self.value_bytes) <= 0:
-            raise ValueError("prefetched layer byte geometry must be positive")
-        if self.transfer_first_slot is None:
-            if (
-                self.transfer_object_id_base is not None
-                or self.transfer_object_version is not None
-                or self.registration_event is not None
-                or self.wave_events
-                or self.wave_object_slots
-                or self.wave_row_ends
-            ):
-                raise ValueError("copy-engine layer retained SM wave state")
-            return
-        if (
-            self.transfer_first_slot < 0
-            or self.transfer_object_id_base is None
-            or self.transfer_object_id_base <= 0
-            or self.transfer_object_version is None
-            or self.transfer_object_version <= 0
-            or not self.wave_row_ends
-            or any(end <= 0 for end in self.wave_row_ends)
-            or tuple(sorted(set(self.wave_row_ends))) != self.wave_row_ends
-        ):
-            raise ValueError("SM-prefetched layer wave geometry is invalid")
-        event_owned = (
-            len(self.wave_events) == len(self.wave_row_ends)
-            and not self.wave_object_slots
-            and self.registration_event is None
-            and self.ready_event is self.wave_events[-1]
-        )
-        object_owned = (
-            not self.wave_events
-            and len(self.wave_object_slots) == len(self.wave_row_ends)
-            and self.registration_event is not None
-            and self.wave_object_slots
-            == tuple(
-                self.transfer_first_slot + 2 * wave
-                for wave in range(len(self.wave_row_ends))
-            )
-        )
-        if event_owned == object_owned:
-            raise ValueError("SM-prefetched layer readiness owner is ambiguous")
-
-    @property
-    def wave_count(self) -> int:
-        return len(self.wave_row_ends)
 
 
 @dataclass(frozen=True)
@@ -284,7 +222,7 @@ class SglangForwardEpoch:
     """Sole mutable execution state for one immutable forward plan."""
 
     plan: SglangForwardPlan
-    nvme_acquisition: NvmeBatchAcquisition | None = None
+    acquisition: SglangForwardAcquisition | None = None
     fragment_lookahead: dict[int, _FragmentLookahead] = field(default_factory=dict)
     # One transport submission can publish the same completion fence for
     # several adjacent layers. Once that fence is ordered on the numerical
@@ -381,8 +319,7 @@ class SglangForwardEpoch:
         if not operation:
             raise ValueError("forward epoch operation must be named")
         if (
-            self.nvme_acquisition is not None
-            or self.fragment_lookahead
+            self.fragment_lookahead
             or self.ordered_prefetch_event_ids
             or self.modeled_ready_by_attention_layers
             or self.host_layer_templates

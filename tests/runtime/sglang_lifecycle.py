@@ -18,6 +18,10 @@ from nta_runtime.engines.sglang import NtaFlashInferAttnBackend  # noqa: E402
 from nta_runtime.engines.sglang_lifecycle import (  # noqa: E402
     SglangForwardLifecycle,
 )
+from nta_runtime.engines.sglang_acquisition_contract import (  # noqa: E402
+    AcquisitionTier,
+    SglangForwardAcquisition,
+)
 from nta_runtime.engines.sglang_state import (  # noqa: E402
     SglangForwardEpoch,
     SglangForwardPlan,
@@ -228,10 +232,50 @@ def assert_same(left, right) -> None:
     assert left is right
 
 
+class FakeAcquisition(SglangForwardAcquisition):
+    def __init__(
+        self,
+        order,
+        *,
+        tier: AcquisitionTier = AcquisitionTier.NVME,
+        fail: bool = False,
+        finish_label: str | None = None,
+        fail_finish: bool = False,
+    ) -> None:
+        self.order = order
+        self._tier = tier
+        self.fail = fail
+        self.finish_label = finish_label
+        self.fail_finish = fail_finish
+
+    @property
+    def tier(self) -> AcquisitionTier:
+        return self._tier
+
+    def layer(self, local_layer: int):
+        del local_layer
+        return None
+
+    def consume_layer(self, layer, stream, *, wait_for_ready: bool) -> None:
+        del layer, stream, wait_for_ready
+
+    def finish(self, stream) -> None:
+        del stream
+        if self.finish_label is not None:
+            self.order.append(self.finish_label)
+        if self.fail_finish:
+            raise RuntimeError(f"fault:{self.finish_label}")
+
+    def abort_after_quiescence(self) -> None:
+        self.order.append("acquisition-abort")
+        if self.fail:
+            raise RuntimeError("fault:acquisition-abort")
+
+
 def test_abort_order_and_idempotence() -> None:
     order = []
     pending = SimpleNamespace(consumer_index=5)
-    active = new_epoch(pending=pending, nvme_acquisition=object())
+    active = new_epoch(pending=pending, acquisition=FakeAcquisition(order))
     counters = new_stats()
     owner = new_lifecycle(
         layer_count=1,
@@ -241,10 +285,6 @@ def test_abort_order_and_idempotence() -> None:
     owner.activate(active)
     stream = object()
 
-    def abort_nvme(acquisition) -> None:
-        assert_same(acquisition, active.nvme_acquisition)
-        order.append("nvme-abort")
-
     with (
         patch(
             "torch.cuda.synchronize",
@@ -252,19 +292,22 @@ def test_abort_order_and_idempotence() -> None:
         ) as synchronize,
         patch("torch.cuda.current_stream", return_value=stream),
     ):
-        assert owner.abort(abort_nvme=abort_nvme)
-        assert not owner.abort(abort_nvme=lambda _acquisition: None)
+        assert owner.abort()
+        assert not owner.abort()
     synchronize.assert_called_once_with()
-    assert order == ["sync", "nvme-abort", "hicache-retire"]
+    assert order == ["sync", "acquisition-abort", "hicache-retire"]
     assert owner.active is None
     assert counters["forward_lifecycle_aborts"] == 1
 
 
 def test_abort_preserves_owners_until_quiescent() -> None:
-    for failed_stage in ("sync", "nvme-abort", "hicache-retire"):
+    for failed_stage in ("sync", "acquisition-abort", "hicache-retire"):
         order = []
         pending = SimpleNamespace(consumer_index=7)
-        active = new_epoch(pending=pending, nvme_acquisition=object())
+        acquisition = FakeAcquisition(
+            order, fail=failed_stage == "acquisition-abort"
+        )
+        active = new_epoch(pending=pending, acquisition=acquisition)
         counters = new_stats()
 
         class FaultHiCache(FakeHiCache):
@@ -290,28 +333,27 @@ def test_abort_preserves_owners_until_quiescent() -> None:
             if failed_stage == "sync":
                 raise RuntimeError("fault:sync")
 
-        def abort_nvme(_acquisition) -> None:
-            order.append("nvme-abort")
-            if failed_stage == "nvme-abort":
-                raise RuntimeError("fault:nvme-abort")
-
         with (
             patch("torch.cuda.synchronize", side_effect=synchronize),
             patch("torch.cuda.current_stream", return_value=object()),
         ):
             assert_raises(
                 f"fault:{failed_stage}",
-                lambda: owner.abort(abort_nvme=abort_nvme),
+                owner.abort,
             )
         expected_first = {
             "sync": ["sync"],
-            "nvme-abort": ["sync", "nvme-abort", "hicache-retire"],
-            "hicache-retire": ["sync", "nvme-abort", "hicache-retire"],
+            "acquisition-abort": [
+                "sync",
+                "acquisition-abort",
+                "hicache-retire",
+            ],
+            "hicache-retire": ["sync", "acquisition-abort", "hicache-retire"],
         }
         assert order == expected_first[failed_stage]
         assert owner.active is active
         assert counters["forward_lifecycle_aborts"] == 0
-        assert (active.nvme_acquisition is None) == (
+        assert (active.acquisition is None) == (
             failed_stage == "hicache-retire"
         )
         assert (hicache.get(pending.consumer_index) is pending) == (
@@ -322,9 +364,7 @@ def test_abort_preserves_owners_until_quiescent() -> None:
         # lifecycle abort, never one count per attempted cleanup.
         order.clear()
         hicache.failed_stage = None
-
-        def retry_nvme(_acquisition) -> None:
-            order.append("nvme-abort")
+        acquisition.fail = False
 
         with (
             patch(
@@ -333,43 +373,16 @@ def test_abort_preserves_owners_until_quiescent() -> None:
             ),
             patch("torch.cuda.current_stream", return_value=object()),
         ):
-            assert owner.abort(abort_nvme=retry_nvme)
-            assert not owner.abort(
-                pending,
-                abort_nvme=lambda _acquisition: None,
-            )
+            assert owner.abort()
+            assert not owner.abort(pending)
         expected_retry = {
-            "sync": ["sync", "nvme-abort", "hicache-retire"],
-            "nvme-abort": ["sync", "nvme-abort"],
+            "sync": ["sync", "acquisition-abort", "hicache-retire"],
+            "acquisition-abort": ["sync", "acquisition-abort"],
             "hicache-retire": ["sync", "hicache-retire"],
         }
         assert order == expected_retry[failed_stage]
         assert owner.active is None
         assert counters["forward_lifecycle_aborts"] == 1
-
-    order = []
-    pending = SimpleNamespace(consumer_index=8)
-    active = new_epoch(pending=pending, nvme_acquisition=object())
-    counters = new_stats()
-    owner = new_lifecycle(
-        layer_count=1,
-        hicache=FakeHiCache(pending, order),
-        counters=counters,
-    )
-    owner.activate(active)
-    with (
-        patch("torch.cuda.synchronize", side_effect=lambda: order.append("sync")),
-        patch("torch.cuda.current_stream", return_value=object()),
-    ):
-        assert_raises("no pipeline owner", owner.abort)
-    assert order == ["sync", "hicache-retire"]
-    assert owner.active is active
-    assert counters["forward_lifecycle_aborts"] == 0
-    with patch("torch.cuda.synchronize"):
-        assert owner.abort(abort_nvme=lambda _acquisition: None)
-    assert owner.active is None
-    assert counters["forward_lifecycle_aborts"] == 1
-
 
 def test_dispatch_validation_is_transactional() -> None:
     counters = new_stats()
@@ -436,7 +449,15 @@ def commit_backend(*, fail_at=None):
     pending = SimpleNamespace(consumer_index=13)
     counters = new_stats()
     hicache = FakeHiCache(pending, order)
-    active = new_epoch(pending=pending)
+    active = new_epoch(
+        pending=pending,
+        acquisition=FakeAcquisition(
+            order,
+            tier=AcquisitionTier.HOST_STAGED,
+            finish_label="acquisition-finish",
+            fail_finish=fail_at == "acquisition-finish",
+        ),
+    )
     owner = new_lifecycle(layer_count=1, hicache=hicache, counters=counters)
     owner.activate(active)
     backend = object.__new__(NtaFlashInferAttnBackend)
@@ -491,6 +512,7 @@ def test_external_commit_order_and_fault_containment() -> None:
     expected = [
         "quiescence",
         "stream-retire",
+        "acquisition-finish",
         "dispatch",
         "frontier",
         "hicache",
@@ -537,7 +559,7 @@ def test_external_commit_order_and_fault_containment() -> None:
                     publish_stats=True,
                 ),
             )
-        cleanup = ["abort-sync"]
+        cleanup = ["abort-sync", "acquisition-abort"]
         if failed_stage not in {"observation", "publish", "finish"}:
             cleanup.append("hicache-retire")
         assert order == expected[: failed_index + 1] + cleanup
@@ -576,7 +598,7 @@ def test_external_commit_order_and_fault_containment() -> None:
                 publish_stats=True,
             ),
         )
-    assert order == ["abort-sync", "hicache-retire"]
+    assert order == ["abort-sync", "acquisition-abort", "hicache-retire"]
     assert backend._stats["external_launches"] == 0
     assert owner._hicache.get(pending.consumer_index) is None
     assert owner.active is None

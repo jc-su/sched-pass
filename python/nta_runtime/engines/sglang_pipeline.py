@@ -17,7 +17,7 @@ import torch
 
 from nta_runtime.engines.sglang_hicache import PendingHostLoad
 from nta_runtime.engines.sglang_planning import pipeline_object_range
-from nta_runtime.engines.sglang_state import _PrefetchedLayer
+from nta_runtime.engines.sglang_acquisition_contract import HostLayerPublication
 from nta_runtime.engines.sglang_transfer import (
     HostMoverController,
     HostTransferLeasePlan,
@@ -176,7 +176,7 @@ class SglangHostTransport:
             max(1, transfer_plan.sm_waves_per_layer),
         )
 
-        prefetched_layers: dict[int, _PrefetchedLayer] = {}
+        prefetched_layers: dict[int, HostLayerPublication] = {}
         profile_start = (
             torch.cuda.Event(enable_timing=True) if self._profile_transfer else None
         )
@@ -336,7 +336,7 @@ class SglangHostTransport:
                             else transfer_first_slot
                             + objects_per_layer * ready_layer
                         )
-                        prefetched_layers[ready_layer] = _PrefetchedLayer(
+                        prefetched_layers[ready_layer] = HostLayerPublication(
                             key_bytes=key_bytes,
                             value_bytes=value_bytes,
                             ready_event=ready_event,

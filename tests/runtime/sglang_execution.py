@@ -10,10 +10,17 @@ from unittest.mock import patch
 import torch
 
 from nta_runtime.engines.sglang_execution import (
+    AttentionDispatch,
     AttentionDispatchKind,
     SglangAttentionExecutor,
     select_attention_dispatch,
     use_preloaded_stock_alias,
+)
+from nta_runtime.engines.sglang_acquisition_contract import (
+    AcquisitionConsumerPlan,
+    AcquisitionTier,
+    SglangForwardAcquisition,
+    SglangLayerAcquisition,
 )
 from nta_runtime.engines.sglang_verification import SglangAttentionVerifier
 
@@ -26,6 +33,62 @@ class ReadyEvent:
     def query(self) -> bool:
         self.queries += 1
         return self.ready
+
+
+class FakeAcquisitionOwner(SglangForwardAcquisition):
+    def __init__(self, tier: AcquisitionTier) -> None:
+        self._tier = tier
+        self.consumed = []
+
+    @property
+    def tier(self) -> AcquisitionTier:
+        return self._tier
+
+    def layer(self, local_layer: int):
+        del local_layer
+        return None
+
+    def consume_layer(self, layer, stream, *, wait_for_ready: bool) -> None:
+        self.consumed.append((layer, stream, wait_for_ready))
+
+    def finish(self, stream) -> None:
+        del stream
+
+    def abort_after_quiescence(self) -> None:
+        pass
+
+
+def acquired_layer(
+    event,
+    *,
+    local_layer: int = 2,
+    layer_id: int = 6,
+    progressive: bool = False,
+    publication=None,
+    tier: AcquisitionTier = AcquisitionTier.HOST_STAGED,
+):
+    owner = FakeAcquisitionOwner(tier)
+    if tier is AcquisitionTier.HOST_STAGED:
+        if publication is None:
+            publication = SimpleNamespace(
+                transfer_first_slot=8 if progressive else None
+            )
+        consumer_plan = AcquisitionConsumerPlan.HOST_MATERIALIZED
+        backend_record = None
+    else:
+        publication = None
+        consumer_plan = AcquisitionConsumerPlan.PREACQUIRED
+        backend_record = object()
+    return SglangLayerAcquisition(
+        owner,
+        local_layer,
+        layer_id,
+        event,
+        tier,
+        consumer_plan,
+        publication,
+        backend_record,
+    )
 
 
 def pending(prefetched_layers=None):
@@ -47,18 +110,18 @@ def main() -> None:
     direct = select_attention_dispatch(
         pending=None,
         host_execution=None,
-        tier_is_nvme=False,
+        acquisition=None,
         layer_id=4,
     )
     assert direct.kind is AttentionDispatchKind.PREACQUIRED
     assert direct.local_layer == -1
 
     ready = ReadyEvent(True)
-    preloaded = SimpleNamespace(transfer_first_slot=8, ready_event=ready)
+    preloaded = acquired_layer(ready, progressive=True)
     selected = select_attention_dispatch(
-        pending=pending({2: preloaded}),
+        pending=pending(),
         host_execution=execution(dependency=True, overlap=True),
-        tier_is_nvme=False,
+        acquisition=preloaded,
         layer_id=6,
     )
     assert selected.kind is AttentionDispatchKind.PRELOADED
@@ -71,11 +134,11 @@ def main() -> None:
     )
 
     arriving_event = ReadyEvent(False)
-    arriving = SimpleNamespace(transfer_first_slot=8, ready_event=arriving_event)
+    arriving = acquired_layer(arriving_event, progressive=True)
     selected = select_attention_dispatch(
-        pending=pending({2: arriving}),
+        pending=pending(),
         host_execution=execution(dependency=True, overlap=True),
-        tier_is_nvme=False,
+        acquisition=arriving,
         layer_id=6,
     )
     assert selected.kind is AttentionDispatchKind.ARRIVING_PREFETCH
@@ -87,9 +150,9 @@ def main() -> None:
     # host-side readiness at dispatch time. Preserve that decision and let the
     # stock stream wait enforce correctness without a racing event query.
     selected = select_attention_dispatch(
-        pending=pending({2: arriving}),
+        pending=pending(),
         host_execution=execution(dependency=True, overlap=True),
-        tier_is_nvme=False,
+        acquisition=arriving,
         layer_id=6,
         modeled_ready_by_attention=True,
     )
@@ -100,9 +163,9 @@ def main() -> None:
     # stronger than a racing host-side query. It must not create a second
     # partial consumer for a later layer in the same transport submission.
     selected = select_attention_dispatch(
-        pending=pending({2: arriving}),
+        pending=pending(),
         host_execution=execution(dependency=True, overlap=True),
-        tier_is_nvme=False,
+        acquisition=arriving,
         layer_id=6,
         prefetch_event_ordered=True,
     )
@@ -119,13 +182,19 @@ def main() -> None:
         transport_program=lambda: "phase-program"
     )
     wave_events = (object(), object(), object())
-    wave_prefetch = SimpleNamespace(
+    wave_publication = SimpleNamespace(
         transfer_first_slot=8,
-        ready_event=wave_events[-1],
         wave_events=wave_events,
         wave_object_slots=(),
         registration_event=None,
         wave_count=3,
+    )
+    wave_acquisition = acquired_layer(
+        wave_events[-1],
+        local_layer=0,
+        layer_id=4,
+        progressive=True,
+        publication=wave_publication,
     )
     wave_schedule = SimpleNamespace(work_count=7)
     wave_plan = object()
@@ -142,7 +211,7 @@ def main() -> None:
         wave_plan,
         wave_schedule,
         0,
-        wave_prefetch.ready_event,
+        wave_acquisition.ready_event,
         0,
         wave_host_execution,
     )
@@ -156,7 +225,7 @@ def main() -> None:
     ):
         for expected_prepare in (True, False):
             outcome = wave_executor._execute_arriving_prefetch(
-                dispatch=SimpleNamespace(prefetched=wave_prefetch),
+                dispatch=SimpleNamespace(acquisition=wave_acquisition),
                 batch=wave_batch,
                 wrapper="wrapper",
                 q="query",
@@ -186,14 +255,11 @@ def main() -> None:
     # consumer exists.  External-only/cache-placement forwards have no direct
     # work to overlap and must wait for the event before using the stock alias.
     no_direct_event = ReadyEvent(False)
-    no_direct_prefetch = SimpleNamespace(
-        transfer_first_slot=8,
-        ready_event=no_direct_event,
-    )
+    no_direct_prefetch = acquired_layer(no_direct_event, progressive=True)
     selected = select_attention_dispatch(
-        pending=pending({2: no_direct_prefetch}),
+        pending=pending(),
         host_execution=execution(dependency=True, overlap=False),
-        tier_is_nvme=False,
+        acquisition=no_direct_prefetch,
         layer_id=6,
     )
     assert selected.kind is AttentionDispatchKind.PRELOADED
@@ -201,28 +267,102 @@ def main() -> None:
     assert use_preloaded_stock_alias(selected, alias_available=True)
 
     copy_event = ReadyEvent(False)
-    copy_prefetch = SimpleNamespace(transfer_first_slot=None, ready_event=copy_event)
+    copy_prefetch = acquired_layer(copy_event)
     selected = select_attention_dispatch(
-        pending=pending({2: copy_prefetch}),
+        pending=pending(),
         host_execution=execution(dependency=True, overlap=True),
-        tier_is_nvme=False,
+        acquisition=copy_prefetch,
         layer_id=6,
     )
     assert selected.kind is AttentionDispatchKind.PRELOADED
     assert copy_event.queries == 0
 
+    nvme_acquisition = acquired_layer(
+        ReadyEvent(False),
+        local_layer=0,
+        layer_id=4,
+        tier=AcquisitionTier.NVME,
+    )
     nvme = select_attention_dispatch(
         pending=pending(),
         host_execution=None,
-        tier_is_nvme=True,
+        acquisition=nvme_acquisition,
         layer_id=4,
     )
-    assert nvme.kind is AttentionDispatchKind.NVME
+    assert nvme.kind is AttentionDispatchKind.PRELOADED
+
+    # Host and NVMe readiness use one executor branch.  The producer owner,
+    # not a tier flag, orders the fence; only Host requires per-layer
+    # materialization because NVMe prepared the preacquired plan up front.
+    common_executor = SglangAttentionExecutor.__new__(SglangAttentionExecutor)
+    common_executor._stats = defaultdict(int)
+    common_executor._record_barrier_arrival = lambda *_args: None
+    common_log = []
+    common_executor._upload_plan = lambda *_args, **_kwargs: common_log.append(
+        "host-materialize"
+    )
+    allocation = SimpleNamespace(
+        plan=SimpleNamespace(has_external=False, work_item_count=3),
+        object_count=0,
+    )
+    common_executor._materializer = SimpleNamespace(
+        require_allocation=lambda _wrapper: allocation
+    )
+    common_executor.run_preacquired = lambda *_args, **kwargs: common_log.append(
+        ("run", kwargs.get("validate_runtime_health", False))
+    )
+    common_batch = SimpleNamespace(
+        pending_host_load=object(),
+        semantic_plans={},
+    )
+    common_executor._execute_preloaded(
+        dispatch=AttentionDispatch(
+            AttentionDispatchKind.PRELOADED,
+            preloaded.local_layer,
+            preloaded,
+            execution(dependency=True),
+        ),
+        batch=common_batch,
+        wrapper="host-wrapper",
+        q="query",
+        kv_cache="kv",
+        output="output",
+        layer=SimpleNamespace(layer_id=6),
+        stream="stream",
+        run_options={},
+    )
+    assert preloaded.owner.consumed[-1][2]
+    assert common_log == ["host-materialize", ("run", False)]
+
+    nvme_wrapper = object()
+    common_batch.semantic_plans[id(nvme_wrapper)] = SimpleNamespace(
+        schedule=SimpleNamespace(work_count=3)
+    )
+    common_log.clear()
+    common_executor._execute_preloaded(
+        dispatch=AttentionDispatch(
+            AttentionDispatchKind.PRELOADED,
+            nvme_acquisition.local_layer,
+            nvme_acquisition,
+            None,
+        ),
+        batch=common_batch,
+        wrapper=nvme_wrapper,
+        q="query",
+        kv_cache="kv",
+        output="output",
+        layer=SimpleNamespace(layer_id=4),
+        stream="stream",
+        run_options={},
+    )
+    assert nvme_acquisition.owner.consumed[-1][2]
+    assert common_log == [("run", True)]
+    assert common_executor._stats["nvme_preacquired_launches"] == 1
 
     incremental = select_attention_dispatch(
         pending=pending(),
         host_execution=execution(dependency=True),
-        tier_is_nvme=False,
+        acquisition=None,
         layer_id=4,
     )
     assert incremental.kind is AttentionDispatchKind.HOST_INCREMENTAL
@@ -230,37 +370,32 @@ def main() -> None:
     bulk = select_attention_dispatch(
         pending=pending(),
         host_execution=execution(dependency=True, bulk=True),
-        tier_is_nvme=False,
+        acquisition=None,
         layer_id=4,
     )
     assert bulk.kind is AttentionDispatchKind.HOST_DEVICE_BULK
 
     malformed = (
         dict(
-            pending=None, host_execution=execution(dependency=True), tier_is_nvme=False
+            pending=None, host_execution=execution(dependency=True), acquisition=None
         ),
-        dict(pending=pending(), host_execution=None, tier_is_nvme=False),
+        dict(pending=pending(), host_execution=None, acquisition=None),
         dict(
             pending=pending(),
             host_execution=execution(dependency=False),
-            tier_is_nvme=False,
+            acquisition=None,
         ),
         dict(
             pending=pending(),
             host_execution=execution(dependency=True),
-            tier_is_nvme=True,
+            acquisition=nvme_acquisition,
         ),
         dict(
-            pending=pending(
-                {
-                    0: SimpleNamespace(
-                        transfer_first_slot=8,
-                        ready_event=ReadyEvent(True),
-                    )
-                }
-            ),
+            pending=pending(),
             host_execution=None,
-            tier_is_nvme=False,
+            acquisition=acquired_layer(
+                ReadyEvent(True), local_layer=0, layer_id=4, progressive=True
+            ),
         ),
     )
     for arguments in malformed:

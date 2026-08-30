@@ -27,6 +27,12 @@ from typing import Any
 import torch
 
 from nta_runtime.engines.sglang_contracts import PagePair
+from nta_runtime.engines.sglang_acquisition_contract import (
+    AcquisitionConsumerPlan,
+    AcquisitionTier,
+    SglangForwardAcquisition,
+    SglangLayerAcquisition,
+)
 from nta_runtime.execution_topology import (
     ExactWorkTopology,
     RequestWorkTopology,
@@ -892,3 +898,66 @@ class SglangNvmeAcquisitionPipeline:
             except BaseException as error:
                 errors.append(error)
         return tuple(errors)
+
+
+class NvmeForwardAcquisition(SglangForwardAcquisition):
+    """Expose proactive NVMe windows through the common consumer contract."""
+
+    def __init__(
+        self,
+        pipeline: SglangNvmeAcquisitionPipeline,
+        acquisition: NvmeBatchAcquisition,
+    ) -> None:
+        if not acquisition.layers:
+            raise ValueError("NVMe forward acquisition has no layers")
+        self._pipeline = pipeline
+        self._acquisition = acquisition
+        self._finished = False
+
+    @property
+    def backend_acquisition(self) -> NvmeBatchAcquisition:
+        return self._acquisition
+
+    @property
+    def tier(self) -> AcquisitionTier:
+        return AcquisitionTier.NVME
+
+    def layer(self, local_layer: int) -> SglangLayerAcquisition:
+        acquired = self._acquisition.layer(local_layer)
+        return SglangLayerAcquisition(
+            self,
+            local_layer,
+            acquired.layer_id,
+            acquired.ready_event,
+            AcquisitionTier.NVME,
+            AcquisitionConsumerPlan.PREACQUIRED,
+            backend_record=acquired,
+        )
+
+    def consume_layer(
+        self,
+        layer: SglangLayerAcquisition,
+        stream: torch.cuda.Stream,
+        *,
+        wait_for_ready: bool,
+    ) -> None:
+        if self._finished or layer.owner is not self:
+            raise RuntimeError("NVMe consumer uses an inactive acquisition")
+        if not wait_for_ready:
+            raise RuntimeError("NVMe layer has no partial consumer publication")
+        acquired = layer.backend_record
+        if not isinstance(acquired, NvmeLayerAcquisition):
+            raise RuntimeError("NVMe consumer lost its backend layer record")
+        self._pipeline.wait_layer(self._acquisition, acquired, stream)
+
+    def finish(self, stream: torch.cuda.Stream) -> None:
+        if self._finished:
+            raise RuntimeError("NVMe acquisition was finished more than once")
+        self._pipeline.record_consumer(self._acquisition, stream)
+        self._finished = True
+
+    def abort_after_quiescence(self) -> None:
+        if self._finished:
+            return
+        self._pipeline.abort(self._acquisition)
+        self._finished = True

@@ -2566,6 +2566,10 @@ def main() -> None:
     stock_pending = types.SimpleNamespace(
         prefetched_layers=prefetched,
         prefetch_tensors=(object(),),
+        controller=types.SimpleNamespace(
+            layer_num=2,
+            mem_pool_device=types.SimpleNamespace(start_layer=0),
+        ),
         materialize_mapping=lambda: (_ for _ in ()).throw(
             AssertionError("complete prefetch materialized an unused CPU page map")
         ),
