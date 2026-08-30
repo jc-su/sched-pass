@@ -38,7 +38,10 @@ from experiments.validate_bailian_replay import (  # noqa: E402
     _validate_prefetch_arrival_readiness,
     _validate_progressive_consumer,
 )
-from SglangHiCacheLoad import _load_workload  # noqa: E402
+from SglangHiCacheLoad import (  # noqa: E402
+    _append_request_unique_suffixes,
+    _load_workload,
+)
 from SglangBailianReplay import (  # noqa: E402
     _cache_state as replay_cache_state,
     _native_dispatch_distribution,
@@ -406,6 +409,43 @@ def main() -> None:
         assert loaded.resident_inputs[0] == loaded.external_inputs[0][:32]
         assert loaded.resident_arrival_offsets == (0.0,)
         assert loaded.external_arrival_offsets == (0.5,)
+        extended = _load_workload(
+            root / "manifest.json",
+            LossyTokenizer(),
+            external_suffix_tokens=7,
+        )
+        repeated = _load_workload(
+            root / "manifest.json",
+            LossyTokenizer(),
+            external_suffix_tokens=7,
+        )
+        assert extended.resident_inputs == loaded.resident_inputs
+        assert tuple(map(len, extended.external_inputs)) == (55,)
+        assert extended.external_inputs[0][:48] == loaded.external_inputs[0]
+        assert extended.external_inputs == repeated.external_inputs
+        assert extended.metadata["external_suffix_tokens"] == 7
+        assert extended.metadata["source_external_input_tokens"] == [48]
+        assert extended.metadata["external_input_tokens"] == [55]
+        assert (
+            extended.metadata["source_token_input_identity_digest"]
+            == (loaded.metadata["token_input_identity_digest"])
+        )
+        assert (
+            extended.metadata["token_input_identity_digest"]
+            != (loaded.metadata["token_input_identity_digest"])
+        )
+        assert extended.metadata["token_suffix_adapter"] == (
+            "deterministic_request_unique_token_suffix_v1"
+        )
+        branched, _ = _append_request_unique_suffixes(
+            LossyTokenizer(),
+            ("short", "long", "duplicate"),
+            ((1, 2), (1, 2, 3), (1, 2)),
+            2,
+        )
+        assert branched[0][:2] == (1, 2)
+        assert branched[0][2] != 3
+        assert len({branched[0][2], branched[1][3], branched[2][2]}) == 3
 
         cohort_manifest, cohort_rows = build_cohort(
             root / "manifest.json",

@@ -257,6 +257,81 @@ def _validate_workload(report: dict[str, Any]) -> None:
             f"serving record arrival diverges for {record['request_id']}",
         )
 
+    # Keep old diagnostic fixtures readable. New reports make a requested
+    # suffix auditable against the exact input lengths seen by SGLang.
+    if "external_suffix_tokens" not in workload:
+        return
+    suffix_tokens = workload.get("external_suffix_tokens")
+    _require(
+        isinstance(suffix_tokens, int)
+        and not isinstance(suffix_tokens, bool)
+        and suffix_tokens >= 0
+        and report.get("external_suffix_tokens") == suffix_tokens,
+        "serving workload has invalid external suffix provenance",
+    )
+    source_identity = workload.get("source_token_input_identity_digest")
+    effective_identity = workload.get("token_input_identity_digest")
+    _require(
+        isinstance(source_identity, str)
+        and bool(source_identity)
+        and isinstance(effective_identity, str)
+        and bool(effective_identity),
+        "serving workload lacks source/effective token identity",
+    )
+    resident_lengths = workload.get("resident_input_tokens")
+    source_external_lengths = workload.get("source_external_input_tokens")
+    effective_external_lengths = workload.get("external_input_tokens")
+    _require(
+        isinstance(resident_lengths, list)
+        and isinstance(source_external_lengths, list)
+        and isinstance(effective_external_lengths, list)
+        and all(isinstance(value, int) and value > 0 for value in resident_lengths)
+        and all(
+            isinstance(value, int) and value > 0 for value in source_external_lengths
+        )
+        and all(
+            isinstance(value, int) and value > 0 for value in effective_external_lengths
+        )
+        and [
+            effective - source
+            for source, effective in zip(
+                source_external_lengths, effective_external_lengths, strict=True
+            )
+        ]
+        == [suffix_tokens] * len(source_external_lengths),
+        "serving workload suffix does not match effective external input lengths",
+    )
+    records_by_kind = {
+        kind: sorted(
+            (record for record in report.get("records", []) if record["kind"] == kind),
+            key=lambda record: int(record["index"]),
+        )
+        for kind in ("resident", "external")
+    }
+    _require(
+        [record["input_tokens"] for record in records_by_kind["resident"]]
+        == resident_lengths
+        and [record["input_tokens"] for record in records_by_kind["external"]]
+        == effective_external_lengths,
+        "serving timed inputs diverge from effective workload lengths",
+    )
+    if suffix_tokens == 0:
+        _require(
+            workload.get("token_suffix_adapter") == "none"
+            and workload.get("token_suffix_identity_digest") is None
+            and source_identity == effective_identity,
+            "zero-suffix replay changed token identity",
+        )
+    else:
+        _require(
+            workload.get("token_suffix_adapter")
+            == "deterministic_request_unique_token_suffix_v1"
+            and isinstance(workload.get("token_suffix_identity_digest"), str)
+            and bool(workload["token_suffix_identity_digest"])
+            and source_identity != effective_identity,
+            "nonzero suffix replay lacks collision-free token identity",
+        )
+
 
 def _validate_byte_accounting(report: dict[str, Any]) -> None:
     selected = report.get("selected_bytes")

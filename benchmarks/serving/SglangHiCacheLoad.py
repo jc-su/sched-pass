@@ -856,10 +856,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("request rate must be positive")
     if not 0.0 < args.mem_fraction_static < 1.0:
         parser.error("--mem-fraction-static must be between zero and one")
-    if args.external_tokens + args.external_suffix_tokens >= max_request_input_tokens:
-        parser.error("external prompt exceeds the SGLang request input budget")
-    if args.resident_tokens >= max_request_input_tokens:
-        parser.error("resident prompt exceeds the SGLang request input budget")
+    if args.workload_manifest is None:
+        if (
+            args.external_tokens + args.external_suffix_tokens
+            >= max_request_input_tokens
+        ):
+            parser.error("external prompt exceeds the SGLang request input budget")
+        if args.resident_tokens >= max_request_input_tokens:
+            parser.error("resident prompt exceeds the SGLang request input budget")
     if args.hicache_ratio <= 1:
         parser.error("HiCache ratio must exceed device cache capacity")
     if args.workload_manifest is None:
@@ -963,6 +967,94 @@ def _structure_token_inputs(
     return tuple(inputs), identity_digest.hexdigest()
 
 
+def _append_request_unique_suffixes(
+    tokenizer: Any,
+    request_ids: Sequence[str],
+    inputs: Sequence[TokenInput],
+    token_count: int,
+) -> tuple[tuple[TokenInput, ...], str | None]:
+    """Append deterministic request-local token rows to manifest inputs.
+
+    The Bailian manifest describes the source trace.  A mechanism-envelope
+    experiment may add uncached compute rows, but those rows must be present in
+    the actual token inputs rather than merely in report metadata.  Distinct
+    first suffix tokens prevent two equal (or prefix-related) source prompts
+    from accidentally sharing the synthetic continuation in SGLang's radix
+    cache.  The full suffix is deterministic so paired arms replay identical
+    demand.
+    """
+
+    if token_count < 0:
+        raise ValueError("external suffix token count cannot be negative")
+    normalized_inputs = tuple(
+        tuple(int(value) for value in prompt) for prompt in inputs
+    )
+    if len(request_ids) != len(normalized_inputs):
+        raise RuntimeError("external suffix request identities and inputs disagree")
+    if token_count == 0:
+        return normalized_inputs, None
+
+    vocabulary_size = int(len(tokenizer))
+    special = {int(value) for value in getattr(tokenizer, "all_special_ids", ())}
+    safe_tokens = tuple(
+        token_id for token_id in range(vocabulary_size) if token_id not in special
+    )
+    if len(safe_tokens) < len(normalized_inputs):
+        raise RuntimeError(
+            "tokenizer has too few non-special tokens for request-unique suffixes"
+        )
+
+    # If one source prompt is a prefix of another, do not choose the latter's
+    # next token as the former's branch token.  Equal prompts are separated by
+    # the globally unique generated first-token set below.
+    forbidden_by_index: list[set[int]] = []
+    for prompt in normalized_inputs:
+        forbidden_by_index.append(
+            {
+                other[len(prompt)]
+                for other in normalized_inputs
+                if len(other) > len(prompt) and other[: len(prompt)] == prompt
+            }
+        )
+
+    used_first_tokens: set[int] = set()
+    suffix_identity = hashlib.sha256(b"nta-request-unique-suffix-v1\0")
+    extended: list[TokenInput] = []
+    for index, (request_id, prompt) in enumerate(
+        zip(request_ids, normalized_inputs, strict=True)
+    ):
+        request_key = str(request_id).encode("utf-8")
+        seed = hashlib.sha256(b"nta-suffix-first\0" + request_key).digest()
+        start = int.from_bytes(seed[:8], "big") % len(safe_tokens)
+        first_token: int | None = None
+        for offset in range(len(safe_tokens)):
+            candidate = safe_tokens[(start + offset) % len(safe_tokens)]
+            if (
+                candidate not in used_first_tokens
+                and candidate not in forbidden_by_index[index]
+            ):
+                first_token = candidate
+                break
+        if first_token is None:  # pragma: no cover - guarded by vocabulary check
+            raise RuntimeError("could not allocate a request-unique suffix branch")
+        used_first_tokens.add(first_token)
+
+        suffix = [first_token]
+        for position in range(1, token_count):
+            digest = hashlib.sha256(
+                b"nta-suffix-row\0" + request_key + int(position).to_bytes(8, "little")
+            ).digest()
+            suffix.append(
+                safe_tokens[int.from_bytes(digest[:8], "big") % len(safe_tokens)]
+            )
+        suffix_identity.update(request_key)
+        suffix_identity.update(b"\0")
+        for token_id in suffix:
+            suffix_identity.update(int(token_id).to_bytes(8, "little"))
+        extended.append(prompt + tuple(suffix))
+    return tuple(extended), suffix_identity.hexdigest()
+
+
 @dataclass(frozen=True)
 class LoadedWorkload:
     """Role-partitioned replay inputs sharing one exact arrival timebase."""
@@ -978,7 +1070,12 @@ class LoadedWorkload:
     metadata: dict[str, Any]
 
 
-def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
+def _load_workload(
+    path: pathlib.Path,
+    tokenizer: Any,
+    *,
+    external_suffix_tokens: int = 0,
+) -> LoadedWorkload:
     manifest = validate_workload(path.resolve())
     records_path = path.resolve().parent / str(manifest["records_file"])
     rows = read_jsonl(records_path)
@@ -1018,10 +1115,31 @@ def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
     inputs, token_identity_digest = _structure_token_inputs(
         tokenizer, rows, block_size
     )
-    input_by_request = {
+    source_input_by_request = {
         str(row["request_id"]): values
         for row, values in zip(rows, inputs, strict=True)
     }
+    external_request_ids = tuple(str(row["request_id"]) for row in external_rows)
+    source_external_inputs = tuple(
+        source_input_by_request[request_id] for request_id in external_request_ids
+    )
+    effective_external_inputs, suffix_identity_digest = _append_request_unique_suffixes(
+        tokenizer,
+        external_request_ids,
+        source_external_inputs,
+        external_suffix_tokens,
+    )
+    input_by_request = dict(source_input_by_request)
+    input_by_request.update(
+        zip(external_request_ids, effective_external_inputs, strict=True)
+    )
+    source_identity_digest = token_identity_digest
+    if suffix_identity_digest is not None:
+        identity = hashlib.sha256(b"nta-effective-token-input-v1\0")
+        identity.update(source_identity_digest.encode("ascii"))
+        identity.update(b"\0")
+        identity.update(suffix_identity_digest.encode("ascii"))
+        token_identity_digest = identity.hexdigest()
     resident_page_ids = unique_input_page_ids(resident_rows, block_size=block_size)
     external_cached_prefix_tokens = [
         int(row["cached_prefix_tokens"]) for row in external_rows
@@ -1051,8 +1169,21 @@ def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
         "tokenization_errors": 0,
         "token_input_adapter": "collision_free_content_block_tokens_v1",
         "token_input_identity_digest": token_identity_digest,
+        "source_token_input_identity_digest": source_identity_digest,
+        "token_suffix_adapter": (
+            "deterministic_request_unique_token_suffix_v1"
+            if external_suffix_tokens
+            else "none"
+        ),
+        "token_suffix_identity_digest": suffix_identity_digest,
+        "external_suffix_tokens": external_suffix_tokens,
         "resident_input_tokens": [int(row["input_length"]) for row in resident_rows],
-        "external_input_tokens": [int(row["input_length"]) for row in external_rows],
+        "source_external_input_tokens": [
+            int(row["input_length"]) for row in external_rows
+        ],
+        "external_input_tokens": [
+            len(input_by_request[str(row["request_id"])]) for row in external_rows
+        ],
         # The trace exposes exact shared-prefix block identities.  Only that
         # prefix is materialized during placement; request-local continuation
         # rows remain uncached and are the timed prefill query.
@@ -1074,9 +1205,7 @@ def _load_workload(path: pathlib.Path, tokenizer: Any) -> LoadedWorkload:
         resident_request_ids=tuple(
             str(row["request_id"]) for row in resident_rows
         ),
-        external_request_ids=tuple(
-            str(row["request_id"]) for row in external_rows
-        ),
+        external_request_ids=external_request_ids,
         resident_inputs=tuple(
             input_by_request[str(row["request_id"])] for row in resident_rows
         ),
@@ -1535,7 +1664,11 @@ def main() -> int:
     external_request_ids: Sequence[str] | None = None
     tokenizer = AutoTokenizer.from_pretrained(str(args.model.resolve()))
     if args.workload_manifest is not None:
-        loaded_workload = _load_workload(args.workload_manifest, tokenizer)
+        loaded_workload = _load_workload(
+            args.workload_manifest,
+            tokenizer,
+            external_suffix_tokens=args.external_suffix_tokens,
+        )
         resident_request_ids = loaded_workload.resident_request_ids
         external_request_ids = loaded_workload.external_request_ids
         resident_prompts = list(loaded_workload.resident_inputs)
@@ -1551,8 +1684,8 @@ def main() -> int:
                 "use a tokenizer-compatible prompt adapter before claiming serving evidence"
             )
         prompt_lengths = [
-            *workload_metadata["resident_input_tokens"],
-            *workload_metadata["external_input_tokens"],
+            *map(len, resident_prompts),
+            *map(len, external_prompts),
         ]
         output_lengths = [
             *workload_metadata["resident_output_tokens"],
@@ -1578,7 +1711,9 @@ def main() -> int:
         args.resident_requests = len(resident_prompts)
         args.external_requests = len(external_prompts)
         args.resident_tokens = max(workload_metadata["resident_input_tokens"])
-        args.external_tokens = max(workload_metadata["external_input_tokens"])
+        args.external_tokens = max(
+            workload_metadata["source_external_input_tokens"]
+        )
         cached_prefix_lengths = [
             int(value)
             for value in workload_metadata["external_cached_prefix_tokens"]

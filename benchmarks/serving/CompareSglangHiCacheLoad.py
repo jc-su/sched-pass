@@ -182,7 +182,10 @@ def parse_args() -> argparse.Namespace:
             "--churn-tokens cannot exceed --context-length; choose a smaller "
             "churn request or a larger model context"
         )
-    if args.external_tokens + args.external_suffix_tokens > args.context_length:
+    if (
+        args.workload_manifest is None
+        and args.external_tokens + args.external_suffix_tokens > args.context_length
+    ):
         parser.error(
             "--external-tokens plus --external-suffix-tokens cannot exceed "
             "--context-length"
@@ -532,12 +535,15 @@ def main() -> int:
                 args.output, reports, order, "normalized workload was not replayed"
             )
             raise RuntimeError("normalized workload was not replayed")
-        if stock_workload.get("manifest_digest") != nta_workload.get(
-            "manifest_digest"
-        ) or stock_workload.get("demand_trace_digest") != nta_workload.get(
-            "demand_trace_digest"
-        ) or stock_workload.get("token_input_identity_digest") != nta_workload.get(
-            "token_input_identity_digest"
+        paired_identity_fields = (
+            "manifest_digest",
+            "demand_trace_digest",
+            "token_input_identity_digest",
+            "external_suffix_tokens",
+        )
+        if any(
+            stock_workload.get(field) != nta_workload.get(field)
+            for field in paired_identity_fields
         ):
             _write_failed_comparison(
                 args.output,
