@@ -95,6 +95,7 @@ benchmark_as_root=$(resolve_privilege_mode \
   "${NTA_VFIO_BENCHMARK_SUDO:-auto}" "$benchmark")
 state=/run/nta-vfio-${bdf}.driver
 partition_state=/run/nta-vfio-${bdf}.partitions
+session_state=/run/nta-vfio-${bdf}.session
 
 [[ $bdf =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]] ||
   die "NTA_NVME_BDF must use DDDD:BB:SS.F syntax"
@@ -105,6 +106,56 @@ current_driver() {
   else
     printf 'none\n'
   fi
+}
+
+nvme_controller_device() {
+  local controller
+  for controller in "$device"/nvme/nvme*; do
+    [[ -d $controller ]] || continue
+    [[ $(<"$controller/state") == live ]] || continue
+    printf '/dev/%s\n' "$(basename "$controller")"
+    return
+  done
+  die "$bdf has no live Linux NVMe controller"
+}
+
+smart_write_counters() {
+  command -v nvme >/dev/null 2>&1 ||
+    die "nvme-cli is required for the zero-write session gate"
+  local controller payload data_units host_commands
+  controller=$(nvme_controller_device)
+  payload=$(as_root nvme smart-log -o json "$controller") ||
+    die "cannot read NVMe SMART log from $controller"
+  data_units=$(sed -n \
+    's/.*"data_units_written":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    <<<"$payload")
+  host_commands=$(sed -n \
+    's/.*"host_write_commands":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    <<<"$payload")
+  [[ $data_units =~ ^[0-9]+$ && $host_commands =~ ^[0-9]+$ ]] ||
+    die "NVMe SMART log omitted write counters for $controller"
+  printf '%s %s\n' "$data_units" "$host_commands"
+}
+
+session_field() {
+  local name=$1
+  [[ -r $session_state ]] || die "NVMe physical session is not active"
+  sed -n "s/^${name}=//p" "$session_state"
+}
+
+validate_session() {
+  [[ -r $session_state ]] ||
+    die "NVMe physical session is not active; run session-start first"
+  local recorded_boot current_boot recorded_reference
+  recorded_boot=$(session_field boot_id)
+  current_boot=$(</proc/sys/kernel/random/boot_id)
+  [[ -n $recorded_boot && $recorded_boot == "$current_boot" ]] ||
+    die "NVMe physical session belongs to a different boot"
+  recorded_reference=$(session_field reference)
+  [[ -n $recorded_reference && $recorded_reference == "$reference" ]] ||
+    die "NVMe physical session was captured for a different reference"
+  [[ -f $reference && $(stat -c '%s' "$reference") == "$reference_bytes" ]] ||
+    die "NVMe physical session reference is absent or has the wrong size"
 }
 
 wait_for_driver() {
@@ -128,6 +179,7 @@ wait_for_nvme_namespace() {
         [[ -e $block ]] || continue
         [[ $(<"$block/nsid") == "$nsid" ]] || continue
         [[ -b /dev/$(basename "$block") ]] || continue
+        wait_for_namespace_partitions "/dev/$(basename "$block")"
         printf 'restored_namespace=/dev/%s\n' "$(basename "$block")"
         return 0
       done
@@ -135,6 +187,32 @@ wait_for_nvme_namespace() {
     sleep 0.1
   done
   die "$bdf returned to the nvme driver but no live namespace appeared"
+}
+
+wait_for_namespace_partitions() {
+  local block_device=$1 partition_number partition_node _
+  # Namespace creation and partition scanning are separate asynchronous kernel
+  # events.  Checking mount/holder state as soon as the namespace node appears
+  # can therefore miss a mounted child and unbind a live filesystem.  ``partx
+  # --show`` reads the on-media table without modifying it; wait for every
+  # listed child node before the safety preflight is allowed to continue.
+  command -v partx >/dev/null 2>&1 ||
+    die "partx is required to validate NVMe child partitions"
+  command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 || true
+  for partition_number in $(
+    as_root partx --show --noheadings --output NR "$block_device" 2>/dev/null
+  ); do
+    [[ $partition_number =~ ^[1-9][0-9]*$ ]] ||
+      die "partx returned an invalid partition number for $block_device"
+    partition_node=${block_device}p${partition_number}
+    for _ in {1..100}; do
+      [[ -b $partition_node ]] && break
+      sleep 0.1
+    done
+    [[ -b $partition_node ]] ||
+      die "partition scan did not publish $partition_node"
+  done
+  command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 || true
 }
 
 wait_for_expected_partitions() {
@@ -193,6 +271,7 @@ require_safe_device() {
       die "$(basename "$block") is a hidden multipath namespace"
     fi
 
+    wait_for_namespace_partitions "/dev/$(basename "$block")"
     check_block_device "$block"
     local partition
     for partition in "$block"/"$(basename "$block")"p*; do
@@ -364,6 +443,10 @@ bind_vfio() {
   require_media_policy
   snapshot_partitions
   capture_reference
+  # Recheck after the potentially long reference read. A desktop automounter
+  # or another process may have acquired the namespace since the first
+  # preflight; never cross the unbind boundary on stale safety evidence.
+  require_safe_device
 
   if [[ $(current_driver) != none ]]; then
     printf '%s' "$bdf" | as_root tee "$device/driver/unbind" >/dev/null
@@ -374,6 +457,76 @@ bind_vfio() {
   local cdev
   cdev=$(vfio_cdev)
   [[ -c $cdev ]] || die "VFIO cdev $cdev is unavailable"
+}
+
+start_session() {
+  require_rebind_confirmation
+  [[ ! -e $session_state ]] ||
+    die "NVMe physical session is already active; run session-stop first"
+  if [[ $(current_driver) == vfio-pci ]]; then
+    [[ -r $state ]] ||
+      die "VFIO controller has no ownership state; restore it explicitly"
+    "$0" restore >/dev/null
+  fi
+  [[ $(current_driver) == nvme ]] ||
+    die "session-start requires the canonical Linux nvme driver"
+  wait_for_nvme_namespace >/dev/null
+  require_safe_device
+
+  local baseline_data_units baseline_host_commands serial boot_id temporary
+  read -r baseline_data_units baseline_host_commands < <(smart_write_counters)
+  serial=$(tr -d '[:space:]' <"$device/nvme"/nvme*/serial)
+  [[ -n $serial ]] || die "cannot read NVMe controller serial"
+  boot_id=$(</proc/sys/kernel/random/boot_id)
+
+  local committed=0
+  restore_uncommitted_session() {
+    if [[ $committed == 0 && $(current_driver) == vfio-pci ]]; then
+      "$0" restore >/dev/null 2>&1 || true
+    fi
+  }
+  trap restore_uncommitted_session EXIT
+  bind_vfio
+  temporary=$(as_root mktemp /run/.nta-vfio-session.XXXXXX)
+  printf \
+    'boot_id=%s\nserial=%s\nreference=%s\ndata_units_written=%s\nhost_write_commands=%s\n' \
+    "$boot_id" "$serial" "$reference" "$baseline_data_units" \
+    "$baseline_host_commands" | as_root tee "$temporary" >/dev/null
+  as_root chmod 0600 "$temporary"
+  as_root mv "$temporary" "$session_state"
+  committed=1
+  trap - EXIT
+  printf 'nvme_session=active bdf=%s serial=%s reference=%s\n' \
+    "$bdf" "$serial" "$reference"
+}
+
+stop_session() {
+  validate_session
+  [[ $(current_driver) == vfio-pci ]] ||
+    die "NVMe physical session lost VFIO ownership before session-stop"
+  [[ -r $state ]] ||
+    die "NVMe physical session has no restore ownership state"
+  local baseline_data_units baseline_host_commands recorded_serial
+  baseline_data_units=$(session_field data_units_written)
+  baseline_host_commands=$(session_field host_write_commands)
+  recorded_serial=$(session_field serial)
+  [[ $baseline_data_units =~ ^[0-9]+$ &&
+    $baseline_host_commands =~ ^[0-9]+$ && -n $recorded_serial ]] ||
+    die "NVMe physical session state is malformed"
+
+  "$0" restore >/dev/null
+  local final_data_units final_host_commands current_serial
+  read -r final_data_units final_host_commands < <(smart_write_counters)
+  current_serial=$(tr -d '[:space:]' <"$device/nvme"/nvme*/serial)
+  [[ $current_serial == "$recorded_serial" ]] ||
+    die "NVMe controller identity changed during the physical session"
+  if [[ $final_data_units != "$baseline_data_units" ||
+    $final_host_commands != "$baseline_host_commands" ]]; then
+    die "zero-write gate failed: data_units_written $baseline_data_units->$final_data_units, host_write_commands $baseline_host_commands->$final_host_commands"
+  fi
+  as_root rm -f "$session_state"
+  printf 'nvme_session=closed bdf=%s serial=%s zero_write=pass\n' \
+    "$bdf" "$current_serial"
 }
 
 case ${1:-status} in
@@ -475,6 +628,33 @@ qualify)
     trap - EXIT
   fi
   ;;
+session-start)
+  start_session
+  ;;
+session-stop)
+  stop_session
+  ;;
+run)
+  # Execute one physical command in a persistent, explicitly authorized VFIO
+  # session.  This is the CTest/artifact boundary: a controller that remained
+  # on VFIO is reused, while a controller reclaimed by its kernel driver is
+  # re-qualified (including a fresh read-only oracle) before the command runs.
+  # No implicit restore is performed, so independent test processes do not
+  # repeatedly tear down the same device.
+  require_rebind_confirmation
+  shift
+  if [[ ${1:-} == -- ]]; then
+    shift
+  fi
+  [[ $# -gt 0 ]] || die "run requires a command after --"
+  validate_session
+  [[ $(current_driver) == vfio-pci ]] ||
+    die "$bdf is not bound to vfio-pci inside the active session"
+  require_containment
+  [[ -r $state ]] ||
+    die "VFIO controller has no ownership state"
+  exec "$@"
+  ;;
 restore)
   require_safe_device
   if [[ $(current_driver) == vfio-pci ]]; then
@@ -498,6 +678,6 @@ restore)
   "$0" status
   ;;
 *)
-  die "usage: $0 {status|preflight|bind|probe|bind-and-probe|qualify|restore}"
+  die "usage: $0 {status|preflight|bind|probe|bind-and-probe|qualify|session-start|session-stop|run|restore}"
   ;;
 esac

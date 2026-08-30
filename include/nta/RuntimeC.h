@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 52U
+#define NTA_RUNTIME_C_API_VERSION 55U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -422,9 +422,10 @@ nta_status nta_runtime_register_indexed_host_objects_async_bound(
 /* Enqueue a device-memory wait for Ready-or-Failed without a host poll or an
  * SM-resident waiter. Directory publication must already be ordered on
  * cuda_stream. */
-nta_status nta_runtime_wait_object_range_terminal(
-    nta_runtime *runtime, uint32_t first_object_slot, uint32_t object_count,
-    uint64_t cuda_stream);
+nta_status nta_runtime_wait_object_range_terminal(nta_runtime *runtime,
+                                                  uint32_t first_object_slot,
+                                                  uint32_t object_count,
+                                                  uint64_t cuda_stream);
 nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
                                         uint32_t object_slot,
                                         uint32_t relative_replica,
@@ -524,11 +525,12 @@ uint32_t
 nta_device_work_plan_dependency_count(const nta_device_work_plan *plan);
 int32_t nta_device_work_plan_device_ordinal(const nta_device_work_plan *plan);
 
-nta_status nta_jit_operator_module_create(
-    const char *shared_object, nta_jit_operator_module **module_out);
+nta_status nta_jit_operator_module_create(const char *shared_object,
+                                          nta_jit_operator_module **module_out);
 void nta_jit_operator_module_destroy(nta_jit_operator_module *module);
-nta_status nta_jit_operator_module_contract(
-    const nta_jit_operator_module *module, nta_operator_contract *contract_out);
+nta_status
+nta_jit_operator_module_contract(const nta_jit_operator_module *module,
+                                 nta_operator_contract *contract_out);
 nta_status nta_jit_operator_module_plan(const nta_jit_operator_module *module,
                                         nta_operator_plan *plan_out);
 
@@ -599,9 +601,10 @@ nta_status nta_jit_phase_progress_host(const nta_jit_phase_program *program,
                                        uint64_t cuda_stream);
 /* C API v44: freeze an exact device-owned runnable queue window without a
  * device-to-host ready-count read. */
-nta_status nta_jit_phase_prepare_ready_window(
-    const nta_jit_phase_program *program, nta_runtime *runtime,
-    uint32_t maximum_work, uint64_t cuda_stream);
+nta_status
+nta_jit_phase_prepare_ready_window(const nta_jit_phase_program *program,
+                                   nta_runtime *runtime, uint32_t maximum_work,
+                                   uint64_t cuda_stream);
 /* C API v45: publish one stable direct/deferred work partition for a
  * producer-event-owned proactive acquisition. */
 nta_status nta_jit_phase_prepare_event_work_partition(
@@ -665,6 +668,23 @@ nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
                                        uint32_t issue_budget,
                                        uint32_t completion_budget,
                                        uint64_t cuda_stream);
+/* C API v53: compact exact rows from one HBM address table to another. */
+nta_status nta_jit_phase_compact_hbm_rows(const nta_jit_phase_program *program,
+                                          uint64_t source_addresses,
+                                          uint64_t destination_addresses,
+                                          uint32_t row_count,
+                                          uint32_t row_bytes,
+                                          uint64_t cuda_stream);
+/* C API v54: fail-stop before stock numerical use of a Failed object. */
+nta_status nta_jit_phase_require_ready_objects(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);
+/* C API v55: fuse per-row Ready validation with exact HBM compaction. */
+nta_status
+nta_jit_phase_compact_ready_hbm_rows(const nta_jit_phase_program *program,
+                                     nta_runtime *runtime, uint64_t row_table,
+                                     uint32_t row_count, uint32_t row_bytes,
+                                     uint64_t cuda_stream);
 /* C API v36: typed tier ownership is exported with each descriptor and
  * NVMe object replacement has an event-ordered asynchronous form; this
  * retains the completion-driven NVMe progress API. One launch remains active

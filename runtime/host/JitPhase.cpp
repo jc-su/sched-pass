@@ -16,11 +16,10 @@ using Reset = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                               cudaStream_t);
 using Discover = cudaError_t (*)(void *, const void *, const void *,
                                  std::uint32_t, cudaStream_t);
-using DiscoverOrderedNvme = cudaError_t (*)(
-    void *, const void *, const void *, std::uint32_t, std::uint32_t,
-    std::uint32_t, cudaStream_t);
-using PrepareReadyWindow = cudaError_t (*)(void *, std::uint32_t,
-                                           cudaStream_t);
+using DiscoverOrderedNvme = cudaError_t (*)(void *, const void *, const void *,
+                                            std::uint32_t, std::uint32_t,
+                                            std::uint32_t, cudaStream_t);
+using PrepareReadyWindow = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using PrepareEventWorkPartition = cudaError_t (*)(void *, const void *,
                                                   std::uint32_t, std::uint32_t,
                                                   cudaStream_t);
@@ -34,9 +33,9 @@ using RebindIndexedHostPairs = cudaError_t (*)(void *, std::uint32_t,
                                                std::uint64_t, cudaStream_t);
 using PreloadHost = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
                                     cudaStream_t);
-using PreloadHostPairsOrdered = cudaError_t (*)(
-    void *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t *,
-    cudaStream_t);
+using PreloadHostPairsOrdered = cudaError_t (*)(void *, std::uint32_t,
+                                                std::uint32_t, std::uint32_t,
+                                                std::uint32_t *, cudaStream_t);
 using AliasPreloadedObjects = cudaError_t (*)(void *, std::uint32_t,
                                               std::uint32_t, std::uint32_t,
                                               std::uint64_t, std::uint32_t,
@@ -73,9 +72,17 @@ using ProgressNvme = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
 using ProgressNvmeUntilIdle = cudaError_t (*)(void *, std::uint32_t,
                                               std::uint32_t, std::uint64_t,
                                               cudaStream_t);
-using ProgressNvmeOrderedUntilIdle = cudaError_t (*)(
-    void *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-    std::uint64_t, cudaStream_t);
+using ProgressNvmeOrderedUntilIdle =
+    cudaError_t (*)(void *, std::uint32_t, std::uint32_t, std::uint32_t,
+                    std::uint32_t, std::uint64_t, cudaStream_t);
+using CompactHbmRows = cudaError_t (*)(const std::uint64_t *,
+                                       const std::uint64_t *, std::uint32_t,
+                                       std::uint32_t, cudaStream_t);
+using CompactReadyHbmRows = cudaError_t (*)(void *, const std::uint64_t *,
+                                            std::uint32_t, std::uint32_t,
+                                            cudaStream_t);
+using RequireReadyObjects = cudaError_t (*)(const void *, std::uint32_t,
+                                            std::uint32_t, cudaStream_t);
 using Publish = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using Complete = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using CompleteStreamOrdered = cudaError_t (*)(void *, const void *,
@@ -138,12 +145,12 @@ struct JitPhaseProgram::Impl {
       operator_contract::validate(plan, contract);
       reset = load<Reset>(library, "nta_jit_reset_epoch");
       discover = load<Discover>(library, "nta_jit_discover_work");
-      discoverUnqueuedHost = load<Discover>(
-          library, "nta_jit_discover_work_unqueued_host");
+      discoverUnqueuedHost =
+          load<Discover>(library, "nta_jit_discover_work_unqueued_host");
       discoverOrderedNvme = load<DiscoverOrderedNvme>(
           library, "nta_jit_discover_work_ordered_nvme");
-      prepareReadyWindow = load<PrepareReadyWindow>(
-          library, "nta_jit_prepare_ready_window");
+      prepareReadyWindow =
+          load<PrepareReadyWindow>(library, "nta_jit_prepare_ready_window");
       prepareEventWorkPartition = load<PrepareEventWorkPartition>(
           library, "nta_jit_prepare_event_work_partition");
       invalidateCachedObjects = load<InvalidateCachedObjects>(
@@ -168,6 +175,12 @@ struct JitPhaseProgram::Impl {
           load<ProgressIndexedHostRangeParallel>(
               library,
               "nta_jit_progress_validated_indexed_host_range_parallel");
+      compactHbmRows =
+          load<CompactHbmRows>(library, "nta_jit_compact_hbm_rows");
+      compactReadyHbmRows =
+          load<CompactReadyHbmRows>(library, "nta_jit_compact_ready_hbm_rows");
+      requireReadyObjects =
+          load<RequireReadyObjects>(library, "nta_jit_require_ready_objects");
       setIndexedRowCounts = load<ProgressIndexedHostRangeParallel>(
           library, "nta_jit_set_indexed_row_counts");
       prepareSelectedIndexedRows = load<PrepareSelectedIndexedRows>(
@@ -220,6 +233,9 @@ struct JitPhaseProgram::Impl {
   ProgressIndexedHostRange progressValidatedIndexedHostRange = nullptr;
   ProgressIndexedHostRangeParallel progressValidatedIndexedHostRangeParallel =
       nullptr;
+  CompactHbmRows compactHbmRows = nullptr;
+  CompactReadyHbmRows compactReadyHbmRows = nullptr;
+  RequireReadyObjects requireReadyObjects = nullptr;
   ProgressIndexedHostRangeParallel setIndexedRowCounts = nullptr;
   PrepareSelectedIndexedRows prepareSelectedIndexedRows = nullptr;
   PrepareBoundedSelectedIndexedRows prepareBoundedSelectedIndexedRows = nullptr;
@@ -304,8 +320,7 @@ void JitPhaseProgram::discover(cudaStream_t stream, abi::RuntimeView *runtime,
 
 void JitPhaseProgram::discoverUnqueuedHost(
     cudaStream_t stream, abi::RuntimeView *runtime,
-    const abi::WorkItem *workItems,
-    const abi::AcquireRequirement *dependencies,
+    const abi::WorkItem *workItems, const abi::AcquireRequirement *dependencies,
     std::uint32_t workItemCount) const {
   if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
       workItemCount == 0) {
@@ -319,8 +334,7 @@ void JitPhaseProgram::discoverUnqueuedHost(
 
 void JitPhaseProgram::discoverOrderedNvme(
     cudaStream_t stream, abi::RuntimeView *runtime,
-    const abi::WorkItem *workItems,
-    const abi::AcquireRequirement *dependencies,
+    const abi::WorkItem *workItems, const abi::AcquireRequirement *dependencies,
     std::uint32_t workItemCount, std::uint32_t firstIntent,
     std::uint32_t intentCount) const {
   if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
@@ -409,10 +423,12 @@ void JitPhaseProgram::preloadHostPairs(cudaStream_t stream,
         "nta_jit_preload_host_pairs");
 }
 
-void JitPhaseProgram::preloadHostPairsOrdered(
-    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
-    std::uint32_t pairCount, std::uint32_t workerBlocks,
-    std::uint32_t *taskHead) const {
+void JitPhaseProgram::preloadHostPairsOrdered(cudaStream_t stream,
+                                              abi::RuntimeView *runtime,
+                                              std::uint32_t firstObject,
+                                              std::uint32_t pairCount,
+                                              std::uint32_t workerBlocks,
+                                              std::uint32_t *taskHead) const {
   if (runtime == nullptr || pairCount == 0 || workerBlocks == 0 ||
       taskHead == nullptr) {
     throw std::invalid_argument(
@@ -589,6 +605,48 @@ void JitPhaseProgram::progressValidatedIndexedHostRangeParallel(
         "nta_jit_progress_validated_indexed_host_range_parallel");
 }
 
+void JitPhaseProgram::compactHbmRows(cudaStream_t stream,
+                                     const std::uint64_t *sourceAddresses,
+                                     const std::uint64_t *destinationAddresses,
+                                     std::uint32_t rowCount,
+                                     std::uint32_t rowBytes) const {
+  if (sourceAddresses == nullptr || destinationAddresses == nullptr ||
+      rowCount == 0 || rowBytes == 0) {
+    throw std::invalid_argument(
+        "JIT HBM compaction needs device address tables and row geometry");
+  }
+  check(impl_->compactHbmRows(sourceAddresses, destinationAddresses, rowCount,
+                              rowBytes, stream),
+        "nta_jit_compact_hbm_rows");
+}
+
+void JitPhaseProgram::compactReadyHbmRows(cudaStream_t stream,
+                                          abi::RuntimeView *runtime,
+                                          const std::uint64_t *rowTable,
+                                          std::uint32_t rowCount,
+                                          std::uint32_t rowBytes) const {
+  if (runtime == nullptr || rowTable == nullptr || rowCount == 0 ||
+      rowBytes == 0) {
+    throw std::invalid_argument(
+        "JIT Ready HBM compaction needs runtime and device row tables");
+  }
+  check(
+      impl_->compactReadyHbmRows(runtime, rowTable, rowCount, rowBytes, stream),
+      "nta_jit_compact_ready_hbm_rows");
+}
+
+void JitPhaseProgram::requireReadyObjects(cudaStream_t stream,
+                                          abi::RuntimeView *runtime,
+                                          std::uint32_t firstObject,
+                                          std::uint32_t objectCount) const {
+  if (runtime == nullptr || objectCount == 0) {
+    throw std::invalid_argument(
+        "JIT ready-object gate needs a runtime and object range");
+  }
+  check(impl_->requireReadyObjects(runtime, firstObject, objectCount, stream),
+        "nta_jit_require_ready_objects");
+}
+
 void JitPhaseProgram::progressNvme(cudaStream_t stream,
                                    abi::RuntimeView *runtime,
                                    std::uint32_t issueBudget,
@@ -601,9 +659,11 @@ void JitPhaseProgram::progressNvme(cudaStream_t stream,
         "nta_jit_progress_nvme");
 }
 
-void JitPhaseProgram::progressNvmeUntilIdle(
-    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t issueBudget,
-    std::uint32_t completionBudget, std::uint64_t timeoutNs) const {
+void JitPhaseProgram::progressNvmeUntilIdle(cudaStream_t stream,
+                                            abi::RuntimeView *runtime,
+                                            std::uint32_t issueBudget,
+                                            std::uint32_t completionBudget,
+                                            std::uint64_t timeoutNs) const {
   if (runtime == nullptr || issueBudget == 0 || completionBudget == 0 ||
       timeoutNs == 0) {
     throw std::invalid_argument(
@@ -615,20 +675,19 @@ void JitPhaseProgram::progressNvmeUntilIdle(
 }
 
 void JitPhaseProgram::progressNvmeOrderedUntilIdle(
-    cudaStream_t stream, abi::RuntimeView *runtime,
-    std::uint32_t firstIntent, std::uint32_t intentCount,
-    std::uint32_t issueBudget, std::uint32_t completionBudget,
-    std::uint64_t timeoutNs) const {
-  if (runtime == nullptr || intentCount == 0 ||
-      issueBudget == 0 || completionBudget == 0 || timeoutNs == 0 ||
+    cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstIntent,
+    std::uint32_t intentCount, std::uint32_t issueBudget,
+    std::uint32_t completionBudget, std::uint64_t timeoutNs) const {
+  if (runtime == nullptr || intentCount == 0 || issueBudget == 0 ||
+      completionBudget == 0 || timeoutNs == 0 ||
       firstIntent > UINT32_MAX - intentCount) {
     throw std::invalid_argument(
         "ordered NVMe progress needs a bounded intent range, budgets, and "
         "timeout");
   }
-  check(impl_->progressNvmeOrderedUntilIdle(
-            runtime, firstIntent, intentCount, issueBudget, completionBudget,
-            timeoutNs, stream),
+  check(impl_->progressNvmeOrderedUntilIdle(runtime, firstIntent, intentCount,
+                                            issueBudget, completionBudget,
+                                            timeoutNs, stream),
         "nta_jit_progress_nvme_ordered_until_idle");
 }
 

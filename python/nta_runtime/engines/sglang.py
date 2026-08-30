@@ -21,7 +21,6 @@ from nta_runtime.flashinfer_schedule import (
     paged_prefill_schedule,
     require_supported_version,
 )
-from nta_runtime.hbm_registration import HbmDestinationSlice
 from nta_runtime.indexed_transfer_torch import warm_indexed_tensor_mover
 from nta_runtime.adapters.sglang import (
     SglangAdapter,
@@ -44,7 +43,10 @@ from nta_runtime.engines.sglang_acquisition import (
 )
 from nta_runtime.engines.sglang_transfer import HostMoverController
 from nta_runtime.engines.sglang_pipeline import SglangHostTransport
-from nta_runtime.engines.sglang_nvme import SglangNvmeAcquisitionPipeline
+from nta_runtime.engines.sglang_nvme import (
+    SglangNvmeAcquisitionPipeline,
+)
+from nta_runtime.engines.sglang_nvme_resources import prepare_sglang_nvme_resources
 from nta_runtime.engines.sglang_acquisition_contract import (
     AcquisitionTier,
     HostForwardAcquisition,
@@ -419,8 +421,17 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             capacity=demand_graph_capacity,
             stats=self._stats,
         )
-        nvme_regions = (
-            self._prepare_nvme_regions() if self._tier_service.is_nvme else {}
+        nvme_resources = (
+            prepare_sglang_nvme_resources(
+                tier_service=self._tier_service,
+                token_to_kv_pool=self.token_to_kv_pool,
+                model_start_layer=self._model_start_layer,
+                model_end_layer=self._model_end_layer,
+                global_model_layer_count=self._global_model_layer_count,
+                stats=self._stats,
+            )
+            if self._tier_service.is_nvme
+            else None
         )
         self._profile_cpu = observability.profile_cpu
         self._metadata_planner = SglangMetadataPlanner(
@@ -457,7 +468,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 object_capacity=self._object_capacity,
                 work_ticket_capacity=self._work_ticket_capacity,
                 tenant_isolation=self._tenant_isolation_enabled,
-                regions=nvme_regions,
+                regions=nvme_resources.regions,
+                scratch=nvme_resources.scratch,
                 stats=self._stats,
             )
             if self._tier_service.is_nvme
@@ -1239,58 +1251,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             progressive_consumer=progressive_consumer,
             final_layer=final_layer,
         )
-
-    def _prepare_nvme_regions(self) -> dict[tuple[int, str], Any]:
-        """Describe and coalesce stable framework KV allocations at startup."""
-
-        started = time.perf_counter_ns()
-        catalog = self._tier_service.catalog
-        if catalog is None or catalog.layer_count != self._global_model_layer_count:
-            raise RuntimeError(
-                "NVMe catalog layer count does not match the SGLang model"
-            )
-        if catalog.page_tokens != 1:
-            raise RuntimeError(
-                "NVMe SGLang integration currently requires page_tokens=1"
-            )
-        destinations: list[HbmDestinationSlice] = []
-        for local_layer in range(self._model_layer_count):
-            layer_id = self._model_start_layer + local_layer
-            tensors = (
-                ("key", self.token_to_kv_pool._get_key_buffer(layer_id)),
-                ("value", self.token_to_kv_pool._get_value_buffer(layer_id)),
-            )
-            for kind, tensor in tensors:
-                if not tensor.is_cuda or int(tensor.nbytes) <= 0:
-                    raise RuntimeError(
-                        f"NVMe {kind} region for layer {layer_id} is not live CUDA HBM"
-                    )
-                destinations.append(
-                    HbmDestinationSlice(
-                        (layer_id, kind),
-                        int(tensor.data_ptr()),
-                        int(tensor.nbytes),
-                    )
-                )
-        try:
-            prepared = self._tier_service.prepare_nvme_hbm_destinations(
-                tuple(destinations)
-            )
-        except BaseException as error:
-            raise RuntimeError(
-                "NVMe worker-prepare could not register the complete local KV "
-                f"destination set (layers=[{self._model_start_layer}, "
-                f"{self._model_end_layer}), tensors={len(destinations)})"
-            ) from error
-        self._stats["nvme_region_prepare_ns"] = time.perf_counter_ns() - started
-        self._stats["nvme_region_count"] = prepared.registration_count
-        self._stats["nvme_region_bytes"] = prepared.registration_bytes
-        self._stats["nvme_destination_slice_count"] = prepared.destination_count
-        self._stats["nvme_destination_slice_bytes"] = prepared.destination_bytes
-        self._stats["nvme_shared_region_slices"] = (
-            prepared.destination_count - prepared.registration_count
-        )
-        return dict(prepared.regions)
 
     def _bind_forward_requests(
         self, forward_batch: Any, *, allow_capture_ids: bool

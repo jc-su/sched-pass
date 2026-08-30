@@ -39,6 +39,11 @@ from experiments.atomic_io import atomic_write_text  # noqa: E402
 from nta_runtime.engines.sglang_nvme import (  # noqa: E402
     SglangNvmeAcquisitionPipeline,
 )
+from nta_runtime.nvme_granularity import (  # noqa: E402
+    NvmeTransferServiceModel,
+    plan_nvme_scratch_capacity,
+)
+from nta_runtime.nvme_materialization import NvmeScratchArena  # noqa: E402
 from nta_runtime.requests import RequestBinding  # noqa: E402
 from nta_runtime.runtime import (  # noqa: E402
     JitPhaseProgram,
@@ -97,13 +102,22 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--minimum-publication-wall-speedup", type=float, default=0.0)
     parser.add_argument("--minimum-ordered-wall-speedup", type=float, default=0.0)
     parser.add_argument("--minimum-window-wall-speedup", type=float, default=0.0)
+    parser.add_argument("--command-service-ns", type=int, default=0)
+    parser.add_argument("--read-bandwidth-bps", type=int, default=0)
+    parser.add_argument("--compaction-bandwidth-bps", type=int, default=0)
+    parser.add_argument("--compaction-launch-ns", type=int, default=0)
+    parser.add_argument("--minimum-granularity-gain", type=float, default=1.03)
+    parser.add_argument("--minimum-granularity-wall-speedup", type=float, default=0.0)
     arguments = parser.parse_args()
-    if min(
-        arguments.layers,
-        arguments.runs,
-        arguments.source_stride,
-        arguments.trials,
-    ) <= 0:
+    if (
+        min(
+            arguments.layers,
+            arguments.runs,
+            arguments.source_stride,
+            arguments.trials,
+        )
+        <= 0
+    ):
         parser.error("layers, runs, source-stride, and trials must be positive")
     if (
         arguments.warmup < 0
@@ -112,14 +126,27 @@ def _arguments() -> argparse.Namespace:
         or arguments.production_window_layers > arguments.layers
         or arguments.pipeline_window_layers < 0
         or arguments.pipeline_window_layers > arguments.layers
+        or arguments.compaction_launch_ns < 0
     ):
         parser.error("warmup must be non-negative")
+    service_values = (
+        arguments.command_service_ns,
+        arguments.read_bandwidth_bps,
+        arguments.compaction_bandwidth_bps,
+    )
+    if any(service_values) and (not all(value > 0 for value in service_values)):
+        parser.error("all three NVMe service measurements must be positive")
+    if arguments.minimum_granularity_gain < 1.0:
+        parser.error("minimum granularity gain must be at least one")
+    if arguments.minimum_granularity_wall_speedup > 0 and not all(service_values):
+        parser.error("the granularity gate requires a calibrated service model")
     if (
         min(
             arguments.minimum_publication_prepare_speedup,
             arguments.minimum_publication_wall_speedup,
             arguments.minimum_ordered_wall_speedup,
             arguments.minimum_window_wall_speedup,
+            arguments.minimum_granularity_wall_speedup,
         )
         < 0
     ):
@@ -147,6 +174,7 @@ class _PhysicalTier:
         layer_count: int,
         source_rows: int,
         issue_budget: int,
+        service_model: NvmeTransferServiceModel | None = None,
     ) -> None:
         capabilities = transport.capabilities
         self.nvme_lba_size = int(capabilities.lba_size)
@@ -160,7 +188,9 @@ class _PhysicalTier:
             ),
             completion_budget=int(capabilities.queue_depth),
             progress_timeout_ns=1_000_000_000,
+            nvme_service_model=service_model or NvmeTransferServiceModel(),
         )
+        self.nvme_controller_page_size = int(capabilities.controller_page_size)
         self._layer_count = layer_count
         self._source_rows = source_rows
 
@@ -278,6 +308,23 @@ class _Arm:
         self.region = transport.register_hbm_region(
             self.storage.data_ptr(), self.storage.numel()
         )
+        self.scratch_storage: torch.Tensor | None = None
+        self.scratch_region: Any | None = None
+        scratch: NvmeScratchArena | None = None
+        if tier.config.nvme_service_model.calibrated:
+            scratch_bytes = plan_nvme_scratch_capacity(
+                queue_depth=int(tier.config.queue_depth),
+                max_transfer_bytes=tier.nvme_max_transfer_bytes,
+            )
+            self.scratch_storage = torch.empty(
+                scratch_bytes,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            self.scratch_region = transport.register_hbm_region(
+                self.scratch_storage.data_ptr(), self.scratch_storage.numel()
+            )
+            scratch = NvmeScratchArena(self.scratch_storage, self.scratch_region)
         objects_per_layer = 2 * run_count
         work_items_per_layer = 2 * run_count
         if window_layers <= 0 or window_layers > layer_count:
@@ -320,6 +367,7 @@ class _Arm:
             work_ticket_capacity=work_item_count,
             tenant_isolation=False,
             regions=regions,
+            scratch=scratch,
             stats=self.stats,
             window_layer_limit=pipeline_window_layers,
         )
@@ -344,6 +392,14 @@ class _Arm:
         current = torch.cuda.current_stream()
         gpu_start = torch.cuda.Event(enable_timing=True)
         gpu_stop = torch.cuda.Event(enable_timing=True)
+        stage_counters = (
+            "nvme_geometry_cpu_ns",
+            "nvme_descriptor_cpu_ns",
+            "nvme_publication_cpu_ns",
+            "nvme_finalization_cpu_ns",
+            "nvme_topology_cpu_ns",
+        )
+        stage_before = {name: int(self.stats.get(name, 0)) for name in stage_counters}
         torch.cuda.nvtx.range_push(self.name)
         try:
             gpu_start.record(self.progress_stream)
@@ -366,15 +422,27 @@ class _Arm:
             wall_stop = time.perf_counter_ns()
         finally:
             torch.cuda.nvtx.range_pop()
-        return {
+        result = {
             "prepare_ms": (prepare_stop - wall_start) / 1e6,
             "gpu_pipeline_ms": gpu_start.elapsed_time(gpu_stop),
             "wall_ms": (wall_stop - wall_start) / 1e6,
         }
+        result.update(
+            {
+                name.removeprefix("nvme_").removesuffix("_cpu_ns") + "_cpu_ms": (
+                    int(self.stats[name]) - stage_before[name]
+                )
+                / 1e6
+                for name in stage_counters
+            }
+        )
+        return result
 
     def close(self) -> None:
         self.pipeline.close()
         self.runtime.close()
+        if self.scratch_region is not None:
+            self.scratch_region.close()
         self.region.close()
 
 
@@ -466,11 +534,22 @@ def main() -> None:
         )
     )
     source_rows = 1 + arguments.source_stride * (arguments.runs - 1)
-    tier = _PhysicalTier(
+    direct_tier = _PhysicalTier(
         transport,
         layer_count=arguments.layers,
         source_rows=source_rows,
         issue_budget=arguments.issue_budget,
+    )
+    calibrated_model = (
+        None
+        if arguments.command_service_ns == 0
+        else NvmeTransferServiceModel(
+            command_service_ns=arguments.command_service_ns,
+            read_bandwidth_bytes_per_second=arguments.read_bandwidth_bps,
+            compaction_bandwidth_bytes_per_second=(arguments.compaction_bandwidth_bps),
+            compaction_launch_ns=arguments.compaction_launch_ns,
+            minimum_gain=arguments.minimum_granularity_gain,
+        )
     )
     program: JitPhaseProgram | None = None
     arms: dict[str, _Arm] = {}
@@ -480,8 +559,8 @@ def main() -> None:
             SOURCE_OFFSET % capabilities.lba_size
             or ROW_BYTES % capabilities.lba_size
             or ROW_BYTES > capabilities.max_transfer_bytes
-            or SOURCE_OFFSET + tier.source_bytes > capabilities.namespace_bytes
-            or SOURCE_OFFSET + tier.source_bytes > reference.stat().st_size
+            or SOURCE_OFFSET + direct_tier.source_bytes > capabilities.namespace_bytes
+            or SOURCE_OFFSET + direct_tier.source_bytes > reference.stat().st_size
         ):
             raise RuntimeError("publication benchmark is not NVMe materializable")
         program, _path, _digest = load_activated_transport_program()
@@ -511,11 +590,26 @@ def main() -> None:
             ),
             "layered_batch": (False, False, 1, 1),
         }
+        arm_tiers = {name: direct_tier for name in arm_configurations}
+        if calibrated_model is not None:
+            arm_configurations["granularity_auto"] = (
+                False,
+                False,
+                production_window_layers,
+                arguments.pipeline_window_layers or None,
+            )
+            arm_tiers["granularity_auto"] = _PhysicalTier(
+                transport,
+                layer_count=arguments.layers,
+                source_rows=source_rows,
+                issue_budget=arguments.issue_budget,
+                service_model=calibrated_model,
+            )
         arms = {
             name: _Arm(
                 name=name,
                 transport=transport,
-                tier=tier,
+                tier=arm_tiers[name],
                 program=program,
                 layer_count=arguments.layers,
                 run_count=arguments.runs,
@@ -553,10 +647,7 @@ def main() -> None:
             raise RuntimeError(f"publication benchmark left NVMe queue failed: {queue}")
 
         medians = {
-            name: {
-                field: _median(values, field)
-                for field in ("prepare_ms", "gpu_pipeline_ms", "wall_ms")
-            }
+            name: {field: _median(values, field) for field in values[0]}
             for name, values in samples.items()
         }
         comparisons = {
@@ -574,6 +665,12 @@ def main() -> None:
                 for field in ("prepare_ms", "gpu_pipeline_ms", "wall_ms")
             },
         }
+        if "granularity_auto" in medians:
+            comparisons["exact_granularity"] = {
+                field: medians["ordered_batch"][field]
+                / medians["granularity_auto"][field]
+                for field in ("prepare_ms", "gpu_pipeline_ms", "wall_ms")
+            }
         gate = {
             "minimum_publication_prepare_speedup": (
                 arguments.minimum_publication_prepare_speedup
@@ -583,6 +680,9 @@ def main() -> None:
             ),
             "minimum_ordered_wall_speedup": (arguments.minimum_ordered_wall_speedup),
             "minimum_window_wall_speedup": arguments.minimum_window_wall_speedup,
+            "minimum_granularity_wall_speedup": (
+                arguments.minimum_granularity_wall_speedup
+            ),
             "passed": (
                 comparisons["bulk_publication"]["prepare_ms"]
                 >= arguments.minimum_publication_prepare_speedup
@@ -592,6 +692,11 @@ def main() -> None:
                 >= arguments.minimum_ordered_wall_speedup
                 and comparisons["queue_fill_window"]["wall_ms"]
                 >= arguments.minimum_window_wall_speedup
+                and (
+                    arguments.minimum_granularity_wall_speedup == 0
+                    or comparisons["exact_granularity"]["wall_ms"]
+                    >= arguments.minimum_granularity_wall_speedup
+                )
             ),
         }
         transfer_runs_per_lane = (
@@ -602,7 +707,7 @@ def main() -> None:
         )
         objects_per_layer = 2 * transfer_runs_per_lane
         report = {
-            "schema": 2,
+            "schema": 3,
             "benchmark": "sglang_nvme_pipeline_causal",
             "read_only": True,
             "layers": arguments.layers,
@@ -613,10 +718,31 @@ def main() -> None:
             "bytes_per_trial": 2 * arguments.layers * arguments.runs * ROW_BYTES,
             "warmup": arguments.warmup,
             "trials": arguments.trials,
-            "issue_budget": tier.config.issue_budget,
+            "issue_budget": direct_tier.config.issue_budget,
             "runtime_window_capacity_layers": production_window_layers,
             "pipeline_window_layer_limit": arguments.pipeline_window_layers,
+            "granularity_service_model": {
+                "calibrated": calibrated_model is not None,
+                "command_service_ns": arguments.command_service_ns or None,
+                "read_bandwidth_bytes_per_second": (
+                    arguments.read_bandwidth_bps or None
+                ),
+                "compaction_bandwidth_bytes_per_second": (
+                    arguments.compaction_bandwidth_bps or None
+                ),
+                "compaction_launch_ns": (
+                    arguments.compaction_launch_ns
+                    if calibrated_model is not None
+                    else None
+                ),
+                "minimum_gain": (
+                    arguments.minimum_granularity_gain
+                    if calibrated_model is not None
+                    else None
+                ),
+            },
             "window_count": {name: arm.window_count for name, arm in arms.items()},
+            "pipeline_stats": {name: arm.stats for name, arm in arms.items()},
             "samples": samples,
             "median": medians,
             "comparison_speedup": comparisons,
@@ -643,7 +769,9 @@ def main() -> None:
                 f"ordered_wall="
                 f"{comparisons['ordered_dispatch']['wall_ms']:.3f}x "
                 f"window_wall="
-                f"{comparisons['queue_fill_window']['wall_ms']:.3f}x"
+                f"{comparisons['queue_fill_window']['wall_ms']:.3f}x "
+                f"granularity_wall="
+                f"{comparisons.get('exact_granularity', {}).get('wall_ms', 1.0):.3f}x"
             )
     finally:
         try:

@@ -36,11 +36,10 @@ public:
                 std::uint32_t workItemCount) const;
   // Skip generic EDF-heap construction only for a statically ordered Host
   // indexed range with homogeneous request policy and unconstrained credits.
-  void discoverUnqueuedHost(
-      cudaStream_t stream, abi::RuntimeView *runtime,
-      const abi::WorkItem *workItems,
-      const abi::AcquireRequirement *dependencies,
-      std::uint32_t workItemCount) const;
+  void discoverUnqueuedHost(cudaStream_t stream, abi::RuntimeView *runtime,
+                            const abi::WorkItem *workItems,
+                            const abi::AcquireRequirement *dependencies,
+                            std::uint32_t workItemCount) const;
   // Use the O(1)-cursor NVMe path only after device-side validation proves
   // this finite intent image is already in EDF order. Validation falls back
   // to the generic heap without host synchronization.
@@ -52,8 +51,7 @@ public:
                            std::uint32_t intentCount) const;
   void prepareReadyWindow(cudaStream_t stream, abi::RuntimeView *runtime,
                           std::uint32_t maximumWork) const;
-  void prepareEventWorkPartition(cudaStream_t stream,
-                                 abi::RuntimeView *runtime,
+  void prepareEventWorkPartition(cudaStream_t stream, abi::RuntimeView *runtime,
                                  const abi::WorkItem *workItems,
                                  std::uint32_t workItemCount,
                                  std::uint32_t directWorkCount) const;
@@ -101,6 +99,21 @@ public:
   void progressValidatedIndexedHostRangeParallel(
       cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstObject,
       std::uint32_t objectCount, std::uint32_t copyBlocksPerGroup) const;
+  // Compact exact rows from transport-owned HBM scratch into framework-owned
+  // numerical destinations. Both address tables reside on the device.
+  void compactHbmRows(cudaStream_t stream, const std::uint64_t *sourceAddresses,
+                      const std::uint64_t *destinationAddresses,
+                      std::uint32_t rowCount, std::uint32_t rowBytes) const;
+  // Validate each exact row's acquisition owner and compact it in one launch.
+  void compactReadyHbmRows(cudaStream_t stream, abi::RuntimeView *runtime,
+                           const std::uint64_t *rowTable,
+                           std::uint32_t rowCount,
+                           std::uint32_t rowBytes) const;
+  // Fail-stop before a stock numerical consumer if any terminal acquisition
+  // object is Failed rather than Ready.
+  void requireReadyObjects(cudaStream_t stream, abi::RuntimeView *runtime,
+                           std::uint32_t firstObject,
+                           std::uint32_t objectCount) const;
   // Bound the next validated indexed copy of each listed object to the
   // in-place-rewritten prefix of its registered index arrays. The per-step
   // selection loop uses this to acquire only the current step's misses.
@@ -127,9 +140,9 @@ public:
   void reduceMappedIndexedKeyPages(
       cudaStream_t stream, const void *source, std::uint32_t sourceRows,
       std::uint64_t sourceStrideBytes, const std::int32_t *rowIndices,
-      std::uint32_t tokenCount, std::uint32_t pageTokens,
-      std::uint32_t kvHeads, std::uint32_t headDim, std::uint32_t elementType,
-      float *outputMin, float *outputMax) const;
+      std::uint32_t tokenCount, std::uint32_t pageTokens, std::uint32_t kvHeads,
+      std::uint32_t headDim, std::uint32_t elementType, float *outputMin,
+      float *outputMax) const;
   void reduceMappedKeyPages(cudaStream_t stream, const void *source,
                             std::uint32_t sourceRows,
                             std::uint64_t sourceStrideBytes,
@@ -145,10 +158,9 @@ public:
                              std::uint32_t completionBudget,
                              std::uint64_t timeoutNs) const;
   void progressNvmeOrderedUntilIdle(
-      cudaStream_t stream, abi::RuntimeView *runtime,
-      std::uint32_t firstIntent, std::uint32_t intentCount,
-      std::uint32_t issueBudget, std::uint32_t completionBudget,
-      std::uint64_t timeoutNs) const;
+      cudaStream_t stream, abi::RuntimeView *runtime, std::uint32_t firstIntent,
+      std::uint32_t intentCount, std::uint32_t issueBudget,
+      std::uint32_t completionBudget, std::uint64_t timeoutNs) const;
   void publish(cudaStream_t stream, abi::RuntimeView *runtime,
                std::uint32_t pendingBudget) const;
   void complete(cudaStream_t stream, abi::RuntimeView *runtime,
@@ -180,8 +192,7 @@ public:
     complete(stream, runtime, config.workTicketCount);
     for (std::uint32_t round = 0; round < config.progressRounds; ++round) {
       progressNvmeUntilIdle(stream, runtime, config.issueBudget,
-                            config.completionBudget,
-                            config.progressTimeoutNs);
+                            config.completionBudget, config.progressTimeoutNs);
       ready();
       complete(stream, runtime, config.workTicketCount);
     }

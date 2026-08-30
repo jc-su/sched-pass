@@ -1007,8 +1007,8 @@ nta_status nta_runtime_install_registered_nvme_objects_async(
       const std::size_t nativeBytes =
           checkedSize(object.bytes, "NVMe object bytes");
       auto destination = object.region->value->view(
-          reinterpret_cast<void *>(static_cast<std::uintptr_t>(
-              object.destination_device_address)),
+          reinterpret_cast<void *>(
+              static_cast<std::uintptr_t>(object.destination_device_address)),
           nativeBytes);
       native.push_back({
           object.slot,
@@ -1031,8 +1031,7 @@ nta_status nta_runtime_install_registered_nvme_objects_async(
     if (destinationDeviceAddressesOut != nullptr) {
       for (std::uint32_t index = 0; index < objectCount; ++index) {
         destinationDeviceAddressesOut[index] =
-            reinterpret_cast<std::uintptr_t>(
-                installed[index].directDeviceBase);
+            reinterpret_cast<std::uintptr_t>(installed[index].directDeviceBase);
       }
     }
   });
@@ -1199,13 +1198,14 @@ std::int32_t nta_runtime_device_ordinal(const nta_runtime *runtime) {
              : runtime->value->deviceOrdinal();
 }
 
-nta_status nta_runtime_wait_object_range_terminal(
-    nta_runtime *runtime, std::uint32_t firstObjectSlot,
-    std::uint32_t objectCount, std::uint64_t cudaStream) {
+nta_status nta_runtime_wait_object_range_terminal(nta_runtime *runtime,
+                                                  std::uint32_t firstObjectSlot,
+                                                  std::uint32_t objectCount,
+                                                  std::uint64_t cudaStream) {
   return protect([&] {
     requireHandle(runtime, "runtime");
     runtime->value->waitObjectRangeTerminal(firstObjectSlot, objectCount,
-                                             stream(cudaStream));
+                                            stream(cudaStream));
   });
 }
 
@@ -1576,8 +1576,8 @@ nta_device_work_plan_device_ordinal(const nta_device_work_plan *plan) {
              : plan->value->deviceOrdinal();
 }
 
-nta_status nta_jit_operator_module_create(
-    const char *sharedObject, nta_jit_operator_module **moduleOut) {
+nta_status nta_jit_operator_module_create(const char *sharedObject,
+                                          nta_jit_operator_module **moduleOut) {
   if (moduleOut != nullptr) {
     *moduleOut = nullptr;
   }
@@ -1597,8 +1597,9 @@ void nta_jit_operator_module_destroy(nta_jit_operator_module *module) {
   delete module;
 }
 
-nta_status nta_jit_operator_module_contract(
-    const nta_jit_operator_module *module, nta_operator_contract *contractOut) {
+nta_status
+nta_jit_operator_module_contract(const nta_jit_operator_module *module,
+                                 nta_operator_contract *contractOut) {
   return protect([&] {
     requireHandle(module, "JIT operator module");
     if (contractOut == nullptr) {
@@ -2016,6 +2017,48 @@ nta_status nta_jit_phase_progress_nvme(const nta_jit_phase_program *program,
     program->value->progressNvme(stream(cudaStream),
                                  runtime->value->deviceView(), issueBudget,
                                  completionBudget);
+  });
+}
+
+nta_status nta_jit_phase_compact_hbm_rows(const nta_jit_phase_program *program,
+                                          std::uint64_t sourceAddresses,
+                                          std::uint64_t destinationAddresses,
+                                          std::uint32_t rowCount,
+                                          std::uint32_t rowBytes,
+                                          std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    program->value->compactHbmRows(
+        stream(cudaStream),
+        reinterpret_cast<const std::uint64_t *>(sourceAddresses),
+        reinterpret_cast<const std::uint64_t *>(destinationAddresses), rowCount,
+        rowBytes);
+  });
+}
+
+nta_status nta_jit_phase_require_ready_objects(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint32_t firstObject, std::uint32_t objectCount,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->requireReadyObjects(stream(cudaStream),
+                                        runtime->value->deviceView(),
+                                        firstObject, objectCount);
+  });
+}
+
+nta_status nta_jit_phase_compact_ready_hbm_rows(
+    const nta_jit_phase_program *program, nta_runtime *runtime,
+    std::uint64_t rowTable, std::uint32_t rowCount, std::uint32_t rowBytes,
+    std::uint64_t cudaStream) {
+  return protect([&] {
+    requireHandle(program, "JIT phase program");
+    requireHandle(runtime, "runtime");
+    program->value->compactReadyHbmRows(
+        stream(cudaStream), runtime->value->deviceView(),
+        reinterpret_cast<const std::uint64_t *>(rowTable), rowCount, rowBytes);
   });
 }
 

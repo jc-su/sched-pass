@@ -27,7 +27,7 @@ from .requests import RequestBinding
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 52
+API_VERSION = 55
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -2012,6 +2012,35 @@ _phase_nvme = _function(
     ctypes.c_int,
     _Handle,
     _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_compact_hbm_rows = _function(
+    "nta_jit_phase_compact_hbm_rows",
+    ctypes.c_int,
+    _Handle,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_require_ready_objects = _function(
+    "nta_jit_phase_require_ready_objects",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint64,
+)
+_phase_compact_ready_hbm_rows = _function(
+    "nta_jit_phase_compact_ready_hbm_rows",
+    ctypes.c_int,
+    _Handle,
+    _Handle,
+    ctypes.c_uint64,
     ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
@@ -4176,6 +4205,123 @@ class JitPhaseProgram(_Owner):
                 object_count,
                 object_id_base,
                 version,
+                _stream_address(stream),
+            )
+        )
+
+    def compact_hbm_rows(
+        self,
+        source_addresses: Any,
+        destination_addresses: Any,
+        row_bytes: int,
+        stream: Any = None,
+        *,
+        first_row: int = 0,
+        row_count: int | None = None,
+    ) -> None:
+        """Compact exact scratch rows into framework HBM destinations."""
+        import torch
+
+        arrays = (source_addresses, destination_addresses)
+        if any(
+            not isinstance(array, torch.Tensor)
+            or array.device.type != "cuda"
+            or array.dtype != torch.int64
+            or not array.is_contiguous()
+            for array in arrays
+        ):
+            raise ValueError("HBM compaction address tables must be CUDA int64")
+        if source_addresses.device != destination_addresses.device:
+            raise ValueError("HBM compaction address tables must share a device")
+        total_rows = source_addresses.numel()
+        if row_count is None:
+            row_count = total_rows - first_row
+        if (
+            total_rows != destination_addresses.numel()
+            or min(total_rows, row_bytes, row_count) <= 0
+            or first_row < 0
+            or first_row > total_rows - row_count
+        ):
+            raise ValueError("HBM compaction address geometry is invalid")
+        address_offset = first_row * source_addresses.element_size()
+        _check(
+            _phase_compact_hbm_rows(
+                self._handle,
+                source_addresses.data_ptr() + address_offset,
+                destination_addresses.data_ptr() + address_offset,
+                row_count,
+                row_bytes,
+                _stream_address(stream),
+            )
+        )
+
+    def require_ready_objects(
+        self,
+        runtime: Runtime,
+        first_object: int,
+        object_count: int,
+        stream: Any = None,
+    ) -> None:
+        """Fail-stop if a terminal object range contains anything but Ready."""
+
+        if (
+            first_object < 0
+            or object_count <= 0
+            or first_object > runtime.config.object_capacity
+            or object_count > runtime.config.object_capacity - first_object
+        ):
+            raise ValueError("ready-object validation exceeds object capacity")
+        _check(
+            _phase_require_ready_objects(
+                self._handle,
+                runtime._handle,
+                first_object,
+                object_count,
+                _stream_address(stream),
+            )
+        )
+
+    def compact_ready_hbm_rows(
+        self,
+        runtime: Runtime,
+        row_table: Any,
+        row_bytes: int,
+        stream: Any = None,
+        *,
+        first_row: int = 0,
+        row_count: int | None = None,
+    ) -> None:
+        """Validate acquisition owners and compact exact rows in one launch."""
+        import torch
+
+        if (
+            not isinstance(row_table, torch.Tensor)
+            or row_table.device.type != "cuda"
+            or row_table.dtype != torch.int64
+            or not row_table.is_contiguous()
+            or row_table.ndim != 2
+            or row_table.shape[1] != 3
+        ):
+            raise ValueError("Ready HBM compaction uses a contiguous CUDA int64 Nx3 table")
+        if row_table.device.index != runtime.device_ordinal:
+            raise ValueError("Ready HBM compaction table and runtime disagree")
+        total_rows = row_table.shape[0]
+        if row_count is None:
+            row_count = total_rows - first_row
+        if (
+            min(total_rows, row_bytes, row_count) <= 0
+            or first_row < 0
+            or first_row > total_rows - row_count
+        ):
+            raise ValueError("Ready HBM compaction geometry is invalid")
+        table_offset = first_row * 3 * row_table.element_size()
+        _check(
+            _phase_compact_ready_hbm_rows(
+                self._handle,
+                runtime._handle,
+                row_table.data_ptr() + table_offset,
+                row_count,
+                row_bytes,
                 _stream_address(stream),
             )
         )

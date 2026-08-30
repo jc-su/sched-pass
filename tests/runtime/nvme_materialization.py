@@ -3,9 +3,17 @@ from dataclasses import dataclass
 from nta_runtime.nvme_materialization import (
     NvmeSlotLifetime,
     NvmeTensorLane,
+    materialize_nvme_run_plan,
     plan_nvme_runs,
     publish_registered_nvme_objects,
     publish_nvme_runs,
+    summarize_nvme_runs,
+)
+from nta_runtime.nvme_granularity import (
+    NvmeGranularity,
+    NvmeTransferServiceModel,
+    choose_nvme_granularity,
+    plan_nvme_spans,
 )
 from nta_runtime.runtime import RegisteredNvmeObjectInstall
 
@@ -57,6 +65,167 @@ class _Region:
 
 
 def main() -> None:
+    service = NvmeTransferServiceModel(
+        command_service_ns=13_000,
+        read_bandwidth_bytes_per_second=6_700_000_000,
+        compaction_bandwidth_bytes_per_second=600_000_000_000,
+        compaction_launch_ns=20_000,
+    )
+    sparse = (tuple(range(0, 32, 2)), tuple(range(16)))
+    sparse_direct = plan_nvme_runs(
+        (sparse,),
+        lane_element_bytes=(4096, 4096),
+        lba_size=512,
+        max_transfer_bytes=2 * 1024 * 1024,
+        object_capacity=64,
+    )
+    sparse_span = plan_nvme_spans(
+        (sparse,),
+        lane_element_bytes=(4096, 4096),
+        lba_size=512,
+        max_transfer_bytes=2 * 1024 * 1024,
+        scratch_alignment=4096,
+        service_model=service,
+    )
+    assert sparse_direct.object_count == 32
+    assert sparse_span.object_count == 2
+    assert sparse_span.physical_bytes == 31 * 2 * 4096
+    assert sparse_span.exact_bytes == 16 * 2 * 4096
+    assert sparse_span.scratch_bytes == sparse_span.physical_bytes
+    assert sparse_span.selected_row_copy_count == 32
+    assert len(sparse_span.spans_for(sparse)) == 1
+    # The linear sliding-window planner must retain the globally minimal
+    # conservative service objective, not substitute a local gap heuristic.
+    sources = (0, 2, 3, 9, 11, 12, 18)
+    linear_pair = (sources, tuple(range(len(sources))))
+    linear_model = NvmeTransferServiceModel(
+        command_service_ns=10,
+        read_bandwidth_bytes_per_second=1_000_000_000,
+        compaction_bandwidth_bytes_per_second=1_000_000_000,
+    )
+    linear = plan_nvme_spans(
+        (linear_pair,),
+        lane_element_bytes=(4, 4),
+        lba_size=4,
+        max_transfer_bytes=32,
+        scratch_alignment=4,
+        service_model=linear_model,
+    )
+    row_ns = 8
+    fixed_ns = 20
+    brute: list[tuple[int, int, int] | None] = [None] * (len(sources) + 1)
+    brute[0] = (0, 0, 0)
+    for begin in range(len(sources)):
+        assert brute[begin] is not None
+        for end in range(begin, len(sources)):
+            rows = sources[end] - sources[begin] + 1
+            if rows > 8:
+                break
+            current = brute[begin]
+            assert current is not None
+            candidate = (
+                current[0] + fixed_ns + rows * row_ns,
+                current[1] + rows * 8,
+                current[2] + 2,
+            )
+            if brute[end + 1] is None or candidate < brute[end + 1]:
+                brute[end + 1] = candidate
+    linear_objective = (
+        len(linear.spans) * fixed_ns
+        + sum(span.source_row_count for span in linear.spans) * row_ns,
+        linear.physical_bytes,
+        linear.command_count,
+    )
+    assert linear_objective == brute[-1]
+    sparse_decision = choose_nvme_granularity(
+        direct_command_count=sparse_direct.object_count,
+        direct_transfer_bytes=16 * 2 * 4096,
+        direct_work_item_count=len(sparse_direct.unique_runs),
+        span_command_count=sparse_span.command_count,
+        span_transfer_bytes=sparse_span.physical_bytes,
+        span_exact_bytes=sparse_span.exact_bytes,
+        span_work_item_count=len(sparse_span.spans),
+        span_scratch_bytes=sparse_span.scratch_bytes,
+        compaction_launch_count=1,
+        object_capacity=64,
+        work_ticket_capacity=64,
+        scratch_capacity_bytes=1 << 20,
+        service_model=service,
+    )
+    assert sparse_decision.kind is NvmeGranularity.SPAN_COMPACT
+    assert sparse_decision.reason == "service_cost"
+    assert sparse_decision.direct_predicted_ns > sparse_decision.span_predicted_ns
+
+    dense = (tuple(range(16)), tuple(range(16)))
+    dense_direct = plan_nvme_runs(
+        (dense,),
+        lane_element_bytes=(4096, 4096),
+        lba_size=512,
+        max_transfer_bytes=2 * 1024 * 1024,
+        object_capacity=64,
+    )
+    dense_span = plan_nvme_spans(
+        (dense,),
+        lane_element_bytes=(4096, 4096),
+        lba_size=512,
+        max_transfer_bytes=2 * 1024 * 1024,
+        scratch_alignment=4096,
+        service_model=service,
+    )
+    dense_decision = choose_nvme_granularity(
+        direct_command_count=dense_direct.object_count,
+        direct_transfer_bytes=16 * 2 * 4096,
+        direct_work_item_count=len(dense_direct.unique_runs),
+        span_command_count=dense_span.command_count,
+        span_transfer_bytes=dense_span.physical_bytes,
+        span_exact_bytes=dense_span.exact_bytes,
+        span_work_item_count=len(dense_span.spans),
+        span_scratch_bytes=dense_span.scratch_bytes,
+        compaction_launch_count=1,
+        object_capacity=64,
+        work_ticket_capacity=64,
+        scratch_capacity_bytes=1 << 20,
+        service_model=service,
+    )
+    assert dense_direct.object_count == dense_span.object_count == 2
+    assert dense_decision.kind is NvmeGranularity.DIRECT
+    assert dense_decision.reason == "insufficient_gain"
+
+    uncalibrated = choose_nvme_granularity(
+        direct_command_count=sparse_direct.object_count,
+        direct_transfer_bytes=16 * 2 * 4096,
+        direct_work_item_count=len(sparse_direct.unique_runs),
+        span_command_count=0,
+        span_transfer_bytes=0,
+        span_exact_bytes=0,
+        span_work_item_count=0,
+        span_scratch_bytes=0,
+        compaction_launch_count=1,
+        object_capacity=64,
+        work_ticket_capacity=64,
+        scratch_capacity_bytes=1 << 20,
+        service_model=NvmeTransferServiceModel(),
+    )
+    assert uncalibrated.kind is NvmeGranularity.DIRECT
+    assert uncalibrated.reason == "uncalibrated"
+    scratch_limited = choose_nvme_granularity(
+        direct_command_count=sparse_direct.object_count,
+        direct_transfer_bytes=16 * 2 * 4096,
+        direct_work_item_count=len(sparse_direct.unique_runs),
+        span_command_count=sparse_span.command_count,
+        span_transfer_bytes=sparse_span.physical_bytes,
+        span_exact_bytes=sparse_span.exact_bytes,
+        span_work_item_count=len(sparse_span.spans),
+        span_scratch_bytes=sparse_span.scratch_bytes,
+        compaction_launch_count=1,
+        object_capacity=64,
+        work_ticket_capacity=64,
+        scratch_capacity_bytes=sparse_span.scratch_bytes - 1,
+        service_model=service,
+    )
+    assert scratch_limited.kind is NvmeGranularity.DIRECT
+    assert scratch_limited.reason == "scratch_capacity"
+
     # The second pair is a strict subset of the first. Its transfer run must
     # fan out from the same acquisition owner instead of consuming another
     # directory slot or issuing duplicate NVMe I/O.
@@ -73,6 +242,13 @@ def main() -> None:
     assert len(plan.unique_runs) == 2
     assert plan.object_count == 4
     assert plan.runs_for(shared_prefix) == (plan.unique_runs[0],)
+    summary = summarize_nvme_runs(
+        (complete, shared_prefix, complete),
+        lane_element_bytes=(4, 8),
+        lba_size=4,
+        max_transfer_bytes=16,
+    )
+    assert materialize_nvme_run_plan(summary, object_capacity=4) == plan
 
     try:
         plan_nvme_runs(

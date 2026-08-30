@@ -19,11 +19,32 @@ import math
 from types import MappingProxyType
 from typing import Any
 
-from nta_runtime.indexed_transfer import ContiguousPairRun, analyze_index_pairs
+from nta_runtime.indexed_transfer import ContiguousPairRun
+from nta_runtime.nvme_granularity import NvmeSourceSpan, NvmeSpanPlan
 from nta_runtime.runtime import RegisteredNvmeObjectInstall
 
 
 IndexPair = tuple[tuple[int, ...], tuple[int, ...]]
+RunGeometry = tuple[int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class NvmeRunSummary:
+    """Allocation-light exact direct-run factorization used for policy."""
+
+    pair_runs: tuple[tuple[IndexPair, tuple[RunGeometry, ...]], ...]
+    unique_runs: tuple[RunGeometry, ...]
+    lane_element_bytes: tuple[int, ...]
+    rows_per_lba: int
+    maximum_rows_per_command: int
+
+    @property
+    def object_count(self) -> int:
+        return len(self.lane_element_bytes) * len(self.unique_runs)
+
+    @property
+    def physical_rows(self) -> int:
+        return sum(run[2] for run in self.unique_runs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,12 +107,29 @@ def plan_nvme_runs(
     directory slots.
     """
 
+    summary = summarize_nvme_runs(
+        index_pairs,
+        lane_element_bytes=lane_element_bytes,
+        lba_size=lba_size,
+        max_transfer_bytes=max_transfer_bytes,
+    )
+    return materialize_nvme_run_plan(summary, object_capacity=object_capacity)
+
+
+def summarize_nvme_runs(
+    index_pairs: Iterable[IndexPair],
+    *,
+    lane_element_bytes: tuple[int, ...],
+    lba_size: int,
+    max_transfer_bytes: int,
+) -> NvmeRunSummary:
+    """Factor exact direct runs without allocating one object per run."""
+
     if (
         not lane_element_bytes
         or min(lane_element_bytes) <= 0
         or lba_size <= 0
         or max_transfer_bytes <= 0
-        or object_capacity <= 0
     ):
         raise ValueError("NVMe run planning requires positive resource geometry")
     rows_per_lba = math.lcm(
@@ -110,44 +148,80 @@ def plan_nvme_runs(
     unique_pairs = tuple(dict.fromkeys(pair for pair in index_pairs if pair[0]))
     if not unique_pairs:
         raise RuntimeError("NVMe run planning has no external index pair")
-    pair_runs: list[tuple[IndexPair, tuple[ContiguousPairRun, ...]]] = []
+    pair_runs: list[tuple[IndexPair, tuple[RunGeometry, ...]]] = []
     for pair in unique_pairs:
         source_ordinals, destination_rows = pair
         if len(source_ordinals) != len(destination_rows):
             raise RuntimeError("NVMe source and destination index counts disagree")
-        layout = analyze_index_pairs(source_ordinals, destination_rows)
-        runs: list[ContiguousPairRun] = []
-        for contiguous in layout.runs:
-            if contiguous.row_count % rows_per_lba:
+        if min(source_ordinals) < 0 or min(destination_rows) < 0:
+            raise RuntimeError("NVMe source and destination rows cannot be negative")
+        if len(set(destination_rows)) != len(destination_rows):
+            raise RuntimeError("NVMe destination rows must be unique")
+        runs: list[RunGeometry] = []
+        run_begin = 0
+        for index in range(1, len(source_ordinals) + 1):
+            contiguous = index < len(source_ordinals) and (
+                source_ordinals[index] == source_ordinals[index - 1] + 1
+                and destination_rows[index] == destination_rows[index - 1] + 1
+            )
+            if contiguous:
+                continue
+            contiguous_rows = index - run_begin
+            if contiguous_rows % rows_per_lba:
                 raise RuntimeError("NVMe run is not exactly LBA materializable")
             consumed = 0
-            while consumed < contiguous.row_count:
-                row_count = min(maximum_rows, contiguous.row_count - consumed)
+            while consumed < contiguous_rows:
+                row_count = min(maximum_rows, contiguous_rows - consumed)
                 runs.append(
-                    ContiguousPairRun(
-                        contiguous.source_first + consumed,
-                        contiguous.destination_first + consumed,
+                    (
+                        source_ordinals[run_begin] + consumed,
+                        destination_rows[run_begin] + consumed,
                         row_count,
                     )
                 )
                 consumed += row_count
+            run_begin = index
         if not runs:
             raise RuntimeError("NVMe index pair produced no transfer run")
         pair_runs.append((pair, tuple(runs)))
 
     unique_runs = tuple(dict.fromkeys(run for _pair, runs in pair_runs for run in runs))
-    required_objects = len(unique_runs) * len(lane_element_bytes)
-    if required_objects > object_capacity:
-        raise RuntimeError(
-            "NVMe layer needs more HBM object slots than the runtime capacity"
-        )
-    return NvmeRunPlan(
+    return NvmeRunSummary(
         tuple(pair_runs),
         unique_runs,
         tuple(lane_element_bytes),
-        object_capacity,
         rows_per_lba,
         maximum_rows,
+    )
+
+
+def materialize_nvme_run_plan(
+    summary: NvmeRunSummary, *, object_capacity: int
+) -> NvmeRunPlan:
+    """Allocate the typed direct plan only after direct policy selection."""
+
+    if not isinstance(summary, NvmeRunSummary) or object_capacity <= 0:
+        raise ValueError("NVMe direct materialization requires a summary and capacity")
+    if summary.object_count > object_capacity:
+        raise RuntimeError(
+            "NVMe layer needs more HBM object slots than the runtime capacity"
+        )
+    runs_by_geometry = {
+        geometry: ContiguousPairRun(*geometry) for geometry in summary.unique_runs
+    }
+    return NvmeRunPlan(
+        tuple(
+            (
+                pair,
+                tuple(runs_by_geometry[geometry] for geometry in geometries),
+            )
+            for pair, geometries in summary.pair_runs
+        ),
+        tuple(runs_by_geometry[geometry] for geometry in summary.unique_runs),
+        summary.lane_element_bytes,
+        object_capacity,
+        summary.rows_per_lba,
+        summary.maximum_rows_per_command,
     )
 
 
@@ -184,6 +258,36 @@ class NvmeTensorLane:
         if run.destination_first > self.destination_rows - run.row_count:
             raise RuntimeError("NVMe run exceeds its numerical destination")
         return self.destination_address + run.destination_first * self.row_stride_bytes
+
+
+@dataclass(frozen=True, slots=True)
+class NvmeScratchArena:
+    """One setup-time registered HBM arena owned for span materialization."""
+
+    tensor: Any
+    region: Any
+    address: int = field(init=False)
+    bytes: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        import torch
+
+        if (
+            not isinstance(self.tensor, torch.Tensor)
+            or self.tensor.device.type != "cuda"
+            or self.tensor.dtype != torch.uint8
+            or not self.tensor.is_contiguous()
+            or self.tensor.numel() <= 0
+            or self.region is None
+        ):
+            raise ValueError("NVMe scratch arena requires contiguous registered HBM")
+        object.__setattr__(self, "address", int(self.tensor.data_ptr()))
+        object.__setattr__(self, "bytes", int(self.tensor.numel()))
+
+    def destination(self, offset: int, bytes_: int) -> int:
+        if offset < 0 or bytes_ <= 0 or offset > self.bytes - bytes_:
+            raise RuntimeError("NVMe span exceeds its HBM scratch arena")
+        return self.address + offset
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +381,14 @@ class NvmeRunPublication:
     ) -> tuple[tuple[NvmeObjectReference, ...], ...]:
         return tuple(self._lookup[run] for run in self.plan.runs_for(pair))
 
+    def objects_for_run(
+        self, run: ContiguousPairRun
+    ) -> tuple[NvmeObjectReference, ...]:
+        try:
+            return self._lookup[run]
+        except KeyError as error:
+            raise RuntimeError("NVMe transfer run was not published") from error
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedNvmeRunPublication:
@@ -296,6 +408,72 @@ class PreparedNvmeRunPublication:
             or len(self.previous_destinations) != len(self.bindings)
         ):
             raise ValueError("prepared NVMe publication is incomplete")
+
+    @property
+    def object_count(self) -> int:
+        return len(self.bindings)
+
+
+@dataclass(frozen=True, slots=True)
+class NvmeSpanPublication:
+    """Directory image and exact compaction addresses for one span plan."""
+
+    plan: NvmeSpanPlan
+    objects_by_span: tuple[tuple[NvmeSourceSpan, tuple[NvmeObjectReference, ...]], ...]
+    compaction_addresses: tuple[
+        tuple[int, tuple[tuple[int, int, int], ...]], ...
+    ]
+    slot_destinations: tuple[tuple[int, int], ...]
+    counters: NvmePublicationCounters
+    _lookup: Any = field(init=False, repr=False, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        lookup = dict(self.objects_by_span)
+        if (
+            tuple(lookup) != self.plan.spans
+            or any(
+                len(objects) != len(self.plan.lane_element_bytes)
+                for objects in lookup.values()
+            )
+            or len(self.compaction_addresses) != len(self.plan.lane_element_bytes)
+            or len(self.slot_destinations) != self.plan.object_count
+        ):
+            raise ValueError("NVMe span publication is incomplete")
+        object.__setattr__(self, "_lookup", MappingProxyType(lookup))
+
+    @property
+    def object_count(self) -> int:
+        return len(self.slot_destinations)
+
+    @property
+    def transfer_bytes(self) -> int:
+        return self.plan.physical_bytes
+
+    def objects_for(self, span: NvmeSourceSpan) -> tuple[NvmeObjectReference, ...]:
+        try:
+            return self._lookup[span]
+        except KeyError as error:
+            raise RuntimeError("NVMe source span was not published") from error
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedNvmeSpanPublication:
+    plan: NvmeSpanPlan
+    bindings: tuple[RegisteredNvmeObjectInstall, ...]
+    spans_by_object: tuple[NvmeSourceSpan, ...]
+    compaction_addresses: tuple[
+        tuple[int, tuple[tuple[int, int, int], ...]], ...
+    ]
+    previous_destinations: tuple[int | None, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            len(self.bindings) != self.plan.object_count
+            or len(self.spans_by_object) != len(self.bindings)
+            or len(self.previous_destinations) != len(self.bindings)
+            or len(self.compaction_addresses) != len(self.plan.lane_element_bytes)
+        ):
+            raise ValueError("prepared NVMe span publication is incomplete")
 
     @property
     def object_count(self) -> int:
@@ -513,6 +691,167 @@ def publish_prepared_nvme_runs(
         )
     if cursor != len(installed_addresses):
         raise RuntimeError("NVMe publication result exceeds its prepared image")
+    return tuple(publications)
+
+
+def prepare_nvme_spans(
+    plan: NvmeSpanPlan,
+    lanes: tuple[NvmeTensorLane, ...],
+    *,
+    scratch: NvmeScratchArena,
+    scratch_base: int,
+    extent_resolver: Callable[[int, tuple[int, ...], str, int], Any],
+    layer_id: int,
+    object_version: int,
+    object_id_base: int,
+    first_object_slot: int,
+    lifetime: NvmeSlotLifetime,
+) -> PreparedNvmeSpanPublication:
+    """Prepare exact source-span DMA and its post-DMA HBM compaction image."""
+
+    if (
+        tuple(lane.row_bytes for lane in lanes) != plan.lane_element_bytes
+        or len(lanes) == 0
+        or scratch_base < 0
+        or object_version <= 0
+        or object_version >= 1 << 32
+        or min(layer_id, object_id_base, first_object_slot) < 0
+        or first_object_slot > (1 << 32) - plan.object_count
+        or object_id_base > (1 << 64) - plan.object_count
+    ):
+        raise ValueError("NVMe span publication identity or geometry is invalid")
+    if scratch_base > scratch.bytes - plan.scratch_bytes:
+        raise RuntimeError("NVMe span plan exceeds its scratch allocation")
+
+    bindings: list[RegisteredNvmeObjectInstall] = []
+    spans_by_object: list[NvmeSourceSpan] = []
+    previous_destinations: list[int | None] = []
+    compaction: list[list[tuple[int, int, int]]] = [[] for _lane in lanes]
+    relative = 0
+    for span in plan.spans:
+        ordinals = tuple(
+            range(span.source_first, span.source_first + span.source_row_count)
+        )
+        for lane_index, lane in enumerate(lanes):
+            transfer_bytes = span.source_row_count * lane.row_bytes
+            extent = extent_resolver(layer_id, ordinals, lane.component, lane.row_bytes)
+            if int(getattr(extent, "bytes", -1)) != transfer_bytes:
+                raise RuntimeError("NVMe catalog changed source-span byte geometry")
+            destination = scratch.destination(
+                scratch_base + span.scratch_offsets[lane_index], transfer_bytes
+            )
+            slot = first_object_slot + relative
+            previous = lifetime.previous(slot)
+            bindings.append(
+                RegisteredNvmeObjectInstall(
+                    slot,
+                    object_id_base + relative,
+                    object_version,
+                    int(extent.offset),
+                    transfer_bytes,
+                    scratch.region,
+                    destination,
+                    lifetime.prior_consumer_event(slot),
+                )
+            )
+            spans_by_object.append(span)
+            previous_destinations.append(previous)
+            for selection in span.selections:
+                if selection.destination_row >= lane.destination_rows:
+                    raise RuntimeError(
+                        "NVMe span compaction exceeds its numerical destination"
+                    )
+                compaction[lane_index].append(
+                    (
+                        slot,
+                        destination
+                        + selection.source_row_offset * lane.row_stride_bytes,
+                        lane.destination_address
+                        + selection.destination_row * lane.row_stride_bytes,
+                    )
+                )
+            relative += 1
+    if relative != plan.object_count:
+        raise RuntimeError("NVMe span preparation changed object geometry")
+    return PreparedNvmeSpanPublication(
+        plan,
+        tuple(bindings),
+        tuple(spans_by_object),
+        tuple(
+            (lane.row_bytes, tuple(addresses))
+            for lane, addresses in zip(lanes, compaction, strict=True)
+        ),
+        tuple(previous_destinations),
+    )
+
+
+def publish_prepared_nvme_spans(
+    preparations: tuple[PreparedNvmeSpanPublication, ...],
+    *,
+    runtime: Any,
+    stream: Any,
+    lifetime: NvmeSlotLifetime,
+) -> tuple[NvmeSpanPublication, ...]:
+    """Commit prepared span images as one native directory transaction."""
+
+    if not preparations:
+        raise ValueError("prepared NVMe span batch cannot be empty")
+    bindings = tuple(
+        binding for preparation in preparations for binding in preparation.bindings
+    )
+    installed_addresses = publish_registered_nvme_objects(
+        bindings, runtime=runtime, stream=stream
+    )
+    publications: list[NvmeSpanPublication] = []
+    cursor = 0
+    for preparation in preparations:
+        installed = installed_addresses[cursor : cursor + preparation.object_count]
+        cursor += preparation.object_count
+        expected = tuple(
+            binding.destination_device_address for binding in preparation.bindings
+        )
+        if installed != expected:
+            raise RuntimeError("NVMe span objects do not alias their scratch views")
+        objects_by_span: dict[NvmeSourceSpan, list[NvmeObjectReference]] = {
+            span: [] for span in preparation.plan.spans
+        }
+        slot_destinations: list[tuple[int, int]] = []
+        fresh = same = rebound = quiesced = 0
+        for span, binding, previous, address in zip(
+            preparation.spans_by_object,
+            preparation.bindings,
+            preparation.previous_destinations,
+            installed,
+            strict=True,
+        ):
+            if previous is None:
+                fresh += 1
+            elif previous == address:
+                same += 1
+            else:
+                rebound += 1
+            if previous is not None:
+                quiesced += 1
+            objects_by_span[span].append(
+                NvmeObjectReference(binding.slot, binding.object_id, binding.bytes)
+            )
+            slot_destinations.append((binding.slot, address))
+        committed = tuple(slot_destinations)
+        lifetime.commit(committed)
+        publications.append(
+            NvmeSpanPublication(
+                preparation.plan,
+                tuple(
+                    (span, tuple(objects_by_span[span]))
+                    for span in preparation.plan.spans
+                ),
+                preparation.compaction_addresses,
+                committed,
+                NvmePublicationCounters(fresh, same, rebound, quiesced),
+            )
+        )
+    if cursor != len(installed_addresses):
+        raise RuntimeError("NVMe span publication result exceeds its prepared image")
     return tuple(publications)
 
 

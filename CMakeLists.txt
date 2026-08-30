@@ -35,6 +35,47 @@ set(NTA_TEST_NVME_DMA_TARGET "$ENV{NTA_NVME_DMA_TARGET}" CACHE STRING
     "NVMe DMA destination for physical CTest")
 set(NTA_TEST_NVME_HBM_BACKEND "$ENV{NTA_NVME_HBM_BACKEND}" CACHE STRING
     "Required HBM mapper for physical CTest")
+set(NTA_TEST_NVME_COMMAND_SERVICE_NS
+    "$ENV{NTA_NVME_COMMAND_SERVICE_NS}" CACHE STRING
+    "Measured effective NVMe command service for exact-granularity CTest")
+set(NTA_TEST_NVME_READ_BANDWIDTH_BPS
+    "$ENV{NTA_NVME_READ_BANDWIDTH_BPS}" CACHE STRING
+    "Measured NVMe read bandwidth for exact-granularity CTest")
+set(NTA_TEST_NVME_COMPACTION_BANDWIDTH_BPS
+    "$ENV{NTA_NVME_COMPACTION_BANDWIDTH_BPS}" CACHE STRING
+    "Measured HBM compaction bandwidth for exact-granularity CTest")
+set(NTA_TEST_NVME_COMPACTION_LAUNCH_NS
+    "$ENV{NTA_NVME_COMPACTION_LAUNCH_NS}" CACHE STRING
+    "Measured HBM compaction launch service for exact-granularity CTest")
+set(NTA_TEST_NVME_MINIMUM_GAIN "$ENV{NTA_NVME_MINIMUM_GAIN}" CACHE STRING
+    "Minimum modeled gain for exact-granularity CTest")
+set(_NTA_TEST_NVME_SERVICE_VALUE_COUNT 0)
+foreach(_value IN ITEMS
+        NTA_TEST_NVME_COMMAND_SERVICE_NS
+        NTA_TEST_NVME_READ_BANDWIDTH_BPS
+        NTA_TEST_NVME_COMPACTION_BANDWIDTH_BPS)
+  if(NOT "${${_value}}" STREQUAL "")
+    math(EXPR _NTA_TEST_NVME_SERVICE_VALUE_COUNT
+         "${_NTA_TEST_NVME_SERVICE_VALUE_COUNT} + 1")
+  endif()
+endforeach()
+if(NOT _NTA_TEST_NVME_SERVICE_VALUE_COUNT EQUAL 0 AND
+   NOT _NTA_TEST_NVME_SERVICE_VALUE_COUNT EQUAL 3)
+  message(FATAL_ERROR
+    "physical NVMe granularity CTest requires command, read-bandwidth, and "
+    "compaction-bandwidth measurements together")
+endif()
+if(_NTA_TEST_NVME_SERVICE_VALUE_COUNT EQUAL 3)
+  set(NTA_TEST_NVME_SERVICE_CALIBRATED TRUE)
+  if(NOT NTA_TEST_NVME_COMPACTION_LAUNCH_NS)
+    set(NTA_TEST_NVME_COMPACTION_LAUNCH_NS "0")
+  endif()
+  if(NOT NTA_TEST_NVME_MINIMUM_GAIN)
+    set(NTA_TEST_NVME_MINIMUM_GAIN "1.03")
+  endif()
+else()
+  set(NTA_TEST_NVME_SERVICE_CALIBRATED FALSE)
+endif()
 if(NOT NTA_TEST_NVME_HBM_BACKEND)
   set(NTA_TEST_NVME_HBM_BACKEND "auto" CACHE STRING
       "Required HBM mapper for physical CTest" FORCE)
@@ -60,6 +101,18 @@ set_property(CACHE NTA_TEST_NVME_USE_SUDO PROPERTY STRINGS OFF ON)
 if(NOT NTA_TEST_NVME_USE_SUDO STREQUAL "OFF" AND
    NOT NTA_TEST_NVME_USE_SUDO STREQUAL "ON")
   message(FATAL_ERROR "NTA_TEST_NVME_USE_SUDO must be OFF or ON")
+endif()
+set(NTA_TEST_NVME_MANAGE_SESSION "OFF" CACHE STRING
+    "Keep the explicit NVMe endpoint on VFIO across physical CTests (OFF or ON)")
+set_property(CACHE NTA_TEST_NVME_MANAGE_SESSION PROPERTY STRINGS OFF ON)
+if(NOT NTA_TEST_NVME_MANAGE_SESSION STREQUAL "OFF" AND
+   NOT NTA_TEST_NVME_MANAGE_SESSION STREQUAL "ON")
+  message(FATAL_ERROR "NTA_TEST_NVME_MANAGE_SESSION must be OFF or ON")
+endif()
+if(NTA_TEST_NVME_MANAGE_SESSION STREQUAL "ON" AND
+   NOT NTA_TEST_NVME_USE_SUDO STREQUAL "ON")
+  message(FATAL_ERROR
+    "NTA_TEST_NVME_MANAGE_SESSION=ON requires NTA_TEST_NVME_USE_SUDO=ON")
 endif()
 if(NTA_TEST_NVME_REFERENCE AND
    NOT EXISTS "${NTA_TEST_NVME_REFERENCE}")
@@ -104,6 +157,7 @@ if(NTA_TEST_NVME_ENDPOINT)
   list(APPEND NTA_TEST_NVME_PROBE_ARGUMENTS
        "${NTA_TEST_NVME_HBM_BACKEND}")
 endif()
+set(NTA_TEST_NVME_PRIVILEGED_PREFIX)
 set(NTA_TEST_NVME_COMMAND_PREFIX)
 if(NTA_TEST_NVME_USE_SUDO STREQUAL "ON")
   if(NOT NTA_TEST_NVME_ENDPOINT)
@@ -115,9 +169,25 @@ if(NTA_TEST_NVME_USE_SUDO STREQUAL "ON")
   # env_reset intentionally removes those variables. Pass the explicit test
   # contract through ``env`` so the privileged child receives exactly the
   # configured endpoint/policy, without relying on a broad sudo -E.
-  list(APPEND NTA_TEST_NVME_COMMAND_PREFIX
+  list(APPEND NTA_TEST_NVME_PRIVILEGED_PREFIX
        "${NTA_SUDO_EXECUTABLE}" "-n" "env")
-  list(APPEND NTA_TEST_NVME_COMMAND_PREFIX ${NTA_TEST_NVME_ENVIRONMENT})
+  list(APPEND NTA_TEST_NVME_PRIVILEGED_PREFIX
+       ${NTA_TEST_NVME_ENVIRONMENT})
+  set(NTA_TEST_NVME_COMMAND_PREFIX ${NTA_TEST_NVME_PRIVILEGED_PREFIX})
+  if(NTA_TEST_NVME_MANAGE_SESSION STREQUAL "ON")
+    if(NOT NTA_TEST_NVME_ENDPOINT MATCHES
+       "^vfio:[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]\\.[0-7]$")
+      message(FATAL_ERROR
+        "managed physical NVMe CTests require vfio:DDDD:BB:SS.F")
+    endif()
+    string(REGEX REPLACE "^vfio:" "" NTA_TEST_NVME_BDF
+           "${NTA_TEST_NVME_ENDPOINT}")
+    list(APPEND NTA_TEST_NVME_COMMAND_PREFIX
+      "NTA_ALLOW_DEVICE_REBIND=1"
+      "NTA_NVME_BDF=${NTA_TEST_NVME_BDF}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/nta-vfio-device.sh"
+      "run" "--")
+  endif()
 endif()
 
 find_package(LLVM REQUIRED CONFIG)
@@ -177,6 +247,39 @@ elseif(UNIX)
 endif()
 
 enable_testing()
+
+if(NTA_TEST_NVME_MANAGE_SESSION STREQUAL "ON")
+  add_test(
+    NAME nta-nvme-session-start
+    COMMAND ${NTA_TEST_NVME_PRIVILEGED_PREFIX}
+      "NTA_ALLOW_DEVICE_REBIND=1"
+      "NTA_NVME_BDF=${NTA_TEST_NVME_BDF}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/nta-vfio-device.sh"
+      session-start
+  )
+  add_test(
+    NAME nta-nvme-session-stop
+    COMMAND ${NTA_TEST_NVME_PRIVILEGED_PREFIX}
+      "NTA_NVME_BDF=${NTA_TEST_NVME_BDF}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/nta-vfio-device.sh"
+      session-stop
+  )
+  set_tests_properties(
+    nta-nvme-session-start PROPERTIES
+      FIXTURES_SETUP nta_nvme_session
+      LABELS "physical;nvme;safety"
+      RESOURCE_LOCK nta_nvme_physical
+      TIMEOUT 30
+  )
+  set_tests_properties(
+    nta-nvme-session-stop PROPERTIES
+      FIXTURES_CLEANUP nta_nvme_session
+      LABELS "physical;nvme;safety"
+      RESOURCE_LOCK nta_nvme_physical
+      TIMEOUT 30
+      PASS_REGULAR_EXPRESSION "zero_write=pass"
+  )
+endif()
 
 add_library(nta-work-plan STATIC
   runtime/host/WorkPlan.cpp
@@ -1036,6 +1139,51 @@ if(NTA_ENABLE_CUDA)
     )
     set_tests_properties(nta-transport-program-standalone-load
                          PROPERTIES TIMEOUT 30)
+    add_test(
+      NAME nta-hbm-compaction-gpu
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/hbm_compaction.py
+              "${NTA_TRANSPORT_PROGRAM}"
+    )
+    set_tests_properties(
+      nta-hbm-compaction-gpu PROPERTIES
+      ENVIRONMENT
+        "NTA_RUNTIME_LIBRARY=$<TARGET_FILE:nta-runtime>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+      LABELS "correctness;nvme;gpu"
+      TIMEOUT 30
+    )
+    add_test(
+      NAME nta-hbm-compaction-calibration-gpu
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/nvme/HbmCompactionCalibration.py
+              "${NTA_TRANSPORT_PROGRAM}"
+              --pool-mib=256
+              --trials=11
+              --output=${CMAKE_CURRENT_BINARY_DIR}/physical-results/profiling/hbm-compaction-calibration-smoke.json
+    )
+    set_tests_properties(
+      nta-hbm-compaction-calibration-gpu PROPERTIES
+      ENVIRONMENT
+        "NTA_RUNTIME_LIBRARY=$<TARGET_FILE:nta-runtime>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}"
+      LABELS "performance;calibration;nvme;gpu"
+      PASS_REGULAR_EXPRESSION "nta-hbm-compaction-calibration"
+      RUN_SERIAL TRUE
+      TIMEOUT 30
+    )
+    add_test(
+      NAME nta-ready-object-gate-gpu
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/ready_object_gate.py
+              "${NTA_TRANSPORT_PROGRAM}"
+    )
+    set_tests_properties(
+      nta-ready-object-gate-gpu PROPERTIES
+      ENVIRONMENT
+        "NTA_RUNTIME_LIBRARY=$<TARGET_FILE:nta-runtime>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+      LABELS "correctness;nvme;gpu"
+      RUN_SERIAL TRUE
+      TIMEOUT 30
+    )
   endif()
   add_executable(nta-jit-operator-load tests/runtime/JitOperatorLoad.cpp)
   target_link_libraries(nta-jit-operator-load PRIVATE nta-runtime-host)
@@ -1268,6 +1416,62 @@ if(Python3_Interpreter_FOUND)
         LABELS "physical;performance;nvme;sglang;pipeline"
         ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
       )
+      if(NTA_TEST_NVME_SERVICE_CALIBRATED)
+        add_test(
+          NAME nta-sglang-nvme-granularity-sparse-performance
+          COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
+            --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+            --cache-root ${NTA_TEST_JIT_CACHE_ROOT}
+            --clang ${NTA_CLANG_CUDA}
+            --cuda-path ${NTA_CUDA_ROOT}
+            --
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/nvme/SglangPipelinePublication.py
+            --warmup=1
+            --trials=3
+            --source-stride=2
+            --command-service-ns=${NTA_TEST_NVME_COMMAND_SERVICE_NS}
+            --read-bandwidth-bps=${NTA_TEST_NVME_READ_BANDWIDTH_BPS}
+            --compaction-bandwidth-bps=${NTA_TEST_NVME_COMPACTION_BANDWIDTH_BPS}
+            --compaction-launch-ns=${NTA_TEST_NVME_COMPACTION_LAUNCH_NS}
+            --minimum-granularity-gain=${NTA_TEST_NVME_MINIMUM_GAIN}
+            --minimum-granularity-wall-speedup=2.0
+            --output=${CMAKE_CURRENT_BINARY_DIR}/physical-results/profiling/sglang-nvme-granularity-sparse.json
+        )
+        add_test(
+          NAME nta-sglang-nvme-granularity-dense-no-regression
+          COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/jit/activate.py
+            --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+            --cache-root ${NTA_TEST_JIT_CACHE_ROOT}
+            --clang ${NTA_CLANG_CUDA}
+            --cuda-path ${NTA_CUDA_ROOT}
+            --
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/nvme/SglangPipelinePublication.py
+            --warmup=2
+            --trials=7
+            --source-stride=1
+            --command-service-ns=${NTA_TEST_NVME_COMMAND_SERVICE_NS}
+            --read-bandwidth-bps=${NTA_TEST_NVME_READ_BANDWIDTH_BPS}
+            --compaction-bandwidth-bps=${NTA_TEST_NVME_COMPACTION_BANDWIDTH_BPS}
+            --compaction-launch-ns=${NTA_TEST_NVME_COMPACTION_LAUNCH_NS}
+            --minimum-granularity-gain=${NTA_TEST_NVME_MINIMUM_GAIN}
+            --minimum-granularity-wall-speedup=0.97
+            --output=${CMAKE_CURRENT_BINARY_DIR}/physical-results/profiling/sglang-nvme-granularity-dense.json
+        )
+        set_tests_properties(
+          nta-sglang-nvme-granularity-sparse-performance
+          nta-sglang-nvme-granularity-dense-no-regression
+          PROPERTIES
+            RUN_SERIAL TRUE TIMEOUT 300 RESOURCE_LOCK nta_nvme_physical
+            LABELS "physical;performance;nvme;sglang;pipeline;granularity"
+            ENVIRONMENT "${NTA_TEST_NVME_ENVIRONMENT}"
+        )
+      endif()
       add_test(
         NAME nta-flashinfer-nvme-numerical
         COMMAND ${NTA_TEST_NVME_COMMAND_PREFIX}
@@ -2154,6 +2358,24 @@ if(Python3_Interpreter_FOUND)
         "host_transfer_initiator.*gpu.*output_parity.*true"
     )
   endif()
+endif()
+
+if(NTA_TEST_NVME_MANAGE_SESSION STREQUAL "ON")
+  foreach(_test IN ITEMS
+          nta-sglang-nvme-physical
+          nta-sglang-nvme-publication-performance
+          nta-sglang-nvme-granularity-sparse-performance
+          nta-sglang-nvme-granularity-dense-no-regression
+          nta-flashinfer-nvme-numerical
+          nta-nvme-external-hbm-offset-gpu
+          nta-vfio-nvme-probe
+          nta-paged-attention-nvme-gpu)
+    if(TEST ${_test})
+      set_property(
+        TEST ${_test} APPEND PROPERTY FIXTURES_REQUIRED nta_nvme_session
+      )
+    endif()
+  endforeach()
 endif()
 
 add_custom_target(

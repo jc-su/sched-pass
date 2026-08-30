@@ -222,6 +222,28 @@ def main() -> None:
         ServingTierConfig.from_environment(nvme_environment).nvme_hbm_backend
         is NvmeHbmBackendRequirement.CUDA_DMA_BUF_IOAS
     )
+    calibrated = ServingTierConfig.from_environment(
+        {
+            **nvme_environment,
+            "NTA_NVME_COMMAND_SERVICE_NS": "13000",
+            "NTA_NVME_READ_BANDWIDTH_BPS": "6700000000",
+            "NTA_NVME_COMPACTION_BANDWIDTH_BPS": "600000000000",
+            "NTA_NVME_COMPACTION_LAUNCH_NS": "20000",
+            "NTA_NVME_MINIMUM_GAIN": "1.05",
+        }
+    ).nvme_service_model
+    assert calibrated.calibrated
+    assert calibrated.command_service_ns == 13_000
+    assert calibrated.compaction_launch_ns == 20_000
+    assert calibrated.minimum_gain == 1.05
+    try:
+        ServingTierConfig.from_environment(
+            {**nvme_environment, "NTA_NVME_COMMAND_SERVICE_NS": "13000"}
+        )
+    except ValueError as error:
+        assert "requires command" in str(error)
+    else:
+        raise AssertionError("a partial NVMe service calibration was accepted")
     _require_nvme_hbm_backend(
         NvmeHbmBackendRequirement.AUTO, "nvidia-peer-pages"
     )

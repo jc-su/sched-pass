@@ -48,6 +48,14 @@ def main() -> None:
     assert 'chmod 0444 "$temporary"' in vfio_script
     assert 'mv -f "$temporary" "$reference"' in vfio_script
     assert "wait_for_nvme_namespace" in vfio_script
+    assert "wait_for_namespace_partitions" in vfio_script
+    assert 'partx --show --noheadings --output NR "$block_device"' in vfio_script
+    safe_device_begin = vfio_script.index("require_safe_device()")
+    containment_begin = vfio_script.index("require_containment()", safe_device_begin)
+    safe_device = vfio_script[safe_device_begin:containment_begin]
+    assert safe_device.index("wait_for_namespace_partitions") < safe_device.index(
+        'check_block_device "$block"'
+    )
     assert "returned to the nvme driver but no live namespace appeared" in vfio_script
     assert "not a valid byte oracle for the raw namespace" in vfio_script
     assert "wait_for_driver nvme" in vfio_script
@@ -56,6 +64,26 @@ def main() -> None:
     assert vfio_script.index("wait_for_driver nvme") < vfio_script.index(
         "capture_reference", vfio_script.index("bind_vfio()")
     )
+    bind_begin = vfio_script.index("bind_vfio()")
+    case_begin = vfio_script.index("case ${1:-status}", bind_begin)
+    bind_body = vfio_script[bind_begin:case_begin]
+    capture_index = bind_body.index("capture_reference")
+    assert bind_body.index("require_safe_device", capture_index) > capture_index
+    assert "run)" in vfio_script
+    run_begin = vfio_script.index("run)")
+    restore_begin = vfio_script.index("restore)", run_begin)
+    run_body = vfio_script[run_begin:restore_begin]
+    assert "require_rebind_confirmation" in run_body
+    assert "validate_session" in run_body
+    assert '[[ -r $state ]]' in run_body
+    assert "bind_vfio" not in run_body
+    assert 'exec "$@"' in run_body
+    assert "smart_write_counters" in vfio_script
+    assert '"data_units_written"' in vfio_script
+    assert '"host_write_commands"' in vfio_script
+    assert "zero-write gate failed" in vfio_script
+    assert "session-start)" in vfio_script
+    assert "session-stop)" in vfio_script
     assert "driver_override is only a transactional bind aid" in vfio_script
     runtime = (ROOT / "runtime" / "host" / "NvmeRuntime.cpp").read_text(
         encoding="utf-8"
@@ -229,6 +257,14 @@ def main() -> None:
     assert "${NTA_TEST_NVME_ENVIRONMENT}" in preflight
     assert "NTA_TEST_NVME_HBM_BACKEND" in cmake
     assert "--hbm-backend=${NTA_TEST_NVME_HBM_BACKEND}" in cmake
+    assert 'set(NTA_TEST_NVME_MANAGE_SESSION "OFF"' in cmake
+    assert "NTA_TEST_NVME_MANAGE_SESSION=ON requires" in cmake
+    assert '"NTA_ALLOW_DEVICE_REBIND=1"' in cmake
+    assert '"run" "--"' in cmake
+    assert "FIXTURES_SETUP nta_nvme_session" in cmake
+    assert "FIXTURES_CLEANUP nta_nvme_session" in cmake
+    assert "FIXTURES_REQUIRED nta_nvme_session" in cmake
+    assert 'PASS_REGULAR_EXPRESSION "zero_write=pass"' in cmake
     control_plane = (ROOT / "runtime" / "host" / "NvmeVfioControlPlane.cpp").read_text(
         encoding="utf-8"
     )

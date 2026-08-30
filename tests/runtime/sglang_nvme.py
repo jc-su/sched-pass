@@ -1,8 +1,12 @@
 from types import SimpleNamespace
 
-from nta_runtime.engines.sglang_nvme import (
+from nta_runtime.engines.sglang_nvme_planning import (
     plan_nvme_batch_geometry,
     plan_nvme_window_layer_capacity,
+)
+from nta_runtime.nvme_granularity import (
+    NvmeGranularity,
+    NvmeTransferServiceModel,
 )
 from nta_runtime.requests import RequestBinding
 
@@ -90,6 +94,55 @@ def test_nonphysical_semantics_fail_closed() -> None:
         raise AssertionError("nonphysical NVMe semantics were accepted")
 
 
+def test_measured_service_cost_selects_exact_span_compaction() -> None:
+    sparse = (tuple(range(0, 32, 2)), tuple(range(16)))
+    sparse_semantic = SimpleNamespace(
+        dependency_kind="physical_pages",
+        schedule=SimpleNamespace(request_indices=(0, 1)),
+        page_pairs=(sparse, sparse),
+    )
+    model = NvmeTransferServiceModel(
+        command_service_ns=20_000,
+        read_bandwidth_bytes_per_second=6_000_000_000,
+        compaction_bandwidth_bytes_per_second=600_000_000_000,
+        compaction_launch_ns=10_000,
+    )
+    planned = plan_nvme_batch_geometry(
+        semantic_plans={7: sparse_semantic},
+        bindings=(
+            RequestBinding(0, 3, 11, 101, deadline_clock=900, tenant_id=4),
+            RequestBinding(1, 8, 17, 202, deadline_clock=500, tenant_id=4),
+        ),
+        row_bytes=(4096, 4096),
+        lba_size=4096,
+        max_transfer_bytes=2 * 1024 * 1024,
+        object_capacity=64,
+        work_ticket_capacity=64,
+        tenant_isolation=False,
+        service_model=model,
+        scratch_capacity_bytes=1 << 20,
+        scratch_alignment=4096,
+    )
+    assert planned.granularity is NvmeGranularity.SPAN_COMPACT
+    assert planned.granularity_reason == "service_cost"
+    assert planned.object_count == 2
+    assert planned.work_item_count == 2
+    assert planned.logical_transfer_bytes == 16 * 8192
+    assert planned.scoped_exact_transfer_bytes == planned.logical_transfer_bytes
+    assert planned.unique_source_transfer_bytes == planned.logical_transfer_bytes
+    assert planned.physical_transfer_bytes == 31 * 8192
+    assert planned.scratch_bytes_per_layer == planned.physical_transfer_bytes
+    assert planned.selected_predicted_ns < planned.direct_predicted_ns
+
+
+def test_uncalibrated_geometry_never_selects_span_optimistically() -> None:
+    planned = geometry(isolated=False)
+    assert planned.granularity is NvmeGranularity.DIRECT
+    assert planned.granularity_reason == "uncalibrated"
+    assert planned.scratch_bytes_per_layer == 0
+    assert planned.physical_transfer_bytes >= planned.unique_source_transfer_bytes
+
+
 def test_window_planner_reaches_refill_steady_state() -> None:
     assert (
         plan_nvme_window_layer_capacity(
@@ -138,6 +191,8 @@ def main() -> None:
     test_isolated_geometry_fails_before_partial_publication()
     test_fanout_ticket_capacity_fails_before_publication()
     test_nonphysical_semantics_fail_closed()
+    test_measured_service_cost_selects_exact_span_compaction()
+    test_uncalibrated_geometry_never_selects_span_optimistically()
     test_window_planner_reaches_refill_steady_state()
     print("sglang_nvme=pass")
 

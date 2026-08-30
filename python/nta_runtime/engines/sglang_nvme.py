@@ -22,16 +22,23 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import time
 from typing import Any
 
 import torch
 
-from nta_runtime.engines.sglang_contracts import PagePair
 from nta_runtime.engines.sglang_acquisition_contract import (
     AcquisitionConsumerPlan,
     AcquisitionTier,
     SglangForwardAcquisition,
     SglangLayerAcquisition,
+)
+from nta_runtime.engines.sglang_nvme_planning import (
+    NvmeAcquisitionGroupPlan,
+    NvmeBatchGeometry,
+    NvmeScopedMaterializationPlan,
+    plan_nvme_batch_geometry,
+    plan_nvme_window_layer_capacity,
 )
 from nta_runtime.execution_topology import (
     ExactWorkTopology,
@@ -41,14 +48,24 @@ from nta_runtime.execution_topology import (
 from nta_runtime.flashinfer import object_requirement
 from nta_runtime.indexed_transfer import ContiguousPairRun
 from nta_runtime.nvme_materialization import (
+    NvmeScratchArena,
     NvmeRunPlan,
     NvmeRunPublication,
+    NvmeSpanPublication,
     NvmeSlotLifetime,
     NvmeTensorLane,
     PreparedNvmeRunPublication,
-    plan_nvme_runs,
+    PreparedNvmeSpanPublication,
     prepare_nvme_runs,
+    prepare_nvme_spans,
     publish_prepared_nvme_runs,
+    publish_prepared_nvme_spans,
+)
+from nta_runtime.nvme_granularity import (
+    NvmeGranularity,
+    NvmeSourceSpan,
+    NvmeSpanPlan,
+    NvmeTransferServiceModel,
 )
 from nta_runtime.requests import RequestBinding
 from nta_runtime.runtime import DeviceWorkPlan, JitPhaseProgram, Runtime
@@ -66,66 +83,9 @@ class NvmeAcquisitionGroupKey:
     tenant_id: int
     layer_id: int
     source_first: int
-    destination_first: int
+    destination_first: int | None
     row_count: int
     resource_version: int
-
-
-@dataclass(frozen=True, slots=True)
-class _ScopedRunPlan:
-    """Runs deduplicated within one accounting/isolation scope."""
-
-    tenant_id: int | None
-    plan: NvmeRunPlan
-    consumers: Mapping[PagePair, tuple[int, ...]]
-
-
-@dataclass(frozen=True, slots=True)
-class NvmeBatchGeometry:
-    """Layer-invariant exact source/destination geometry for one forward."""
-
-    scopes: tuple[_ScopedRunPlan, ...]
-    row_bytes: tuple[int, int]
-    object_count: int
-    work_item_count: int
-    logical_transfer_bytes: int
-
-
-def plan_nvme_window_layer_capacity(
-    *,
-    layer_count: int,
-    objects_per_layer: int,
-    capacity_layer_limit: int,
-    queue_depth: int,
-    explicit_limit: int | None = None,
-) -> int:
-    """Size one producer window from queue geometry, not a device threshold.
-
-    One queue residency only measures fill and drain. Two usable queue depths
-    permit completion-driven refill and therefore reach the steady-state data
-    path; one additional layer keeps useful producer work available while the
-    next compact descriptor image is enqueued. Capacity and model bounds remain
-    hard limits. An explicit limit exists only for mechanism-envelope tests.
-    """
-
-    if min(layer_count, objects_per_layer, capacity_layer_limit, queue_depth) <= 0:
-        raise ValueError("NVMe window planning requires positive resource geometry")
-    if explicit_limit is not None and (
-        explicit_limit <= 0 or explicit_limit > layer_count
-    ):
-        raise ValueError("NVMe acquisition window limit exceeds model layers")
-    if explicit_limit is not None:
-        return min(capacity_layer_limit, layer_count, explicit_limit)
-    usable_queue_entries = max(1, queue_depth - 1)
-    refill_layers = (
-        2 * usable_queue_entries + objects_per_layer - 1
-    ) // objects_per_layer
-    producer_lookahead = 1 if refill_layers < layer_count else 0
-    return min(
-        capacity_layer_limit,
-        layer_count,
-        refill_layers + producer_lookahead,
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +112,7 @@ class NvmeBatchAcquisition:
     acquisition_id: int
     layers: tuple[NvmeLayerAcquisition, ...]
     window_count: int
+    compaction_images: tuple[_CompactionImage, ...] = ()
 
     def layer(self, local_layer: int) -> NvmeLayerAcquisition:
         if local_layer < 0 or local_layer >= len(self.layers):
@@ -170,10 +131,12 @@ class _TransportPlanAllocation:
 
 
 @dataclass(frozen=True, slots=True)
-class _PublishedRun:
+class _PublishedGroup:
     """One physical K/V transfer group and all generation-bound consumers."""
 
-    run: ContiguousPairRun
+    source_first: int
+    destination_first: int | None
+    row_count: int
     objects: tuple[Any, ...]
     consumers: tuple[RequestBinding, ...]
 
@@ -186,7 +149,7 @@ class _PublishedLayer:
     layer_id: int
     version: int
     first_object_slot: int
-    groups: tuple[_PublishedRun, ...]
+    groups: tuple[_PublishedGroup, ...]
     transfer_bytes: int
 
     @property
@@ -196,8 +159,22 @@ class _PublishedLayer:
 
 @dataclass(frozen=True, slots=True)
 class _PreparedScope:
-    scope: _ScopedRunPlan
-    publication: PreparedNvmeRunPublication
+    scope: NvmeScopedMaterializationPlan
+    publication: PreparedNvmeRunPublication | PreparedNvmeSpanPublication
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactionLaunch:
+    local_layer: int
+    address_offset: int
+    row_count: int
+    row_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CompactionImage:
+    rows: torch.Tensor
+    launches: tuple[_CompactionLaunch, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,125 +200,6 @@ def _deadline_key(binding: RequestBinding) -> tuple[int, int, int, int]:
     )
 
 
-def plan_nvme_batch_geometry(
-    *,
-    semantic_plans: Mapping[int, Any],
-    bindings: tuple[RequestBinding, ...],
-    row_bytes: tuple[int, int],
-    lba_size: int,
-    max_transfer_bytes: int,
-    object_capacity: int,
-    work_ticket_capacity: int,
-    tenant_isolation: bool,
-) -> NvmeBatchGeometry:
-    """Factor exact numerical demand into shared transport acquisition groups.
-
-    Without tenant isolation, identical runs are transferred once across the
-    batch.  With isolation, deduplication is scoped to a tenant: this prevents
-    one tenant from consuming another tenant's finite byte budget.  Cross-
-    tenant sharing may therefore duplicate physical bytes, an explicit and
-    conservative isolation cost rather than nondeterministic first-CTA
-    charging.
-    """
-
-    if (
-        not semantic_plans
-        or not bindings
-        or len(row_bytes) != 2
-        or min(row_bytes) <= 0
-        or min(lba_size, max_transfer_bytes, object_capacity, work_ticket_capacity) <= 0
-    ):
-        raise ValueError("NVMe batch geometry requires non-empty bounded inputs")
-    binding_by_index = {binding.request_index: binding for binding in bindings}
-    if len(binding_by_index) != len(bindings):
-        raise ValueError("NVMe request bindings repeat an engine request index")
-
-    pair_consumers: dict[PagePair, set[int]] = defaultdict(set)
-    for semantic in semantic_plans.values():
-        if getattr(semantic, "dependency_kind", None) != "physical_pages":
-            raise RuntimeError("NVMe acquisition requires physical-page semantics")
-        schedule = semantic.schedule
-        if len(schedule.request_indices) != len(semantic.page_pairs):
-            raise RuntimeError("NVMe schedule and physical-page demand disagree")
-        for request_index, pair in zip(
-            schedule.request_indices, semantic.page_pairs, strict=True
-        ):
-            if request_index not in binding_by_index:
-                raise RuntimeError("NVMe work references an unbound request")
-            if pair[0]:
-                if len(pair[0]) != len(pair[1]):
-                    raise RuntimeError("NVMe source/destination pair is malformed")
-                pair_consumers[pair].add(int(request_index))
-    if not pair_consumers:
-        raise RuntimeError("NVMe external batch contains no physical demand")
-
-    scoped_pairs: dict[int | None, dict[PagePair, set[int]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
-    for pair, consumers in pair_consumers.items():
-        if tenant_isolation:
-            for request_index in consumers:
-                tenant = binding_by_index[request_index].tenant_id
-                scoped_pairs[tenant][pair].add(request_index)
-        else:
-            scoped_pairs[None][pair].update(consumers)
-
-    scopes: list[_ScopedRunPlan] = []
-    total_objects = 0
-    total_work_items = 0
-    physical_bytes = 0
-    for tenant_id in sorted(
-        scoped_pairs, key=lambda value: -1 if value is None else value
-    ):
-        consumers = scoped_pairs[tenant_id]
-        plan = plan_nvme_runs(
-            consumers,
-            lane_element_bytes=row_bytes,
-            lba_size=lba_size,
-            max_transfer_bytes=max_transfer_bytes,
-            object_capacity=object_capacity,
-        )
-        total_objects += plan.object_count
-        run_consumers: dict[ContiguousPairRun, set[int]] = defaultdict(set)
-        for pair, indices in consumers.items():
-            for run in plan.runs_for(pair):
-                run_consumers[run].update(indices)
-        if any(not run_consumers[run] for run in plan.unique_runs):
-            raise RuntimeError("NVMe run planning produced an unowned transfer group")
-        total_work_items += sum(len(run_consumers[run]) for run in plan.unique_runs)
-        physical_bytes += sum(
-            run.row_count * sum(row_bytes) for run in plan.unique_runs
-        )
-        scopes.append(
-            _ScopedRunPlan(
-                tenant_id,
-                plan,
-                {pair: tuple(sorted(indices)) for pair, indices in consumers.items()},
-            )
-        )
-    if total_objects > object_capacity:
-        raise RuntimeError(
-            "NVMe forward needs more concurrent acquisition objects than the "
-            "runtime directory; increase NTA_RUNTIME_MAX_WORK_TICKETS"
-        )
-    if total_work_items > work_ticket_capacity:
-        raise RuntimeError(
-            "NVMe forward needs more generation-bound work items than the runtime "
-            "ticket directory; increase NTA_RUNTIME_MAX_WORK_TICKETS"
-        )
-    logical_runs = {run for scope in scopes for run in scope.plan.unique_runs}
-    logical_bytes = sum(run.row_count * sum(row_bytes) for run in logical_runs)
-    if physical_bytes < logical_bytes:
-        raise RuntimeError("NVMe isolation accounting undercounted physical bytes")
-    return NvmeBatchGeometry(
-        tuple(scopes),
-        tuple(row_bytes),
-        total_objects,
-        total_work_items,
-        logical_bytes,
-    )
-
-
 class SglangNvmeAcquisitionPipeline:
     """Own proactive cross-layer NVMe transport and its CUDA event frontier."""
 
@@ -358,6 +216,7 @@ class SglangNvmeAcquisitionPipeline:
         work_ticket_capacity: int,
         tenant_isolation: bool,
         regions: Mapping[tuple[int, str], Any],
+        scratch: NvmeScratchArena | None = None,
         stats: dict[str, Any],
         window_layer_limit: int | None = None,
     ) -> None:
@@ -385,6 +244,18 @@ class SglangNvmeAcquisitionPipeline:
         self._intent_capacity = int(runtime.config.intent_capacity)
         self._tenant_isolation = tenant_isolation
         self._regions = dict(regions)
+        self._scratch = scratch
+        configured_model = getattr(
+            self._tier_service.config, "nvme_service_model", None
+        )
+        self._service_model = (
+            configured_model
+            if isinstance(configured_model, NvmeTransferServiceModel)
+            else NvmeTransferServiceModel()
+        )
+        self._scratch_alignment = int(
+            getattr(self._tier_service, "nvme_controller_page_size", 4096)
+        )
         self._stats = stats
         self._window_layer_limit = window_layer_limit
         self._slot_lifetime = NvmeSlotLifetime(torch.cuda.Event())
@@ -448,6 +319,35 @@ class SglangNvmeAcquisitionPipeline:
         )
         return plan
 
+    @staticmethod
+    def _bind_group_consumers(
+        geometry: NvmeBatchGeometry,
+        bindings: tuple[RequestBinding, ...],
+    ) -> Mapping[NvmeAcquisitionGroupPlan, tuple[RequestBinding, ...]]:
+        binding_by_index = {binding.request_index: binding for binding in bindings}
+        if len(binding_by_index) != len(bindings):
+            raise RuntimeError("NVMe forward repeats an engine request index")
+        result: dict[NvmeAcquisitionGroupPlan, tuple[RequestBinding, ...]] = {}
+        for scope in geometry.scopes:
+            for group_plan in scope.groups:
+                consumers = tuple(
+                    sorted(
+                        (
+                            binding_by_index[index]
+                            for index in group_plan.consumer_indices
+                        ),
+                        key=_deadline_key,
+                    )
+                )
+                if not consumers:
+                    raise RuntimeError("NVMe acquisition group has no live consumer")
+                if scope.tenant_id is not None and any(
+                    consumer.tenant_id != scope.tenant_id for consumer in consumers
+                ):
+                    raise RuntimeError("NVMe acquisition escaped its tenant scope")
+                result[group_plan] = consumers
+        return result
+
     def _prepare_layer(
         self,
         *,
@@ -457,6 +357,7 @@ class SglangNvmeAcquisitionPipeline:
         kv_cache: tuple[torch.Tensor, torch.Tensor],
         version: int,
         first_object_slot: int,
+        scratch_base: int,
     ) -> _PreparedLayer:
         key_cache, value_cache = kv_cache
         if not key_cache.is_cuda or not value_cache.is_cuda:
@@ -482,16 +383,36 @@ class SglangNvmeAcquisitionPipeline:
         prepared: list[_PreparedScope] = []
         first_slot = first_object_slot
         for scope in geometry.scopes:
-            publication = prepare_nvme_runs(
-                scope.plan,
-                lanes,
-                extent_resolver=self._tier_service.extent,
-                layer_id=layer_id,
-                object_version=version,
-                object_id_base=_OBJECT_ID_BASE + first_slot,
-                first_object_slot=first_slot,
-                lifetime=self._slot_lifetime,
-            )
+            if geometry.granularity is NvmeGranularity.DIRECT:
+                if not isinstance(scope.plan, NvmeRunPlan):
+                    raise RuntimeError("direct materialization lost its run plan")
+                publication = prepare_nvme_runs(
+                    scope.plan,
+                    lanes,
+                    extent_resolver=self._tier_service.extent,
+                    layer_id=layer_id,
+                    object_version=version,
+                    object_id_base=_OBJECT_ID_BASE + first_slot,
+                    first_object_slot=first_slot,
+                    lifetime=self._slot_lifetime,
+                )
+            else:
+                if self._scratch is None or not isinstance(scope.plan, NvmeSpanPlan):
+                    raise RuntimeError(
+                        "span materialization lost its registered scratch owner"
+                    )
+                publication = prepare_nvme_spans(
+                    scope.plan,
+                    lanes,
+                    scratch=self._scratch,
+                    scratch_base=scratch_base + scope.span_scratch_offset,
+                    extent_resolver=self._tier_service.extent,
+                    layer_id=layer_id,
+                    object_version=version,
+                    object_id_base=_OBJECT_ID_BASE + first_slot,
+                    first_object_slot=first_slot,
+                    lifetime=self._slot_lifetime,
+                )
             prepared.append(_PreparedScope(scope, publication))
             first_slot += publication.object_count
         if first_slot != first_object_slot + geometry.object_count:
@@ -508,14 +429,15 @@ class SglangNvmeAcquisitionPipeline:
         self,
         *,
         geometry: NvmeBatchGeometry,
-        bindings: tuple[RequestBinding, ...],
+        bound_consumers: Mapping[
+            NvmeAcquisitionGroupPlan, tuple[RequestBinding, ...]
+        ],
         prepared: _PreparedLayer,
-        publications: tuple[NvmeRunPublication, ...],
+        publications: tuple[NvmeRunPublication | NvmeSpanPublication, ...],
     ) -> _PublishedLayer:
         if len(publications) != len(prepared.scopes):
             raise RuntimeError("NVMe layer publication changed its scope count")
-        binding_by_index = {binding.request_index: binding for binding in bindings}
-        groups: list[_PublishedRun] = []
+        groups: list[_PublishedGroup] = []
         transfer_bytes = 0
         for prepared_scope, publication in zip(
             prepared.scopes, publications, strict=True
@@ -535,34 +457,42 @@ class SglangNvmeAcquisitionPipeline:
                 ),
             ):
                 self._stats[name] = self._stats.get(name, 0) + value
-            by_run = dict(publication.objects_by_run)
-            run_consumers: dict[ContiguousPairRun, set[int]] = defaultdict(set)
-            for pair, consumers in scope.consumers.items():
-                for run in scope.plan.runs_for(pair):
-                    run_consumers[run].update(consumers)
-            for run in scope.plan.unique_runs:
-                consumer_indices = run_consumers[run]
+            if geometry.granularity is NvmeGranularity.DIRECT:
+                if not isinstance(publication, NvmeRunPublication):
+                    raise RuntimeError("direct NVMe scope published a source span")
+            else:
+                if not isinstance(publication, NvmeSpanPublication):
+                    raise RuntimeError("span NVMe scope published a direct run")
+            for group_plan in scope.groups:
                 # Keep one generation-bound work ticket per consumer while all
                 # tickets name the same two directory objects.  The object
                 # protocol still issues each K/V DMA once, but cancellation or
                 # slot reuse of one request cannot invalidate another request's
                 # readiness proof.
-                consumers = tuple(
-                    sorted(
-                        (binding_by_index[index] for index in consumer_indices),
-                        key=_deadline_key,
-                    )
-                )
-                if not consumers:
-                    raise RuntimeError("NVMe acquisition run has no live consumer")
-                if scope.tenant_id is not None and any(
-                    consumer.tenant_id != scope.tenant_id for consumer in consumers
-                ):
-                    raise RuntimeError("NVMe isolated run escaped its tenant scope")
-                objects = by_run[run]
+                consumers = bound_consumers[group_plan]
+                if isinstance(publication, NvmeRunPublication):
+                    if not isinstance(group_plan.materialization, ContiguousPairRun):
+                        raise RuntimeError(
+                            "direct publication lost its transfer-run identity"
+                        )
+                    objects = publication.objects_for_run(group_plan.materialization)
+                else:
+                    if not isinstance(group_plan.materialization, NvmeSourceSpan):
+                        raise RuntimeError(
+                            "span publication lost its source-span identity"
+                        )
+                    objects = publication.objects_for(group_plan.materialization)
                 if len(objects) != 2:
                     raise RuntimeError("NVMe acquisition group must own one K/V pair")
-                groups.append(_PublishedRun(run, objects, consumers))
+                groups.append(
+                    _PublishedGroup(
+                        group_plan.source_first,
+                        group_plan.destination_first,
+                        group_plan.row_count,
+                        objects,
+                        consumers,
+                    )
+                )
             transfer_bytes += publication.transfer_bytes
         published = _PublishedLayer(
             prepared.local_layer,
@@ -575,6 +505,55 @@ class SglangNvmeAcquisitionPipeline:
         if published.object_count != geometry.object_count:
             raise RuntimeError("NVMe layer publication changed object geometry")
         return published
+
+    def _build_compaction_image(
+        self,
+        *,
+        publications_by_layer: tuple[
+            tuple[NvmeRunPublication | NvmeSpanPublication, ...], ...
+        ],
+        first_local_layer: int,
+    ) -> _CompactionImage | None:
+        """Build one immutable device address image for a transport window."""
+
+        rows: list[tuple[int, int, int]] = []
+        launches: list[_CompactionLaunch] = []
+        for layer_offset, publications in enumerate(publications_by_layer):
+            by_row_bytes: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+            for publication in publications:
+                if not isinstance(publication, NvmeSpanPublication):
+                    if isinstance(publication, NvmeRunPublication):
+                        continue
+                    raise RuntimeError("NVMe publication has an unknown exact form")
+                for row_bytes, addresses in publication.compaction_addresses:
+                    by_row_bytes[row_bytes].extend(addresses)
+            for row_bytes, addresses in by_row_bytes.items():
+                if not addresses:
+                    raise RuntimeError("NVMe span produced an empty compaction wave")
+                address_offset = len(rows)
+                rows.extend(addresses)
+                launches.append(
+                    _CompactionLaunch(
+                        first_local_layer + layer_offset,
+                        address_offset,
+                        len(addresses),
+                        row_bytes,
+                    )
+                )
+        if not launches:
+            return None
+        device = torch.device("cuda", self._runtime.device_ordinal)
+        with torch.cuda.stream(self._progress_stream):
+            row_image = torch.tensor(
+                rows,
+                dtype=torch.int64,
+                device=device,
+            )
+        row_image.record_stream(self._readiness_stream)
+        return _CompactionImage(
+            row_image,
+            tuple(launches),
+        )
 
     def _upload_transport_window(
         self,
@@ -589,7 +568,7 @@ class SglangNvmeAcquisitionPipeline:
     ]:
         if not layers or inter_layer_compute_ns <= 0:
             raise RuntimeError("NVMe transport window has invalid deadline geometry")
-        grouped: dict[int, list[tuple[_PublishedLayer, _PublishedRun]]] = defaultdict(
+        grouped: dict[int, list[tuple[_PublishedLayer, _PublishedGroup]]] = defaultdict(
             list
         )
         binding_by_request: dict[int, RequestBinding] = {}
@@ -634,7 +613,7 @@ class SglangNvmeAcquisitionPipeline:
                     )
                 spans.append(WorkDependencySpan(begin, len(group.objects), 0))
                 logical_work.append(cursor)
-                demand_units.append(group.run.row_count)
+                demand_units.append(group.row_count)
                 # Offset zero means "inherit the request deadline" in the
                 # native ABI, so the first layer uses one nanosecond. Relative
                 # offsets keep every window in the GPU global-timer domain.
@@ -649,9 +628,9 @@ class SglangNvmeAcquisitionPipeline:
                     owner.generation,
                     owner.tenant_id,
                     layer.layer_id,
-                    group.run.source_first,
-                    group.run.destination_first,
-                    group.run.row_count,
+                    group.source_first,
+                    group.destination_first,
+                    group.row_count,
                     layer.version,
                 )
                 keys_by_layer[layer.local_layer].append(key)
@@ -688,6 +667,7 @@ class SglangNvmeAcquisitionPipeline:
     ) -> NvmeBatchAcquisition:
         """Enqueue a complete cross-layer producer pipeline without synchronizing."""
 
+        prepare_started_ns = time.perf_counter_ns()
         if self._active_acquisition_id is not None:
             raise RuntimeError("the preceding NVMe acquisition has no consumer fence")
         if inter_layer_compute_ns <= 0:
@@ -705,7 +685,18 @@ class SglangNvmeAcquisitionPipeline:
             object_capacity=self._object_capacity,
             work_ticket_capacity=self._work_ticket_capacity,
             tenant_isolation=self._tenant_isolation,
+            service_model=self._service_model,
+            scratch_capacity_bytes=(
+                0 if self._scratch is None else self._scratch.bytes
+            ),
+            scratch_alignment=self._scratch_alignment,
         )
+        bound_consumers = self._bind_group_consumers(geometry, bindings)
+        geometry_finished_ns = time.perf_counter_ns()
+        descriptor_cpu_ns = 0
+        publication_cpu_ns = 0
+        finalization_cpu_ns = 0
+        topology_cpu_ns = 0
 
         # Request-directory publication and any preceding numerical consumer
         # are explicit stream edges.  No host synchronization is required.
@@ -717,11 +708,19 @@ class SglangNvmeAcquisitionPipeline:
 
         phases = self._transport_program()
         layers: list[NvmeLayerAcquisition] = []
+        compaction_images: list[_CompactionImage] = []
         capacity_layer_limit = min(
             self._object_capacity // geometry.object_count,
             self._intent_capacity // geometry.object_count,
             self._work_ticket_capacity // geometry.work_item_count,
         )
+        if geometry.granularity is NvmeGranularity.SPAN_COMPACT:
+            if self._scratch is None or geometry.scratch_bytes_per_layer <= 0:
+                raise RuntimeError("span materialization has no bounded scratch arena")
+            capacity_layer_limit = min(
+                capacity_layer_limit,
+                self._scratch.bytes // geometry.scratch_bytes_per_layer,
+            )
         if capacity_layer_limit <= 0:
             raise RuntimeError("NVMe acquisition cannot fit one layer in the runtime")
         window_layer_capacity = plan_nvme_window_layer_capacity(
@@ -740,6 +739,7 @@ class SglangNvmeAcquisitionPipeline:
                 self._layer_count, first_local_layer + window_layer_capacity
             )
             prepared_layers: list[_PreparedLayer] = []
+            stage_started_ns = time.perf_counter_ns()
             for local_layer in range(first_local_layer, last_local_layer):
                 layer_id = self._layer_start + local_layer
                 version = self._next_version()
@@ -754,31 +754,60 @@ class SglangNvmeAcquisitionPipeline:
                         kv_cache=kv_cache_for_layer(layer_id),
                         version=version,
                         first_object_slot=first_object_slot,
+                        scratch_base=(local_layer - first_local_layer)
+                        * geometry.scratch_bytes_per_layer,
                     )
                 )
+            descriptor_cpu_ns += time.perf_counter_ns() - stage_started_ns
 
             prepared_window = tuple(prepared_layers)
             flat_preparations = tuple(
                 scope.publication for layer in prepared_window for scope in layer.scopes
             )
-            flat_publications = publish_prepared_nvme_runs(
-                flat_preparations,
-                runtime=self._runtime,
-                stream=self._progress_stream,
-                lifetime=self._slot_lifetime,
-            )
+            stage_started_ns = time.perf_counter_ns()
+            if geometry.granularity is NvmeGranularity.DIRECT:
+                if not all(
+                    isinstance(item, PreparedNvmeRunPublication)
+                    for item in flat_preparations
+                ):
+                    raise RuntimeError("direct NVMe preparation changed form")
+                flat_publications = publish_prepared_nvme_runs(
+                    flat_preparations,
+                    runtime=self._runtime,
+                    stream=self._progress_stream,
+                    lifetime=self._slot_lifetime,
+                )
+            else:
+                if not all(
+                    isinstance(item, PreparedNvmeSpanPublication)
+                    for item in flat_preparations
+                ):
+                    raise RuntimeError("span NVMe preparation changed form")
+                flat_publications = publish_prepared_nvme_spans(
+                    flat_preparations,
+                    runtime=self._runtime,
+                    stream=self._progress_stream,
+                    lifetime=self._slot_lifetime,
+                )
+            publication_cpu_ns += time.perf_counter_ns() - stage_started_ns
             published_layers: list[_PublishedLayer] = []
+            publications_by_layer: list[
+                tuple[NvmeRunPublication | NvmeSpanPublication, ...]
+            ] = []
             publication_cursor = 0
+            stage_started_ns = time.perf_counter_ns()
             for prepared in prepared_window:
                 scope_count = len(prepared.scopes)
+                layer_publications = flat_publications[
+                    publication_cursor : publication_cursor + scope_count
+                ]
+                publications_by_layer.append(layer_publications)
                 published_layers.append(
                     self._finalize_layer(
                         geometry=geometry,
-                        bindings=bindings,
+                        bound_consumers=bound_consumers,
                         prepared=prepared,
-                        publications=flat_publications[
-                            publication_cursor : publication_cursor + scope_count
-                        ],
+                        publications=layer_publications,
                     )
                 )
                 publication_cursor += scope_count
@@ -786,13 +815,26 @@ class SglangNvmeAcquisitionPipeline:
                 raise RuntimeError("NVMe window publication changed its scope image")
 
             published_window = tuple(published_layers)
+            compaction_image = self._build_compaction_image(
+                publications_by_layer=tuple(publications_by_layer),
+                first_local_layer=first_local_layer,
+            )
+            if geometry.granularity is NvmeGranularity.SPAN_COMPACT:
+                if compaction_image is None:
+                    raise RuntimeError("span NVMe window lost its compaction image")
+                compaction_images.append(compaction_image)
+            elif compaction_image is not None:
+                raise RuntimeError("direct NVMe window acquired scratch compaction")
+            finalization_cpu_ns += time.perf_counter_ns() - stage_started_ns
 
+            stage_started_ns = time.perf_counter_ns()
             plan, keys_by_layer = self._upload_transport_window(
                 window_index=window_index,
                 row_bytes=geometry.row_bytes,
                 layers=published_window,
                 inter_layer_compute_ns=inter_layer_compute_ns,
             )
+            topology_cpu_ns += time.perf_counter_ns() - stage_started_ns
             object_count = geometry.object_count * len(published_window)
             work_count = geometry.work_item_count * len(published_window)
             phases.reset(
@@ -828,12 +870,35 @@ class SglangNvmeAcquisitionPipeline:
                 self._progress_stream,
             )
             self._readiness_stream.wait_event(armed_event)
+            launches_by_layer: dict[int, list[_CompactionLaunch]] = defaultdict(list)
+            if compaction_image is not None:
+                for launch in compaction_image.launches:
+                    launches_by_layer[launch.local_layer].append(launch)
             for published in published_window:
                 self._runtime.wait_object_range_terminal(
                     published.first_object_slot,
                     geometry.object_count,
                     self._readiness_stream,
                 )
+                layer_launches = launches_by_layer[published.local_layer]
+                if compaction_image is not None and not layer_launches:
+                    raise RuntimeError("span NVMe layer lost its compaction launch")
+                if not layer_launches:
+                    phases.require_ready_objects(
+                        self._runtime,
+                        published.first_object_slot,
+                        geometry.object_count,
+                        self._readiness_stream,
+                    )
+                for launch in layer_launches:
+                    phases.compact_ready_hbm_rows(
+                        self._runtime,
+                        compaction_image.rows,
+                        launch.row_bytes,
+                        self._readiness_stream,
+                        first_row=launch.address_offset,
+                        row_count=launch.row_count,
+                    )
                 self._ready_events[published.local_layer].record(self._readiness_stream)
             observed_event.record(self._readiness_stream)
             # Directory slots may be reused by the next window only after its
@@ -871,9 +936,16 @@ class SglangNvmeAcquisitionPipeline:
         self._active_acquisition_id = acquisition_id
         self._consumer_recorded = False
         self._waited_layers.clear()
-        acquisition = NvmeBatchAcquisition(acquisition_id, tuple(layers), window_count)
+        acquisition = NvmeBatchAcquisition(
+            acquisition_id,
+            tuple(layers),
+            window_count,
+            tuple(compaction_images),
+        )
         physical_bytes = sum(layer.transfer_bytes for layer in layers)
         logical_bytes = sum(layer.logical_transfer_bytes for layer in layers)
+        scoped_exact_bytes = geometry.scoped_exact_transfer_bytes * len(layers)
+        unique_source_bytes = geometry.unique_source_transfer_bytes * len(layers)
         self._stats["nvme_pipeline_batches"] = (
             self._stats.get("nvme_pipeline_batches", 0) + 1
         )
@@ -894,7 +966,43 @@ class SglangNvmeAcquisitionPipeline:
         )
         self._stats["nvme_pipeline_isolation_bytes"] = self._stats.get(
             "nvme_pipeline_isolation_bytes", 0
-        ) + (physical_bytes - logical_bytes)
+        ) + (scoped_exact_bytes - logical_bytes)
+        self._stats["nvme_pipeline_unique_source_bytes"] = (
+            self._stats.get("nvme_pipeline_unique_source_bytes", 0)
+            + unique_source_bytes
+        )
+        self._stats["nvme_pipeline_extra_source_bytes"] = self._stats.get(
+            "nvme_pipeline_extra_source_bytes", 0
+        ) + (physical_bytes - unique_source_bytes)
+        granularity_key = f"nvme_granularity_{geometry.granularity.value}_batches"
+        self._stats[granularity_key] = self._stats.get(granularity_key, 0) + 1
+        reason_key = f"nvme_granularity_reason_{geometry.granularity_reason}"
+        self._stats[reason_key] = self._stats.get(reason_key, 0) + 1
+        if geometry.direct_predicted_ns is not None:
+            self._stats["nvme_direct_predicted_ns"] = self._stats.get(
+                "nvme_direct_predicted_ns", 0
+            ) + geometry.direct_predicted_ns * len(layers)
+        if geometry.selected_predicted_ns is not None:
+            self._stats["nvme_selected_predicted_ns"] = self._stats.get(
+                "nvme_selected_predicted_ns", 0
+            ) + geometry.selected_predicted_ns * len(layers)
+        if compaction_images:
+            compaction_rows = sum(
+                launch.row_count
+                for image in compaction_images
+                for launch in image.launches
+            )
+            self._stats["nvme_compaction_rows"] = (
+                self._stats.get("nvme_compaction_rows", 0) + compaction_rows
+            )
+            self._stats["nvme_compaction_launches"] = self._stats.get(
+                "nvme_compaction_launches", 0
+            ) + sum(len(image.launches) for image in compaction_images)
+            self._stats["nvme_scratch_high_water_bytes"] = max(
+                self._stats.get("nvme_scratch_high_water_bytes", 0),
+                geometry.scratch_bytes_per_layer
+                * min(window_layer_capacity, len(layers)),
+            )
         self._stats["nvme_bytes"] = self._stats.get("nvme_bytes", 0) + physical_bytes
         self._stats["nvme_pipeline_windows"] = (
             self._stats.get("nvme_pipeline_windows", 0) + window_count
@@ -903,6 +1011,21 @@ class SglangNvmeAcquisitionPipeline:
         self._stats["nvme_progress_rounds"] = (
             self._stats.get("nvme_progress_rounds", 0) + window_count
         )
+        for name, value in (
+            (
+                "nvme_geometry_cpu_ns",
+                geometry_finished_ns - prepare_started_ns,
+            ),
+            ("nvme_descriptor_cpu_ns", descriptor_cpu_ns),
+            ("nvme_publication_cpu_ns", publication_cpu_ns),
+            ("nvme_finalization_cpu_ns", finalization_cpu_ns),
+            ("nvme_topology_cpu_ns", topology_cpu_ns),
+            (
+                "nvme_prepare_cpu_ns",
+                time.perf_counter_ns() - prepare_started_ns,
+            ),
+        ):
+            self._stats[name] = self._stats.get(name, 0) + value
         return acquisition
 
     def wait_layer(

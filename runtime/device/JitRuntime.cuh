@@ -1334,6 +1334,160 @@ nta_jit_progress_validated_indexed_host_range_parallel(
   return nta::jit::launchStatus();
 }
 
+extern "C" __global__ void
+nta_require_ready_objects(const nta::abi::RuntimeView *runtime,
+                          std::uint32_t firstObject,
+                          std::uint32_t objectCount) {
+  if (runtime == nullptr || objectCount == 0 ||
+      firstObject > runtime->objectCapacity ||
+      objectCount > runtime->objectCapacity - firstObject) {
+    asm volatile("trap;");
+    return;
+  }
+  for (std::uint32_t relative = threadIdx.x; relative < objectCount;
+       relative += blockDim.x) {
+    const auto state = static_cast<nta::abi::ObjectState>(
+        atomicAdd(&runtime->objects[firstObject + relative].state, 0U));
+    if (state != nta::abi::ObjectState::Ready) {
+      // A terminal stream-memory wait accepts both Ready and Failed. Stock
+      // numerical kernels cannot inspect the runtime, so fail the CUDA
+      // execution context here rather than expose stale framework HBM.
+      asm volatile("trap;");
+    }
+  }
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_require_ready_objects(const void *runtime, std::uint32_t firstObject,
+                              std::uint32_t objectCount, cudaStream_t stream) {
+  constexpr std::uint32_t threads = 256;
+  if (runtime == nullptr || objectCount == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_require_ready_objects<<<1, threads, 0, stream>>>(
+      static_cast<const nta::abi::RuntimeView *>(runtime), firstObject,
+      objectCount);
+  return nta::jit::launchStatus();
+}
+
+extern "C" __global__ void
+nta_compact_hbm_rows(const std::uint64_t *sourceAddresses,
+                     const std::uint64_t *destinationAddresses,
+                     std::uint32_t rowCount, std::uint32_t rowBytes) {
+  const std::uint32_t row = blockIdx.x;
+  if (sourceAddresses == nullptr || destinationAddresses == nullptr ||
+      row >= rowCount || rowBytes == 0) {
+    return;
+  }
+  const std::uint64_t sourceAddress = sourceAddresses[row];
+  const std::uint64_t destinationAddress = destinationAddresses[row];
+  const auto *source = reinterpret_cast<const std::byte *>(sourceAddress);
+  auto *destination = reinterpret_cast<std::byte *>(destinationAddress);
+  if (source == nullptr || destination == nullptr) {
+    return;
+  }
+  constexpr std::uint32_t vectorBytes = sizeof(uint4);
+  if ((sourceAddress | destinationAddress | rowBytes) % vectorBytes == 0) {
+    const auto *sourceVectors = reinterpret_cast<const uint4 *>(source);
+    auto *destinationVectors = reinterpret_cast<uint4 *>(destination);
+    const std::uint32_t vectorCount = rowBytes / vectorBytes;
+    for (std::uint32_t index = threadIdx.x; index < vectorCount;
+         index += blockDim.x) {
+      destinationVectors[index] = sourceVectors[index];
+    }
+    return;
+  }
+  for (std::uint32_t index = threadIdx.x; index < rowBytes;
+       index += blockDim.x) {
+    destination[index] = source[index];
+  }
+}
+
+extern "C" __global__ void
+nta_compact_ready_hbm_rows(nta::abi::RuntimeView *runtime,
+                           const std::uint64_t *rowTable,
+                           std::uint32_t rowCount, std::uint32_t rowBytes) {
+  const std::uint32_t row = blockIdx.x;
+  if (runtime == nullptr || rowTable == nullptr || row >= rowCount ||
+      rowBytes == 0) {
+    return;
+  }
+  __shared__ std::uint64_t sourceAddress;
+  __shared__ std::uint64_t destinationAddress;
+  __shared__ std::uint32_t valid;
+  if (threadIdx.x == 0) {
+    const std::uint64_t *entry = rowTable + 3U * row;
+    const std::uint64_t encodedSlot = entry[0];
+    sourceAddress = entry[1];
+    destinationAddress = entry[2];
+    valid = 0;
+    if (encodedSlot < runtime->objectCapacity && sourceAddress != 0 &&
+        destinationAddress != 0) {
+      const std::uint32_t objectSlot = static_cast<std::uint32_t>(encodedSlot);
+      const auto state = static_cast<nta::abi::ObjectState>(
+          atomicAdd(&runtime->objects[objectSlot].state, 0U));
+      valid = state == nta::abi::ObjectState::Ready;
+    }
+  }
+  __syncthreads();
+  if (valid == 0) {
+    if (threadIdx.x == 0) {
+      // The stream-memory terminal wait accepts Ready and Failed. Associate
+      // every exact row with the object that supplied it so validation and
+      // the copy share one launch without weakening the fail-stop boundary.
+      asm volatile("trap;");
+    }
+    return;
+  }
+  const auto *source = reinterpret_cast<const std::byte *>(sourceAddress);
+  auto *destination = reinterpret_cast<std::byte *>(destinationAddress);
+  constexpr std::uint32_t vectorBytes = sizeof(uint4);
+  if ((sourceAddress | destinationAddress | rowBytes) % vectorBytes == 0) {
+    const auto *sourceVectors = reinterpret_cast<const uint4 *>(source);
+    auto *destinationVectors = reinterpret_cast<uint4 *>(destination);
+    const std::uint32_t vectorCount = rowBytes / vectorBytes;
+    for (std::uint32_t index = threadIdx.x; index < vectorCount;
+         index += blockDim.x) {
+      destinationVectors[index] = sourceVectors[index];
+    }
+    return;
+  }
+  for (std::uint32_t index = threadIdx.x; index < rowBytes;
+       index += blockDim.x) {
+    destination[index] = source[index];
+  }
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_compact_hbm_rows(const std::uint64_t *sourceAddresses,
+                         const std::uint64_t *destinationAddresses,
+                         std::uint32_t rowCount, std::uint32_t rowBytes,
+                         cudaStream_t stream) {
+  constexpr std::uint32_t threads = 256;
+  if (sourceAddresses == nullptr || destinationAddresses == nullptr ||
+      rowCount == 0 || rowBytes == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_compact_hbm_rows<<<rowCount, threads, 0, stream>>>(
+      sourceAddresses, destinationAddresses, rowCount, rowBytes);
+  return nta::jit::launchStatus();
+}
+
+extern "C" __attribute__((visibility("default"))) cudaError_t
+nta_jit_compact_ready_hbm_rows(void *runtime, const std::uint64_t *rowTable,
+                               std::uint32_t rowCount, std::uint32_t rowBytes,
+                               cudaStream_t stream) {
+  constexpr std::uint32_t threads = 256;
+  if (runtime == nullptr || rowTable == nullptr || rowCount == 0 ||
+      rowBytes == 0) {
+    return cudaErrorInvalidValue;
+  }
+  nta_compact_ready_hbm_rows<<<rowCount, threads, 0, stream>>>(
+      static_cast<nta::abi::RuntimeView *>(runtime), rowTable, rowCount,
+      rowBytes);
+  return nta::jit::launchStatus();
+}
+
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_progress_nvme(void *runtime, std::uint32_t issueBudget,
                       std::uint32_t completionBudget, cudaStream_t stream) {

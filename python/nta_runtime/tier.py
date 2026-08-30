@@ -17,7 +17,7 @@ an operator/configuration error, not a silent change in the measured path.
 from __future__ import annotations
 
 from collections.abc import Hashable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import enum
 import hashlib
 import json
@@ -33,6 +33,7 @@ from .hbm_registration import (
     HbmDestinationSlice,
     coalesce_hbm_destinations,
 )
+from .nvme_granularity import NvmeTransferServiceModel
 from .resource_contract import (
     ResourceKind,
     resource_contract,
@@ -653,6 +654,9 @@ class ServingTierConfig:
     progress_timeout_ns: int = 100_000_000
     trust_read_only_device_code: bool = False
     nvme_hbm_backend: NvmeHbmBackendRequirement = NvmeHbmBackendRequirement.AUTO
+    nvme_service_model: NvmeTransferServiceModel = field(
+        default_factory=NvmeTransferServiceModel
+    )
 
     _NVME_DEFAULTS: ClassVar[dict[str, int]] = {
         "namespace_id": 1,
@@ -723,6 +727,8 @@ class ServingTierConfig:
             raise ValueError(
                 "nvme_hbm_backend must be a NvmeHbmBackendRequirement value"
             )
+        if not isinstance(self.nvme_service_model, NvmeTransferServiceModel):
+            raise ValueError("nvme_service_model must be a typed service model")
         if self.tier is ServingTier.CXL_DAX:
             if self.window_bytes <= 0:
                 raise ValueError("CXL DAX window_bytes must be positive")
@@ -733,6 +739,8 @@ class ServingTierConfig:
             and self.nvme_hbm_backend is not NvmeHbmBackendRequirement.AUTO
         ):
             raise ValueError("an NVMe HBM backend requirement needs the NVMe tier")
+        if self.tier is not ServingTier.NVME and self.nvme_service_model.calibrated:
+            raise ValueError("an NVMe service model needs the NVMe tier")
         if self.tier is not ServingTier.NVME:
             changed_nvme_fields = [
                 name
@@ -803,6 +811,43 @@ class ServingTierConfig:
                 "NTA_NVME_HBM_BACKEND must be auto, cuda-dmabuf-ioas, or "
                 "nvidia-peer-pages"
             ) from error
+        service_names = (
+            "NTA_NVME_COMMAND_SERVICE_NS",
+            "NTA_NVME_READ_BANDWIDTH_BPS",
+            "NTA_NVME_COMPACTION_BANDWIDTH_BPS",
+        )
+        service_values = tuple(values.get(name, "").strip() for name in service_names)
+        service_tuning_present = any(
+            values.get(name, "").strip()
+            for name in (
+                "NTA_NVME_COMPACTION_LAUNCH_NS",
+                "NTA_NVME_MINIMUM_GAIN",
+            )
+        )
+        if (any(service_values) and not all(service_values)) or (
+            service_tuning_present and not all(service_values)
+        ):
+            raise ValueError(
+                "NVMe granularity calibration requires command, read-bandwidth, "
+                "and compaction-bandwidth measurements together"
+            )
+        service_model = (
+            NvmeTransferServiceModel()
+            if not any(service_values)
+            else NvmeTransferServiceModel(
+                command_service_ns=_positive_int(service_values[0], service_names[0]),
+                read_bandwidth_bytes_per_second=_positive_int(
+                    service_values[1], service_names[1]
+                ),
+                compaction_bandwidth_bytes_per_second=_positive_int(
+                    service_values[2], service_names[2]
+                ),
+                compaction_launch_ns=int(
+                    values.get("NTA_NVME_COMPACTION_LAUNCH_NS", "0")
+                ),
+                minimum_gain=float(values.get("NTA_NVME_MINIMUM_GAIN", "1.03")),
+            )
+        )
         return cls(
             tier=tier,
             endpoint=endpoint,
@@ -834,6 +879,7 @@ class ServingTierConfig:
                 "NTA_NVME_TRUST_READ_ONLY_DEVICE_CODE",
             ),
             nvme_hbm_backend=hbm_backend,
+            nvme_service_model=service_model,
         )
 
 
@@ -855,6 +901,7 @@ class ServingTierService:
         self._nvme_hbm_regions: dict[tuple[int, int], Any] = {}
         self._nvme_hbm_prepared = False
         self._nvme_lba_size: int | None = None
+        self._nvme_controller_page_size: int | None = None
         self._nvme_max_transfer_bytes: int | None = None
         self._nvme_namespace_bytes: int | None = None
         # Keep catalog validation and experiment tooling independent of CUDA
@@ -896,9 +943,8 @@ class ServingTierService:
                 )
                 capabilities = self.nvme.capabilities
                 self._nvme_lba_size = int(capabilities.lba_size)
-                self._nvme_max_transfer_bytes = int(
-                    capabilities.max_transfer_bytes
-                )
+                self._nvme_controller_page_size = int(capabilities.controller_page_size)
+                self._nvme_max_transfer_bytes = int(capabilities.max_transfer_bytes)
                 self._nvme_namespace_bytes = int(capabilities.namespace_bytes)
                 self.catalog.validate_nvme_geometry(
                     lba_size=self._nvme_lba_size,
@@ -1022,6 +1068,14 @@ class ServingTierService:
         return self._nvme_lba_size
 
     @property
+    def nvme_controller_page_size(self) -> int:
+        if not self.is_nvme or self._nvme_controller_page_size is None:
+            raise RuntimeError(
+                "NVMe controller page size is only available for an NVMe tier"
+            )
+        return self._nvme_controller_page_size
+
+    @property
     def nvme_max_transfer_bytes(self) -> int:
         if not self.is_nvme or self._nvme_max_transfer_bytes is None:
             raise RuntimeError("NVMe transfer limit is only available for an NVMe tier")
@@ -1127,6 +1181,19 @@ class ServingTierService:
             "resource_contract": self.contract.as_dict(),
             "tier_fallback": False,
             "required_nvme_hbm_backend": self.config.nvme_hbm_backend.value,
+        }
+        service_model = self.config.nvme_service_model
+        result["nvme_granularity_service_model"] = {
+            "calibrated": service_model.calibrated,
+            "command_service_ns": service_model.command_service_ns,
+            "read_bandwidth_bytes_per_second": (
+                service_model.read_bandwidth_bytes_per_second
+            ),
+            "compaction_bandwidth_bytes_per_second": (
+                service_model.compaction_bandwidth_bytes_per_second
+            ),
+            "compaction_launch_ns": service_model.compaction_launch_ns,
+            "minimum_gain": service_model.minimum_gain,
         }
         if self.nvme is not None:
             capabilities = self.nvme.capabilities
