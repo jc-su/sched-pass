@@ -2653,7 +2653,8 @@ issueNvmeGenericSerial(nta::abi::RuntimeView *runtime,
 __device__ __forceinline__ void
 progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
                  std::uint32_t completionBudget, std::uint32_t orderedFirstSlot,
-                 std::uint32_t orderedSlotCount, std::uint32_t *orderedCursor) {
+                 std::uint32_t orderedSlotCount, std::uint32_t *orderedCursor,
+                 bool verifyControlPage) {
   using namespace nta;
   if (runtime == nullptr || blockIdx.x != 0 || threadIdx.x >= warpSize) {
     return;
@@ -2672,7 +2673,8 @@ progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
   if (!ownsQueue) {
     return;
   }
-  bool queueOnline = lane == 0 && device::nvmeQueueOnline(queue);
+  bool queueOnline =
+      lane == 0 && (!verifyControlPage || device::nvmeQueueOnline(queue));
   queueOnline = __shfl_sync(0xffffffffU, queueOnline, 0);
   if (!queueOnline) {
     device::failNvmeQueue(runtime, queue, lane, 0xfffffffcU);
@@ -2866,7 +2868,8 @@ progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
     }
     __syncwarp();
   }
-  queueOnline = lane == 0 && device::nvmeQueueOnline(queue);
+  queueOnline =
+      lane == 0 && (!verifyControlPage || device::nvmeQueueOnline(queue));
   queueOnline = __shfl_sync(0xffffffffU, queueOnline, 0);
   if (issued != 0 && !queueOnline) {
     device::failNvmeQueue(runtime, queue, lane, 0xfffffffcU);
@@ -2883,7 +2886,8 @@ progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
 extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
                                              std::uint32_t issueBudget,
                                              std::uint32_t completionBudget) {
-  progressNvmeOnce(runtime, issueBudget, completionBudget, 0, 0, nullptr);
+  progressNvmeOnce(runtime, issueBudget, completionBudget, 0, 0, nullptr,
+                   true);
 }
 
 __device__ __forceinline__ bool
@@ -2932,9 +2936,15 @@ progressNvmeUntil(nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
   const std::uint32_t orderedCount = ordered ? intentCount : 0U;
   std::uint32_t *cursor = ordered ? &control->size : nullptr;
   const std::uint64_t start = device::globalTimerNs();
+  bool verifyControlPage = true;
   for (;;) {
     progressNvmeOnce(runtime, issueBudget, completionBudget, firstIntent,
-                     orderedCount, cursor);
+                     orderedCount, cursor, verifyControlPage);
+    // The control page is CPU-owned setup/lifetime state. Runtime teardown is
+    // ordered after this kernel, so only the CQ is a changing I/O-coherent
+    // input during steady-state polling. Re-reading five control words twice
+    // per round would turn PCIe coherence into the data path.
+    verifyControlPage = false;
     __syncwarp();
 
     bool finished = false;
