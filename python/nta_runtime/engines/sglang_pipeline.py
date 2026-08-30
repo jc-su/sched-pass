@@ -26,6 +26,18 @@ from nta_runtime.engines.sglang_transfer import (
 from nta_runtime.runtime import copy_strided_host_runs_async
 
 
+def bounded_sm_pair_worker_grid(
+    pair_count: int, maximum_worker_ctas: int
+) -> tuple[int, bool]:
+    """Return the finite CTA grid and whether it throttles pair-block tasks."""
+
+    if pair_count <= 0 or not 0 < maximum_worker_ctas <= 64:
+        raise ValueError("SM pair mover geometry is invalid")
+    task_count = 2 * pair_count
+    worker_ctas = min(maximum_worker_ctas, task_count)
+    return worker_ctas, worker_ctas < task_count
+
+
 class SglangHostTransport:
     """Own finite host mover streams and layer-readiness publication."""
 
@@ -38,6 +50,7 @@ class SglangHostTransport:
         stream_priority: int,
         frontier_layers_per_wave: int,
         sm_acquisition_waves: int,
+        sm_mover_max_worker_ctas: int,
         copy_engine_max_operations: int,
         profile_barrier: bool,
         profile_cpu: bool,
@@ -51,6 +64,7 @@ class SglangHostTransport:
             object_capacity,
             frontier_layers_per_wave,
             sm_acquisition_waves,
+            sm_mover_max_worker_ctas,
             copy_engine_max_operations,
         ) <= 0:
             raise ValueError("SGLang host transport geometry must be positive")
@@ -61,6 +75,9 @@ class SglangHostTransport:
         self._object_capacity = object_capacity
         self._frontier_layers_per_wave = frontier_layers_per_wave
         self._sm_acquisition_waves = sm_acquisition_waves
+        if sm_mover_max_worker_ctas > 64:
+            raise ValueError("SGLang SM mover worker CTA bound exceeds the ABI limit")
+        self._sm_mover_max_worker_ctas = sm_mover_max_worker_ctas
         self._copy_engine_max_operations = copy_engine_max_operations
         self._profile_barrier = profile_barrier
         self._profile_cpu = profile_cpu
@@ -472,16 +489,35 @@ class SglangHostTransport:
         with torch.cuda.stream(self._prefetch_stream):
             if profile_start is not None:
                 profile_start.record(self._prefetch_stream)
+            worker_ctas = 0
+            throttled = False
             if objects_per_layer == 2:
                 first_slot = transfer_first_slot + 2 * local_layer
                 if paired_copy:
-                    phase_program.preload_host_pairs(
-                        self._runtime,
-                        first_slot,
-                        wave_end - local_layer,
-                        self._prefetch_stream,
+                    pair_count = wave_end - local_layer
+                    worker_ctas, throttled = bounded_sm_pair_worker_grid(
+                        pair_count,
+                        self._sm_mover_max_worker_ctas,
                     )
+                    if throttled:
+                        phase_program.preload_host_pairs_ordered(
+                            self._runtime,
+                            first_slot,
+                            pair_count,
+                            worker_ctas,
+                            self._ordered_task_head,
+                            self._prefetch_stream,
+                        )
+                        throttled = True
+                    else:
+                        phase_program.preload_host_pairs(
+                            self._runtime,
+                            first_slot,
+                            pair_count,
+                            self._prefetch_stream,
+                        )
                 else:
+                    worker_ctas = 4 * (wave_end - local_layer)
                     phase_program.preload_host(
                         self._runtime,
                         first_slot,
@@ -496,10 +532,9 @@ class SglangHostTransport:
                 pair_count = (
                     (wave_end - local_layer) * objects_per_layer // 2
                 )
-                worker_blocks = min(
-                    64,
-                    2 * self._frontier_layers_per_wave,
-                    2 * pair_count,
+                worker_blocks, throttled = bounded_sm_pair_worker_grid(
+                    pair_count,
+                    self._sm_mover_max_worker_ctas,
                 )
                 phase_program.preload_host_pairs_ordered(
                     self._runtime,
@@ -509,6 +544,7 @@ class SglangHostTransport:
                     self._ordered_task_head,
                     self._prefetch_stream,
                 )
+                worker_ctas = worker_blocks
                 submissions = 1
             else:
                 if objects_per_layer <= 2 or objects_per_layer % 2:
@@ -532,6 +568,7 @@ class SglangHostTransport:
                                 self._prefetch_stream,
                             )
                         ready_event.record(self._prefetch_stream)
+                        worker_ctas += 2
                         submissions += 1
             if profile_finish is not None:
                 profile_finish.record(self._prefetch_stream)
@@ -552,6 +589,9 @@ class SglangHostTransport:
         self._stats["sm_acquisition_wave_submissions"] = self._stats.get(
             "sm_acquisition_wave_submissions", 0
         ) + submissions
+        self._stats["sm_mover_worker_ctas"] += worker_ctas
+        if throttled:
+            self._stats["sm_mover_throttled_submissions"] += 1
 
     def _enqueue_copy_wave(
         self,

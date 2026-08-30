@@ -98,6 +98,7 @@ class SglangTelemetryConfig:
     indexed_copy_max_blocks: int
     frontier_layers_per_wave: int
     sm_acquisition_waves: int
+    sm_mover_max_worker_ctas: int
     demand_graph_enabled: bool
     demand_graph_capacity: int
     engine_version: str
@@ -117,6 +118,7 @@ class SglangTelemetryConfig:
             self.indexed_copy_max_blocks,
             self.frontier_layers_per_wave,
             self.sm_acquisition_waves,
+            self.sm_mover_max_worker_ctas,
             self.demand_graph_capacity,
         )
         if any(value <= 0 for value in positive):
@@ -222,6 +224,8 @@ _ZERO_COUNTERS = (
     "copy_engine_layout_cpu_ns",
     "sm_mover_bytes",
     "sm_acquisition_wave_submissions",
+    "sm_mover_worker_ctas",
+    "sm_mover_throttled_submissions",
     "prefetch_mover_plan_sm_rows",
     "batches",
     "decode_launches",
@@ -467,6 +471,7 @@ def initial_engine_stats(
         "indexed_copy_max_blocks": config.indexed_copy_max_blocks,
         "frontier_layers_per_wave": config.frontier_layers_per_wave,
         "sm_acquisition_waves": config.sm_acquisition_waves,
+        "sm_mover_max_worker_ctas": config.sm_mover_max_worker_ctas,
         "demand_graph_enabled": config.demand_graph_enabled,
         "demand_graph_capacity": config.demand_graph_capacity,
         "transport_program_loaded": False,

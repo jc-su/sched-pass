@@ -59,10 +59,22 @@ def main() -> None:
     )
     from nta_runtime.engines.sglang_materialization import SglangPlanMaterializer
     from nta_runtime.engines.sglang_metadata import SglangMetadataPlanner
+    from nta_runtime.engines.sglang_pipeline import bounded_sm_pair_worker_grid
     from nta_runtime.engines.sglang_transfer import HostMoverController, MoverProfile
     from nta_runtime.execution_planner import HostExecutionMode
     from nta_runtime.indexed_transfer import IndexedMoverServiceModel
     from nta_runtime.requests import RequestBinding
+
+    assert bounded_sm_pair_worker_grid(4, 8) == (8, False)
+    assert bounded_sm_pair_worker_grid(4, 2) == (2, True)
+    assert bounded_sm_pair_worker_grid(1, 1) == (1, True)
+    for invalid_geometry in ((0, 1), (1, 0), (1, 65)):
+        try:
+            bounded_sm_pair_worker_grid(*invalid_geometry)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid SM mover geometry was accepted")
 
     binding = RequestBinding(
         request_index=0,

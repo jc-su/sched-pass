@@ -284,6 +284,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._indexed_copy_max_blocks = tuning.indexed_copy_max_blocks
         self._frontier_layers_per_wave = tuning.frontier_layers_per_wave
         self._sm_acquisition_waves = tuning.sm_acquisition_waves
+        self._sm_mover_max_worker_ctas = tuning.sm_mover_max_worker_ctas
         self._overlap_enabled = tuning.overlap_enabled
         self._frontier_enabled = tuning.frontier_enabled
         self._demand_graph_enabled = tuning.demand_graph_enabled
@@ -352,6 +353,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 indexed_copy_max_blocks=self._indexed_copy_max_blocks,
                 frontier_layers_per_wave=self._frontier_layers_per_wave,
                 sm_acquisition_waves=self._sm_acquisition_waves,
+                sm_mover_max_worker_ctas=self._sm_mover_max_worker_ctas,
                 demand_graph_enabled=self._demand_graph_enabled,
                 demand_graph_capacity=demand_graph_capacity,
                 engine_version=observability.engine_version,
@@ -488,6 +490,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             stream_priority=mover_priority,
             frontier_layers_per_wave=self._frontier_layers_per_wave,
             sm_acquisition_waves=self._sm_acquisition_waves,
+            sm_mover_max_worker_ctas=self._sm_mover_max_worker_ctas,
             copy_engine_max_operations=self._copy_engine_max_operations,
             profile_barrier=self._profile_barrier,
             profile_cpu=self._profile_cpu,

@@ -62,6 +62,7 @@ def _telemetry_config() -> SglangTelemetryConfig:
         indexed_copy_max_blocks=32,
         frontier_layers_per_wave=4,
         sm_acquisition_waves=4,
+        sm_mover_max_worker_ctas=8,
         demand_graph_enabled=False,
         demand_graph_capacity=144,
         engine_version="test",

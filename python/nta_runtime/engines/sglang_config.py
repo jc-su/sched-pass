@@ -267,6 +267,7 @@ class SglangExecutionTuning:
     indexed_copy_max_blocks: int
     frontier_layers_per_wave: int
     sm_acquisition_waves: int
+    sm_mover_max_worker_ctas: int
     overlap_enabled: bool
     frontier_enabled: bool
     demand_graph_enabled: bool
@@ -323,6 +324,10 @@ class SglangExecutionTuning:
         )
         frontier_wave = min(
             64, positive_environment("NTA_EXECUTION_FRONTIER_LAYERS_PER_WAVE", 4)
+        )
+        sm_mover_max_worker_ctas = min(
+            64,
+            positive_environment("NTA_EXECUTION_HOST_SM_MAX_WORKER_CTAS", 8),
         )
         overlap_enabled = bootstrap.execution.protocol.allow_overlap
         frontier_enabled = (
@@ -383,6 +388,7 @@ class SglangExecutionTuning:
             indexed_copy_max_blocks=indexed_blocks,
             frontier_layers_per_wave=frontier_wave,
             sm_acquisition_waves=sm_acquisition_waves,
+            sm_mover_max_worker_ctas=sm_mover_max_worker_ctas,
             overlap_enabled=overlap_enabled,
             frontier_enabled=frontier_enabled,
             demand_graph_enabled=graph_enabled,
