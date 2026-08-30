@@ -126,12 +126,21 @@ class AcquisitionAdmission:
         requests = tuple(getattr(batch, "reqs", ()) or ())
         external_bytes = bridge.transfer_bytes(consumer_index)
         if getattr(batch, "decoding_reqs", None) is not None:
+            progress = bridge.progress(consumer_index)
             bridge.record_admission(
                 admission_considered_batches=1,
                 admission_considered_requests=len(requests),
-                admission_external_bytes=external_bytes,
+                admission_external_bytes=(
+                    external_bytes
+                    if external_bytes
+                    else 0 if progress is None else progress.total_bytes
+                ),
                 admission_released_mixed_batches=1,
             )
+            if progress is not None and not progress.complete:
+                self._start_immediate_acquisition(
+                    bridge, consumer_index, batch, progress
+                )
             return batch
         progress = bridge.progress(consumer_index)
         if progress is None:
@@ -145,6 +154,9 @@ class AcquisitionAdmission:
             bridge.record_admission(admission_released_complete=1)
             return batch
         if not _has_runnable_decode(running):
+            self._start_immediate_acquisition(
+                bridge, consumer_index, batch, progress
+            )
             bridge.record_admission(admission_released_without_decode=1)
             return batch
         feedback_reason = _compiler_feedback_reason(running, bridge)
@@ -201,6 +213,35 @@ class AcquisitionAdmission:
             admission_delayed_requests=len(requests),
         )
         return None
+
+    @staticmethod
+    def _start_immediate_acquisition(
+        bridge: SglangHiCacheBridge,
+        consumer_index: int,
+        batch: Any,
+        progress: Any,
+    ) -> None:
+        """Bind calibrated transport before an immediately released prefill.
+
+        Mixed batches and prefills with no useful resident decode cannot be held
+        by admission, but their exact scheduler shape is still available here.
+        Starting the finite queue at this edge preserves maximum prefetch lead
+        time without freezing AUTO's mover at the earlier, shape-free HiCache
+        capture edge. An uncalibrated shape remains unpublished and is handled
+        by the exact metadata path; no optimistic model or silent fallback is
+        introduced.
+        """
+
+        if progress.published_layers != 0:
+            return
+        if not bridge.prepare_admission_acquisition(consumer_index, batch):
+            return
+        bridge.start_admission_acquisition(consumer_index, batch)
+        published = bridge.progress(consumer_index)
+        if published is None or published.published_layers == 0:
+            raise RuntimeError(
+                "HiCache immediate acquisition did not publish transfer progress"
+            )
 
     def poll(self, scheduler: Any, *, running_batch: Any | None = None) -> Any | None:
         staged = self._staged

@@ -78,16 +78,14 @@ class SglangHostAcquisitionCoordinator:
 
     @property
     def proactive_layer_queue_enabled(self) -> bool:
-        """Return whether capture may submit whole-layer Host transfers.
+        """Return whether a scheduler-bound batch may submit Host transfers.
 
-        AUTO retains the production eager fast path: a later metadata decision
-        may consume a completed layer through the stock alias or attach typed
-        work to an in-flight producer.  DIRECT is explicitly that same physical
-        path.  DEVICE_BULK and DEPENDENCY_AWARE are causal execution forms whose
-        demand must be discovered and acquired by the typed runtime; eagerly
-        publishing every layer would erase the boundary those forms claim to
-        measure.  Tenant isolation likewise requires request accounting before
-        transport can reserve bytes.
+        AUTO and DIRECT both admit a finite whole-layer queue.  AUTO binds its
+        mover to the exact scheduler batch before submission; DIRECT is the
+        explicit eager diagnostic arm and may submit at capture. DEVICE_BULK
+        and DEPENDENCY_AWARE are causal execution forms whose demand must be
+        discovered and acquired by the typed runtime. Tenant isolation likewise
+        requires request accounting before transport can reserve bytes.
         """
 
         return (
@@ -95,6 +93,15 @@ class SglangHostAcquisitionCoordinator:
             and not self._tenant_isolation_enabled
             and self._execution_config.host_execution_mode
             in {HostExecutionMode.AUTO, HostExecutionMode.DIRECT}
+        )
+
+    @property
+    def eager_capture_enabled(self) -> bool:
+        """Return whether transport selection is intentionally batch-agnostic."""
+
+        return (
+            self.proactive_layer_queue_enabled
+            and self._execution_config.host_execution_mode is HostExecutionMode.DIRECT
         )
 
     def capture(self, pending: PendingHostLoad) -> None:
@@ -111,10 +118,11 @@ class SglangHostAcquisitionCoordinator:
         if conventional:
             self.publish_range(pending, 0, layer_count)
             initial_layers = layer_count
-        elif self.proactive_layer_queue_enabled:
-            # Descriptor ownership is frozen before submission.  No active
-            # ForwardBatch exists at this edge, so mover selection can use only
-            # deployment-local observations and never stale batch state.
+        elif self.eager_capture_enabled:
+            # DIRECT is the explicit batch-agnostic baseline. AUTO must wait for
+            # the scheduler batch: freezing its mover here would permanently
+            # discard the already-calibrated layer-service shape and make the
+            # resource-aware copy-engine/SM decision impossible.
             self.transfer_plan(pending)
             pending.acquisition = LayerAcquisition(pending.layer_bytes)
             self._add("host_acquisition_jobs_prepared", layer_count)

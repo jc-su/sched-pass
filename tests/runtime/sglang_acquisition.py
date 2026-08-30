@@ -70,7 +70,9 @@ def pending(pool):
 
 
 def main() -> None:
-    # Capture freezes physical descriptors before one dense finite submission.
+    # AUTO captures ownership but waits for an exact scheduler shape before it
+    # freezes mover descriptors. This prevents the earlier shape-free edge from
+    # permanently selecting the SM issuer.
     owner, pool, transport = coordinator()
     lease = pending(pool)
 
@@ -86,13 +88,28 @@ def main() -> None:
     owner.account_selection = account
     owner.transfer_plan = freeze
     owner.capture(lease)
-    assert transport.ranges == [(0, 4)]
-    assert lease.acquisition.started
-    assert lease.acquisition.model is None
-    assert lease.acquisition.fully_published
-    assert owner._stats["initial_acquisition_layers"] == 4
-    assert owner._stats["initial_typed_gap_layers"] == 0
-    assert owner._stats["lease_acquisition_groups_started"] == 1
+    assert transport.ranges == []
+    assert lease.acquisition is None
+    assert lease.transfer_plan is None
+    assert owner._stats["initial_acquisition_layers"] == 0
+    assert owner._stats["initial_typed_gap_layers"] == 4
+    assert owner._stats["schedule_bound_acquisition_batches"] == 1
+
+    # DIRECT remains the explicit batch-agnostic eager baseline.
+    direct_owner, direct_pool, direct_transport = coordinator(
+        mode=HostExecutionMode.DIRECT
+    )
+    direct = pending(direct_pool)
+    direct_owner.account_selection = account
+    direct_owner.transfer_plan = freeze
+    direct_owner.capture(direct)
+    assert direct_transport.ranges == [(0, 4)]
+    assert direct.acquisition.started
+    assert direct.acquisition.model is None
+    assert direct.acquisition.fully_published
+    assert direct_owner._stats["initial_acquisition_layers"] == 4
+    assert direct_owner._stats["initial_typed_gap_layers"] == 0
+    assert direct_owner._stats["lease_acquisition_groups_started"] == 1
 
     # The explicit dependency-aware causal form cannot be preempted by an
     # eager whole-layer producer. Its first exact groups are bound only after

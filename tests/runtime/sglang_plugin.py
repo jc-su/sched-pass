@@ -918,6 +918,19 @@ def main() -> None:
     assert admission.poll(scheduler) is batch
     assert prepared_bridge.stats["admission_released_feasible"] == 1
 
+    # A mixed batch cannot be delayed behind itself, but AUTO still has to bind
+    # and start its mover at this first shape-aware scheduler edge.
+    mixed_bridge = PreparedBridge()
+    mixed_batch = types.SimpleNamespace(
+        reqs=[external, resident],
+        hicache_consumer_index=3,
+        decoding_reqs=[resident],
+    )
+    admission = AcquisitionAdmission(config, clock=lambda: clock[0])
+    assert admission.consider(scheduler, mixed_batch, mixed_bridge) is mixed_batch
+    assert mixed_bridge.prepared and mixed_bridge.started
+    assert mixed_bridge.stats["admission_released_mixed_batches"] == 1
+
     capped_bridge = PreparedBridge()
     admission = AcquisitionAdmission(AdmissionConfig(True, 5), clock=lambda: clock[0])
     assert admission.consider(scheduler, batch, capped_bridge) is batch
