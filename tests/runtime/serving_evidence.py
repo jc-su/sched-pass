@@ -241,6 +241,8 @@ def main() -> None:
         raise AssertionError("a native path without compiler proof passed the gate")
 
     serving = load_serving_module()
+    assert serving._max_request_input_tokens(32_768, 18_000) == 17_992
+    assert serving._max_request_input_tokens(16_000, 18_000) == 15_992
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3)) == 2
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3, 4)) == 3
     try:

@@ -637,8 +637,18 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SGLANG_INPUT_MARGIN_TOKENS = 8
 
 
-def _max_request_input_tokens(context_length: int) -> int:
-    return context_length - SGLANG_INPUT_MARGIN_TOKENS
+def _max_request_input_tokens(
+    context_length: int, max_total_tokens: int
+) -> int:
+    """Return the input envelope enforced by the configured SGLang engine.
+
+    SGLang bounds one request by both the model context and the engine's KV
+    token pool.  The latter matters for placement-pressure requests: using
+    only ``context_length`` can generate a request larger than a deliberately
+    small ``max_total_tokens`` pool before the timed workload even starts.
+    """
+
+    return min(context_length, max_total_tokens) - SGLANG_INPUT_MARGIN_TOKENS
 
 
 def _machine_metadata() -> dict[str, Any]:
@@ -829,9 +839,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("request and token counts must be positive")
     if args.external_suffix_tokens < 0:
         parser.error("external suffix token count cannot be negative")
-    if args.context_length <= SGLANG_INPUT_MARGIN_TOKENS:
-        parser.error("context length is too small for the SGLang request envelope")
-    max_request_input_tokens = _max_request_input_tokens(args.context_length)
+    if min(args.context_length, args.max_total_tokens) <= SGLANG_INPUT_MARGIN_TOKENS:
+        parser.error("configured token capacity is too small for a request")
+    max_request_input_tokens = _max_request_input_tokens(
+        args.context_length, args.max_total_tokens
+    )
     if args.churn_tokens >= max_request_input_tokens:
         parser.error("churn token count exceeds the SGLang request input budget")
     if args.load_warmup_iterations < 0:
@@ -1546,7 +1558,9 @@ def main() -> int:
             *workload_metadata["resident_output_tokens"],
             *workload_metadata["external_output_tokens"],
         ]
-        max_request_input_tokens = _max_request_input_tokens(args.context_length)
+        max_request_input_tokens = _max_request_input_tokens(
+            args.context_length, args.max_total_tokens
+        )
         if any(length >= max_request_input_tokens for length in prompt_lengths):
             raise RuntimeError(
                 "Bailian prompt exceeds the SGLang request input budget "
@@ -1647,12 +1661,14 @@ def main() -> int:
         tokenizer, external_prefixes, external_prompts
     )
     if any(
-        len(prompt) >= _max_request_input_tokens(args.context_length)
+        len(prompt)
+        >= _max_request_input_tokens(args.context_length, args.max_total_tokens)
         for prompt in [*resident_prompts, *external_prompts]
     ):
         raise RuntimeError(
             "a generated prompt exceeds the SGLang request input budget "
-            f"({_max_request_input_tokens(args.context_length)} tokens for "
+            f"({_max_request_input_tokens(args.context_length, args.max_total_tokens)} "
+            "tokens for "
             f"context length {args.context_length})"
         )
     eviction_rounds = (
@@ -1704,7 +1720,9 @@ def main() -> int:
         # then restores only the exact pages shared with the resident set.
         required_placement_pressure = args.max_total_tokens + block_size
         remaining = max(args.churn_tokens, required_placement_pressure)
-        maximum_prompt_tokens = _max_request_input_tokens(args.context_length) - 1
+        maximum_prompt_tokens = (
+            _max_request_input_tokens(args.context_length, args.max_total_tokens) - 1
+        )
         while remaining > 0:
             token_count = min(maximum_prompt_tokens, remaining)
             placement_eviction_prompts.append(
