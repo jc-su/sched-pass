@@ -73,9 +73,9 @@ using ProgressNvme = cudaError_t (*)(void *, std::uint32_t, std::uint32_t,
 using ProgressNvmeUntilIdle = cudaError_t (*)(void *, std::uint32_t,
                                               std::uint32_t, std::uint64_t,
                                               cudaStream_t);
-using ProgressNvmeOrderedUntilRangeTerminal = cudaError_t (*)(
+using ProgressNvmeOrderedUntilIdle = cudaError_t (*)(
     void *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-    std::uint32_t, std::uint32_t, std::uint64_t, cudaStream_t);
+    std::uint64_t, cudaStream_t);
 using Publish = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using Complete = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
 using CompleteStreamOrdered = cudaError_t (*)(void *, const void *,
@@ -182,10 +182,8 @@ struct JitPhaseProgram::Impl {
       progressNvme = load<ProgressNvme>(library, "nta_jit_progress_nvme");
       progressNvmeUntilIdle = load<ProgressNvmeUntilIdle>(
           library, "nta_jit_progress_nvme_until_idle");
-      progressNvmeOrderedUntilRangeTerminal =
-          load<ProgressNvmeOrderedUntilRangeTerminal>(
-              library,
-              "nta_jit_progress_nvme_ordered_until_range_terminal");
+      progressNvmeOrderedUntilIdle = load<ProgressNvmeOrderedUntilIdle>(
+          library, "nta_jit_progress_nvme_ordered_until_idle");
       publish = load<Publish>(library, "nta_jit_publish_ready");
       complete = load<Complete>(library, "nta_jit_complete_launched");
       completeStreamOrdered = load<CompleteStreamOrdered>(
@@ -229,8 +227,7 @@ struct JitPhaseProgram::Impl {
   ReduceMappedIndexedKeyPages reduceMappedIndexedKeyPages = nullptr;
   ProgressNvme progressNvme = nullptr;
   ProgressNvmeUntilIdle progressNvmeUntilIdle = nullptr;
-  ProgressNvmeOrderedUntilRangeTerminal
-      progressNvmeOrderedUntilRangeTerminal = nullptr;
+  ProgressNvmeOrderedUntilIdle progressNvmeOrderedUntilIdle = nullptr;
   Publish publish = nullptr;
   Complete complete = nullptr;
   CompleteStreamOrdered completeStreamOrdered = nullptr;
@@ -617,24 +614,22 @@ void JitPhaseProgram::progressNvmeUntilIdle(
         "nta_jit_progress_nvme_until_idle");
 }
 
-void JitPhaseProgram::progressNvmeOrderedUntilRangeTerminal(
+void JitPhaseProgram::progressNvmeOrderedUntilIdle(
     cudaStream_t stream, abi::RuntimeView *runtime,
     std::uint32_t firstIntent, std::uint32_t intentCount,
-    std::uint32_t firstObject, std::uint32_t objectCount,
     std::uint32_t issueBudget, std::uint32_t completionBudget,
     std::uint64_t timeoutNs) const {
-  if (runtime == nullptr || intentCount == 0 || objectCount == 0 ||
+  if (runtime == nullptr || intentCount == 0 ||
       issueBudget == 0 || completionBudget == 0 || timeoutNs == 0 ||
-      firstIntent > UINT32_MAX - intentCount ||
-      firstObject > UINT32_MAX - objectCount) {
+      firstIntent > UINT32_MAX - intentCount) {
     throw std::invalid_argument(
-        "ordered NVMe range progress needs bounded intent/object ranges, "
-        "budgets, and timeout");
+        "ordered NVMe progress needs a bounded intent range, budgets, and "
+        "timeout");
   }
-  check(impl_->progressNvmeOrderedUntilRangeTerminal(
-            runtime, firstIntent, intentCount, firstObject, objectCount,
-            issueBudget, completionBudget, timeoutNs, stream),
-        "nta_jit_progress_nvme_ordered_until_range_terminal");
+  check(impl_->progressNvmeOrderedUntilIdle(
+            runtime, firstIntent, intentCount, issueBudget, completionBudget,
+            timeoutNs, stream),
+        "nta_jit_progress_nvme_ordered_until_idle");
 }
 
 void JitPhaseProgram::publish(cudaStream_t stream, abi::RuntimeView *runtime,

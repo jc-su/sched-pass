@@ -209,13 +209,13 @@ nta_queue_discovered_intents(nta::abi::RuntimeView *runtime) {
 // collision-free objectSlot==intentSlot mapping produced by typed SGLang
 // acquisition windows. An unsorted or collided image is not an error: it is
 // queued into the generic heap in this same stream-ordered step.
-extern "C" __global__ void nta_validate_ordered_nvme_intents(
-    nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
-    std::uint32_t intentCount) {
+extern "C" __global__ void
+nta_validate_ordered_nvme_intents(nta::abi::RuntimeView *runtime,
+                                  std::uint32_t firstIntent,
+                                  std::uint32_t intentCount) {
   using namespace nta;
-  if (runtime == nullptr || blockIdx.x != 0 || threadIdx.x != 0 ||
-      runtime->intents == nullptr || runtime->intentPool == nullptr ||
-      firstIntent > runtime->intentCapacity ||
+  if (runtime == nullptr || blockIdx.x != 0 || runtime->intents == nullptr ||
+      runtime->intentPool == nullptr || firstIntent > runtime->intentCapacity ||
       intentCount > runtime->intentCapacity - firstIntent) {
     return;
   }
@@ -224,8 +224,10 @@ extern "C" __global__ void nta_validate_ordered_nvme_intents(
   if (control == nullptr) {
     return;
   }
-  if (!device::validateOrderedIntentWindow(
-          runtime, abi::SourceKind::Nvme, firstIntent, intentCount)) {
+  __shared__ device::OrderedIntentValidationScratch scratch;
+  const bool ordered = device::validateOrderedIntentWindow(
+      runtime, abi::SourceKind::Nvme, firstIntent, intentCount, scratch);
+  if (threadIdx.x == 0 && !ordered) {
     nta::jit::queueDiscoveredIntents(runtime);
   }
 }
@@ -258,9 +260,10 @@ nta_jit_discover_work(void *runtime, const void *workItems,
 // generation, object-version, credit, and readiness transitions; only the
 // unused O(intentCapacity) heap construction is omitted.
 extern "C" __attribute__((visibility("default"))) cudaError_t
-nta_jit_discover_work_unqueued_host(
-    void *runtime, const void *workItems, const void *dependencies,
-    std::uint32_t workItemCount, cudaStream_t stream) {
+nta_jit_discover_work_unqueued_host(void *runtime, const void *workItems,
+                                    const void *dependencies,
+                                    std::uint32_t workItemCount,
+                                    cudaStream_t stream) {
   if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
       workItemCount == 0) {
     return cudaErrorInvalidValue;
@@ -276,10 +279,12 @@ nta_jit_discover_work_unqueued_host(
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
-nta_jit_discover_work_ordered_nvme(
-    void *runtime, const void *workItems, const void *dependencies,
-    std::uint32_t workItemCount, std::uint32_t firstIntent,
-    std::uint32_t intentCount, cudaStream_t stream) {
+nta_jit_discover_work_ordered_nvme(void *runtime, const void *workItems,
+                                   const void *dependencies,
+                                   std::uint32_t workItemCount,
+                                   std::uint32_t firstIntent,
+                                   std::uint32_t intentCount,
+                                   cudaStream_t stream) {
   if (runtime == nullptr || workItems == nullptr || dependencies == nullptr ||
       workItemCount == 0 || intentCount == 0) {
     return cudaErrorInvalidValue;
@@ -295,8 +300,8 @@ nta_jit_discover_work_ordered_nvme(
   if (status != cudaSuccess) {
     return status;
   }
-  nta_validate_ordered_nvme_intents<<<1, 1, 0, stream>>>(
-      view, firstIntent, intentCount);
+  nta_validate_ordered_nvme_intents<<<1, 256, 0, stream>>>(view, firstIntent,
+                                                           intentCount);
   return nta::jit::launchStatus();
 }
 
@@ -450,8 +455,7 @@ nta_jit_preload_host_pairs(void *runtime, std::uint32_t firstObject,
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
-nta_jit_preload_host_pairs_ordered(void *runtime,
-                                   std::uint32_t firstObject,
+nta_jit_preload_host_pairs_ordered(void *runtime, std::uint32_t firstObject,
                                    std::uint32_t pairCount,
                                    std::uint32_t workerBlocks,
                                    std::uint32_t *taskHead,
@@ -1070,13 +1074,11 @@ extern "C" __global__ void nta_prepare_bounded_selected_indexed_rows(
     std::uint32_t cacheSlotCount, std::uint32_t *selectedRows,
     std::uint32_t *sourceIndices, std::uint32_t *stagingIndices,
     std::uint32_t capacity, std::uint64_t *copiedRows) {
-  ntaPrepareSelectedRows(
-      runtime, firstObject, objectCount, selectedPages, selectedPageCount,
-      pageTokens, tokenCount, hostRows, deviceRows, cachedPages,
-      cacheSlotCount, selectedRows, sourceIndices, stagingIndices, capacity,
-      copiedRows);
+  ntaPrepareSelectedRows(runtime, firstObject, objectCount, selectedPages,
+                         selectedPageCount, pageTokens, tokenCount, hostRows,
+                         deviceRows, cachedPages, cacheSlotCount, selectedRows,
+                         sourceIndices, stagingIndices, capacity, copiedRows);
 }
-
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_prepare_bounded_selected_indexed_rows(
@@ -1173,7 +1175,6 @@ nta_jit_reduce_mapped_key_pages(const void *source, std::uint32_t sourceRows,
       outputMin, outputMax);
   return nta::jit::launchStatus();
 }
-
 
 extern "C" __global__ void nta_reduce_mapped_indexed_key_pages(
     const std::byte *source, std::uint32_t sourceRows,
@@ -1348,8 +1349,7 @@ nta_jit_progress_nvme(void *runtime, std::uint32_t issueBudget,
 extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_progress_nvme_until_idle(void *runtime, std::uint32_t issueBudget,
                                  std::uint32_t completionBudget,
-                                 std::uint64_t timeoutNs,
-                                 cudaStream_t stream) {
+                                 std::uint64_t timeoutNs, cudaStream_t stream) {
   if (runtime == nullptr || issueBudget == 0 || completionBudget == 0 ||
       timeoutNs == 0) {
     return cudaErrorInvalidValue;
@@ -1361,18 +1361,17 @@ nta_jit_progress_nvme_until_idle(void *runtime, std::uint32_t issueBudget,
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
-nta_jit_progress_nvme_ordered_until_range_terminal(
+nta_jit_progress_nvme_ordered_until_idle(
     void *runtime, std::uint32_t firstIntent, std::uint32_t intentCount,
-    std::uint32_t firstObject, std::uint32_t objectCount,
     std::uint32_t issueBudget, std::uint32_t completionBudget,
     std::uint64_t timeoutNs, cudaStream_t stream) {
-  if (runtime == nullptr || intentCount == 0 || objectCount == 0 ||
-      issueBudget == 0 || completionBudget == 0 || timeoutNs == 0) {
+  if (runtime == nullptr || intentCount == 0 || issueBudget == 0 ||
+      completionBudget == 0 || timeoutNs == 0) {
     return cudaErrorInvalidValue;
   }
-  nta_progress_nvme_ordered_until_range_terminal<<<1, 32, 0, stream>>>(
+  nta_progress_nvme_ordered_until_idle<<<1, 32, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime), firstIntent, intentCount,
-      firstObject, objectCount, issueBudget, completionBudget, timeoutNs);
+      issueBudget, completionBudget, timeoutNs);
   return nta::jit::launchStatus();
 }
 

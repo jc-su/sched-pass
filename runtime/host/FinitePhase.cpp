@@ -48,6 +48,8 @@ FinitePhaseProgram::FinitePhaseProgram(CUmodule module)
       progressHost_(load(module, "nta_progress_host_staging")),
       progressNvme_(load(module, "nta_progress_nvme")),
       progressNvmeUntilIdle_(load(module, "nta_progress_nvme_until_idle")),
+      progressNvmeOrderedUntilIdle_(
+          load(module, "nta_progress_nvme_ordered_until_idle")),
       publish_(load(module, "nta_publish_ready")),
       complete_(load(module, "nta_complete_launched")) {}
 
@@ -79,6 +81,24 @@ void FinitePhaseProgram::progressNvmeUntilIdle(
                        &timeoutNs};
   launch(progressNvmeUntilIdle_, 1, 32, stream, arguments,
          "nta_progress_nvme_until_idle");
+}
+
+void FinitePhaseProgram::progressNvmeOrderedUntilIdle(
+    CUstream stream, abi::RuntimeView *runtime, std::uint32_t firstIntent,
+    std::uint32_t intentCount, std::uint32_t issueBudget,
+    std::uint32_t completionBudget, std::uint64_t timeoutNs) const {
+  if (runtime == nullptr || intentCount == 0 || issueBudget == 0 ||
+      completionBudget == 0 || timeoutNs == 0 ||
+      firstIntent > UINT32_MAX - intentCount) {
+    throw std::invalid_argument(
+        "ordered NVMe progress needs a bounded intent range, budgets, and "
+        "timeout");
+  }
+  CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+  void *arguments[] = {&runtimeAddress, &firstIntent, &intentCount, &issueBudget,
+                       &completionBudget, &timeoutNs};
+  launch(progressNvmeOrderedUntilIdle_, 1, 32, stream, arguments,
+         "nta_progress_nvme_ordered_until_idle");
 }
 
 void FinitePhaseProgram::progressHost(CUstream stream,

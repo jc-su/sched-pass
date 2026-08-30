@@ -91,6 +91,43 @@ class NvmeBatchGeometry:
     logical_transfer_bytes: int
 
 
+def plan_nvme_window_layer_capacity(
+    *,
+    layer_count: int,
+    objects_per_layer: int,
+    capacity_layer_limit: int,
+    queue_depth: int,
+    explicit_limit: int | None = None,
+) -> int:
+    """Size one producer window from queue geometry, not a device threshold.
+
+    One queue residency only measures fill and drain. Two usable queue depths
+    permit completion-driven refill and therefore reach the steady-state data
+    path; one additional layer keeps useful producer work available while the
+    next compact descriptor image is enqueued. Capacity and model bounds remain
+    hard limits. An explicit limit exists only for mechanism-envelope tests.
+    """
+
+    if min(layer_count, objects_per_layer, capacity_layer_limit, queue_depth) <= 0:
+        raise ValueError("NVMe window planning requires positive resource geometry")
+    if explicit_limit is not None and (
+        explicit_limit <= 0 or explicit_limit > layer_count
+    ):
+        raise ValueError("NVMe acquisition window limit exceeds model layers")
+    if explicit_limit is not None:
+        return min(capacity_layer_limit, layer_count, explicit_limit)
+    usable_queue_entries = max(1, queue_depth - 1)
+    refill_layers = (
+        2 * usable_queue_entries + objects_per_layer - 1
+    ) // objects_per_layer
+    producer_lookahead = 1 if refill_layers < layer_count else 0
+    return min(
+        capacity_layer_limit,
+        layer_count,
+        refill_layers + producer_lookahead,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class NvmeLayerAcquisition:
     """One layer's transport ownership and completion edge."""
@@ -322,6 +359,7 @@ class SglangNvmeAcquisitionPipeline:
         tenant_isolation: bool,
         regions: Mapping[tuple[int, str], Any],
         stats: dict[str, Any],
+        window_layer_limit: int | None = None,
     ) -> None:
         if (
             min(layer_start, layer_count, object_capacity, work_ticket_capacity) < 0
@@ -332,6 +370,10 @@ class SglangNvmeAcquisitionPipeline:
             raise ValueError("NVMe acquisition pipeline has invalid capacity")
         if not regions:
             raise ValueError("NVMe acquisition pipeline has no registered HBM regions")
+        if window_layer_limit is not None and (
+            window_layer_limit <= 0 or window_layer_limit > layer_count
+        ):
+            raise ValueError("NVMe acquisition window limit exceeds model layers")
         self._runtime = runtime
         self._tier_service = tier_service
         self._transport_program = transport_program
@@ -344,8 +386,20 @@ class SglangNvmeAcquisitionPipeline:
         self._tenant_isolation = tenant_isolation
         self._regions = dict(regions)
         self._stats = stats
+        self._window_layer_limit = window_layer_limit
         self._slot_lifetime = NvmeSlotLifetime(torch.cuda.Event())
         self._ready_events = tuple(torch.cuda.Event() for _ in range(layer_count))
+        # A stream-memory wait consumes no SM residency.  Keep it separate from
+        # the transport worker so one ordered worker can keep the controller
+        # busy while each transformer layer independently publishes a CUDA-
+        # visible ready event to its numerical consumer.
+        self._readiness_stream = torch.cuda.Stream(device=runtime.device_ordinal)
+        self._window_armed_events = tuple(
+            torch.cuda.Event() for _ in range(layer_count)
+        )
+        self._window_observed_events = tuple(
+            torch.cuda.Event() for _ in range(layer_count)
+        )
         self._binding_event = torch.cuda.Event()
         self._consumer_event = torch.cuda.Event()
         self._consumer_recorded = False
@@ -584,9 +638,9 @@ class SglangNvmeAcquisitionPipeline:
                 # Offset zero means "inherit the request deadline" in the
                 # native ABI, so the first layer uses one nanosecond. Relative
                 # offsets keep every window in the GPU global-timer domain.
-                deadline_offset = 1 + (
-                    layer.local_layer - first_local_layer
-                ) * inter_layer_compute_ns
+                deadline_offset = (
+                    1 + (layer.local_layer - first_local_layer) * inter_layer_compute_ns
+                )
                 if deadline_offset >= 1 << 64:
                     raise RuntimeError("NVMe layer deadline exceeds the native ABI")
                 ready_deadline_offsets.append(deadline_offset)
@@ -670,19 +724,12 @@ class SglangNvmeAcquisitionPipeline:
         )
         if capacity_layer_limit <= 0:
             raise RuntimeError("NVMe acquisition cannot fit one layer in the runtime")
-        # Keep enough layer-major commands to fill the controller's usable
-        # queue, plus one producer lookahead layer while the next window's
-        # descriptors are prepared. This is a resource-geometry bound, not a
-        # device-specific threshold; large per-layer demand naturally uses a
-        # smaller window and fine-grained demand naturally uses a larger one.
-        issue_width = max(1, int(self._tier_service.config.issue_budget) - 1)
-        queue_fill_layers = (
-            issue_width + geometry.object_count - 1
-        ) // geometry.object_count
-        window_layer_capacity = min(
-            capacity_layer_limit,
-            self._layer_count,
-            queue_fill_layers + (1 if self._layer_count > 1 else 0),
+        window_layer_capacity = plan_nvme_window_layer_capacity(
+            layer_count=self._layer_count,
+            objects_per_layer=geometry.object_count,
+            capacity_layer_limit=capacity_layer_limit,
+            queue_depth=int(self._tier_service.config.queue_depth),
+            explicit_limit=self._window_layer_limit,
         )
         window_count = (
             self._layer_count + window_layer_capacity - 1
@@ -712,9 +759,7 @@ class SglangNvmeAcquisitionPipeline:
 
             prepared_window = tuple(prepared_layers)
             flat_preparations = tuple(
-                scope.publication
-                for layer in prepared_window
-                for scope in layer.scopes
+                scope.publication for layer in prepared_window for scope in layer.scopes
             )
             flat_publications = publish_prepared_nvme_runs(
                 flat_preparations,
@@ -764,30 +809,47 @@ class SglangNvmeAcquisitionPipeline:
                 self._progress_stream,
             )
             plan.mark_consumed(self._progress_stream)
+
+            # Reset/discovery must become CUDA-visible before terminal waits
+            # inspect reused directory slots; otherwise an old Ready value can
+            # satisfy a new acquisition (ABA).  One persistent ordered worker
+            # then advances the complete window.  Batched stream-memory waits
+            # publish true per-layer readiness without a resident polling CTA.
+            armed_event = self._window_armed_events[window_index]
+            observed_event = self._window_observed_events[window_index]
+            armed_event.record(self._progress_stream)
+            phases.progress_nvme_ordered_until_idle(
+                self._runtime,
+                0,
+                object_count,
+                self._tier_service.config.issue_budget,
+                self._tier_service.config.completion_budget,
+                self._tier_service.config.progress_timeout_ns,
+                self._progress_stream,
+            )
+            self._readiness_stream.wait_event(armed_event)
             for published in published_window:
-                phases.progress_nvme_ordered_until_range_terminal(
-                    self._runtime,
-                    0,
-                    object_count,
+                self._runtime.wait_object_range_terminal(
                     published.first_object_slot,
                     geometry.object_count,
-                    self._tier_service.config.issue_budget,
-                    self._tier_service.config.completion_budget,
-                    self._tier_service.config.progress_timeout_ns,
-                    self._progress_stream,
+                    self._readiness_stream,
                 )
-                self._ready_events[published.local_layer].record(
-                    self._progress_stream
-                )
+                self._ready_events[published.local_layer].record(self._readiness_stream)
+            observed_event.record(self._readiness_stream)
+            # Directory slots may be reused by the next window only after its
+            # terminal states have been captured in layer-owned CUDA events.
+            self._progress_stream.wait_event(observed_event)
             phases.publish(self._runtime, work_count, self._progress_stream)
             phases.complete(self._runtime, work_count, self._progress_stream)
             self._slot_lifetime.record_retirement(self._progress_stream)
 
             for published in published_window:
                 keys = keys_by_layer[published.local_layer]
-                deadline_offset = 1 + (
-                    published.local_layer - first_local_layer
-                ) * inter_layer_compute_ns
+                deadline_offset = (
+                    1
+                    + (published.local_layer - first_local_layer)
+                    * inter_layer_compute_ns
+                )
                 layers.append(
                     NvmeLayerAcquisition(
                         published.layer_id,
@@ -809,9 +871,7 @@ class SglangNvmeAcquisitionPipeline:
         self._active_acquisition_id = acquisition_id
         self._consumer_recorded = False
         self._waited_layers.clear()
-        acquisition = NvmeBatchAcquisition(
-            acquisition_id, tuple(layers), window_count
-        )
+        acquisition = NvmeBatchAcquisition(acquisition_id, tuple(layers), window_count)
         physical_bytes = sum(layer.transfer_bytes for layer in layers)
         logical_bytes = sum(layer.logical_transfer_bytes for layer in layers)
         self._stats["nvme_pipeline_batches"] = (
@@ -836,13 +896,13 @@ class SglangNvmeAcquisitionPipeline:
             "nvme_pipeline_isolation_bytes", 0
         ) + (physical_bytes - logical_bytes)
         self._stats["nvme_bytes"] = self._stats.get("nvme_bytes", 0) + physical_bytes
-        self._stats["nvme_pipeline_windows"] = self._stats.get(
-            "nvme_pipeline_windows", 0
-        ) + window_count
+        self._stats["nvme_pipeline_windows"] = (
+            self._stats.get("nvme_pipeline_windows", 0) + window_count
+        )
         self._stats["nvme_epochs"] = self._stats.get("nvme_epochs", 0) + window_count
-        self._stats["nvme_progress_rounds"] = self._stats.get(
-            "nvme_progress_rounds", 0
-        ) + window_count
+        self._stats["nvme_progress_rounds"] = (
+            self._stats.get("nvme_progress_rounds", 0) + window_count
+        )
         return acquisition
 
     def wait_layer(

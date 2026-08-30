@@ -389,6 +389,41 @@ public:
     completions.upload(completion, queueValue.cqHead);
   }
 
+  void completeTwoSubmissionsAcrossWrap(bool duplicateCommandId = false) {
+    nta::abi::NvmeQueueView queueValue = queue.download();
+    require(queueValue.outstanding == 2,
+            "batched completion test needs two outstanding commands");
+    queueValue.cqHead = Depth - 1U;
+    queueValue.cqPhase = 1;
+    queue.upload(queueValue);
+
+    const std::uint32_t firstSubmission =
+        (queueValue.sqTail + Depth - queueValue.outstanding) % Depth;
+    std::uint32_t firstCommandId = nta::abi::InvalidIndex;
+    std::uint32_t completionSlot = queueValue.cqHead;
+    std::uint32_t phase = queueValue.cqPhase;
+    for (std::uint32_t index = 0; index < 2; ++index) {
+      const nta::abi::NvmeSubmission submission =
+          submissions.download((firstSubmission + index) % Depth);
+      std::uint32_t commandId = submission.dword[0] >> 16U;
+      if (index == 0) {
+        firstCommandId = commandId;
+      } else if (duplicateCommandId) {
+        commandId = firstCommandId;
+      }
+      require(commandId < Depth,
+              "batched completion names an invalid command context");
+      nta::abi::NvmeCompletion completion{};
+      completion.dword[3] = commandId | (phase << 16U);
+      completions.upload(completion, completionSlot);
+      ++completionSlot;
+      if (completionSlot == Depth) {
+        completionSlot = 0;
+        phase ^= 1U;
+      }
+    }
+  }
+
   [[nodiscard]] std::uint32_t activeContextCount() const {
     std::uint32_t active = 0;
     for (std::uint32_t commandId = 0; commandId < Depth; ++commandId) {
@@ -727,10 +762,10 @@ void verifyNvmeStatusFailure(QueueFixture &fixture, const KernelModule &kernels,
   const nta::abi::TenantContext tenant = fixture.tenants.download();
   const nta::abi::BackendView backend = fixture.backends.download(
       static_cast<std::uint32_t>(nta::abi::SourceKind::Nvme));
-  require(queue.active == 1 && queue.outstanding == 0 && queue.completed == 0 &&
+  require(queue.active == 0 && queue.outstanding == 0 && queue.completed == 0 &&
               queue.failed == 1 && queue.error == 1 &&
               fixture.activeContextCount() == 0,
-          "NVMe status failure did not retire exactly one command");
+          "NVMe status failure did not fail-close and retire the queue");
   require(fixture.objects.download().state ==
                   static_cast<std::uint32_t>(nta::abi::ObjectState::Failed) &&
               fixture.workTickets.download().state ==
@@ -739,6 +774,78 @@ void verifyNvmeStatusFailure(QueueFixture &fixture, const KernelModule &kernels,
   require(request.outstandingBytes == 0 && tenant.outstandingBytes == 0 &&
               backend.outstandingBytes == 0,
           "NVMe status failure leaked admission credits");
+}
+
+void issueTwoDirectCommands(QueueFixture &fixture, const KernelModule &kernels,
+                            CUstream stream) {
+  fixture.initializeSecondRequest();
+  kernels.initial(stream, fixture.runtime.get(), fixture.tasks.get(),
+                  fixture.output.get());
+  checkDriver(cuStreamSynchronize(stream),
+              "synchronize first batched-completion issue");
+  kernels.initial(stream, fixture.runtime.get(), fixture.tasks.get() + 1,
+                  fixture.output.get() + 1);
+  checkDriver(cuStreamSynchronize(stream),
+              "synchronize second batched-completion issue");
+  require(fixture.queue.download().outstanding == 2 &&
+              fixture.activeContextCount() == 2,
+          "batched-completion setup did not retain two live commands");
+}
+
+void verifyBatchedCompletionWrap(QueueFixture &fixture,
+                                 const KernelModule &kernels,
+                                 const nta::FinitePhaseProgram &phases,
+                                 CUstream stream) {
+  issueTwoDirectCommands(fixture, kernels, stream);
+  fixture.completeTwoSubmissionsAcrossWrap();
+  phases.progressNvme(stream, fixture.runtime.get(), 1, QueueFixture::Depth);
+  checkDriver(cuStreamSynchronize(stream),
+              "synchronize wrapped completion batch");
+
+  const nta::abi::NvmeQueueView queue = fixture.queue.download();
+  const nta::abi::RequestContext first = fixture.requests.download(0);
+  const nta::abi::RequestContext second = fixture.requests.download(1);
+  const nta::abi::TenantContext tenant = fixture.tenants.download();
+  const nta::abi::BackendView backend = fixture.backends.download(
+      static_cast<std::uint32_t>(nta::abi::SourceKind::Nvme));
+  require(queue.active == 1 && queue.error == 0 && queue.completed == 2 &&
+              queue.failed == 0 && queue.outstanding == 0 &&
+              queue.cqHead == 1 && queue.cqPhase == 0 &&
+              fixture.activeContextCount() == 0,
+          "wrapped completion batch did not retire exactly two commands");
+  require(fixture.objects.download(0).state ==
+                  static_cast<std::uint32_t>(nta::abi::ObjectState::Ready) &&
+              fixture.objects.download(1).state ==
+                  static_cast<std::uint32_t>(nta::abi::ObjectState::Ready),
+          "wrapped completion batch did not publish both objects");
+  require(first.outstandingBytes == 0 && second.outstandingBytes == 0 &&
+              tenant.outstandingBytes == 0 && backend.outstandingBytes == 0,
+          "wrapped completion batch leaked admission credits");
+}
+
+void verifyDuplicateCompletionFailure(QueueFixture &fixture,
+                                      const KernelModule &kernels,
+                                      const nta::FinitePhaseProgram &phases,
+                                      CUstream stream) {
+  issueTwoDirectCommands(fixture, kernels, stream);
+  fixture.completeTwoSubmissionsAcrossWrap(true);
+  phases.progressNvme(stream, fixture.runtime.get(), 1, QueueFixture::Depth);
+  checkDriver(cuStreamSynchronize(stream),
+              "synchronize duplicate completion failure");
+
+  const nta::abi::NvmeQueueView queue = fixture.queue.download();
+  const nta::abi::RequestContext first = fixture.requests.download(0);
+  const nta::abi::RequestContext second = fixture.requests.download(1);
+  const nta::abi::TenantContext tenant = fixture.tenants.download();
+  const nta::abi::BackendView backend = fixture.backends.download(
+      static_cast<std::uint32_t>(nta::abi::SourceKind::Nvme));
+  require(queue.active == 0 && queue.error == 0xffffffffU &&
+              queue.completed == 1 && queue.failed == 1 &&
+              queue.outstanding == 0 && fixture.activeContextCount() == 0,
+          "duplicate CQE did not fail-close the remaining command");
+  require(first.outstandingBytes == 0 && second.outstandingBytes == 0 &&
+              tenant.outstandingBytes == 0 && backend.outstandingBytes == 0,
+          "duplicate CQE failure leaked admission credits");
 }
 
 void verifyMalformedCompletionFailure(QueueFixture &fixture,
@@ -862,6 +969,12 @@ int main() {
     verifyNvmeStatusFailure(statusFixture, kernels, phases, stream);
     QueueFixture malformedFixture;
     verifyMalformedCompletionFailure(malformedFixture, kernels, phases, stream);
+    QueueFixture batchedCompletionFixture;
+    verifyBatchedCompletionWrap(batchedCompletionFixture, kernels, phases,
+                                stream);
+    QueueFixture duplicateCompletionFixture;
+    verifyDuplicateCompletionFailure(duplicateCompletionFixture, kernels,
+                                     phases, stream);
     QueueFixture staleIntentFixture;
     verifyStaleIntentIsolation(staleIntentFixture, kernels, phases, stream);
     QueueFixture offlineFixture;

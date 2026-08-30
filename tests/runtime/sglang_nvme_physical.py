@@ -56,6 +56,7 @@ class _PhysicalTier:
         self.nvme_lba_size = int(capabilities.lba_size)
         self.nvme_max_transfer_bytes = int(capabilities.max_transfer_bytes)
         self.config = SimpleNamespace(
+            queue_depth=int(capabilities.queue_depth),
             issue_budget=int(capabilities.queue_depth),
             completion_budget=int(capabilities.queue_depth),
             progress_timeout_ns=1_000_000_000,

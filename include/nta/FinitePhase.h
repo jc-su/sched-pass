@@ -43,6 +43,10 @@ public:
                              std::uint32_t issueBudget,
                              std::uint32_t completionBudget,
                              std::uint64_t timeoutNs) const;
+  void progressNvmeOrderedUntilIdle(
+      CUstream stream, abi::RuntimeView *runtime, std::uint32_t firstIntent,
+      std::uint32_t intentCount, std::uint32_t issueBudget,
+      std::uint32_t completionBudget, std::uint64_t timeoutNs) const;
   void publish(CUstream stream, abi::RuntimeView *runtime,
                std::uint32_t pendingBudget) const;
   void complete(CUstream stream, abi::RuntimeView *runtime,
@@ -83,6 +87,7 @@ private:
   CUfunction progressHost_ = nullptr;
   CUfunction progressNvme_ = nullptr;
   CUfunction progressNvmeUntilIdle_ = nullptr;
+  CUfunction progressNvmeOrderedUntilIdle_ = nullptr;
   CUfunction publish_ = nullptr;
   CUfunction complete_ = nullptr;
 };

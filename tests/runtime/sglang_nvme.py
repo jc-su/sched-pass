@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
-from nta_runtime.engines.sglang_nvme import plan_nvme_batch_geometry
+from nta_runtime.engines.sglang_nvme import (
+    plan_nvme_batch_geometry,
+    plan_nvme_window_layer_capacity,
+)
 from nta_runtime.requests import RequestBinding
 
 
@@ -87,12 +90,55 @@ def test_nonphysical_semantics_fail_closed() -> None:
         raise AssertionError("nonphysical NVMe semantics were accepted")
 
 
+def test_window_planner_reaches_refill_steady_state() -> None:
+    assert (
+        plan_nvme_window_layer_capacity(
+            layer_count=36,
+            objects_per_layer=32,
+            capacity_layer_limit=36,
+            queue_depth=64,
+        )
+        == 5
+    )
+    # Larger per-layer demand naturally needs fewer layers, while a small
+    # runtime remains a hard bound independent of the queue target.
+    assert (
+        plan_nvme_window_layer_capacity(
+            layer_count=36,
+            objects_per_layer=96,
+            capacity_layer_limit=36,
+            queue_depth=64,
+        )
+        == 3
+    )
+    assert (
+        plan_nvme_window_layer_capacity(
+            layer_count=36,
+            objects_per_layer=4,
+            capacity_layer_limit=7,
+            queue_depth=64,
+        )
+        == 7
+    )
+    assert (
+        plan_nvme_window_layer_capacity(
+            layer_count=36,
+            objects_per_layer=32,
+            capacity_layer_limit=36,
+            queue_depth=64,
+            explicit_limit=4,
+        )
+        == 4
+    )
+
+
 def main() -> None:
     test_batch_deduplicates_shared_runs_without_isolation()
     test_tenant_isolation_scopes_shared_physical_bytes()
     test_isolated_geometry_fails_before_partial_publication()
     test_fanout_ticket_capacity_fails_before_publication()
     test_nonphysical_semantics_fail_closed()
+    test_window_planner_reaches_refill_steady_state()
     print("sglang_nvme=pass")
 
 

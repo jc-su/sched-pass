@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 51U
+#define NTA_RUNTIME_C_API_VERSION 52U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -674,11 +674,12 @@ nta_status nta_jit_phase_progress_nvme_until_idle(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t issue_budget, uint32_t completion_budget, uint64_t timeout_ns,
     uint64_t cuda_stream);
-nta_status nta_jit_phase_progress_nvme_ordered_until_range_terminal(
+/* C API v52: preserve a validated finite EDF order while one completion-driven
+ * worker keeps issuing until both the intent window and controller are idle. */
+nta_status nta_jit_phase_progress_nvme_ordered_until_idle(
     const nta_jit_phase_program *program, nta_runtime *runtime,
-    uint32_t first_intent, uint32_t intent_count, uint32_t first_object,
-    uint32_t object_count, uint32_t issue_budget, uint32_t completion_budget,
-    uint64_t timeout_ns, uint64_t cuda_stream);
+    uint32_t first_intent, uint32_t intent_count, uint32_t issue_budget,
+    uint32_t completion_budget, uint64_t timeout_ns, uint64_t cuda_stream);
 nta_status nta_jit_phase_publish(const nta_jit_phase_program *program,
                                  nta_runtime *runtime, uint32_t pending_budget,
                                  uint64_t cuda_stream);

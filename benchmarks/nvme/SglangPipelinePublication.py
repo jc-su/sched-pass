@@ -64,6 +64,12 @@ def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--layers", type=int, default=36)
     parser.add_argument("--runs", type=int, default=16)
+    parser.add_argument(
+        "--source-stride",
+        type=int,
+        default=2,
+        help="source-row spacing for the controlled granularity envelope",
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--trials", type=int, default=7)
     parser.add_argument(
@@ -78,31 +84,45 @@ def _arguments() -> argparse.Namespace:
         default=0,
         help="ordered/heap runtime capacity in layers (0 uses all layers)",
     )
+    parser.add_argument(
+        "--pipeline-window-layers",
+        type=int,
+        default=0,
+        help="benchmark-only layer window cap (0 uses the production planner)",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--minimum-publication-prepare-speedup", type=float, default=0.0
     )
-    parser.add_argument(
-        "--minimum-publication-wall-speedup", type=float, default=0.0
-    )
+    parser.add_argument("--minimum-publication-wall-speedup", type=float, default=0.0)
     parser.add_argument("--minimum-ordered-wall-speedup", type=float, default=0.0)
     parser.add_argument("--minimum-window-wall-speedup", type=float, default=0.0)
     arguments = parser.parse_args()
-    if min(arguments.layers, arguments.runs, arguments.trials) <= 0:
-        parser.error("layers, runs, and trials must be positive")
+    if min(
+        arguments.layers,
+        arguments.runs,
+        arguments.source_stride,
+        arguments.trials,
+    ) <= 0:
+        parser.error("layers, runs, source-stride, and trials must be positive")
     if (
         arguments.warmup < 0
         or arguments.issue_budget < 0
         or arguments.production_window_layers < 0
         or arguments.production_window_layers > arguments.layers
+        or arguments.pipeline_window_layers < 0
+        or arguments.pipeline_window_layers > arguments.layers
     ):
         parser.error("warmup must be non-negative")
-    if min(
-        arguments.minimum_publication_prepare_speedup,
-        arguments.minimum_publication_wall_speedup,
-        arguments.minimum_ordered_wall_speedup,
-        arguments.minimum_window_wall_speedup,
-    ) < 0:
+    if (
+        min(
+            arguments.minimum_publication_prepare_speedup,
+            arguments.minimum_publication_wall_speedup,
+            arguments.minimum_ordered_wall_speedup,
+            arguments.minimum_window_wall_speedup,
+        )
+        < 0
+    ):
         parser.error("minimum speedups must be non-negative")
     return arguments
 
@@ -132,6 +152,7 @@ class _PhysicalTier:
         self.nvme_lba_size = int(capabilities.lba_size)
         self.nvme_max_transfer_bytes = int(capabilities.max_transfer_bytes)
         self.config = SimpleNamespace(
+            queue_depth=int(capabilities.queue_depth),
             issue_budget=(
                 int(capabilities.queue_depth)
                 if issue_budget == 0
@@ -230,6 +251,7 @@ class _SchedulerProgram:
             runtime, plan, first_intent, intent_count, stream
         )
 
+
 class _Arm:
     def __init__(
         self,
@@ -240,9 +262,11 @@ class _Arm:
         program: JitPhaseProgram,
         layer_count: int,
         run_count: int,
+        source_stride: int,
         scalar_publication: bool,
         generic_heap: bool,
         window_layers: int,
+        pipeline_window_layers: int | None,
     ) -> None:
         self.name = name
         self.storage = torch.full(
@@ -283,9 +307,7 @@ class _Arm:
             for layer in range(layer_count)
             for component in ("key", "value")
         }
-        runtime_view = _PublicationRuntime(
-            self.runtime, scalar=scalar_publication
-        )
+        runtime_view = _PublicationRuntime(self.runtime, scalar=scalar_publication)
         scheduler = _SchedulerProgram(program, generic_heap=generic_heap)
         self.pipeline = SglangNvmeAcquisitionPipeline(
             runtime=runtime_view,
@@ -299,8 +321,9 @@ class _Arm:
             tenant_isolation=False,
             regions=regions,
             stats=self.stats,
+            window_layer_limit=pipeline_window_layers,
         )
-        source = tuple(2 * index for index in range(run_count))
+        source = tuple(source_stride * index for index in range(run_count))
         destination = tuple(range(run_count))
         pair = (source, destination)
         self.semantic = SimpleNamespace(
@@ -362,8 +385,9 @@ def _verify(
     layer_count: int,
     source_rows: int,
     run_count: int,
+    source_stride: int,
 ) -> None:
-    source_ordinals = tuple(2 * index for index in range(run_count))
+    source_ordinals = tuple(source_stride * index for index in range(run_count))
     lane_bytes = source_rows * ROW_BYTES
     with reference.open("rb") as handle:
         for layer in range(layer_count):
@@ -441,7 +465,7 @@ def main() -> None:
             hbm_mapping_policy=_mapping_policy(),
         )
     )
-    source_rows = 2 * arguments.runs
+    source_rows = 1 + arguments.source_stride * (arguments.runs - 1)
     tier = _PhysicalTier(
         transport,
         layer_count=arguments.layers,
@@ -467,10 +491,25 @@ def main() -> None:
             else arguments.production_window_layers
         )
         arm_configurations = {
-            "ordered_batch": (False, False, production_window_layers),
-            "ordered_scalar": (True, False, production_window_layers),
-            "heap_batch": (False, True, production_window_layers),
-            "layered_batch": (False, False, 1),
+            "ordered_batch": (
+                False,
+                False,
+                production_window_layers,
+                arguments.pipeline_window_layers or None,
+            ),
+            "ordered_scalar": (
+                True,
+                False,
+                production_window_layers,
+                arguments.pipeline_window_layers or None,
+            ),
+            "heap_batch": (
+                False,
+                True,
+                production_window_layers,
+                arguments.pipeline_window_layers or None,
+            ),
+            "layered_batch": (False, False, 1, 1),
         }
         arms = {
             name: _Arm(
@@ -480,9 +519,11 @@ def main() -> None:
                 program=program,
                 layer_count=arguments.layers,
                 run_count=arguments.runs,
+                source_stride=arguments.source_stride,
                 scalar_publication=configuration[0],
                 generic_heap=configuration[1],
                 window_layers=configuration[2],
+                pipeline_window_layers=configuration[3],
             )
             for name, configuration in arm_configurations.items()
         }
@@ -491,9 +532,7 @@ def main() -> None:
             for name in arm_names:
                 arms[name].run()
 
-        samples: dict[str, list[dict[str, float]]] = {
-            name: [] for name in arm_names
-        }
+        samples: dict[str, list[dict[str, float]]] = {name: [] for name in arm_names}
         for trial in range(arguments.trials):
             pivot = trial % len(arm_names)
             order = arm_names[pivot:] + arm_names[:pivot]
@@ -507,6 +546,7 @@ def main() -> None:
                 layer_count=arguments.layers,
                 source_rows=source_rows,
                 run_count=arguments.runs,
+                source_stride=arguments.source_stride,
             )
         queue = transport.stats
         if queue.failed or queue.outstanding or queue.error:
@@ -526,13 +566,11 @@ def main() -> None:
                 for field in ("prepare_ms", "gpu_pipeline_ms", "wall_ms")
             },
             "ordered_dispatch": {
-                field: medians["heap_batch"][field]
-                / medians["ordered_batch"][field]
+                field: medians["heap_batch"][field] / medians["ordered_batch"][field]
                 for field in ("prepare_ms", "gpu_pipeline_ms", "wall_ms")
             },
             "queue_fill_window": {
-                field: medians["layered_batch"][field]
-                / medians["ordered_batch"][field]
+                field: medians["layered_batch"][field] / medians["ordered_batch"][field]
                 for field in ("prepare_ms", "gpu_pipeline_ms", "wall_ms")
             },
         }
@@ -543,9 +581,7 @@ def main() -> None:
             "minimum_publication_wall_speedup": (
                 arguments.minimum_publication_wall_speedup
             ),
-            "minimum_ordered_wall_speedup": (
-                arguments.minimum_ordered_wall_speedup
-            ),
+            "minimum_ordered_wall_speedup": (arguments.minimum_ordered_wall_speedup),
             "minimum_window_wall_speedup": arguments.minimum_window_wall_speedup,
             "passed": (
                 comparisons["bulk_publication"]["prepare_ms"]
@@ -558,25 +594,29 @@ def main() -> None:
                 >= arguments.minimum_window_wall_speedup
             ),
         }
+        transfer_runs_per_lane = (
+            (arguments.runs + capabilities.max_transfer_bytes // ROW_BYTES - 1)
+            // (capabilities.max_transfer_bytes // ROW_BYTES)
+            if arguments.source_stride == 1
+            else arguments.runs
+        )
+        objects_per_layer = 2 * transfer_runs_per_lane
         report = {
             "schema": 2,
             "benchmark": "sglang_nvme_pipeline_causal",
             "read_only": True,
             "layers": arguments.layers,
             "runs_per_layer": arguments.runs,
-            "objects_per_layer": 2 * arguments.runs,
-            "commands_per_trial": 2 * arguments.layers * arguments.runs,
-            "bytes_per_trial": 2
-            * arguments.layers
-            * arguments.runs
-            * ROW_BYTES,
+            "source_stride_rows": arguments.source_stride,
+            "objects_per_layer": objects_per_layer,
+            "commands_per_trial": arguments.layers * objects_per_layer,
+            "bytes_per_trial": 2 * arguments.layers * arguments.runs * ROW_BYTES,
             "warmup": arguments.warmup,
             "trials": arguments.trials,
             "issue_budget": tier.config.issue_budget,
             "runtime_window_capacity_layers": production_window_layers,
-            "window_count": {
-                name: arm.window_count for name, arm in arms.items()
-            },
+            "pipeline_window_layer_limit": arguments.pipeline_window_layers,
+            "window_count": {name: arm.window_count for name, arm in arms.items()},
             "samples": samples,
             "median": medians,
             "comparison_speedup": comparisons,

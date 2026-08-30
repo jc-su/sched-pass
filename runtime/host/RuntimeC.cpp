@@ -2032,19 +2032,17 @@ nta_status nta_jit_phase_progress_nvme_until_idle(
   });
 }
 
-nta_status nta_jit_phase_progress_nvme_ordered_until_range_terminal(
+nta_status nta_jit_phase_progress_nvme_ordered_until_idle(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     std::uint32_t firstIntent, std::uint32_t intentCount,
-    std::uint32_t firstObject, std::uint32_t objectCount,
     std::uint32_t issueBudget, std::uint32_t completionBudget,
     std::uint64_t timeoutNs, std::uint64_t cudaStream) {
   return protect([&] {
     requireHandle(program, "JIT phase program");
     requireHandle(runtime, "runtime");
-    program->value->progressNvmeOrderedUntilRangeTerminal(
+    program->value->progressNvmeOrderedUntilIdle(
         stream(cudaStream), runtime->value->deviceView(), firstIntent,
-        intentCount, firstObject, objectCount, issueBudget, completionBudget,
-        timeoutNs);
+        intentCount, issueBudget, completionBudget, timeoutNs);
   });
 }
 

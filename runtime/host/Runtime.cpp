@@ -1923,15 +1923,31 @@ void HostRuntime::waitObjectRangeTerminal(std::uint32_t firstSlot,
       objectCount > impl_->config.objectCapacity - firstSlot) {
     throw std::out_of_range("object terminal-wait range exceeds capacity");
   }
-  for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
-    const CUdeviceptr stateAddress =
-        reinterpret_cast<CUdeviceptr>(impl_->objectEntries + firstSlot + relative) +
-        offsetof(abi::ObjectEntry, state);
-    checkDriver(
-        cuStreamWaitValue32(reinterpret_cast<CUstream>(stream), stateAddress,
-                            static_cast<std::uint32_t>(abi::ObjectState::Ready),
-                            CU_STREAM_WAIT_VALUE_GEQ),
-        "wait for object terminal state");
+  // cuStreamBatchMemOp accepts fewer than 256 operations.  A layer can own
+  // more objects than that, so use bounded stack storage and preserve range
+  // order across batches without allocating in the serving hot path.
+  constexpr std::uint32_t MaxBatchOperations = 255;
+  std::array<CUstreamBatchMemOpParams, MaxBatchOperations> operations{};
+  std::uint32_t relative = 0;
+  while (relative < objectCount) {
+    const std::uint32_t batchCount =
+        std::min(MaxBatchOperations, objectCount - relative);
+    for (std::uint32_t index = 0; index < batchCount; ++index) {
+      CUstreamBatchMemOpParams &operation = operations[index];
+      operation = {};
+      operation.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+      operation.waitValue.address = reinterpret_cast<CUdeviceptr>(
+                                        impl_->objectEntries + firstSlot +
+                                        relative + index) +
+                                    offsetof(abi::ObjectEntry, state);
+      operation.waitValue.value =
+          static_cast<std::uint32_t>(abi::ObjectState::Ready);
+      operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
+    }
+    checkDriver(cuStreamBatchMemOp(reinterpret_cast<CUstream>(stream), batchCount,
+                                   operations.data(), 0),
+                "wait for object terminal range");
+    relative += batchCount;
   }
 }
 

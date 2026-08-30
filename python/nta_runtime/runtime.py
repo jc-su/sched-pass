@@ -27,7 +27,7 @@ from .requests import RequestBinding
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 51
+API_VERSION = 52
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -411,6 +411,8 @@ class _IndexedHostObject(ctypes.Structure):
 
 _INDEXED_HOST_OBJECT_PACKER = struct.Struct("@QQQQQIIIIIIII")
 _ACQUIRE_REQUIREMENT_PACKER = struct.Struct("@QQQQIIII")
+_WORK_ITEM_PACKER = struct.Struct("@IIIIIIIIIIIIQII")
+_REQUEST_RANGE_PACKER = struct.Struct("@IIII")
 
 
 class _IndexedHostIndexBinding(ctypes.Structure):
@@ -547,6 +549,9 @@ class _RegisteredNvmeObject(ctypes.Structure):
     ]
 
 
+_REGISTERED_NVME_OBJECT_PACKER = struct.Struct("@QQQPQQII")
+
+
 class _CxlOptions(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
@@ -638,10 +643,15 @@ def _validate_abi_layouts() -> None:
     ]
     if invalid:
         raise RuntimeError("Python/native ABI layout mismatch: " + ", ".join(invalid))
-    if _ACQUIRE_REQUIREMENT_PACKER.size != ctypes.sizeof(
-        AcquireRequirement
-    ) or _INDEXED_HOST_OBJECT_PACKER.size != ctypes.sizeof(_IndexedHostObject):
-        raise RuntimeError("Python packed/native indexed ABI layout mismatch")
+    packed_layouts = (
+        (_ACQUIRE_REQUIREMENT_PACKER, AcquireRequirement),
+        (_INDEXED_HOST_OBJECT_PACKER, _IndexedHostObject),
+        (_WORK_ITEM_PACKER, WorkItem),
+        (_REQUEST_RANGE_PACKER, RequestRange),
+        (_REGISTERED_NVME_OBJECT_PACKER, _RegisteredNvmeObject),
+    )
+    if any(packer.size != ctypes.sizeof(native) for packer, native in packed_layouts):
+        raise RuntimeError("Python packed/native ABI layout mismatch")
 
 
 _validate_abi_layouts()
@@ -674,15 +684,11 @@ class RuntimeConfig:
                 name,
                 _u32(getattr(self, name), name, positive=True),
             )
-        object.__setattr__(
-            self, "device_ordinal", _device_ordinal(self.device_ordinal)
-        )
+        object.__setattr__(self, "device_ordinal", _device_ordinal(self.device_ordinal))
         if type(self.enable_cta_nvme_try_issue) is not bool:
             raise ValueError("enable_cta_nvme_try_issue must be boolean")
         tenant_capacity = _u32(self.tenant_capacity, "tenant_capacity")
-        staging_capacity = _u64(
-            self.staging_byte_capacity, "staging_byte_capacity"
-        )
+        staging_capacity = _u64(self.staging_byte_capacity, "staging_byte_capacity")
         # Mirror native normalization in the immutable Python image.  Policy
         # telemetry and callers must never observe zero while HostRuntime is
         # actually enforcing request-capacity tenants or an unlimited budget.
@@ -1716,9 +1722,7 @@ _copy_strided_host_runs = _function(
 _operator_module_create = _function(
     "nta_jit_operator_module_create", ctypes.c_int, ctypes.c_char_p, _HandlePointer
 )
-_operator_module_destroy = _function(
-    "nta_jit_operator_module_destroy", None, _Handle
-)
+_operator_module_destroy = _function("nta_jit_operator_module_destroy", None, _Handle)
 _operator_module_contract = _function(
     "nta_jit_operator_module_contract",
     ctypes.c_int,
@@ -2022,13 +2026,11 @@ _phase_nvme_until_idle = _function(
     ctypes.c_uint64,
     ctypes.c_uint64,
 )
-_phase_nvme_ordered_until_range_terminal = _function(
-    "nta_jit_phase_progress_nvme_ordered_until_range_terminal",
+_phase_nvme_ordered_until_idle = _function(
+    "nta_jit_phase_progress_nvme_ordered_until_idle",
     ctypes.c_int,
     _Handle,
     _Handle,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint32,
@@ -2140,9 +2142,7 @@ def copy_strided_host_runs_async(groups: Any, runs: Any, stream: Any = None) -> 
     # HiCache leases can contain hundreds of runs across dozens of K/V layer
     # groups, so the redundant O(groups * runs) interpreter loop otherwise
     # becomes visible in TTFT even though CUDA receives one batched copy.
-    maximum_source_row = max(
-        run.source_first + run.row_count for run in run_values
-    )
+    maximum_source_row = max(run.source_first + run.row_count for run in run_values)
     minimum_destination_row = min(run.destination_first for run in run_values)
     maximum_destination_row = max(
         run.destination_first + run.row_count for run in run_values
@@ -2330,6 +2330,7 @@ class RegisteredNvmeObjectInstall:
             raise ValueError(
                 "NVMe numerical destination exceeds its registered HBM region"
             )
+
     def native(self) -> _RegisteredNvmeObject:
         if not isinstance(self.region, NvmeHbmRegion) or not self.region._handle:
             raise ValueError("registered NVMe object requires a live HBM region")
@@ -2983,9 +2984,23 @@ class Runtime(_Owner):
             raise ValueError(
                 "registered NVMe batch regions belong to a different transport"
             )
-        native = (_RegisteredNvmeObject * len(values))(
-            *(value.native() for value in values)
-        )
+        native = (_RegisteredNvmeObject * len(values))()
+        for index, value in enumerate(values):
+            _REGISTERED_NVME_OBJECT_PACKER.pack_into(
+                native,
+                index * _REGISTERED_NVME_OBJECT_PACKER.size,
+                value.object_id,
+                value.source_byte_offset,
+                value.bytes,
+                int(value.region._handle.value),
+                value.destination_device_address,
+                _u64(
+                    _event_address(value.prior_consumer_event),
+                    "prior consumer event",
+                ),
+                value.slot,
+                value.version,
+            )
         destinations = (ctypes.c_uint64 * len(values))()
         _check(
             _runtime_install_registered_nvme_objects_async(
@@ -3276,7 +3291,9 @@ class DeviceWorkPlan(_Owner):
             for contributor_index in range(request.work_count):
                 work_ticket = request.work_begin + contributor_index
                 span = spans[work_ticket]
-                work_items[work_ticket] = WorkItem(
+                _WORK_ITEM_PACKER.pack_into(
+                    work_items,
+                    work_ticket * _WORK_ITEM_PACKER.size,
                     request.request_index,
                     request.request_slot,
                     request.generation,
@@ -3290,17 +3307,19 @@ class DeviceWorkPlan(_Owner):
                     request.work_count,
                     topology.estimated_compute_ns[work_ticket],
                     topology.ready_deadline_offset_ns[work_ticket],
+                    0,
+                    0,
                 )
-        request_values = tuple(
-            RequestRange(
+        native_requests = (RequestRange * len(topology.requests))()
+        for index, request in enumerate(topology.requests):
+            _REQUEST_RANGE_PACKER.pack_into(
+                native_requests,
+                index * _REQUEST_RANGE_PACKER.size,
                 request.work_begin,
                 request.work_count,
                 request.request_slot,
                 request.generation,
             )
-            for request in topology.requests
-        )
-        native_requests = (RequestRange * len(request_values))(*request_values)
         self._upload_native(
             work_items,
             native_dependencies,
@@ -4199,41 +4218,31 @@ class JitPhaseProgram(_Owner):
             )
         )
 
-    def progress_nvme_ordered_until_range_terminal(
+    def progress_nvme_ordered_until_idle(
         self,
         runtime: Runtime,
         first_intent: int,
         intent_count: int,
-        first_object: int,
-        object_count: int,
         issue_budget: int,
         completion_budget: int,
         timeout_ns: int,
         stream: Any = None,
     ) -> None:
-        """Advance one EDF window until a contiguous object range is terminal."""
+        """Advance one finite EDF window until transport is idle."""
         if (
             first_intent < 0
             or intent_count <= 0
             or first_intent + intent_count > runtime.config.intent_capacity
         ):
             raise ValueError("ordered NVMe intent range exceeds runtime capacity")
-        if (
-            first_object < 0
-            or object_count <= 0
-            or first_object + object_count > runtime.config.object_capacity
-        ):
-            raise ValueError("NVMe terminal target exceeds object capacity")
         if timeout_ns <= 0:
             raise ValueError("NVMe progress timeout must be positive")
         _check(
-            _phase_nvme_ordered_until_range_terminal(
+            _phase_nvme_ordered_until_idle(
                 self._handle,
                 runtime._handle,
                 first_intent,
                 intent_count,
-                first_object,
-                object_count,
                 issue_budget,
                 completion_budget,
                 timeout_ns,

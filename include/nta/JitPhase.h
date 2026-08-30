@@ -144,10 +144,9 @@ public:
                              std::uint32_t issueBudget,
                              std::uint32_t completionBudget,
                              std::uint64_t timeoutNs) const;
-  void progressNvmeOrderedUntilRangeTerminal(
+  void progressNvmeOrderedUntilIdle(
       cudaStream_t stream, abi::RuntimeView *runtime,
       std::uint32_t firstIntent, std::uint32_t intentCount,
-      std::uint32_t firstObject, std::uint32_t objectCount,
       std::uint32_t issueBudget, std::uint32_t completionBudget,
       std::uint64_t timeoutNs) const;
   void publish(cudaStream_t stream, abi::RuntimeView *runtime,

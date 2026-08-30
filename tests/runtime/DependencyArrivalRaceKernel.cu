@@ -25,15 +25,12 @@ __device__ void resetIntentQueue(nta::abi::RuntimeView *runtime,
   }
 }
 
-__device__ void prepareIntent(nta::abi::RuntimeView *runtime,
-                              std::uint32_t slotIndex,
-                              std::uint64_t intentSequence,
-                              std::uint64_t deadlineClock,
-                              std::uint32_t priority,
-                              std::uint32_t requestSlot = 0,
-                              std::uint32_t generation = 1,
-                              nta::abi::SourceKind source =
-                                  nta::abi::SourceKind::HostStaged) {
+__device__ void
+prepareIntent(nta::abi::RuntimeView *runtime, std::uint32_t slotIndex,
+              std::uint64_t intentSequence, std::uint64_t deadlineClock,
+              std::uint32_t priority, std::uint32_t requestSlot = 0,
+              std::uint32_t generation = 1,
+              nta::abi::SourceKind source = nta::abi::SourceKind::HostStaged) {
   nta::abi::IntentSlot &slot = runtime->intents[slotIndex];
   slot.sequence = intentSequence;
   slot.sourceKind = static_cast<std::uint32_t>(source);
@@ -50,8 +47,9 @@ __device__ void prepareIntent(nta::abi::RuntimeView *runtime,
 
 } // namespace
 
-extern "C" __global__ void nta_test_dependency_arrival_race(
-    nta::abi::RuntimeView *runtime, std::uint32_t *observation) {
+extern "C" __global__ void
+nta_test_dependency_arrival_race(nta::abi::RuntimeView *runtime,
+                                 std::uint32_t *observation) {
   using namespace nta;
   if (blockIdx.x != 0 || threadIdx.x >= 32) {
     return;
@@ -66,31 +64,16 @@ extern "C" __global__ void nta_test_dependency_arrival_race(
     *runtime->pendingCount = 0;
 
     runtime->objects[0] = {
-        91,
-        0,
-        4096,
-        0,
-        7,
-        static_cast<std::uint32_t>(abi::ObjectState::Issued),
-        0,
-        0,
-        0,
-        0,
-        0,
+        91, 0, 4096, 0, 7, static_cast<std::uint32_t>(abi::ObjectState::Issued),
+        0,  0, 0,    0, 0,
     };
     runtime->workTickets[0] = {
-        42,
-        0,
-        3,
-        static_cast<std::uint32_t>(abi::WorkTicketState::Initializing),
-        1,
-        0,
-        0,
-        1,
-        4096,
-        2500,
-        0,
-        1,
+        42,   0,
+        3,    static_cast<std::uint32_t>(abi::WorkTicketState::Initializing),
+        1,    0,
+        0,    1,
+        4096, 2500,
+        0,    1,
     };
     runtime->reductionExpected[0] = 0;
     runtime->reductionCompleted[0] = 0;
@@ -143,8 +126,9 @@ extern "C" __global__ void nta_test_dependency_arrival_race(
   }
 }
 
-extern "C" __global__ void nta_test_request_reduction_groups(
-    nta::abi::RuntimeView *runtime, std::uint32_t *observation) {
+extern "C" __global__ void
+nta_test_request_reduction_groups(nta::abi::RuntimeView *runtime,
+                                  std::uint32_t *observation) {
   using namespace nta;
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
@@ -158,16 +142,19 @@ extern "C" __global__ void nta_test_request_reduction_groups(
     runtime->reductionFailed[group] = 0;
   }
   runtime->workTickets[0] = {
-      42, 0, 3, static_cast<std::uint32_t>(abi::WorkTicketState::New),
-      0,  0, 0, 3, 0, 2500, 0, 2,
+      42, 0,    3, static_cast<std::uint32_t>(abi::WorkTicketState::New),
+      0,  0,    0, 3,
+      0,  2500, 0, 2,
   };
   runtime->workTickets[1] = {
-      42, 0, 3, static_cast<std::uint32_t>(abi::WorkTicketState::New),
-      0,  1, 0, 3, 0, 2500, 0, 2,
+      42, 0,    3, static_cast<std::uint32_t>(abi::WorkTicketState::New),
+      0,  1,    0, 3,
+      0,  2500, 0, 2,
   };
   runtime->workTickets[2] = {
-      43, 1, 4, static_cast<std::uint32_t>(abi::WorkTicketState::New),
-      0,  2, 0, 3, 0, 4000, 1, 1,
+      43, 1,    4, static_cast<std::uint32_t>(abi::WorkTicketState::New),
+      0,  2,    0, 3,
+      0,  4000, 1, 1,
   };
   (void)device::completeWorkTicket(runtime, 0);
   (void)device::completeWorkTicket(runtime, 2);
@@ -183,8 +170,9 @@ extern "C" __global__ void nta_test_request_reduction_groups(
   observation[7] = runtime->failedCount;
 }
 
-extern "C" __global__ void nta_test_cancelled_intent_credit_release(
-    nta::abi::RuntimeView *runtime, std::uint32_t *observation) {
+extern "C" __global__ void
+nta_test_cancelled_intent_credit_release(nta::abi::RuntimeView *runtime,
+                                         std::uint32_t *observation) {
   using namespace nta;
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
@@ -201,16 +189,11 @@ extern "C" __global__ void nta_test_cancelled_intent_credit_release(
   runtime->tenants[0].outstandingBytes = 0;
   abi::BackendView &backend =
       runtime->backends[static_cast<std::uint32_t>(source)];
-  backend = {0,
-             0,
-             1,
-             0,
-             bytes,
-             static_cast<std::uint32_t>(source),
-             1,
-             static_cast<std::uint32_t>(source),
-             0,
-             0};
+  backend = {0,     0,
+             1,     0,
+             bytes, static_cast<std::uint32_t>(source),
+             1,     static_cast<std::uint32_t>(source),
+             0,     0};
   abi::IntentSlot &slot = runtime->intents[0];
   slot = {};
   slot.intent.bytes = bytes;
@@ -233,8 +216,9 @@ extern "C" __global__ void nta_test_cancelled_intent_credit_release(
   observation[5] = static_cast<std::uint32_t>(slot.chargedBackendBytes);
 }
 
-extern "C" __global__ void nta_test_explicit_indexed_claim_credit_lifetime(
-    nta::abi::RuntimeView *runtime, std::uint32_t *observation) {
+extern "C" __global__ void
+nta_test_explicit_indexed_claim_credit_lifetime(nta::abi::RuntimeView *runtime,
+                                                std::uint32_t *observation) {
   using namespace nta;
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
@@ -251,16 +235,11 @@ extern "C" __global__ void nta_test_explicit_indexed_claim_credit_lifetime(
   runtime->tenants[0].outstandingBytes = 0;
   abi::BackendView &backend =
       runtime->backends[static_cast<std::uint32_t>(source)];
-  backend = {0,
-             0,
-             1,
-             0,
-             bytes,
-             static_cast<std::uint32_t>(source),
-             1,
-             static_cast<std::uint32_t>(source),
-             0,
-             0};
+  backend = {0,     0,
+             1,     0,
+             bytes, static_cast<std::uint32_t>(source),
+             1,     static_cast<std::uint32_t>(source),
+             0,     0};
   abi::IntentSlot &slot = runtime->intents[0];
   slot = {};
   slot.intent.bytes = bytes;
@@ -278,8 +257,8 @@ extern "C" __global__ void nta_test_explicit_indexed_claim_credit_lifetime(
   // through its queue instead.
   std::uint64_t requestBytes = 0;
   std::uint64_t backendBytes = 0;
-  bool admitted = device::reserveIntentCredits(
-      runtime, slot.intent, source, requestBytes, backendBytes);
+  bool admitted = device::reserveIntentCredits(runtime, slot.intent, source,
+                                               requestBytes, backendBytes);
   if (admitted && !device::claimIntent(slot)) {
     device::releaseIntentCredits(runtime, slot.intent, source, requestBytes,
                                  backendBytes);
@@ -310,8 +289,9 @@ extern "C" __global__ void nta_test_explicit_indexed_claim_credit_lifetime(
   observation[12] = static_cast<std::uint32_t>(backend.outstandingBytes);
 }
 
-extern "C" __global__ void nta_test_indexed_publication_topology(
-    nta::abi::RuntimeView *runtime, std::uint32_t *observation) {
+extern "C" __global__ void
+nta_test_indexed_publication_topology(nta::abi::RuntimeView *runtime,
+                                      std::uint32_t *observation) {
   using namespace nta;
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
@@ -333,31 +313,13 @@ extern "C" __global__ void nta_test_indexed_publication_topology(
   runtime->reductionCompleted[0] = 0;
   runtime->reductionFailed[0] = 0;
   runtime->objects[0] = {
-      101,
-      0,
-      4096,
-      0,
-      5,
-      static_cast<std::uint32_t>(abi::ObjectState::Ready),
-      0,
-      0,
-      0,
-      0,
-      0,
+      101, 0, 4096, 0, 5, static_cast<std::uint32_t>(abi::ObjectState::Ready),
+      0,   0, 0,    0, 0,
   };
   runtime->workTickets[0] = {
-      42,
-      0,
-      3,
-      static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
-      1,
-      0,
-      0,
-      9,
-      4096,
-      2500,
-      0,
-      1,
+      42,   0,    3, static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+      1,    0,    0, 9,
+      4096, 2500, 0, 1,
   };
   runtime->dependencies[0] = {101, 0, 5};
   runtime->dependencyNext[0] = abi::InvalidIndex;
@@ -379,32 +341,17 @@ extern "C" __global__ void nta_test_indexed_publication_topology(
   *runtime->readyCount = 0;
   *runtime->changedOverflow = 0;
   runtime->objects[1] = {
-      102,
-      0,
-      4096,
-      0,
-      6,
-      static_cast<std::uint32_t>(abi::ObjectState::Ready),
-      0,
-      0,
-      0,
-      0,
-      0,
+      102, 0, 4096, 0, 6, static_cast<std::uint32_t>(abi::ObjectState::Ready),
+      0,   0, 0,    0, 0,
   };
   for (std::uint32_t ticket = 0; ticket < 2; ++ticket) {
     runtime->workTickets[ticket] = {
-        42 + ticket,
-        ticket,
-        3 + ticket,
-        static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
-        1,
-        ticket,
-        0,
-        9,
-        4096,
-        2500,
-        ticket,
-        1,
+        42 + ticket, ticket,
+        3 + ticket,  static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+        1,           ticket,
+        0,           9,
+        4096,        2500,
+        ticket,      1,
     };
     runtime->dependencies[ticket] = {102, 1, 6};
     runtime->dependencySatisfied[ticket] = 0;
@@ -459,10 +406,10 @@ nta_test_intent_deadline_queue(nta::abi::RuntimeView *runtime,
       device::queueIntent(runtime, runtime->intents[1], source) ? 0U : 2U;
   const std::uint32_t first = device::popIntent(runtime, source);
   observation[5] = first;
-  observation[6] =
-      first != abi::InvalidIndex && device::requeueIntent(runtime, first, source)
-          ? device::popIntent(runtime, source)
-          : abi::InvalidIndex;
+  observation[6] = first != abi::InvalidIndex &&
+                           device::requeueIntent(runtime, first, source)
+                       ? device::popIntent(runtime, source)
+                       : abi::InvalidIndex;
   observation[7] = device::popIntent(runtime, source);
   observation[8] = device::popIntent(runtime, source);
 
@@ -470,16 +417,11 @@ nta_test_intent_deadline_queue(nta::abi::RuntimeView *runtime,
   // longer critical path has less laxity; in best-effort the shorter known
   // path minimizes mean completion time.
   runtime->backends[static_cast<std::uint32_t>(abi::SourceKind::HostStaged)] = {
-      0,
-      0,
-      0,
-      0,
-      UINT64_MAX,
-      static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
-      1,
-      static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
-      0,
-      0,
+      0,          0,
+      0,          0,
+      UINT64_MAX, static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
+      1,          static_cast<std::uint32_t>(abi::SourceKind::HostStaged),
+      0,          0,
   };
   runtime->requestProgress[0] = {
       42, 5, 1, 1, 0, 0, 0, 0, 4, 4096, 0, 0, 600'000, 600'000, 0,
@@ -492,9 +434,8 @@ nta_test_intent_deadline_queue(nta::abi::RuntimeView *runtime,
     prepareIntent(runtime, slotIndex, 30 + slotIndex, 3'000, 4, slotIndex,
                   5 + slotIndex);
     setupFailure |=
-        device::queueIntent(runtime, runtime->intents[slotIndex], source)
-            ? 0U
-            : 4U;
+        device::queueIntent(runtime, runtime->intents[slotIndex], source) ? 0U
+                                                                          : 4U;
   }
   observation[9] = device::popIntent(runtime, source);
 
@@ -503,9 +444,8 @@ nta_test_intent_deadline_queue(nta::abi::RuntimeView *runtime,
     prepareIntent(runtime, slotIndex, 40 + slotIndex, 0, 4, slotIndex,
                   5 + slotIndex);
     setupFailure |=
-        device::queueIntent(runtime, runtime->intents[slotIndex], source)
-            ? 0U
-            : 8U;
+        device::queueIntent(runtime, runtime->intents[slotIndex], source) ? 0U
+                                                                          : 8U;
   }
   observation[10] = device::popIntent(runtime, source);
 
@@ -513,14 +453,12 @@ nta_test_intent_deadline_queue(nta::abi::RuntimeView *runtime,
   // deadline would otherwise win.
   resetIntentQueue(runtime, source, 5);
   prepareIntent(runtime, 0, 50, 100, 1);
-  setupFailure |= device::queueIntent(runtime, runtime->intents[0], source)
-                      ? 0U
-                      : 16U;
+  setupFailure |=
+      device::queueIntent(runtime, runtime->intents[0], source) ? 0U : 16U;
   runtime->intents[0].sequence = 51;
   prepareIntent(runtime, 1, 60, 200, 1);
-  setupFailure |= device::queueIntent(runtime, runtime->intents[1], source)
-                      ? 0U
-                      : 16U;
+  setupFailure |=
+      device::queueIntent(runtime, runtime->intents[1], source) ? 0U : 16U;
   observation[11] = device::popIntent(runtime, source);
   observation[12] = device::popIntent(runtime, source);
   observation[13] = runtime->intentQueueEntries[0].state;
@@ -529,21 +467,18 @@ nta_test_intent_deadline_queue(nta::abi::RuntimeView *runtime,
   // must select the new generation once and never resurrect the old one.
   resetIntentQueue(runtime, source, 6);
   prepareIntent(runtime, 0, 70, 100, 1);
-  setupFailure |= device::queueIntent(runtime, runtime->intents[0], source)
-                      ? 0U
-                      : 32U;
+  setupFailure |=
+      device::queueIntent(runtime, runtime->intents[0], source) ? 0U : 32U;
   atomicExch(&runtime->intentQueueEntries[0].state,
              static_cast<std::uint32_t>(abi::IntentQueueState::Free));
   runtime->intents[0].intent.valid = 0;
   prepareIntent(runtime, 0, 71, 200, 1);
-  setupFailure |= device::queueIntent(runtime, runtime->intents[0], source)
-                      ? 0U
-                      : 32U;
+  setupFailure |=
+      device::queueIntent(runtime, runtime->intents[0], source) ? 0U : 32U;
   observation[14] = device::popIntent(runtime, source);
   observation[15] = device::popIntent(runtime, source);
-  observation[16] = runtime->intentQueueControls[
-                        static_cast<std::uint32_t>(source)]
-                        .size;
+  observation[16] =
+      runtime->intentQueueControls[static_cast<std::uint32_t>(source)].size;
   observation[17] = setupFailure;
 }
 
@@ -572,9 +507,8 @@ nta_test_intent_queue_concurrency(nta::abi::RuntimeView *runtime,
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    observation[4] = runtime->intentQueueControls[
-                         static_cast<std::uint32_t>(source)]
-                         .size;
+    observation[4] =
+        runtime->intentQueueControls[static_cast<std::uint32_t>(source)].size;
   }
 
   std::uint32_t selected = abi::InvalidIndex;
@@ -584,8 +518,8 @@ nta_test_intent_queue_concurrency(nta::abi::RuntimeView *runtime,
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    const abi::IntentQueueControl &control = runtime->intentQueueControls[
-        static_cast<std::uint32_t>(source)];
+    const abi::IntentQueueControl &control =
+        runtime->intentQueueControls[static_cast<std::uint32_t>(source)];
     observation[9] = control.size;
     observation[10] = control.lock;
     observation[11] = 0;
@@ -601,8 +535,8 @@ nta_test_intent_queue_concurrency(nta::abi::RuntimeView *runtime,
     for (std::uint32_t index = 0; index < 4; ++index) {
       observation[12 + index] = device::popIntent(runtime, source);
     }
-    const abi::IntentQueueControl &control = runtime->intentQueueControls[
-        static_cast<std::uint32_t>(source)];
+    const abi::IntentQueueControl &control =
+        runtime->intentQueueControls[static_cast<std::uint32_t>(source)];
     observation[16] = control.size;
     observation[17] = control.lock;
   }
@@ -616,8 +550,7 @@ nta_test_constrained_edf_dispatch(nta::abi::RuntimeView *runtime,
     return;
   }
   constexpr abi::SourceKind source = abi::SourceKind::HostStaged;
-  constexpr std::uint32_t sourceIndex =
-      static_cast<std::uint32_t>(source);
+  constexpr std::uint32_t sourceIndex = static_cast<std::uint32_t>(source);
   constexpr std::uint64_t bytes = 4096;
 
   resetIntentQueue(runtime, source, 8);
@@ -677,63 +610,141 @@ nta_test_constrained_edf_dispatch(nta::abi::RuntimeView *runtime,
       static_cast<std::uint32_t>(runtime->tenants[0].outstandingBytes);
 }
 
-extern "C" __global__ void nta_test_ordered_intent_window_validation(
-    nta::abi::RuntimeView *runtime, std::uint32_t *observation) {
+extern "C" __global__ void
+nta_test_ordered_intent_window_validation(nta::abi::RuntimeView *runtime,
+                                          std::uint32_t *observation) {
   using namespace nta;
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  if (blockIdx.x != 0 || blockDim.x != device::OrderedIntentValidationThreads) {
     return;
   }
   constexpr abi::SourceKind source = abi::SourceKind::Nvme;
-  constexpr std::uint32_t sourceIndex =
-      static_cast<std::uint32_t>(source);
+  constexpr std::uint32_t sourceIndex = static_cast<std::uint32_t>(source);
   constexpr std::uint64_t bytes = 4096;
+  __shared__ device::OrderedIntentValidationScratch scratch;
 
-  resetIntentQueue(runtime, source, 9);
-  runtime->intentPool->active = 3;
-  runtime->intentPool->enqueued = 3;
-  runtime->intentPool->consumed = 0;
-  runtime->backends[sourceIndex] = {
-      0, 0, 1'000'000'000, 0, 8 * bytes, sourceIndex, 1, sourceIndex, 0, 3,
-  };
-  runtime->tenants[0] = {8 * bytes, 0};
-  runtime->requests[0] = {100, 0, 8 * bytes, 0, 1, 0, 0, 0};
-  prepareIntent(runtime, 0, 100, 100, 1, 0, 1, source);
-  prepareIntent(runtime, 1, 101, 200, 1, 0, 1, source);
-  prepareIntent(runtime, 2, 102, 300, 1, 0, 1, source);
-  const bool ordered =
-      device::validateOrderedIntentWindow(runtime, source, 0, 3);
-  abi::IntentQueueControl &control = runtime->intentQueueControls[sourceIndex];
-  observation[0] = ordered ? 1U : 0U;
-  observation[1] = control.size;
-  observation[2] = control.reserved[0] == device::OrderedIntentWindowMagic;
-  observation[3] =
-      control.reserved[1] == device::orderedIntentWindowGeometry(0, 3);
-  const device::AdmittedIntent first =
-      device::claimOrderedAdmissibleIntent(runtime, source, 0, 3, control.size);
-  observation[4] = first.slotIndex;
-  observation[5] = control.size;
-  if (first.slotIndex != abi::InvalidIndex) {
-    abi::IntentSlot &slot = runtime->intents[first.slotIndex];
-    device::releaseIntentCredits(runtime, slot.intent, source,
-                                 first.requestBytes, first.backendBytes);
-    device::consumeIntent(runtime, slot);
+  if (threadIdx.x == 0) {
+    resetIntentQueue(runtime, source, 9);
+    runtime->intentPool->active = 3;
+    runtime->intentPool->enqueued = 3;
+    runtime->intentPool->consumed = 0;
+    runtime->backends[sourceIndex] = {
+        0, 0, 1'000'000'000, 0, 8 * bytes, sourceIndex, 1, sourceIndex, 0, 3,
+    };
+    runtime->tenants[0] = {8 * bytes, 0};
+    runtime->requests[0] = {100, 0, 8 * bytes, 0, 1, 0, 0, 0};
+    prepareIntent(runtime, 0, 100, 100, 1, 0, 1, source);
+    prepareIntent(runtime, 1, 101, 200, 1, 0, 1, source);
+    prepareIntent(runtime, 2, 102, 300, 1, 0, 1, source);
   }
+  __syncthreads();
+  const bool ordered =
+      device::validateOrderedIntentWindow(runtime, source, 0, 3, scratch);
+  abi::IntentQueueControl &control = runtime->intentQueueControls[sourceIndex];
+  if (threadIdx.x == 0) {
+    observation[0] = ordered ? 1U : 0U;
+    observation[1] = control.size;
+    observation[2] = control.reserved[0] == device::OrderedIntentWindowMagic;
+    observation[3] =
+        control.reserved[1] == device::orderedIntentWindowGeometry(0, 3);
+    const device::AdmittedIntent first = device::claimOrderedAdmissibleIntent(
+        runtime, source, 0, 3, control.size);
+    observation[4] = first.slotIndex;
+    observation[5] = control.size;
+    if (first.slotIndex != abi::InvalidIndex) {
+      abi::IntentSlot &slot = runtime->intents[first.slotIndex];
+      device::releaseIntentCredits(runtime, slot.intent, source,
+                                   first.requestBytes, first.backendBytes);
+      device::consumeIntent(runtime, slot);
+    }
+  }
+  __syncthreads();
 
-  resetIntentQueue(runtime, source, 10);
-  prepareIntent(runtime, 0, 110, 300, 1, 0, 1, source);
-  prepareIntent(runtime, 1, 111, 100, 1, 0, 1, source);
-  prepareIntent(runtime, 2, 112, 200, 1, 0, 1, source);
-  observation[6] =
-      device::validateOrderedIntentWindow(runtime, source, 0, 3) ? 1U : 0U;
-  observation[7] = control.reserved[0] == 0;
-  observation[8] = control.reserved[1] == 0;
+  if (threadIdx.x == 0) {
+    resetIntentQueue(runtime, source, 10);
+    prepareIntent(runtime, 0, 110, 300, 1, 0, 1, source);
+    prepareIntent(runtime, 1, 111, 100, 1, 0, 1, source);
+    prepareIntent(runtime, 2, 112, 200, 1, 0, 1, source);
+  }
+  __syncthreads();
+  const bool deadlineOrdered =
+      device::validateOrderedIntentWindow(runtime, source, 0, 3, scratch);
+  if (threadIdx.x == 0) {
+    observation[6] = deadlineOrdered ? 1U : 0U;
+    observation[7] = control.reserved[0] == 0;
+    observation[8] = control.reserved[1] == 0;
+  }
+  __syncthreads();
 
-  resetIntentQueue(runtime, source, 11);
-  prepareIntent(runtime, 0, 120, 100, 1, 0, 1, source);
-  prepareIntent(runtime, 1, 121, 100, 2, 0, 1, source);
-  observation[9] =
-      device::validateOrderedIntentWindow(runtime, source, 0, 2) ? 1U : 0U;
-  observation[10] = control.reserved[0] == 0;
+  if (threadIdx.x == 0) {
+    resetIntentQueue(runtime, source, 11);
+    prepareIntent(runtime, 0, 120, 100, 1, 0, 1, source);
+    prepareIntent(runtime, 1, 121, 100, 2, 0, 1, source);
+  }
+  __syncthreads();
+  const bool priorityOrdered =
+      device::validateOrderedIntentWindow(runtime, source, 0, 2, scratch);
+  if (threadIdx.x == 0) {
+    observation[9] = priorityOrdered ? 1U : 0U;
+    observation[10] = control.reserved[0] == 0;
+  }
+}
+
+extern "C" __global__ void nta_test_ordered_intent_window_validation_chunks(
+    nta::abi::RuntimeView *runtime, std::uint32_t *observation) {
+  using namespace nta;
+  constexpr std::uint32_t count =
+      device::OrderedIntentValidationThreads * 2U + 1U;
+  constexpr abi::SourceKind source = abi::SourceKind::Nvme;
+  constexpr std::uint32_t sourceIndex = static_cast<std::uint32_t>(source);
+  if (blockIdx.x != 0 || blockDim.x != device::OrderedIntentValidationThreads ||
+      runtime == nullptr || runtime->intentCapacity < count) {
+    return;
+  }
+  __shared__ device::OrderedIntentValidationScratch scratch;
+
+  if (threadIdx.x == 0) {
+    resetIntentQueue(runtime, source, 12);
+    runtime->intentPool->active = count;
+    runtime->intentPool->enqueued = count;
+    runtime->intentPool->consumed = 0;
+    runtime->backends[sourceIndex] = {
+        0, 0, 1'000'000'000, 0, 8ULL * 4096 * count, sourceIndex,
+        1, sourceIndex, 0, count,
+    };
+    runtime->tenants[0] = {8ULL * 4096 * count, 0};
+    runtime->requests[0] = {100, 0, 8ULL * 4096 * count, 0, 1, 0, 0, 0};
+  }
+  __syncthreads();
+  for (std::uint32_t slot = threadIdx.x; slot < count; slot += blockDim.x) {
+    prepareIntent(runtime, slot, 1'000 + slot, 10'000 + slot, 1, 0, 1,
+                  source);
+  }
+  __syncthreads();
+  const bool ordered =
+      device::validateOrderedIntentWindow(runtime, source, 0, count, scratch);
+  abi::IntentQueueControl &control = runtime->intentQueueControls[sourceIndex];
+  if (threadIdx.x == 0) {
+    observation[0] = ordered ? 1U : 0U;
+    observation[1] = control.reserved[0] == device::OrderedIntentWindowMagic;
+    observation[2] =
+        control.reserved[1] == device::orderedIntentWindowGeometry(0, count);
+    observation[3] = control.size;
+    resetIntentQueue(runtime, source, 13);
+  }
+  __syncthreads();
+  for (std::uint32_t slot = threadIdx.x; slot < count; slot += blockDim.x) {
+    const std::uint64_t deadline =
+        slot == device::OrderedIntentValidationThreads ? 1U : 20'000 + slot;
+    prepareIntent(runtime, slot, 2'000 + slot, deadline, 1, 0, 1, source);
+  }
+  __syncthreads();
+  const bool crossChunkOrdered =
+      device::validateOrderedIntentWindow(runtime, source, 0, count, scratch);
+  if (threadIdx.x == 0) {
+    observation[4] = crossChunkOrdered ? 1U : 0U;
+    observation[5] = control.reserved[0] == 0;
+    observation[6] = control.reserved[1] == 0;
+  }
 }
 
 extern "C" __global__ void
@@ -753,18 +764,9 @@ nta_test_request_progress_fail_closed(nta::abi::RuntimeView *runtime,
       42, 3, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0,
   };
   runtime->workTickets[0] = {
-      42,
-      0,
-      3,
-      static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
-      1,
-      0,
-      0,
-      5,
-      4096,
-      2500,
-      0,
-      1,
+      42,   0,    3, static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+      1,    0,    0, 5,
+      4096, 2500, 0, 1,
   };
 
   device::recordPendingWork(runtime, runtime->workTickets[0]);
@@ -785,8 +787,8 @@ nta_test_request_progress_fail_closed(nta::abi::RuntimeView *runtime,
   observation[4] = runtime->failedCount;
   observation[5] = runtime->stickyFailedCount - stickyBefore;
   observation[6] = runtime->requestProgress[0].pendingWork;
-  observation[7] = static_cast<std::uint32_t>(
-      runtime->requestProgress[0].unavailableBytes);
-  observation[8] = static_cast<std::uint32_t>(
-      runtime->requestProgress[0].pendingComputeNs);
+  observation[7] =
+      static_cast<std::uint32_t>(runtime->requestProgress[0].unavailableBytes);
+  observation[8] =
+      static_cast<std::uint32_t>(runtime->requestProgress[0].pendingComputeNs);
 }

@@ -19,7 +19,6 @@ import math
 from types import MappingProxyType
 from typing import Any
 
-from nta_runtime.abi import u32, u64
 from nta_runtime.indexed_transfer import ContiguousPairRun, analyze_index_pairs
 from nta_runtime.runtime import RegisteredNvmeObjectInstall
 
@@ -194,81 +193,8 @@ class NvmeObjectReference:
     bytes: int
 
 
-@dataclass(frozen=True, slots=True)
-class RegisteredNvmeObjectBinding:
-    """One prevalidated directory binding over a setup-time HBM mapping.
-
-    The transport owns ``region`` and its IOMMU mapping; the engine owns the
-    numerical destination contained by that region.  ``prior_consumer_event``
-    is field-scoped: every reused directory slot carries its own quiescence
-    proof even when all slots share the same CUDA event.
-    """
-
-    slot: int
-    object_id: int
-    version: int
-    source_offset: int
-    bytes: int
-    region: Any
-    destination_address: int
-    prior_consumer_event: Any | None = field(
-        default=None, repr=False, compare=False, hash=False
-    )
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "slot", u32(self.slot, "NVMe object slot"))
-        object.__setattr__(
-            self, "object_id", u64(self.object_id, "NVMe object identity")
-        )
-        object.__setattr__(
-            self,
-            "version",
-            u32(self.version, "NVMe object version", positive=True),
-        )
-        object.__setattr__(
-            self,
-            "source_offset",
-            u64(self.source_offset, "NVMe object source offset"),
-        )
-        object.__setattr__(
-            self, "bytes", u64(self.bytes, "NVMe object bytes", positive=True)
-        )
-        object.__setattr__(
-            self,
-            "destination_address",
-            u64(
-                self.destination_address,
-                "NVMe object destination address",
-                positive=True,
-            ),
-        )
-        if self.source_offset > (1 << 64) - 1 - self.bytes:
-            raise ValueError("NVMe object source extent overflows uint64")
-        if self.destination_address > (1 << 64) - 1 - self.bytes:
-            raise ValueError("NVMe object destination extent overflows uint64")
-        try:
-            region_address = u64(
-                self.region.address, "registered HBM region address", positive=True
-            )
-            region_bytes = u64(
-                self.region.bytes, "registered HBM region bytes", positive=True
-            )
-        except AttributeError as error:
-            raise TypeError(
-                "NVMe object binding requires a registered HBM region"
-            ) from error
-        if (
-            region_address > (1 << 64) - 1 - region_bytes
-            or self.destination_address < region_address
-            or self.destination_address - region_address > region_bytes - self.bytes
-        ):
-            raise ValueError(
-                "NVMe numerical destination exceeds its registered HBM region"
-            )
-
-
 def publish_registered_nvme_objects(
-    bindings: tuple[RegisteredNvmeObjectBinding, ...],
+    bindings: tuple[RegisteredNvmeObjectInstall, ...],
     *,
     runtime: Any,
     stream: Any,
@@ -294,21 +220,8 @@ def publish_registered_nvme_objects(
         raise ValueError(
             "registered NVMe publication slots must be contiguous and increasing"
         )
-    installs = tuple(
-        RegisteredNvmeObjectInstall(
-            binding.slot,
-            binding.object_id,
-            binding.version,
-            binding.source_offset,
-            binding.bytes,
-            binding.region,
-            binding.destination_address,
-            binding.prior_consumer_event,
-        )
-        for binding in bindings
-    )
-    installed = runtime.install_registered_nvme_objects_async(installs, stream)
-    expected = tuple(binding.destination_address for binding in bindings)
+    installed = runtime.install_registered_nvme_objects_async(bindings, stream)
+    expected = tuple(binding.destination_device_address for binding in bindings)
     if installed != expected:
         raise RuntimeError("NVMe objects do not alias their numerical destinations")
     return installed
@@ -371,7 +284,7 @@ class PreparedNvmeRunPublication:
 
     plan: NvmeRunPlan
     lane_count: int
-    bindings: tuple[RegisteredNvmeObjectBinding, ...]
+    bindings: tuple[RegisteredNvmeObjectInstall, ...]
     runs_by_object: tuple[ContiguousPairRun, ...]
     previous_destinations: tuple[int | None, ...]
 
@@ -497,7 +410,7 @@ def prepare_nvme_runs(
                 raise RuntimeError("NVMe catalog produced an invalid physical extent")
             resolved.append((run, lane, extent))
 
-    bindings: list[RegisteredNvmeObjectBinding] = []
+    bindings: list[RegisteredNvmeObjectInstall] = []
     previous_destinations: list[int | None] = []
     runs_by_object: list[ContiguousPairRun] = []
     for relative, (run, lane, extent) in enumerate(resolved):
@@ -507,7 +420,7 @@ def prepare_nvme_runs(
         quiescence = lifetime.prior_consumer_event(slot)
         destination = lane.address(run)
         bindings.append(
-            RegisteredNvmeObjectBinding(
+            RegisteredNvmeObjectInstall(
                 slot,
                 object_id,
                 object_version,
@@ -554,12 +467,10 @@ def publish_prepared_nvme_runs(
         installed = installed_addresses[cursor : cursor + preparation.object_count]
         cursor += preparation.object_count
         expected = tuple(
-            binding.destination_address for binding in preparation.bindings
+            binding.destination_device_address for binding in preparation.bindings
         )
         if installed != expected:
-            raise RuntimeError(
-                "NVMe objects do not alias their numerical destinations"
-            )
+            raise RuntimeError("NVMe objects do not alias their numerical destinations")
 
         run_objects: dict[ContiguousPairRun, list[NvmeObjectReference]] = {
             run: [] for run in preparation.plan.unique_runs

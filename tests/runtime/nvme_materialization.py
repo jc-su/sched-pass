@@ -3,11 +3,11 @@ from dataclasses import dataclass
 from nta_runtime.nvme_materialization import (
     NvmeSlotLifetime,
     NvmeTensorLane,
-    RegisteredNvmeObjectBinding,
     plan_nvme_runs,
     publish_registered_nvme_objects,
     publish_nvme_runs,
 )
+from nta_runtime.runtime import RegisteredNvmeObjectInstall
 
 
 @dataclass(frozen=True)
@@ -234,10 +234,10 @@ def main() -> None:
     shared_event = object()
     direct_runtime = _Runtime()
     direct_bindings = (
-        RegisteredNvmeObjectBinding(
+        RegisteredNvmeObjectInstall(
             0, 100, 9, 0, 16, _Region(4_000, 64), 4_000, shared_event
         ),
-        RegisteredNvmeObjectBinding(
+        RegisteredNvmeObjectInstall(
             1, 101, 9, 16, 16, _Region(5_000, 64), 5_016, shared_event
         ),
     )
@@ -253,7 +253,7 @@ def main() -> None:
         publish_registered_nvme_objects(
             (
                 direct_bindings[0],
-                RegisteredNvmeObjectBinding(
+                RegisteredNvmeObjectInstall(
                     2, 102, 10, 32, 16, _Region(6_000, 64), 6_000, shared_event
                 ),
             ),
@@ -267,9 +267,7 @@ def main() -> None:
     assert direct_runtime.batch_calls == 1
 
     try:
-        RegisteredNvmeObjectBinding(
-            0, 100, 1, 0, 32, _Region(4_000, 16), 4_000, None
-        )
+        RegisteredNvmeObjectInstall(0, 100, 1, 0, 32, _Region(4_000, 16), 4_000, None)
     except ValueError as error:
         assert "registered HBM region" in str(error)
     else:

@@ -685,9 +685,10 @@ intentQueueEntryPrecedes(const abi::IntentQueueEntry &left,
   return left.intentSequence < right.intentSequence;
 }
 
-__device__ __forceinline__ bool intentQueueNodeCurrent(
-    abi::RuntimeView *runtime, abi::SourceKind source,
-    const abi::IntentQueueNode &node, abi::IntentQueueEntry *&entry) {
+__device__ __forceinline__ bool
+intentQueueNodeCurrent(abi::RuntimeView *runtime, abi::SourceKind source,
+                       const abi::IntentQueueNode &node,
+                       abi::IntentQueueEntry *&entry) {
   entry = nullptr;
   if (node.slotIndex >= runtime->intentCapacity) {
     return false;
@@ -702,7 +703,8 @@ __device__ __forceinline__ bool intentQueueNodeCurrent(
       candidate.epoch != currentEpoch(runtime) ||
       candidate.sourceKind != sourceIndex ||
       slot.sequence != node.intentSequence || slot.epoch != candidate.epoch ||
-      slot.sourceKind != sourceIndex || atomicAdd(&slot.intent.valid, 0U) != 1U) {
+      slot.sourceKind != sourceIndex ||
+      atomicAdd(&slot.intent.valid, 0U) != 1U) {
     return false;
   }
   entry = &candidate;
@@ -741,8 +743,7 @@ setIntentHeapNode(abi::RuntimeView *runtime, abi::SourceKind source,
                   const abi::IntentQueueNode &node) {
   heap[index] = node;
   if (node.slotIndex < runtime->intentCapacity) {
-    abi::IntentQueueEntry &entry =
-        runtime->intentQueueEntries[node.slotIndex];
+    abi::IntentQueueEntry &entry = runtime->intentQueueEntries[node.slotIndex];
     if (entry.intentSequence == node.intentSequence &&
         entry.sourceKind == static_cast<std::uint32_t>(source)) {
       entry.heapIndex = index;
@@ -750,9 +751,10 @@ setIntentHeapNode(abi::RuntimeView *runtime, abi::SourceKind source,
   }
 }
 
-__device__ __forceinline__ void
-siftIntentUp(abi::RuntimeView *runtime, abi::SourceKind source,
-             abi::IntentQueueNode *heap, std::uint32_t index) {
+__device__ __forceinline__ void siftIntentUp(abi::RuntimeView *runtime,
+                                             abi::SourceKind source,
+                                             abi::IntentQueueNode *heap,
+                                             std::uint32_t index) {
   while (index != 0) {
     const std::uint32_t parent = (index - 1U) / 2U;
     if (!intentQueueNodePrecedes(runtime, source, heap[index], heap[parent])) {
@@ -766,10 +768,11 @@ siftIntentUp(abi::RuntimeView *runtime, abi::SourceKind source,
   }
 }
 
-__device__ __forceinline__ void
-siftIntentDown(abi::RuntimeView *runtime, abi::SourceKind source,
-               abi::IntentQueueNode *heap, std::uint32_t size,
-               std::uint32_t index) {
+__device__ __forceinline__ void siftIntentDown(abi::RuntimeView *runtime,
+                                               abi::SourceKind source,
+                                               abi::IntentQueueNode *heap,
+                                               std::uint32_t size,
+                                               std::uint32_t index) {
   for (;;) {
     const std::uint32_t left = index * 2U + 1U;
     if (left >= size) {
@@ -777,8 +780,8 @@ siftIntentDown(abi::RuntimeView *runtime, abi::SourceKind source,
     }
     const std::uint32_t right = left + 1U;
     const std::uint32_t first =
-        right < size &&
-                intentQueueNodePrecedes(runtime, source, heap[right], heap[left])
+        right < size && intentQueueNodePrecedes(runtime, source, heap[right],
+                                                heap[left])
             ? right
             : left;
     if (!intentQueueNodePrecedes(runtime, source, heap[first], heap[index])) {
@@ -794,8 +797,8 @@ siftIntentDown(abi::RuntimeView *runtime, abi::SourceKind source,
 
 __device__ __forceinline__ void
 removeIntentHeapAt(abi::RuntimeView *runtime, abi::SourceKind source,
-                   abi::IntentQueueControl &control,
-                   abi::IntentQueueNode *heap, std::uint32_t index) {
+                   abi::IntentQueueControl &control, abi::IntentQueueNode *heap,
+                   std::uint32_t index) {
   if (index >= control.size) {
     return;
   }
@@ -816,8 +819,8 @@ removeIntentHeapAt(abi::RuntimeView *runtime, abi::SourceKind source,
     return;
   }
   setIntentHeapNode(runtime, source, heap, index, last);
-  if (index != 0 && intentQueueNodePrecedes(
-                        runtime, source, heap[index], heap[(index - 1U) / 2U])) {
+  if (index != 0 && intentQueueNodePrecedes(runtime, source, heap[index],
+                                            heap[(index - 1U) / 2U])) {
     siftIntentUp(runtime, source, heap, index);
   } else {
     siftIntentDown(runtime, source, heap, control.size, index);
@@ -845,10 +848,11 @@ compactIntentHeap(abi::RuntimeView *runtime, abi::SourceKind source,
   }
 }
 
-__device__ __forceinline__ bool
-pushIntentHeap(abi::RuntimeView *runtime, abi::SourceKind source,
-               abi::IntentQueueControl &control, abi::IntentQueueNode *heap,
-               std::uint32_t slotIndex) {
+__device__ __forceinline__ bool pushIntentHeap(abi::RuntimeView *runtime,
+                                               abi::SourceKind source,
+                                               abi::IntentQueueControl &control,
+                                               abi::IntentQueueNode *heap,
+                                               std::uint32_t slotIndex) {
   if (control.size >= runtime->intentCapacity) {
     compactIntentHeap(runtime, source, control, heap);
   }
@@ -880,10 +884,9 @@ __device__ __forceinline__ bool queueIntent(abi::RuntimeView *runtime,
     return false;
   }
   abi::IntentQueueEntry &entry = runtime->intentQueueEntries[slotIndex];
-  if (atomicCAS(
-          &entry.state,
-          static_cast<std::uint32_t>(abi::IntentQueueState::Free),
-          static_cast<std::uint32_t>(abi::IntentQueueState::Preparing)) !=
+  if (atomicCAS(&entry.state,
+                static_cast<std::uint32_t>(abi::IntentQueueState::Free),
+                static_cast<std::uint32_t>(abi::IntentQueueState::Preparing)) !=
       static_cast<std::uint32_t>(abi::IntentQueueState::Free)) {
     return false;
   }
@@ -922,8 +925,8 @@ __device__ __forceinline__ bool queueIntent(abi::RuntimeView *runtime,
 // Raw heap operations are exposed only to the queue ordering/concurrency
 // fixtures. Production dispatch must use claimAdmissibleIntent so byte-credit
 // constraints cannot turn pop/requeue into same-round starvation.
-__device__ __forceinline__ std::uint32_t
-popIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
+__device__ __forceinline__ std::uint32_t popIntent(abi::RuntimeView *runtime,
+                                                   abi::SourceKind source) {
   if (!intentQueueAvailable(runtime)) {
     return abi::InvalidIndex;
   }
@@ -950,10 +953,9 @@ popIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
       }
     }
     if (current &&
-        atomicCAS(
-            &entry->state,
-            static_cast<std::uint32_t>(abi::IntentQueueState::Queued),
-            static_cast<std::uint32_t>(abi::IntentQueueState::Claimed)) ==
+        atomicCAS(&entry->state,
+                  static_cast<std::uint32_t>(abi::IntentQueueState::Queued),
+                  static_cast<std::uint32_t>(abi::IntentQueueState::Claimed)) ==
             static_cast<std::uint32_t>(abi::IntentQueueState::Queued)) {
       selected = node.slotIndex;
       break;
@@ -970,10 +972,9 @@ __device__ __forceinline__ bool requeueIntent(abi::RuntimeView *runtime,
     return false;
   }
   abi::IntentQueueEntry &entry = runtime->intentQueueEntries[slotIndex];
-  if (atomicCAS(
-          &entry.state,
-          static_cast<std::uint32_t>(abi::IntentQueueState::Claimed),
-          static_cast<std::uint32_t>(abi::IntentQueueState::Preparing)) !=
+  if (atomicCAS(&entry.state,
+                static_cast<std::uint32_t>(abi::IntentQueueState::Claimed),
+                static_cast<std::uint32_t>(abi::IntentQueueState::Preparing)) !=
       static_cast<std::uint32_t>(abi::IntentQueueState::Claimed)) {
     return false;
   }
@@ -1116,8 +1117,7 @@ inline constexpr std::uint64_t OrderedIntentWindowMagic =
     0x4e54414f52444552ULL; // "NTAORDER"
 
 __device__ __forceinline__ std::uint64_t
-orderedIntentWindowGeometry(std::uint32_t firstSlot,
-                            std::uint32_t slotCount) {
+orderedIntentWindowGeometry(std::uint32_t firstSlot, std::uint32_t slotCount) {
   return (static_cast<std::uint64_t>(firstSlot) << 32U) | slotCount;
 }
 
@@ -1133,18 +1133,17 @@ combineCreditState(DispatchCreditState left, DispatchCreditState right) {
              : DispatchCreditState::Ready;
 }
 
-__device__ __forceinline__ DispatchCreditState
-creditState(const std::uint64_t *counter, std::uint64_t maximum,
-            std::uint64_t bytes) {
+__device__ __forceinline__ DispatchCreditState creditState(
+    const std::uint64_t *counter, std::uint64_t maximum, std::uint64_t bytes) {
   if (bytes > maximum) {
     return DispatchCreditState::Impossible;
   }
-  const std::uint64_t outstanding = atomicAdd(
-      reinterpret_cast<unsigned long long *>(
-          const_cast<std::uint64_t *>(counter)),
-      0ULL);
+  const std::uint64_t outstanding =
+      atomicAdd(reinterpret_cast<unsigned long long *>(
+                    const_cast<std::uint64_t *>(counter)),
+                0ULL);
   return outstanding <= maximum - bytes ? DispatchCreditState::Ready
-                                         : DispatchCreditState::Blocked;
+                                        : DispatchCreditState::Blocked;
 }
 
 __device__ __forceinline__ DispatchCreditState
@@ -1164,30 +1163,28 @@ intentCreditState(abi::RuntimeView *runtime, const abi::AcquireIntent &intent,
     return DispatchCreditState::Impossible;
   }
   const abi::RequestContext &request = runtime->requests[intent.requestSlot];
-  state = combineCreditState(
-      state, creditState(&request.outstandingBytes, request.maxOutstandingBytes,
-                         intent.bytes));
+  state = combineCreditState(state, creditState(&request.outstandingBytes,
+                                                request.maxOutstandingBytes,
+                                                intent.bytes));
   if (intent.tenantId >= runtime->tenantCapacity) {
     return DispatchCreditState::Impossible;
   }
   const abi::TenantContext &tenant = runtime->tenants[intent.tenantId];
-  return combineCreditState(
-      state, creditState(&tenant.outstandingBytes, tenant.maxOutstandingBytes,
-                         intent.bytes));
+  return combineCreditState(state, creditState(&tenant.outstandingBytes,
+                                               tenant.maxOutstandingBytes,
+                                               intent.bytes));
 }
 
 __device__ __forceinline__ bool
 reserveIntentCredits(abi::RuntimeView *runtime,
                      const abi::AcquireIntent &intent, abi::SourceKind source,
-                     std::uint64_t &requestBytes,
-                     std::uint64_t &backendBytes) {
+                     std::uint64_t &requestBytes, std::uint64_t &backendBytes) {
   const bool live = requestLive(runtime, intent.requestSlot, intent.generation);
   if (live && !tryReserveRequestBytes(runtime, intent.requestSlot,
                                       intent.generation, intent.bytes)) {
     return false;
   }
-  if (live &&
-      !tryReserveTenantBytes(runtime, intent.tenantId, intent.bytes)) {
+  if (live && !tryReserveTenantBytes(runtime, intent.tenantId, intent.bytes)) {
     releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
                         intent.bytes);
     return false;
@@ -1208,8 +1205,7 @@ reserveIntentCredits(abi::RuntimeView *runtime,
 __device__ __forceinline__ void
 releaseIntentCredits(abi::RuntimeView *runtime,
                      const abi::AcquireIntent &intent, abi::SourceKind source,
-                     std::uint64_t requestBytes,
-                     std::uint64_t backendBytes) {
+                     std::uint64_t requestBytes, std::uint64_t backendBytes) {
   releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
                       requestBytes);
   releaseTenantBytes(runtime, intent.tenantId, requestBytes);
@@ -1224,8 +1220,7 @@ recordIntentCredits(abi::IntentSlot &slot, std::uint64_t requestBytes,
 }
 
 __device__ __forceinline__ void
-releaseRecordedIntentCredits(abi::RuntimeView *runtime,
-                             abi::IntentSlot &slot,
+releaseRecordedIntentCredits(abi::RuntimeView *runtime, abi::IntentSlot &slot,
                              const abi::AcquireIntent &intent,
                              abi::SourceKind source) {
   const std::uint64_t requestBytes = slot.chargedRequestBytes;
@@ -1294,8 +1289,8 @@ claimAdmissibleIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
     }
   }
 
-  const bool terminal = readyIndex == abi::InvalidIndex &&
-                        impossibleIndex != abi::InvalidIndex;
+  const bool terminal =
+      readyIndex == abi::InvalidIndex && impossibleIndex != abi::InvalidIndex;
   const std::uint32_t selectedIndex =
       readyIndex != abi::InvalidIndex ? readyIndex : impossibleIndex;
   if (selectedIndex == abi::InvalidIndex) {
@@ -1316,8 +1311,8 @@ claimAdmissibleIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
   const std::uint32_t queued =
       static_cast<std::uint32_t>(abi::IntentQueueState::Queued);
   if (atomicCAS(&entry.state, queued,
-                static_cast<std::uint32_t>(
-                    abi::IntentQueueState::Claimed)) != queued) {
+                static_cast<std::uint32_t>(abi::IntentQueueState::Claimed)) !=
+      queued) {
     releaseIntentCredits(runtime, slot.intent, source, result.requestBytes,
                          result.backendBytes);
     unlockIntentQueue(*control);
@@ -1344,11 +1339,27 @@ claimAdmissibleIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
 // advances in O(1) when the earliest intent has credits. If that intent is
 // temporarily blocked, a bounded forward scan retains the generic queue's
 // work-conserving behavior without paying heap maintenance on every 4-KiB I/O.
-__device__ __forceinline__ bool validateOrderedIntentWindow(
-    abi::RuntimeView *runtime, abi::SourceKind source,
-    std::uint32_t firstSlot, std::uint32_t slotCount) {
+inline constexpr std::uint32_t OrderedIntentValidationThreads = 256;
+
+struct OrderedIntentValidationScratch {
+  abi::IntentQueueEntry entries[OrderedIntentValidationThreads];
+  std::uint32_t present[OrderedIntentValidationThreads];
+  std::uint32_t ordered;
+  std::uint32_t havePrevious;
+  abi::IntentQueueEntry previous;
+};
+
+// Validate one finite intent image collectively. Global slot reads and EDF-key
+// construction are parallel; lane zero performs only the ordered comparison in
+// shared memory. Invalid images remain fail-closed and are queued through the
+// generic heap by the caller.
+__device__ __forceinline__ bool
+validateOrderedIntentWindow(abi::RuntimeView *runtime, abi::SourceKind source,
+                            std::uint32_t firstSlot, std::uint32_t slotCount,
+                            OrderedIntentValidationScratch &scratch) {
   if (runtime == nullptr || runtime->intents == nullptr || slotCount == 0 ||
-      firstSlot > runtime->intentCapacity ||
+      blockDim.x != OrderedIntentValidationThreads || blockDim.y != 1 ||
+      blockDim.z != 1 || firstSlot > runtime->intentCapacity ||
       slotCount > runtime->intentCapacity - firstSlot) {
     return false;
   }
@@ -1356,53 +1367,78 @@ __device__ __forceinline__ bool validateOrderedIntentWindow(
   if (control == nullptr) {
     return false;
   }
-  control->reserved[0] = 0;
-  control->reserved[1] = 0;
+  if (threadIdx.x == 0) {
+    control->reserved[0] = 0;
+    control->reserved[1] = 0;
+    scratch.ordered = control->size == 0 ? 1U : 0U;
+    scratch.havePrevious = 0;
+  }
+  __syncthreads();
 
-  bool ordered = control->size == 0;
-  bool havePrevious = false;
-  abi::IntentQueueEntry previous{};
-  const std::uint32_t sourceIndex = static_cast<std::uint32_t>(source);
   const std::uint32_t end = firstSlot + slotCount;
-  for (std::uint32_t index = firstSlot; ordered && index < end; ++index) {
-    abi::IntentSlot &slot = runtime->intents[index];
-    if (atomicAdd(&slot.intent.valid, 0U) != 1U ||
-        slot.epoch != currentEpoch(runtime)) {
-      continue;
+  const std::uint32_t sourceIndex = static_cast<std::uint32_t>(source);
+  for (std::uint32_t base = firstSlot; base < end;
+       base += OrderedIntentValidationThreads) {
+    const std::uint32_t index = base + threadIdx.x;
+    scratch.present[threadIdx.x] = 0;
+    if (index < end) {
+      abi::IntentSlot &slot = runtime->intents[index];
+      if (atomicAdd(&slot.intent.valid, 0U) == 1U &&
+          slot.epoch == currentEpoch(runtime)) {
+        if (slot.sourceKind != sourceIndex || slot.intent.objectSlot != index ||
+            slot.intent.deadlineClock == 0) {
+          atomicExch(&scratch.ordered, 0U);
+        } else {
+          abi::IntentQueueEntry current{};
+          current.intentSequence = slot.sequence;
+          current.stableSequence = index;
+          current.deadlineClock = slot.intent.deadlineClock;
+          current.criticalServiceNs =
+              criticalServiceNs(runtime, slot.intent, source);
+          current.priority = slot.intent.priority;
+          scratch.entries[threadIdx.x] = current;
+          scratch.present[threadIdx.x] = 1U;
+        }
+      }
     }
-    if (slot.sourceKind != sourceIndex || slot.intent.objectSlot != index ||
-        slot.intent.deadlineClock == 0) {
-      ordered = false;
-      break;
+    __syncthreads();
+    if (threadIdx.x == 0 && scratch.ordered != 0) {
+      const std::uint32_t remaining = end - base;
+      const std::uint32_t chunkCount =
+          remaining < OrderedIntentValidationThreads
+              ? remaining
+              : OrderedIntentValidationThreads;
+      for (std::uint32_t offset = 0; offset < chunkCount; ++offset) {
+        if (scratch.present[offset] == 0) {
+          continue;
+        }
+        const abi::IntentQueueEntry current = scratch.entries[offset];
+        if (scratch.havePrevious != 0 &&
+            intentQueueEntryPrecedes(current, scratch.previous)) {
+          scratch.ordered = 0;
+          break;
+        }
+        scratch.previous = current;
+        scratch.havePrevious = 1U;
+      }
     }
-    abi::IntentQueueEntry current{};
-    current.intentSequence = slot.sequence;
-    current.stableSequence = index;
-    current.deadlineClock = slot.intent.deadlineClock;
-    current.criticalServiceNs = criticalServiceNs(runtime, slot.intent, source);
-    current.priority = slot.intent.priority;
-    if (havePrevious && intentQueueEntryPrecedes(current, previous)) {
-      ordered = false;
-      break;
-    }
-    previous = current;
-    havePrevious = true;
+    __syncthreads();
   }
-  if (!ordered) {
-    return false;
+
+  if (threadIdx.x == 0 && scratch.ordered != 0) {
+    control->size = firstSlot;
+    control->reserved[1] = orderedIntentWindowGeometry(firstSlot, slotCount);
+    __threadfence();
+    control->reserved[0] = OrderedIntentWindowMagic;
+    __threadfence();
   }
-  // The heap-size field is unused in ordered mode and becomes the sole queue
-  // owner's persistent dispatch cursor across finite frontier kernels.
-  control->size = firstSlot;
-  control->reserved[1] = orderedIntentWindowGeometry(firstSlot, slotCount);
-  __threadfence();
-  control->reserved[0] = OrderedIntentWindowMagic;
-  __threadfence();
-  return true;
+  __syncthreads();
+  return scratch.ordered != 0;
 }
 
-__device__ __forceinline__ bool orderedIntentCurrent(
-    abi::RuntimeView *runtime, abi::SourceKind source, std::uint32_t index) {
+__device__ __forceinline__ bool orderedIntentCurrent(abi::RuntimeView *runtime,
+                                                     abi::SourceKind source,
+                                                     std::uint32_t index) {
   if (runtime == nullptr || runtime->intents == nullptr ||
       index >= runtime->intentCapacity) {
     return false;
@@ -1414,9 +1450,8 @@ __device__ __forceinline__ bool orderedIntentCurrent(
 }
 
 __device__ __forceinline__ AdmittedIntent claimOrderedAdmissibleIntent(
-    abi::RuntimeView *runtime, abi::SourceKind source,
-    std::uint32_t firstSlot, std::uint32_t slotCount,
-    std::uint32_t &cursor) {
+    abi::RuntimeView *runtime, abi::SourceKind source, std::uint32_t firstSlot,
+    std::uint32_t slotCount, std::uint32_t &cursor) {
   AdmittedIntent result{};
   if (runtime == nullptr || runtime->intents == nullptr || slotCount == 0 ||
       firstSlot > runtime->intentCapacity ||
@@ -1448,8 +1483,8 @@ __device__ __forceinline__ AdmittedIntent claimOrderedAdmissibleIntent(
       impossible = index;
     }
   }
-  const bool terminal = ready == abi::InvalidIndex &&
-                        impossible != abi::InvalidIndex;
+  const bool terminal =
+      ready == abi::InvalidIndex && impossible != abi::InvalidIndex;
   const std::uint32_t selected =
       ready != abi::InvalidIndex ? ready : impossible;
   if (selected == abi::InvalidIndex) {
@@ -1458,8 +1493,8 @@ __device__ __forceinline__ AdmittedIntent claimOrderedAdmissibleIntent(
 
   abi::IntentSlot &slot = runtime->intents[selected];
   if (!terminal &&
-      !reserveIntentCredits(runtime, slot.intent, source,
-                            result.requestBytes, result.backendBytes)) {
+      !reserveIntentCredits(runtime, slot.intent, source, result.requestBytes,
+                            result.backendBytes)) {
     return result;
   }
   if (!claimIntent(slot)) {
@@ -1756,6 +1791,21 @@ struct NvmeAdmission {
 };
 
 inline constexpr std::uint32_t NvmeIssueBatchCapacity = 64;
+inline constexpr std::uint32_t NvmeCompletionBatchCapacity = 64;
+
+struct NvmeCompletionDescriptor {
+  std::uint32_t commandId;
+  std::uint32_t status;
+};
+
+struct NvmeCompletionBatch {
+  NvmeCompletionDescriptor entries[NvmeCompletionBatchCapacity];
+  std::uint32_t count;
+  std::uint32_t nextHead;
+  std::uint32_t nextPhase;
+  std::uint32_t malformed;
+  std::uint32_t firstError;
+};
 
 struct NvmeIssueDescriptor {
   std::uint32_t intentSlotIndex;
@@ -1772,6 +1822,116 @@ struct NvmeIssueBatch {
   std::uint32_t count;
   std::uint32_t maximumDmaPageCount;
 };
+
+// Consume a bounded CQ prefix as one I/O-coherence transaction. NVMe publishes
+// each completion only after its DMA is globally visible; lane zero first
+// observes and claims a contiguous phase-valid prefix, then one system fence
+// orders all of those observations before warp-parallel readiness publication.
+// Context state 2 is private to the queue lease and prevents a malformed
+// duplicate command ID from being processed twice.
+__device__ __forceinline__ bool
+drainNvmeCompletionBatch(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
+                         std::uint32_t completionBudget, std::uint32_t lane,
+                         NvmeCompletionBatch &batch) {
+  if (lane == 0) {
+    batch.count = 0;
+    batch.nextHead = queue.cqHead;
+    batch.nextPhase = queue.cqPhase;
+    batch.malformed = 0;
+    batch.firstError = 0;
+    const std::uint32_t maximum = min(
+        min(completionBudget, NvmeCompletionBatchCapacity), queue.outstanding);
+    while (batch.count < maximum) {
+      abi::NvmeCompletion &completion = queue.completions[batch.nextHead];
+      const std::uint32_t commandAndStatus =
+          loadIoCoherent(&completion.dword[3]);
+      const std::uint32_t statusField = commandAndStatus >> 16U;
+      if ((statusField & 1U) != batch.nextPhase) {
+        break;
+      }
+      const std::uint32_t commandId = commandAndStatus & 0xffffU;
+      if (commandId >= queue.depth ||
+          atomicCAS(&queue.contexts[commandId].active, 1U, 2U) != 1U) {
+        batch.malformed = 1;
+        break;
+      }
+      batch.entries[batch.count++] = {commandId, statusField >> 1U};
+      ++batch.nextHead;
+      if (batch.nextHead == queue.depth) {
+        batch.nextHead = 0;
+        batch.nextPhase ^= 1U;
+      }
+    }
+    if (batch.count != 0) {
+      systemIoFence();
+    }
+  }
+  __syncwarp();
+
+  std::uint32_t completed = 0;
+  std::uint32_t failed = 0;
+  for (std::uint32_t index = lane; index < batch.count; index += warpSize) {
+    const NvmeCompletionDescriptor completion = batch.entries[index];
+    abi::NvmeCommandContext &stored = queue.contexts[completion.commandId];
+    const abi::NvmeCommandContext context = stored;
+    bool objectCurrent = context.epoch == currentEpoch(runtime) &&
+                         context.objectSlot < runtime->objectCapacity;
+    if (objectCurrent) {
+      abi::ObjectEntry &object = runtime->objects[context.objectSlot];
+      const abi::ReplicaEntry *selected =
+          replica(runtime, object, object.selectedReplica);
+      objectCurrent = object.objectId == context.objectId &&
+                      object.version == context.objectVersion &&
+                      selected != nullptr &&
+                      selected->sourceKind ==
+                          static_cast<std::uint32_t>(abi::SourceKind::Nvme);
+      if (objectCurrent && completion.status == 0) {
+        atomicExch(&object.state,
+                   static_cast<std::uint32_t>(abi::ObjectState::Ready));
+        publishObjectTransition(runtime, context.objectSlot,
+                                abi::ObjectState::Ready);
+        ++completed;
+      } else if (objectCurrent) {
+        atomicExch(&object.state,
+                   static_cast<std::uint32_t>(abi::ObjectState::Failed));
+        publishObjectTransition(runtime, context.objectSlot,
+                                abi::ObjectState::Failed);
+        failBoundWorkTicket(runtime, context.workTicket, context.requestSlot,
+                            context.generation);
+        ++failed;
+        atomicCAS(&batch.firstError, 0U, completion.status);
+      }
+    }
+    if (!objectCurrent) {
+      ++failed;
+      atomicCAS(&batch.firstError, 0U, 0xfffffffbU);
+    }
+    releaseRequestBytes(runtime, context.requestSlot, context.generation,
+                        context.bytes);
+    releaseTenantBytes(runtime, context.tenantId, context.bytes);
+    releaseBackendBytes(runtime, abi::SourceKind::Nvme, context.backendBytes);
+    atomicExch(&stored.active, 0U);
+  }
+
+  for (std::uint32_t offset = warpSize / 2U; offset != 0; offset /= 2U) {
+    completed += __shfl_down_sync(0xffffffffU, completed, offset);
+    failed += __shfl_down_sync(0xffffffffU, failed, offset);
+  }
+  if (lane == 0 && batch.count != 0) {
+    queue.completed += completed;
+    queue.failed += failed;
+    if (batch.firstError != 0) {
+      queue.error = batch.firstError;
+    }
+    queue.cqHead = batch.nextHead;
+    queue.cqPhase = batch.nextPhase;
+    queue.outstanding -= batch.count;
+    systemIoFence();
+    storeMmio(queue.cqDoorbell, queue.cqHead);
+  }
+  __syncwarp();
+  return batch.malformed != 0;
+}
 
 enum class NvmeIssueSelection : std::uint32_t {
   Empty,
@@ -1935,11 +2095,10 @@ rejectNvmeDispatch(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
 // Convert one already-admitted intent into a fully validated SQ descriptor.
 // The same fail-closed transition is shared by generic and ordered dispatch;
 // the caller chooses only the scheduling policy and construction granularity.
-__device__ __forceinline__ NvmeIssueSelection selectNvmeIssue(
-    abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
-    const AdmittedIntent &dispatch, std::uint32_t submissionSlot,
-    const NvmeIssueDescriptor *reserved, std::uint32_t reservedCount,
-    NvmeIssueDescriptor &selectedIssue) {
+__device__ __forceinline__ NvmeIssueSelection
+selectNvmeIssue(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
+                const AdmittedIntent &dispatch, std::uint32_t submissionSlot,
+                NvmeIssueDescriptor &selectedIssue) {
   const std::uint32_t intentSlotIndex = dispatch.slotIndex;
   if (intentSlotIndex == abi::InvalidIndex) {
     return NvmeIssueSelection::Empty;
@@ -1969,12 +2128,10 @@ __device__ __forceinline__ NvmeIssueSelection selectNvmeIssue(
   std::uint32_t commandId = abi::InvalidIndex;
   for (std::uint32_t searched = 0; searched < queue.depth; ++searched) {
     const std::uint32_t candidate = (queue.cidCursor + searched) % queue.depth;
-    bool reservedInBatch = false;
-    for (std::uint32_t prior = 0; prior < reservedCount; ++prior) {
-      reservedInBatch |= reserved[prior].commandId == candidate;
-    }
-    if (!reservedInBatch &&
-        atomicAdd(&queue.contexts[candidate].active, 0U) == 0) {
+    // The sole queue owner issues at most free-CIDs - 1 commands per batch and
+    // advances from the selected CID. It therefore cannot wrap to a CID chosen
+    // earlier in this batch before finding another genuinely free context.
+    if (atomicAdd(&queue.contexts[candidate].active, 0U) == 0) {
       commandId = candidate;
       queue.cidCursor = (candidate + 1U) % queue.depth;
       break;
@@ -2159,13 +2316,12 @@ nta_request_live_work_cta(nta::abi::RuntimeView *runtime,
 }
 
 static __device__ __attribute__((noinline)) void *
-nta_acquire_slow_impl(nta::abi::RuntimeView *runtime,
-                      std::uint32_t requestSlot, std::uint32_t generation,
-                      std::uint32_t objectSlot, std::uint64_t objectId,
-                      std::uint32_t objectVersion, std::uint64_t offset,
-                      std::uint32_t bytes, std::uint32_t workTicket,
-                      bool designatedLeader, std::uint64_t deadlineClock,
-                      bool deferIntentQueue) {
+nta_acquire_slow_impl(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+                      std::uint32_t generation, std::uint32_t objectSlot,
+                      std::uint64_t objectId, std::uint32_t objectVersion,
+                      std::uint64_t offset, std::uint32_t bytes,
+                      std::uint32_t workTicket, bool designatedLeader,
+                      std::uint64_t deadlineClock, bool deferIntentQueue) {
   using namespace nta;
   if (!device::requestLive(runtime, requestSlot, generation)) {
     device::failWorkTicket(runtime, workTicket,
@@ -2316,7 +2472,8 @@ nta_acquire_slow_impl(nta::abi::RuntimeView *runtime,
         (void)intentIndex;
         pending.valid = 2U;
         intentSlot->intent = pending;
-        const bool backendQueued = device::backendAcceptsIntent(runtime, source);
+        const bool backendQueued =
+            device::backendAcceptsIntent(runtime, source);
         device::publishIntent(runtime, *intentSlot, source,
                               !deferIntentQueue || !backendQueued);
         // Discovery publishes demand and dependency identity only.  Transport
@@ -2325,8 +2482,7 @@ nta_acquire_slow_impl(nta::abi::RuntimeView *runtime,
         // progress kernel claims its explicit contiguous range.  In
         // particular, ReplicaIndicesValidated is an access-safety proof, not
         // permission to bypass queue ordering.
-        if (!backendQueued &&
-            device::claimIntent(*intentSlot)) {
+        if (!backendQueued && device::claimIntent(*intentSlot)) {
           atomicExch(&object.state,
                      static_cast<std::uint32_t>(abi::ObjectState::Failed));
           device::publishObjectTransition(runtime, objectSlot,
@@ -2410,8 +2566,7 @@ nta_acquire_tensor_map_slow(nta::abi::RuntimeView *runtime,
 static __device__ __attribute__((noinline)) std::uint32_t
 nta_acquire_set_leader_with_deadline(
     nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
-    std::uint32_t generation,
-    const nta::abi::AcquireRequirement *requirements,
+    std::uint32_t generation, const nta::abi::AcquireRequirement *requirements,
     std::uint32_t requirementCount, std::uint32_t directRequirementCount,
     std::uint32_t workTicket, std::uint64_t deadlineClock,
     bool deferIntentQueue) {
@@ -2480,12 +2635,11 @@ nta_acquire_set_leader_with_deadline(
     // item to each thread so it can compact many items without one tiny CTA per
     // item. Numerical CTA callers continue to use nta_acquire_slow, whose
     // wrapper preserves the lane-zero ownership contract.
-    acquired &=
-        nta_acquire_slow_impl(runtime, requestSlot, generation,
-                              requirement.objectSlot, requirement.objectId,
-                              requirement.objectVersion, requirement.offset,
-                              requirement.bytes, workTicket, true,
-                              deadlineClock, deferIntentQueue) != nullptr;
+    acquired &= nta_acquire_slow_impl(
+                    runtime, requestSlot, generation, requirement.objectSlot,
+                    requirement.objectId, requirement.objectVersion,
+                    requirement.offset, requirement.bytes, workTicket, true,
+                    deadlineClock, deferIntentQueue) != nullptr;
   }
   return acquired ? 1U : 0U;
 }
@@ -2602,7 +2756,7 @@ issueNvmeGenericSerial(nta::abi::RuntimeView *runtime,
       const device::AdmittedIntent dispatch =
           device::claimAdmissibleIntent(runtime, abi::SourceKind::Nvme);
       selection = device::selectNvmeIssue(runtime, queue, dispatch,
-                                          queue.sqTail, nullptr, 0, descriptor);
+                                          queue.sqTail, descriptor);
     }
 
     const std::uint32_t action =
@@ -2685,88 +2839,19 @@ progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
     return;
   }
 
-  bool malformedCompletion = false;
-  if (lane == 0) {
-    std::uint32_t drained = 0;
-    while (drained < completionBudget && queue.outstanding != 0) {
-      abi::NvmeCompletion &completion = queue.completions[queue.cqHead];
-      const std::uint32_t commandAndStatus =
-          device::loadIoCoherent(&completion.dword[3]);
-      const std::uint32_t statusField = commandAndStatus >> 16U;
-      if ((statusField & 1U) != queue.cqPhase) {
-        break;
-      }
-      device::systemIoFence();
-
-      const std::uint32_t commandId = commandAndStatus & 0xffffU;
-      bool contextValid = commandId < queue.depth;
-      if (contextValid) {
-        abi::NvmeCommandContext &stored = queue.contexts[commandId];
-        contextValid = atomicAdd(&stored.active, 0U) != 0;
-        if (contextValid) {
-          const abi::NvmeCommandContext context = stored;
-          bool objectCurrent = context.epoch == device::currentEpoch(runtime) &&
-                               context.objectSlot < runtime->objectCapacity;
-          if (objectCurrent) {
-            abi::ObjectEntry &object = runtime->objects[context.objectSlot];
-            const abi::ReplicaEntry *replica =
-                device::replica(runtime, object, object.selectedReplica);
-            objectCurrent =
-                object.objectId == context.objectId &&
-                object.version == context.objectVersion && replica != nullptr &&
-                replica->sourceKind ==
-                    static_cast<std::uint32_t>(abi::SourceKind::Nvme);
-            if (objectCurrent && (statusField >> 1U) == 0) {
-              atomicExch(&object.state,
-                         static_cast<std::uint32_t>(abi::ObjectState::Ready));
-              device::publishObjectTransition(runtime, context.objectSlot,
-                                              abi::ObjectState::Ready);
-              ++queue.completed;
-            } else if (objectCurrent) {
-              atomicExch(&object.state,
-                         static_cast<std::uint32_t>(abi::ObjectState::Failed));
-              device::publishObjectTransition(runtime, context.objectSlot,
-                                              abi::ObjectState::Failed);
-              device::failBoundWorkTicket(runtime, context.workTicket,
-                                          context.requestSlot,
-                                          context.generation);
-              ++queue.failed;
-              queue.error = statusField >> 1U;
-            }
-          }
-          if (!objectCurrent) {
-            ++queue.failed;
-            queue.error = 0xfffffffbU;
-          }
-          device::releaseRequestBytes(runtime, context.requestSlot,
-                                      context.generation, context.bytes);
-          device::releaseTenantBytes(runtime, context.tenantId, context.bytes);
-          device::releaseBackendBytes(runtime, abi::SourceKind::Nvme,
-                                      context.backendBytes);
-          atomicExch(&stored.active, 0U);
-        }
-      }
-      if (!contextValid) {
-        malformedCompletion = true;
-        break;
-      }
-
-      queue.cqHead++;
-      if (queue.cqHead == queue.depth) {
-        queue.cqHead = 0;
-        queue.cqPhase ^= 1U;
-      }
-      --queue.outstanding;
-      ++drained;
-    }
-    if (drained != 0) {
-      device::systemIoFence();
-      device::storeMmio(queue.cqDoorbell, queue.cqHead);
-    }
-  }
-  malformedCompletion = __shfl_sync(0xffffffffU, malformedCompletion, 0);
-  if (malformedCompletion) {
-    device::failNvmeQueue(runtime, queue, lane, 0xffffffffU);
+  __shared__ device::NvmeCompletionBatch completionBatch;
+  const bool malformedCompletion = device::drainNvmeCompletionBatch(
+      runtime, queue, completionBudget, lane, completionBatch);
+  // A command status error is terminal for this single-queue runtime.  The
+  // completion itself has already released its credits; failNvmeQueue retires
+  // every still-active context and every not-yet-issued intent.  Returning
+  // from a completion-driven worker with queue.error set but outstanding I/O
+  // left behind would otherwise strand credits and directory ownership.
+  if (malformedCompletion || completionBatch.firstError != 0) {
+    const std::uint32_t error = malformedCompletion
+                                    ? 0xffffffffU
+                                    : completionBatch.firstError;
+    device::failNvmeQueue(runtime, queue, lane, error);
     if (lane == 0) {
       __threadfence();
       atomicExch(&queue.ownerLock, 0U);
@@ -2802,8 +2887,7 @@ progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
         device::NvmeIssueDescriptor descriptor{};
         const device::NvmeIssueSelection selection = device::selectNvmeIssue(
             runtime, queue, dispatch,
-            (queue.sqTail + issueBatch.count) % queue.depth, issueBatch.entries,
-            issueBatch.count, descriptor);
+            (queue.sqTail + issueBatch.count) % queue.depth, descriptor);
         if (selection == device::NvmeIssueSelection::Empty ||
             selection == device::NvmeIssueSelection::Fatal) {
           break;
@@ -2886,43 +2970,19 @@ progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
 extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
                                              std::uint32_t issueBudget,
                                              std::uint32_t completionBudget) {
-  progressNvmeOnce(runtime, issueBudget, completionBudget, 0, 0, nullptr,
-                   true);
-}
-
-__device__ __forceinline__ bool
-nvmeObjectRangeTerminal(nta::abi::RuntimeView *runtime,
-                        std::uint32_t firstObject, std::uint32_t objectCount) {
-  using namespace nta;
-  if (runtime == nullptr || runtime->objects == nullptr || objectCount == 0 ||
-      firstObject > runtime->objectCapacity ||
-      objectCount > runtime->objectCapacity - firstObject) {
-    return false;
-  }
-  for (std::uint32_t relative = 0; relative < objectCount; ++relative) {
-    const std::uint32_t state =
-        atomicAdd(&runtime->objects[firstObject + relative].state, 0U);
-    if (state < static_cast<std::uint32_t>(abi::ObjectState::Ready)) {
-      return false;
-    }
-  }
-  return true;
+  progressNvmeOnce(runtime, issueBudget, completionBudget, 0, 0, nullptr, true);
 }
 
 __device__ __forceinline__ void
 progressNvmeUntil(nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
-                  std::uint32_t intentCount, std::uint32_t firstTargetObject,
-                  std::uint32_t targetObjectCount, std::uint32_t issueBudget,
+                  std::uint32_t intentCount, std::uint32_t issueBudget,
                   std::uint32_t completionBudget, std::uint64_t timeoutNs) {
   using namespace nta;
   if (runtime == nullptr || blockIdx.x != 0 || threadIdx.x >= warpSize ||
       timeoutNs == 0 ||
       (intentCount != 0 &&
        (firstIntent > runtime->intentCapacity ||
-        intentCount > runtime->intentCapacity - firstIntent)) ||
-      (targetObjectCount != 0 &&
-       (firstTargetObject > runtime->objectCapacity ||
-        targetObjectCount > runtime->objectCapacity - firstTargetObject))) {
+        intentCount > runtime->intentCapacity - firstIntent))) {
     return;
   }
   const std::uint32_t lane = threadIdx.x;
@@ -2951,21 +3011,14 @@ progressNvmeUntil(nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
     bool timedOut = false;
     if (lane == 0) {
       abi::NvmeQueueView *queue = device::nvmeQueue(runtime);
-      if (targetObjectCount != 0) {
-        finished = queue == nullptr || queue->error != 0 ||
-                   nvmeObjectRangeTerminal(runtime, firstTargetObject,
-                                           targetObjectCount);
-      } else {
-        abi::BackendView *entry =
-            device::backend(runtime, abi::SourceKind::Nvme);
-        const std::uint64_t pending =
-            entry == nullptr ? 0
-                             : atomicAdd(reinterpret_cast<unsigned long long *>(
-                                             &entry->pendingAcquisitions),
-                                         0ULL);
-        finished = queue == nullptr || queue->error != 0 ||
-                   (queue->outstanding == 0 && pending == 0);
-      }
+      abi::BackendView *entry = device::backend(runtime, abi::SourceKind::Nvme);
+      const std::uint64_t pending =
+          entry == nullptr ? 0
+                           : atomicAdd(reinterpret_cast<unsigned long long *>(
+                                           &entry->pendingAcquisitions),
+                                       0ULL);
+      finished = queue == nullptr || queue->error != 0 ||
+                 (queue->outstanding == 0 && pending == 0);
       timedOut = !finished && device::globalTimerNs() - start >= timeoutNs;
     }
     finished = __shfl_sync(0xffffffffU, finished, 0);
@@ -2987,17 +3040,15 @@ progressNvmeUntil(nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
 extern "C" __global__ void nta_progress_nvme_until_idle(
     nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
     std::uint32_t completionBudget, std::uint64_t timeoutNs) {
-  progressNvmeUntil(runtime, 0, 0, 0, 0, issueBudget, completionBudget,
-                    timeoutNs);
+  progressNvmeUntil(runtime, 0, 0, issueBudget, completionBudget, timeoutNs);
 }
 
-extern "C" __global__ void nta_progress_nvme_ordered_until_range_terminal(
+extern "C" __global__ void nta_progress_nvme_ordered_until_idle(
     nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
-    std::uint32_t intentCount, std::uint32_t firstObject,
-    std::uint32_t objectCount, std::uint32_t issueBudget,
+    std::uint32_t intentCount, std::uint32_t issueBudget,
     std::uint32_t completionBudget, std::uint64_t timeoutNs) {
-  progressNvmeUntil(runtime, firstIntent, intentCount, firstObject, objectCount,
-                    issueBudget, completionBudget, timeoutNs);
+  progressNvmeUntil(runtime, firstIntent, intentCount, issueBudget,
+                    completionBudget, timeoutNs);
 }
 
 #endif
@@ -3581,10 +3632,10 @@ __device__ __forceinline__ void copyIndexedHostObjectPairFixed(
 }
 
 template <std::uint32_t BlocksPerPair>
-__device__ __forceinline__ void preloadIndexedHostPair(
-    abi::RuntimeView *runtime, std::uint32_t firstObject,
-    std::uint32_t pairCount, std::uint32_t relativePair,
-    std::uint32_t pairBlock, std::uint32_t *invalidIndex) {
+__device__ __forceinline__ void
+preloadIndexedHostPair(abi::RuntimeView *runtime, std::uint32_t firstObject,
+                       std::uint32_t pairCount, std::uint32_t relativePair,
+                       std::uint32_t pairBlock, std::uint32_t *invalidIndex) {
   const std::uint64_t keySlot64 =
       static_cast<std::uint64_t>(firstObject) + 2ULL * relativePair;
   if (runtime == nullptr || relativePair >= pairCount ||
@@ -3597,8 +3648,7 @@ __device__ __forceinline__ void preloadIndexedHostPair(
   abi::ObjectEntry &keyObject = runtime->objects[keySlot];
   abi::ObjectEntry &valueObject = runtime->objects[valueSlot];
   const abi::ReplicaEntry *keyReplica = replica(runtime, keyObject, 0);
-  const abi::ReplicaEntry *valueReplica =
-      replica(runtime, valueObject, 0);
+  const abi::ReplicaEntry *valueReplica = replica(runtime, valueObject, 0);
   const std::uint32_t elementBytes =
       keyReplica == nullptr || keyReplica->dmaPageCount == 0
           ? 0
@@ -3731,18 +3781,16 @@ extern "C" __global__ __launch_bounds__(
 // directory is laid out (EDF layer, exact wave, K/V), so bounding the worker
 // count preserves work-conserving earliest-deadline issue while retaining the
 // same eight-CTA transfer parallelism as the high-throughput whole-layer path.
-extern "C" __global__ __launch_bounds__(1024, 1) void
-nta_preload_indexed_host_pairs_ordered(nta::abi::RuntimeView *runtime,
-                                       std::uint32_t firstObject,
-                                       std::uint32_t pairCount,
-                                       std::uint32_t *taskHead) {
+extern "C" __global__
+__launch_bounds__(1024, 1) void nta_preload_indexed_host_pairs_ordered(
+    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
+    std::uint32_t pairCount, std::uint32_t *taskHead) {
   constexpr std::uint32_t BlocksPerPair = 2;
   __shared__ std::uint32_t task;
   __shared__ std::uint32_t invalidIndex;
   const std::uint64_t taskCount64 =
       static_cast<std::uint64_t>(pairCount) * BlocksPerPair;
-  if (runtime == nullptr || taskHead == nullptr ||
-      taskCount64 > UINT32_MAX) {
+  if (runtime == nullptr || taskHead == nullptr || taskCount64 > UINT32_MAX) {
     return;
   }
   const std::uint32_t taskCount = static_cast<std::uint32_t>(taskCount64);
@@ -3778,8 +3826,8 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
     chargedBytes = 0;
     backendBytes = 0;
     if (selectedFromQueue != 0U) {
-      const device::AdmittedIntent dispatch = device::claimAdmissibleIntent(
-          runtime, abi::SourceKind::HostStaged);
+      const device::AdmittedIntent dispatch =
+          device::claimAdmissibleIntent(runtime, abi::SourceKind::HostStaged);
       selectedIntent = dispatch.slotIndex;
       terminalDispatch = dispatch.terminal ? 1U : 0U;
       chargedBytes = dispatch.requestBytes;
@@ -3805,12 +3853,12 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   }
   if (intentSlot.epoch != device::currentEpoch(runtime)) {
     if (threadIdx.x == 0) {
-      const bool owned = selectedFromQueue != 0U ||
-                         device::claimIntent(intentSlot);
+      const bool owned =
+          selectedFromQueue != 0U || device::claimIntent(intentSlot);
       if (owned) {
-        device::releaseIntentCredits(
-            runtime, intent, abi::SourceKind::HostStaged, chargedBytes,
-            backendBytes);
+        device::releaseIntentCredits(runtime, intent,
+                                     abi::SourceKind::HostStaged, chargedBytes,
+                                     backendBytes);
         device::consumeIntent(runtime, intentSlot);
       }
     }
@@ -3818,12 +3866,12 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   }
   if (intent.objectSlot >= runtime->objectCapacity) {
     if (threadIdx.x == 0) {
-      const bool owned = selectedFromQueue != 0U ||
-                         device::claimIntent(intentSlot);
+      const bool owned =
+          selectedFromQueue != 0U || device::claimIntent(intentSlot);
       if (owned) {
-        device::releaseIntentCredits(
-            runtime, intent, abi::SourceKind::HostStaged, chargedBytes,
-            backendBytes);
+        device::releaseIntentCredits(runtime, intent,
+                                     abi::SourceKind::HostStaged, chargedBytes,
+                                     backendBytes);
         device::failBoundWorkTicket(runtime, intent.workTicket,
                                     intent.requestSlot, intent.generation);
         device::consumeIntent(runtime, intentSlot);
@@ -3895,12 +3943,12 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   __syncthreads();
   if (!transferValid || invalidIndex != 0) {
     if (threadIdx.x == 0) {
-      const bool owned = selectedFromQueue != 0U ||
-                         device::claimIntent(intentSlot);
+      const bool owned =
+          selectedFromQueue != 0U || device::claimIntent(intentSlot);
       if (owned) {
-        device::releaseIntentCredits(
-            runtime, intent, abi::SourceKind::HostStaged, chargedBytes,
-            backendBytes);
+        device::releaseIntentCredits(runtime, intent,
+                                     abi::SourceKind::HostStaged, chargedBytes,
+                                     backendBytes);
         if (objectCurrent) {
           atomicExch(&object.state,
                      static_cast<std::uint32_t>(abi::ObjectState::Failed));
@@ -3926,8 +3974,8 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
       if (live) {
         accepted = device::tryReserveRequestBytes(
             runtime, intent.requestSlot, intent.generation, intent.bytes);
-        if (accepted && !device::tryReserveTenantBytes(
-                            runtime, intent.tenantId, intent.bytes)) {
+        if (accepted && !device::tryReserveTenantBytes(runtime, intent.tenantId,
+                                                       intent.bytes)) {
           device::releaseRequestBytes(runtime, intent.requestSlot,
                                       intent.generation, intent.bytes);
           accepted = false;
@@ -4022,9 +4070,8 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
     device::publishObjectTransition(runtime, intent.objectSlot,
                                     abi::ObjectState::Ready);
     device::consumeIntent(runtime, intentSlot);
-    device::releaseIntentCredits(runtime, intent,
-                                 abi::SourceKind::HostStaged, chargedBytes,
-                                 backendBytes);
+    device::releaseIntentCredits(runtime, intent, abi::SourceKind::HostStaged,
+                                 chargedBytes, backendBytes);
   }
 }
 
@@ -4563,8 +4610,7 @@ extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
     };
   }
   for (std::uint32_t source = index;
-       runtime->intentQueueControls != nullptr &&
-       source < abi::BackendCount;
+       runtime->intentQueueControls != nullptr && source < abi::BackendCount;
        source += stride) {
     runtime->intentQueueControls[source] = {};
   }

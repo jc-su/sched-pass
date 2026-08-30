@@ -86,7 +86,6 @@ from nta_runtime.indexed_transfer import (
     IndexedTensorLane,
 )
 from nta_runtime.nvme_materialization import (
-    RegisteredNvmeObjectBinding,
     publish_registered_nvme_objects,
 )
 from nta_runtime.flashinfer import (
@@ -103,6 +102,7 @@ from nta_runtime.runtime import (
     DeviceWorkPlan,
     IndexedHostIndexBinding,
     IndexedAcquisitionPlan,
+    RegisteredNvmeObjectInstall,
     JitPhaseProgram,
     Runtime,
 )
@@ -898,14 +898,14 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
             owner.begin_external_publication(stream) if runs else (0, None)
         )
 
-        bindings: list[RegisteredNvmeObjectBinding] = []
+        bindings: list[RegisteredNvmeObjectInstall] = []
         for slot, run in enumerate(runs):
             object_id = 0x4E54415600000000 + slot
             destination_address = destination.address(
                 run.destination_first, run.row_count
             )
             bindings.append(
-                RegisteredNvmeObjectBinding(
+                RegisteredNvmeObjectInstall(
                     slot,
                     object_id,
                     version,
