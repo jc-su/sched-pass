@@ -1694,6 +1694,45 @@ def main() -> None:
     assert aggregate_movers._stats["host_mover_complete_calibration_frontiers"] == 1
     assert aggregate_movers._stats["host_mover_complete_calibration_wave_samples"] == 3
 
+    # A complete probe frontier can be composed of timer-dominated waves. The
+    # observation methods reject these scales; collection must preserve that
+    # fail-closed state instead of assigning samples to a missing copy curve.
+    small_movers = HostMoverController(
+        policy="auto",
+        default_service_model=IndexedMoverServiceModel(
+            sm_bandwidth_bytes_per_second=30_000_000_000,
+        ),
+        calibration_samples=3,
+        copy_engine_max_operations=64,
+        frontier_layers_per_wave=4,
+        profile_transfer=False,
+        frontier_enabled=True,
+        profile_index_layout=False,
+        profile_index_min_bytes=64 * 1024,
+        verify_index_map=False,
+        stats={},
+    )
+    for engine in ("sm", "copy_engine"):
+        for _ in range(3):
+            small_movers.record_profile(
+                MoverProfile(
+                    _ProfileEvent(0.1),
+                    _ProfileEvent(),
+                    engine,
+                    32 * 1024,
+                    32 * 1024,
+                    1,
+                    0 if engine == "sm" else 100,
+                    True,
+                )
+            )
+    small_movers.collect_profiles()
+    small_curve = small_movers.service_model(32 * 1024)
+    assert small_curve.sm_samples == 0
+    assert small_curve.copy_samples == 0
+    assert not small_curve.copy_estimate_available
+    assert small_movers._stats.get("host_mover_complete_calibration_frontiers", 0) == 0
+
     context_stats: dict[str, int] = {}
     context_movers = HostMoverController(
         policy="auto",

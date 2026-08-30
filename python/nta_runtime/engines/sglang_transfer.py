@@ -701,6 +701,14 @@ class HostMoverController:
                     elapsed_ns=equivalent_elapsed_ns,
                     alpha=1.0,
                 )
+                if updated.sm_samples == previous_samples:
+                    # The model deliberately rejects timer-dominated transfer
+                    # scales. A complete frontier may still consist entirely
+                    # of such small waves; do not manufacture calibration
+                    # samples for an observation the model did not accept.
+                    continue
+                if updated.sm_samples != previous_samples + 1:
+                    raise RuntimeError("SM mover observation changed sample weight")
                 updated = replace(
                     updated, sm_samples=previous_samples + sample_count
                 )
@@ -718,6 +726,13 @@ class HostMoverController:
                     ),
                     alpha=1.0,
                 )
+                if updated.copy_samples == previous_samples:
+                    # In particular, retaining a nonzero sample count without
+                    # a bandwidth/operation estimate violates the typed model
+                    # and used to abort auto calibration at small wave scales.
+                    continue
+                if updated.copy_samples != previous_samples + 1:
+                    raise RuntimeError("copy mover observation changed sample weight")
                 updated = replace(
                     updated, copy_samples=previous_samples + sample_count
                 )
