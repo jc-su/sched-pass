@@ -1755,6 +1755,31 @@ struct NvmeAdmission {
   bool admitted;
 };
 
+inline constexpr std::uint32_t NvmeIssueBatchCapacity = 64;
+
+struct NvmeIssueDescriptor {
+  std::uint32_t intentSlotIndex;
+  std::uint32_t objectSlot;
+  std::uint32_t commandId;
+  std::uint32_t submissionSlot;
+  std::uint32_t dmaPageCount;
+  std::uint64_t requestBytes;
+  std::uint64_t backendBytes;
+};
+
+struct NvmeIssueBatch {
+  NvmeIssueDescriptor entries[NvmeIssueBatchCapacity];
+  std::uint32_t count;
+  std::uint32_t maximumDmaPageCount;
+};
+
+enum class NvmeIssueSelection : std::uint32_t {
+  Empty,
+  Retired,
+  Ready,
+  Fatal,
+};
+
 __device__ __forceinline__ NvmeAdmission
 tryAdmitNvme(abi::RuntimeView *runtime, const abi::AcquireIntent &intent,
              std::uint64_t bytes) {
@@ -1814,12 +1839,12 @@ prepareNvmeRead(abi::NvmeQueueView &queue, const abi::ReplicaEntry &replica,
 }
 
 __device__ __forceinline__ void
-publishNvmeRead(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
-                abi::ObjectEntry &object, const abi::ReplicaEntry &replica,
-                const abi::AcquireIntent &intent,
-                const NvmeAdmission &admission, std::uint32_t commandId,
-                std::uint32_t submissionSlot, abi::IntentSlot *consumedIntent,
-                bool directSubmission) {
+publishNvmeReadState(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
+                     abi::ObjectEntry &object, const abi::ReplicaEntry &replica,
+                     const abi::AcquireIntent &intent,
+                     const NvmeAdmission &admission, std::uint32_t commandId,
+                     std::uint32_t submissionSlot,
+                     abi::IntentSlot *consumedIntent) {
   abi::NvmeSubmission &submission = queue.submissions[submissionSlot];
   const auto *dmaPages =
       reinterpret_cast<const std::uint64_t *>(replica.dmaPageListAddress);
@@ -1864,12 +1889,108 @@ publishNvmeRead(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
   if (consumedIntent != nullptr) {
     consumeIntent(runtime, *consumedIntent);
   }
+}
+
+__device__ __forceinline__ void
+publishNvmeRead(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
+                abi::ObjectEntry &object, const abi::ReplicaEntry &replica,
+                const abi::AcquireIntent &intent,
+                const NvmeAdmission &admission, std::uint32_t commandId,
+                std::uint32_t submissionSlot, abi::IntentSlot *consumedIntent,
+                bool directSubmission) {
+  publishNvmeReadState(runtime, queue, object, replica, intent, admission,
+                       commandId, submissionSlot, consumedIntent);
   queue.sqTail = (submissionSlot + 1U) % queue.depth;
   ++queue.outstanding;
   ++queue.submitted;
   if (directSubmission) {
     ++queue.directSubmitted;
   }
+}
+
+__device__ __forceinline__ void
+rejectNvmeDispatch(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
+                   abi::IntentSlot &selectedSlot,
+                   const AdmittedIntent &dispatch, std::uint32_t error) {
+  abi::AcquireIntent &selected = selectedSlot.intent;
+  if (selected.objectSlot < runtime->objectCapacity) {
+    abi::ObjectEntry &object = runtime->objects[selected.objectSlot];
+    if (object.objectId == selected.objectId &&
+        object.version == selected.objectVersion) {
+      atomicExch(&object.state,
+                 static_cast<std::uint32_t>(abi::ObjectState::Failed));
+      publishObjectTransition(runtime, selected.objectSlot,
+                              abi::ObjectState::Failed);
+    }
+  }
+  releaseIntentCredits(runtime, selected, abi::SourceKind::Nvme,
+                       dispatch.requestBytes, dispatch.backendBytes);
+  failBoundWorkTicket(runtime, selected.workTicket, selected.requestSlot,
+                      selected.generation);
+  consumeIntent(runtime, selectedSlot);
+  ++queue.failed;
+  queue.error = error;
+}
+
+// Convert one already-admitted intent into a fully validated SQ descriptor.
+// The same fail-closed transition is shared by generic and ordered dispatch;
+// the caller chooses only the scheduling policy and construction granularity.
+__device__ __forceinline__ NvmeIssueSelection selectNvmeIssue(
+    abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
+    const AdmittedIntent &dispatch, std::uint32_t submissionSlot,
+    const NvmeIssueDescriptor *reserved, std::uint32_t reservedCount,
+    NvmeIssueDescriptor &selectedIssue) {
+  const std::uint32_t intentSlotIndex = dispatch.slotIndex;
+  if (intentSlotIndex == abi::InvalidIndex) {
+    return NvmeIssueSelection::Empty;
+  }
+  if (intentSlotIndex >= runtime->intentPool->capacity ||
+      intentSlotIndex >= runtime->intentCapacity) {
+    ++queue.failed;
+    queue.error = 0xfffffffbU;
+    return NvmeIssueSelection::Fatal;
+  }
+
+  abi::IntentSlot &selectedSlot = runtime->intents[intentSlotIndex];
+  abi::AcquireIntent &selected = selectedSlot.intent;
+  if (dispatch.terminal || selected.objectSlot >= runtime->objectCapacity) {
+    rejectNvmeDispatch(runtime, queue, selectedSlot, dispatch, 0xfffffffbU);
+    return NvmeIssueSelection::Retired;
+  }
+
+  abi::ObjectEntry &object = runtime->objects[selected.objectSlot];
+  const abi::ReplicaEntry *replica =
+      device::replica(runtime, object, object.selectedReplica);
+  if (!validNvmeTransfer(runtime, queue, selected, object, replica)) {
+    rejectNvmeDispatch(runtime, queue, selectedSlot, dispatch, 0xfffffffeU);
+    return NvmeIssueSelection::Retired;
+  }
+
+  std::uint32_t commandId = abi::InvalidIndex;
+  for (std::uint32_t searched = 0; searched < queue.depth; ++searched) {
+    const std::uint32_t candidate = (queue.cidCursor + searched) % queue.depth;
+    bool reservedInBatch = false;
+    for (std::uint32_t prior = 0; prior < reservedCount; ++prior) {
+      reservedInBatch |= reserved[prior].commandId == candidate;
+    }
+    if (!reservedInBatch &&
+        atomicAdd(&queue.contexts[candidate].active, 0U) == 0) {
+      commandId = candidate;
+      queue.cidCursor = (candidate + 1U) % queue.depth;
+      break;
+    }
+  }
+  if (commandId == abi::InvalidIndex) {
+    rejectNvmeDispatch(runtime, queue, selectedSlot, dispatch, 0xfffffffaU);
+    return NvmeIssueSelection::Retired;
+  }
+
+  selectedIssue = {
+      intentSlotIndex,       selected.objectSlot,   commandId,
+      submissionSlot,        replica->dmaPageCount, dispatch.requestBytes,
+      dispatch.backendBytes,
+  };
+  return NvmeIssueSelection::Ready;
 }
 
 // The CTA miss path attempts at most one lock acquisition and never observes a
@@ -2468,12 +2589,71 @@ nta_requirement_tensor_map(nta::abi::RuntimeView *runtime,
 }
 
 #if NTA_DEVICE_PHASE_KERNELS
+__device__ __forceinline__ std::uint32_t
+issueNvmeGenericSerial(nta::abi::RuntimeView *runtime,
+                       nta::abi::NvmeQueueView &queue,
+                       std::uint32_t issueBudget, std::uint32_t lane) {
+  using namespace nta;
+  std::uint32_t issued = 0U;
+  for (std::uint32_t attempt = 0; attempt < issueBudget; ++attempt) {
+    device::NvmeIssueDescriptor descriptor{};
+    device::NvmeIssueSelection selection = device::NvmeIssueSelection::Empty;
+    if (lane == 0 && queue.outstanding + 1U < queue.depth) {
+      const device::AdmittedIntent dispatch =
+          device::claimAdmissibleIntent(runtime, abi::SourceKind::Nvme);
+      selection = device::selectNvmeIssue(runtime, queue, dispatch,
+                                          queue.sqTail, nullptr, 0, descriptor);
+    }
+
+    const std::uint32_t action =
+        __shfl_sync(0xffffffffU, static_cast<std::uint32_t>(selection), 0);
+    if (action ==
+            static_cast<std::uint32_t>(device::NvmeIssueSelection::Empty) ||
+        action ==
+            static_cast<std::uint32_t>(device::NvmeIssueSelection::Fatal)) {
+      break;
+    }
+    if (action ==
+        static_cast<std::uint32_t>(device::NvmeIssueSelection::Retired)) {
+      continue;
+    }
+    descriptor.intentSlotIndex =
+        __shfl_sync(0xffffffffU, descriptor.intentSlotIndex, 0);
+    descriptor.objectSlot = __shfl_sync(0xffffffffU, descriptor.objectSlot, 0);
+    descriptor.commandId = __shfl_sync(0xffffffffU, descriptor.commandId, 0);
+    descriptor.submissionSlot =
+        __shfl_sync(0xffffffffU, descriptor.submissionSlot, 0);
+    descriptor.requestBytes =
+        __shfl_sync(0xffffffffU, descriptor.requestBytes, 0);
+    descriptor.backendBytes =
+        __shfl_sync(0xffffffffU, descriptor.backendBytes, 0);
+
+    abi::IntentSlot &selectedSlot =
+        runtime->intents[descriptor.intentSlotIndex];
+    abi::AcquireIntent &selected = selectedSlot.intent;
+    abi::ObjectEntry &object = runtime->objects[descriptor.objectSlot];
+    const abi::ReplicaEntry &replica =
+        *device::replica(runtime, object, object.selectedReplica);
+    device::prepareNvmeRead(queue, replica, descriptor.commandId,
+                            descriptor.submissionSlot, lane, warpSize);
+    __syncwarp();
+    if (lane == 0) {
+      const device::NvmeAdmission admission{descriptor.requestBytes,
+                                            descriptor.backendBytes, true};
+      device::publishNvmeRead(runtime, queue, object, replica, selected,
+                              admission, descriptor.commandId,
+                              descriptor.submissionSlot, &selectedSlot, false);
+      ++issued;
+    }
+    __syncwarp();
+  }
+  return __shfl_sync(0xffffffffU, issued, 0);
+}
+
 __device__ __forceinline__ void
 progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
-                 std::uint32_t completionBudget,
-                 std::uint32_t orderedFirstSlot,
-                 std::uint32_t orderedSlotCount,
-                 std::uint32_t *orderedCursor) {
+                 std::uint32_t completionBudget, std::uint32_t orderedFirstSlot,
+                 std::uint32_t orderedSlotCount, std::uint32_t *orderedCursor) {
   using namespace nta;
   if (runtime == nullptr || blockIdx.x != 0 || threadIdx.x >= warpSize) {
     return;
@@ -2593,148 +2773,99 @@ progressNvmeOnce(nta::abi::RuntimeView *runtime, std::uint32_t issueBudget,
   }
   __syncwarp();
 
-  std::uint32_t issued = 0U;
-  for (std::uint32_t attempt = 0; attempt < issueBudget; ++attempt) {
-    std::uint32_t intentSlotIndex = abi::InvalidIndex;
-    std::uint32_t objectSlot = abi::InvalidIndex;
-    std::uint32_t commandId = abi::InvalidIndex;
-    std::uint32_t submissionSlot = 0;
-    std::uint32_t action = 0;
-    std::uint64_t chargedBytes = 0;
-    std::uint64_t backendBytes = 0;
-    if (lane == 0 && queue.outstanding + 1U < queue.depth) {
-      const device::AdmittedIntent dispatch =
-          orderedSlotCount == 0 || orderedCursor == nullptr
-              ? device::claimAdmissibleIntent(runtime, abi::SourceKind::Nvme)
-              : device::claimOrderedAdmissibleIntent(
-                    runtime, abi::SourceKind::Nvme, orderedFirstSlot,
-                    orderedSlotCount, *orderedCursor);
-      intentSlotIndex = dispatch.slotIndex;
-      chargedBytes = dispatch.requestBytes;
-      backendBytes = dispatch.backendBytes;
-      if (intentSlotIndex != abi::InvalidIndex &&
-          intentSlotIndex < runtime->intentPool->capacity &&
-          intentSlotIndex < runtime->intentCapacity) {
-        abi::IntentSlot &selectedSlot = runtime->intents[intentSlotIndex];
-        abi::AcquireIntent &selected = selectedSlot.intent;
-        if (dispatch.terminal ||
-            selected.objectSlot >= runtime->objectCapacity) {
-          if (selected.objectSlot < runtime->objectCapacity) {
-            abi::ObjectEntry &object =
-                runtime->objects[selected.objectSlot];
-            if (object.objectId == selected.objectId &&
-                object.version == selected.objectVersion) {
-              atomicExch(&object.state, static_cast<std::uint32_t>(
-                                            abi::ObjectState::Failed));
-              device::publishObjectTransition(runtime, selected.objectSlot,
-                                              abi::ObjectState::Failed);
-            }
-          }
-          device::releaseIntentCredits(
-              runtime, selected, abi::SourceKind::Nvme, chargedBytes,
-              backendBytes);
-          device::failBoundWorkTicket(runtime, selected.workTicket,
-                                      selected.requestSlot,
-                                      selected.generation);
-          device::consumeIntent(runtime, selectedSlot);
-          ++queue.failed;
-          queue.error = 0xfffffffbU;
-          action = 1;
-        } else {
-          abi::ObjectEntry &object = runtime->objects[selected.objectSlot];
-          const abi::ReplicaEntry *replica =
-              device::replica(runtime, object, object.selectedReplica);
-          const bool objectCurrent = object.objectId == selected.objectId &&
-                                     object.version == selected.objectVersion;
-          if (!device::validNvmeTransfer(runtime, queue, selected, object,
-                                         replica)) {
-            device::releaseIntentCredits(
-                runtime, selected, abi::SourceKind::Nvme, chargedBytes,
-                backendBytes);
-            if (objectCurrent) {
-              atomicExch(&object.state, static_cast<std::uint32_t>(
-                                            abi::ObjectState::Failed));
-              device::publishObjectTransition(runtime, selected.objectSlot,
-                                              abi::ObjectState::Failed);
-            }
-            device::failBoundWorkTicket(runtime, selected.workTicket,
-                                        selected.requestSlot,
-                                        selected.generation);
-            device::consumeIntent(runtime, selectedSlot);
-            ++queue.failed;
-            queue.error = 0xfffffffeU;
-            action = 1;
-          } else {
-            for (std::uint32_t searched = 0; searched < queue.depth;
-                 ++searched) {
-              const std::uint32_t candidate =
-                  (queue.cidCursor + searched) % queue.depth;
-              if (atomicAdd(&queue.contexts[candidate].active, 0U) == 0) {
-                commandId = candidate;
-                queue.cidCursor = (candidate + 1U) % queue.depth;
-                break;
-              }
-            }
-            if (commandId != abi::InvalidIndex) {
-              objectSlot = selected.objectSlot;
-              submissionSlot = queue.sqTail;
-              action = 2;
-            } else {
-              device::releaseIntentCredits(
-                  runtime, selected, abi::SourceKind::Nvme, chargedBytes,
-                  backendBytes);
-              chargedBytes = 0;
-              backendBytes = 0;
-              if (objectCurrent) {
-                atomicExch(&object.state, static_cast<std::uint32_t>(
-                                              abi::ObjectState::Failed));
-                device::publishObjectTransition(runtime, selected.objectSlot,
-                                                abi::ObjectState::Failed);
-              }
-              device::failBoundWorkTicket(runtime, selected.workTicket,
-                                          selected.requestSlot,
-                                          selected.generation);
-              device::consumeIntent(runtime, selectedSlot);
-              ++queue.failed;
-              queue.error = 0xfffffffaU;
-              action = 1;
-            }
-          }
+  std::uint32_t issued = 0;
+  if (orderedSlotCount == 0 || orderedCursor == nullptr) {
+    // The generic heap supports arbitrary object sizes and dynamic duplicate
+    // suppression. Preserve its proven whole-warp PRP construction instead of
+    // extending the finite-window optimization beyond its typed contract.
+    issued = issueNvmeGenericSerial(runtime, queue, issueBudget, lane);
+  } else {
+    // The validated ordered cursor serializes admission, but it does not
+    // require serial SQE construction. Select a bounded batch on lane zero,
+    // preserving exact EDF and byte-credit order, then let warp lanes build
+    // independent small commands concurrently. Large PRP lists retain a
+    // cooperative whole-warp writer.
+    __shared__ device::NvmeIssueBatch issueBatch;
+    if (lane == 0) {
+      issueBatch.count = 0;
+      issueBatch.maximumDmaPageCount = 0;
+      const std::uint32_t maximumBatch =
+          min(issueBudget, device::NvmeIssueBatchCapacity);
+      while (issueBatch.count < maximumBatch &&
+             queue.outstanding + issueBatch.count + 1U < queue.depth) {
+        const device::AdmittedIntent dispatch =
+            device::claimOrderedAdmissibleIntent(
+                runtime, abi::SourceKind::Nvme, orderedFirstSlot,
+                orderedSlotCount, *orderedCursor);
+        device::NvmeIssueDescriptor descriptor{};
+        const device::NvmeIssueSelection selection = device::selectNvmeIssue(
+            runtime, queue, dispatch,
+            (queue.sqTail + issueBatch.count) % queue.depth, issueBatch.entries,
+            issueBatch.count, descriptor);
+        if (selection == device::NvmeIssueSelection::Empty ||
+            selection == device::NvmeIssueSelection::Fatal) {
+          break;
         }
+        if (selection == device::NvmeIssueSelection::Retired) {
+          continue;
+        }
+        issueBatch.entries[issueBatch.count++] = descriptor;
+        issueBatch.maximumDmaPageCount =
+            max(issueBatch.maximumDmaPageCount, descriptor.dmaPageCount);
       }
     }
-
-    action = __shfl_sync(0xffffffffU, action, 0);
-    if (action == 0) {
-      break;
-    }
-    if (action == 1) {
-      continue;
-    }
-    intentSlotIndex = __shfl_sync(0xffffffffU, intentSlotIndex, 0);
-    objectSlot = __shfl_sync(0xffffffffU, objectSlot, 0);
-    commandId = __shfl_sync(0xffffffffU, commandId, 0);
-    submissionSlot = __shfl_sync(0xffffffffU, submissionSlot, 0);
-
-    abi::IntentSlot &selectedSlot = runtime->intents[intentSlotIndex];
-    abi::AcquireIntent &selected = selectedSlot.intent;
-    abi::ObjectEntry &object = runtime->objects[objectSlot];
-    const abi::ReplicaEntry &replica =
-        *device::replica(runtime, object, object.selectedReplica);
-    device::prepareNvmeRead(queue, replica, commandId, submissionSlot, lane,
-                            warpSize);
     __syncwarp();
 
-    if (lane == 0) {
-      const device::NvmeAdmission admission{chargedBytes, backendBytes, true};
-      device::publishNvmeRead(runtime, queue, object, replica, selected,
-                              admission, commandId, submissionSlot,
-                              &selectedSlot, false);
-      ++issued;
+    issued = issueBatch.count;
+    if (issueBatch.maximumDmaPageCount <= 2U) {
+      for (std::uint32_t index = lane; index < issued; index += warpSize) {
+        const device::NvmeIssueDescriptor descriptor =
+            issueBatch.entries[index];
+        abi::IntentSlot &selectedSlot =
+            runtime->intents[descriptor.intentSlotIndex];
+        abi::AcquireIntent &selected = selectedSlot.intent;
+        abi::ObjectEntry &object = runtime->objects[descriptor.objectSlot];
+        const abi::ReplicaEntry &replica =
+            *device::replica(runtime, object, object.selectedReplica);
+        device::prepareNvmeRead(queue, replica, descriptor.commandId,
+                                descriptor.submissionSlot, 0, 1);
+        const device::NvmeAdmission admission{descriptor.requestBytes,
+                                              descriptor.backendBytes, true};
+        device::publishNvmeReadState(runtime, queue, object, replica, selected,
+                                     admission, descriptor.commandId,
+                                     descriptor.submissionSlot, &selectedSlot);
+      }
+      __syncwarp();
+    } else {
+      for (std::uint32_t index = 0; index < issued; ++index) {
+        const device::NvmeIssueDescriptor descriptor =
+            issueBatch.entries[index];
+        abi::IntentSlot &selectedSlot =
+            runtime->intents[descriptor.intentSlotIndex];
+        abi::AcquireIntent &selected = selectedSlot.intent;
+        abi::ObjectEntry &object = runtime->objects[descriptor.objectSlot];
+        const abi::ReplicaEntry &replica =
+            *device::replica(runtime, object, object.selectedReplica);
+        device::prepareNvmeRead(queue, replica, descriptor.commandId,
+                                descriptor.submissionSlot, lane, warpSize);
+        __syncwarp();
+        if (lane == 0) {
+          const device::NvmeAdmission admission{descriptor.requestBytes,
+                                                descriptor.backendBytes, true};
+          device::publishNvmeReadState(
+              runtime, queue, object, replica, selected, admission,
+              descriptor.commandId, descriptor.submissionSlot, &selectedSlot);
+        }
+        __syncwarp();
+      }
+    }
+    if (lane == 0 && issued != 0) {
+      queue.sqTail = (queue.sqTail + issued) % queue.depth;
+      queue.outstanding += issued;
+      queue.submitted += issued;
     }
     __syncwarp();
   }
-  issued = __shfl_sync(0xffffffffU, issued, 0);
   queueOnline = lane == 0 && device::nvmeQueueOnline(queue);
   queueOnline = __shfl_sync(0xffffffffU, queueOnline, 0);
   if (issued != 0 && !queueOnline) {
@@ -2755,9 +2886,9 @@ extern "C" __global__ void nta_progress_nvme(nta::abi::RuntimeView *runtime,
   progressNvmeOnce(runtime, issueBudget, completionBudget, 0, 0, nullptr);
 }
 
-__device__ __forceinline__ bool nvmeObjectRangeTerminal(
-    nta::abi::RuntimeView *runtime, std::uint32_t firstObject,
-    std::uint32_t objectCount) {
+__device__ __forceinline__ bool
+nvmeObjectRangeTerminal(nta::abi::RuntimeView *runtime,
+                        std::uint32_t firstObject, std::uint32_t objectCount) {
   using namespace nta;
   if (runtime == nullptr || runtime->objects == nullptr || objectCount == 0 ||
       firstObject > runtime->objectCapacity ||
@@ -2774,11 +2905,11 @@ __device__ __forceinline__ bool nvmeObjectRangeTerminal(
   return true;
 }
 
-__device__ __forceinline__ void progressNvmeUntil(
-    nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
-    std::uint32_t intentCount, std::uint32_t firstTargetObject,
-    std::uint32_t targetObjectCount, std::uint32_t issueBudget,
-    std::uint32_t completionBudget, std::uint64_t timeoutNs) {
+__device__ __forceinline__ void
+progressNvmeUntil(nta::abi::RuntimeView *runtime, std::uint32_t firstIntent,
+                  std::uint32_t intentCount, std::uint32_t firstTargetObject,
+                  std::uint32_t targetObjectCount, std::uint32_t issueBudget,
+                  std::uint32_t completionBudget, std::uint64_t timeoutNs) {
   using namespace nta;
   if (runtime == nullptr || blockIdx.x != 0 || threadIdx.x >= warpSize ||
       timeoutNs == 0 ||
@@ -2793,11 +2924,10 @@ __device__ __forceinline__ void progressNvmeUntil(
   const std::uint32_t lane = threadIdx.x;
   abi::IntentQueueControl *control =
       device::intentQueueControl(runtime, abi::SourceKind::Nvme);
-  bool ordered =
-      lane == 0 && intentCount != 0 && control != nullptr &&
-      control->reserved[0] == device::OrderedIntentWindowMagic &&
-      control->reserved[1] ==
-          device::orderedIntentWindowGeometry(firstIntent, intentCount);
+  bool ordered = lane == 0 && intentCount != 0 && control != nullptr &&
+                 control->reserved[0] == device::OrderedIntentWindowMagic &&
+                 control->reserved[1] == device::orderedIntentWindowGeometry(
+                                             firstIntent, intentCount);
   ordered = __shfl_sync(0xffffffffU, ordered, 0);
   const std::uint32_t orderedCount = ordered ? intentCount : 0U;
   std::uint32_t *cursor = ordered ? &control->size : nullptr;
