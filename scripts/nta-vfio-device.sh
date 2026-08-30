@@ -330,22 +330,42 @@ snapshot_partitions() {
 }
 
 bind_vfio() {
-  local vmem_users
+  local vmem_users vmem_target
   vmem_users=$(lsmod | awk '$1 == "vmem_sw" { print $3 }')
   if [[ -n $vmem_users && $vmem_users -ne 0 ]]; then
-    die "vmem_sw has active references; stop its users before binding"
+    vmem_target=$(cat /sys/module/vmem_sw/parameters/target_bdf 2>/dev/null || true)
+    if [[ -z $vmem_target || $vmem_target == "$bdf" ]]; then
+      die "vmem_sw has active references to the selected controller; stop its users before binding"
+    fi
   fi
-  require_safe_device
   require_containment
-  require_media_policy
-  snapshot_partitions
-  capture_reference
   as_root modprobe iommufd
   as_root modprobe vfio-pci
   local driver
   driver=$(current_driver)
   printf '%s\n' "$driver" | as_root tee "$state" >/dev/null
-  if [[ $driver != none ]]; then
+
+  # A custom block driver may expose a transformed or cached namespace view.
+  # Such a view is not a valid byte oracle for the raw namespace that VFIO
+  # will read.  Quiesce the original driver first, capture through the
+  # canonical Linux NVMe driver, and retain the original driver in $state so
+  # restore still returns ownership exactly where it came from.
+  require_safe_device
+  if [[ $(current_driver) != nvme ]]; then
+    if [[ $(current_driver) != none ]]; then
+      printf '%s' "$bdf" | as_root tee "$device/driver/unbind" >/dev/null
+    fi
+    printf '%s' nvme | as_root tee "$device/driver_override" >/dev/null
+    printf '%s' "$bdf" | as_root tee /sys/bus/pci/drivers_probe >/dev/null
+    wait_for_driver nvme
+    wait_for_nvme_namespace
+  fi
+  require_safe_device
+  require_media_policy
+  snapshot_partitions
+  capture_reference
+
+  if [[ $(current_driver) != none ]]; then
     printf '%s' "$bdf" | as_root tee "$device/driver/unbind" >/dev/null
   fi
   printf '%s' vfio-pci | as_root tee "$device/driver_override" >/dev/null

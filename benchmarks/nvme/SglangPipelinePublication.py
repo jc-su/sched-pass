@@ -383,9 +383,24 @@ def _verify(
                 expected = torch.frombuffer(rows, dtype=torch.uint8).reshape(
                     run_count, ROW_BYTES
                 )
-                torch.testing.assert_close(
-                    arm.storage[lane, layer].cpu(), expected, rtol=0, atol=0
-                )
+                actual = arm.storage[lane, layer].cpu()
+                mismatch = actual != expected
+                if bool(mismatch.any()):
+                    coordinates = mismatch.nonzero()[:8].tolist()
+                    examples = tuple(
+                        (
+                            int(row),
+                            int(byte),
+                            int(actual[row, byte]),
+                            int(expected[row, byte]),
+                        )
+                        for row, byte in coordinates
+                    )
+                    raise RuntimeError(
+                        f"{arm.name} corrupted NVMe publication at layer={layer} "
+                        f"lane={lane}: mismatched_bytes={int(mismatch.sum())} "
+                        f"first(row,byte,actual,expected)={examples}"
+                    )
     if arm.runtime.sticky_failed_count != 0:
         raise RuntimeError(f"{arm.name} publication poisoned the runtime")
 

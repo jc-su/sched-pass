@@ -49,6 +49,13 @@ def main() -> None:
     assert 'mv -f "$temporary" "$reference"' in vfio_script
     assert "wait_for_nvme_namespace" in vfio_script
     assert "returned to the nvme driver but no live namespace appeared" in vfio_script
+    assert "not a valid byte oracle for the raw namespace" in vfio_script
+    assert "wait_for_driver nvme" in vfio_script
+    assert "/sys/module/vmem_sw/parameters/target_bdf" in vfio_script
+    assert "active references to the selected controller" in vfio_script
+    assert vfio_script.index("wait_for_driver nvme") < vfio_script.index(
+        "capture_reference", vfio_script.index("bind_vfio()")
+    )
     assert "driver_override is only a transactional bind aid" in vfio_script
     runtime = (ROOT / "runtime" / "host" / "NvmeRuntime.cpp").read_text(
         encoding="utf-8"
