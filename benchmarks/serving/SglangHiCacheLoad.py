@@ -343,31 +343,49 @@ def _publish_engine_stats_snapshot(
     )
 
 
-def _measured_consumer_contract(report: dict[str, Any]) -> dict[str, Any]:
-    native = (
-        int(report.get("transformed_direct_launches", 0))
-        + int(report.get("ticketed_incremental_launches", 0))
-        + int(report.get("event_ordered_incremental_launches", 0))
-    )
-    stock = int(report.get("stock_prefetched_external_attention_launches", 0))
-    kind = (
-        "native_work_unit"
-        if native
-        else "framework_reference"
-        if stock
-        else "projection_only"
-    )
+def _consumer_contract(kind: str) -> dict[str, Any]:
+    if kind not in {"native_work_unit", "framework_reference", "projection_only"}:
+        raise ValueError(f"unknown measured consumer kind {kind!r}")
+    native = kind == "native_work_unit"
     return {
         "schema": 1,
         "engine": "sglang",
         "backend": "nta_flashinfer",
         "kind": kind,
         "exact_demand": True,
-        "typed_work_plan": kind == "native_work_unit",
-        "native_submission": kind == "native_work_unit",
+        "typed_work_plan": native,
+        "native_submission": native,
         "numerical_consumer": kind != "projection_only",
         "engine_version": os.environ.get("NTA_SGLANG_VERSION", "0.5.16"),
     }
+
+
+def _measured_consumer_contracts(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Describe every numerical path used in the timed counter window."""
+
+    native = (
+        int(report.get("transformed_direct_launches", 0))
+        + int(report.get("ticketed_incremental_launches", 0))
+        + int(report.get("event_ordered_incremental_launches", 0))
+    )
+    stock = int(report.get("stock_prefetched_external_attention_launches", 0))
+    kinds = [
+        kind
+        for kind, active in (
+            ("native_work_unit", native),
+            ("framework_reference", stock),
+        )
+        if active
+    ]
+    if not kinds:
+        kinds.append("projection_only")
+    return [_consumer_contract(kind) for kind in kinds]
+
+
+def _measured_consumer_contract(report: dict[str, Any]) -> dict[str, Any]:
+    """Return the strongest aggregate contract for compatibility."""
+
+    return _measured_consumer_contracts(report)[0]
 
 
 def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
@@ -605,7 +623,8 @@ def _measurement_delta(
         baseline.get("snapshot_unix_ns", 0)
     )
     measured["measurement_counter_fields"] = sorted(counter_names)
-    measured["consumer_contract"] = _measured_consumer_contract(measured)
+    measured["consumer_contracts"] = _measured_consumer_contracts(measured)
+    measured["consumer_contract"] = measured["consumer_contracts"][0]
     measured["execution_protocol_status"] = measured["consumer_contract"]["kind"]
     return measured
 
@@ -2214,26 +2233,28 @@ def main() -> int:
     )
     engine_version = importlib.metadata.version("sglang")
     consumer_contract: dict[str, Any] | None = None
+    consumer_contracts: list[dict[str, Any]] = []
     if args.attention_backend == "nta_flashinfer":
-        contracts = [
-            entry.get("consumer_contract")
-            for entry in stats
-            if isinstance(entry, dict)
-            and entry.get("backend") == "nta_flashinfer"
-            and isinstance(entry.get("consumer_contract"), dict)
+        contracts_by_kind: dict[str, dict[str, Any]] = {}
+        for entry in stats:
+            if not isinstance(entry, dict) or entry.get("backend") != "nta_flashinfer":
+                continue
+            path_contracts = entry.get("consumer_contracts")
+            if not isinstance(path_contracts, list):
+                path_contracts = [entry.get("consumer_contract")]
+            for contract in path_contracts:
+                if isinstance(contract, dict) and isinstance(contract.get("kind"), str):
+                    contracts_by_kind[contract["kind"]] = contract
+        consumer_contracts = [
+            contracts_by_kind[kind]
+            for kind in ("native_work_unit", "framework_reference", "projection_only")
+            if kind in contracts_by_kind
         ]
         # Prefer proof that the native work-unit consumer launched.  If the
         # report only contains a projection/reference contract, preserve it so
         # the formal evaluator can reject the trial with an actionable reason
         # instead of silently manufacturing evidence.
-        consumer_contract = next(
-            (
-                contract
-                for contract in contracts
-                if contract.get("kind") == "native_work_unit"
-            ),
-            contracts[0] if contracts else None,
-        )
+        consumer_contract = consumer_contracts[0] if consumer_contracts else None
     else:
         # Stock FlashInfer is the numerical framework reference.  It is not a
         # typed NTA work-unit consumer, but it still consumes the same exact
@@ -2249,6 +2270,7 @@ def main() -> int:
             "numerical_consumer": True,
             "engine_version": engine_version,
         }
+        consumer_contracts = [consumer_contract]
     tier_entries = {
         str(entry["serving_tier"])
         for entry in stats
@@ -2431,6 +2453,7 @@ def main() -> int:
     }
     if consumer_contract is not None:
         report["consumer_contract"] = consumer_contract
+        report["consumer_contracts"] = consumer_contracts
     if args.output is not None:
         atomic_write_json(args.output, report)
     print(json.dumps(report, sort_keys=True))

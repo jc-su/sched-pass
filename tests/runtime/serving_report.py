@@ -75,6 +75,8 @@ def single() -> dict[str, object]:
         "engine_stats": [
             {
                 "backend": "nta_flashinfer",
+                "ticketed_incremental_launches": 1,
+                "stock_prefetched_external_attention_launches": 0,
                 "consumer_contract": {
                     "schema": 1,
                     "engine": "sglang",
@@ -336,6 +338,7 @@ def main() -> None:
     framework_reference["engine_stats"][0][
         "stock_prefetched_external_attention_launches"
     ] = 1
+    framework_reference["engine_stats"][0]["ticketed_incremental_launches"] = 0
     validate(framework_reference)
     invalid_reference = copy.deepcopy(framework_reference)
     invalid_reference["engine_stats"][0][
@@ -344,9 +347,31 @@ def main() -> None:
     try:
         validate(invalid_reference)
     except ValueError as error:
-        assert "external exact prefetch" in str(error)
+        assert "timed numerical launches" in str(error)
     else:
         raise AssertionError("unfenced framework-reference evidence was accepted")
+    mixed_consumer = copy.deepcopy(nta)
+    framework_contract = framework_reference["engine_stats"][0]["consumer_contract"]
+    mixed_consumer["engine_stats"][0].update(
+        {
+            "consumer_contracts": [
+                mixed_consumer["engine_stats"][0]["consumer_contract"],
+                framework_contract,
+            ],
+            "stock_prefetched_external_attention_launches": 1,
+        }
+    )
+    validate(mixed_consumer)
+    missing_mixed_contract = copy.deepcopy(mixed_consumer)
+    missing_mixed_contract["engine_stats"][0]["consumer_contracts"] = [
+        missing_mixed_contract["engine_stats"][0]["consumer_contract"]
+    ]
+    try:
+        validate(missing_mixed_contract)
+    except ValueError as error:
+        assert "timed numerical launches" in str(error)
+    else:
+        raise AssertionError("mixed serving evidence hid its framework consumer")
     invalid_contract = copy.deepcopy(comparison)
     invalid_contract["nta"]["engine_stats"][0]["consumer_contract"]["kind"] = (
         "projection_only"

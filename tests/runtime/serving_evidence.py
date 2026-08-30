@@ -220,6 +220,41 @@ def main() -> None:
     assert not activation["compiler_verification_required"]
     assert activation["verification_domain"] == "framework_exact_preacquired"
 
+    # One timed forward may use the native consumer at an unresolved frontier
+    # and stock FlashInfer after later layers become fully preacquired.  The
+    # aggregate contract remains native, while the path set proves both
+    # numerical consumers instead of forcing one label to describe both.
+    mixed = report(compact_ctas=1, canonical_ctas=2)
+    native_contract = dict(mixed["engine_stats"][0]["consumer_contract"])
+    framework_contract = dict(prefetched["engine_stats"][0]["consumer_contract"])
+    mixed["engine_stats"][0].update(
+        {
+            "consumer_contracts": [native_contract, framework_contract],
+            "stock_attention_launches": 1,
+            "stock_prefetched_external_attention_launches": 1,
+            "external_launches": 2,
+            "native_external_attention_launches": 1,
+            "prefetched_layers": 1,
+            "demand_host_layers": 1,
+            "prefill_launches": 2,
+        }
+    )
+    activation = module.require_clean_mechanism(
+        mixed, require_physical_compaction=True
+    )
+    assert activation["native_work_unit_active"]
+    assert activation["external_attention_stock_consumer"]
+    assert activation["framework_preacquired_verified"]
+    missing_mixed_path = report(compact_ctas=1, canonical_ctas=2)
+    missing_mixed_path["engine_stats"][0].update(mixed["engine_stats"][0])
+    missing_mixed_path["engine_stats"][0]["consumer_contracts"] = [native_contract]
+    try:
+        module.require_clean_mechanism(missing_mixed_path)
+    except RuntimeError as error:
+        assert "framework contract" in str(error)
+    else:
+        raise AssertionError("mixed execution hid its stock numerical contract")
+
     missing_transport = report(compact_ctas=1, canonical_ctas=1)
     missing_transport["engine_stats"][0].pop("transport_contract")
     try:
@@ -651,6 +686,18 @@ def main() -> None:
         < 1e-9
     )
     assert measured["consumer_contract"]["kind"] == "framework_reference"
+    assert [
+        contract["kind"] for contract in measured["consumer_contracts"]
+    ] == ["framework_reference"]
+    assert [
+        contract["kind"]
+        for contract in serving._measured_consumer_contracts(
+            {
+                "ticketed_incremental_launches": 1,
+                "stock_prefetched_external_attention_launches": 35,
+            }
+        )
+    ] == ["native_work_unit", "framework_reference"]
     dispatch = serving._execution_dispatch([measured])
     assert dispatch["kind"] == "stock_direct"
     assert dispatch["plan_uploads"] == 0

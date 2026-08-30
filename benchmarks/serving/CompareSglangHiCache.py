@@ -232,11 +232,16 @@ def require_clean_mechanism(
     framework_preacquired_verified = False
     if stock_external_launches > 0:
         framework_preacquired_verified = any(
-            isinstance(entry.get("consumer_contract"), dict)
-            and entry["consumer_contract"].get("kind") == "framework_reference"
-            and entry["consumer_contract"].get("exact_demand") is True
-            and entry["consumer_contract"].get("numerical_consumer") is True
+            isinstance(contract, dict)
+            and contract.get("kind") == "framework_reference"
+            and contract.get("exact_demand") is True
+            and contract.get("numerical_consumer") is True
             for entry in stats
+            for contract in (
+                entry.get("consumer_contracts")
+                if isinstance(entry.get("consumer_contracts"), list)
+                else [entry.get("consumer_contract")]
+            )
         )
         if not framework_preacquired_verified:
             raise RuntimeError(

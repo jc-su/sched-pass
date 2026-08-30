@@ -435,21 +435,58 @@ def _validate_consumer_contract(
     report: dict[str, Any], *, require_formal_execution: bool
 ) -> None:
     """Validate the numerical consumer, not only the scheduler projection."""
-    contracts = []
+    contracts: list[dict[str, Any]] = []
     for entry in report.get("engine_stats", []):
         if not isinstance(entry, dict) or entry.get("backend") != "nta_flashinfer":
             continue
         try:
-            contracts.append(
+            primary = validate_consumer_contract(
+                entry.get("consumer_contract"),
+                expected_engine="sglang",
+                expected_backend=entry.get("backend"),
+                require_formal_execution=require_formal_execution,
+            )
+            raw_paths = entry.get("consumer_contracts")
+            if raw_paths is None:
+                raw_paths = [entry.get("consumer_contract")]
+            if not isinstance(raw_paths, list) or not raw_paths:
+                raise ValueError("consumer path contracts must be a nonempty list")
+            paths = [
                 validate_consumer_contract(
-                    entry.get("consumer_contract"),
+                    value,
                     expected_engine="sglang",
                     expected_backend=entry.get("backend"),
                     require_formal_execution=require_formal_execution,
                 )
-            )
+                for value in raw_paths
+            ]
         except ValueError as error:
             raise ValueError(str(error)) from error
+        path_kinds = [contract["kind"] for contract in paths]
+        native_launches = sum(
+            int(entry.get(name, 0))
+            for name in (
+                "transformed_direct_launches",
+                "ticketed_incremental_launches",
+                "event_ordered_incremental_launches",
+            )
+        )
+        stock_launches = int(
+            entry.get("stock_prefetched_external_attention_launches", 0)
+        )
+        expected_kinds = [
+            kind
+            for kind, launches in (
+                ("native_work_unit", native_launches),
+                ("framework_reference", stock_launches),
+            )
+            if launches > 0
+        ] or ["projection_only"]
+        _require(
+            path_kinds == expected_kinds and primary["kind"] == expected_kinds[0],
+            "consumer path contracts diverge from timed numerical launches",
+        )
+        contracts.extend(paths)
     if require_formal_execution:
         _require(
             contracts,
