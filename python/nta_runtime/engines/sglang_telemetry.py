@@ -261,6 +261,8 @@ _ZERO_COUNTERS = (
     "deadline_frontier_modeled_ready_layers",
     "deadline_frontier_modeled_stock_dispatches",
     "deadline_frontier_fragment_layers",
+    "partial_consumer_unproven_layers",
+    "partial_consumer_planned_layers",
     "resident_reference_batches",
     "hicache_external_batches",
     "hicache_fallback_batches",

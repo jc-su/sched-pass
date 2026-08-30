@@ -237,6 +237,12 @@ class SglangForwardEpoch:
     # ``Event.query`` from selecting an expensive partial consumer for work that
     # will be ready when the GPU actually reaches attention.
     modeled_ready_by_attention_layers: set[int] = field(default_factory=set)
+    # A partial consumer is a planned execution form, never the absence of a
+    # readiness proof.  AUTO leaves this set empty until a calibrated
+    # arrival/cost policy proves that consuming waves is cheaper than waiting
+    # for the complete producer fence.  Bounded calibration and explicit
+    # causal modes may populate it to measure that execution form.
+    planned_progressive_consumer_layers: set[int] = field(default_factory=set)
     # Pure orchestration geometry is invariant across layers for one FlashInfer
     # wrapper.  Object addresses and versions are rebound separately by the
     # materializer, so caching this template does not retain tier resources.
@@ -322,6 +328,7 @@ class SglangForwardEpoch:
             self.fragment_lookahead
             or self.ordered_prefetch_event_ids
             or self.modeled_ready_by_attention_layers
+            or self.planned_progressive_consumer_layers
             or self.host_layer_templates
             or self.arriving_partition_key is not None
             or self.execution is not None

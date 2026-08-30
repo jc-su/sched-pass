@@ -163,6 +163,48 @@ def main() -> None:
     assert admission.acquisition.fully_published
     assert admission_owner._stats["host_acquisition_jobs_submitted"] == 4
 
+    # A progressive producer capability is not itself a partial-consumer
+    # decision. Normal AUTO selection must wait for a per-layer arrival/cost
+    # proof; bounded calibration may explicitly measure the path, while an EDF
+    # ready prediction revokes that layer from the probe.
+    publications = {
+        layer: types.SimpleNamespace(transfer_first_slot=2 * layer)
+        for layer in range(4)
+    }
+
+    def consumer_batch(reason: str) -> SglangForwardEpoch:
+        lease = types.SimpleNamespace(prefetched_layers=publications)
+        execution = types.SimpleNamespace(
+            uses_progressive_consumer=True,
+            overlap_initial=True,
+            selection_reason=reason,
+        )
+        return SglangForwardEpoch(
+            plan=SglangForwardPlan(
+                bindings=(),
+                semantic_plans={},
+                pending_host_load=lease,
+                host_execution=execution,
+            )
+        )
+
+    unproven_batch = consumer_batch("predicted_gain")
+    admission_owner.plan_published_consumers(
+        unproven_batch.pending_host_load,
+        unproven_batch,
+    )
+    assert not unproven_batch.planned_progressive_consumer_layers
+    assert admission_owner._stats["partial_consumer_unproven_layers"] == 4
+
+    probe_batch = consumer_batch("calibration_probe")
+    probe_batch.modeled_ready_by_attention_layers.add(3)
+    admission_owner.plan_published_consumers(
+        probe_batch.pending_host_load,
+        probe_batch,
+    )
+    assert probe_batch.planned_progressive_consumer_layers == {0, 1, 2}
+    assert admission_owner._stats["partial_consumer_planned_layers"] == 3
+
     # Frontier policy belongs to the acquisition owner, not the framework
     # adapter. Before calibration it emits one bounded probe; a frozen model
     # can publish the complete feasible suffix in one transition.

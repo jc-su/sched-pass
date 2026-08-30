@@ -302,6 +302,49 @@ class SglangHostAcquisitionCoordinator:
             self._add("host_acquisition_jobs_submitted", submission.job_count)
         return submission.job_count
 
+    def plan_published_consumers(
+        self,
+        pending: PendingHostLoad,
+        batch: SglangForwardEpoch,
+    ) -> None:
+        """Bind partial consumers only at an explicit calibration/causal edge.
+
+        A published progressive layer merely exposes wave readiness; it does
+        not prove that the GPU will reach attention before the complete layer
+        fence.  AUTO's normal ``predicted_gain`` result is currently a
+        whole-forward execution estimate, not that per-layer arrival proof, so
+        it must not turn a racing CPU ``Event.query`` into partial execution.
+        Bounded probes and the explicit dependency-aware experiment retain the
+        path needed to measure and validate a future closed-loop policy.
+        """
+
+        if batch.pending_host_load is not pending:
+            raise RuntimeError("consumer planning lost its active HiCache lease")
+        execution = batch.host_execution
+        if (
+            execution is None
+            or not execution.uses_progressive_consumer
+            or not execution.overlap_initial
+        ):
+            return
+        progressive_layers = {
+            local_layer
+            for local_layer, publication in pending.prefetched_layers.items()
+            if getattr(publication, "transfer_first_slot", None) is not None
+        }
+        if not progressive_layers:
+            return
+        explicit_measurement = execution.selection_reason in {
+            "calibration_probe",
+            "forced_dependency_aware",
+        }
+        if not explicit_measurement:
+            self._add("partial_consumer_unproven_layers", len(progressive_layers))
+            return
+        planned = progressive_layers - batch.modeled_ready_by_attention_layers
+        batch.planned_progressive_consumer_layers.update(planned)
+        self._add("partial_consumer_planned_layers", len(planned))
+
     def publish_range(
         self,
         pending: PendingHostLoad,

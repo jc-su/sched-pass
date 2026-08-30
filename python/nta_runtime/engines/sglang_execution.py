@@ -167,9 +167,16 @@ def select_attention_dispatch(
     acquisition: SglangLayerAcquisition | None,
     layer_id: int,
     prefetch_event_ordered: bool = False,
-    modeled_ready_by_attention: bool = False,
+    progressive_consumer_planned: bool = False,
 ) -> AttentionDispatch:
-    """Select exactly one layer path without submitting CUDA work."""
+    """Select exactly one layer path without submitting CUDA work.
+
+    Producer incompleteness on the launch thread is not permission to use the
+    partial consumer: Python can enqueue many transformer layers ahead of GPU
+    execution.  ``progressive_consumer_planned`` is therefore an explicit
+    scheduling/cost decision.  A host-side event query can only veto that plan
+    once the producer is already complete; it can never create the plan.
+    """
 
     if pending is None:
         if host_execution is not None or acquisition is not None:
@@ -203,12 +210,12 @@ def select_attention_dispatch(
         ):
             raise RuntimeError("progressive Host attention has no execution decision")
         arriving = (
-            acquisition.progressive
+            progressive_consumer_planned
+            and acquisition.progressive
             and host_execution is not None
             and host_execution.uses_dependency_protocol
             and host_execution.overlap_initial
             and not prefetch_event_ordered
-            and not modeled_ready_by_attention
             and not acquisition.ready_event.query()
         )
         return AttentionDispatch(

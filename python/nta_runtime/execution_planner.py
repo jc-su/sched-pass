@@ -238,6 +238,7 @@ class HostExecutionPlan:
         "insufficient_gain",
         "predicted_gain",
         "tenant_isolation",
+        "scheduled_preacquired",
         "forced_direct",
         "forced_device_bulk",
         "forced_dependency_aware",

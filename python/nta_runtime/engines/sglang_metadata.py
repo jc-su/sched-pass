@@ -222,11 +222,17 @@ class SglangMetadataPlanner:
         A calibration epoch must construct and execute one typed observation;
         otherwise an early, fully-published prefetch can permanently bypass
         the only path capable of closing the online setup-cost model.
+
+        A normal AUTO epoch also requires an affirmative per-layer plan before
+        using a progressive consumer.  Fully published acquisition fences with
+        no such plan are scheduled-preacquired work: stock FlashInfer waits on
+        those fences without building exact CTA dependency topology.  This is
+        a ready specialization of NTA ownership, not a framework fallback.
         """
 
         if not self._tier_service.is_host_staged or calibration_probe:
             return None
-        return prove_direct_metadata_execution(
+        direct = prove_direct_metadata_execution(
             schedules,
             pending,
             bindings,
@@ -234,6 +240,36 @@ class SglangMetadataPlanner:
             tenant_isolation=self._tenant_isolation_enabled,
             model=host_cost_model,
             mode=self._execution_config.host_execution_mode,
+        )
+        if direct is not None:
+            return direct
+        acquisition = pending.acquisition
+        if (
+            self._execution_config.host_execution_mode is not HostExecutionMode.AUTO
+            or acquisition is None
+            or not acquisition.fully_published
+        ):
+            return None
+        scheduled = prove_direct_metadata_execution(
+            schedules,
+            pending,
+            bindings,
+            host_staged=True,
+            tenant_isolation=self._tenant_isolation_enabled,
+            model=host_cost_model,
+            mode=HostExecutionMode.DIRECT,
+        )
+        if scheduled is None:  # pragma: no cover - forced DIRECT is total
+            raise RuntimeError("scheduled-preacquired execution has no direct plan")
+        return HostExecutionPlan(
+            block_counts=scheduled.block_counts,
+            predicted_atomic_ns=scheduled.predicted_atomic_ns,
+            predicted_incremental_ns=scheduled.predicted_incremental_ns,
+            form=scheduled.form,
+            overlap_initial=False,
+            selection_reason="scheduled_preacquired",
+            scope_units=scheduled.scope_units,
+            incremental_service_scale=scheduled.incremental_service_scale,
         )
 
     def _record_direct_mixed_heterogeneity(

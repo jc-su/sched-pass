@@ -61,7 +61,12 @@ def main() -> None:
     from nta_runtime.engines.sglang_metadata import SglangMetadataPlanner
     from nta_runtime.engines.sglang_pipeline import bounded_sm_pair_worker_grid
     from nta_runtime.engines.sglang_transfer import HostMoverController, MoverProfile
-    from nta_runtime.execution_planner import HostCostModel, HostExecutionMode
+    from nta_runtime.execution_planner import (
+        HostCostModel,
+        HostExecutionForm,
+        HostExecutionMode,
+        HostExecutionPlan,
+    )
     from nta_runtime.indexed_transfer import IndexedMoverServiceModel
     from nta_runtime.requests import RequestBinding
 
@@ -148,6 +153,30 @@ def main() -> None:
             is None
         )
         direct_proof.assert_not_called()
+
+        scheduled_candidate = HostExecutionPlan(
+            block_counts=(2,),
+            predicted_atomic_ns=100,
+            predicted_incremental_ns=100,
+            form=HostExecutionForm.DIRECT,
+            selection_reason="forced_direct",
+        )
+        published = types.SimpleNamespace(
+            acquisition=types.SimpleNamespace(fully_published=True)
+        )
+        direct_proof.side_effect = (None, scheduled_candidate)
+        scheduled = fastpath_planner._bounded_direct_plan(
+            {7: object()},
+            published,
+            (binding,),
+            host_cost_model=model_snapshot,
+            calibration_probe=False,
+        )
+        assert scheduled is not None
+        assert scheduled.form is HostExecutionForm.DIRECT
+        assert scheduled.selection_reason == "scheduled_preacquired"
+        assert direct_proof.call_count == 2
+        assert direct_proof.call_args.kwargs["mode"] is HostExecutionMode.DIRECT
     assert not _requires_feasible_edf((binding,), tenant_isolation=False)
     assert _requires_feasible_edf((binding,), tenant_isolation=True)
     homogeneous_peer = RequestBinding(

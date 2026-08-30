@@ -125,7 +125,7 @@ def main() -> None:
         layer_id=6,
     )
     assert selected.kind is AttentionDispatchKind.PRELOADED
-    assert ready.queries == 1
+    assert ready.queries == 0
     assert use_preloaded_stock_alias(selected, alias_available=True)
     assert not use_preloaded_stock_alias(
         selected,
@@ -141,20 +141,29 @@ def main() -> None:
         acquisition=arriving,
         layer_id=6,
     )
-    assert selected.kind is AttentionDispatchKind.ARRIVING_PREFETCH
-    assert arriving_event.queries == 1
-    assert not use_preloaded_stock_alias(selected, alias_available=True)
-    assert not use_preloaded_stock_alias(selected, alias_available=False)
+    assert selected.kind is AttentionDispatchKind.PRELOADED
+    assert arriving_event.queries == 0
 
-    # A calibrated EDF result is about the future GPU attention deadline, not
-    # host-side readiness at dispatch time. Preserve that decision and let the
-    # stock stream wait enforce correctness without a racing event query.
     selected = select_attention_dispatch(
         pending=pending(),
         host_execution=execution(dependency=True, overlap=True),
         acquisition=arriving,
         layer_id=6,
-        modeled_ready_by_attention=True,
+        progressive_consumer_planned=True,
+    )
+    assert selected.kind is AttentionDispatchKind.ARRIVING_PREFETCH
+    assert arriving_event.queries == 1
+    assert not use_preloaded_stock_alias(selected, alias_available=True)
+    assert not use_preloaded_stock_alias(selected, alias_available=False)
+
+    # The scheduler can revoke a progressive plan when its calibrated EDF
+    # result predicts completion by the future GPU attention deadline. The
+    # stock stream wait remains the correctness backstop.
+    selected = select_attention_dispatch(
+        pending=pending(),
+        host_execution=execution(dependency=True, overlap=True),
+        acquisition=arriving,
+        layer_id=6,
     )
     assert selected.kind is AttentionDispatchKind.PRELOADED
     assert arriving_event.queries == 1
@@ -168,6 +177,7 @@ def main() -> None:
         acquisition=arriving,
         layer_id=6,
         prefetch_event_ordered=True,
+        progressive_consumer_planned=True,
     )
     assert selected.kind is AttentionDispatchKind.PRELOADED
     assert arriving_event.queries == 1

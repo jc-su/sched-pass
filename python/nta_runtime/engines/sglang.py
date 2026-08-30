@@ -1514,6 +1514,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 )
                 progress = self._hicache.progress(consumer_index)
                 prefetch_fully_ready = progress is not None and progress.complete
+                active_batch = self._forward_lifecycle.active
+                if active_batch is None:  # pragma: no cover - activated above
+                    raise RuntimeError("host-staged batch lost its execution epoch")
+                self._host_acquisition.plan_published_consumers(
+                    pending,
+                    active_batch,
+                )
                 ready_stock_fastpath = (
                     prefetch_fully_ready
                     and self._execution_config.host_execution_mode
@@ -1910,13 +1917,18 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             acquisition is not None
             and local_layer in batch.modeled_ready_by_attention_layers
         )
+        progressive_consumer_planned = (
+            acquisition is not None
+            and local_layer in batch.planned_progressive_consumer_layers
+            and not modeled_ready_by_attention
+        )
         dispatch = select_attention_dispatch(
             pending=pending,
             host_execution=batch.host_execution,
             acquisition=acquisition,
             layer_id=int(layer.layer_id),
             prefetch_event_ordered=prefetch_event_ordered,
-            modeled_ready_by_attention=modeled_ready_by_attention,
+            progressive_consumer_planned=progressive_consumer_planned,
         )
         if modeled_ready_by_attention:
             self._stats["deadline_frontier_modeled_stock_dispatches"] = (
