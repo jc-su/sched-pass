@@ -160,10 +160,9 @@ def test_profile_classification_survives_forward_release() -> None:
     assert owner.external_since(external_cursor)
 
     resident_cursor = owner.profile_cursor()
-    resident = new_epoch()
-    owner.activate(resident)
-    owner.finish(resident, retain_for_graph=False)
+    owner.record_reference_forward()
     assert not owner.external_since(resident_cursor)
+    assert owner.active is None
     assert_raises(
         "exactly one lifecycle epoch",
         lambda: owner.external_since(external_cursor),
@@ -500,7 +499,6 @@ def commit_backend(*, fail_at=None):
     )
     backend._finalize_stream_ordered_batch = stage("stream-retire")
     backend._commit_incremental_setup_observation = stage("observation")
-    backend._publish_stats = stage("publish")
     backend._finish_forward = stage(
         "finish",
         lambda: owner.finish(active, retain_for_graph=False),
@@ -517,7 +515,6 @@ def test_external_commit_order_and_fault_containment() -> None:
         "frontier",
         "hicache",
         "observation",
-        "publish",
         "finish",
     ]
     backend, active, pending, owner, order = commit_backend()
@@ -532,7 +529,6 @@ def test_external_commit_order_and_fault_containment() -> None:
             local_layer=0,
             native_dispatch=True,
             progressive_consumer=True,
-            publish_stats=True,
         )
     synchronize.assert_not_called()
     assert order == expected
@@ -556,11 +552,10 @@ def test_external_commit_order_and_fault_containment() -> None:
                     local_layer=0,
                     native_dispatch=True,
                     progressive_consumer=True,
-                    publish_stats=True,
                 ),
             )
         cleanup = ["abort-sync", "acquisition-abort"]
-        if failed_stage not in {"observation", "publish", "finish"}:
+        if failed_stage not in {"observation", "finish"}:
             cleanup.append("hicache-retire")
         assert order == expected[: failed_index + 1] + cleanup
         assert owner.active is None
@@ -595,7 +590,6 @@ def test_external_commit_order_and_fault_containment() -> None:
                 local_layer=0,
                 native_dispatch=True,
                 progressive_consumer=True,
-                publish_stats=True,
             ),
         )
     assert order == ["abort-sync", "acquisition-abort", "hicache-retire"]

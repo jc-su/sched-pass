@@ -66,6 +66,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hicache-ratio", type=float, default=8.0)
     parser.add_argument("--max-running-requests", type=int, default=16)
     parser.add_argument(
+        "--numa-node",
+        type=int,
+        help="SGLang scheduler/HiCache NUMA node, applied identically to both arms",
+    )
+    parser.add_argument(
+        "--cpu-affinity",
+        help="fail-closed CPU-list contract applied identically to both arms",
+    )
+    parser.add_argument(
         "--eviction-rounds",
         type=int,
         help=(
@@ -169,6 +178,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("admission bounds are invalid")
     if args.eviction_rounds is not None and args.eviction_rounds < 0:
         parser.error("eviction rounds cannot be negative")
+    if args.numa_node is not None and args.numa_node < 0:
+        parser.error("NUMA node cannot be negative")
     if args.load_warmup_iterations < 0:
         parser.error("load warmup iterations cannot be negative")
     if args.incremental_setup_ns is not None and args.incremental_setup_ns < 0:
@@ -282,6 +293,10 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     ]
     if args.eviction_rounds is not None:
         command.extend(("--eviction-rounds", str(args.eviction_rounds)))
+    if args.numa_node is not None:
+        command.extend(("--numa-node", str(args.numa_node)))
+    if args.cpu_affinity is not None:
+        command.extend(("--cpu-affinity", args.cpu_affinity))
     command.extend(("--load-warmup-iterations", str(args.load_warmup_iterations)))
     if args.workload_manifest is not None:
         command.extend(("--workload-manifest", str(args.workload_manifest.resolve())))

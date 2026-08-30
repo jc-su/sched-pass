@@ -16,7 +16,7 @@ import random
 import subprocess
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
 try:
     from experiments.bailian import (
@@ -92,6 +92,10 @@ _MEASUREMENT_COUNTERS = frozenset(
         "progressive_consumer_batch_observations",
         "progressive_consumer_batches",
         "progressive_consumer_layers",
+        "resident_reference_metadata_calls",
+        "resident_reference_metadata_cpu_ns",
+        "resident_reference_metadata_stock_cpu_ns",
+        "resident_reference_metadata_overhead_cpu_ns",
         "fragment_lookahead_layers",
         "fragment_lookahead_objects",
         "fragment_lookahead_bytes",
@@ -700,6 +704,96 @@ def _machine_metadata() -> dict[str, Any]:
     }
 
 
+def _parse_cpu_affinity(value: str | None) -> frozenset[int] | None:
+    """Parse a Linux CPU-list without delegating benchmark policy to a shell."""
+
+    if value is None:
+        return None
+    cpus: set[int] = set()
+    for segment in value.split(","):
+        fields = segment.strip().split("-", 1)
+        try:
+            first = int(fields[0])
+            last = first if len(fields) == 1 else int(fields[1])
+        except ValueError as error:
+            raise ValueError(f"invalid CPU affinity segment {segment!r}") from error
+        if first < 0 or last < first:
+            raise ValueError(f"invalid CPU affinity segment {segment!r}")
+        cpus.update(range(first, last + 1))
+    if not cpus:
+        raise ValueError("CPU affinity cannot be empty")
+    return frozenset(cpus)
+
+
+def _apply_engine_cpu_affinity(
+    engine: Any, requested: frozenset[int] | None
+) -> dict[str, Any]:
+    """Pin and verify the complete in-process SGLang engine tree.
+
+    SGLang may replace the launcher's affinity while constructing scheduler
+    subprocesses.  Applying the artifact contract after construction and
+    before every setup/model request makes the measured control-plane and
+    host-memory path reproducible.  Every existing thread is included; a
+    process-level check alone can miss CUDA or framework worker threads with a
+    wider inherited mask.
+    """
+
+    if requested is None:
+        return {
+            "requested": None,
+            "verified": False,
+            "scope": "uncontrolled",
+            "processes": [],
+        }
+    os.sched_setaffinity(0, requested)
+    child_pids = tuple(int(pid) for pid in engine.get_all_child_pids())
+    process_pids = (os.getpid(), *child_pids)
+    for pid in process_pids:
+        task_root = pathlib.Path(f"/proc/{pid}/task")
+        try:
+            tids = tuple(int(entry.name) for entry in task_root.iterdir())
+        except (FileNotFoundError, ProcessLookupError) as error:
+            raise RuntimeError(
+                f"SGLang process {pid} exited while applying CPU affinity"
+            ) from error
+        for tid in tids:
+            try:
+                os.sched_setaffinity(tid, requested)
+            except ProcessLookupError:
+                # A transient framework thread may retire between the task
+                # directory snapshot and sched_setaffinity. The process-level
+                # verification below remains authoritative.
+                continue
+
+    processes: list[dict[str, Any]] = []
+    for pid in process_pids:
+        try:
+            actual = frozenset(os.sched_getaffinity(pid))
+            name = pathlib.Path(f"/proc/{pid}/comm").read_text().strip()
+        except (FileNotFoundError, ProcessLookupError) as error:
+            raise RuntimeError(
+                f"SGLang process {pid} exited before CPU-affinity verification"
+            ) from error
+        if actual != requested:
+            raise RuntimeError(
+                "SGLang CPU-affinity contract was not preserved: "
+                f"process={name}, expected={sorted(requested)}, "
+                f"actual={sorted(actual)}"
+            )
+        processes.append(
+            {
+                "role": "client" if pid == os.getpid() else name,
+                "cpus": sorted(actual),
+            }
+        )
+    return {
+        "requested": sorted(requested),
+        "verified": True,
+        "scope": "client_and_engine_children",
+        "processes": processes,
+    }
+
+
 def _engine_byte_accounting(
     stats: list[dict[str, Any]],
 ) -> tuple[int | None, int | None, str]:
@@ -774,6 +868,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mem-fraction-static", type=float, default=0.35)
     parser.add_argument("--hicache-ratio", type=float, default=8.0)
     parser.add_argument("--max-running-requests", type=int, default=16)
+    parser.add_argument(
+        "--numa-node",
+        type=int,
+        help=(
+            "explicit SGLang scheduler and HiCache host-allocation NUMA node; "
+            "use the node local to the measured GPU"
+        ),
+    )
+    parser.add_argument(
+        "--cpu-affinity",
+        help=(
+            "Linux CPU-list applied fail-closed to the SGLang client and all "
+            "engine children (for example 0-15)"
+        ),
+    )
     parser.add_argument(
         "--eviction-rounds",
         type=int,
@@ -869,6 +978,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("load warmup iterations cannot be negative")
     if args.eviction_rounds is not None and args.eviction_rounds < 0:
         parser.error("eviction rounds cannot be negative")
+    if args.numa_node is not None and args.numa_node < 0:
+        parser.error("NUMA node cannot be negative")
+    try:
+        _parse_cpu_affinity(args.cpu_affinity)
+    except ValueError as error:
+        parser.error(str(error))
     if args.slo_ttft_seconds <= 0 or args.slo_p99_itl_seconds <= 0:
         parser.error("SLO thresholds must be positive")
     if args.request_rate <= 0:
@@ -910,6 +1025,14 @@ def parse_args() -> argparse.Namespace:
 
 
 TokenInput = tuple[int, ...]
+
+
+class _AsyncGate(Protocol):
+    async def wait(self) -> Any: ...
+
+
+class _Signal(Protocol):
+    def set(self) -> Any: ...
 
 
 def _churn_window(
@@ -1402,8 +1525,8 @@ async def _stream_request(
     kind: str,
     index: int,
     request_id: str | None,
-    gate: asyncio.Event | None,
-    first_token_event: asyncio.Event | None,
+    gate: _AsyncGate | None,
+    first_token_event: _Signal | None,
     offset_seconds: float,
     load_start_seconds: float,
 ) -> dict[str, Any]:
@@ -1496,6 +1619,36 @@ async def _stream_request(
     }
 
 
+class _FirstTokenBarrier:
+    """Release synthetic external arrivals after every resident is active.
+
+    A single ``asyncio.Event`` set by the first resident made the measured
+    mixed-forward shape depend on which response happened to reach the client
+    first.  That scheduler race changed the number of engine forwards across
+    otherwise identical arms.  Natural-trace replay uses explicit timestamps
+    and bypasses this barrier; the synthetic mechanism workload uses it to
+    define one reproducible state transition.
+    """
+
+    __slots__ = ("_event", "_remaining")
+
+    def __init__(self, parties: int) -> None:
+        if parties <= 0:
+            raise ValueError("first-token barrier requires resident parties")
+        self._remaining = parties
+        self._event = asyncio.Event()
+
+    def set(self) -> None:
+        if self._remaining <= 0:
+            return
+        self._remaining -= 1
+        if self._remaining == 0:
+            self._event.set()
+
+    async def wait(self) -> None:
+        await self._event.wait()
+
+
 async def _run_load(
     engine: Any,
     resident_prompts: list[TokenInput],
@@ -1509,7 +1662,7 @@ async def _run_load(
     external_request_ids: Sequence[str] | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
     started = time.perf_counter()
-    resident_started = asyncio.Event()
+    residents_started = _FirstTokenBarrier(len(resident_prompts))
     resident_sampling = {
         "temperature": 0,
         # A performance-excluded warmup must preserve the timed concurrency
@@ -1544,7 +1697,7 @@ async def _run_load(
                 else None
             ),
             gate=None,
-            first_token_event=resident_started,
+            first_token_event=residents_started,
             offset_seconds=(
                 float(resident_offsets[index])
                 if resident_offsets is not None
@@ -1598,7 +1751,7 @@ async def _run_load(
                 gate=(
                     None
                     if resident_offsets is not None and external_offsets is not None
-                    else resident_started
+                    else residents_started
                 ),
                 first_token_event=None,
                 offset_seconds=offsets[index],
@@ -1669,6 +1822,19 @@ def _slo_goodput(
 
 def main() -> int:
     args = parse_args()
+    requested_cpu_affinity = _parse_cpu_affinity(args.cpu_affinity)
+    if requested_cpu_affinity is not None:
+        os.sched_setaffinity(0, requested_cpu_affinity)
+    if args.numa_node is not None:
+        requested_numa_node = str(args.numa_node)
+        configured_numa_node = os.environ.get("SGLANG_HICACHE_HOST_NUMA_NODE")
+        if configured_numa_node not in {None, requested_numa_node}:
+            raise RuntimeError(
+                "SGLang scheduler and HiCache allocator NUMA nodes disagree: "
+                f"scheduler={requested_numa_node}, "
+                f"allocator={configured_numa_node}"
+            )
+        os.environ["SGLANG_HICACHE_HOST_NUMA_NODE"] = requested_numa_node
     workspace = configure_environment(args)
     prior_stats_paths = set(workspace.glob("nta-engine.*.json"))
     import sglang as sgl
@@ -1892,6 +2058,7 @@ def main() -> int:
             remaining -= token_count
 
     measurement_baseline: dict[str, dict[str, Any]] = {}
+    cpu_affinity_contract: dict[str, Any] = {}
     load_started = time.perf_counter()
     with sgl.Engine(
         model_path=str(args.model.resolve()),
@@ -1914,7 +2081,11 @@ def main() -> int:
         hicache_write_policy="write_through",
         hicache_io_backend="kernel",
         hicache_mem_layout="page_first",
+        numa_node=None if args.numa_node is None else [args.numa_node],
     ) as engine:
+        cpu_affinity_contract = _apply_engine_cpu_affinity(
+            engine, requested_cpu_affinity
+        )
 
         def warm_residents() -> None:
             """Materialize, then exactly verify the resident working set."""
@@ -1994,37 +2165,40 @@ def main() -> int:
         warm_residents()
 
         def establish_final_placement() -> None:
-            """Restore the requested device/host split after setup traffic.
+            """Rebuild the requested device/host split from an empty cache.
 
             Warmup requests intentionally exercise the same mixed scheduler
-            path as the timed load, but they also perturb the device LRU.  A
-            timed external request must not accidentally become a device hit
-            merely because a graph warmup touched it.  Repeat the explicit
-            placement protocol after every excluded warmup so placement is a
-            property of the timed phase, not of incidental setup order.
+            path as the timed load, but every exact calibration suffix creates
+            a distinct radix branch. Merely applying more LRU pressure leaves
+            those branches resident and makes TPOT depend on the configured
+            warmup count. Flush and deterministically reconstruct placement
+            after every excluded warmup so the measured cache topology, not
+            only its token totals, is identical across causal arms.
 
             A normalized Bailian cohort has an exact placement contract.  LRU
-            pressure alone cannot reconstruct that contract: a completed
-            calibration may leave a different subset of one shared prefix on
-            device even when the same number of tokens is evicted.  Rebuild
-            the cohort from an empty radix/HiCache state before applying the
-            deterministic pressure sequence.  This is outside the timed
-            window and is applied identically to every causal arm.
+            pressure alone cannot reconstruct that contract; its registered
+            eviction prompts remain the authoritative sequence. Synthetic
+            workloads reuse one fixed cold churn window after each flush.
+            This setup is outside the timed window and is identical for every
+            causal arm.
             """
 
-            if workload_metadata is not None:
-                flush_result = engine.flush_cache()
-                if not bool(getattr(flush_result, "success", False)):
-                    message = str(getattr(flush_result, "message", ""))
-                    raise RuntimeError(
-                        "failed to reset SGLang cache before rebuilding the "
-                        f"measured placement: {message}"
-                    )
-                warm_external_prefixes()
-            for prompt in placement_eviction_prompts:
+            flush_result = engine.flush_cache()
+            if not bool(getattr(flush_result, "success", False)):
+                message = str(getattr(flush_result, "message", ""))
+                raise RuntimeError(
+                    "failed to reset SGLang cache before rebuilding the "
+                    f"measured placement: {message}"
+                )
+            warm_external_prefixes()
+            placement_pressure = (
+                placement_eviction_prompts
+                if workload_metadata is not None
+                else _churn_window(churn_prompts, 0, eviction_rounds)
+            )
+            for prompt in placement_pressure:
                 generated_text(_generate_one(engine, prompt, setup_sampling))
-            if placement_eviction_prompts:
-                warm_residents()
+            warm_residents()
 
         establish_final_placement()
 
@@ -2077,14 +2251,15 @@ def main() -> int:
                     if record["kind"] == "external"
                 ]
             )
-            for prompt in _churn_window(
-                churn_prompts, 2 + warmup, eviction_rounds
-            ):
-                generated_text(_generate_one(engine, prompt, setup_sampling))
-            if eviction_rounds:
-                warm_residents()
             establish_final_placement()
 
+        # SGLang's startup and cache-management workers may replace process
+        # affinity after Engine construction. Re-apply and verify the declared
+        # contract at the final quiescent boundary immediately before timing;
+        # this is the affinity that the serving result is allowed to claim.
+        cpu_affinity_contract = _apply_engine_cpu_affinity(
+            engine, requested_cpu_affinity
+        )
         # Delimit the timed counter window with a control-plane snapshot. It
         # quiesces prior CUDA observations without issuing a model request or
         # changing cache placement.
@@ -2314,6 +2489,7 @@ def main() -> int:
     correctness = {
         "verification_failures": 0,
         "placement_proven": True,
+        "placement_reset_between_warmups": True,
         "generated_text_sha256": digest.hexdigest(),
         "demand_trace_digest": (
             workload_metadata["demand_trace_digest"]
@@ -2373,6 +2549,8 @@ def main() -> int:
         "context_length": args.context_length,
         "mem_fraction_static": args.mem_fraction_static,
         "max_running_requests": args.max_running_requests,
+        "numa_node": args.numa_node,
+        "cpu_affinity": cpu_affinity_contract,
         "batch_mode": args.batch_mode,
         "mixed_chunk_enabled": args.batch_mode == "coalesced",
         "chunked_prefill_size": (
@@ -2422,6 +2600,7 @@ def main() -> int:
         "slo_goodput": slo_goodput,
         "generated_text_sha256": digest.hexdigest(),
         "placement_proven": True,
+        "placement_reset_between_warmups": True,
         "verification_failures": 0,
         "correctness": correctness,
         "finite_window_accounting": finite_window_accounting,

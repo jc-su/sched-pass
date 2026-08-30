@@ -137,6 +137,27 @@ class SglangForwardLifecycle:
             )
         return self._last_activation_external
 
+    def record_reference_forward(self) -> None:
+        """Publish one resource-free framework-reference forward.
+
+        Resident work has no request binding, acquisition lease, wrapper alias,
+        or stream-ordered owner.  It therefore must not allocate an execution
+        epoch merely so optional forward profiling can classify it.  The
+        serial is the complete observation contract for this path; external
+        forwards continue to use ``activate`` and ``finish``.
+        """
+
+        if self._active is not None or self._engine_batch is not None:
+            raise RuntimeError(
+                "resident reference forward observed a live execution owner"
+            )
+        if self._wrapper_aliases:
+            raise RuntimeError(
+                "resident reference forward observed live wrapper aliases"
+            )
+        self._activation_serial += 1
+        self._last_activation_external = False
+
     def replace_unstarted_epoch(
         self,
         expected: SglangForwardEpoch,

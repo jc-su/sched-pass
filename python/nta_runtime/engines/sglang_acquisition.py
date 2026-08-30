@@ -20,6 +20,7 @@ from nta_runtime.acquisition_scheduler import (
 from nta_runtime.adapters.sglang import SglangExecutionConfig
 from nta_runtime.engines.sglang_calibration import (
     LayerServiceKey,
+    SglangConsumerPolicyCalibration,
     SglangLayerServiceCalibration,
 )
 from nta_runtime.engines.sglang_hicache import PendingHostLoad
@@ -55,6 +56,8 @@ class SglangHostAcquisitionCoordinator:
         frontier_layers_per_wave: int,
         movers: HostMoverController,
         calibration: SglangLayerServiceCalibration,
+        consumer_calibration: SglangConsumerPolicyCalibration,
+        minimum_consumer_gain: float,
         transport: SglangHostTransport,
         stats: MutableMapping[str, Any],
     ) -> None:
@@ -64,6 +67,8 @@ class SglangHostAcquisitionCoordinator:
             frontier_layers_per_wave,
         ) <= 0:
             raise ValueError("SGLang Host acquisition geometry must be positive")
+        if minimum_consumer_gain < 1.0:
+            raise ValueError("SGLang consumer gain must be at least one")
         self._device_pool = device_pool
         self._execution_config = execution_config
         self._tenant_isolation_enabled = bool(tenant_isolation_enabled)
@@ -73,6 +78,8 @@ class SglangHostAcquisitionCoordinator:
         self._frontier_layers_per_wave = frontier_layers_per_wave
         self._movers = movers
         self._calibration = calibration
+        self._consumer_calibration = consumer_calibration
+        self._minimum_consumer_gain = minimum_consumer_gain
         self._transport = transport
         self._stats = stats
 
@@ -229,10 +236,18 @@ class SglangHostAcquisitionCoordinator:
         if active_batch is not None and active_batch.pending_host_load is pending:
             active_batch.layer_service_key = shape_key
         self._movers.collect_profiles()
-        self.transfer_plan(
+        transfer_plan = self.transfer_plan(
             pending,
             layer_service_key=shape_key,
             layer_curve=curve,
+        )
+        self._consumer_calibration.bind_lease(
+            pending,
+            layer_service_key=shape_key,
+            mover_kind=transfer_plan.mover.kind,
+            layers_per_submission=self._frontier_layers_per_wave,
+            sm_waves_per_layer=transfer_plan.sm_waves_per_layer,
+            minimum_gain=self._minimum_consumer_gain,
         )
         model = self.deadline_model_for_curve(pending, curve)
         if model is None:
@@ -336,12 +351,17 @@ class SglangHostAcquisitionCoordinator:
             return
         explicit_measurement = execution.selection_reason in {
             "calibration_probe",
+            "consumer_policy_probe",
             "forced_dependency_aware",
         }
-        if not explicit_measurement:
+        planned = (
+            progressive_layers
+            if explicit_measurement
+            else progressive_layers & set(pending.planned_progressive_layers)
+        ) - batch.modeled_ready_by_attention_layers
+        if not planned:
             self._add("partial_consumer_unproven_layers", len(progressive_layers))
             return
-        planned = progressive_layers - batch.modeled_ready_by_attention_layers
         batch.planned_progressive_consumer_layers.update(planned)
         self._add("partial_consumer_planned_layers", len(planned))
 

@@ -39,6 +39,7 @@ class FakeAcquisitionOwner(SglangForwardAcquisition):
     def __init__(self, tier: AcquisitionTier) -> None:
         self._tier = tier
         self.consumed = []
+        self.abort_count = 0
 
     @property
     def tier(self) -> AcquisitionTier:
@@ -55,7 +56,7 @@ class FakeAcquisitionOwner(SglangForwardAcquisition):
         del stream
 
     def abort_after_quiescence(self) -> None:
-        pass
+        self.abort_count += 1
 
 
 def acquired_layer(

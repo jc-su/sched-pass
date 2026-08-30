@@ -1766,8 +1766,6 @@ def main() -> None:
             else:
                 confirm_direct.append(benchmark(direct_call, 2_000))
                 confirm_baseline.append(benchmark(baseline_call, 2_000))
-        confirmed_baseline_us = statistics.median(confirm_baseline)
-        confirmed_direct_us = statistics.median(confirm_direct)
         direct_overhead = paired_overhead_percent(confirm_baseline, confirm_direct)
         if direct_overhead > 5.0:
             raise RuntimeError(

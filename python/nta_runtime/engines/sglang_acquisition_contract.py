@@ -28,6 +28,41 @@ class AcquisitionConsumerPlan(str, Enum):
     PREACQUIRED = "preacquired"
 
 
+@dataclass(frozen=True, slots=True)
+class HostArrivalProfileKey:
+    """Stable deployment-local class for producer/attention timing policy.
+
+    Exact request lengths are deliberately not part of this key.  Production
+    traces rarely repeat them, which would turn an online policy into a
+    per-request cold start.  Power-of-two geometry classes preserve the
+    dominant transfer/compute scale while each class still makes a
+    conservative decision from its observed minimum arrival margin and
+    maximum consumer cost.
+    """
+
+    phase: str
+    query_rows_bucket: int
+    batch_size_bucket: int
+    transfer_rows_bucket: int
+    transfer_bytes_bucket: int
+    mover_kind: str
+    layers_per_submission: int
+    sm_waves_per_layer: int
+
+    def __post_init__(self) -> None:
+        if self.phase not in {"decode", "extend"}:
+            raise ValueError("Host arrival profile has an invalid phase")
+        if min(
+            self.query_rows_bucket,
+            self.batch_size_bucket,
+            self.transfer_rows_bucket,
+            self.transfer_bytes_bucket,
+        ) < 0 or min(self.layers_per_submission, self.sm_waves_per_layer) <= 0:
+            raise ValueError("Host arrival profile geometry must be positive")
+        if self.mover_kind not in {"sm", "copy_engine", "hybrid"}:
+            raise ValueError("Host arrival profile has an invalid mover kind")
+
+
 @dataclass(frozen=True)
 class HostLayerPublication:
     """One Host-produced layer and any exact intra-layer completion waves."""
@@ -44,6 +79,10 @@ class HostLayerPublication:
     wave_events: tuple[torch.cuda.Event, ...]
     wave_object_slots: tuple[int, ...]
     wave_row_ends: tuple[int, ...]
+    # A lease-unique timing marker is present only while the bounded consumer
+    # policy is collecting producer-vs-attention arrival samples. Numerical
+    # correctness continues to use ``ready_event``.
+    profile_ready_event: torch.cuda.Event | None = None
 
     def __post_init__(self) -> None:
         if min(self.key_bytes, self.value_bytes) <= 0:

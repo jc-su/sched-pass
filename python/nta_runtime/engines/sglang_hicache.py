@@ -20,6 +20,7 @@ from nta_runtime.engines.sglang_contracts import (
     LeaseOperationTransfer,
 )
 from nta_runtime.acquisition_scheduler import LayerAcquisition, LayerAcquisitionModel
+from nta_runtime.engines.sglang_acquisition_contract import HostArrivalProfileKey
 
 from nta_runtime.progress_frontier import (
     RequestFrontier,
@@ -61,6 +62,14 @@ class PendingHostLoad:
     transfer_events: tuple[Any, ...] = ()
     selection_accounted: bool = False
     acquisition: LayerAcquisition | None = None
+    arrival_profile_key: HostArrivalProfileKey | None = None
+    arrival_profiling: bool = False
+    # Set only after metadata selected the ordinary stock numerical path.
+    # Typed calibration/probe setup must not bias the arrival-margin sample.
+    arrival_profile_active: bool = False
+    consumer_policy_probe: bool = False
+    partial_profile_recorded: bool = False
+    planned_progressive_layers: frozenset[int] = frozenset()
 
     def transfers_by_operation(self) -> dict[int, LeaseOperationTransfer]:
         transfers: dict[int, LeaseOperationTransfer] = {}

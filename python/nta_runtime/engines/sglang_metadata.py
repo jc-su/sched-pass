@@ -8,7 +8,7 @@ semantic result can be inspected without entering numerical execution.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
 from typing import Any
 
@@ -230,7 +230,11 @@ class SglangMetadataPlanner:
         a ready specialization of NTA ownership, not a framework fallback.
         """
 
-        if not self._tier_service.is_host_staged or calibration_probe:
+        if (
+            not self._tier_service.is_host_staged
+            or calibration_probe
+            or pending.consumer_policy_probe
+        ):
             return None
         direct = prove_direct_metadata_execution(
             schedules,
@@ -248,6 +252,7 @@ class SglangMetadataPlanner:
             self._execution_config.host_execution_mode is not HostExecutionMode.AUTO
             or acquisition is None
             or not acquisition.fully_published
+            or pending.planned_progressive_layers
         ):
             return None
         scheduled = prove_direct_metadata_execution(
@@ -338,10 +343,19 @@ class SglangMetadataPlanner:
             calibration_probe=(
                 self._execution_config.host_execution_mode
                 is HostExecutionMode.AUTO
-                and calibration_probe
+                and (calibration_probe or pending.consumer_policy_probe)
             ),
             tenant_isolation=self._tenant_isolation_enabled,
         )
+        if (
+            pending.consumer_policy_probe
+            and not calibration_probe
+            and host_execution.selection_reason == "calibration_probe"
+        ):
+            host_execution = replace(
+                host_execution,
+                selection_reason="consumer_policy_probe",
+            )
         semantic_plans = (
             {
                 wrapper_id: semantic_plan(

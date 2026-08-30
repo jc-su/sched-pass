@@ -53,6 +53,10 @@ def coordinator(
         frontier_layers_per_wave=4,
         movers=types.SimpleNamespace(),
         calibration=types.SimpleNamespace(),
+        consumer_calibration=types.SimpleNamespace(
+            bind_lease=lambda *_args, **_kwargs: None
+        ),
+        minimum_consumer_gain=1.03,
         transport=transport,
         stats={},
     )
@@ -173,7 +177,10 @@ def main() -> None:
     }
 
     def consumer_batch(reason: str) -> SglangForwardEpoch:
-        lease = types.SimpleNamespace(prefetched_layers=publications)
+        lease = types.SimpleNamespace(
+            prefetched_layers=publications,
+            planned_progressive_layers=frozenset(),
+        )
         execution = types.SimpleNamespace(
             uses_progressive_consumer=True,
             overlap_initial=True,

@@ -63,7 +63,10 @@ from nta_runtime.engines.sglang_state import (
     _FragmentLookahead,
     _OperatorProfile,
 )
-from nta_runtime.engines.sglang_calibration import SglangLayerServiceCalibration
+from nta_runtime.engines.sglang_calibration import (
+    SglangConsumerPolicyCalibration,
+    SglangLayerServiceCalibration,
+)
 from nta_runtime.engines.sglang_graphs import DemandGraphCache
 from nta_runtime.engines.sglang_execution import (
     AttentionDispatchKind,
@@ -306,6 +309,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._model_layer_count = tuning.model.layer_count
         self._cuda_graph_mode = False
         self._stock_forward = False
+        self._resident_reference_forward = False
         demand_graph_capacity = tuning.demand_graph_capacity
         mover_model = host_mover_default_service_model
         self._stats = initial_engine_stats(
@@ -382,6 +386,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             enabled=self._tier_service.is_host_staged,
             minimum_samples=layer_service_minimum_samples,
             maximum_samples=layer_service_maximum_samples,
+            model_start_layer=self._model_start_layer,
+            model_layer_count=self._model_layer_count,
+            stats=self._stats,
+        )
+        self._consumer_calibration = SglangConsumerPolicyCalibration(
+            enabled=self._tier_service.is_host_staged,
             model_start_layer=self._model_start_layer,
             model_layer_count=self._model_layer_count,
             stats=self._stats,
@@ -520,6 +530,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             frontier_layers_per_wave=self._frontier_layers_per_wave,
             movers=self._host_movers,
             calibration=self._layer_calibration,
+            consumer_calibration=self._consumer_calibration,
+            minimum_consumer_gain=self._host_cost_model.minimum_predicted_gain,
             transport=self._host_transport,
             stats=self._stats,
         )
@@ -672,6 +684,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # that committed them).
         committed_before = int(self._stats["layer_service_profiled_intervals"])
         self._layer_calibration.collect()
+        self._consumer_calibration.collect()
         self._stats["layer_service_retirement_commits"] += (
             int(self._stats["layer_service_profiled_intervals"]) - committed_before
         )
@@ -720,12 +733,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         torch.cuda.synchronize()
         self._collect_transfer_profiles()
         self._layer_calibration.collect()
+        self._consumer_calibration.collect()
         self._collect_barrier_profiles(already_synchronized=True)
         pending = {
             "mover": self._host_movers.pending_profile_count,
             "transfer": len(self._transfer_profiles),
             "operator": len(self._operator_profiles),
             "layer_service": self._layer_calibration.pending_count,
+            "consumer_policy": self._consumer_calibration.pending_count,
             "barrier": len(self._barrier_profiles),
         }
         pending = {name: count for name, count in pending.items() if count}
@@ -1048,7 +1063,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         indexed_object_count: int = 0,
         record_semantic: bool = False,
         fragment: DeadlineFragment | None = None,
-        publish_stats: bool = False,
     ) -> None:
         """Commit one external consumer in a single ordered transaction.
 
@@ -1126,8 +1140,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             if not final_layer:
                 return
             self._commit_incremental_setup_observation(batch)
-            if publish_stats:
-                self._publish_stats()
             self._finish_forward(batch)
         except BaseException as error:
             # Attention has already been enqueued when this transaction starts.
@@ -1147,6 +1159,16 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._forward_lifecycle.begin()
 
     def _finish_forward(self, batch: SglangForwardEpoch) -> None:
+        pending = batch.pending_host_load
+        if pending is not None:
+            execution = batch.host_execution
+            self._consumer_calibration.retire_lease(
+                pending,
+                probe_executed=(
+                    execution is not None
+                    and execution.selection_reason == "consumer_policy_probe"
+                ),
+            )
         self._forward_lifecycle.finish(
             batch,
             retain_for_graph=self._cuda_graph_mode,
@@ -1283,6 +1305,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
     ) -> None:
         self._begin_forward()
         self._cuda_graph_mode = True
+        self._resident_reference_forward = False
         counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
@@ -1410,9 +1433,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
 
     def init_forward_metadata(self, forward_batch: Any) -> None:
+        metadata_profile_started = time.perf_counter_ns() if self._profile_cpu else 0
         self._begin_forward()
         self._cuda_graph_mode = False
         self._stock_forward = False
+        self._resident_reference_forward = False
         if forward_batch.forward_mode.is_mixed():
             self._stats["mixed_forward_batches"] += 1
             self._stats["mixed_forward_requests"] += len(
@@ -1447,12 +1472,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if pending is not None:
             self.use_paged = True
         try:
+            stock_metadata_started = (
+                time.perf_counter_ns() if self._profile_cpu else 0
+            )
             super().init_forward_metadata(forward_batch)
+            stock_metadata_finished = (
+                time.perf_counter_ns() if self._profile_cpu else 0
+            )
             if pending is None:
-                # A resident stock forward has no acquisition identity to
-                # publish and no native work to attribute.  Account its known
-                # all-layer dispatch once here; the per-layer methods can then
-                # be a thin call into SGLang's stock backend.
+                # A resident stock forward has no acquisition identity,
+                # resource lifetime, or native work to attribute.  Publish
+                # only the observation serial needed by the optional around-
+                # forward profiler.  In particular, do not allocate a typed
+                # epoch and do not send every layer through its state machine.
                 stock_layers = self._model_layer_count
                 self._stats["stock_attention_launches"] += stock_layers
                 self._stats["stock_resident_attention_launches"] += stock_layers
@@ -1460,18 +1492,21 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._stats["decode_launches"] += stock_layers
                 else:
                     self._stats["prefill_launches"] += stock_layers
-                self._forward_lifecycle.activate(
-                    SglangForwardEpoch(
-                        plan=SglangForwardPlan(
-                            bindings=(),
-                            semantic_plans={},
-                            pending_host_load=None,
-                        ),
-                    )
-                )
+                self._forward_lifecycle.record_reference_forward()
+                self._resident_reference_forward = True
                 self._stats["batches"] += 1
                 self._stats["resident_reference_batches"] += 1
                 self._stats["stock_resident_batches"] += 1
+                if self._profile_cpu:
+                    metadata_profile_finished = time.perf_counter_ns()
+                    total_ns = metadata_profile_finished - metadata_profile_started
+                    stock_ns = stock_metadata_finished - stock_metadata_started
+                    self._stats["resident_reference_metadata_calls"] += 1
+                    self._stats["resident_reference_metadata_cpu_ns"] += total_ns
+                    self._stats["resident_reference_metadata_stock_cpu_ns"] += stock_ns
+                    self._stats[
+                        "resident_reference_metadata_overhead_cpu_ns"
+                    ] += max(0, total_ns - stock_ns)
                 return
             bind_started = time.perf_counter_ns() if self._profile_cpu else 0
             bindings = self._bind_forward_requests(
@@ -1517,15 +1552,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 active_batch = self._forward_lifecycle.active
                 if active_batch is None:  # pragma: no cover - activated above
                     raise RuntimeError("host-staged batch lost its execution epoch")
-                self._host_acquisition.plan_published_consumers(
-                    pending,
-                    active_batch,
-                )
                 ready_stock_fastpath = (
                     prefetch_fully_ready
                     and self._execution_config.host_execution_mode
                     is HostExecutionMode.AUTO
-                    and selected.selection_reason != "calibration_probe"
+                    and selected.selection_reason
+                    not in {"calibration_probe", "consumer_policy_probe"}
                 )
                 if ready_stock_fastpath or not selected.uses_dependency_protocol:
                     self._host_acquisition.publish_missing(pending)
@@ -1562,6 +1594,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 adoption_ns = time.perf_counter_ns() - adoption_started
                 if self._forward_lifecycle.active is None:  # pragma: no cover - set above
                     raise RuntimeError("incremental host batch lost its metadata")
+                # Wrapper identity is part of the immutable semantic plan.
+                # Publish the mutable per-layer consumer decision only after
+                # that identity transition; doing it in the opposite order
+                # correctly trips SglangForwardEpoch.require_unstarted.
+                self._host_acquisition.plan_published_consumers(
+                    pending,
+                    self._forward_lifecycle.active,
+                )
                 event_partition_layer = next(
                     (
                         local_layer
@@ -1704,6 +1744,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             ),
             count_batch=count_batch,
         )
+        if self._tier_service.is_host_staged:
+            execution = planned.host_execution
+            pending.arrival_profile_active = bool(
+                pending.arrival_profiling
+                and execution is not None
+                and not execution.uses_dependency_protocol
+            )
         if self._tier_service.is_host_staged:
             planned.batch.acquisition = HostForwardAcquisition(pending)
         self._forward_lifecycle.activate(planned.batch)
@@ -2018,8 +2065,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 AttentionDispatchKind.ARRIVING_PREFETCH,
             }
         )
+        partial_policy_probe = (
+            dispatch.kind is AttentionDispatchKind.ARRIVING_PREFETCH
+            and batch.host_execution is not None
+            and batch.host_execution.selection_reason == "consumer_policy_probe"
+            and pending is not None
+            and pending.arrival_profile_key is not None
+        )
         gpu_profile = None
-        if self._profile_gpu or service_probe:
+        if self._profile_gpu or service_probe or partial_policy_probe:
             gpu_profile = (
                 torch.cuda.Event(enable_timing=True),
                 torch.cuda.Event(enable_timing=True),
@@ -2102,6 +2156,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
         if gpu_profile is not None:
             gpu_profile[1].record(stream)
+            if partial_policy_probe:
+                if pending is None:  # pragma: no cover - guarded above
+                    raise RuntimeError("partial policy probe lost its Host lease")
+                self._consumer_calibration.record_partial_profile(
+                    pending=pending,
+                    start=gpu_profile[0],
+                    finish=gpu_profile[1],
+                )
             service_prediction_ns = None
             service_prediction_scale = None
             if service_probe:
@@ -2168,7 +2230,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 indexed_object_count=outcome.indexed_object_count,
                 record_semantic=True,
                 fragment=outcome.deadline_fragment,
-                publish_stats=True,
             )
         else:
             self._record_execution_layer(
@@ -2178,7 +2239,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
             if final_layer:
                 self._commit_incremental_setup_observation(batch)
-                self._publish_stats()
                 self._finish_forward(batch)
         return output.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -2330,7 +2390,6 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             local_layer=local_layer,
             native_dispatch=False,
             progressive_consumer=False,
-            publish_stats=True,
         )
         return output.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -2343,6 +2402,16 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         forward_batch: Any,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
+        if self._resident_reference_forward:
+            return FlashInferAttnBackend.forward_decode(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+            )
         batch = self._forward_lifecycle.active
         if batch is None:
             raise RuntimeError(
@@ -2356,27 +2425,27 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 query=q,
                 global_layer=int(layer.layer_id),
             )
+            self._consumer_calibration.record_arrival(
+                batch=batch,
+                phase="decode",
+                query=q,
+                global_layer=int(layer.layer_id),
+            )
         if self._stock_forward:
             pending = batch.pending_host_load
-            if pending is None:
-                output = FlashInferAttnBackend.forward_decode(
-                    self,
-                    q,
-                    k,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache=save_kv_cache,
-                )
-                if (
-                    int(layer.layer_id) - self._model_start_layer + 1
-                    == self._model_layer_count
-                ):
-                    self._finish_forward(batch)
-                return output
+            if pending is None:  # pragma: no cover - resident path returns above
+                raise RuntimeError("resident decode entered an external epoch")
             self._stats["stock_attention_launches"] += 1
             local_layer = self._wait_for_stock_external_layer(batch, layer)
             self._stats["decode_launches"] += 1
+            stock_profile = None
+            if pending.arrival_profile_active:
+                stream = torch.cuda.current_stream()
+                stock_profile = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                stock_profile[0].record(stream)
             output = FlashInferAttnBackend.forward_decode(
                 self,
                 q,
@@ -2386,6 +2455,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 forward_batch,
                 save_kv_cache=save_kv_cache,
             )
+            if stock_profile is not None:
+                stock_profile[1].record(stream)
+                self._consumer_calibration.record_stock_profile(
+                    pending=pending,
+                    global_layer=int(layer.layer_id),
+                    start=stock_profile[0],
+                    finish=stock_profile[1],
+                )
             self._commit_external_layer(
                 batch=batch,
                 pending=pending,
@@ -2436,6 +2513,16 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         forward_batch: Any,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
+        if self._resident_reference_forward:
+            return FlashInferAttnBackend.forward_extend(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+            )
         batch = self._forward_lifecycle.active
         if batch is None:
             raise RuntimeError(
@@ -2449,27 +2536,27 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 query=q,
                 global_layer=int(layer.layer_id),
             )
+            self._consumer_calibration.record_arrival(
+                batch=batch,
+                phase="extend",
+                query=q,
+                global_layer=int(layer.layer_id),
+            )
         if self._stock_forward:
             pending = batch.pending_host_load
-            if pending is None:
-                output = FlashInferAttnBackend.forward_extend(
-                    self,
-                    q,
-                    k,
-                    v,
-                    layer,
-                    forward_batch,
-                    save_kv_cache=save_kv_cache,
-                )
-                if (
-                    int(layer.layer_id) - self._model_start_layer + 1
-                    == self._model_layer_count
-                ):
-                    self._finish_forward(batch)
-                return output
+            if pending is None:  # pragma: no cover - resident path returns above
+                raise RuntimeError("resident prefill entered an external epoch")
             self._stats["stock_attention_launches"] += 1
             local_layer = self._wait_for_stock_external_layer(batch, layer)
             self._stats["prefill_launches"] += 1
+            stock_profile = None
+            if pending.arrival_profile_active:
+                stream = torch.cuda.current_stream()
+                stock_profile = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                stock_profile[0].record(stream)
             output = FlashInferAttnBackend.forward_extend(
                 self,
                 q,
@@ -2479,6 +2566,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 forward_batch,
                 save_kv_cache=save_kv_cache,
             )
+            if stock_profile is not None:
+                stock_profile[1].record(stream)
+                self._consumer_calibration.record_stock_profile(
+                    pending=pending,
+                    global_layer=int(layer.layer_id),
+                    start=stock_profile[0],
+                    finish=stock_profile[1],
+                )
             self._commit_external_layer(
                 batch=batch,
                 pending=pending,
@@ -2630,6 +2725,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._stats.get(f"{prefix}_gpu_ms", 0.0) + milliseconds
             )
         self._operator_profiles[:] = pending_operators
+        self._consumer_calibration.collect()
 
     def _collect_barrier_profiles(self, *, already_synchronized: bool = False) -> None:
         if not self._barrier_profiles:
@@ -2685,6 +2781,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         report = dict(self._stats)
         report.update(self._tier_service.stats())
         report["layer_service_curves"] = self._layer_calibration.report()
+        report["consumer_policy_calibration"] = self._consumer_calibration.report()
         consumer_contract = _consumer_contract_for_stats(
             report,
             engine_version=self._engine_version,

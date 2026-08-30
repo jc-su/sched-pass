@@ -330,6 +330,15 @@ class SglangHostTransport:
                                 max(1, transfer_plan.sm_waves_per_layer) - 1
                             ]
                         )
+                        profile_ready_event = None
+                        if pending.arrival_profiling:
+                            # This marker is lease-unique and timing-enabled;
+                            # reusable numerical ready events stay timing-free
+                            # outside explicit barrier profiling. Recording it
+                            # immediately after the layer fence preserves the
+                            # producer timestamp without changing readiness.
+                            profile_ready_event = torch.cuda.Event(enable_timing=True)
+                            profile_ready_event.record(self._prefetch_stream)
                         layer_first_slot = (
                             None
                             if not use_sm_mover
@@ -380,6 +389,7 @@ class SglangHostTransport:
                                 else ()
                             ),
                             wave_row_ends=layer_transfer.wave_row_ends,
+                            profile_ready_event=profile_ready_event,
                         )
                     self._stats["lookahead_copy_waves"] = (
                         self._stats.get("lookahead_copy_waves", 0) + 1

@@ -235,6 +235,7 @@ class HostExecutionPlan:
         "conventional",
         "uncalibrated_setup",
         "calibration_probe",
+        "consumer_policy_probe",
         "insufficient_gain",
         "predicted_gain",
         "tenant_isolation",

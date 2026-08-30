@@ -120,6 +120,7 @@ def main() -> None:
     }
     model_snapshot = object()
     direct_candidate = object()
+    direct_pending = types.SimpleNamespace(consumer_policy_probe=False)
     fastpath_planner = SglangMetadataPlanner.__new__(SglangMetadataPlanner)
     fastpath_planner._tier_service = types.SimpleNamespace(is_host_staged=True)
     fastpath_planner._tenant_isolation_enabled = False
@@ -133,7 +134,7 @@ def main() -> None:
         assert (
             fastpath_planner._bounded_direct_plan(
                 {7: object()},
-                object(),
+                direct_pending,
                 (binding,),
                 host_cost_model=model_snapshot,
                 calibration_probe=False,
@@ -145,7 +146,7 @@ def main() -> None:
         assert (
             fastpath_planner._bounded_direct_plan(
                 {7: object()},
-                object(),
+                direct_pending,
                 (binding,),
                 host_cost_model=model_snapshot,
                 calibration_probe=True,
@@ -162,7 +163,9 @@ def main() -> None:
             selection_reason="forced_direct",
         )
         published = types.SimpleNamespace(
-            acquisition=types.SimpleNamespace(fully_published=True)
+            acquisition=types.SimpleNamespace(fully_published=True),
+            planned_progressive_layers=frozenset(),
+            consumer_policy_probe=False,
         )
         direct_proof.side_effect = (None, scheduled_candidate)
         scheduled = fastpath_planner._bounded_direct_plan(
@@ -1565,6 +1568,9 @@ def main() -> None:
         backend._hicache = hicache
         backend._nvme_pipeline = None
         backend._cuda_graph_mode = False
+        backend._consumer_calibration = types.SimpleNamespace(
+            retire_lease=lambda _pending, **_kwargs: None
+        )
         backend._stats = {
             "forward_lifecycle_completions": 0,
             "forward_lifecycle_aborts": 0,
@@ -1975,6 +1981,7 @@ def main() -> None:
     boundary_backend._layer_calibration = PendingLayerProfiles(
         boundary_layer_profiles, retire_layer_profiles
     )
+    boundary_backend._consumer_calibration = PendingLayerProfiles([], lambda: None)
     boundary_backend._collect_barrier_profiles = retire_barrier_profiles
     with patch("torch.cuda.synchronize", lambda: boundary_calls.append("sync")):
         boundary_backend._quiesce_observation_boundary()
@@ -2019,6 +2026,7 @@ def main() -> None:
     )
     profile_backend._incremental_service_samples = 0
     profile_backend._stats = {}
+    profile_backend._consumer_calibration = PendingLayerProfiles([], lambda: None)
     profile_backend._collect_transfer_profiles()
     assert profile_backend._host_movers.collect_count == 1
     assert profile_backend._operator_profiles == []
@@ -2034,6 +2042,7 @@ def main() -> None:
     stale_boundary._barrier_profiles = []
     stale_boundary._collect_transfer_profiles = lambda: None
     stale_boundary._layer_calibration = PendingLayerProfiles([], lambda: None)
+    stale_boundary._consumer_calibration = PendingLayerProfiles([], lambda: None)
     stale_boundary._collect_barrier_profiles = lambda **_kwargs: None
     with patch("torch.cuda.synchronize", lambda: None):
         try:

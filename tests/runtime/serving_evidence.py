@@ -330,6 +330,28 @@ def main() -> None:
     assert streamed["itl_sample_count"] == 2
     assert len(streamed["inter_token_seconds"]) == 2
     assert streamed["token_timestamps_exact"] is True
+
+    async def exercise_first_token_barrier() -> None:
+        barrier = serving._FirstTokenBarrier(2)
+        released = asyncio.create_task(barrier.wait())
+        await asyncio.sleep(0)
+        assert not released.done()
+        barrier.set()
+        await asyncio.sleep(0)
+        assert not released.done()
+        barrier.set()
+        await released
+        # A duplicate stream notification cannot underflow or re-open the
+        # already-completed state transition.
+        barrier.set()
+
+    asyncio.run(exercise_first_token_barrier())
+    try:
+        serving._FirstTokenBarrier(0)
+    except ValueError as error:
+        assert "resident parties" in str(error)
+    else:
+        raise AssertionError("empty synthetic resident barrier was accepted")
     try:
         asyncio.run(
             serving._stream_request(
