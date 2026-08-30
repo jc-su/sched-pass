@@ -164,6 +164,9 @@ def main() -> None:
     assert 'RESULTS_ROOT / "qualification" / "nvme-reference.bin"' in qualification
     assert 'gpu.get("selected_data_path_verified") is True' in qualification
     assert 'gpu.get("destination") == args.dma_target' in qualification
+    assert '"gpu_queue_depth_calibration": gpu_calibration' in qualification
+    assert '"target_identity": target_identity' in qualification
+    assert '"recommended_serving_config"' in qualification
     assert '"NTA_NVME_HBM_BACKEND": args.require_hbm_backend' in qualification
     assert 'gpu.get("hbm_mapping_policy") != required_backend' in qualification
     assert "provenance_ready = not dirty" in qualification
@@ -172,6 +175,29 @@ def main() -> None:
         in qualification
     )
     assert "and iommu_fault_free" in qualification
+    assert "retain_vfio = args.keep_vfio and qualified" in qualification
+    assert 'if not retain_vfio and pci_driver(args.bdf) == "vfio-pci"' in qualification
+    winner, winner_path, summaries = runner.select_calibrated_result(
+        [
+            (8, {"end_to_end_mib_per_second": 7000.0}, Path("q8-t0")),
+            (5, {"end_to_end_mib_per_second": 7300.0}, Path("q5-t0")),
+            (5, {"end_to_end_mib_per_second": 7350.0}, Path("q5-t1")),
+            (5, {"end_to_end_mib_per_second": 7325.0}, Path("q5-t2")),
+            (8, {"end_to_end_mib_per_second": 7100.0}, Path("q8-t1")),
+            (8, {"end_to_end_mib_per_second": 7050.0}, Path("q8-t2")),
+        ]
+    )
+    assert winner["end_to_end_mib_per_second"] == 7325.0
+    assert winner_path == Path("q5-t2")
+    assert [entry["queue_depth"] for entry in summaries] == [5, 8]
+    assert runner._depth_candidates("5,8,16") == (5, 8, 16)
+    for invalid in ("", "0", "5,5", "five"):
+        try:
+            runner._depth_candidates(invalid)
+        except Exception:
+            pass
+        else:
+            raise AssertionError(f"invalid queue-depth sweep accepted: {invalid!r}")
     direct_gpu = {
         "hbm_mapping_policy": "cuda-dmabuf-ioas",
         "hbm_mapping_backend": "cuda-dmabuf-ioas",
@@ -332,6 +358,22 @@ def main() -> None:
     )
     assert runner_process.returncode != 0
     assert "--allow-device-rebind" in runner_process.stdout
+
+    uncalibrated = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run-nvme-qualification.py"),
+            "--queue-depth-candidates",
+            "5",
+        ],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    assert uncalibrated.returncode != 0
+    assert "at least 2 GPU queue depths" in uncalibrated.stdout
     print("nvme_safety=pass")
 
 

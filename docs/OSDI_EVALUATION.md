@@ -192,7 +192,10 @@ python experiments/validate_tier_qualification.py \
 An evaluation specification containing an NVMe or DAX arm must set
 `"tier_qualification"` to this artifact.  The runner refuses a missing,
 skipped, failed, or non-exact qualification; it never turns a capability skip
-into a data point.  The evaluation reproduction profile copies the normalized
+into a data point. An NVMe arm must also use the queue-depth recommendation for
+the same transfer granularity recorded by qualification; changing either is a
+new service point and requires requalification. The evaluation reproduction
+profile copies the normalized
 workload and the qualification artifact into its bundle, rewrites the spec to
 those copies, and validates both digests.
 

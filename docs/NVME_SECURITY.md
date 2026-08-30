@@ -178,18 +178,25 @@ python3 scripts/run-nvme-qualification.py \
   --dma-target hbm-peer \
   --media-policy trusted-read-only-code \
   --require-hbm-backend nvidia-peer-pages \
-  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 100 \
+  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 300 \
+  --fio-depth-candidates 1,2,4,8,16,32 \
+  --queue-depth-candidates 4,5,6,8,16,32,64 \
+  --calibration-trials 3 \
   --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
   --allow-device-rebind --require-ready \
   --reference /path/outside/checkout/nvme-reference.bin \
   --output /path/outside/checkout/nvme-qualification.json
 ```
 
-The runner first measures a read-only `fio` baseline while the kernel owns the
-namespace. It captures a reference file by reading the namespace, binds only
-the selected controller to VFIO, runs exact GPU-controlled reads, checksum
-verifies every destination, counts target-specific DMAR fault messages before
-and after the run, and restores the original driver in all normal/error paths.
+The runner first sweeps a read-only `fio` baseline while the kernel owns the
+namespace. It records stable BDF/NSID/model/serial/geometry provenance, captures
+a reference file by reading the namespace, binds only the selected controller
+to VFIO, and sweeps the GPU-controlled queue depth with at least three trials
+per point. Every destination is checksum verified. The runner counts
+target-specific DMAR fault messages before and after the run and restores the
+original driver in all normal/error paths. Only the median winner is emitted as
+the serving recommendation, and that recommendation is explicitly scoped to
+the measured transfer size.
 
 `ready` requires all of the following: exact selected data verified, zero
 verification/transport failures, zero outstanding commands, GPU doorbell
@@ -235,6 +242,9 @@ attachment:
 python3 scripts/run-nvme-qualification.py \
   --bdf 0000:d8:00.0 --allow-device-rebind --keep-vfio \
   --media-policy trusted-read-only-code --dma-target hbm-peer \
+  --require-hbm-backend nvidia-peer-pages --require-ready \
+  --fio-depth-candidates 1,2,4,8,16,32 \
+  --queue-depth-candidates 4,5,6,8,16,32,64 --calibration-trials 3 \
   --reference /tmp/nta-artifacts/nvme/nvme-reference.bin \
   --output /tmp/nta-artifacts/nvme/qualification.json
 ```

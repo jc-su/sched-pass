@@ -245,7 +245,10 @@ python3 scripts/run-nvme-qualification.py \
   --dma-target hbm-peer \
   --media-policy trusted-read-only-code \
   --require-hbm-backend nvidia-peer-pages \
-  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 100 \
+  --bytes 2097152 --requests 32 --progress-rounds 1 --iterations 300 \
+  --fio-depth-candidates 1,2,4,8,16,32 \
+  --queue-depth-candidates 4,5,6,8,16,32,64 \
+  --calibration-trials 3 \
   --fio-runtime 10 --minimum-bandwidth-ratio 0.9 \
   --allow-device-rebind --require-ready \
   --reference /tmp/nta-artifacts/nvme/nvme-reference.bin \
@@ -260,6 +263,14 @@ python3 experiments/validate_tier_qualification.py \
   --required-tier nvme \
   /tmp/nta-artifacts/nvme/tier-qualification.json
 ```
+
+Qualification sweeps the same-device `fio` baseline and the exact
+NVMe-to-HBM path independently. It records the stable PCI BDF, namespace ID,
+model, serial, and namespace geometry, selects the median GPU winner, and emits
+an `NTA_NVME_QUEUE_DEPTH` recommendation scoped to the recorded transfer size.
+Do not reuse that depth for another transfer granularity without a new
+qualification: small command streams require more concurrency than multi-MiB
+acquisitions on this controller.
 
 `cuda-dmabuf-ioas` is retained as an explicit module-free capability probe,
 not assumed from a kernel version. Linux `7.0.0-30-generic` exposes

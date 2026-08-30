@@ -106,6 +106,129 @@ def _validate_native(report: dict[str, Any], tier: str) -> None:
     )
 
 
+def _validate_nvme_tuning(report: dict[str, Any], gpu: dict[str, Any]) -> None:
+    """Prove that the reported datapath and baseline are the calibrated winners."""
+    identity = report.get("target_identity")
+    _require(isinstance(identity, dict), "NVMe report has no stable target identity")
+    bdf = identity.get("bdf")
+    _require(
+        isinstance(bdf, str)
+        and re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]", bdf)
+        is not None,
+        "NVMe target identity has no valid PCI BDF",
+    )
+    for field in ("model", "serial", "kernel_driver", "block_device"):
+        _require(
+            isinstance(identity.get(field), str) and bool(identity[field]),
+            f"NVMe target identity has no {field}",
+        )
+    _require(
+        gpu.get("device") == f"vfio:{bdf}"
+        and gpu.get("namespace_id") == identity.get("namespace_id"),
+        "NVMe GPU result does not match the identified namespace",
+    )
+
+    baseline = report.get("baseline")
+    baseline_candidates = report.get("baseline_candidates")
+    _require(
+        isinstance(baseline, dict)
+        and isinstance(baseline_candidates, list)
+        and len(baseline_candidates) >= 2
+        and all(isinstance(candidate, dict) for candidate in baseline_candidates),
+        "NVMe report has no baseline calibration",
+    )
+    baseline_depths = [
+        candidate.get("queue_depth") for candidate in baseline_candidates
+    ]
+    _require(
+        baseline.get("block_device") == identity.get("block_device")
+        and all(
+            candidate.get("block_device") == identity.get("block_device")
+            for candidate in baseline_candidates
+        )
+        and all(isinstance(depth, int) and depth > 0 for depth in baseline_depths)
+        and len(set(baseline_depths)) == len(baseline_depths)
+        and all(
+            candidate.get("block_bytes") == gpu.get("bytes_per_request")
+            for candidate in baseline_candidates
+        ),
+        "NVMe fio calibration used a different namespace",
+    )
+    baseline_bandwidths = [
+        candidate.get("bandwidth_mib_per_second") for candidate in baseline_candidates
+    ]
+    _require(
+        all(_finite(value) and float(value) > 0 for value in baseline_bandwidths)
+        and _finite(baseline.get("bandwidth_mib_per_second"))
+        and math.isclose(
+            float(baseline["bandwidth_mib_per_second"]),
+            max(float(value) for value in baseline_bandwidths),
+            rel_tol=1e-9,
+        ),
+        "NVMe report did not select the fastest fio baseline",
+    )
+
+    calibration = report.get("gpu_queue_depth_calibration")
+    _require(
+        isinstance(calibration, list) and len(calibration) >= 2,
+        "NVMe report has no GPU queue-depth calibration",
+    )
+    depths: set[int] = set()
+    winners: list[tuple[float, int]] = []
+    for candidate in calibration:
+        _require(isinstance(candidate, dict), "NVMe GPU calibration is malformed")
+        depth = candidate.get("queue_depth")
+        samples = candidate.get("bandwidth_mib_per_second")
+        _require(
+            isinstance(depth, int)
+            and depth >= 2
+            and depth not in depths
+            and isinstance(samples, list)
+            and len(samples) >= 3
+            and len(samples) % 2 == 1
+            and candidate.get("trials") == len(samples)
+            and all(_finite(value) and float(value) > 0 for value in samples),
+            "NVMe GPU calibration candidate is invalid",
+        )
+        depths.add(depth)
+        median = sorted(float(value) for value in samples)[len(samples) // 2]
+        _require(
+            _finite(candidate.get("median_bandwidth_mib_per_second"))
+            and math.isclose(
+                float(candidate["median_bandwidth_mib_per_second"]),
+                median,
+                rel_tol=1e-9,
+            ),
+            "NVMe GPU calibration median is inconsistent",
+        )
+        winners.append((median, depth))
+    selected_median, selected_depth = min(winners, key=lambda item: (-item[0], item[1]))
+    recommendation = report.get("recommended_serving_config")
+    _require(
+        gpu.get("queue_depth") == selected_depth
+        and _finite(gpu.get("end_to_end_mib_per_second"))
+        and math.isclose(
+            float(gpu["end_to_end_mib_per_second"]), selected_median, rel_tol=1e-9
+        )
+        and isinstance(recommendation, dict)
+        and recommendation.get("NTA_NVME_QUEUE_DEPTH") == selected_depth
+        and recommendation.get("transfer_bytes") == gpu.get("bytes_per_request")
+        and recommendation.get("selection_metric")
+        == "median_exact_end_to_end_mib_per_second",
+        "NVMe report did not select its calibrated GPU queue depth",
+    )
+    ratio = report.get("matched_bandwidth_ratio")
+    _require(
+        _finite(ratio)
+        and math.isclose(
+            float(ratio),
+            selected_median / float(baseline["bandwidth_mib_per_second"]),
+            rel_tol=1e-9,
+        ),
+        "NVMe matched bandwidth ratio is inconsistent",
+    )
+
+
 def _validate_entry(entry: dict[str, Any], tier: str) -> None:
     _require(
         entry.get("tier") == tier,
@@ -222,6 +345,7 @@ def _validate_entry(entry: dict[str, Any], tier: str) -> None:
     _require(
         gpu.get("outstanding") == 0, "NVMe GPU-controlled run has outstanding commands"
     )
+    _validate_nvme_tuning(report, gpu)
     ratio = report.get("matched_bandwidth_ratio")
     _require(_finite(ratio), "NVMe report has no finite matched bandwidth ratio")
     threshold = report.get("minimum_bandwidth_ratio")

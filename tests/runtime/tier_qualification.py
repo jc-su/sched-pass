@@ -58,6 +58,52 @@ def main() -> None:
                 "required_hbm_backend": "cuda-dmabuf-ioas",
                 "reported_hbm_mapping_policy": "cuda-dmabuf-ioas",
                 "selected_hbm_backend": "cuda-dmabuf-ioas",
+                "target_identity": {
+                    "bdf": "0000:d8:00.0",
+                    "namespace_id": 1,
+                    "block_device": "/dev/nvme-test",
+                    "kernel_driver": "nvme",
+                    "model": "fixture-nvme",
+                    "serial": "fixture-serial",
+                },
+                "baseline": {
+                    "block_device": "/dev/nvme-test",
+                    "queue_depth": 4,
+                    "bandwidth_mib_per_second": 1000.0,
+                },
+                "baseline_candidates": [
+                    {
+                        "block_device": "/dev/nvme-test",
+                        "block_bytes": 2097152,
+                        "queue_depth": 4,
+                        "bandwidth_mib_per_second": 1000.0,
+                    },
+                    {
+                        "block_device": "/dev/nvme-test",
+                        "block_bytes": 2097152,
+                        "queue_depth": 8,
+                        "bandwidth_mib_per_second": 990.0,
+                    },
+                ],
+                "gpu_queue_depth_calibration": [
+                    {
+                        "queue_depth": 5,
+                        "trials": 3,
+                        "bandwidth_mib_per_second": [940.0, 950.0, 960.0],
+                        "median_bandwidth_mib_per_second": 950.0,
+                    },
+                    {
+                        "queue_depth": 8,
+                        "trials": 3,
+                        "bandwidth_mib_per_second": [900.0, 920.0, 910.0],
+                        "median_bandwidth_mib_per_second": 910.0,
+                    },
+                ],
+                "recommended_serving_config": {
+                    "NTA_NVME_QUEUE_DEPTH": 5,
+                    "transfer_bytes": 2097152,
+                    "selection_metric": "median_exact_end_to_end_mib_per_second",
+                },
                 "gpu_controlled": {
                     "revision": "a" * 40,
                     "runtime_abi": 32,
@@ -72,6 +118,11 @@ def main() -> None:
                     "verification_failures": 0,
                     "failed": 0,
                     "outstanding": 0,
+                    "device": "vfio:0000:d8:00.0",
+                    "namespace_id": 1,
+                    "queue_depth": 5,
+                    "bytes_per_request": 2097152,
+                    "end_to_end_mib_per_second": 950.0,
                 },
             },
             "dax": {
@@ -157,12 +208,38 @@ def main() -> None:
         slow_report = slow["entries"][2]["report"]
         slow_report["matched_bandwidth_ratio"] = 0.35
         slow_report["performance_qualified"] = False
+        slow_report["gpu_controlled"]["end_to_end_mib_per_second"] = 350.0
+        slow_report["gpu_queue_depth_calibration"][0]["bandwidth_mib_per_second"] = [
+            340.0,
+            350.0,
+            360.0,
+        ]
+        slow_report["gpu_queue_depth_calibration"][0][
+            "median_bandwidth_mib_per_second"
+        ] = 350.0
+        slow_report["gpu_queue_depth_calibration"][1]["bandwidth_mib_per_second"] = [
+            300.0,
+            310.0,
+            320.0,
+        ]
+        slow_report["gpu_queue_depth_calibration"][1][
+            "median_bandwidth_mib_per_second"
+        ] = 310.0
         try:
             validate(slow)
         except ValueError as error:
             assert "performance threshold" in str(error)
         else:
             raise AssertionError("slow NVMe transport passed tier admission")
+
+        untuned = json.loads(json.dumps(document))
+        untuned["entries"][2]["report"]["gpu_controlled"]["queue_depth"] = 8
+        try:
+            validate(untuned)
+        except ValueError as error:
+            assert "calibrated GPU queue depth" in str(error)
+        else:
+            raise AssertionError("an untuned NVMe queue passed tier admission")
 
         dirty = json.loads(json.dumps(document))
         dirty["entries"][2]["report"]["dirty"] = True
