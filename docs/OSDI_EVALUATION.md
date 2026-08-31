@@ -153,6 +153,12 @@ stock-only reports at at least three offered rates, with at least 100 requests
 and exact token timing in every report.  Freeze the first stable multi-signal
 knee before running either paired arm:
 
+For a normalized workload, keep one rate-bearing manifest and pass
+`--scale-workload-arrivals-to-request-rate` at each pilot rate.  The harness
+uniformly time-dilates the recorded offsets, preserves request order and exact
+demand, and records the source rate, target rate, and scale.  It rejects a
+CLI/manifest rate mismatch without that explicit transform.
+
 ```bash
 python experiments/freeze_serving_overload_rate.py \
   --input 8=/path/stock-rate-8.json \

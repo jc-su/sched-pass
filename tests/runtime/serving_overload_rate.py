@@ -89,6 +89,14 @@ def report(
         },
         "generated_text_sha256": aggregate_output,
         "request_rate": rate,
+        "arrival_schedule": {
+            "method": "seeded_exponential",
+            "source_mode": "synthetic_open_loop",
+            "source_target_rate_per_second": rate,
+            "target_rate_per_second": rate,
+            "uniform_time_scale": 1.0,
+            "request_order_preserved": True,
+        },
         "records": records,
         "elapsed_seconds": elapsed,
         "request_throughput": throughput,
@@ -213,6 +221,16 @@ def main() -> None:
         expect_failure(
             lambda: build_freeze(pilots, FreezeRule()),
             "not the stock FlashInfer arm",
+        )
+
+        pilots = inputs(directory)
+        mislabeled_path = pilots[2].path
+        mislabeled = json.loads(mislabeled_path.read_text(encoding="utf-8"))
+        mislabeled["arrival_schedule"]["target_rate_per_second"] = 12.0
+        write(mislabeled_path, mislabeled)
+        expect_failure(
+            lambda: build_freeze(pilots, FreezeRule()),
+            "arrival schedule disagrees",
         )
 
         pilots = inputs(directory)

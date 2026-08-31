@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import pathlib
 import platform
@@ -945,6 +946,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scale-workload-arrivals-to-request-rate",
+        action="store_true",
+        help=(
+            "uniformly time-dilate a manifest with a recorded target rate so "
+            "its exact request order/shape is replayed at --request-rate"
+        ),
+    )
+    parser.add_argument(
         "--allow-oversubscribed-pool",
         action="store_true",
         help=(
@@ -1041,6 +1050,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("SLO thresholds must be positive")
     if args.request_rate <= 0:
         parser.error("request rate must be positive")
+    if args.scale_workload_arrivals_to_request_rate and args.workload_manifest is None:
+        parser.error("arrival scaling requires --workload-manifest")
     if not 0.0 < args.mem_fraction_static < 1.0:
         parser.error("--mem-fraction-static must be between zero and one")
     if args.workload_manifest is None:
@@ -1249,6 +1260,77 @@ class LoadedWorkload:
     resident_output_tokens: tuple[int, ...]
     external_output_tokens: tuple[int, ...]
     metadata: dict[str, Any]
+
+
+def _configure_workload_arrivals(
+    workload: LoadedWorkload,
+    *,
+    target_rate: float,
+    scale_to_target: bool,
+) -> LoadedWorkload:
+    """Prove or explicitly transform one manifest arrival schedule."""
+
+    if not math.isfinite(target_rate) or target_rate <= 0.0:
+        raise ValueError("workload target arrival rate must be positive")
+    metadata = dict(workload.metadata)
+    arrival = metadata.get("arrival")
+    if not isinstance(arrival, dict):
+        raise RuntimeError("workload manifest has no arrival contract")
+    source_value = arrival.get("target_rate_per_second")
+    source_rate = (
+        float(source_value)
+        if isinstance(source_value, (int, float))
+        and not isinstance(source_value, bool)
+        and math.isfinite(float(source_value))
+        and float(source_value) > 0.0
+        else None
+    )
+    if scale_to_target:
+        if source_rate is None:
+            raise RuntimeError(
+                "arrival scaling requires a manifest with a positive "
+                "target_rate_per_second"
+            )
+        scale = source_rate / target_rate
+        resident_offsets = tuple(
+            float(offset) * scale for offset in workload.resident_arrival_offsets
+        )
+        external_offsets = tuple(
+            float(offset) * scale for offset in workload.external_arrival_offsets
+        )
+        request_offsets = {
+            request_id: float(offset) * scale
+            for request_id, offset in metadata["request_arrival_offsets"].items()
+        }
+        method = "uniform_manifest_time_dilation"
+    else:
+        if source_rate is not None and not math.isclose(
+            source_rate, target_rate, rel_tol=1e-9, abs_tol=1e-12
+        ):
+            raise RuntimeError(
+                "--request-rate disagrees with the manifest arrival rate; "
+                "pass --scale-workload-arrivals-to-request-rate to transform it"
+            )
+        scale = 1.0
+        resident_offsets = workload.resident_arrival_offsets
+        external_offsets = workload.external_arrival_offsets
+        request_offsets = dict(metadata["request_arrival_offsets"])
+        method = "manifest_exact"
+    metadata["request_arrival_offsets"] = request_offsets
+    metadata["runtime_arrival"] = {
+        "method": method,
+        "source_mode": str(arrival.get("mode")),
+        "source_target_rate_per_second": source_rate,
+        "target_rate_per_second": target_rate if source_rate is not None else None,
+        "uniform_time_scale": scale,
+        "request_order_preserved": True,
+    }
+    return replace(
+        workload,
+        resident_arrival_offsets=resident_offsets,
+        external_arrival_offsets=external_offsets,
+        metadata=metadata,
+    )
 
 
 def _load_workload(
@@ -1916,6 +1998,11 @@ def main() -> int:
             args.workload_manifest,
             tokenizer,
             external_suffix_tokens=args.external_suffix_tokens,
+        )
+        loaded_workload = _configure_workload_arrivals(
+            loaded_workload,
+            target_rate=args.request_rate,
+            scale_to_target=args.scale_workload_arrivals_to_request_rate,
         )
         resident_request_ids = loaded_workload.resident_request_ids
         external_request_ids = loaded_workload.external_request_ids
@@ -2606,6 +2693,18 @@ def main() -> int:
         "model": str(args.model.resolve()),
         "seed": args.seed,
         "request_rate": args.request_rate,
+        "arrival_schedule": (
+            workload_metadata["runtime_arrival"]
+            if workload_metadata is not None
+            else {
+                "method": "seeded_exponential",
+                "source_mode": "synthetic_open_loop",
+                "source_target_rate_per_second": args.request_rate,
+                "target_rate_per_second": args.request_rate,
+                "uniform_time_scale": 1.0,
+                "request_order_preserved": True,
+            }
+        ),
         "external_requests": args.external_requests,
         "external_tokens": args.external_tokens,
         "external_suffix_tokens": args.external_suffix_tokens,

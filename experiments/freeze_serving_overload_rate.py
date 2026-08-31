@@ -352,6 +352,34 @@ def _load_observation(spec: PilotInput, rule: FreezeRule) -> _Observation:
     )
     if not math.isclose(report_rate, rate, rel_tol=1e-9, abs_tol=1e-12):
         raise ValueError("CLI offered rate disagrees with the stock report")
+    arrival_schedule = report.get("arrival_schedule")
+    if not isinstance(arrival_schedule, dict) or arrival_schedule.get("method") not in {
+        "seeded_exponential",
+        "manifest_exact",
+        "uniform_manifest_time_dilation",
+    }:
+        raise ValueError("stock saturation pilot has no proved arrival schedule")
+    schedule_rate = _finite(
+        arrival_schedule.get("target_rate_per_second"),
+        "arrival-schedule target rate",
+        positive=True,
+    )
+    if not math.isclose(schedule_rate, rate, rel_tol=1e-9, abs_tol=1e-12):
+        raise ValueError("arrival schedule disagrees with the offered rate")
+    if arrival_schedule.get("request_order_preserved") is not True:
+        raise ValueError("arrival schedule does not preserve request order")
+    scale = _finite(
+        arrival_schedule.get("uniform_time_scale"),
+        "arrival-schedule time scale",
+        positive=True,
+    )
+    if arrival_schedule["method"] == "uniform_manifest_time_dilation":
+        source_rate = _finite(
+            arrival_schedule.get("source_target_rate_per_second"),
+            "arrival-schedule source rate",
+            positive=True,
+        )
+        _close(scale, source_rate / rate, "arrival-schedule time scale")
     records_value = report.get("records")
     if not isinstance(records_value, list) or any(
         not isinstance(record, dict) for record in records_value

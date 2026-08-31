@@ -1037,6 +1037,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/gpu_trial.py
     )
     add_test(
+      NAME nta-workload-arrival-scaling
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/workload_arrival_scaling.py
+    )
+    add_test(
       NAME nta-serving-evidence
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_evidence.py
@@ -1110,6 +1115,7 @@ if(NTA_ENABLE_CUDA)
       nta-qualification-runner
       nta-serving-trial-gates nta-serving-overload-rate
       nta-gpu-trial
+      nta-workload-arrival-scaling
       nta-serving-evidence nta-serving-path-evidence nta-jit-operator-family
       nta-stats-publisher nta-vllm-lifecycle
       nta-opportunity-analysis

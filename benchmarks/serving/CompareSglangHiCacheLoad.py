@@ -46,6 +46,14 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         help="normalized Bailian manifest replayed identically by both arms",
     )
+    parser.add_argument(
+        "--scale-workload-arrivals-to-request-rate",
+        action="store_true",
+        help=(
+            "uniformly replay a rate-bearing manifest at --request-rate in "
+            "both arms"
+        ),
+    )
     parser.add_argument("--external-requests", type=int, default=3)
     parser.add_argument("--external-tokens", type=int, default=8192)
     parser.add_argument(
@@ -217,6 +225,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--mem-fraction-static must be between zero and one")
     if args.external_suffix_tokens < 0:
         parser.error("external suffix token count cannot be negative")
+    if args.scale_workload_arrivals_to_request_rate and args.workload_manifest is None:
+        parser.error("arrival scaling requires --workload-manifest")
     if args.churn_tokens > args.context_length:
         parser.error(
             "--churn-tokens cannot exceed --context-length; choose a smaller "
@@ -334,6 +344,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     )
     if args.workload_manifest is not None:
         command.extend(("--workload-manifest", str(args.workload_manifest.resolve())))
+    if args.scale_workload_arrivals_to_request_rate:
+        command.append("--scale-workload-arrivals-to-request-rate")
     if args.allow_oversubscribed_pool:
         command.append("--allow-oversubscribed-pool")
     environment = os.environ.copy()
