@@ -1099,6 +1099,43 @@ class _Signal(Protocol):
     def set(self) -> Any: ...
 
 
+def _required_placement_pressure_tokens(
+    *,
+    device_pool_tokens: int,
+    page_tokens: int,
+    external_cache_tokens: int,
+    exact_manifest: bool,
+    eviction_rounds: int | None,
+    churn_tokens: int,
+) -> int:
+    """Return unique setup pressure that proves the requested cache split.
+
+    A pool-sized window is sufficient only when every old radix page is
+    immediately evictable. HiCache write-through temporarily pins freshly
+    materialized external pages. For an exact manifest, append one complete
+    external working-set window so any page released after the eviction front
+    first passes it is still made older than enough unique pages. This work is
+    setup-only and is excluded from all serving measurements.
+    """
+
+    if min(device_pool_tokens, page_tokens, churn_tokens) <= 0:
+        raise ValueError("cache placement geometry must be positive")
+    if external_cache_tokens < 0:
+        raise ValueError("external cache working set cannot be negative")
+    if eviction_rounds is not None and eviction_rounds < 0:
+        raise ValueError("cache placement eviction rounds cannot be negative")
+
+    pool_frontier = device_pool_tokens + page_tokens
+    if exact_manifest:
+        required = pool_frontier + external_cache_tokens
+        if eviction_rounds is not None:
+            required = max(required, eviction_rounds * churn_tokens)
+        return required
+    if eviction_rounds is None:
+        return pool_frontier
+    return eviction_rounds * churn_tokens
+
+
 def _structure_token_inputs(
     tokenizer: Any, rows: Sequence[dict[str, Any]], block_size: int
 ) -> tuple[tuple[TokenInput, ...], str]:
@@ -2156,11 +2193,6 @@ def main() -> int:
         if workload_metadata is not None
         else 1
     )
-    required_placement_pressure = (
-        args.max_total_tokens + placement_page_tokens
-        if workload_metadata is not None or args.eviction_rounds is None
-        else args.eviction_rounds * args.churn_tokens
-    )
     placement_eviction_prompts: list[TokenInput] = []
     if workload_metadata is not None:
         block_size = int(workload_metadata["block_size"])
@@ -2187,9 +2219,18 @@ def main() -> int:
         # The cohort labels every external request as a host-tier dependency.
         # Merely crossing the combined working-set size evicts an arbitrary LRU
         # suffix and can leave a short external prefix entirely on device.  A
-        # pool-sized unique pressure window makes every non-shared external
-        # page older than the eviction frontier.  Warming residents afterwards
-        # then restores only the exact pages shared with the resident set.
+        # pool-sized unique pressure window starts that eviction. The trailing
+        # external-working-set window covers pages temporarily pinned by
+        # asynchronous write-through. Warming residents afterwards then
+        # restores only the exact pages shared with the resident set.
+    required_placement_pressure = _required_placement_pressure_tokens(
+        device_pool_tokens=args.max_total_tokens,
+        page_tokens=placement_page_tokens,
+        external_cache_tokens=external_cache_tokens,
+        exact_manifest=workload_metadata is not None,
+        eviction_rounds=args.eviction_rounds,
+        churn_tokens=args.churn_tokens,
+    )
     remaining = required_placement_pressure
     maximum_pressure_prompt_tokens = min(
         args.churn_tokens,

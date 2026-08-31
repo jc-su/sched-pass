@@ -346,6 +346,30 @@ def main() -> None:
         raise AssertionError("an open consumer policy entered timed serving")
     assert serving._max_request_input_tokens(32_768, 18_000) == 17_992
     assert serving._max_request_input_tokens(16_000, 18_000) == 15_992
+    assert serving._required_placement_pressure_tokens(
+        device_pool_tokens=40_000,
+        page_tokens=16,
+        external_cache_tokens=16_704,
+        exact_manifest=True,
+        eviction_rounds=None,
+        churn_tokens=32_700,
+    ) == 56_720
+    assert serving._required_placement_pressure_tokens(
+        device_pool_tokens=40_000,
+        page_tokens=1,
+        external_cache_tokens=0,
+        exact_manifest=False,
+        eviction_rounds=None,
+        churn_tokens=32_700,
+    ) == 40_001
+    assert serving._required_placement_pressure_tokens(
+        device_pool_tokens=40_000,
+        page_tokens=16,
+        external_cache_tokens=16_704,
+        exact_manifest=True,
+        eviction_rounds=2,
+        churn_tokens=32_700,
+    ) == 65_400
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3)) == 2
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3, 4)) == 3
     try:
