@@ -165,6 +165,7 @@ _ZERO_COUNTERS = (
     "host_acquisition_jobs_submitted",
     "host_acquisition_submission_calls",
     "host_acquisition_models_bound",
+    "host_acquisition_structural_owners",
     "host_acquisition_layers_consumed",
     "host_acquisition_refill_jobs",
     "host_acquisition_shape_uncalibrated",

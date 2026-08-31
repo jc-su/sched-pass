@@ -31,6 +31,7 @@ class FakeTransport:
         for local_layer in range(first_local_layer, last_local_layer):
             pending.prefetched_layers[local_layer] = object()
 
+
 def coordinator(
     *,
     isolated: bool = False,
@@ -169,6 +170,47 @@ def main() -> None:
     assert admission.acquisition.fully_published
     assert admission_owner._stats["host_acquisition_jobs_submitted"] == 4
 
+    # Feasibility is optional; physical ownership is not. An unseen dynamic
+    # batch shape receives a structural layer queue, submits in transformer
+    # order, and retires every numerical consumer without claiming an EDF
+    # model or learning optimistically in the serving window.
+    structural_owner, structural_pool, structural_transport = coordinator()
+    structural = pending(structural_pool)
+    structural.arrival_profile_key = None
+    structural_owner.account_selection = account
+    structural_owner._calibration = types.SimpleNamespace(
+        shape_key=lambda _batch: ("extend", 64, 2),
+        curve_for_batch=lambda _batch: None,
+    )
+    structural_owner._movers = types.SimpleNamespace(collect_profiles=lambda: None)
+    structural_plan = types.SimpleNamespace(
+        mover=types.SimpleNamespace(kind="sm"),
+        sm_waves_per_layer=1,
+    )
+    structural_owner.transfer_plan = (
+        lambda item, **_kwargs: setattr(item, "transfer_plan", structural_plan)
+        or structural_plan
+    )
+
+    def bind_structural(item, **_kwargs):
+        item.arrival_profile_key = object()
+
+    structural_owner._consumer_calibration = types.SimpleNamespace(
+        bind_lease=bind_structural
+    )
+    structural_owner.capture(structural)
+    assert not structural_owner.prepare_owner(structural, object())
+    assert structural.acquisition is not None
+    assert structural.acquisition.model is None
+    assert structural_owner._stats["host_acquisition_jobs_prepared"] == 4
+    assert structural_owner._stats["host_acquisition_structural_owners"] == 1
+    assert structural_owner.submit(structural) == 4
+    assert structural_transport.ranges == [(0, 4)]
+    for layer in range(4):
+        structural_owner.retire_layer(structural, layer)
+    assert structural.acquisition.queue.terminal
+    assert structural_owner._stats["host_acquisition_layers_consumed"] == 4
+
     # A progressive producer capability is not itself a partial-consumer
     # decision. Normal AUTO selection must wait for a per-layer arrival/cost
     # proof; bounded calibration may explicitly measure the path, while an EDF
@@ -255,9 +297,7 @@ def main() -> None:
             deadline_model=model,
             deadline_model_initialized=calibrated,
         )
-        frontier_owner.transfer_plan = (
-            lambda item, **_kwargs: item.transfer_plan
-        )
+        frontier_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
         frontier_owner.advance_after_attention(frontier_pending, batch, 0)
         return (
             frontier_transport.ranges,

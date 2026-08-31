@@ -61,11 +61,14 @@ class SglangHostAcquisitionCoordinator:
         transport: SglangHostTransport,
         stats: MutableMapping[str, Any],
     ) -> None:
-        if min(
-            model_layer_count,
-            sm_acquisition_waves,
-            frontier_layers_per_wave,
-        ) <= 0:
+        if (
+            min(
+                model_layer_count,
+                sm_acquisition_waves,
+                frontier_layers_per_wave,
+            )
+            <= 0
+        ):
             raise ValueError("SGLang Host acquisition geometry must be positive")
         if minimum_consumer_gain < 1.0:
             raise ValueError("SGLang consumer gain must be at least one")
@@ -236,7 +239,6 @@ class SglangHostAcquisitionCoordinator:
         curve = self._calibration.curve_for_batch(batch)
         if shape_key is None or curve is None:
             self._add("host_acquisition_shape_uncalibrated")
-            return False
         if active_batch is not None and active_batch.pending_host_load is pending:
             active_batch.layer_service_key = shape_key
         self._movers.collect_profiles()
@@ -245,14 +247,25 @@ class SglangHostAcquisitionCoordinator:
             layer_service_key=shape_key,
             layer_curve=curve,
         )
-        self._consumer_calibration.bind_lease(
-            pending,
-            layer_service_key=shape_key,
-            mover_kind=transfer_plan.mover.kind,
-            layers_per_submission=self._frontier_layers_per_wave,
-            sm_waves_per_layer=transfer_plan.sm_waves_per_layer,
-            minimum_gain=self._minimum_consumer_gain,
-        )
+        if (
+            shape_key is not None
+            and getattr(pending, "arrival_profile_key", None) is None
+        ):
+            self._consumer_calibration.bind_lease(
+                pending,
+                layer_service_key=shape_key,
+                mover_kind=transfer_plan.mover.kind,
+                layers_per_submission=self._frontier_layers_per_wave,
+                sm_waves_per_layer=transfer_plan.sm_waves_per_layer,
+                minimum_gain=self._minimum_consumer_gain,
+            )
+        if acquisition is None:
+            acquisition = LayerAcquisition(pending.layer_bytes)
+            pending.acquisition = acquisition
+            self._add("host_acquisition_jobs_prepared", len(pending.layer_bytes))
+            self._add("host_acquisition_structural_owners")
+        if curve is None:
+            return False
         model = self.deadline_model_for_curve(pending, curve)
         if model is None:
             self._add(
@@ -261,10 +274,6 @@ class SglangHostAcquisitionCoordinator:
                 else "host_acquisition_model_rejected"
             )
             return False
-        if acquisition is None:
-            acquisition = LayerAcquisition(pending.layer_bytes)
-            pending.acquisition = acquisition
-            self._add("host_acquisition_jobs_prepared", len(model.layer_bytes))
         if acquisition.bind_model(model):
             self._add("host_acquisition_models_bound")
         return True
