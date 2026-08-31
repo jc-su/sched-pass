@@ -475,6 +475,12 @@ def run(
             "co-tenant sampler lost environmental samples: "
             f"{sampler.sampling_errors} errors"
         )
+    if sampler.foreign_samples:
+        failures.append(
+            "GPU co-tenant contamination was observed in "
+            f"{sampler.foreign_samples} samples "
+            f"(pids={sorted(sampler.foreign_pids)})"
+        )
     gpu_telemetry = sampler.telemetry()
     if int(gpu_telemetry["errors"]):
         failures.append(
