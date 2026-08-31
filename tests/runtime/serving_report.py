@@ -14,7 +14,10 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from experiments.validate_serving_report import validate  # noqa: E402
+from experiments.validate_serving_report import (  # noqa: E402
+    validate,
+    validate_formal_arm,
+)
 from experiments.validate_serving_trials import (  # noqa: E402
     validate as validate_trials,
 )
@@ -342,6 +345,28 @@ def main() -> None:
         }
     )
     validate(comparison)
+    formal_arm = copy.deepcopy(nta)
+    formal_arm.update(
+        {
+            "dirty": False,
+            "load_warmup_excluded": True,
+            "calibration_input_contract": {
+                "kind": "exact_token_content_graph_and_query_rows",
+                "content_graph_preserved": True,
+                "cache_reset_after_each_warmup": True,
+                "verified": True,
+            },
+        }
+    )
+    validate_formal_arm(formal_arm)
+    inexact_warmup = copy.deepcopy(formal_arm)
+    inexact_warmup["calibration_input_contract"]["content_graph_preserved"] = False
+    try:
+        validate_formal_arm(inexact_warmup)
+    except ValueError as error:
+        assert "content-sharing graph" in str(error)
+    else:
+        raise AssertionError("a content-changing formal warmup passed validation")
     standalone = copy.deepcopy(nta)
     for field in (
         "cotenant_gpu_samples",

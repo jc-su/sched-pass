@@ -59,8 +59,7 @@ def parse_args() -> argparse.Namespace:
         "--scale-workload-arrivals-to-request-rate",
         action="store_true",
         help=(
-            "uniformly replay a rate-bearing manifest at --request-rate in "
-            "both arms"
+            "uniformly replay a rate-bearing manifest at --request-rate in both arms"
         ),
     )
     parser.add_argument("--external-requests", type=int, default=3)
@@ -252,10 +251,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("incremental setup cost must be nonnegative")
     if not args.nta_calibration_profile_tag.strip():
         parser.error("calibration profile tag cannot be empty")
-    if (
-        args.prepare_nta_calibration_profile
-        and args.nta_calibration_profile is None
-    ):
+    if args.prepare_nta_calibration_profile and args.nta_calibration_profile is None:
         parser.error(
             "--prepare-nta-calibration-profile requires --nta-calibration-profile"
         )
@@ -615,7 +611,9 @@ def main() -> int:
         backend: contract
         for backend, contract in calibration_contracts.items()
         if not isinstance(contract, dict)
-        or contract.get("kind") != "exact_token_prefix_and_query_rows"
+        or contract.get("kind") != "exact_token_content_graph_and_query_rows"
+        or contract.get("content_graph_preserved") is not True
+        or contract.get("cache_reset_after_each_warmup") is not True
         or contract.get("verified") is not True
     }
     if invalid_calibration:
@@ -623,7 +621,7 @@ def main() -> int:
             args.output,
             reports,
             order,
-            "paired warmups did not prove an exact token-prefix/query-row contract",
+            "paired warmups did not preserve the exact token content graph",
             {"invalid_calibration_contracts": invalid_calibration},
         )
         raise RuntimeError("load warmup did not preserve the exact request shape")
@@ -671,8 +669,7 @@ def main() -> int:
         )
         if (
             not isinstance(accounting, dict)
-            or accounting.get("method")
-            != "finite_window_arrival_departure_accounting"
+            or accounting.get("method") != "finite_window_arrival_departure_accounting"
             or accounting.get("interpretation")
             != "descriptive_client_timestamp_accounting"
             or not all(

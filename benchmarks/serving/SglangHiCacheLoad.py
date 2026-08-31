@@ -1790,7 +1790,7 @@ def _flush_cache_when_idle(
     return elapsed
 
 
-def _exact_calibration_input(
+def _distinct_prefix_branch_input(
     tokenizer: Any,
     prefix: Sequence[int],
     measured: Sequence[int],
@@ -1798,30 +1798,29 @@ def _exact_calibration_input(
     label: str,
     forbidden_first_tokens: set[int],
 ) -> TokenInput:
-    """Build an exact-prefix, exact-query-row calibration input.
+    """Build an exact-prefix branch with a distinct continuation.
 
-    Replaying the measured input during warmup turns its nominally uncached
-    suffix into a radix-cache hit.  That silently changes a mixed prefill with
-    hundreds of query rows into an almost-exact-prefix request.  Text-level
-    length matching is insufficient because tokenizer merges can alter the
-    boundary.  This harness submits token IDs directly: the cached prefix is
-    byte-for-byte identical and the continuation has exactly the same row
-    count, while its first token is unique across measured and warmup inputs.
+    Prefix materialization must not insert the timed continuation into the
+    radix cache. Text-level length matching is insufficient because tokenizer
+    merges can alter the boundary. This harness submits token IDs directly:
+    the cached prefix is byte-for-byte identical and the continuation has the
+    requested row count, while its first token is unique across materialized
+    and measured inputs.
     """
     prefix_ids = tuple(int(value) for value in prefix)
     measured_ids = tuple(int(value) for value in measured)
     if not prefix_ids or measured_ids[: len(prefix_ids)] != prefix_ids:
-        raise RuntimeError("calibration input does not retain the exact cached prefix")
+        raise RuntimeError("distinct branch does not retain the exact cached prefix")
     query_rows = len(measured_ids) - len(prefix_ids)
     if query_rows <= 0:
-        raise RuntimeError("calibration prompt has no uncached continuation")
+        raise RuntimeError("distinct branch has no uncached continuation")
     suffix = list(_token_input(tokenizer, make_prompt(tokenizer, label, query_rows)))
     if len(suffix) != query_rows:
-        raise RuntimeError("calibration continuation changed the exact query-row count")
+        raise RuntimeError("distinct branch changed the exact query-row count")
     special = {int(value) for value in getattr(tokenizer, "all_special_ids", ())}
     vocabulary_size = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer))
     if vocabulary_size <= len(special) + len(forbidden_first_tokens):
-        raise RuntimeError("tokenizer has no distinct calibration token")
+        raise RuntimeError("tokenizer has no distinct branch token")
     if suffix[0] in forbidden_first_tokens or suffix[0] in special:
         seed = int.from_bytes(hashlib.sha256(label.encode("utf-8")).digest()[:8], "big")
         for offset in range(vocabulary_size):
@@ -1830,11 +1829,11 @@ def _exact_calibration_input(
                 suffix[0] = candidate
                 break
         else:  # pragma: no cover - guarded by the vocabulary-size check above
-            raise RuntimeError("could not select a distinct calibration token")
+            raise RuntimeError("could not select a distinct branch token")
     forbidden_first_tokens.add(suffix[0])
     candidate = prefix_ids + tuple(suffix)
     if len(candidate) != len(measured_ids) or candidate == measured_ids:
-        raise RuntimeError("calibration input did not preserve the exact request shape")
+        raise RuntimeError("distinct branch did not preserve the exact request shape")
     return candidate
 
 
@@ -1842,14 +1841,14 @@ def _exact_prefix_materialization_inputs(
     tokenizer: Any,
     prefixes: Sequence[Sequence[int]],
     measured_inputs: Sequence[Sequence[int]],
-) -> tuple[tuple[TokenInput, ...], set[int]]:
+) -> tuple[TokenInput, ...]:
     """Create one-token branches that materialize every exact timed prefix.
 
     Submitting a prefix by itself can leave its final input token outside the
     reusable radix boundary.  A distinct one-token continuation makes the
     complete prefix reusable without inserting the timed continuation.  One
-    shared forbidden set also prevents materialization and calibration
-    branches from colliding across requests or warmup iterations.
+    shared forbidden set prevents materialization branches from colliding
+    across requests.
     """
 
     if len(prefixes) != len(measured_inputs):
@@ -1876,7 +1875,7 @@ def _exact_prefix_materialization_inputs(
         measured_ids = tuple(int(value) for value in measured)
         one_row_shape = prefix_ids + (measured_ids[len(prefix_ids)],)
         materialization_inputs.append(
-            _exact_calibration_input(
+            _distinct_prefix_branch_input(
                 tokenizer,
                 prefix_ids,
                 one_row_shape,
@@ -1884,7 +1883,7 @@ def _exact_prefix_materialization_inputs(
                 forbidden_first_tokens=forbidden_first_tokens,
             )
         )
-    return tuple(materialization_inputs), forbidden_first_tokens
+    return tuple(materialization_inputs)
 
 
 async def _stream_request(
@@ -2346,33 +2345,14 @@ def main() -> int:
         raise RuntimeError(
             "runtime token inputs disagree with the workload cache-union contract"
         )
-    external_effective_prefixes = [
-        prompt[:cached]
-        for prompt, cached in zip(
-            external_prompts,
-            effective_external_cached_prefix_lengths,
-            strict=True,
-        )
-    ]
     external_query_rows = [
         len(prompt) - cached
         for cached, prompt in zip(
             effective_external_cached_prefix_lengths, external_prompts, strict=True
         )
     ]
-    (
-        external_materialization_prompts,
-        calibration_forbidden_first_tokens,
-    ) = _exact_prefix_materialization_inputs(
+    external_materialization_prompts = _exact_prefix_materialization_inputs(
         tokenizer, external_prefixes, external_prompts
-    )
-    calibration_forbidden_first_tokens.update(
-        prompt[cached]
-        for prompt, cached in zip(
-            external_prompts,
-            effective_external_cached_prefix_lengths,
-            strict=True,
-        )
     )
     placement_probe_groups = _placement_probe_groups(external_prefixes)
     resident_probe_groups = _placement_probe_groups(resident_prompts)
@@ -2737,33 +2717,19 @@ def main() -> int:
             establish_final_placement()
 
         calibration_shape_records: list[list[dict[str, int]]] = []
-        for warmup in range(args.load_warmup_iterations):
+        for _warmup in range(args.load_warmup_iterations):
             # Demand graphs warm on the first occurrence and capture on the
             # second. Both are excluded so the measured occurrence is replay.
-            # Every continuation-bearing request uses the exact measured prefix
-            # and row count, but diverges on its first uncached token. This is a
-            # token-level contract for both synthetic and Bailian replays.
-            calibration_external_prompts = [
-                (
-                    prompt
-                    if len(prompt) == len(prefix)
-                    else _exact_calibration_input(
-                        tokenizer,
-                        prefix,
-                        prompt,
-                        label=f"load-calibration-suffix-{warmup}-{index}",
-                        forbidden_first_tokens=calibration_forbidden_first_tokens,
-                    )
-                )
-                for index, (prefix, prompt) in enumerate(
-                    zip(external_effective_prefixes, external_prompts, strict=True)
-                )
-            ]
+            # Replaying the exact token inputs also preserves cross-request
+            # content sharing and controlled-cycle cache evolution. Every
+            # excluded occurrence is followed by a cache flush and exact
+            # placement reconstruction, so no warmup radix entry reaches the
+            # timed window.
             warmup_records, _ = engine.loop.run_until_complete(
                 _run_load(
                     engine,
                     resident_prompts,
-                    calibration_external_prompts,
+                    external_prompts,
                     args,
                     resident_offsets,
                     external_offsets,
@@ -2909,8 +2875,10 @@ def main() -> int:
             + json.dumps(mismatched_calibrations, sort_keys=True)
         )
     calibration_contract = {
-        "kind": "exact_token_prefix_and_query_rows",
+        "kind": "exact_token_content_graph_and_query_rows",
         "cache_composition": "initial_object_union_longest_common_prefix",
+        "content_graph_preserved": True,
+        "cache_reset_after_each_warmup": True,
         "verified": (
             args.load_warmup_iterations > 0
             and len(calibration_shape_records) == args.load_warmup_iterations

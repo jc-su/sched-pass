@@ -870,14 +870,14 @@ def main() -> None:
     prefix = (11, 12, 13)
     measured_input = prefix + (14, 15)
     forbidden = {14}
-    calibration = serving._exact_calibration_input(
+    calibration = serving._distinct_prefix_branch_input(
         _Tokenizer(),
         prefix,
         measured_input,
         label="calibration-a",
         forbidden_first_tokens=forbidden,
     )
-    second_calibration = serving._exact_calibration_input(
+    second_calibration = serving._distinct_prefix_branch_input(
         _Tokenizer(),
         prefix,
         measured_input,
@@ -897,12 +897,10 @@ def main() -> None:
         == 3
     )
 
-    materialized, materialization_forbidden = (
-        serving._exact_prefix_materialization_inputs(
-            _Tokenizer(),
-            (prefix, (21, 22)),
-            (measured_input, (21, 22, 99, 14)),
-        )
+    materialized = serving._exact_prefix_materialization_inputs(
+        _Tokenizer(),
+        (prefix, (21, 22)),
+        (measured_input, (21, 22, 99, 14)),
     )
     assert tuple(len(value) for value in materialized) == (len(prefix) + 1, 3)
     assert materialized[0][: len(prefix)] == prefix
@@ -910,7 +908,6 @@ def main() -> None:
     assert materialized[0][len(prefix)] not in {14, 99}
     assert materialized[1][2] not in {14, 99}
     assert materialized[0][len(prefix)] != materialized[1][2]
-    assert {14, 99}.issubset(materialization_forbidden)
 
     baseline = {
         "backend": "nta_flashinfer",

@@ -1569,6 +1569,15 @@ def validate_formal_arm(report: dict[str, Any]) -> dict[str, Any]:
         report.get("load_warmup_excluded") is True,
         "formal serving arm did not exclude a shape-faithful load warmup",
     )
+    calibration = report.get("calibration_input_contract")
+    _require(
+        isinstance(calibration, dict)
+        and calibration.get("kind") == "exact_token_content_graph_and_query_rows"
+        and calibration.get("content_graph_preserved") is True
+        and calibration.get("cache_reset_after_each_warmup") is True
+        and calibration.get("verified") is True,
+        "formal serving arm warmup changed the timed content-sharing graph",
+    )
     return report
 
 
