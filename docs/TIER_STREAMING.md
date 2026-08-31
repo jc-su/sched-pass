@@ -25,7 +25,8 @@ the appropriate arm. No arm may drop contributors, change the numerical
 contract, or use a quality selector to manufacture a speedup. The D6
 diagnostic profile therefore measures a protocol capability and is not
 silently treated as the source of the SGLang headline result. Formal serving
-attributes progressive release through A3/A2.
+attributes progressive consumption through A3/A2, where both arms use the
+same scheduler-bound acquisition owner.
 
 The current SGLang serving path creates one `ExecutionSession` per real
 FlashInfer attention launch. The tier-streaming executor is a reusable

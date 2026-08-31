@@ -103,8 +103,8 @@ anonymized trace explicitly reports compute/transfer regime as
 and serving profiles rather than inferred from prompt lengths.  RQ1 is the
 paired serving result against stock SGLang HiCache under identical exact
 demand. RQ2 is the causal decomposition across framework bulk control, exact
-NTA preacquisition, GPU demand discovery with bulk readiness, and progressive
-heterogeneous work-unit release.
+eager NTA preacquisition, scheduler-bound whole-layer acquisition, and
+progressive heterogeneous work-unit consumption.
 RQ3 reports request-state, tier, load, arrival, and granularity strata.  RQ4
 reports control and resource overhead with profiler artifacts.
 
@@ -116,8 +116,10 @@ instrumentation overhead on requests that do not exercise a remote tier while
 keeping the mixed-batch mechanism measurable.
 
 The paired plan has three adjacent boundaries: A1/A0 for exact acquisition,
-A2/A1 for GPU demand discovery, and A3/A2 for progressive work-unit release.
-All three pairs consume the same exact demand and numerical contract.
+A2/A1 for scheduler-bound ownership, and A3/A2 for progressive work-unit
+consumption. All three pairs consume the same exact demand and numerical
+contract; A2 and A3 additionally share the same acquisition owner and differ
+only in consumer readiness.
 
 The generated trial specification is explicitly marked
 `evaluation_profile=osdi-complete`. This profile is a machine-checked gate,

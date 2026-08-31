@@ -199,6 +199,7 @@ class HostExecutionForm(str, Enum):
     """Explicit control path; wave count alone cannot identify ownership."""
 
     DIRECT = "direct"
+    SCHEDULED_BULK = "scheduled_bulk"
     DEVICE_BULK = "device_bulk"
     DEPENDENCY_AWARE = "dependency_aware"
 
@@ -213,6 +214,7 @@ class HostExecutionMode(str, Enum):
 
     AUTO = "auto"
     DIRECT = "direct"
+    SCHEDULED_BULK = "scheduled_bulk"
     DEVICE_BULK = "device_bulk"
     DEPENDENCY_AWARE = "dependency_aware"
 
@@ -241,6 +243,7 @@ class HostExecutionPlan:
         "tenant_isolation",
         "scheduled_preacquired",
         "forced_direct",
+        "forced_scheduled_bulk",
         "forced_device_bulk",
         "forced_dependency_aware",
     ] = "predicted_gain"
@@ -260,12 +263,12 @@ class HostExecutionPlan:
             raise ValueError("host execution decision scope is invalid")
         if not isinstance(self.form, HostExecutionForm):
             raise TypeError("host execution form has an invalid type")
-        if self.form in {HostExecutionForm.DIRECT, HostExecutionForm.DEVICE_BULK} and (
-            len(self.block_counts) != 1 or self.overlap_initial
-        ):
-            raise ValueError(
-                "direct and device-bulk execution must be one non-overlapped wave"
-            )
+        if self.form in {
+            HostExecutionForm.DIRECT,
+            HostExecutionForm.SCHEDULED_BULK,
+            HostExecutionForm.DEVICE_BULK,
+        } and (len(self.block_counts) != 1 or self.overlap_initial):
+            raise ValueError("bulk execution must be one non-overlapped wave")
 
     @property
     def rounds(self) -> int:
@@ -275,6 +278,15 @@ class HostExecutionPlan:
     def uses_dependency_protocol(self) -> bool:
         return self.form in {
             HostExecutionForm.DEVICE_BULK,
+            HostExecutionForm.DEPENDENCY_AWARE,
+        }
+
+    @property
+    def uses_scheduler_bound_acquisition(self) -> bool:
+        """Whether transport ownership is bound at the scheduler shape edge."""
+
+        return self.form in {
+            HostExecutionForm.SCHEDULED_BULK,
             HostExecutionForm.DEPENDENCY_AWARE,
         }
 
@@ -751,14 +763,21 @@ def prove_atomic_host_execution(
     )
     if mode in {HostExecutionMode.DEVICE_BULK, HostExecutionMode.DEPENDENCY_AWARE}:
         return None
-    if mode is HostExecutionMode.DIRECT:
+    if mode in {HostExecutionMode.DIRECT, HostExecutionMode.SCHEDULED_BULK}:
+        scheduled = mode is HostExecutionMode.SCHEDULED_BULK
         return HostExecutionPlan(
             block_counts=(object_count,),
             predicted_atomic_ns=atomic_ns,
             predicted_incremental_ns=atomic_ns,
-            form=HostExecutionForm.DIRECT,
+            form=(
+                HostExecutionForm.SCHEDULED_BULK
+                if scheduled
+                else HostExecutionForm.DIRECT
+            ),
             overlap_initial=False,
-            selection_reason="forced_direct",
+            selection_reason=(
+                "forced_scheduled_bulk" if scheduled else "forced_direct"
+            ),
             scope_units=scope_units,
             incremental_service_scale=_incremental_service_scale(model),
         )
@@ -814,8 +833,11 @@ def plan_host_execution(
     model.validate()
     if not isinstance(mode, HostExecutionMode):
         raise TypeError("host execution mode has an invalid type")
-    if require_dependency_protocol and mode is HostExecutionMode.DIRECT:
-        raise ValueError("tenant isolation cannot force direct host execution")
+    if require_dependency_protocol and mode in {
+        HostExecutionMode.DIRECT,
+        HostExecutionMode.SCHEDULED_BULK,
+    }:
+        raise ValueError("tenant isolation requires typed host execution")
     if calibration_probe and mode is not HostExecutionMode.AUTO:
         raise ValueError("calibration probes require automatic host execution")
     if min(object_count, transfer_bytes, runnable_tiles, scope_units) <= 0:
@@ -833,14 +855,21 @@ def plan_host_execution(
         compute_ns,
         scope_units,
     )
-    if mode is HostExecutionMode.DIRECT:
+    if mode in {HostExecutionMode.DIRECT, HostExecutionMode.SCHEDULED_BULK}:
+        scheduled = mode is HostExecutionMode.SCHEDULED_BULK
         return HostExecutionPlan(
             block_counts=(object_count,),
             predicted_atomic_ns=atomic_ns,
             predicted_incremental_ns=atomic_ns,
-            form=HostExecutionForm.DIRECT,
+            form=(
+                HostExecutionForm.SCHEDULED_BULK
+                if scheduled
+                else HostExecutionForm.DIRECT
+            ),
             overlap_initial=False,
-            selection_reason="forced_direct",
+            selection_reason=(
+                "forced_scheduled_bulk" if scheduled else "forced_direct"
+            ),
             scope_units=scope_units,
             incremental_service_scale=_incremental_service_scale(model),
         )

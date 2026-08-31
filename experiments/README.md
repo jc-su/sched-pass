@@ -62,9 +62,10 @@ python experiments/make_evaluation_spec.py \
 ```
 
 The generator expands three adjacent causal boundaries: A1/A0 isolates exact
-NTA acquisition from framework bulk control, A2/A1 isolates GPU demand
-discovery with a bulk readiness boundary, and A3/A2 isolates progressive
-work-unit release. It requires a concrete command for every arm and validates
+NTA acquisition from framework bulk control, A2/A1 isolates scheduler-bound
+acquisition from eager acquisition, and A3/A2 isolates progressive work-unit
+consumption from a whole-layer stock consumer. It requires a concrete command
+for every arm and validates
 the resulting spec before writing it; no missing arm is silently treated as a
 baseline.
 Generated specifications carry `evaluation_profile=osdi-complete`. The runner

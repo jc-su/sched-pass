@@ -964,11 +964,17 @@ def main() -> None:
             }
         )
     ] == ["native_work_unit", "framework_reference"]
+    # This synthetic delta deliberately exercises cumulative device-bulk
+    # accounting as well as a direct batch. Do not mislabel that mixture as a
+    # pure direct arm.
     dispatch = serving._execution_dispatch([measured])
+    assert dispatch["kind"] == "mixed_dispatch"
+    direct_measured = {**measured, "host_device_bulk_batches": 0}
+    dispatch = serving._execution_dispatch([direct_measured])
     assert dispatch["kind"] == "stock_direct"
     assert dispatch["plan_uploads"] == 0
     assert dispatch["semantic_wrapper_plan_builds"] == 0
-    invalid_dispatch = dict(measured, transformed_direct_launches=1)
+    invalid_dispatch = dict(direct_measured, transformed_direct_launches=1)
     try:
         serving._execution_dispatch([invalid_dispatch])
     except RuntimeError as error:
@@ -976,7 +982,7 @@ def main() -> None:
     else:
         raise AssertionError("direct-only execution accepted a native launch")
     scheduled = {
-        **measured,
+        **direct_measured,
         "host_direct_batches": 0,
         "host_incremental_batches": 1,
         "host_acquisition_jobs_submitted": 36,
@@ -986,6 +992,24 @@ def main() -> None:
     }
     dispatch = serving._execution_dispatch([scheduled])
     assert dispatch["kind"] == "scheduled_preacquired"
+    scheduled_bulk = {
+        **direct_measured,
+        "host_direct_batches": 0,
+        "host_scheduled_bulk_batches": 1,
+        "host_incremental_batches": 0,
+    }
+    dispatch = serving._execution_dispatch([scheduled_bulk])
+    assert dispatch["kind"] == "scheduled_bulk"
+    device_bulk = {
+        **direct_measured,
+        "host_direct_batches": 0,
+        "host_device_bulk_batches": 1,
+        "native_external_attention_launches": 36,
+        "stock_prefetched_external_attention_launches": 0,
+        "ticketed_incremental_launches": 36,
+    }
+    dispatch = serving._execution_dispatch([device_bulk])
+    assert dispatch["kind"] == "device_bulk_diagnostic"
     selected, physical_bytes, status = serving._engine_byte_accounting([measured])
     assert selected == physical_bytes == 301_916_160
     assert status == "exact_engine_transfer_counters"

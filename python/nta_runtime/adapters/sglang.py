@@ -81,8 +81,8 @@ class SglangExecutionConfig:
             mode = HostExecutionMode(raw_mode)
         except ValueError as error:
             raise ValueError(
-                "NTA_EXECUTION_HOST_FORM must be auto, direct, device_bulk, "
-                "or dependency_aware"
+                "NTA_EXECUTION_HOST_FORM must be auto, direct, scheduled_bulk, "
+                "device_bulk, or dependency_aware"
             ) from error
         if protocol.kind.value == "conventional" and mode not in {
             HostExecutionMode.AUTO,

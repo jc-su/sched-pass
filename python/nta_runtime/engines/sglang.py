@@ -1665,7 +1665,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._record_host_selection(selected)
                 if (
                     (pending.acquisition is None or pending.acquisition.model is None)
-                    and selected.uses_dependency_protocol
+                    and selected.uses_scheduler_bound_acquisition
                     and self._host_acquisition.proactive_layer_queue_enabled
                     and self._host_acquisition.prepare_owner(
                         pending,
@@ -1700,12 +1700,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._host_acquisition.publish_missing(pending)
                     self._stock_forward = True
                     self._activate_stock_prefetch(bindings, pending, count_batch=False)
-                    self._stats["host_direct_batches"] = (
-                        self._stats.get("host_direct_batches", 0) + 1
+                    bulk_counter = (
+                        "host_scheduled_bulk_batches"
+                        if selected.form is HostExecutionForm.SCHEDULED_BULK
+                        else "host_direct_batches"
                     )
+                    self._stats[bulk_counter] = self._stats.get(bulk_counter, 0) + 1
                     if mixed_host_batch:
-                        self._stats["host_mixed_direct_batches"] = (
-                            self._stats.get("host_mixed_direct_batches", 0) + 1
+                        mixed_counter = (
+                            "host_mixed_scheduled_bulk_batches"
+                            if selected.form is HostExecutionForm.SCHEDULED_BULK
+                            else "host_mixed_direct_batches"
+                        )
+                        self._stats[mixed_counter] = (
+                            self._stats.get(mixed_counter, 0) + 1
                         )
                     if ready_stock_fastpath:
                         self._stats["host_bound_after_full_ready_batches"] = (
@@ -1830,6 +1838,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         configured = self._execution_config.host_execution_mode
         forced_forms = {
             HostExecutionMode.DIRECT: HostExecutionForm.DIRECT,
+            HostExecutionMode.SCHEDULED_BULK: HostExecutionForm.SCHEDULED_BULK,
             HostExecutionMode.DEVICE_BULK: HostExecutionForm.DEVICE_BULK,
             HostExecutionMode.DEPENDENCY_AWARE: HostExecutionForm.DEPENDENCY_AWARE,
         }

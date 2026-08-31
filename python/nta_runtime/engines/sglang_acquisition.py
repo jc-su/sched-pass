@@ -90,12 +90,13 @@ class SglangHostAcquisitionCoordinator:
     def proactive_layer_queue_enabled(self) -> bool:
         """Return whether a scheduler-bound batch may submit Host transfers.
 
-        AUTO and DEPENDENCY_AWARE admit the same finite, scheduler-bound queue;
-        their consumer policy differs, not their ownership or transport path.
-        DIRECT is the explicit eager diagnostic arm and may submit at capture.
-        DEVICE_BULK retains device-discovered acquisition for the causal A2
-        arm. Tenant isolation likewise requires request accounting before
-        transport can reserve bytes.
+        SCHEDULED_BULK and DEPENDENCY_AWARE admit the same finite,
+        scheduler-bound queue; their consumer policy differs, not their
+        ownership or transport path. AUTO may select either consumer after
+        calibration. DIRECT is the explicit eager diagnostic arm and may
+        submit at capture. DEVICE_BULK retains device-discovered acquisition
+        as a diagnostic and tenant isolation requires request accounting
+        before transport can reserve bytes.
         """
 
         return (
@@ -105,6 +106,7 @@ class SglangHostAcquisitionCoordinator:
             in {
                 HostExecutionMode.AUTO,
                 HostExecutionMode.DIRECT,
+                HostExecutionMode.SCHEDULED_BULK,
                 HostExecutionMode.DEPENDENCY_AWARE,
             }
         )

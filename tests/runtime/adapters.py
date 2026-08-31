@@ -212,6 +212,13 @@ def main() -> None:
         }
     )
     assert forced_config.host_execution_mode is HostExecutionMode.DEPENDENCY_AWARE
+    scheduled_bulk_config = SglangExecutionConfig.from_environment(
+        {
+            "NTA_EXECUTION_PROTOCOL": "late_bound",
+            "NTA_EXECUTION_HOST_FORM": "scheduled_bulk",
+        }
+    )
+    assert scheduled_bulk_config.host_execution_mode is HostExecutionMode.SCHEDULED_BULK
     device_bulk_config = SglangExecutionConfig.from_environment(
         {
             "NTA_EXECUTION_PROTOCOL": "late_bound",

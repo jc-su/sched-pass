@@ -182,6 +182,20 @@ def main() -> None:
     )
     assert forced_direct.form is HostExecutionForm.DIRECT
     assert forced_direct.selection_reason == "forced_direct"
+    forced_scheduled_bulk = plan_host_execution(
+        object_count=16,
+        transfer_bytes=4 * 1024 * 1024,
+        runnable_tiles=64,
+        initial_runnable_tiles=17,
+        model=model,
+        mode=HostExecutionMode.SCHEDULED_BULK,
+    )
+    assert forced_scheduled_bulk.form is HostExecutionForm.SCHEDULED_BULK
+    assert forced_scheduled_bulk.block_counts == (16,)
+    assert not forced_scheduled_bulk.overlap_initial
+    assert not forced_scheduled_bulk.uses_dependency_protocol
+    assert forced_scheduled_bulk.uses_scheduler_bound_acquisition
+    assert forced_scheduled_bulk.selection_reason == "forced_scheduled_bulk"
     forced_device_bulk = plan_host_execution(
         object_count=16,
         transfer_bytes=4 * 1024 * 1024,
@@ -191,6 +205,7 @@ def main() -> None:
         mode=HostExecutionMode.DEVICE_BULK,
     )
     assert forced_device_bulk.form is HostExecutionForm.DEVICE_BULK
+    assert not forced_device_bulk.uses_scheduler_bound_acquisition
     assert forced_device_bulk.block_counts == (16,)
     assert not forced_device_bulk.overlap_initial
     assert forced_device_bulk.uses_dependency_protocol
@@ -410,6 +425,16 @@ def main() -> None:
         )
         is None
     )
+    scheduled_proof = prove_atomic_host_execution(
+        object_count=16,
+        transfer_bytes=4 * 1024 * 1024,
+        runnable_tiles=64,
+        model=model,
+        mode=HostExecutionMode.SCHEDULED_BULK,
+    )
+    assert scheduled_proof is not None
+    assert scheduled_proof.form is HostExecutionForm.SCHEDULED_BULK
+    assert scheduled_proof.selection_reason == "forced_scheduled_bulk"
     assert (
         prove_atomic_host_execution(
             object_count=16,

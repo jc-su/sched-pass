@@ -115,6 +115,8 @@ _MEASUREMENT_COUNTERS = frozenset(
         "hicache_external_batches",
         "hicache_fallback_batches",
         "host_direct_batches",
+        "host_scheduled_bulk_batches",
+        "host_device_bulk_batches",
         "host_bound_after_full_ready_batches",
         "host_typed_after_full_publication_batches",
         "host_acquisition_jobs_prepared",
@@ -131,6 +133,7 @@ _MEASUREMENT_COUNTERS = frozenset(
         "metadata_acquisition_groups_prepared",
         "host_incremental_batches",
         "host_mixed_direct_batches",
+        "host_mixed_scheduled_bulk_batches",
         "host_typed_mixed_batches",
         "host_progress_rounds",
         "hybrid_parallel_waves",
@@ -448,8 +451,11 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
         name: sum(int(report.get(name, 0)) for report in reports)
         for name in (
             "host_direct_batches",
+            "host_scheduled_bulk_batches",
+            "host_device_bulk_batches",
             "host_incremental_batches",
             "host_mixed_direct_batches",
+            "host_mixed_scheduled_bulk_batches",
             "host_typed_mixed_batches",
             "stock_prefetched_external_attention_launches",
             "transformed_direct_launches",
@@ -461,6 +467,8 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
         )
     }
     direct = counters["host_direct_batches"]
+    scheduled = counters["host_scheduled_bulk_batches"]
+    device_bulk = counters["host_device_bulk_batches"]
     incremental = counters["host_incremental_batches"]
     stock_launches = counters["stock_prefetched_external_attention_launches"]
     native_launches = (
@@ -468,7 +476,10 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
         + counters["ticketed_incremental_launches"]
         + counters["event_ordered_incremental_launches"]
     )
-    if direct and not incremental:
+    active_forms = sum(
+        value > 0 for value in (direct, scheduled, device_bulk, incremental)
+    )
+    if direct and active_forms == 1:
         residual = {
             name: counters[name]
             for name in (
@@ -490,7 +501,17 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
                 "direct-only host selection did not execute stock FlashInfer"
             )
         kind = "stock_direct"
-    elif incremental and not direct:
+    elif scheduled and active_forms == 1:
+        if native_launches or stock_launches == 0:
+            raise RuntimeError(
+                "scheduled bulk did not remain on the stock numerical consumer"
+            )
+        kind = "scheduled_bulk"
+    elif device_bulk and active_forms == 1:
+        if native_launches == 0 or stock_launches:
+            raise RuntimeError("device bulk did not remain on its native bulk consumer")
+        kind = "device_bulk_diagnostic"
+    elif incremental and active_forms == 1:
         if native_launches:
             kind = "native_incremental"
         elif counters["host_acquisition_jobs_submitted"] > 0 and stock_launches > 0:
@@ -503,7 +524,7 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
                 "incremental host selection executed neither native work nor "
                 "a scheduled preacquired consumer"
             )
-    elif direct and incremental:
+    elif active_forms > 1:
         kind = "mixed_dispatch"
     else:
         kind = "unclassified"

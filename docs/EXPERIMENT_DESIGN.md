@@ -85,15 +85,20 @@ Use four matched serving arms:
 ```
 A0  framework bulk control (stock SGLang HiCache)
 A1  exact NTA preacquisition + stock numerical consumer
-A2  GPU demand discovery + exact acquisition + one bulk readiness boundary
-A3  the same acquisition path + progressive heterogeneous work-unit release
+A2  scheduler-bound exact acquisition + whole-layer stock consumer
+A3  the same acquisition path + progressive heterogeneous work-unit consumer
 ```
 
-A1/A0 measures the exact acquisition boundary. A2/A1 measures device discovery
-without changing the numerical consumer or allowing progressive release.
-A3/A2 measures only the late-bound work-unit boundary. Transport engine,
+A1/A0 measures the exact acquisition boundary. A2/A1 measures moving ownership
+from eager lease capture to the scheduler-shape edge without changing the
+whole-layer numerical consumer. A3/A2 changes only the consumer to event-wave
+partial readiness. Transport engine,
 frontier depth, granularity, tier, and request heterogeneity are orthogonal
 sweeps; they do not create additional headline mechanisms.
+
+Device-discovered bulk execution remains a diagnostic negative control. It is
+not a canonical arm because it uses a different acquisition owner from the
+proactive A3 path and would therefore confound A3/A2.
 
 For a 36-layer model, an observation of frontier depth 1 means all 36 layers
 used the exact external/preacquired contract, but only the first layer reached
@@ -180,3 +185,8 @@ claim that production holds temperature constant. The production selector
 adapts from measured transfer and compute observations; power-limit
 sensitivity is a separate robustness experiment and must use identical limits
 for stock and NTA.
+
+Likewise, the causal A1--A3 arms fix one common transport engine only to
+separate acquisition and consumer effects. Natural-trace full-system runs must
+also evaluate the production AUTO selector. Neither selector reads temperature
+or power; those values remain artifact telemetry and trial-validity evidence.

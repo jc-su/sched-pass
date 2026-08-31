@@ -110,6 +110,7 @@ def main() -> None:
     assert stats["native_demand_sm_bytes"] == 0
     assert stats["serving_tier"] == "host_staged"
     counter_fields = set(stats["cumulative_counter_fields"])
+    assert "host_scheduled_bulk_batches" in counter_fields
     assert "host_device_bulk_batches" in counter_fields
     assert "forward_lifecycle_aborts" in counter_fields
     assert "host_mover_profiled_sm_gpu_ms" in counter_fields

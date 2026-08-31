@@ -5,8 +5,10 @@ bound to acquisition groups and released when its dependencies are ready.
 Transport engine, frontier depth, granularity, tier, and workload skew are
 orthogonal axes; they are not separate mechanisms.  The four arms below are
 the minimum causal decomposition needed to distinguish framework control,
-exact preacquisition, device-side demand discovery, and progressive work-unit
-consumption.
+exact eager preacquisition, scheduler-bound whole-layer acquisition, and
+progressive work-unit consumption. Device-side demand discovery remains a
+separate diagnostic because the serving fast path and the progressive path
+must not be forced to execute two mutually exclusive acquisition owners.
 
 An arm name is never accepted as evidence.  :func:`validate_arm_result`
 reconstructs the executed form from the timed report and its engine counters.
@@ -32,9 +34,9 @@ ARM_DEFINITIONS: dict[str, dict[str, Any]] = {
         "role": "exact NTA acquisition with the stock numerical consumer",
     },
     "A2": {
-        "name": "device-discovery-bulk",
-        "consumer_kind": "native_work_unit",
-        "role": "GPU demand discovery and exact acquisition with one bulk readiness boundary",
+        "name": "scheduled-whole-layer",
+        "consumer_kind": "framework_reference",
+        "role": "scheduler-bound exact acquisition with the stock whole-layer consumer",
     },
     "A3": {
         "name": "late-bound-work-unit",
@@ -45,8 +47,8 @@ ARM_DEFINITIONS: dict[str, dict[str, Any]] = {
 
 CAUSAL_PAIRS = (
     ("A1", "A0", "exact_acquisition_boundary"),
-    ("A2", "A1", "device_discovery_boundary"),
-    ("A3", "A2", "late_bound_work_unit_boundary"),
+    ("A2", "A1", "schedule_bound_acquisition_boundary"),
+    ("A3", "A2", "progressive_work_unit_boundary"),
 )
 
 FORMAL_SERVING_METRICS = (
@@ -70,10 +72,10 @@ FORMAL_SERVING_METRICS = (
 def arm_environment(arm: str) -> dict[str, str]:
     """Return the explicit execution form for one canonical arm.
 
-    The caller still owns tier, mover, graph, and verification settings.  A2
-    names a real device-bulk form; accepting the configuration before that
-    form is implemented would turn an intended ablation into a mislabeled A3
-    run, so framework adapters must fail closed on unknown values.
+    The caller owns tier, graph, and verification settings. Canonical causal
+    arms fix the same SM mover so acquisition/consumer boundaries are not
+    confounded by transport-engine selection; production AUTO must be evaluated
+    separately. Framework adapters fail closed on unknown execution forms.
     """
 
     if arm == "A0":
@@ -88,10 +90,9 @@ def arm_environment(arm: str) -> dict[str, str]:
     if arm == "A2":
         return {
             "NTA_EXECUTION_PROTOCOL": "late_bound",
-            "NTA_EXECUTION_HOST_FORM": "device_bulk",
+            "NTA_EXECUTION_HOST_FORM": "scheduled_bulk",
             "NTA_EXECUTION_HOST_MOVER": "sm",
             "NTA_EXECUTION_CALIBRATION_PROBES": "0",
-            "NTA_EXECUTION_MAX_ROUNDS": "1",
         }
     if arm == "A3":
         return {
@@ -238,6 +239,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "hicache_fallback_batches",
             "hicache_external_batches",
             "host_direct_batches",
+            "host_scheduled_bulk_batches",
             "host_device_bulk_batches",
             "host_incremental_batches",
             "external_launches",
@@ -250,6 +252,17 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "progressive_consumer_batches",
             "progressive_consumer_layers",
             "request_acquisition_groups",
+            "admission_acquisition_groups_prepared",
+            "admission_acquisition_groups_started",
+            "lease_acquisition_groups_prepared",
+            "lease_acquisition_groups_started",
+            "host_acquisition_structural_owners",
+            "host_acquisition_jobs_submitted",
+            "host_acquisition_models_bound",
+            "initial_acquisition_layers",
+            "schedule_bound_acquisition_batches",
+            "typed_exact_dependency_groups",
+            "typed_transfer_groups",
             "prefetch_mover_plan_calibration_probe_sm_leases",
             "prefetch_mover_plan_calibration_probe_copy_leases",
             "verified_operator_modules",
@@ -270,7 +283,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
         != 0
     ):
         raise ValueError(f"{arm} timed a host-mover calibration probe")
-    if arm in {"A2", "A3"} and counters["verified_operator_modules"] <= 0:
+    if arm == "A3" and counters["verified_operator_modules"] <= 0:
         raise ValueError(f"{arm} did not verify its compiler/operator contract")
 
     protocol = _identity(stats, "execution_protocol")
@@ -282,6 +295,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
         valid = (
             host_form == "direct"
             and counters["host_direct_batches"] > 0
+            and counters["host_scheduled_bulk_batches"] == 0
             and counters["host_device_bulk_batches"] == 0
             and counters["host_incremental_batches"] == 0
             and counters["stock_prefetched_external_attention_launches"] > 0
@@ -289,40 +303,60 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["ticketed_incremental_launches"] == 0
             and counters["event_ordered_incremental_launches"] == 0
             and counters["progressive_consumer_layers"] == 0
+            and counters["lease_acquisition_groups_prepared"] > 0
+            and counters["lease_acquisition_groups_started"] > 0
+            and counters["host_acquisition_jobs_submitted"] > 0
+            and counters["initial_acquisition_layers"] > 0
+            and counters["schedule_bound_acquisition_batches"] == 0
         )
         execution_form = "exact_preacquired_stock"
     elif arm == "A2":
         valid = (
-            host_form == "device_bulk"
-            and counters["host_device_bulk_batches"] > 0
+            host_form == "scheduled_bulk"
+            and counters["host_scheduled_bulk_batches"] > 0
             and counters["host_direct_batches"] == 0
+            and counters["host_device_bulk_batches"] == 0
             and counters["host_incremental_batches"] == 0
-            and counters["native_external_attention_launches"] > 0
-            and counters["stock_prefetched_external_attention_launches"] == 0
-            and counters["ticketed_incremental_launches"] > 0
-            and counters["request_acquisition_groups"] > 0
+            and counters["native_external_attention_launches"] == 0
+            and counters["stock_prefetched_external_attention_launches"] > 0
+            and counters["ticketed_incremental_launches"] == 0
+            and counters["request_acquisition_groups"] == 0
             and counters["event_ordered_incremental_launches"] == 0
             and counters["progressive_consumer_batches"] == 0
             and counters["progressive_consumer_layers"] == 0
+            and counters["admission_acquisition_groups_prepared"] > 0
+            and counters["admission_acquisition_groups_started"] > 0
+            and counters["host_acquisition_structural_owners"] > 0
+            and counters["host_acquisition_jobs_submitted"] > 0
+            and counters["host_acquisition_models_bound"] > 0
+            and counters["initial_acquisition_layers"] == 0
+            and counters["schedule_bound_acquisition_batches"] > 0
         )
-        execution_form = "device_discovery_bulk"
+        execution_form = "scheduled_whole_layer"
     else:
         valid = (
             host_form == "dependency_aware"
             and counters["host_incremental_batches"] > 0
             and counters["host_direct_batches"] == 0
+            and counters["host_scheduled_bulk_batches"] == 0
             and counters["host_device_bulk_batches"] == 0
             and counters["native_external_attention_launches"] > 0
-            # A proactive wave event is a useful partial-consumer path, but it
-            # does not prove A3's device-scheduled acquisition boundary.  At
-            # least one layer must materialize exact request acquisition groups
-            # and submit them through the ticketed runtime.
-            and counters["ticketed_incremental_launches"] > 0
-            and counters["request_acquisition_groups"] > 0
+            and counters["ticketed_incremental_launches"] == 0
+            and counters["request_acquisition_groups"] == 0
+            and counters["event_ordered_incremental_launches"] > 0
             and counters["mixed_dependency_layers"] > 0
             and counters["progressive_consumer_batch_observations"] > 0
             and counters["progressive_consumer_batches"] > 0
             and counters["progressive_consumer_layers"] > 0
+            and counters["admission_acquisition_groups_prepared"] > 0
+            and counters["admission_acquisition_groups_started"] > 0
+            and counters["host_acquisition_structural_owners"] > 0
+            and counters["host_acquisition_jobs_submitted"] > 0
+            and counters["host_acquisition_models_bound"] > 0
+            and counters["initial_acquisition_layers"] == 0
+            and counters["schedule_bound_acquisition_batches"] > 0
+            and counters["typed_exact_dependency_groups"] > 0
+            and counters["typed_transfer_groups"] > 0
             and _heterogeneous_native_batch(report)
         )
         execution_form = "late_bound_heterogeneous_work_unit"

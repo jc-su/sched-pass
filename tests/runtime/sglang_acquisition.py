@@ -116,11 +116,24 @@ def main() -> None:
     assert direct_owner._stats["initial_typed_gap_layers"] == 0
     assert direct_owner._stats["lease_acquisition_groups_started"] == 1
 
-    # The explicit dependency-aware causal form shares AUTO's scheduler-bound
-    # producer queue. It is not eager at lease capture, but admission may bind
-    # and submit exact layer groups once the scheduler shape is known. This is
-    # what separates progressive consumption from the old per-layer demand
-    # transport path.
+    # A2 and A3 share the scheduler-bound producer queue. Neither freezes the
+    # transfer plan at lease capture; their only causal difference is whether
+    # the numerical consumer may run from partial event-wave readiness.
+    scheduled_owner, scheduled_pool, scheduled_transport = coordinator(
+        mode=HostExecutionMode.SCHEDULED_BULK
+    )
+    scheduled = pending(scheduled_pool)
+    scheduled_owner.account_selection = account
+    scheduled_owner.transfer_plan = freeze
+    scheduled_owner.capture(scheduled)
+    assert scheduled.acquisition is None
+    assert not scheduled.prefetched_layers
+    assert not scheduled_transport.ranges
+    assert scheduled_owner._stats["initial_acquisition_layers"] == 0
+    assert scheduled_owner._stats["schedule_bound_acquisition_batches"] == 1
+    assert scheduled_owner.proactive_layer_queue_enabled
+    assert not scheduled_owner.eager_capture_enabled
+
     typed_owner, typed_pool, typed_transport = coordinator(
         mode=HostExecutionMode.DEPENDENCY_AWARE
     )

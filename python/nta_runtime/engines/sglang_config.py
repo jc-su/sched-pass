@@ -396,7 +396,10 @@ class SglangExecutionTuning:
             requested_sm_waves
             if overlap_enabled
             and bootstrap.execution.host_execution_mode
-            is not HostExecutionMode.DIRECT
+            not in {
+                HostExecutionMode.DIRECT,
+                HostExecutionMode.SCHEDULED_BULK,
+            }
             else 1
         )
         graph_enabled, fragment_enabled, overlap_policy = demand_overlap_policy(

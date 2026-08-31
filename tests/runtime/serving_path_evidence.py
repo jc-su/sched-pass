@@ -19,7 +19,9 @@ from experiments.mechanism_arms import validate_arm_result  # noqa: E402
 
 def _arm_report(arm: str) -> dict:
     framework = arm == "A0"
-    consumer = "framework_reference" if arm in {"A0", "A1"} else "native_work_unit"
+    consumer = (
+        "framework_reference" if arm in {"A0", "A1", "A2"} else "native_work_unit"
+    )
     report = {
         "attention_backend": "flashinfer" if framework else "nta_flashinfer",
         "consumer_contract": {"kind": consumer},
@@ -37,33 +39,39 @@ def _arm_report(arm: str) -> dict:
         "execution_protocol": "late_bound",
         "host_execution_mode": {
             "A1": "direct",
-            "A2": "device_bulk",
+            "A2": "scheduled_bulk",
             "A3": "dependency_aware",
         }[arm],
         "hicache_fallback_batches": 0,
         "hicache_external_batches": 1,
         "host_direct_batches": int(arm == "A1"),
-        "host_device_bulk_batches": int(arm == "A2"),
+        "host_scheduled_bulk_batches": int(arm == "A2"),
+        "host_device_bulk_batches": 0,
         "host_incremental_batches": int(arm == "A3"),
         "external_launches": 36,
-        "native_external_attention_launches": (
-            0 if arm == "A1" else 1 if arm == "A3" else 36
-        ),
-        "stock_prefetched_external_attention_launches": (
-            36 if arm == "A1" else 35 if arm == "A3" else 0
-        ),
-        "ticketed_incremental_launches": (
-            0 if arm == "A1" else 1 if arm == "A3" else 36
-        ),
+        "native_external_attention_launches": (1 if arm == "A3" else 0),
+        "stock_prefetched_external_attention_launches": (35 if arm == "A3" else 36),
+        "ticketed_incremental_launches": 0,
         "event_ordered_incremental_launches": 1 if arm == "A3" else 0,
-        "request_acquisition_groups": 0 if arm == "A1" else 1,
+        "request_acquisition_groups": 0,
         "mixed_dependency_layers": 1 if arm == "A3" else 0,
         "progressive_consumer_batch_observations": 1,
         "progressive_consumer_batches": 1 if arm == "A3" else 0,
         "progressive_consumer_layers": 1 if arm == "A3" else 0,
+        "admission_acquisition_groups_prepared": int(arm in {"A2", "A3"}),
+        "admission_acquisition_groups_started": int(arm in {"A2", "A3"}),
+        "lease_acquisition_groups_prepared": int(arm == "A1"),
+        "lease_acquisition_groups_started": int(arm == "A1"),
+        "host_acquisition_structural_owners": int(arm in {"A2", "A3"}),
+        "host_acquisition_jobs_submitted": 36,
+        "host_acquisition_models_bound": int(arm in {"A2", "A3"}),
+        "initial_acquisition_layers": 36 if arm == "A1" else 0,
+        "schedule_bound_acquisition_batches": int(arm in {"A2", "A3"}),
+        "typed_exact_dependency_groups": int(arm == "A3"),
+        "typed_transfer_groups": int(arm == "A3"),
         "prefetch_mover_plan_calibration_probe_sm_leases": 0,
         "prefetch_mover_plan_calibration_probe_copy_leases": 0,
-        "verified_operator_modules": 0 if arm == "A1" else 2,
+        "verified_operator_modules": 2 if arm == "A3" else 0,
     }
     report["engine_stats"] = [counters]
     return report
@@ -81,22 +89,30 @@ def main() -> None:
     else:
         raise AssertionError("a progressive run passed as device-bulk")
     ungrouped_bulk = _arm_report("A2")
-    ungrouped_bulk["engine_stats"][0]["request_acquisition_groups"] = 0
+    ungrouped_bulk["engine_stats"][0]["host_acquisition_structural_owners"] = 0
     try:
         validate_arm_result(ungrouped_bulk, "A2")
     except ValueError as error:
         assert "A2" in str(error)
     else:
-        raise AssertionError("an ungrouped bulk launch passed as exact A2")
-    event_only = _arm_report("A3")
-    event_only["engine_stats"][0]["ticketed_incremental_launches"] = 0
-    event_only["engine_stats"][0]["request_acquisition_groups"] = 0
+        raise AssertionError("an unowned scheduled bulk launch passed as exact A2")
+    unowned_progressive = _arm_report("A3")
+    unowned_progressive["engine_stats"][0]["host_acquisition_structural_owners"] = 0
     try:
-        validate_arm_result(event_only, "A3")
+        validate_arm_result(unowned_progressive, "A3")
     except ValueError as error:
         assert "A3" in str(error)
     else:
-        raise AssertionError("an event-only proactive prefetch passed as A3")
+        raise AssertionError("an unowned proactive wave passed as A3")
+    ticket_contaminated = _arm_report("A3")
+    ticket_contaminated["engine_stats"][0]["ticketed_incremental_launches"] = 1
+    ticket_contaminated["engine_stats"][0]["request_acquisition_groups"] = 1
+    try:
+        validate_arm_result(ticket_contaminated, "A3")
+    except ValueError as error:
+        assert "A3" in str(error)
+    else:
+        raise AssertionError("a demand-ticket diagnostic passed as proactive A3")
     calibration = _arm_report("A3")
     calibration["engine_stats"][0][
         "prefetch_mover_plan_calibration_probe_sm_leases"
