@@ -78,6 +78,15 @@ contracts, external attention coverage, and result-derived mechanism counters
 before its report enters the randomized paired runner. The older nested
 comparison driver is diagnostic only.
 
+Initial placement is a setup fact, not a state frozen for the duration of a
+serving run.  The harness proves the exact host/device object union immediately
+before timing, then records the exact radix-prefix binding observed at every
+request arrival.  The first timed access to each content identity must agree
+with the setup-derived prefix; later accesses may be promoted, extended,
+evicted, or uncached by earlier timed requests.  Those transitions are outcomes
+and may differ between causal arms.  Controlled replay cycles retain one access
+ordinal per exact identity and are explicitly non-independent observations.
+
 ## RQ2: causal decomposition
 
 Use four matched serving arms:
@@ -170,9 +179,10 @@ protocol, and mechanism counters are included in the artifact.
 
 ## Fairness
 
-No arm may change demand IDs, page order, cache placement, numerical output
-contract, or request trace. A different demand trace is a different workload,
-not an ablation of execution.
+No arm may change demand IDs, page order, initial cache-placement policy and
+proof, numerical output contract, or request trace. Dynamic cache state after
+timing begins is a system outcome, not a condition that can be forced equal. A
+different demand trace is a different workload, not an ablation of execution.
 The work-unit matrix and serving harness must be run from a clean revision,
 and artifacts must contain that revision and complete activation metadata.
 
@@ -181,14 +191,16 @@ preconditions or scheduler inputs. A formal paired campaign records one
 administrator-selected power limit, begins both arms below the same thermal
 bound, rejects foreign GPU processes and actual thermal slowdown, and reports
 the observed clock/power range. It does not claim that production holds
-temperature constant. If the installed chassis cannot sustain even the GPU's
-minimum firmware power limit, an implementation-independent saturation test
-may prequalify one graphics-clock ceiling. That ceiling must be declared,
-machine-checked, bound into AUTO calibration compatibility, and identical for
-all arms; it must not be selected from stock/NTA performance results. The
-production selector adapts from measured transfer and compute observations;
-power/clock sensitivity is a separate robustness experiment and must use
-identical settings for stock and NTA.
+temperature constant, nor wait for a favorable exact temperature. The bound is
+a predeclared contamination gate, not a workload condition. Headline trials use
+the production-default DVFS policy. If the installed chassis cannot sustain
+even the GPU's minimum firmware power limit, an implementation-independent
+saturation test may prequalify one graphics-clock ceiling. That ceiling must
+be declared, machine-checked, bound into AUTO calibration compatibility, and
+identical for all arms; it must not be selected from stock/NTA performance
+results. The production selector adapts from measured transfer and compute
+observations; power/clock sensitivity is a separate robustness experiment and
+must use identical settings for stock and NTA.
 
 Likewise, the causal A1--A3 arms fix one common transport engine only to
 separate acquisition and consumer effects. Natural-trace full-system runs must

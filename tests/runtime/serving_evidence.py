@@ -368,6 +368,74 @@ def main() -> None:
         raise AssertionError("a native path without compiler proof passed the gate")
 
     serving = load_serving_module()
+    cache_records = [
+        {
+            "kind": "resident",
+            "index": 0,
+            "request_id": "resident-0",
+            "arrival_offset_seconds": 0.0,
+            "input_tokens": 4,
+            "host_cached_tokens": 0,
+            "device_cached_tokens": 3,
+        },
+        {
+            "kind": "external",
+            "index": 0,
+            "request_id": "external-cycle-0",
+            "arrival_offset_seconds": 1.0,
+            "input_tokens": 5,
+            "host_cached_tokens": 3,
+            "device_cached_tokens": 0,
+        },
+        {
+            "kind": "external",
+            "index": 1,
+            "request_id": "external-cycle-1",
+            "arrival_offset_seconds": 2.0,
+            "input_tokens": 6,
+            "host_cached_tokens": 4,
+            "device_cached_tokens": 1,
+        },
+    ]
+    cache_contract, cache_transitions = serving.annotate_timed_cache_bindings(
+        cache_records,
+        resident_inputs=((1, 2, 3, 4),),
+        external_inputs=((10, 11, 12, 13, 14), (10, 11, 12, 90, 91, 92)),
+        external_materialized_prefix_tokens=(2, 2),
+        external_initial_prefix_tokens=(3, 3),
+    )
+    assert cache_contract["schema"] == 2
+    assert cache_contract["identity_access_ordinals"] == [0, 1]
+    assert cache_contract["matches_initial_contract"] == [True, False]
+    assert cache_contract["first_identity_accesses_verified"] is True
+    assert cache_records[2]["observed_cached_prefix_tokens"] == 5
+    assert cache_records[2]["cache_identity_first_access"] is False
+    assert cache_transitions == {
+        "resident_to_device": 1,
+        "external_to_host": 1,
+        "external_to_split": 1,
+    }
+
+    undercovered = [dict(record) for record in cache_records]
+    undercovered[1].update(
+        {
+            "host_cached_tokens": 2,
+            "device_cached_tokens": 0,
+        }
+    )
+    try:
+        serving.annotate_timed_cache_bindings(
+            undercovered,
+            resident_inputs=((1, 2, 3, 4),),
+            external_inputs=((10, 11, 12, 13, 14), (10, 11, 12, 90, 91, 92)),
+            external_materialized_prefix_tokens=(2, 2),
+            external_initial_prefix_tokens=(3, 3),
+        )
+    except ValueError as error:
+        assert "first timed content access" in str(error)
+    else:
+        raise AssertionError("an undercovered first content access passed validation")
+
     closed_snapshot = {
         "scheduler": {
             "backend": "nta_flashinfer",
@@ -471,9 +539,11 @@ def main() -> None:
         [((1, 2, 3, 4, 5, 9), 6)],
         [((1, 2, 3), 3), ((1, 2, 3, 4, 5, 8), 5)],
     ) == (5,)
-    assert serving._placement_probe_groups(
-        ((1, 2), (1, 2, 3), (4,), (1, 2))
-    ) == ((2,), (0, 3), (1,))
+    assert serving._placement_probe_groups(((1, 2), (1, 2, 3), (4,), (1, 2))) == (
+        (2,),
+        (0, 3),
+        (1,),
+    )
     try:
         serving._reusable_prefix_tokens((1, 2), (1, 3, 4))
     except RuntimeError as error:
@@ -599,9 +669,10 @@ def main() -> None:
             load_start_seconds=time.perf_counter(),
         )
     )
-    assert deadline_record["submitted_offset_seconds"] >= deadline_record[
-        "arrival_offset_seconds"
-    ]
+    assert (
+        deadline_record["submitted_offset_seconds"]
+        >= deadline_record["arrival_offset_seconds"]
+    )
 
     async def exercise_first_token_barrier() -> None:
         barrier = serving._FirstTokenBarrier(2)

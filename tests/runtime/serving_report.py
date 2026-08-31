@@ -53,8 +53,16 @@ def single() -> dict[str, object]:
             "input_tokens": 32,
             "device_cached_tokens": 31,
             "host_cached_tokens": 0,
+            "materialized_cached_prefix_tokens": 31,
+            "effective_initial_cached_prefix_tokens": 31,
+            "observed_cached_prefix_tokens": 31,
             "initial_cache_state": "resident",
             "observed_cache_state": "device",
+            "cache_binding_identity_sha256": "a" * 64,
+            "observed_cache_binding_sha256": "a" * 64,
+            "cache_identity_access_ordinal": 0,
+            "cache_identity_first_access": True,
+            "initial_cache_contract_match": True,
             "text_sha256": "resident-digest",
             "inter_token_seconds": [0.01],
         }
@@ -71,15 +79,11 @@ def single() -> dict[str, object]:
             "reason": "measured_reconstruction",
             "attempt": 1,
             "destructive_probe_followed_by_disjoint_replay": True,
-            "observations": [
-                {"index": 0, "expected": 32, "device": 0, "host": 32}
-            ],
+            "observations": [{"index": 0, "expected": 32, "device": 0, "host": 32}],
         },
         "initial_resident_placement_proof": {
             "reason": "measured_reconstruction",
-            "observations": [
-                {"index": 0, "expected": 31, "device": 31, "host": 0}
-            ],
+            "observations": [{"index": 0, "expected": 31, "device": 31, "host": 0}],
         },
         "cache_state_transitions": {"resident_to_device": 1},
         "cotenant_gpu_samples": 0,
@@ -213,10 +217,10 @@ def main() -> None:
     assert heterogeneity["proven"] is True
     assert heterogeneity["native_mixed_consumer_proven"] is True
     assert heterogeneity["heterogeneous_axis_count"] == 6
-    assert abs(
-        heterogeneity["client_overlap"]["resident_external_overlap_seconds"]
-        - 0.1
-    ) < 1e-12
+    assert (
+        abs(heterogeneity["client_overlap"]["resident_external_overlap_seconds"] - 0.1)
+        < 1e-12
+    )
 
     direct_heterogeneity = serving_batch_heterogeneity(
         heterogeneous_records,
@@ -239,9 +243,7 @@ def main() -> None:
     joint_boundary = copy.deepcopy(stock)
     joint_boundary["records"][0]["tpot_seconds"] = 0.060
     assert preregistered_goodput(joint_boundary)["qualified_requests"] == 1
-    assert (
-        preregistered_joint_goodput(joint_boundary)["qualified_requests"] == 0
-    )
+    assert preregistered_joint_goodput(joint_boundary)["qualified_requests"] == 0
     nta = copy.deepcopy(stock)
     nta["attention_backend"] = "nta_flashinfer"
     nta["engine_stats"] = single()["engine_stats"]
@@ -355,6 +357,7 @@ def main() -> None:
         {
             "device_cached_tokens": 16,
             "host_cached_tokens": 15,
+            "observed_cached_prefix_tokens": 31,
             "observed_cache_state": "split",
         }
     )
@@ -362,16 +365,16 @@ def main() -> None:
     validate(transitioned)
     lost_resident_prefix = copy.deepcopy(transitioned)
     lost_resident_prefix["records"][0]["host_cached_tokens"] = 14
+    lost_resident_prefix["records"][0]["observed_cached_prefix_tokens"] = 30
+    lost_resident_prefix["records"][0]["initial_cache_contract_match"] = False
     try:
         validate(lost_resident_prefix)
     except ValueError as error:
-        assert "lost its exact cached prefix" in str(error)
+        assert "cache identity access" in str(error)
     else:
         raise AssertionError("inexact resident transition passed validation")
     tampered_goodput = copy.deepcopy(comparison)
-    tampered_goodput["nta_preregistered_goodput"][
-        "goodput_requests_per_second"
-    ] *= 2
+    tampered_goodput["nta_preregistered_goodput"]["goodput_requests_per_second"] *= 2
     try:
         validate(tampered_goodput)
     except ValueError as error:
@@ -478,9 +481,7 @@ def main() -> None:
     )
     validate(host_tier)
     invalid_host_tier = copy.deepcopy(host_tier)
-    invalid_host_tier["engine_stats"][0]["tier_data_path"] = (
-        "cuda_visible_cxl_direct"
-    )
+    invalid_host_tier["engine_stats"][0]["tier_data_path"] = "cuda_visible_cxl_direct"
     try:
         validate(invalid_host_tier)
     except ValueError as error:
@@ -546,9 +547,7 @@ def main() -> None:
     else:
         raise AssertionError("co-tenant-contaminated serving evidence was accepted")
     thermal_environment = copy.deepcopy(comparison)
-    thermal_environment["nta"]["gpu_environment"][
-        "thermal_slowdown_samples"
-    ] = 1
+    thermal_environment["nta"]["gpu_environment"]["thermal_slowdown_samples"] = 1
     try:
         validate(thermal_environment)
     except ValueError as error:
@@ -696,9 +695,9 @@ def main() -> None:
     }
     validate_trials(qualification)
     ineligible = copy.deepcopy(qualification)
-    ineligible["bars"]["registered_goodput"][
-        "all_requests_have_token_level_itl"
-    ] = False
+    ineligible["bars"]["registered_goodput"]["all_requests_have_token_level_itl"] = (
+        False
+    )
     try:
         validate_trials(ineligible)
     except ValueError as error:

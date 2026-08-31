@@ -27,6 +27,7 @@ try:
         unique_input_page_ids,
     )
     from experiments.cache_identity import effective_cached_prefixes
+    from experiments.cache_evolution import annotate_timed_cache_bindings
     from experiments.atomic_io import atomic_write_json
     from experiments.queueing import finite_window_system_accounting
     from experiments.serving_metrics import joint_slo_goodput
@@ -41,6 +42,7 @@ except ModuleNotFoundError:
         unique_input_page_ids,
     )
     from experiments.cache_identity import effective_cached_prefixes
+    from experiments.cache_evolution import annotate_timed_cache_bindings
     from experiments.atomic_io import atomic_write_json
     from experiments.queueing import finite_window_system_accounting
     from experiments.serving_metrics import joint_slo_goodput
@@ -1582,6 +1584,8 @@ def _load_workload(
         "block_size": block_size,
         "arrival": manifest["arrival"],
         "prompt": manifest["prompt"],
+        "claims": manifest["claims"],
+        "selection": manifest["selection"],
         "state_mapping": "explicit_request_state",
         "cache_placement": manifest["cache_placement"],
         "request_count": len(rows),
@@ -2845,74 +2849,33 @@ def main() -> int:
         if workload_metadata is not None
         else effective_external_cached_prefix_lengths
     )
-    for record in external:
-        index = int(record["index"])
-        record["materialized_cached_prefix_tokens"] = int(
-            external_cached_prefix_lengths[index]
+    try:
+        cache_binding_contract, cache_state_transitions = annotate_timed_cache_bindings(
+            records,
+            resident_inputs=resident_prompts,
+            external_inputs=external_prompts,
+            external_materialized_prefix_tokens=external_cached_prefix_lengths,
+            external_initial_prefix_tokens=expected_external_prefixes,
         )
-        record["effective_initial_cached_prefix_tokens"] = int(
-            expected_external_prefixes[index]
-        )
-        record["observed_cached_prefix_tokens"] = int(
-            record["host_cached_tokens"] + record["device_cached_tokens"]
-        )
-    missing_external = [
-        {
-            "index": record["index"],
-            "materialized": record["materialized_cached_prefix_tokens"],
-            "expected_effective": record["effective_initial_cached_prefix_tokens"],
-            "device": record["device_cached_tokens"],
-            "host": record["host_cached_tokens"],
-        }
-        for record in external
-        if record["observed_cached_prefix_tokens"]
-        != record["effective_initial_cached_prefix_tokens"]
-    ]
-    if missing_external:
+    except ValueError as error:
         raise RuntimeError(
-            "a timed external request diverged from the content-derived initial "
-            "cache union: " + json.dumps(missing_external, sort_keys=True)
-        )
-    expected_resident_prefixes = [len(value) - 1 for value in resident_prompts]
-    for record in [*external, *resident]:
-        host = int(record["host_cached_tokens"])
-        device = int(record["device_cached_tokens"])
-        record["initial_cache_state"] = str(record["kind"])
-        record["observed_cache_state"] = (
-            "device" if host == 0 else ("host" if device == 0 else "split")
-        )
-    missing_resident = [
-        {
-            "index": record["index"],
-            "expected": expected_resident_prefixes[record["index"]],
-            "device": record["device_cached_tokens"],
-            "host": record["host_cached_tokens"],
-        }
-        for record in resident
-        if record["device_cached_tokens"] + record["host_cached_tokens"]
-        != expected_resident_prefixes[record["index"]]
-    ]
+            f"timed cache-binding evidence is invalid: {error}"
+        ) from error
     minimum_host_prefix = min(record["host_cached_tokens"] for record in external)
     execution_ready_external = [
-        int(record["index"]) for record in external if record["host_cached_tokens"] == 0
+        int(record["index"])
+        for record in external
+        if record["host_cached_tokens"] == 0 and record["device_cached_tokens"] > 0
     ]
-    if missing_resident:
-        raise RuntimeError(
-            "a timed initially-resident request lost its exact cached prefix: "
-            + json.dumps(missing_resident, sort_keys=True)
-        )
+    uncached_external = [
+        int(record["index"])
+        for record in external
+        if record["host_cached_tokens"] == 0 and record["device_cached_tokens"] == 0
+    ]
     if not resident_placement_history or (
         resident_placement_history[-1]["reason"] != "measured_reconstruction"
     ):
         raise RuntimeError("final resident placement was not reconstructed")
-    cache_state_transitions: dict[str, int] = {}
-    for record in records:
-        transition = (
-            f"{record['initial_cache_state']}_to_{record['observed_cache_state']}"
-        )
-        cache_state_transitions[transition] = (
-            cache_state_transitions.get(transition, 0) + 1
-        )
 
     def external_shapes(values: Sequence[dict[str, Any]]) -> list[dict[str, int]]:
         return sorted(
@@ -2958,19 +2921,6 @@ def main() -> int:
         "uncached_query_rows": external_query_rows,
         "timed_shapes": timed_external_shapes,
     }
-    cache_binding_contract = {
-        "schema": 1,
-        "composition": "initial_object_union_longest_common_prefix",
-        "identity_source": "exact_token_ids",
-        "materialized_prefix_tokens": external_cached_prefix_lengths,
-        "effective_initial_prefix_tokens": (effective_external_cached_prefix_lengths),
-        "observed_prefix_tokens": [
-            int(record["observed_cached_prefix_tokens"])
-            for record in sorted(external, key=lambda value: int(value["index"]))
-        ],
-        "exact": True,
-    }
-
     digest = hashlib.sha256()
     for record in sorted(records, key=lambda value: (value["kind"], value["index"])):
         text = record.pop("text").encode("utf-8")
@@ -3144,6 +3094,7 @@ def main() -> int:
         "external_suffix_tokens": args.external_suffix_tokens,
         "minimum_external_host_cached_tokens": minimum_host_prefix,
         "execution_ready_external_requests": execution_ready_external,
+        "uncached_external_requests": uncached_external,
         "resident_requests": args.resident_requests,
         "resident_tokens": args.resident_tokens,
         "resident_output_tokens": args.resident_output_tokens,

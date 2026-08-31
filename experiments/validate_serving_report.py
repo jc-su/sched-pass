@@ -66,6 +66,14 @@ def _nonnegative_integer(value: Any, name: str) -> int:
     return value
 
 
+def _sha256_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _percentile(values: list[float], fraction: float) -> float:
     if not values:
         return 0.0
@@ -104,7 +112,9 @@ def _validate_derived_object(actual: Any, expected: dict[str, Any], name: str) -
         elif isinstance(expected_value, float):
             _close(value, expected_value, field_name)
         else:  # pragma: no cover - metric schema is intentionally closed
-            _require(value == expected_value, f"serving report has invalid {field_name}")
+            _require(
+                value == expected_value, f"serving report has invalid {field_name}"
+            )
 
 
 def _validate_ratio(actual: Any, expected: float | None, name: str) -> None:
@@ -183,7 +193,7 @@ def _validate_initial_placement(report: dict[str, Any]) -> None:
 def _validate_cache_binding(
     report: dict[str, Any], records: list[dict[str, Any]]
 ) -> None:
-    """Validate timed cache hits against the pre-execution content union."""
+    """Validate initial identity separately from per-arrival cache state."""
 
     external = sorted(
         (record for record in records if record.get("kind") == "external"),
@@ -197,19 +207,39 @@ def _validate_cache_binding(
         "serving report has no content-derived cache binding contract",
     )
     _require(
-        contract.get("schema") == 1
-        and contract.get("composition")
-        == "initial_object_union_longest_common_prefix"
+        contract.get("schema") == 2
+        and contract.get("composition") == "initial_object_union_longest_common_prefix"
         and contract.get("identity_source") == "exact_token_ids"
+        and contract.get("timed_observation")
+        == "sglang_exact_radix_prefix_at_request_arrival"
+        and contract.get("state_model")
+        == "initial_proof_then_per_arrival_cache_evolution"
+        and contract.get("first_identity_accesses_verified") is True
+        and contract.get("later_accesses_may_evolve") is True
         and contract.get("exact") is True,
         "serving cache binding contract is not exact",
     )
     materialized = contract.get("materialized_prefix_tokens")
     effective = contract.get("effective_initial_prefix_tokens")
     observed = contract.get("observed_prefix_tokens")
+    initial_identities = contract.get("initial_prefix_identity_sha256")
+    observed_identities = contract.get("observed_prefix_identity_sha256")
+    ordinals = contract.get("identity_access_ordinals")
+    first_accesses = contract.get("first_identity_access")
+    initial_matches = contract.get("matches_initial_contract")
+    vectors = (
+        materialized,
+        effective,
+        observed,
+        initial_identities,
+        observed_identities,
+        ordinals,
+        first_accesses,
+        initial_matches,
+    )
     _require(
-        all(isinstance(values, list) for values in (materialized, effective, observed))
-        and len(materialized) == len(effective) == len(observed) == len(external),
+        all(isinstance(values, list) for values in vectors)
+        and all(len(values) == len(external) for values in vectors),
         "serving cache binding vectors disagree with external requests",
     )
     for expected_index, record in enumerate(external):
@@ -217,32 +247,57 @@ def _validate_cache_binding(
             int(record.get("index", -1)) == expected_index,
             "serving external cache binding indices are not contiguous",
         )
-        values = (
-            materialized[expected_index],
-            effective[expected_index],
-            observed[expected_index],
-        )
+        values = (materialized[expected_index], effective[expected_index])
         _require(
             all(
-                isinstance(value, int)
-                and not isinstance(value, bool)
-                and value > 0
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
                 for value in values
             ),
             f"serving external record {expected_index} has invalid cache binding",
         )
-        declared, content_derived, measured = (int(value) for value in values)
+        declared, content_derived = (int(value) for value in values)
+        measured_value = observed[expected_index]
+        _require(
+            isinstance(measured_value, int)
+            and not isinstance(measured_value, bool)
+            and measured_value >= 0,
+            f"serving external record {expected_index} has invalid timed binding",
+        )
+        measured = int(measured_value)
         recomputed = int(record["host_cached_tokens"]) + int(
             record["device_cached_tokens"]
         )
+        ordinal = ordinals[expected_index]
+        first = first_accesses[expected_index]
+        matches = initial_matches[expected_index]
         _require(
             declared <= content_derived < int(record["input_tokens"])
-            and measured == content_derived == recomputed
+            and measured < int(record["input_tokens"])
+            and measured == recomputed
             and record.get("materialized_cached_prefix_tokens") == declared
-            and record.get("effective_initial_cached_prefix_tokens")
-            == content_derived
+            and record.get("effective_initial_cached_prefix_tokens") == content_derived
             and record.get("observed_cached_prefix_tokens") == measured,
             f"serving external record {expected_index} cache binding is inconsistent",
+        )
+        _require(
+            _sha256_digest(initial_identities[expected_index])
+            and _sha256_digest(observed_identities[expected_index])
+            and record.get("cache_binding_identity_sha256")
+            == initial_identities[expected_index]
+            and record.get("observed_cache_binding_sha256")
+            == observed_identities[expected_index]
+            and isinstance(ordinal, int)
+            and not isinstance(ordinal, bool)
+            and ordinal >= 0
+            and record.get("cache_identity_access_ordinal") == ordinal
+            and isinstance(first, bool)
+            and first == (ordinal == 0)
+            and record.get("cache_identity_first_access") is first
+            and isinstance(matches, bool)
+            and matches == (measured == content_derived)
+            and record.get("initial_cache_contract_match") is matches
+            and (not first or matches),
+            f"serving external record {expected_index} identity chain is inconsistent",
         )
 
 
@@ -253,8 +308,7 @@ def _validate_initial_resident_placement(
 
     proof = report.get("initial_resident_placement_proof")
     _require(
-        isinstance(proof, dict)
-        and proof.get("reason") == "measured_reconstruction",
+        isinstance(proof, dict) and proof.get("reason") == "measured_reconstruction",
         "serving report has no reconstructed resident placement proof",
     )
     observations = proof.get("observations")
@@ -306,26 +360,74 @@ def _validate_cache_state_transitions(
         state = record.get("observed_cache_state")
         host = int(record["host_cached_tokens"])
         device = int(record["device_cached_tokens"])
-        recomputed = "device" if host == 0 else ("host" if device == 0 else "split")
+        recomputed = (
+            "uncached"
+            if host == 0 and device == 0
+            else ("device" if host == 0 else ("host" if device == 0 else "split"))
+        )
+        cached = host + device
+        initial_prefix = record.get("effective_initial_cached_prefix_tokens")
+        materialized = record.get("materialized_cached_prefix_tokens")
         _require(
             initial == record["kind"]
             and state == recomputed
             and host >= 0
             and device >= 0
-            and host + device > 0,
+            and cached < int(record["input_tokens"])
+            and record.get("observed_cached_prefix_tokens") == cached
+            and isinstance(initial_prefix, int)
+            and not isinstance(initial_prefix, bool)
+            and isinstance(materialized, int)
+            and not isinstance(materialized, bool)
+            and 0 < materialized <= initial_prefix < int(record["input_tokens"])
+            and _sha256_digest(record.get("cache_binding_identity_sha256"))
+            and _sha256_digest(record.get("observed_cache_binding_sha256")),
             f"serving record {index} cache-state transition is inconsistent",
         )
         if initial == "resident":
             _require(
-                host + device == int(record["input_tokens"]) - 1,
-                f"serving resident record {index} lost its exact cached prefix",
+                materialized == initial_prefix == int(record["input_tokens"]) - 1,
+                f"serving resident record {index} has an invalid initial prefix",
             )
         transition = f"{initial}_to_{state}"
         observed[transition] = observed.get(transition, 0) + 1
+
+    identity_accesses: dict[str, int] = {}
+    for position, record in enumerate(
+        sorted(
+            records,
+            key=lambda value: (
+                float(value["arrival_offset_seconds"]),
+                str(value["request_id"]),
+                str(value["kind"]),
+                int(value["index"]),
+            ),
+        )
+    ):
+        identity = str(record["cache_binding_identity_sha256"])
+        ordinal = identity_accesses.get(identity, 0)
+        identity_accesses[identity] = ordinal + 1
+        matches = int(record["observed_cached_prefix_tokens"]) == int(
+            record["effective_initial_cached_prefix_tokens"]
+        )
+        _require(
+            record.get("cache_identity_access_ordinal") == ordinal
+            and record.get("cache_identity_first_access") is (ordinal == 0)
+            and record.get("initial_cache_contract_match") is matches
+            and (ordinal != 0 or matches),
+            f"serving cache identity access {position} is inconsistent",
+        )
     _require(
         report.get("cache_state_transitions") == observed,
         "serving cache-state transition summary is inconsistent",
     )
+    contract = report.get("cache_binding_contract")
+    if isinstance(contract, dict):
+        _require(
+            contract.get("unique_content_identities") == len(identity_accesses)
+            and contract.get("timed_content_accesses") == len(records),
+            "serving cache binding cardinality is inconsistent",
+        )
 
 
 def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> None:
@@ -473,8 +575,7 @@ def _validate_finite_window_accounting(report: dict[str, Any]) -> None:
         "serving report uses an unknown finite-window accounting method",
     )
     _require(
-        accounting.get("interpretation")
-        == "descriptive_client_timestamp_accounting",
+        accounting.get("interpretation") == "descriptive_client_timestamp_accounting",
         "serving report mislabels finite-window accounting as queueing evidence",
     )
     for field in (
@@ -501,8 +602,7 @@ def _validate_workload(report: dict[str, Any]) -> None:
         "serving workload changed tokenizer length",
     )
     _require(
-        workload.get("token_input_adapter")
-        == "collision_free_content_block_tokens_v1"
+        workload.get("token_input_adapter") == "collision_free_content_block_tokens_v1"
         and isinstance(workload.get("token_input_identity_digest"), str)
         and bool(workload["token_input_identity_digest"]),
         "serving workload lacks exact token-input identity",
@@ -544,8 +644,28 @@ def _validate_workload(report: dict[str, Any]) -> None:
             f"serving record arrival diverges for {record['request_id']}",
         )
 
-    # Keep old diagnostic fixtures readable. New reports make a requested
-    # suffix auditable against the exact input lengths seen by SGLang.
+    claims = workload.get("claims")
+    selection = workload.get("selection")
+    _require(
+        isinstance(claims, dict) and isinstance(selection, dict),
+        "serving workload omits validated claim/selection provenance",
+    )
+    controlled_replay = selection.get("controlled_replay")
+    if controlled_replay is not None:
+        _require(
+            isinstance(controlled_replay, dict)
+            and isinstance(controlled_replay.get("cycles"), int)
+            and not isinstance(controlled_replay.get("cycles"), bool)
+            and int(controlled_replay["cycles"]) > 1
+            and controlled_replay.get("content_identity_reused_across_cycles") is True
+            and controlled_replay.get("statistical_independence_claim") is False
+            and controlled_replay.get("schedule")
+            == "sequential_cycles_preserving_source_order",
+            "serving workload has an invalid controlled-replay contract",
+        )
+
+    # A requested suffix is auditable against the exact input lengths seen by
+    # SGLang.
     if "external_suffix_tokens" not in workload:
         return
     suffix_tokens = workload.get("external_suffix_tokens")
@@ -867,8 +987,16 @@ def _validate_single(
             "input_tokens",
             "host_cached_tokens",
             "device_cached_tokens",
+            "materialized_cached_prefix_tokens",
+            "effective_initial_cached_prefix_tokens",
+            "observed_cached_prefix_tokens",
             "initial_cache_state",
             "observed_cache_state",
+            "cache_binding_identity_sha256",
+            "observed_cache_binding_sha256",
+            "cache_identity_access_ordinal",
+            "cache_identity_first_access",
+            "initial_cache_contract_match",
             "text_sha256",
             "request_id",
         ):
@@ -1023,14 +1151,12 @@ def _validate_single(
     external_records = [record for record in records if record["kind"] == "external"]
     _close(
         report.get("resident_output_token_throughput"),
-        sum(int(record["completion_tokens"]) for record in resident_records)
-        / elapsed,
+        sum(int(record["completion_tokens"]) for record in resident_records) / elapsed,
         "resident output token throughput",
     )
     _close(
         report.get("external_output_token_throughput"),
-        sum(int(record["completion_tokens"]) for record in external_records)
-        / elapsed,
+        sum(int(record["completion_tokens"]) for record in external_records) / elapsed,
         "external output token throughput",
     )
     for field, source, fraction in (
@@ -1069,8 +1195,7 @@ def _validate_single(
         "serving SLO thresholds are not positive",
     )
     token_level_requests = sum(
-        int(record["itl_sample_count"]) > 0
-        and record["token_timestamps_exact"] is True
+        int(record["itl_sample_count"]) > 0 and record["token_timestamps_exact"] is True
         for record in records
     )
     qualified = sum(
