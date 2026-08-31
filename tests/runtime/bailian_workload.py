@@ -480,11 +480,20 @@ def main() -> None:
         assert validated_cohort["selection"]["max_external_query_rows"] == 16
         assert all(
             row["request_state"] != "external"
-            or row["input_length"] - row["cached_prefix_tokens"] <= 16
+            or row["input_length"]
+            - row["effective_cached_prefix_tokens"]
+            <= 16
             for row in cohort_rows
         )
         assert all(row["arrival_seconds"] == 0.0 for row in cohort_rows)
         loaded_cohort = _load_workload(cohort_path, LossyTokenizer())
+        assert loaded_cohort.metadata[
+            "external_effective_cached_prefix_tokens"
+        ] == [
+            row["effective_cached_prefix_tokens"]
+            for row in cohort_rows
+            if row["request_state"] == "external"
+        ]
         assert loaded_cohort.resident_arrival_offsets == (0.0,)
         assert loaded_cohort.external_arrival_offsets == (0.0,)
         document = json.loads((root / "manifest.json").read_text(encoding="utf-8"))

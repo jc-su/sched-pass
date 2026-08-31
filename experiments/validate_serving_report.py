@@ -180,6 +180,72 @@ def _validate_initial_placement(report: dict[str, Any]) -> None:
         )
 
 
+def _validate_cache_binding(
+    report: dict[str, Any], records: list[dict[str, Any]]
+) -> None:
+    """Validate timed cache hits against the pre-execution content union."""
+
+    external = sorted(
+        (record for record in records if record.get("kind") == "external"),
+        key=lambda record: int(record.get("index", -1)),
+    )
+    if not external:
+        return
+    contract = report.get("cache_binding_contract")
+    _require(
+        isinstance(contract, dict),
+        "serving report has no content-derived cache binding contract",
+    )
+    _require(
+        contract.get("schema") == 1
+        and contract.get("composition")
+        == "initial_object_union_longest_common_prefix"
+        and contract.get("identity_source") == "exact_token_ids"
+        and contract.get("exact") is True,
+        "serving cache binding contract is not exact",
+    )
+    materialized = contract.get("materialized_prefix_tokens")
+    effective = contract.get("effective_initial_prefix_tokens")
+    observed = contract.get("observed_prefix_tokens")
+    _require(
+        all(isinstance(values, list) for values in (materialized, effective, observed))
+        and len(materialized) == len(effective) == len(observed) == len(external),
+        "serving cache binding vectors disagree with external requests",
+    )
+    for expected_index, record in enumerate(external):
+        _require(
+            int(record.get("index", -1)) == expected_index,
+            "serving external cache binding indices are not contiguous",
+        )
+        values = (
+            materialized[expected_index],
+            effective[expected_index],
+            observed[expected_index],
+        )
+        _require(
+            all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+                for value in values
+            ),
+            f"serving external record {expected_index} has invalid cache binding",
+        )
+        declared, content_derived, measured = (int(value) for value in values)
+        recomputed = int(record["host_cached_tokens"]) + int(
+            record["device_cached_tokens"]
+        )
+        _require(
+            declared <= content_derived < int(record["input_tokens"])
+            and measured == content_derived == recomputed
+            and record.get("materialized_cached_prefix_tokens") == declared
+            and record.get("effective_initial_cached_prefix_tokens")
+            == content_derived
+            and record.get("observed_cached_prefix_tokens") == measured,
+            f"serving external record {expected_index} cache binding is inconsistent",
+        )
+
+
 def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> None:
     """Validate run-level GPU occupancy evidence.
 
@@ -776,6 +842,7 @@ def _validate_single(
             _percentile(intervals, 0.99),
             f"record {index} p99 ITL",
         )
+    _validate_cache_binding(report, records)
     engine_stats = report.get("engine_stats")
     _require(
         isinstance(engine_stats, list),

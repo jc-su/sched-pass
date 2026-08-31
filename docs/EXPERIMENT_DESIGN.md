@@ -170,3 +170,13 @@ contract, or request trace. A different demand trace is a different workload,
 not an ablation of execution.
 The work-unit matrix and serving harness must be run from a clean revision,
 and artifacts must contain that revision and complete activation metadata.
+
+GPU power and temperature are nuisance variables, not deployment
+preconditions or scheduler inputs. A formal paired campaign records one
+administrator-selected power limit, begins both arms below the same thermal
+bound, rejects foreign GPU processes and actual thermal slowdown, and reports
+the observed clock/power range. It does not require a fixed runtime clock or
+claim that production holds temperature constant. The production selector
+adapts from measured transfer and compute observations; power-limit
+sensitivity is a separate robustness experiment and must use identical limits
+for stock and NTA.

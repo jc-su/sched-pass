@@ -26,6 +26,7 @@ try:
         write_workload,
     )
     from .validate_workload import validate
+    from .cache_identity import effective_cached_prefixes
 except ImportError:  # pragma: no cover - direct CLI execution
     from bailian import (
         demand_trace_digest,
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover - direct CLI execution
         write_workload,
     )
     from validate_workload import validate
+    from cache_identity import effective_cached_prefixes
 
 
 ARRIVAL_MODES = ("batch_release", "calibrated_open_loop", "burst", "trace_scaled")
@@ -115,9 +117,13 @@ def _shape_score(rows: Sequence[Mapping[str, Any]]) -> float:
 
     inputs = [int(row["input_length"]) for row in rows]
     outputs = [max(1, int(row["output_length"])) for row in rows]
-    cached = [int(row["cached_prefix_tokens"]) for row in rows]
+    cached = [
+        int(row.get("effective_cached_prefix_tokens", row["cached_prefix_tokens"]))
+        for row in rows
+    ]
     queries = [
-        int(row["input_length"]) - int(row["cached_prefix_tokens"])
+        int(row["input_length"])
+        - int(row.get("effective_cached_prefix_tokens", row["cached_prefix_tokens"]))
         for row in rows
     ]
     modalities = {str(row.get("modality", "unknown")) for row in rows}
@@ -130,6 +136,88 @@ def _shape_score(rows: Sequence[Mapping[str, Any]]) -> float:
         + 0.25 * (len(modalities) - 1)
         + 0.10 * (len(followup_kinds) - 1)
     )
+
+
+def _cached_union_rows(
+    rows: Sequence[Mapping[str, Any]], block_size: int
+) -> list[dict[str, Any]]:
+    """Attach the exact prefix visible from the initial radix-object union."""
+
+    objects = [
+        (
+            tuple(str(value) for value in row["hash_ids"]),
+            int(row["cached_prefix_tokens"]),
+        )
+        for row in rows
+    ]
+    effective = effective_cached_prefixes(
+        [
+            (
+                tuple(str(value) for value in row["hash_ids"]),
+                int(row["input_length"]),
+            )
+            for row in rows
+        ],
+        objects,
+        tokens_per_identity_unit=block_size,
+    )
+    result: list[dict[str, Any]] = []
+    for row, cached in zip(rows, effective, strict=True):
+        value = dict(row)
+        value["effective_cached_prefix_tokens"] = cached
+        result.append(value)
+    return result
+
+
+def _candidate_preserves_external_query_rows(
+    selected: Sequence[Mapping[str, Any]],
+    candidate: Mapping[str, Any],
+    *,
+    block_size: int,
+    min_external_query_rows: int,
+) -> bool:
+    """Check only the new pairwise edges in the cache-union constraint."""
+
+    candidate_object = (
+        tuple(str(value) for value in candidate["hash_ids"]),
+        int(candidate["cached_prefix_tokens"]),
+    )
+    external_targets = [
+        row for row in selected if row["request_state"] == "external"
+    ]
+    for target in external_targets:
+        effective = effective_cached_prefixes(
+            [
+                (
+                    tuple(str(value) for value in target["hash_ids"]),
+                    int(target["input_length"]),
+                )
+            ],
+            [candidate_object],
+            tokens_per_identity_unit=block_size,
+        )[0]
+        if int(target["input_length"]) - effective < min_external_query_rows:
+            return False
+    if candidate["request_state"] != "external":
+        return True
+    candidate_target = (
+        tuple(str(value) for value in candidate["hash_ids"]),
+        int(candidate["input_length"]),
+    )
+    objects = [
+        (
+            tuple(str(value) for value in row["hash_ids"]),
+            int(row["cached_prefix_tokens"]),
+        )
+        for row in selected
+    ]
+    objects.append(candidate_object)
+    effective = effective_cached_prefixes(
+        [candidate_target],
+        objects,
+        tokens_per_identity_unit=block_size,
+    )[0]
+    return int(candidate["input_length"]) - effective >= min_external_query_rows
 
 
 def _select_diverse(
@@ -203,11 +291,25 @@ def _select_diverse(
             request_id = str(candidate["request_id"])
             if request_id in used:
                 continue
+            if not _candidate_preserves_external_query_rows(
+                selected,
+                candidate,
+                block_size=block_size,
+                min_external_query_rows=min_external_query_rows,
+            ):
+                continue
             selected.append(candidate)
             roles.append(role)
             used.add(request_id)
             if roles.count(role) == counts[role]:
                 break
+        selected_count = roles.count(role)
+        if selected_count != counts[role]:
+            raise ValueError(
+                "deterministic cache-union selection found only "
+                f"{selected_count} compatible {role} rows for the requested "
+                f"{counts[role]}"
+            )
     total = sum(int(row["cohort_active_tokens"]) for row in selected)
     if total > active_token_budget:
         raise ValueError(
@@ -222,11 +324,21 @@ def _select_diverse(
             old = selected[index]
             old_id = str(old["request_id"])
             base_total = total - int(old["cohort_active_tokens"])
+            proposal_base = [
+                value for position, value in enumerate(selected) if position != index
+            ]
             best = old
             best_score = score
             for candidate in pools[role]:
                 candidate_id = str(candidate["request_id"])
                 if candidate_id != old_id and candidate_id in used:
+                    continue
+                if not _candidate_preserves_external_query_rows(
+                    proposal_base,
+                    candidate,
+                    block_size=block_size,
+                    min_external_query_rows=min_external_query_rows,
+                ):
                     continue
                 candidate_total = base_total + int(candidate["cohort_active_tokens"])
                 if candidate_total > active_token_budget:
@@ -265,7 +377,18 @@ def _select_diverse(
             int(row.get("source_row", 0)),
         )
     )
-    return selected, score
+    selected = _cached_union_rows(selected, block_size)
+    if any(
+        row["request_state"] == "external"
+        and int(row["input_length"])
+        - int(row["effective_cached_prefix_tokens"])
+        < min_external_query_rows
+        for row in selected
+    ):
+        raise ValueError(
+            "selected cache-object union violates the external query-row bound"
+        )
+    return selected, _shape_score(selected)
 
 
 def _assign_arrivals(
@@ -345,9 +468,13 @@ def _cohort_contract(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "cached_prefix_tokens": _axis(
             [int(row["cached_prefix_tokens"]) for row in rows]
         ),
+        "effective_cached_prefix_tokens": _axis(
+            [int(row["effective_cached_prefix_tokens"]) for row in rows]
+        ),
         "uncached_query_rows": _axis(
             [
-                int(row["input_length"]) - int(row["cached_prefix_tokens"])
+                int(row["input_length"])
+                - int(row["effective_cached_prefix_tokens"])
                 for row in rows
             ]
         ),
@@ -472,7 +599,7 @@ def build_cohort(
             "max_external_query_rows": max_external_query_rows,
             "active_token_budget": active_token_budget,
             "active_tokens": total_active,
-            "algorithm": "deterministic_joint_shape_spread_v1",
+            "algorithm": "deterministic_union_aware_shape_spread_v2",
             "shape_score": score,
             "distribution_representative_claim": False,
         },
@@ -497,6 +624,8 @@ def build_cohort(
             "source": "exact_hash_reuse_controlled_placement",
             "synthetic": True,
             "identity_field": "cached_prefix_tokens",
+            "effective_identity_field": "effective_cached_prefix_tokens",
+            "composition": "initial_object_union_longest_common_prefix",
         },
         "cohort_heterogeneity": contract,
         "statistics": workload_statistics(selected),

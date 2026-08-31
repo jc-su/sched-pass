@@ -43,8 +43,9 @@ def demand_trace_digest(rows: Sequence[Mapping[str, Any]]) -> str:
     release time define the workload that must be shared by paired arms.
     """
 
-    canonical = [
-        {
+    canonical = []
+    for row in rows:
+        entry = {
             "request_id": str(row["request_id"]),
             "input_length": int(row["input_length"]),
             "output_length": int(row["output_length"]),
@@ -54,8 +55,11 @@ def demand_trace_digest(rows: Sequence[Mapping[str, Any]]) -> str:
             "cached_prefix_tokens": int(row["cached_prefix_tokens"]),
             "arrival_seconds": float(row["arrival_seconds"]),
         }
-        for row in rows
-    ]
+        if "effective_cached_prefix_tokens" in row:
+            entry["effective_cached_prefix_tokens"] = int(
+                row["effective_cached_prefix_tokens"]
+            )
+        canonical.append(entry)
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -585,7 +589,11 @@ def workload_statistics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         float(right["arrival_seconds"]) - float(left["arrival_seconds"])
         for left, right in zip(rows, rows[1:])
     ]
-    return {
+    effective_cached = [
+        int(row.get("effective_cached_prefix_tokens", row["cached_prefix_tokens"]))
+        for row in rows
+    ]
+    result = {
         "input_tokens": {
             "min": min(int(row["input_length"]) for row in rows),
             "max": max(int(row["input_length"]) for row in rows),
@@ -609,16 +617,16 @@ def workload_statistics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         },
         "uncached_query_rows": {
             "min": min(
-                int(row["input_length"]) - int(row["cached_prefix_tokens"])
-                for row in rows
+                int(row["input_length"]) - cached
+                for row, cached in zip(rows, effective_cached, strict=True)
             ),
             "max": max(
-                int(row["input_length"]) - int(row["cached_prefix_tokens"])
-                for row in rows
+                int(row["input_length"]) - cached
+                for row, cached in zip(rows, effective_cached, strict=True)
             ),
             "mean": mean(
-                int(row["input_length"]) - int(row["cached_prefix_tokens"])
-                for row in rows
+                int(row["input_length"]) - cached
+                for row, cached in zip(rows, effective_cached, strict=True)
             ),
         },
         "modalities": sorted({str(row["modality"]) for row in rows}),
@@ -643,6 +651,13 @@ def workload_statistics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             ),
         },
     }
+    if all("effective_cached_prefix_tokens" in row for row in rows):
+        result["effective_cached_prefix_tokens"] = {
+            "min": min(effective_cached),
+            "max": max(effective_cached),
+            "mean": mean(effective_cached),
+        }
+    return result
 
 
 def normalize(

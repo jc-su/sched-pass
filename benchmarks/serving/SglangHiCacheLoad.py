@@ -26,6 +26,7 @@ try:
         read_jsonl,
         unique_input_page_ids,
     )
+    from experiments.cache_identity import effective_cached_prefixes
     from experiments.atomic_io import atomic_write_json
     from experiments.queueing import finite_window_system_accounting
     from experiments.serving_metrics import joint_slo_goodput
@@ -39,6 +40,7 @@ except ModuleNotFoundError:
         read_jsonl,
         unique_input_page_ids,
     )
+    from experiments.cache_identity import effective_cached_prefixes
     from experiments.atomic_io import atomic_write_json
     from experiments.queueing import finite_window_system_accounting
     from experiments.serving_metrics import joint_slo_goodput
@@ -1436,6 +1438,37 @@ def _load_workload(
     external_cached_prefix_tokens = [
         int(row["cached_prefix_tokens"]) for row in external_rows
     ]
+    initial_cached_objects = [
+        (
+            source_input_by_request[str(row["request_id"])],
+            (
+                int(row["cached_prefix_tokens"])
+                if row["request_state"] == "external"
+                else int(row["input_length"]) - 1
+            ),
+        )
+        for row in rows
+    ]
+    external_effective_cached_prefix_tokens = list(
+        effective_cached_prefixes(
+            [
+                (values, len(values))
+                for values in effective_external_inputs
+            ],
+            initial_cached_objects,
+        )
+    )
+    declared_effective = [
+        row.get("effective_cached_prefix_tokens") for row in external_rows
+    ]
+    if any(value is not None for value in declared_effective) and (
+        any(value is None for value in declared_effective)
+        or [int(value) for value in declared_effective]
+        != external_effective_cached_prefix_tokens
+    ):
+        raise RuntimeError(
+            "manifest effective cache prefixes disagree with token-level identity"
+        )
     external_cached_page_ids = frozenset(
         page_id
         for row, prefix_tokens in zip(
@@ -1476,10 +1509,13 @@ def _load_workload(
         "external_input_tokens": [
             len(input_by_request[str(row["request_id"])]) for row in external_rows
         ],
-        # The trace exposes exact shared-prefix block identities.  Only that
-        # prefix is materialized during placement; request-local continuation
-        # rows remain uncached and are the timed prefill query.
+        # Each row declares the object materialized for that request.  The
+        # effective prefix below is derived separately from the union of all
+        # resident and external objects in the shared radix cache.
         "external_cached_prefix_tokens": external_cached_prefix_tokens,
+        "external_effective_cached_prefix_tokens": (
+            external_effective_cached_prefix_tokens
+        ),
         "resident_output_tokens": [int(row["output_length"]) for row in resident_rows],
         "external_output_tokens": [int(row["output_length"]) for row in external_rows],
         # These are logical page counts, not raw request-length sums.  Shared
@@ -2190,10 +2226,40 @@ def main() -> int:
         _reusable_prefix_tokens(prefix, prompt)
         for prefix, prompt in zip(external_prefixes, external_prompts, strict=True)
     ]
+    initial_cached_objects = [
+        *zip(external_prefixes, external_cached_prefix_lengths, strict=True),
+        *((prompt, len(prompt) - 1) for prompt in resident_prompts),
+    ]
+    effective_external_cached_prefix_lengths = list(
+        effective_cached_prefixes(
+            [(prompt, len(prompt)) for prompt in external_prompts],
+            initial_cached_objects,
+        )
+    )
+    if workload_metadata is not None and (
+        effective_external_cached_prefix_lengths
+        != [
+            int(value)
+            for value in workload_metadata[
+                "external_effective_cached_prefix_tokens"
+            ]
+        ]
+    ):
+        raise RuntimeError(
+            "runtime token inputs disagree with the workload cache-union contract"
+        )
+    external_effective_prefixes = [
+        prompt[:cached]
+        for prompt, cached in zip(
+            external_prompts,
+            effective_external_cached_prefix_lengths,
+            strict=True,
+        )
+    ]
     external_query_rows = [
         len(prompt) - cached
         for cached, prompt in zip(
-            external_cached_prefix_lengths, external_prompts, strict=True
+            effective_external_cached_prefix_lengths, external_prompts, strict=True
         )
     ]
     (
@@ -2201,6 +2267,14 @@ def main() -> int:
         calibration_forbidden_first_tokens,
     ) = _exact_prefix_materialization_inputs(
         tokenizer, external_prefixes, external_prompts
+    )
+    calibration_forbidden_first_tokens.update(
+        prompt[cached]
+        for prompt, cached in zip(
+            external_prompts,
+            effective_external_cached_prefix_lengths,
+            strict=True,
+        )
     )
     placement_probe_groups = _placement_probe_groups(external_prefixes)
     if any(
@@ -2544,7 +2618,7 @@ def main() -> int:
                     )
                 )
                 for index, (prefix, prompt) in enumerate(
-                    zip(external_prefixes, external_prompts, strict=True)
+                    zip(external_effective_prefixes, external_prompts, strict=True)
                 )
             ]
             warmup_records, _ = engine.loop.run_until_complete(
@@ -2617,24 +2691,44 @@ def main() -> int:
     external = [record for record in records if record["kind"] == "external"]
     resident = [record for record in records if record["kind"] == "resident"]
     expected_external_prefixes = (
-        [int(value) for value in workload_metadata["external_cached_prefix_tokens"]]
+        [
+            int(value)
+            for value in workload_metadata[
+                "external_effective_cached_prefix_tokens"
+            ]
+        ]
         if workload_metadata is not None
-        else external_cached_prefix_lengths
+        else effective_external_cached_prefix_lengths
     )
+    for record in external:
+        index = int(record["index"])
+        record["materialized_cached_prefix_tokens"] = int(
+            external_cached_prefix_lengths[index]
+        )
+        record["effective_initial_cached_prefix_tokens"] = int(
+            expected_external_prefixes[index]
+        )
+        record["observed_cached_prefix_tokens"] = int(
+            record["host_cached_tokens"] + record["device_cached_tokens"]
+        )
     missing_external = [
         {
             "index": record["index"],
-            "expected": expected_external_prefixes[record["index"]],
+            "materialized": record["materialized_cached_prefix_tokens"],
+            "expected_effective": record[
+                "effective_initial_cached_prefix_tokens"
+            ],
             "device": record["device_cached_tokens"],
             "host": record["host_cached_tokens"],
         }
         for record in external
-        if record["host_cached_tokens"] + record["device_cached_tokens"]
-        != expected_external_prefixes[record["index"]]
+        if record["observed_cached_prefix_tokens"]
+        != record["effective_initial_cached_prefix_tokens"]
     ]
     if missing_external:
         raise RuntimeError(
-            "a timed external request did not retain its exact cached prefix: "
+            "a timed external request diverged from the content-derived initial "
+            "cache union: "
             + json.dumps(missing_external, sort_keys=True)
         )
     expected_resident_prefixes = [len(value) - 1 for value in resident_prompts]
@@ -2692,14 +2786,30 @@ def main() -> int:
         )
     calibration_contract = {
         "kind": "exact_token_prefix_and_query_rows",
+        "cache_composition": "initial_object_union_longest_common_prefix",
         "verified": (
             args.load_warmup_iterations > 0
             and len(calibration_shape_records) == args.load_warmup_iterations
         ),
         "warmup_iterations": len(calibration_shape_records),
-        "cached_prefix_tokens": external_cached_prefix_lengths,
+        "materialized_prefix_tokens": external_cached_prefix_lengths,
+        "cached_prefix_tokens": effective_external_cached_prefix_lengths,
         "uncached_query_rows": external_query_rows,
         "timed_shapes": timed_external_shapes,
+    }
+    cache_binding_contract = {
+        "schema": 1,
+        "composition": "initial_object_union_longest_common_prefix",
+        "identity_source": "exact_token_ids",
+        "materialized_prefix_tokens": external_cached_prefix_lengths,
+        "effective_initial_prefix_tokens": (
+            effective_external_cached_prefix_lengths
+        ),
+        "observed_prefix_tokens": [
+            int(record["observed_cached_prefix_tokens"])
+            for record in sorted(external, key=lambda value: int(value["index"]))
+        ],
+        "exact": True,
     }
 
     digest = hashlib.sha256()
@@ -2917,6 +3027,7 @@ def main() -> int:
             args.load_warmup_iterations >= 2 and calibration_contract["verified"]
         ),
         "calibration_input_contract": calibration_contract,
+        "cache_binding_contract": cache_binding_contract,
         "batch_heterogeneity": batch_heterogeneity,
         "workload": workload_metadata,
         "demand_semantics": "exact",

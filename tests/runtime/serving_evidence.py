@@ -386,6 +386,12 @@ def main() -> None:
     )
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3)) == 2
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3, 4)) == 3
+    # A request's own materialized object ends at row 3, but another object
+    # in the initial cache union extends the identical content path to row 5.
+    assert serving.effective_cached_prefixes(
+        [((1, 2, 3, 4, 5, 9), 6)],
+        [((1, 2, 3), 3), ((1, 2, 3, 4, 5, 8), 5)],
+    ) == (5,)
     assert serving._placement_probe_groups(
         ((1, 2), (1, 2, 3), (4,), (1, 2))
     ) == ((2,), (0, 3), (1,))

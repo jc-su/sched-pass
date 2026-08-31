@@ -608,7 +608,12 @@ def main() -> int:
     stock_calibration = calibration_contracts["flashinfer"]
     nta_calibration = calibration_contracts["nta_flashinfer"]
     assert isinstance(stock_calibration, dict) and isinstance(nta_calibration, dict)
-    for field in ("cached_prefix_tokens", "uncached_query_rows", "timed_shapes"):
+    for field in (
+        "materialized_prefix_tokens",
+        "cached_prefix_tokens",
+        "uncached_query_rows",
+        "timed_shapes",
+    ):
         if stock_calibration.get(field) != nta_calibration.get(field):
             _write_failed_comparison(
                 args.output,

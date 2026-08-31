@@ -12,8 +12,10 @@ from typing import Any
 
 try:
     from .bailian import demand_trace_digest, read_jsonl
+    from .cache_identity import effective_cached_prefixes
 except ImportError:  # pragma: no cover - supports direct CLI execution
     from bailian import demand_trace_digest, read_jsonl
+    from cache_identity import effective_cached_prefixes
 
 
 def validate(path: Path) -> dict[str, Any]:
@@ -98,7 +100,7 @@ def validate(path: Path) -> dict[str, Any]:
             or isinstance(selected_max, bool)
             or selected_max != len(rows)
             or selection.get("algorithm")
-            != "deterministic_joint_shape_spread_v1"
+            != "deterministic_union_aware_shape_spread_v2"
             or selection.get("distribution_representative_claim") is not False
         ):
             raise ValueError("diverse serving cohort selection is inconsistent")
@@ -184,9 +186,6 @@ def validate(path: Path) -> dict[str, Any]:
                     < min_external_output_tokens
                     or int(row["cached_prefix_tokens"])
                     < min_external_cached_tokens
-                    or int(row["input_length"])
-                    - int(row["cached_prefix_tokens"])
-                    < min_external_query_rows
                 )
             )
             for row in rows
@@ -210,6 +209,8 @@ def validate(path: Path) -> dict[str, Any]:
         "cached_prefix_tokens",
         "arrival_seconds",
     }
+    if selection["mode"] == "diverse_serving_cohort":
+        required.add("effective_cached_prefix_tokens")
     if any(not required <= set(row) for row in rows):
         raise ValueError("workload rows do not contain the normalized demand fields")
     request_ids = [row["request_id"] for row in rows]
@@ -327,6 +328,13 @@ def validate(path: Path) -> dict[str, Any]:
         or not isinstance(cache_placement.get("synthetic"), bool)
     ):
         raise ValueError("workload manifest lacks cache-placement provenance")
+    if selection["mode"] == "diverse_serving_cohort" and (
+        cache_placement.get("effective_identity_field")
+        != "effective_cached_prefix_tokens"
+        or cache_placement.get("composition")
+        != "initial_object_union_longest_common_prefix"
+    ):
+        raise ValueError("diverse serving cohort lacks cache-union provenance")
     cache_claim = claims.get("cache_placement_is_production")
     if not isinstance(cache_claim, bool) or cache_claim == cache_placement["synthetic"]:
         raise ValueError("workload cache-placement claim is inconsistent")
@@ -381,6 +389,61 @@ def validate(path: Path) -> dict[str, Any]:
         if len(row["hash_ids"]) > (input_length + block_size - 1) // block_size:
             raise ValueError("hash prefix is longer than the request")
     if selection["mode"] == "diverse_serving_cohort":
+        expected_effective = effective_cached_prefixes(
+            [
+                (
+                    tuple(str(value) for value in row["hash_ids"]),
+                    int(row["input_length"]),
+                )
+                for row in rows
+            ],
+            [
+                (
+                    tuple(str(value) for value in row["hash_ids"]),
+                    int(row["cached_prefix_tokens"]),
+                )
+                for row in rows
+            ],
+            tokens_per_identity_unit=block_size,
+        )
+        observed_effective = tuple(
+            row["effective_cached_prefix_tokens"] for row in rows
+        )
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            for value in observed_effective
+        ) or observed_effective != expected_effective:
+            raise ValueError(
+                "diverse serving cohort effective cache union is inconsistent"
+            )
+        min_external_query_rows = int(selection["min_external_query_rows"])
+        max_external_query_rows = selection.get("max_external_query_rows")
+        if max_external_query_rows is not None and (
+            not isinstance(max_external_query_rows, int)
+            or isinstance(max_external_query_rows, bool)
+            or max_external_query_rows < min_external_query_rows
+        ):
+            raise ValueError("diverse serving cohort query-row range is invalid")
+        if any(
+            row["request_state"] == "external"
+            and (
+                int(row["input_length"])
+                - int(row["effective_cached_prefix_tokens"])
+                < min_external_query_rows
+                or (
+                    max_external_query_rows is not None
+                    and int(row["input_length"])
+                    - int(row["effective_cached_prefix_tokens"])
+                    > max_external_query_rows
+                )
+            )
+            for row in rows
+        ):
+            raise ValueError(
+                "diverse serving cohort violates its effective query-row bounds"
+            )
         cohort = manifest.get("cohort_heterogeneity")
         if (
             not isinstance(cohort, dict)
@@ -396,8 +459,12 @@ def validate(path: Path) -> dict[str, Any]:
             "cached_prefix_tokens": [
                 int(row["cached_prefix_tokens"]) for row in rows
             ],
+            "effective_cached_prefix_tokens": [
+                int(row["effective_cached_prefix_tokens"]) for row in rows
+            ],
             "uncached_query_rows": [
-                int(row["input_length"]) - int(row["cached_prefix_tokens"])
+                int(row["input_length"])
+                - int(row["effective_cached_prefix_tokens"])
                 for row in rows
             ],
         }
