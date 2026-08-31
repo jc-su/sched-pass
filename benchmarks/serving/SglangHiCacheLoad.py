@@ -56,6 +56,9 @@ from SglangHiCache import (
 )
 
 
+_HICACHE_WRITE_POLICY = "write_through_selective"
+
+
 _MEASUREMENT_COUNTERS = frozenset(
     {
         "batches",
@@ -2272,7 +2275,10 @@ def main() -> int:
         enable_mixed_chunk=args.batch_mode == "coalesced",
         enable_hierarchical_cache=True,
         hicache_ratio=args.hicache_ratio,
-        hicache_write_policy="write_through",
+        # Exact external prefixes are touched twice; one-shot placement
+        # pressure is not. Selective write-through therefore persists demand
+        # without polluting L2 with setup-only eviction objects.
+        hicache_write_policy=_HICACHE_WRITE_POLICY,
         hicache_io_backend="kernel",
         hicache_mem_layout="page_first",
         numa_node=None if args.numa_node is None else [args.numa_node],
@@ -2777,6 +2783,7 @@ def main() -> int:
             else args.context_length
         ),
         "hicache_ratio": args.hicache_ratio,
+        "hicache_write_policy": _HICACHE_WRITE_POLICY,
         "cuda_graph_decode": args.cuda_graph_decode,
         "cuda_graph_prefill": args.cuda_graph_prefill,
         "load_warmup_iterations": args.load_warmup_iterations,

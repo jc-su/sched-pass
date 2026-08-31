@@ -346,6 +346,7 @@ def main() -> None:
         raise AssertionError("an open consumer policy entered timed serving")
     assert serving._max_request_input_tokens(32_768, 18_000) == 17_992
     assert serving._max_request_input_tokens(16_000, 18_000) == 15_992
+    assert serving._HICACHE_WRITE_POLICY == "write_through_selective"
     assert serving._required_placement_pressure_tokens(
         device_pool_tokens=40_000,
         page_tokens=16,
