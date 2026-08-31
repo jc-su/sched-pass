@@ -2632,7 +2632,15 @@ def main() -> int:
             construct_external_placement(reason="measured_reconstruction")
             warm_residents(reason="measured_reconstruction")
 
-        establish_final_placement()
+        # The placement above was built from the same empty-cache boundary as
+        # ``establish_final_placement`` and is already destructively verified.
+        # Rebuilding it again before the first excluded warmup performed no
+        # semantic work and accounted for one quarter of setup reconstruction
+        # in the formal two-warmup campaign. With no warmup, retain the rebuild
+        # so diagnostic runs still emit the measured-reconstruction proof
+        # required by the serving report contract.
+        if args.load_warmup_iterations == 0:
+            establish_final_placement()
 
         calibration_shape_records: list[list[dict[str, int]]] = []
         for warmup in range(args.load_warmup_iterations):
@@ -2684,6 +2692,18 @@ def main() -> int:
                 ]
             )
             establish_final_placement()
+
+        expected_setup_flushes = (
+            2
+            if args.load_warmup_iterations == 0
+            else 1 + args.load_warmup_iterations
+        )
+        if len(setup_cache_flush_wait_seconds) != expected_setup_flushes:
+            raise RuntimeError(
+                "serving setup performed a redundant cache reconstruction: "
+                f"expected {expected_setup_flushes} idle flushes, observed "
+                f"{len(setup_cache_flush_wait_seconds)}"
+            )
 
         # SGLang's startup and cache-management workers may replace process
         # affinity after Engine construction. Re-apply and verify the declared
