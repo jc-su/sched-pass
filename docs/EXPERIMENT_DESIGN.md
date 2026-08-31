@@ -190,3 +190,13 @@ Likewise, the causal A1--A3 arms fix one common transport engine only to
 separate acquisition and consumer effects. Natural-trace full-system runs must
 also evaluate the production AUTO selector. Neither selector reads temperature
 or power; those values remain artifact telemetry and trial-validity evidence.
+
+AUTO timing uses an explicit train/freeze lifecycle. A writable calibration
+process learns content-independent service curves from a training window and
+is excluded in full; the measured process reopens the compatibility-bound
+profile read-only. A dynamic batch shape absent from that profile takes the
+conservative scheduled-whole-layer path rather than probing on a user's
+critical path. Natural-trace evaluation trains on an earlier disjoint window
+and measures a later window. This is deployment autotuning, not a workload or
+temperature precondition: prompt tokens and request identities are never
+stored in the profile, and stock/NTA still receive the same measured trace.

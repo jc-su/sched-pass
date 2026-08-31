@@ -62,6 +62,26 @@ _HICACHE_WRITE_POLICY = "write_through_selective"
 _CALIBRATION_CPU_AFFINITY_ENV = "NTA_EXECUTION_CALIBRATION_CPU_AFFINITY"
 
 
+_TIMED_AUTO_CALIBRATION_COUNTERS = (
+    "host_selection_calibration_probe_batches",
+    "host_selection_consumer_policy_probe_batches",
+    "consumer_policy_profiled_leases",
+    "consumer_policy_probe_leases",
+    "consumer_policy_arrival_samples",
+    "consumer_policy_stock_samples",
+    "consumer_policy_partial_samples",
+    "consumer_policy_partial_reuse_samples",
+    "consumer_policy_partial_setup_samples",
+    "layer_service_profiled_intervals",
+    "incremental_initialization_samples",
+    "incremental_setup_samples",
+    "incremental_service_samples",
+    "cost_model_transfer_samples",
+    "prefetch_mover_plan_calibration_probe_copy_leases",
+    "prefetch_mover_plan_calibration_probe_sm_leases",
+)
+
+
 _MEASUREMENT_COUNTERS = frozenset(
     {
         "batches",
@@ -361,8 +381,17 @@ def _publish_engine_stats_snapshot(
 
 def _require_closed_auto_calibration(
     reports: dict[str, dict[str, Any]],
+    *,
+    calibration_training_run: bool = False,
 ) -> None:
-    """Reject a timed AUTO window that would still perform exploration."""
+    """Keep AUTO learning outside a serving measurement window.
+
+    A writable profile run is explicitly a training process whose complete
+    output is excluded by the paired harness. Every actual measurement must
+    load a read-only profile. Frozen policy maps an unseen shape to the
+    conservative scheduled-whole-layer path, so dynamic batching cannot turn
+    an exact-shape warmup miss into a user-visible exploration probe.
+    """
 
     auto_reports = [
         report
@@ -371,8 +400,19 @@ def _require_closed_auto_calibration(
         and report.get("serving_tier") == "host_staged"
         and report.get("host_execution_mode") == "auto"
     ]
+    if calibration_training_run and not auto_reports:
+        raise RuntimeError(
+            "AUTO calibration training requires host-staged AUTO execution"
+        )
     failures: list[str] = []
     for report in auto_reports:
+        if calibration_training_run:
+            if (
+                report.get("calibration_profile_enabled") is not True
+                or report.get("calibration_profile_read_only") is not False
+            ):
+                failures.append("writable calibration profile")
+            continue
         if (
             report.get("incremental_setup_calibrated") is not True
             or int(report.get("incremental_calibration_probes_remaining", -1)) != 0
@@ -381,14 +421,44 @@ def _require_closed_auto_calibration(
         consumer = report.get("consumer_policy_calibration")
         if (
             not isinstance(consumer, dict)
-            or consumer.get("last_shape_closed") is not True
+            or consumer.get("mode") != "frozen"
+            or report.get("calibration_profile_enabled") is not True
+            or report.get("calibration_profile_status") != "loaded_read_only"
+            or report.get("calibration_profile_read_only") is not True
         ):
-            failures.append("partial-consumer policy")
+            failures.append("read-only partial-consumer policy")
     if failures:
         raise RuntimeError(
-            "performance warmup ended before AUTO calibration closed: "
+            "AUTO serving measurement is not calibration-frozen: "
             + ", ".join(sorted(set(failures)))
-            + "; increase --load-warmup-iterations"
+            + "; prepare and reopen a compatibility-bound read-only profile"
+        )
+
+
+def _require_no_timed_auto_calibration(
+    reports: Sequence[dict[str, Any]],
+    *,
+    calibration_training_run: bool = False,
+) -> None:
+    """Reject any AUTO learning action counted inside the timed delta."""
+
+    if calibration_training_run:
+        return
+    actions: dict[str, int] = {}
+    for name in _TIMED_AUTO_CALIBRATION_COUNTERS:
+        count = sum(
+            int(report.get(name, 0))
+            for report in reports
+            if report.get("backend") == "nta_flashinfer"
+            and report.get("serving_tier") == "host_staged"
+            and report.get("host_execution_mode") == "auto"
+        )
+        if count:
+            actions[name] = count
+    if actions:
+        raise RuntimeError(
+            "AUTO serving measurement performed online calibration: "
+            + json.dumps(actions, sort_keys=True)
         )
 
 
@@ -1002,6 +1072,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "performance-excluded exact-shape mixed arrivals; the NTA arm "
             "also fails closed unless deployment calibration is complete"
+        ),
+    )
+    parser.add_argument(
+        "--auto-calibration-training-run",
+        action="store_true",
+        help=(
+            "mark this entire NTA AUTO process as excluded profile training; "
+            "requires a writable compatibility-bound calibration profile"
         ),
     )
     parser.add_argument(
@@ -2721,7 +2799,10 @@ def main() -> int:
             else {}
         )
         if args.attention_backend == "nta_flashinfer":
-            _require_closed_auto_calibration(measurement_baseline)
+            _require_closed_auto_calibration(
+                measurement_baseline,
+                calibration_training_run=args.auto_calibration_training_run,
+            )
         records, elapsed = engine.loop.run_until_complete(
             _run_load(
                 engine,
@@ -2913,6 +2994,10 @@ def main() -> int:
         ]
     else:
         stats = []
+    _require_no_timed_auto_calibration(
+        stats,
+        calibration_training_run=args.auto_calibration_training_run,
+    )
     execution_dispatch = (
         _execution_dispatch(stats)
         if args.attention_backend == "nta_flashinfer"
@@ -3092,6 +3177,7 @@ def main() -> int:
         "hicache_write_policy": _HICACHE_WRITE_POLICY,
         "cuda_graph_decode": args.cuda_graph_decode,
         "cuda_graph_prefill": args.cuda_graph_prefill,
+        "auto_calibration_training_run": args.auto_calibration_training_run,
         "load_warmup_iterations": args.load_warmup_iterations,
         "setup_cache_flush": {
             "contract": "sglang_deferred_fully_idle",

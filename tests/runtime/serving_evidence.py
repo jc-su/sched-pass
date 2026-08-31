@@ -331,20 +331,55 @@ def main() -> None:
             "host_execution_mode": "auto",
             "incremental_setup_calibrated": True,
             "incremental_calibration_probes_remaining": 0,
-            "consumer_policy_calibration": {"last_shape_closed": True},
+            "calibration_profile_enabled": True,
+            "calibration_profile_read_only": True,
+            "calibration_profile_status": "loaded_read_only",
+            "consumer_policy_calibration": {
+                "mode": "frozen",
+                "last_shape_closed": True,
+            },
         }
     }
     serving._require_closed_auto_calibration(closed_snapshot)
     open_snapshot = {"scheduler": dict(closed_snapshot["scheduler"])}
     open_snapshot["scheduler"]["consumer_policy_calibration"] = {
-        "last_shape_closed": False
+        "mode": "learning",
+        "last_shape_closed": False,
     }
     try:
         serving._require_closed_auto_calibration(open_snapshot)
     except RuntimeError as error:
-        assert "warmup ended before AUTO calibration closed" in str(error)
+        assert "not calibration-frozen" in str(error)
     else:
         raise AssertionError("an open consumer policy entered timed serving")
+    training_snapshot = {"scheduler": dict(open_snapshot["scheduler"])}
+    training_snapshot["scheduler"].update(
+        {
+            "calibration_profile_enabled": True,
+            "calibration_profile_read_only": False,
+            "calibration_profile_status": "saved",
+        }
+    )
+    serving._require_closed_auto_calibration(
+        training_snapshot, calibration_training_run=True
+    )
+    timed_probe = [
+        {
+            "backend": "nta_flashinfer",
+            "serving_tier": "host_staged",
+            "host_execution_mode": "auto",
+            "consumer_policy_probe_leases": 1,
+        }
+    ]
+    serving._require_no_timed_auto_calibration(
+        timed_probe, calibration_training_run=True
+    )
+    try:
+        serving._require_no_timed_auto_calibration(timed_probe)
+    except RuntimeError as error:
+        assert "performed online calibration" in str(error)
+    else:
+        raise AssertionError("timed AUTO serving accepted a consumer probe")
     assert serving._max_request_input_tokens(32_768, 18_000) == 17_992
     assert serving._max_request_input_tokens(16_000, 18_000) == 15_992
     assert serving._HICACHE_WRITE_POLICY == "write_through_selective"

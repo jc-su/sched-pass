@@ -384,6 +384,8 @@ def run(
         command.append("--scale-workload-arrivals-to-request-rate")
     if args.allow_oversubscribed_pool:
         command.append("--allow-oversubscribed-pool")
+    if calibration_profile_access == "writable":
+        command.append("--auto-calibration-training-run")
     environment = os.environ.copy()
     for name in (
         "NTA_EXECUTION_CALIBRATION_PROFILE",
