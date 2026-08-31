@@ -490,6 +490,30 @@ def main() -> None:
     assert streamed["itl_sample_count"] == 2
     assert len(streamed["inter_token_seconds"]) == 2
     assert streamed["token_timestamps_exact"] is True
+    assert streamed["submitted_offset_seconds"] >= streamed["arrival_offset_seconds"]
+
+    deadline_record = asyncio.run(
+        serving._stream_request(
+            _StreamingEngine((1,)),
+            (1, 2, 3, 4),
+            {
+                "temperature": 0,
+                "max_new_tokens": 1,
+                "ignore_eos": True,
+                "stream_interval": 1,
+            },
+            kind="fixture",
+            index=0,
+            request_id="fixture-deadline",
+            gate=None,
+            first_token_event=None,
+            offset_seconds=0.001,
+            load_start_seconds=time.perf_counter(),
+        )
+    )
+    assert deadline_record["submitted_offset_seconds"] >= deadline_record[
+        "arrival_offset_seconds"
+    ]
 
     async def exercise_first_token_barrier() -> None:
         barrier = serving._FirstTokenBarrier(2)

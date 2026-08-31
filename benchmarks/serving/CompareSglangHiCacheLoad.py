@@ -32,6 +32,9 @@ from experiments.serving_path_evidence import (  # noqa: E402
     require_exercised_paths,
     require_frontier_shape,
 )
+from experiments.validate_serving_report import (  # noqa: E402
+    validate as validate_serving_report,
+)
 from gpu_trial import (  # noqa: E402
     CotenantSampler,
     TRIAL_OWNER_ENV,
@@ -935,6 +938,10 @@ def main() -> int:
             int(entry.get("parallel_indexed_progress_layers", 0)) for entry in stats
         ),
     }
+    # A standalone paired run is itself an artifact-producing command.  Apply
+    # the same closed evidence contract used by the repeated-trial wrapper so
+    # an internally inconsistent result can never be printed as a success.
+    validate_serving_report(comparison)
     atomic_write_json(args.output, comparison)
     print(json.dumps(comparison, sort_keys=True))
     return 0

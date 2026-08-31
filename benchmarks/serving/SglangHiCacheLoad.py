@@ -1749,9 +1749,18 @@ async def _stream_request(
         await gate.wait()
         schedule_origin = time.perf_counter()
         workload_gate_wait_seconds = max(0.0, schedule_origin - load_start_seconds)
-    if offset_seconds:
-        await asyncio.sleep(offset_seconds)
     scheduled_arrival = schedule_origin + offset_seconds
+    # ``asyncio.sleep(delay)`` is allowed to wake at the event-loop clock's
+    # resolution boundary.  On this host that occasionally returned up to
+    # 0.7 ms before the requested deadline, which made a formally open-loop
+    # request appear to be submitted before its registered arrival.  Wait on
+    # the absolute deadline and recheck after every wakeup so the load
+    # generator, not a validator tolerance, owns the arrival contract.
+    while True:
+        remaining = scheduled_arrival - time.perf_counter()
+        if remaining <= 0.0:
+            break
+        await asyncio.sleep(remaining)
     submitted = time.perf_counter()
     stream = await engine.async_generate(
         input_ids=list(input_ids),

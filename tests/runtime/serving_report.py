@@ -64,6 +64,14 @@ def single() -> dict[str, object]:
         "machine": {"hostname": "test"},
         "demand_semantics": "exact",
         "placement_proven": True,
+        "initial_placement_proof": {
+            "reason": "measured_reconstruction",
+            "attempt": 1,
+            "destructive_probe_followed_by_disjoint_replay": True,
+            "observations": [
+                {"index": 0, "expected": 32, "device": 0, "host": 32}
+            ],
+        },
         "cotenant_gpu_samples": 0,
         "gpu_samples": 1,
         "gpu_sampling_errors": 0,
@@ -492,6 +500,24 @@ def main() -> None:
         assert "contaminated" in str(error)
     else:
         raise AssertionError("co-tenant-contaminated serving evidence was accepted")
+    missing_initial_placement = copy.deepcopy(comparison)
+    del missing_initial_placement["nta"]["initial_placement_proof"]
+    try:
+        validate(missing_initial_placement)
+    except ValueError as error:
+        assert "initial placement proof" in str(error)
+    else:
+        raise AssertionError("serving evidence without initial placement passed")
+    inexact_initial_placement = copy.deepcopy(comparison)
+    inexact_initial_placement["nta"]["initial_placement_proof"]["observations"][0][
+        "host"
+    ] = 31
+    try:
+        validate(inexact_initial_placement)
+    except ValueError as error:
+        assert "not exact" in str(error)
+    else:
+        raise AssertionError("inexact initial placement evidence passed")
     invalid_single = copy.deepcopy(stock)
     invalid_single["records"][0]["request_id"] = "duplicate"
     invalid_single["workload"] = {

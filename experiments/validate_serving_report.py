@@ -117,6 +117,69 @@ def _validate_ratio(actual: Any, expected: float | None, name: str) -> None:
         _close(actual, expected, name)
 
 
+def _validate_initial_placement(report: dict[str, Any]) -> None:
+    """Validate the measured cache split that existed before timed arrivals."""
+
+    proof = report.get("initial_placement_proof")
+    _require(
+        isinstance(proof, dict),
+        "serving report has no initial placement proof",
+    )
+    _require(
+        proof.get("reason") == "measured_reconstruction",
+        "serving initial placement was not reconstructed after warmup",
+    )
+    _require(
+        isinstance(proof.get("attempt"), int)
+        and not isinstance(proof.get("attempt"), bool)
+        and int(proof["attempt"]) > 0,
+        "serving initial placement proof has no bounded attempt",
+    )
+    _require(
+        proof.get("destructive_probe_followed_by_disjoint_replay") is True,
+        "serving initial placement proof did not restore the probed cache split",
+    )
+    observations = proof.get("observations")
+    _require(
+        isinstance(observations, list) and observations,
+        "serving initial placement proof has no observations",
+    )
+    indices: set[int] = set()
+    for position, observation in enumerate(observations):
+        _require(
+            isinstance(observation, dict),
+            f"serving initial placement observation {position} is not an object",
+        )
+        index = observation.get("index")
+        expected = observation.get("expected")
+        device = observation.get("device")
+        host = observation.get("host")
+        _require(
+            all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (index, expected, device, host)
+            ),
+            f"serving initial placement observation {position} is not integral",
+        )
+        assert isinstance(index, int)
+        assert isinstance(expected, int)
+        assert isinstance(device, int)
+        assert isinstance(host, int)
+        _require(
+            index >= 0 and index not in indices,
+            f"serving initial placement observation {position} has an invalid index",
+        )
+        indices.add(index)
+        _require(
+            expected > 0 and device >= 0 and host > 0,
+            f"serving initial placement observation {position} is not host-backed",
+        )
+        _require(
+            device + host == expected,
+            f"serving initial placement observation {position} is not exact",
+        )
+
+
 def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> None:
     """Validate run-level GPU occupancy evidence.
 
@@ -533,6 +596,7 @@ def _validate_single(
     )
     _require(report.get("demand_semantics") == "exact", "serving demand is not exact")
     _require(report.get("placement_proven") is True, "serving placement was not proven")
+    _validate_initial_placement(report)
     _validate_environment(report, require_complete=require_complete_environment)
     _require(
         report.get("verification_failures") == 0,
