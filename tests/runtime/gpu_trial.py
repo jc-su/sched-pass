@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 import sys
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -22,12 +22,12 @@ def completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[s
 
 
 def main() -> None:
-    with patch.object(
-        gpu_trial.subprocess,
-        "run",
-        side_effect=subprocess.TimeoutExpired(["nvidia-smi"], 5),
-    ):
+    hung = Mock()
+    hung.communicate.side_effect = subprocess.TimeoutExpired(["nvidia-smi"], 5)
+    hung.wait.return_value = -9
+    with patch.object(gpu_trial.subprocess, "Popen", return_value=hung):
         assert gpu_trial._run_nvidia_smi(["--query-gpu=memory.used"]) is None
+    hung.kill.assert_called_once_with()
 
     calls: list[list[str]] = []
 

@@ -21,17 +21,32 @@ def _run_nvidia_smi(arguments: list[str]) -> subprocess.CompletedProcess[str] | 
     an unbounded prerequisite that can strand an entire trial campaign.
     """
 
+    command = ["nvidia-smi", *arguments]
     try:
-        return subprocess.run(
-            ["nvidia-smi", *arguments],
+        process = subprocess.Popen(
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=NVIDIA_SMI_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
         return None
+    try:
+        stdout, stderr = process.communicate(timeout=NVIDIA_SMI_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        # Popen.communicate's usual timeout recipe kills and then waits.  That
+        # second wait is itself unbounded when the NVIDIA process is stuck in
+        # an uninterruptible driver call.  Signal it without waiting and let a
+        # daemon reaper collect it whenever the kernel releases the task.
+        process.kill()
+        threading.Thread(target=process.wait, daemon=True).start()
+        return None
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout,
+        stderr,
+    )
 
 
 def wait_for_free_gpu(
