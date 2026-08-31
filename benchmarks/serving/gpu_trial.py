@@ -192,22 +192,19 @@ class CotenantSampler:
         return marker in environment
 
     def _sample_once(self) -> None:
+        result = _run_nvidia_smi(
+            ["--query-compute-apps=pid", "--format=csv,noheader"]
+        )
+        if result is None or result.returncode != 0:
+            self.sampling_errors += 1
+            return
         try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                self.sampling_errors += 1
-                return
             applications = {
                 int(line)
                 for line in result.stdout.split()
                 if line.strip().isdigit()
             }
-        except (OSError, subprocess.TimeoutExpired, ValueError):
+        except ValueError:
             self.sampling_errors += 1
             return
         self.samples += 1
@@ -224,23 +221,19 @@ class CotenantSampler:
 
     def _sample_telemetry(self) -> None:
         try:
-            result = subprocess.run(
+            result = _run_nvidia_smi(
                 [
-                    "nvidia-smi",
                     "--query-gpu=temperature.gpu,clocks.current.graphics,"
                     "power.draw,clocks_throttle_reasons.active",
                     "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
+                ]
             )
             rows = [
                 tuple(part.strip() for part in line.split(","))
-                for line in result.stdout.splitlines()
+                for line in (result.stdout if result is not None else "").splitlines()
                 if line.strip()
             ]
-            if result.returncode != 0 or not rows:
+            if result is None or result.returncode != 0 or not rows:
                 raise ValueError("nvidia-smi returned no GPU telemetry")
             temperatures = [int(row[0]) for row in rows]
             clocks = [int(row[1]) for row in rows]
@@ -296,7 +289,7 @@ class CotenantSampler:
 
     def __exit__(self, *exc: object) -> None:
         self._stop.set()
-        self._thread.join(timeout=7)
+        self._thread.join(timeout=2 * NVIDIA_SMI_TIMEOUT_SECONDS + 2.0)
 
     @property
     def complete(self) -> bool:

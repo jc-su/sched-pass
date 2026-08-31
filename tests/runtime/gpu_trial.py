@@ -61,6 +61,24 @@ def main() -> None:
         else:
             raise AssertionError("failed compute-process query was accepted")
 
+    sampler = gpu_trial.CotenantSampler("test-owner")
+    with patch.object(
+        gpu_trial,
+        "_run_nvidia_smi",
+        side_effect=(completed(""), completed("34, 1200, 88.5, 0x0\n")),
+    ):
+        sampler._sample_once()
+    assert sampler.samples == 1
+    assert sampler.sampling_errors == 0
+    assert sampler.telemetry_samples == 1
+    assert sampler.temperature_min_c == sampler.temperature_max_c == 34
+
+    failed_sampler = gpu_trial.CotenantSampler("test-owner")
+    with patch.object(gpu_trial, "_run_nvidia_smi", return_value=None):
+        failed_sampler._sample_once()
+    assert failed_sampler.samples == 0
+    assert failed_sampler.sampling_errors == 1
+
     print("gpu_trial=pass")
 
 
