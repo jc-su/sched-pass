@@ -108,7 +108,9 @@ int main() {
   static_assert(nta::decodeTierCapabilities(nta::encodeTierCapabilities(
                     nta::TierDirectAddress | nta::TierHostRegistered)) ==
                 (nta::TierDirectAddress | nta::TierHostRegistered));
-  if (Version != 42 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
+  static_assert((WorkItemSupportedFlags & WorkItemEventPartition) != 0);
+  static_assert((WorkItemSupportedFlags & WorkItemBindCurrentGeneration) != 0);
+  if (Version != 43 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
       MaximumEventCompletionClasses != 64 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;

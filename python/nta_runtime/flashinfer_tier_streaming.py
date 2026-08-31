@@ -43,6 +43,7 @@ from .runtime import (
     Runtime,
     RuntimeConfig,
     WorkItem,
+    WorkItemFlag,
     copy_host_to_device_async,
     require_operator_pair,
 )
@@ -738,6 +739,9 @@ class FlashInferTierStreamingOperator:
                     contributor_index,
                     contributor_counts[group.request_index],
                     0,
+                    0,
+                    0,
+                    int(WorkItemFlag.BIND_CURRENT_GENERATION),
                 )
             )
             contributor_indices[group.request_index] += 1

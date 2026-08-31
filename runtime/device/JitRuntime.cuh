@@ -107,7 +107,9 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
       item.reductionGroup >= runtime->workTicketCapacity ||
       item.contributorCount == 0 ||
       item.contributorIndex >= item.contributorCount ||
-      item.directDependencyCount > item.dependencyCount || item.flags != 0) {
+      item.directDependencyCount > item.dependencyCount ||
+      (item.flags & ~nta::abi::WorkItemSupportedFlags) != 0 ||
+      (item.flags & nta::abi::WorkItemEventPartition) != 0) {
     nta::device::failWorkTicket(runtime, item.workTicket,
                                 nta::abi::WorkTicketState::Failed);
     return;
@@ -120,7 +122,10 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
     ticket.contributorCount = item.contributorCount;
   }
   const nta::abi::RequestContext &request = runtime->requests[item.requestSlot];
-  const std::uint32_t generation = item.generation;
+  const std::uint32_t generation =
+      (item.flags & nta::abi::WorkItemBindCurrentGeneration) != 0
+          ? request.generation
+          : item.generation;
   std::uint64_t deadlineClock = request.deadlineClock;
   if (item.readyDeadlineOffsetNs != 0) {
     const std::uint64_t workDeadline = nta::device::saturatingAdd(
@@ -380,7 +385,8 @@ extern "C" __global__ void nta_prepare_event_work_partition(
   bool invalid = false;
   for (std::uint32_t work = 0; work < workItemCount; ++work) {
     const nta::abi::WorkItem item = workItems[work];
-    if (item.flags != nta::abi::WorkItemEventPartition) {
+    if ((item.flags & ~nta::abi::WorkItemSupportedFlags) != 0 ||
+        (item.flags & nta::abi::WorkItemEventPartition) == 0) {
       invalid = true;
       break;
     }

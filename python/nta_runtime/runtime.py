@@ -483,6 +483,7 @@ class WorkItem(ctypes.Structure):
 
 class WorkItemFlag(enum.IntFlag):
     EVENT_PARTITION = 1 << 0
+    BIND_CURRENT_GENERATION = 1 << 1
 
 
 class RequestRange(ctypes.Structure):

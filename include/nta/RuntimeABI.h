@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 42;
+inline constexpr std::uint32_t Version = 43;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 6;
 inline constexpr std::uint32_t MaximumEventCompletionClasses = 64;
@@ -391,7 +391,12 @@ struct alignas(32) WorkItem {
 static_assert(sizeof(WorkItem) == 64);
 
 inline constexpr std::uint32_t WorkItemEventPartition = 1U << 0;
-inline constexpr std::uint32_t WorkItemSupportedFlags = WorkItemEventPartition;
+// A structural plan may be reused after its request slot is rebound only when
+// the producer explicitly opts into current-generation binding.  Ordinary
+// plans retain their embedded generation and therefore fail closed if stale.
+inline constexpr std::uint32_t WorkItemBindCurrentGeneration = 1U << 1;
+inline constexpr std::uint32_t WorkItemSupportedFlags =
+    WorkItemEventPartition | WorkItemBindCurrentGeneration;
 
 struct alignas(32) WorkTicket {
   std::uint64_t requestId;
