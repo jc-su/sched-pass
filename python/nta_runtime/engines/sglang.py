@@ -1441,6 +1441,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
         consumer_index = -1 if counter is None else int(counter.consumer_index)
         pending = self._hicache.get(consumer_index)
+        if in_capture and pending is not None:
+            raise RuntimeError(
+                "CUDA graph capture observed a live external acquisition"
+            )
         if pending is not None:
             self._host_acquisition.account_selection(pending)
         # A framework CUDA graph has immutable kernel arguments.  Capturing a
@@ -1457,15 +1461,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if in_capture:
             # SGLang's capture batch consists entirely of dummy rows, commonly
             # all using request-pool slot zero.  It has no serving identity and
-            # must not consume generations or pollute the persistent registry.
-            bindings: tuple[RequestBinding, ...] = ()
+            # must not consume generations, acquire a tier lease, or create a
+            # forward epoch.  The captured numerical kernels are the stock
+            # reference path; real replay metadata and acquisition ownership
+            # are rebound out of graph for each serving batch.
+            self._resident_reference_forward = True
             self._stats["graph_capture_dummy_rows"] = self._stats.get(
                 "graph_capture_dummy_rows", 0
             ) + int(getattr(forward_batch, "batch_size", 0) or 0)
-        else:
-            bindings = self._bind_forward_requests(
-                forward_batch, allow_capture_ids=False
-            )
+            self._stats["graph_captures"] += 1
+            return
+        bindings = self._bind_forward_requests(
+            forward_batch, allow_capture_ids=False
+        )
         if pending is None:
             self._forward_lifecycle.activate(
                 SglangForwardEpoch(
@@ -1521,11 +1529,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             )
             self._hicache.handoff_prefetch(pending, self._host_transport.stream)
             self._stats["graph_external_batches"] += 1
-        if in_capture:
-            self._stats["graph_captures"] += 1
-        else:
-            self._stats["graph_replays"] += 1
-            self._stats["batches"] += 1
+        self._stats["graph_replays"] += 1
+        self._stats["batches"] += 1
 
     def init_forward_metadata_in_graph(self, forward_batch: Any) -> None:
         super().init_forward_metadata_in_graph(forward_batch)

@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 from nta_runtime.engines.sglang import NtaFlashInferAttnBackend  # noqa: E402
+from sglang.srt.layers.attention.flashinfer_backend import (  # noqa: E402
+    FlashInferAttnBackend,
+)
 from nta_runtime.engines.sglang_lifecycle import (  # noqa: E402
     SglangForwardLifecycle,
 )
@@ -167,6 +170,73 @@ def test_profile_classification_survives_forward_release() -> None:
         "exactly one lifecycle epoch",
         lambda: owner.external_since(external_cursor),
     )
+
+
+def test_cuda_graph_capture_has_no_request_or_acquisition_epoch() -> None:
+    counters = new_stats()
+    backend = object.__new__(NtaFlashInferAttnBackend)
+    backend._forward_lifecycle = new_lifecycle(
+        layer_count=2,
+        hicache=FakeHiCache(),
+        counters=counters,
+    )
+    backend._hicache = backend._forward_lifecycle._hicache
+    backend._cuda_graph_mode = False
+    backend._stock_forward = False
+    backend._resident_reference_forward = False
+    backend._stats = counters
+    backend._kernels = SimpleNamespace(stock_wrappers=object())
+    backend._activate_wrapper_set = lambda _wrappers: None
+    backend.token_to_kv_pool = SimpleNamespace(layer_transfer_counter=None)
+    capture_batch = SimpleNamespace(batch_size=16)
+    reference_output = object()
+
+    with (
+        patch.object(
+            FlashInferAttnBackend,
+            "init_forward_metadata_out_graph",
+        ) as initialize_stock_graph,
+        patch.object(
+            FlashInferAttnBackend,
+            "forward_decode",
+            return_value=reference_output,
+        ) as stock_decode,
+    ):
+        backend.init_forward_metadata_out_graph(capture_batch, in_capture=True)
+        output = backend.forward_decode(
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+        )
+
+    initialize_stock_graph.assert_called_once_with(capture_batch, in_capture=True)
+    stock_decode.assert_called_once()
+    assert output is reference_output
+    assert backend._resident_reference_forward
+    assert backend._forward_lifecycle.active is None
+    assert backend._forward_lifecycle.engine_batch is None
+    assert counters["graph_capture_dummy_rows"] == 16
+    assert counters["graph_captures"] == 1
+
+    pending = SimpleNamespace(consumer_index=7)
+    backend._hicache._live[pending.consumer_index] = pending
+    backend.token_to_kv_pool.layer_transfer_counter = SimpleNamespace(
+        consumer_index=pending.consumer_index
+    )
+    with patch.object(
+        FlashInferAttnBackend,
+        "init_forward_metadata_out_graph",
+    ):
+        assert_raises(
+            "capture observed a live external acquisition",
+            lambda: backend.init_forward_metadata_out_graph(
+                capture_batch,
+                in_capture=True,
+            ),
+        )
+    assert backend._forward_lifecycle.active is None
 
 
 def test_lifecycle_boundaries() -> None:
@@ -602,6 +672,7 @@ def main() -> None:
     test_immutable_plan_and_atomic_alias_adoption()
     test_unstarted_forward_form_transition()
     test_profile_classification_survives_forward_release()
+    test_cuda_graph_capture_has_no_request_or_acquisition_epoch()
     test_lifecycle_boundaries()
     test_abort_order_and_idempotence()
     test_abort_preserves_owners_until_quiescent()
