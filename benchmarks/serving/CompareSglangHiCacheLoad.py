@@ -39,6 +39,7 @@ from gpu_trial import (  # noqa: E402
     CotenantSampler,
     TRIAL_OWNER_ENV,
     query_gpu_power_limits,
+    trial_environment_evidence,
     wait_for_free_gpu,
 )
 
@@ -467,44 +468,11 @@ def run(
         / f"{args.output.stem}.seed-{args.seed}.{role}.stdout.log"
     )
     atomic_write_text(log_path, completed.stdout)
-    failures: list[str] = []
-    if not sampler.complete:
-        failures.append("co-tenant sampler did not terminate cleanly")
-    if sampler.sampling_errors:
-        failures.append(
-            "co-tenant sampler lost environmental samples: "
-            f"{sampler.sampling_errors} errors"
-        )
-    if sampler.foreign_samples:
-        failures.append(
-            "GPU co-tenant contamination was observed in "
-            f"{sampler.foreign_samples} samples "
-            f"(pids={sorted(sampler.foreign_pids)})"
-        )
-    gpu_telemetry = sampler.telemetry()
-    if int(gpu_telemetry["errors"]):
-        failures.append(
-            "GPU telemetry sampler lost environmental samples: "
-            f"{gpu_telemetry['errors']} errors"
-        )
-    if int(gpu_telemetry["thermal_slowdown_samples"]):
-        failures.append(
-            "GPU thermal slowdown contaminated "
-            f"{gpu_telemetry['thermal_slowdown_samples']} samples"
-        )
-    observed_power_limits = (
-        gpu_telemetry["power_limit_min_watts"],
-        gpu_telemetry["power_limit_max_watts"],
+    environment_evidence, failures = trial_environment_evidence(
+        sampler,
+        expected_power_limit_watts=power_limits[0],
+        start_max_temperature_c=args.gpu_start_max_temperature_c,
     )
-    if any(value is None for value in observed_power_limits) or any(
-        abs(float(value) - power_limits[0]) > 0.01
-        for value in observed_power_limits
-        if value is not None
-    ):
-        failures.append(
-            "GPU power limit changed during the serving arm "
-            f"(expected={power_limits[0]:.2f}, observed={observed_power_limits})"
-        )
     if completed.returncode:
         failures.append(f"worker exited with status {completed.returncode}")
     environment_path = log_path.with_suffix(".environment.json")
@@ -516,12 +484,7 @@ def run(
             "backend": backend,
             "returncode": completed.returncode,
             "failures": failures,
-            "gpu_environment": gpu_telemetry,
-            "gpu_start_max_temperature_c": args.gpu_start_max_temperature_c,
-            "cotenant_gpu_samples": sampler.foreign_samples,
-            "gpu_sampling_errors": sampler.sampling_errors,
-            "gpu_sampling_complete": sampler.complete,
-            "cotenant_pids_seen": sorted(sampler.foreign_pids),
+            **environment_evidence,
         },
     )
     if failures:
@@ -530,13 +493,7 @@ def run(
             + "\n".join(completed.stdout.splitlines()[-120:])
         )
     report = _report(completed.stdout)
-    report["cotenant_gpu_samples"] = sampler.foreign_samples
-    report["gpu_samples"] = sampler.samples
-    report["gpu_sampling_errors"] = sampler.sampling_errors
-    report["gpu_sampling_complete"] = sampler.complete
-    report["cotenant_pids_seen"] = sorted(sampler.foreign_pids)
-    report["gpu_environment"] = gpu_telemetry
-    report["gpu_start_max_temperature_c"] = args.gpu_start_max_temperature_c
+    report.update(environment_evidence)
     report["arm_environment"] = str(environment_path)
     report["arm_log"] = str(log_path)
     return report

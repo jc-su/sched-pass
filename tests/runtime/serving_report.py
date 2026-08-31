@@ -77,6 +77,21 @@ def single() -> dict[str, object]:
         "gpu_sampling_errors": 0,
         "gpu_sampling_complete": True,
         "cotenant_pids_seen": [],
+        "gpu_start_max_temperature_c": 60,
+        "gpu_environment": {
+            "samples": 1,
+            "errors": 0,
+            "temperature_min_c": 34,
+            "temperature_max_c": 50,
+            "graphics_clock_min_mhz": 1000,
+            "graphics_clock_max_mhz": 1800,
+            "graphics_clock_mean_mhz": 1500.0,
+            "power_max_watts": 450.0,
+            "power_limit_min_watts": 500.0,
+            "power_limit_max_watts": 500.0,
+            "thermal_slowdown_samples": 0,
+            "clock_reason_masks": ["0x0000000000000000"],
+        },
         "verification_failures": 0,
         "correctness": {"verification_failures": 0, "generated_text_sha256": "all"},
         "generated_text_sha256": "all",
@@ -500,6 +515,24 @@ def main() -> None:
         assert "contaminated" in str(error)
     else:
         raise AssertionError("co-tenant-contaminated serving evidence was accepted")
+    thermal_environment = copy.deepcopy(comparison)
+    thermal_environment["nta"]["gpu_environment"][
+        "thermal_slowdown_samples"
+    ] = 1
+    try:
+        validate(thermal_environment)
+    except ValueError as error:
+        assert "thermal slowdown" in str(error)
+    else:
+        raise AssertionError("thermally contaminated serving evidence was accepted")
+    unstable_power = copy.deepcopy(comparison)
+    unstable_power["nta"]["gpu_environment"]["power_limit_max_watts"] = 450.0
+    try:
+        validate(unstable_power)
+    except ValueError as error:
+        assert "power limit" in str(error)
+    else:
+        raise AssertionError("power-limit-changing serving evidence was accepted")
     missing_initial_placement = copy.deepcopy(comparison)
     del missing_initial_placement["nta"]["initial_placement_proof"]
     try:

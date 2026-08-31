@@ -26,6 +26,8 @@ if str(ROOT) not in sys.path:
 from benchmarks.serving.gpu_trial import (  # noqa: E402
     CotenantSampler,
     TRIAL_OWNER_ENV,
+    query_gpu_power_limits,
+    trial_environment_evidence,
     wait_for_free_gpu,
 )
 from experiments.atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
@@ -35,6 +37,7 @@ from experiments.mechanism_arms import (  # noqa: E402
     arm_environment,
     validate_arm_result,
 )
+from experiments.validate_serving_report import validate_formal_arm  # noqa: E402
 
 
 _OWNED_EXECUTION_ENV = {
@@ -53,6 +56,12 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--gpu-wait-timeout-seconds", type=float, default=600.0)
+    parser.add_argument(
+        "--gpu-start-max-temperature-c",
+        type=int,
+        default=60,
+        help="maximum GPU temperature for two samples before the arm",
+    )
     parser.add_argument("load_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     load_args = list(args.load_args)
@@ -72,6 +81,8 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
         parser.error("wrapper-owned load arguments were supplied: " + ", ".join(conflicts))
     if args.gpu_wait_timeout_seconds <= 0:
         parser.error("GPU wait timeout must be positive")
+    if args.gpu_start_max_temperature_c <= 0:
+        parser.error("GPU start temperature must be positive")
     return args, load_args
 
 
@@ -117,7 +128,19 @@ def main() -> int:
     owner_token = f"{os.getpid()}:{time.monotonic_ns()}:{args.arm}"
     environment[TRIAL_OWNER_ENV] = owner_token
 
-    wait_for_free_gpu(timeout_seconds=args.gpu_wait_timeout_seconds)
+    wait_for_free_gpu(
+        timeout_seconds=args.gpu_wait_timeout_seconds,
+        max_temperature_c=args.gpu_start_max_temperature_c,
+        stable_samples=2,
+    )
+    power_limits = query_gpu_power_limits()
+    if len(power_limits) != 1:
+        raise RuntimeError(
+            "SGLang serving artifact currently requires exactly one visible GPU"
+        )
+    environment["NTA_EXECUTION_CALIBRATION_GPU_POWER_LIMIT_WATTS"] = (
+        f"{power_limits[0]:.2f}"
+    )
     with CotenantSampler(owner_token) as sampler:
         completed = subprocess.run(
             command,
@@ -130,25 +153,36 @@ def main() -> int:
         )
     log_path = output.with_suffix(output.suffix + ".stdout.log")
     atomic_write_text(log_path, completed.stdout)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"SGLang {args.arm} failed with status {completed.returncode}; "
-            f"see {log_path}"
-        )
-    if not sampler.complete:
-        raise RuntimeError("GPU co-tenant sampler did not terminate")
-    report = _report(completed.stdout)
-    report.update(
-        {
-            "gpu_samples": sampler.samples,
-            "gpu_sampling_errors": sampler.sampling_errors,
-            "gpu_sampling_complete": sampler.complete,
-            "cotenant_gpu_samples": sampler.foreign_samples,
-            "cotenant_pids_seen": sorted(sampler.foreign_pids),
-            "evaluation_arm": args.arm,
-        }
+    environment_evidence, failures = trial_environment_evidence(
+        sampler,
+        expected_power_limit_watts=power_limits[0],
+        start_max_temperature_c=args.gpu_start_max_temperature_c,
     )
+    if completed.returncode:
+        failures.append(f"worker exited with status {completed.returncode}")
+    environment_path = output.with_suffix(output.suffix + ".environment.json")
+    atomic_write_json(
+        environment_path,
+        {
+            "schema": 1,
+            "classification": "sglang-hicache-arm-environment",
+            "evaluation_arm": args.arm,
+            "returncode": completed.returncode,
+            "failures": failures,
+            **environment_evidence,
+        },
+    )
+    if failures:
+        raise RuntimeError(
+            f"SGLang {args.arm} failed ({'; '.join(failures)}); see {log_path}"
+        )
+    report = _report(completed.stdout)
+    report.update(environment_evidence)
+    report["arm_environment"] = str(environment_path)
+    report["arm_log"] = str(log_path)
+    report["evaluation_arm"] = args.arm
     report["evaluation_arm_activation"] = validate_arm_result(report, args.arm)
+    validate_formal_arm(report)
     atomic_write_json(output, report)
     print(json.dumps(report, sort_keys=True))
     return 0

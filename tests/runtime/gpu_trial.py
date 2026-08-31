@@ -79,6 +79,24 @@ def main() -> None:
     assert sampler.temperature_min_c == sampler.temperature_max_c == 34
     assert sampler.power_limit_min_watts == 500.0
     assert sampler.power_limit_max_watts == 500.0
+    evidence, failures = gpu_trial.trial_environment_evidence(
+        sampler,
+        expected_power_limit_watts=500.0,
+        start_max_temperature_c=40,
+    )
+    assert not failures
+    assert evidence["gpu_samples"] == 1
+    telemetry = evidence["gpu_environment"]
+    assert isinstance(telemetry, dict)
+    assert telemetry["thermal_slowdown_samples"] == 0
+
+    sampler.thermal_slowdown_samples = 1
+    _, failures = gpu_trial.trial_environment_evidence(
+        sampler,
+        expected_power_limit_watts=500.0,
+        start_max_temperature_c=40,
+    )
+    assert any("thermal slowdown" in failure for failure in failures)
 
     failed_sampler = gpu_trial.CotenantSampler("test-owner")
     with patch.object(gpu_trial, "_run_nvidia_smi", return_value=None):

@@ -355,3 +355,73 @@ class CotenantSampler:
                 f"0x{mask:016x}" for mask in sorted(self.clock_reason_masks)
             ],
         }
+
+
+def trial_environment_evidence(
+    sampler: CotenantSampler,
+    *,
+    expected_power_limit_watts: float,
+    start_max_temperature_c: int,
+) -> tuple[dict[str, object], list[str]]:
+    """Seal one serving arm's shared, fail-closed GPU environment evidence."""
+
+    if expected_power_limit_watts <= 0.0:
+        raise ValueError("expected GPU power limit must be positive")
+    if start_max_temperature_c <= 0:
+        raise ValueError("GPU start temperature must be positive")
+
+    failures: list[str] = []
+    if not sampler.complete:
+        failures.append("co-tenant sampler did not terminate cleanly")
+    if not sampler.samples:
+        failures.append("GPU environment sampler recorded no successful sample")
+    if sampler.sampling_errors:
+        failures.append(
+            "co-tenant sampler lost environmental samples: "
+            f"{sampler.sampling_errors} errors"
+        )
+    if sampler.foreign_samples:
+        failures.append(
+            "GPU co-tenant contamination was observed in "
+            f"{sampler.foreign_samples} samples "
+            f"(pids={sorted(sampler.foreign_pids)})"
+        )
+
+    telemetry = sampler.telemetry()
+    if not int(telemetry["samples"]):
+        failures.append("GPU telemetry sampler recorded no successful sample")
+    if int(telemetry["errors"]):
+        failures.append(
+            "GPU telemetry sampler lost environmental samples: "
+            f"{telemetry['errors']} errors"
+        )
+    if int(telemetry["thermal_slowdown_samples"]):
+        failures.append(
+            "GPU thermal slowdown contaminated "
+            f"{telemetry['thermal_slowdown_samples']} samples"
+        )
+    observed_power_limits = (
+        telemetry["power_limit_min_watts"],
+        telemetry["power_limit_max_watts"],
+    )
+    if any(value is None for value in observed_power_limits) or any(
+        abs(float(value) - expected_power_limit_watts) > 0.01
+        for value in observed_power_limits
+        if value is not None
+    ):
+        failures.append(
+            "GPU power limit changed during the serving arm "
+            f"(expected={expected_power_limit_watts:.2f}, "
+            f"observed={observed_power_limits})"
+        )
+
+    evidence: dict[str, object] = {
+        "gpu_samples": sampler.samples,
+        "gpu_sampling_errors": sampler.sampling_errors,
+        "gpu_sampling_complete": sampler.complete,
+        "cotenant_gpu_samples": sampler.foreign_samples,
+        "cotenant_pids_seen": sorted(sampler.foreign_pids),
+        "gpu_environment": telemetry,
+        "gpu_start_max_temperature_c": start_max_temperature_c,
+    }
+    return evidence, failures

@@ -238,6 +238,64 @@ def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> 
             foreign_samples == 0,
             "formal serving evidence was contaminated by a foreign GPU process",
         )
+        start_temperature = report.get("gpu_start_max_temperature_c")
+        _require(
+            isinstance(start_temperature, int)
+            and not isinstance(start_temperature, bool)
+            and start_temperature > 0,
+            "formal serving evidence has no GPU start-temperature contract",
+        )
+        telemetry = report.get("gpu_environment")
+        _require(
+            isinstance(telemetry, dict),
+            "formal serving evidence has no GPU telemetry",
+        )
+        telemetry_samples = _nonnegative_integer(
+            telemetry.get("samples"), "GPU telemetry sample count"
+        )
+        telemetry_errors = _nonnegative_integer(
+            telemetry.get("errors"), "GPU telemetry error count"
+        )
+        thermal_samples = _nonnegative_integer(
+            telemetry.get("thermal_slowdown_samples"),
+            "GPU thermal-slowdown sample count",
+        )
+        _require(
+            telemetry_samples == samples,
+            "GPU occupancy and telemetry sample counts disagree",
+        )
+        _require(telemetry_errors == 0, "formal serving evidence lost GPU telemetry")
+        _require(
+            thermal_samples == 0,
+            "formal serving evidence contains GPU thermal slowdown",
+        )
+        temperature_min = _finite(
+            telemetry.get("temperature_min_c"), "minimum GPU temperature"
+        )
+        temperature_max = _finite(
+            telemetry.get("temperature_max_c"), "maximum GPU temperature"
+        )
+        _require(
+            0.0 < temperature_min <= temperature_max,
+            "formal serving evidence has invalid GPU temperatures",
+        )
+        _require(
+            temperature_min <= start_temperature,
+            "formal serving arm did not begin below its temperature contract",
+        )
+        power_limit_min = _finite(
+            telemetry.get("power_limit_min_watts"), "minimum GPU power limit"
+        )
+        power_limit_max = _finite(
+            telemetry.get("power_limit_max_watts"), "maximum GPU power limit"
+        )
+        _require(
+            power_limit_min > 0.0
+            and math.isclose(
+                power_limit_min, power_limit_max, rel_tol=0.0, abs_tol=0.01
+            ),
+            "formal serving evidence changed GPU power limit",
+        )
 
 
 def _validate_finite_window_accounting(report: dict[str, Any]) -> None:
