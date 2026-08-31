@@ -36,6 +36,7 @@ def single() -> dict[str, object]:
     records = [
         {
             "kind": "resident",
+            "index": 0,
             "request_id": "request-0",
             "arrival_offset_seconds": 0.0,
             "submitted_offset_seconds": 0.1,
@@ -52,6 +53,8 @@ def single() -> dict[str, object]:
             "input_tokens": 32,
             "device_cached_tokens": 31,
             "host_cached_tokens": 0,
+            "initial_cache_state": "resident",
+            "observed_cache_state": "device",
             "text_sha256": "resident-digest",
             "inter_token_seconds": [0.01],
         }
@@ -72,6 +75,13 @@ def single() -> dict[str, object]:
                 {"index": 0, "expected": 32, "device": 0, "host": 32}
             ],
         },
+        "initial_resident_placement_proof": {
+            "reason": "measured_reconstruction",
+            "observations": [
+                {"index": 0, "expected": 31, "device": 31, "host": 0}
+            ],
+        },
+        "cache_state_transitions": {"resident_to_device": 1},
         "cotenant_gpu_samples": 0,
         "gpu_samples": 1,
         "gpu_sampling_errors": 0,
@@ -338,6 +348,24 @@ def main() -> None:
     ):
         standalone.pop(field)
     validate(standalone)
+    transitioned = copy.deepcopy(standalone)
+    transitioned["records"][0].update(
+        {
+            "device_cached_tokens": 16,
+            "host_cached_tokens": 15,
+            "observed_cache_state": "split",
+        }
+    )
+    transitioned["cache_state_transitions"] = {"resident_to_split": 1}
+    validate(transitioned)
+    lost_resident_prefix = copy.deepcopy(transitioned)
+    lost_resident_prefix["records"][0]["host_cached_tokens"] = 14
+    try:
+        validate(lost_resident_prefix)
+    except ValueError as error:
+        assert "lost its exact cached prefix" in str(error)
+    else:
+        raise AssertionError("inexact resident transition passed validation")
     tampered_goodput = copy.deepcopy(comparison)
     tampered_goodput["nta_preregistered_goodput"][
         "goodput_requests_per_second"

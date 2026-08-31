@@ -2361,6 +2361,7 @@ def main() -> int:
     placement_pressure_total_tokens = 0
     placement_probe_history: list[dict[str, Any]] = []
     final_placement_proof: dict[str, Any] = {}
+    resident_placement_history: list[dict[str, Any]] = []
     pressure_forbidden_first_tokens = {
         int(prompt[0])
         for prompt in (
@@ -2401,9 +2402,10 @@ def main() -> int:
             engine, requested_cpu_affinity
         )
 
-        def warm_residents() -> None:
+        def warm_residents(*, reason: str) -> None:
             """Materialize, then exactly verify the resident working set."""
 
+            observations: list[dict[str, int]] = []
             for begin in range(0, len(resident_prompts), args.max_running_requests):
                 end = begin + args.max_running_requests
                 prompts = resident_prompts[begin:end]
@@ -2424,7 +2426,9 @@ def main() -> int:
                             [dict(setup_sampling)] * len(prompts),
                         )
                     )
-                for prompt, result in zip(prompts, results, strict=True):
+                for offset, (prompt, result) in enumerate(
+                    zip(prompts, results, strict=True)
+                ):
                     actual_device = device_cached_tokens(result)
                     actual_host = host_cached_tokens(result)
                     if actual_device != len(prompt) - 1 or actual_host != 0:
@@ -2434,6 +2438,17 @@ def main() -> int:
                             f"expected={len(prompt) - 1}, "
                             f"device={actual_device}, host={actual_host}"
                         )
+                    observations.append(
+                        {
+                            "index": begin + offset,
+                            "expected": len(prompt) - 1,
+                            "device": actual_device,
+                            "host": actual_host,
+                        }
+                    )
+            resident_placement_history.append(
+                {"reason": reason, "observations": observations}
+            )
 
         load_seconds = time.perf_counter() - load_started
         generated_text(_generate_one(engine, shape_prompt, setup_sampling))
@@ -2565,7 +2580,7 @@ def main() -> int:
             )
 
         construct_external_placement(reason="jit_warmup")
-        warm_residents()
+        warm_residents(reason="jit_warmup")
 
         def establish_final_placement() -> None:
             """Rebuild the requested device/host split from an empty cache.
@@ -2594,7 +2609,7 @@ def main() -> int:
                 )
             )
             construct_external_placement(reason="measured_reconstruction")
-            warm_residents()
+            warm_residents(reason="measured_reconstruction")
 
         establish_final_placement()
 
@@ -2732,6 +2747,13 @@ def main() -> int:
             + json.dumps(missing_external, sort_keys=True)
         )
     expected_resident_prefixes = [len(value) - 1 for value in resident_prompts]
+    for record in [*external, *resident]:
+        host = int(record["host_cached_tokens"])
+        device = int(record["device_cached_tokens"])
+        record["initial_cache_state"] = str(record["kind"])
+        record["observed_cache_state"] = (
+            "device" if host == 0 else ("host" if device == 0 else "split")
+        )
     missing_resident = [
         {
             "index": record["index"],
@@ -2740,8 +2762,8 @@ def main() -> int:
             "host": record["host_cached_tokens"],
         }
         for record in resident
-        if record["device_cached_tokens"] != expected_resident_prefixes[record["index"]]
-        or record["host_cached_tokens"] != 0
+        if record["device_cached_tokens"] + record["host_cached_tokens"]
+        != expected_resident_prefixes[record["index"]]
     ]
     minimum_host_prefix = min(record["host_cached_tokens"] for record in external)
     execution_ready_external = [
@@ -2749,8 +2771,21 @@ def main() -> int:
     ]
     if missing_resident:
         raise RuntimeError(
-            "a timed resident request was not device-resident: "
+            "a timed initially-resident request lost its exact cached prefix: "
             + json.dumps(missing_resident, sort_keys=True)
+        )
+    if not resident_placement_history or (
+        resident_placement_history[-1]["reason"] != "measured_reconstruction"
+    ):
+        raise RuntimeError("final resident placement was not reconstructed")
+    cache_state_transitions: dict[str, int] = {}
+    for record in records:
+        transition = (
+            f"{record['initial_cache_state']}_to_"
+            f"{record['observed_cache_state']}"
+        )
+        cache_state_transitions[transition] = (
+            cache_state_transitions.get(transition, 0) + 1
         )
 
     def external_shapes(values: Sequence[dict[str, Any]]) -> list[dict[str, int]]:
@@ -2991,6 +3026,8 @@ def main() -> int:
         "placement_pressure_applications": placement_pressure_applications,
         "placement_probe_history": placement_probe_history,
         "initial_placement_proof": final_placement_proof,
+        "initial_resident_placement_proof": resident_placement_history[-1],
+        "cache_state_transitions": cache_state_transitions,
         "resident_input_cache_tokens": resident_cache_tokens,
         "external_input_cache_tokens": external_cache_tokens,
         "combined_input_cache_tokens": combined_cache_tokens,

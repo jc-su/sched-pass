@@ -246,6 +246,88 @@ def _validate_cache_binding(
         )
 
 
+def _validate_initial_resident_placement(
+    report: dict[str, Any], records: list[dict[str, Any]]
+) -> None:
+    """Prove initial residency separately from state at a later arrival."""
+
+    proof = report.get("initial_resident_placement_proof")
+    _require(
+        isinstance(proof, dict)
+        and proof.get("reason") == "measured_reconstruction",
+        "serving report has no reconstructed resident placement proof",
+    )
+    observations = proof.get("observations")
+    _require(
+        isinstance(observations, list) and observations,
+        "serving resident placement proof has no observations",
+    )
+    resident = sorted(
+        (record for record in records if record.get("kind") == "resident"),
+        key=lambda record: int(record["index"]),
+    )
+    _require(
+        len(observations) == len(resident),
+        "serving resident placement proof count disagrees with requests",
+    )
+    for position, observation in enumerate(observations):
+        _require(
+            isinstance(observation, dict),
+            f"serving resident placement observation {position} is not an object",
+        )
+        values = tuple(
+            observation.get(field) for field in ("index", "expected", "device", "host")
+        )
+        _require(
+            all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in values
+            ),
+            f"serving resident placement observation {position} is not integral",
+        )
+        index, expected, device, host = (int(value) for value in values)
+        _require(
+            index == position
+            and expected > 0
+            and device == expected
+            and host == 0
+            and int(resident[position]["index"]) == position
+            and int(resident[position]["input_tokens"]) - 1 == expected,
+            f"serving resident placement observation {position} is not device-resident",
+        )
+
+
+def _validate_cache_state_transitions(
+    report: dict[str, Any], records: list[dict[str, Any]]
+) -> None:
+    observed: dict[str, int] = {}
+    for index, record in enumerate(records):
+        initial = record.get("initial_cache_state")
+        state = record.get("observed_cache_state")
+        host = int(record["host_cached_tokens"])
+        device = int(record["device_cached_tokens"])
+        recomputed = "device" if host == 0 else ("host" if device == 0 else "split")
+        _require(
+            initial == record["kind"]
+            and state == recomputed
+            and host >= 0
+            and device >= 0
+            and host + device > 0,
+            f"serving record {index} cache-state transition is inconsistent",
+        )
+        if initial == "resident":
+            _require(
+                host + device == int(record["input_tokens"]) - 1,
+                f"serving resident record {index} lost its exact cached prefix",
+            )
+        transition = f"{initial}_to_{state}"
+        observed[transition] = observed.get(transition, 0) + 1
+    _require(
+        report.get("cache_state_transitions") == observed,
+        "serving cache-state transition summary is inconsistent",
+    )
+
+
 def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> None:
     """Validate run-level GPU occupancy evidence.
 
@@ -753,6 +835,7 @@ def _validate_single(
         )
         for field in (
             "kind",
+            "index",
             "arrival_offset_seconds",
             "submitted_offset_seconds",
             "finished_offset_seconds",
@@ -768,6 +851,8 @@ def _validate_single(
             "input_tokens",
             "host_cached_tokens",
             "device_cached_tokens",
+            "initial_cache_state",
+            "observed_cache_state",
             "text_sha256",
             "request_id",
         ):
@@ -843,6 +928,8 @@ def _validate_single(
             f"record {index} p99 ITL",
         )
     _validate_cache_binding(report, records)
+    _validate_initial_resident_placement(report, records)
+    _validate_cache_state_transitions(report, records)
     engine_stats = report.get("engine_stats")
     _require(
         isinstance(engine_stats, list),
