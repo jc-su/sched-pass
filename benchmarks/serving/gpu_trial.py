@@ -364,7 +364,13 @@ def trial_environment_evidence(
     start_max_temperature_c: int,
     expected_graphics_clock_limit_mhz: int | None = None,
 ) -> tuple[dict[str, object], list[str]]:
-    """Seal one serving arm's shared, fail-closed GPU environment evidence."""
+    """Seal one serving arm's shared, fail-closed GPU environment evidence.
+
+    Power, temperature, and clock observations are trial-validity telemetry,
+    never mechanism inputs.  An explicit graphics-clock limit identifies a
+    diagnostic sensitivity run; omission identifies the production-default
+    DVFS policy used by headline serving trials.
+    """
 
     if expected_power_limit_watts <= 0.0:
         raise ValueError("expected GPU power limit must be positive")
@@ -444,5 +450,10 @@ def trial_environment_evidence(
         "gpu_environment": telemetry,
         "gpu_start_max_temperature_c": start_max_temperature_c,
         "gpu_graphics_clock_limit_mhz": expected_graphics_clock_limit_mhz,
+        "gpu_clock_policy": (
+            "production_default_dvfs"
+            if expected_graphics_clock_limit_mhz is None
+            else "fixed_diagnostic"
+        ),
     }
     return evidence, failures

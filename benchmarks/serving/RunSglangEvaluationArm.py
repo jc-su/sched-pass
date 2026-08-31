@@ -67,8 +67,8 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
         "--gpu-graphics-clock-limit-mhz",
         type=int,
         help=(
-            "externally configured sustainable graphics-clock ceiling, "
-            "verified from arm telemetry"
+            "optional externally configured fixed clock for diagnostic "
+            "sensitivity runs; omit for headline production-DVFS evidence"
         ),
     )
     parser.add_argument("load_args", nargs=argparse.REMAINDER)

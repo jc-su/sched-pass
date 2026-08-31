@@ -112,8 +112,9 @@ def parse_args() -> argparse.Namespace:
         "--gpu-graphics-clock-limit-mhz",
         type=int,
         help=(
-            "externally configured sustainable graphics-clock ceiling, "
-            "verified identically for every arm"
+            "optional externally configured fixed clock for diagnostic "
+            "sensitivity runs; fixed-clock results are not headline "
+            "production-DVFS evidence"
         ),
     )
     parser.add_argument(

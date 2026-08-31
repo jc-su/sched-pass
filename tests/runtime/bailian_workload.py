@@ -150,9 +150,7 @@ def main() -> None:
     assert replay.metadata["measured_axes"]["input_tokens"]["heterogeneous"]
     assert replay.measured_rows[0]["replayable_prefix_provider_source_index"] == 0
     assert replay.measured_rows[0]["replayable_reuse_gap_seconds"] == 3.0
-    assert (
-        replay.measured_rows[0]["replayable_intervening_unique_input_pages"] == 2
-    )
+    assert replay.measured_rows[0]["replayable_intervening_unique_input_pages"] == 2
     opportunity = replay.metadata["mechanism_opportunity"]
     assert opportunity["input_capacity_crossing_requests"] == 1
     assert opportunity["tier_overlap_candidate_requests"] == 1
@@ -197,7 +195,10 @@ def main() -> None:
     assert boundary["source_prefix_identity_preserved"] is True
     assert boundary["synthetic_output_alias_prevented"] is True
     assert encoded[0] == bounded[2][: len(encoded[0])]
-    assert replay_cache_state({"host_cached_tokens": 3, "device_cached_tokens": 0}) == "host"
+    assert (
+        replay_cache_state({"host_cached_tokens": 3, "device_cached_tokens": 0})
+        == "host"
+    )
     dispatch = _native_dispatch_distribution(
         [
             {
@@ -241,9 +242,7 @@ def main() -> None:
     assert progressive["layer_observations"] == 4
     assert progressive["active_observations"] == 2
     assert progressive["layer_fraction"] == 1 / 18
-    _validate_progressive_consumer(
-        {"progressive_consumer": progressive}, nta=True
-    )
+    _validate_progressive_consumer({"progressive_consumer": progressive}, nta=True)
     readiness = _prefetch_arrival_readiness(
         [
             {
@@ -258,9 +257,7 @@ def main() -> None:
     )
     assert readiness["ready_at_arrival"] == 2
     assert readiness["not_ready_at_arrival"] == 1
-    _validate_prefetch_arrival_readiness(
-        {"prefetch_arrival_readiness": readiness}
-    )
+    _validate_prefetch_arrival_readiness({"prefetch_arrival_readiness": readiness})
     try:
         encode_content_blocks(
             replay.rows,
@@ -466,12 +463,9 @@ def main() -> None:
             cohort_rows,
         )
         validated_cohort = validate(cohort_path)
-        assert validated_cohort["cohort_heterogeneity"][
-            "joint_shape_heterogeneity"
-        ]
+        assert validated_cohort["cohort_heterogeneity"]["joint_shape_heterogeneity"]
         assert validated_cohort["selection"]["active_tokens"] == sum(
-            row["input_length"] + max(1, row["output_length"])
-            for row in cohort_rows
+            row["input_length"] + max(1, row["output_length"]) for row in cohort_rows
         )
         assert {row["request_state"] for row in cohort_rows} == {
             "resident",
@@ -480,22 +474,52 @@ def main() -> None:
         assert validated_cohort["selection"]["max_external_query_rows"] == 16
         assert all(
             row["request_state"] != "external"
-            or row["input_length"]
-            - row["effective_cached_prefix_tokens"]
-            <= 16
+            or row["input_length"] - row["effective_cached_prefix_tokens"] <= 16
             for row in cohort_rows
         )
         assert all(row["arrival_seconds"] == 0.0 for row in cohort_rows)
         loaded_cohort = _load_workload(cohort_path, LossyTokenizer())
-        assert loaded_cohort.metadata[
-            "external_effective_cached_prefix_tokens"
-        ] == [
+        assert loaded_cohort.metadata["external_effective_cached_prefix_tokens"] == [
             row["effective_cached_prefix_tokens"]
             for row in cohort_rows
             if row["request_state"] == "external"
         ]
         assert loaded_cohort.resident_arrival_offsets == (0.0,)
         assert loaded_cohort.external_arrival_offsets == (0.0,)
+
+        cyclic_manifest, cyclic_rows = build_cohort(
+            root / "manifest.json",
+            resident_requests=1,
+            external_requests=1,
+            context_length=64,
+            max_input_tokens=56,
+            max_output_tokens=8,
+            max_external_query_rows=16,
+            active_token_budget=192,
+            arrival_mode="calibrated_open_loop",
+            target_rate=2.0,
+            replay_cycles=2,
+        )
+        cyclic_path = root / "cyclic-cohort-manifest.json"
+        write_workload(
+            cyclic_path,
+            root / "cyclic-cohort-records.jsonl",
+            cyclic_manifest,
+            cyclic_rows,
+        )
+        validated_cyclic = validate(cyclic_path)
+        replay = validated_cyclic["selection"]["controlled_replay"]
+        assert replay["cycles"] == 2
+        assert replay["base_request_count"] == 2
+        assert replay["statistical_independence_claim"] is False
+        assert len(cyclic_rows) == 4
+        assert len({row["request_id"] for row in cyclic_rows}) == 4
+        assert [row["replay_cycle"] for row in cyclic_rows] == [0, 0, 1, 1]
+        assert (
+            cyclic_rows[0]["source_request_id"] == cyclic_rows[2]["source_request_id"]
+        )
+        assert cyclic_rows[0]["hash_ids"] == cyclic_rows[2]["hash_ids"]
+        assert cyclic_rows[0]["arrival_seconds"] < cyclic_rows[2]["arrival_seconds"]
         document = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         assert document["request_count"] == 2
         fixture = (

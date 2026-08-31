@@ -75,10 +75,19 @@ def validate(path: Path) -> dict[str, Any]:
     }:
         raise ValueError("workload manifest lacks selection provenance")
     source_count = selection.get("source_request_count")
+    controlled_replay = selection.get("controlled_replay")
+    minimum_source_rows = (
+        controlled_replay.get("base_request_count")
+        if isinstance(controlled_replay, dict)
+        else len(rows)
+    )
     if (
         not isinstance(source_count, int)
         or isinstance(source_count, bool)
-        or source_count < len(rows)
+        or not isinstance(minimum_source_rows, int)
+        or isinstance(minimum_source_rows, bool)
+        or minimum_source_rows <= 0
+        or source_count < minimum_source_rows
     ):
         raise ValueError("workload selection source count is inconsistent")
     selected_max = selection.get("max_requests")
@@ -99,8 +108,7 @@ def validate(path: Path) -> dict[str, Any]:
             not isinstance(selected_max, int)
             or isinstance(selected_max, bool)
             or selected_max != len(rows)
-            or selection.get("algorithm")
-            != "deterministic_union_aware_shape_spread_v2"
+            or selection.get("algorithm") != "deterministic_union_aware_shape_spread_v2"
             or selection.get("distribution_representative_claim") is not False
         ):
             raise ValueError("diverse serving cohort selection is inconsistent")
@@ -116,21 +124,94 @@ def validate(path: Path) -> dict[str, Any]:
             or resident_count + external_count != len(rows)
         ):
             raise ValueError("diverse serving cohort role counts are invalid")
+        if controlled_replay is not None:
+            if not isinstance(controlled_replay, dict):
+                raise ValueError("controlled cohort replay provenance is invalid")
+            cycles = controlled_replay.get("cycles")
+            base_count = controlled_replay.get("base_request_count")
+            base_resident = controlled_replay.get("base_resident_requests")
+            base_external = controlled_replay.get("base_external_requests")
+            if (
+                not isinstance(cycles, int)
+                or isinstance(cycles, bool)
+                or cycles <= 1
+                or not isinstance(base_count, int)
+                or isinstance(base_count, bool)
+                or base_count <= 0
+                or not isinstance(base_resident, int)
+                or isinstance(base_resident, bool)
+                or base_resident <= 0
+                or not isinstance(base_external, int)
+                or isinstance(base_external, bool)
+                or base_external <= 0
+                or base_resident + base_external != base_count
+                or base_count * cycles != len(rows)
+                or base_resident * cycles != resident_count
+                or base_external * cycles != external_count
+                or controlled_replay.get("content_identity_reused_across_cycles")
+                is not True
+                or controlled_replay.get("statistical_independence_claim") is not False
+                or controlled_replay.get("schedule")
+                != "sequential_cycles_preserving_source_order"
+            ):
+                raise ValueError("controlled cohort replay contract is inconsistent")
+
+            cycle_rows: dict[int, list[dict[str, Any]]] = {
+                cycle: [] for cycle in range(cycles)
+            }
+            for row in rows:
+                cycle = row.get("replay_cycle")
+                source_id = row.get("source_request_id")
+                if (
+                    not isinstance(cycle, int)
+                    or isinstance(cycle, bool)
+                    or cycle not in cycle_rows
+                    or not isinstance(source_id, str)
+                    or not source_id
+                ):
+                    raise ValueError("controlled replay row identity is invalid")
+                cycle_rows[cycle].append(row)
+            if any(len(values) != base_count for values in cycle_rows.values()):
+                raise ValueError("controlled replay cycle length is inconsistent")
+
+            def replay_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+                hash_ids = row.get("hash_ids")
+                prompt_token_ids = row.get("prompt_token_ids")
+                return (
+                    row.get("source_request_id"),
+                    row.get("request_state"),
+                    row.get("input_length"),
+                    row.get("output_length"),
+                    tuple(hash_ids) if isinstance(hash_ids, list) else None,
+                    (
+                        tuple(prompt_token_ids)
+                        if isinstance(prompt_token_ids, list)
+                        else None
+                    ),
+                    row.get("prompt_text"),
+                    row.get("cached_prefix_tokens"),
+                    row.get("effective_cached_prefix_tokens"),
+                )
+
+            base_identity = [replay_identity(row) for row in cycle_rows[0]]
+            if len({identity[0] for identity in base_identity}) != base_count or any(
+                [replay_identity(row) for row in cycle_rows[cycle]] != base_identity
+                for cycle in range(1, cycles)
+            ):
+                raise ValueError(
+                    "controlled replay changed content demand across cycles"
+                )
+        elif any("replay_cycle" in row or "source_request_id" in row for row in rows):
+            raise ValueError("workload rows claim replay cycles without provenance")
         active_budget = selection.get("active_token_budget")
         active_tokens = selection.get("active_tokens")
         context_length = selection.get("context_length")
         min_input_tokens = selection.get("min_input_tokens")
         max_input_tokens = selection.get("max_input_tokens")
         max_output_tokens = selection.get("max_output_tokens")
-        min_resident_output_tokens = selection.get(
-            "min_resident_output_tokens"
-        )
-        min_external_output_tokens = selection.get(
-            "min_external_output_tokens"
-        )
-        min_external_cached_tokens = selection.get(
-            "min_external_cached_tokens"
-        )
+        min_resident_output_tokens = selection.get("min_resident_output_tokens")
+        min_external_output_tokens = selection.get("min_external_output_tokens")
+        min_external_cached_tokens = selection.get("min_external_cached_tokens")
         min_external_query_rows = selection.get("min_external_query_rows")
         if any(
             not isinstance(value, int) or isinstance(value, bool) or value <= 0
@@ -151,8 +232,7 @@ def validate(path: Path) -> dict[str, Any]:
         ):
             raise ValueError("diverse serving cohort token envelope is invalid")
         expected_active = sum(
-            int(row["input_length"]) + max(1, int(row["output_length"]))
-            for row in rows
+            int(row["input_length"]) + max(1, int(row["output_length"])) for row in rows
         )
         if (
             not isinstance(active_budget, int)
@@ -176,16 +256,13 @@ def validate(path: Path) -> dict[str, Any]:
         if any(
             (
                 row.get("request_state") == "resident"
-                and max(1, int(row["output_length"]))
-                < min_resident_output_tokens
+                and max(1, int(row["output_length"])) < min_resident_output_tokens
             )
             or (
                 row.get("request_state") == "external"
                 and (
-                    max(1, int(row["output_length"]))
-                    < min_external_output_tokens
-                    or int(row["cached_prefix_tokens"])
-                    < min_external_cached_tokens
+                    max(1, int(row["output_length"])) < min_external_output_tokens
+                    or int(row["cached_prefix_tokens"]) < min_external_cached_tokens
                 )
             )
             for row in rows
@@ -308,12 +385,8 @@ def validate(path: Path) -> dict[str, Any]:
             or request_states != {"resident", "external"}
             or state.get("counts")
             != {
-                "resident": sum(
-                    row.get("request_state") == "resident" for row in rows
-                ),
-                "external": sum(
-                    row.get("request_state") == "external" for row in rows
-                ),
+                "resident": sum(row.get("request_state") == "resident" for row in rows),
+                "external": sum(row.get("request_state") == "external" for row in rows),
             }
         ):
             raise ValueError("diverse serving cohort state provenance is inconsistent")
@@ -409,12 +482,13 @@ def validate(path: Path) -> dict[str, Any]:
         observed_effective = tuple(
             row["effective_cached_prefix_tokens"] for row in rows
         )
-        if any(
-            not isinstance(value, int)
-            or isinstance(value, bool)
-            or value <= 0
-            for value in observed_effective
-        ) or observed_effective != expected_effective:
+        if (
+            any(
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                for value in observed_effective
+            )
+            or observed_effective != expected_effective
+        ):
             raise ValueError(
                 "diverse serving cohort effective cache union is inconsistent"
             )
@@ -429,8 +503,7 @@ def validate(path: Path) -> dict[str, Any]:
         if any(
             row["request_state"] == "external"
             and (
-                int(row["input_length"])
-                - int(row["effective_cached_prefix_tokens"])
+                int(row["input_length"]) - int(row["effective_cached_prefix_tokens"])
                 < min_external_query_rows
                 or (
                     max_external_query_rows is not None
@@ -456,15 +529,12 @@ def validate(path: Path) -> dict[str, Any]:
         expected_axes = {
             "input_tokens": [int(row["input_length"]) for row in rows],
             "output_tokens": [int(row["output_length"]) for row in rows],
-            "cached_prefix_tokens": [
-                int(row["cached_prefix_tokens"]) for row in rows
-            ],
+            "cached_prefix_tokens": [int(row["cached_prefix_tokens"]) for row in rows],
             "effective_cached_prefix_tokens": [
                 int(row["effective_cached_prefix_tokens"]) for row in rows
             ],
             "uncached_query_rows": [
-                int(row["input_length"])
-                - int(row["effective_cached_prefix_tokens"])
+                int(row["input_length"]) - int(row["effective_cached_prefix_tokens"])
                 for row in rows
             ],
         }

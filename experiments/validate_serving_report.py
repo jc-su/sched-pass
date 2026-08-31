@@ -393,6 +393,22 @@ def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> 
             and start_temperature > 0,
             "formal serving evidence has no GPU start-temperature contract",
         )
+        clock_policy = report.get("gpu_clock_policy")
+        clock_limit = report.get("gpu_graphics_clock_limit_mhz")
+        _require(
+            clock_policy in ("production_default_dvfs", "fixed_diagnostic"),
+            "formal serving evidence has no declared GPU clock policy",
+        )
+        _require(
+            (clock_policy == "production_default_dvfs" and clock_limit is None)
+            or (
+                clock_policy == "fixed_diagnostic"
+                and isinstance(clock_limit, int)
+                and not isinstance(clock_limit, bool)
+                and clock_limit > 0
+            ),
+            "formal serving evidence has an inconsistent GPU clock policy",
+        )
         telemetry = report.get("gpu_environment")
         _require(
             isinstance(telemetry, dict),
@@ -1125,6 +1141,27 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
     _require(
         stock.get("machine") == nta.get("machine"),
         "serving comparison arms do not share the recorded machine",
+    )
+    _require(
+        stock.get("gpu_clock_policy") == nta.get("gpu_clock_policy")
+        and stock.get("gpu_graphics_clock_limit_mhz")
+        == nta.get("gpu_graphics_clock_limit_mhz")
+        and stock.get("gpu_start_max_temperature_c")
+        == nta.get("gpu_start_max_temperature_c"),
+        "serving comparison arms do not share the GPU trial policy",
+    )
+    stock_gpu = stock.get("gpu_environment")
+    nta_gpu = nta.get("gpu_environment")
+    _require(
+        isinstance(stock_gpu, dict)
+        and isinstance(nta_gpu, dict)
+        and math.isclose(
+            float(stock_gpu.get("power_limit_min_watts", math.nan)),
+            float(nta_gpu.get("power_limit_min_watts", math.nan)),
+            rel_tol=0.0,
+            abs_tol=0.01,
+        ),
+        "serving comparison arms do not share the GPU power-limit policy",
     )
     _require(
         isinstance(report.get("harness_args"), dict),

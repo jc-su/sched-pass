@@ -87,6 +87,7 @@ def main() -> None:
     assert not failures
     assert evidence["gpu_samples"] == 1
     assert evidence["gpu_graphics_clock_limit_mhz"] is None
+    assert evidence["gpu_clock_policy"] == "production_default_dvfs"
     telemetry = evidence["gpu_environment"]
     assert isinstance(telemetry, dict)
     assert telemetry["thermal_slowdown_samples"] == 0
@@ -107,13 +108,14 @@ def main() -> None:
         expected_graphics_clock_limit_mhz=1100,
     )
     assert any("graphics clock did not match" in failure for failure in failures)
-    _, failures = gpu_trial.trial_environment_evidence(
+    fixed_evidence, failures = gpu_trial.trial_environment_evidence(
         sampler,
         expected_power_limit_watts=500.0,
         start_max_temperature_c=40,
         expected_graphics_clock_limit_mhz=1200,
     )
     assert not failures
+    assert fixed_evidence["gpu_clock_policy"] == "fixed_diagnostic"
 
     failed_sampler = gpu_trial.CotenantSampler("test-owner")
     with patch.object(gpu_trial, "_run_nvidia_smi", return_value=None):

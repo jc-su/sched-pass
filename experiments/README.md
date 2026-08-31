@@ -113,6 +113,10 @@ runtime.
   Use `--state-policy root_resident` to construct the mixed resident/follow-up
   serving setup explicitly; the manifest records that the state labels are
   synthetic.
+- `prepare_serving_cohort.py --replay-cycles N` may repeat a bounded exact
+  content working set for a long controlled load trial. The manifest explicitly
+  denies statistical independence and gives every serving request a unique ID;
+  this is not a natural-trace claim.
 - Require exact demand and correctness digests for every compared arm.
 - Require a real tier qualification artifact before any NVMe/DAX trial.
 - Treat modeled matrix timing, missing profilers, and unavailable hardware as

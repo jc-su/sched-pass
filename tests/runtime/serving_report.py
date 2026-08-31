@@ -88,6 +88,8 @@ def single() -> dict[str, object]:
         "gpu_sampling_complete": True,
         "cotenant_pids_seen": [],
         "gpu_start_max_temperature_c": 60,
+        "gpu_graphics_clock_limit_mhz": None,
+        "gpu_clock_policy": "production_default_dvfs",
         "gpu_environment": {
             "samples": 1,
             "errors": 0,
@@ -561,6 +563,15 @@ def main() -> None:
         assert "power limit" in str(error)
     else:
         raise AssertionError("power-limit-changing serving evidence was accepted")
+    divergent_clock_policy = copy.deepcopy(comparison)
+    divergent_clock_policy["nta"]["gpu_clock_policy"] = "fixed_diagnostic"
+    divergent_clock_policy["nta"]["gpu_graphics_clock_limit_mhz"] = 1200
+    try:
+        validate(divergent_clock_policy)
+    except ValueError as error:
+        assert "GPU trial policy" in str(error)
+    else:
+        raise AssertionError("divergent GPU clock policies were accepted")
     missing_initial_placement = copy.deepcopy(comparison)
     del missing_initial_placement["nta"]["initial_placement_proof"]
     try:

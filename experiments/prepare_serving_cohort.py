@@ -182,9 +182,7 @@ def _candidate_preserves_external_query_rows(
         tuple(str(value) for value in candidate["hash_ids"]),
         int(candidate["cached_prefix_tokens"]),
     )
-    external_targets = [
-        row for row in selected if row["request_state"] == "external"
-    ]
+    external_targets = [row for row in selected if row["request_state"] == "external"]
     for target in external_targets:
         effective = effective_cached_prefixes(
             [
@@ -380,8 +378,7 @@ def _select_diverse(
     selected = _cached_union_rows(selected, block_size)
     if any(
         row["request_state"] == "external"
-        and int(row["input_length"])
-        - int(row["effective_cached_prefix_tokens"])
+        and int(row["input_length"]) - int(row["effective_cached_prefix_tokens"])
         < min_external_query_rows
         for row in selected
     ):
@@ -389,6 +386,58 @@ def _select_diverse(
             "selected cache-object union violates the external query-row bound"
         )
     return selected, _shape_score(selected)
+
+
+def _repeat_cohort(
+    rows: Sequence[Mapping[str, Any]], replay_cycles: int
+) -> list[dict[str, Any]]:
+    """Repeat one exact content working set without claiming independent rows.
+
+    A serving load experiment often needs more request observations than a
+    bounded host tier can hold as distinct KV objects.  Replaying the same
+    content working set is valid only when that reuse is explicit: request IDs
+    remain unique, source IDs and cycle numbers remain recoverable, and source
+    ordering is preserved within every cycle.  The manifest records that the
+    cycles are not statistically independent source samples.
+    """
+
+    if replay_cycles <= 0:
+        raise ValueError("serving cohort replay cycles must be positive")
+    materialized = [dict(row) for row in rows]
+    if replay_cycles == 1:
+        return materialized
+    if not materialized:
+        raise ValueError("cannot repeat an empty serving cohort")
+
+    source_ids = [str(row["request_id"]) for row in materialized]
+    if len(set(source_ids)) != len(source_ids):
+        raise ValueError("base serving cohort request IDs are not unique")
+    timestamps = [
+        float(row.get("timestamp_seconds", row.get("arrival_seconds", 0.0)))
+        for row in materialized
+    ]
+    if any(right < left for left, right in zip(timestamps, timestamps[1:])):
+        raise ValueError("base serving cohort is not source ordered")
+    origin = timestamps[0]
+    relative = [value - origin for value in timestamps]
+    positive_gaps = [
+        right - left for left, right in zip(relative, relative[1:]) if right > left
+    ]
+    wrap_gap = statistics.median(positive_gaps) if positive_gaps else 1.0
+    cycle_span = relative[-1] + wrap_gap
+
+    repeated: list[dict[str, Any]] = []
+    for cycle in range(replay_cycles):
+        for source_id, order_seconds, row in zip(
+            source_ids, relative, materialized, strict=True
+        ):
+            value = dict(row)
+            value["source_request_id"] = source_id
+            value["request_id"] = f"{source_id}::replay-cycle-{cycle}"
+            value["replay_cycle"] = cycle
+            value["cohort_order_seconds"] = order_seconds + cycle * cycle_span
+            repeated.append(value)
+    return repeated
 
 
 def _assign_arrivals(
@@ -404,7 +453,13 @@ def _assign_arrivals(
     if time_scale <= 0:
         raise ValueError("time_scale must be positive")
     timestamps = [
-        float(row.get("timestamp_seconds", row["arrival_seconds"])) for row in rows
+        float(
+            row.get(
+                "cohort_order_seconds",
+                row.get("timestamp_seconds", row["arrival_seconds"]),
+            )
+        )
+        for row in rows
     ]
     if any(right < left for left, right in zip(timestamps, timestamps[1:])):
         raise ValueError("selected serving cohort is not timestamp ordered")
@@ -439,6 +494,7 @@ def _assign_arrivals(
     for row, offset in zip(rows, offsets):
         row["arrival_seconds"] = float(offset)
         row["arrival_source"] = source
+        row.pop("cohort_order_seconds", None)
     return {
         "mode": mode,
         "source": source,
@@ -473,8 +529,7 @@ def _cohort_contract(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ),
         "uncached_query_rows": _axis(
             [
-                int(row["input_length"])
-                - int(row["effective_cached_prefix_tokens"])
+                int(row["input_length"]) - int(row["effective_cached_prefix_tokens"])
                 for row in rows
             ]
         ),
@@ -517,6 +572,7 @@ def build_cohort(
     time_scale: float = 1.0,
     burst_size: int = 4,
     external_source: str = "reuse",
+    replay_cycles: int = 1,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     source_manifest_path = source_manifest_path.resolve()
     source = validate(source_manifest_path)
@@ -547,12 +603,17 @@ def build_cohort(
         or max_output_tokens >= context_length
     ):
         raise ValueError("serving cohort token envelopes are invalid")
+    if replay_cycles <= 0:
+        raise ValueError("serving cohort replay cycles must be positive")
+    per_cycle_active_budget = active_token_budget // replay_cycles
+    if per_cycle_active_budget <= 0:
+        raise ValueError("active token budget cannot cover one replay cycle")
     selected, score = _select_diverse(
         rows,
         resident_requests=resident_requests,
         external_requests=external_requests,
         context_length=context_length,
-        active_token_budget=active_token_budget,
+        active_token_budget=per_cycle_active_budget,
         block_size=block_size,
         min_input_tokens=min_input_tokens,
         max_input_tokens=max_input_tokens,
@@ -564,6 +625,8 @@ def build_cohort(
         max_external_query_rows=max_external_query_rows,
         external_source=external_source,
     )
+    base_request_count = len(selected)
+    selected = _repeat_cohort(selected, replay_cycles)
     arrival = _assign_arrivals(
         selected,
         mode=arrival_mode,
@@ -585,8 +648,8 @@ def build_cohort(
             "mode": "diverse_serving_cohort",
             "max_requests": len(selected),
             "source_request_count": int(source["request_count"]),
-            "resident_requests": resident_requests,
-            "external_requests": external_requests,
+            "resident_requests": resident_requests * replay_cycles,
+            "external_requests": external_requests * replay_cycles,
             "external_source": external_source,
             "context_length": context_length,
             "min_input_tokens": min_input_tokens,
@@ -602,6 +665,21 @@ def build_cohort(
             "algorithm": "deterministic_union_aware_shape_spread_v2",
             "shape_score": score,
             "distribution_representative_claim": False,
+            **(
+                {
+                    "controlled_replay": {
+                        "cycles": replay_cycles,
+                        "base_request_count": base_request_count,
+                        "base_resident_requests": resident_requests,
+                        "base_external_requests": external_requests,
+                        "content_identity_reused_across_cycles": True,
+                        "statistical_independence_claim": False,
+                        "schedule": "sequential_cycles_preserving_source_order",
+                    }
+                }
+                if replay_cycles > 1
+                else {}
+            ),
         },
         "lineage": {
             "source_manifest": source_manifest_path.name,
@@ -616,8 +694,8 @@ def build_cohort(
             "synthetic": True,
             "source": "controlled_resident_external_assignment",
             "counts": {
-                "resident": resident_requests,
-                "external": external_requests,
+                "resident": resident_requests * replay_cycles,
+                "external": external_requests * replay_cycles,
             },
         },
         "cache_placement": {
@@ -680,8 +758,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--burst-size", type=int, default=4)
     parser.add_argument(
-        "--external-source", choices=EXTERNAL_SOURCES, default="reuse"
+        "--replay-cycles",
+        type=int,
+        default=1,
+        help=(
+            "repeat the selected exact content working set with unique request "
+            "IDs; cycles are recorded as non-independent controlled replay"
+        ),
     )
+    parser.add_argument("--external-source", choices=EXTERNAL_SOURCES, default="reuse")
     args = parser.parse_args(argv)
     try:
         manifest, records = build_cohort(
@@ -703,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
             time_scale=args.time_scale,
             burst_size=args.burst_size,
             external_source=args.external_source,
+            replay_cycles=args.replay_cycles,
         )
         write_workload(args.manifest, args.records, manifest, records)
         validate(args.manifest.resolve())

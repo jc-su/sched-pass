@@ -108,6 +108,16 @@ progressive heterogeneous work-unit consumption.
 RQ3 reports request-state, tier, load, arrival, and granularity strata.  RQ4
 reports control and resource overhead with profiler artifacts.
 
+Controlled saturation trials may need at least 100 timed requests even when a
+single NUMA-local host tier cannot hold 100 distinct long-context KV objects.
+`prepare_serving_cohort.py --replay-cycles N` repeats one validated exact
+content working set with unique serving request IDs. The manifest records the
+base request count, cycle number, reused content identity, and
+`statistical_independence_claim: false`; validators prove that demand is
+identical across cycles. These cycles are load observations, not independent
+Bailian samples, and are never presented as a natural trace. Natural replay
+uses source-contiguous windows and observed cache state instead.
+
 For serving, a resident-only forward is an explicit framework-reference
 control and is not counted as an NTA-transformed launch. A mixed forward is the
 mechanism case: resident and external work coexist in one NTA launch, with
@@ -241,6 +251,18 @@ preferred protocol uses ten repetitions (five is the minimum).  Results are
 reported per stratum before any aggregate.  Use the existing qualified-trial
 runner for paired commands, and store its raw logs outside the checkout.  For
 hardware profiling:
+
+Headline serving results use the machine's unchanged production-default DVFS,
+fan, and power-limit policy. Power draw, temperature, realized clocks,
+throttling reasons, and co-tenants are recorded as nuisance-variable evidence;
+they are never scheduler inputs, workload-selection criteria, or deployment
+preconditions. Arms use the same hardware configuration and are interleaved or
+run in reversed paired order. A trial is rejected only by predeclared validity
+rules such as a foreign GPU process, a changed power-limit setting, telemetry
+loss, or an actual thermal-slowdown event—not because one ordinary temperature
+sample differs between arms. `--gpu-graphics-clock-limit-mhz` is reserved for
+diagnostic sensitivity experiments, is labeled `fixed_diagnostic` in the
+artifact, and must not be mixed into the headline production-DVFS aggregate.
 
 For a complete OSDI trial matrix, generate a specification with
 `experiments/make_evaluation_spec.py` from six or more normalized scenarios,

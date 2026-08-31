@@ -1550,10 +1550,7 @@ def _load_workload(
     ]
     external_effective_cached_prefix_tokens = list(
         effective_cached_prefixes(
-            [
-                (values, len(values))
-                for values in effective_external_inputs
-            ],
+            [(values, len(values)) for values in effective_external_inputs],
             initial_cached_objects,
         )
     )
@@ -2339,9 +2336,7 @@ def main() -> int:
         effective_external_cached_prefix_lengths
         != [
             int(value)
-            for value in workload_metadata[
-                "external_effective_cached_prefix_tokens"
-            ]
+            for value in workload_metadata["external_effective_cached_prefix_tokens"]
         ]
     ):
         raise RuntimeError(
@@ -2376,6 +2371,10 @@ def main() -> int:
         )
     )
     placement_probe_groups = _placement_probe_groups(external_prefixes)
+    resident_probe_groups = _placement_probe_groups(resident_prompts)
+    external_materialization_representatives = tuple(
+        group[0] for group in placement_probe_groups
+    )
     if any(
         len(prompt)
         >= _max_request_input_tokens(args.context_length, args.max_total_tokens)
@@ -2505,9 +2504,12 @@ def main() -> int:
             """Materialize, then exactly verify the resident working set."""
 
             observations: list[dict[str, int]] = []
-            for begin in range(0, len(resident_prompts), args.max_running_requests):
+            for begin in range(
+                0, len(resident_probe_groups), args.max_running_requests
+            ):
                 end = begin + args.max_running_requests
-                prompts = resident_prompts[begin:end]
+                groups = resident_probe_groups[begin:end]
+                prompts = [resident_prompts[group[0]] for group in groups]
                 samplings = [dict(setup_sampling)] * len(prompts)
                 results = generation_results(_generate_many(engine, prompts, samplings))
                 if any(
@@ -2525,9 +2527,7 @@ def main() -> int:
                             [dict(setup_sampling)] * len(prompts),
                         )
                     )
-                for offset, (prompt, result) in enumerate(
-                    zip(prompts, results, strict=True)
-                ):
+                for group, prompt, result in zip(groups, prompts, results, strict=True):
                     actual_device = device_cached_tokens(result)
                     actual_host = host_cached_tokens(result)
                     if actual_device != len(prompt) - 1 or actual_host != 0:
@@ -2537,14 +2537,22 @@ def main() -> int:
                             f"expected={len(prompt) - 1}, "
                             f"device={actual_device}, host={actual_host}"
                         )
-                    observations.append(
-                        {
-                            "index": begin + offset,
-                            "expected": len(prompt) - 1,
-                            "device": actual_device,
-                            "host": actual_host,
-                        }
-                    )
+                    for index in group:
+                        if resident_prompts[index] != prompt:
+                            raise RuntimeError(
+                                "equal resident setup identities disagree"
+                            )
+                        observations.append(
+                            {
+                                "index": index,
+                                "expected": len(prompt) - 1,
+                                "device": actual_device,
+                                "host": actual_host,
+                                "representative_index": group[0],
+                                "shared_identity_group_size": len(group),
+                            }
+                        )
+            observations.sort(key=lambda value: value["index"])
             resident_placement_history.append(
                 {"reason": reason, "observations": observations}
             )
@@ -2577,18 +2585,22 @@ def main() -> int:
             is setup-only and never contributes to the timed records.
             """
 
+            inputs = [
+                external_materialization_prompts[index]
+                for index in external_materialization_representatives
+            ]
             generation_results(
                 _generate_many(
                     engine,
-                    external_materialization_prompts,
-                    [dict(setup_sampling)] * len(external_materialization_prompts),
+                    inputs,
+                    [dict(setup_sampling)] * len(inputs),
                 )
             )
             generation_results(
                 _generate_many(
                     engine,
-                    external_materialization_prompts,
-                    [dict(setup_sampling)] * len(external_materialization_prompts),
+                    inputs,
+                    [dict(setup_sampling)] * len(inputs),
                 )
             )
 
@@ -2772,9 +2784,7 @@ def main() -> int:
             establish_final_placement()
 
         expected_setup_flushes = (
-            2
-            if args.load_warmup_iterations == 0
-            else 1 + args.load_warmup_iterations
+            2 if args.load_warmup_iterations == 0 else 1 + args.load_warmup_iterations
         )
         if len(setup_cache_flush_wait_seconds) != expected_setup_flushes:
             raise RuntimeError(
@@ -2830,9 +2840,7 @@ def main() -> int:
     expected_external_prefixes = (
         [
             int(value)
-            for value in workload_metadata[
-                "external_effective_cached_prefix_tokens"
-            ]
+            for value in workload_metadata["external_effective_cached_prefix_tokens"]
         ]
         if workload_metadata is not None
         else effective_external_cached_prefix_lengths
@@ -2852,9 +2860,7 @@ def main() -> int:
         {
             "index": record["index"],
             "materialized": record["materialized_cached_prefix_tokens"],
-            "expected_effective": record[
-                "effective_initial_cached_prefix_tokens"
-            ],
+            "expected_effective": record["effective_initial_cached_prefix_tokens"],
             "device": record["device_cached_tokens"],
             "host": record["host_cached_tokens"],
         }
@@ -2865,8 +2871,7 @@ def main() -> int:
     if missing_external:
         raise RuntimeError(
             "a timed external request diverged from the content-derived initial "
-            "cache union: "
-            + json.dumps(missing_external, sort_keys=True)
+            "cache union: " + json.dumps(missing_external, sort_keys=True)
         )
     expected_resident_prefixes = [len(value) - 1 for value in resident_prompts]
     for record in [*external, *resident]:
@@ -2903,8 +2908,7 @@ def main() -> int:
     cache_state_transitions: dict[str, int] = {}
     for record in records:
         transition = (
-            f"{record['initial_cache_state']}_to_"
-            f"{record['observed_cache_state']}"
+            f"{record['initial_cache_state']}_to_{record['observed_cache_state']}"
         )
         cache_state_transitions[transition] = (
             cache_state_transitions.get(transition, 0) + 1
@@ -2959,9 +2963,7 @@ def main() -> int:
         "composition": "initial_object_union_longest_common_prefix",
         "identity_source": "exact_token_ids",
         "materialized_prefix_tokens": external_cached_prefix_lengths,
-        "effective_initial_prefix_tokens": (
-            effective_external_cached_prefix_lengths
-        ),
+        "effective_initial_prefix_tokens": (effective_external_cached_prefix_lengths),
         "observed_prefix_tokens": [
             int(record["observed_cached_prefix_tokens"])
             for record in sorted(external, key=lambda value: int(value["index"]))
