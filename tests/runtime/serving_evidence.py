@@ -102,6 +102,50 @@ def main() -> None:
     assert activation["heterogeneous_work_unit_active"]
     assert not activation["transport_only"]
 
+    measured_graph = report(compact_ctas=1, canonical_ctas=1)
+    measured_graph["engine_stats"][0].update(
+        {
+            "measurement_scope": "timed_load_delta",
+            "graph_captures": 0,
+            "graph_replays": 3,
+            "demand_graph_warmups": 0,
+            "demand_graph_captures": 0,
+            "demand_graph_replays": 2,
+        }
+    )
+    cumulative = dict(measured_graph["engine_stats"][0])
+    cumulative.update(
+        {
+            "measurement_scope": None,
+            "graph_captures": 4,
+            "graph_replays": 11,
+            "demand_graph_warmups": 1,
+            "demand_graph_captures": 1,
+            "demand_graph_replays": 5,
+        }
+    )
+    measured_graph["engine_stats_cumulative"] = [cumulative]
+    activation = module.require_clean_mechanism(
+        measured_graph, require_graph_replay=True, require_demand_graph=True
+    )
+    assert activation["model_graph"] == {
+        "lifecycle_captures": 4,
+        "timed_captures": 0,
+        "timed_replays": 3,
+    }
+    assert activation["demand_graph"]["timed_replays"] == 2
+    leaked_capture = {
+        **measured_graph,
+        "engine_stats": [dict(measured_graph["engine_stats"][0])],
+    }
+    leaked_capture["engine_stats"][0]["graph_captures"] = 1
+    try:
+        module.require_clean_mechanism(leaked_capture, require_graph_replay=True)
+    except RuntimeError as error:
+        assert "capture leaked" in str(error)
+    else:
+        raise AssertionError("timed model-graph capture passed the serving gate")
+
     try:
         module.require_clean_mechanism(
             one_cta,

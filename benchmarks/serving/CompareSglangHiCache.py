@@ -118,6 +118,19 @@ def require_clean_mechanism(
     def total(key: str) -> int:
         return sum(int(entry.get(key, 0)) for entry in stats)
 
+    cumulative_stats = [
+        entry
+        for entry in report.get("engine_stats_cumulative", [])
+        if entry.get("backend") == "nta_flashinfer"
+    ]
+    timed_delta = all(
+        entry.get("measurement_scope") == "timed_load_delta" for entry in stats
+    )
+
+    def lifecycle_total(key: str) -> int:
+        owners = cumulative_stats if timed_delta else stats
+        return sum(int(entry.get(key, 0)) for entry in owners)
+
     protocols = {
         str(entry.get("execution_protocol"))
         for entry in stats
@@ -379,23 +392,55 @@ def require_clean_mechanism(
         )
 
     if require_graph_replay:
-        captures = total("graph_captures")
-        replays = total("graph_replays")
-        if captures == 0 or replays == 0:
-            raise RuntimeError("NTA graph trial did not capture and replay")
+        model_graph = {
+            "lifecycle_captures": lifecycle_total("graph_captures"),
+            "timed_captures": total("graph_captures"),
+            "timed_replays": total("graph_replays"),
+        }
+        if timed_delta and not cumulative_stats:
+            raise RuntimeError("NTA graph trial omitted cumulative lifecycle evidence")
+        if (
+            model_graph["lifecycle_captures"] == 0
+            or model_graph["timed_replays"] == 0
+        ):
+            raise RuntimeError(
+                "NTA graph trial did not capture before and replay during "
+                f"measurement ({model_graph})"
+            )
+        if timed_delta and model_graph["timed_captures"] != 0:
+            raise RuntimeError(
+                "NTA graph capture leaked into the timed serving window "
+                f"({model_graph})"
+            )
+    else:
+        model_graph = None
     demand_graph = {
-        key: total(key)
-        for key in (
-            "demand_graph_warmups",
-            "demand_graph_captures",
-            "demand_graph_replays",
-        )
+        "lifecycle_warmups": lifecycle_total("demand_graph_warmups"),
+        "lifecycle_captures": lifecycle_total("demand_graph_captures"),
+        "timed_warmups": total("demand_graph_warmups"),
+        "timed_captures": total("demand_graph_captures"),
+        "timed_replays": total("demand_graph_replays"),
     }
-    if require_demand_graph and min(demand_graph.values()) == 0:
-        raise RuntimeError(
-            "NTA trial did not warm, capture, and replay the demand graph "
-            f"({demand_graph})"
-        )
+    if require_demand_graph:
+        if timed_delta and not cumulative_stats:
+            raise RuntimeError("NTA demand graph omitted cumulative lifecycle evidence")
+        if (
+            demand_graph["lifecycle_warmups"] == 0
+            or demand_graph["lifecycle_captures"] == 0
+            or demand_graph["timed_replays"] == 0
+        ):
+            raise RuntimeError(
+                "NTA trial did not warm/capture before and replay the demand "
+                f"graph during measurement ({demand_graph})"
+            )
+        if timed_delta and (
+            demand_graph["timed_warmups"] != 0
+            or demand_graph["timed_captures"] != 0
+        ):
+            raise RuntimeError(
+                "NTA demand-graph setup leaked into the timed serving window "
+                f"({demand_graph})"
+            )
     return {
         "all_attention_transformed": stock_launches == 0,
         "external_attention_transformed": (
@@ -466,6 +511,7 @@ def require_clean_mechanism(
                 and canonical_ctas > compact_ctas
             )
         ),
+        "model_graph": model_graph,
         "demand_graph": demand_graph,
         "execution_protocol": protocol,
         "auto_calibration_applicable": bool(auto_host_entries),
