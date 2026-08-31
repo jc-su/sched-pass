@@ -46,6 +46,11 @@ def main() -> None:
         )
     assert len(calls) == 2
 
+    with patch.object(
+        gpu_trial, "_run_nvidia_smi", return_value=completed("500.00\n")
+    ):
+        assert gpu_trial.query_gpu_power_limits() == (500.0,)
+
     with (
         patch.object(
             gpu_trial,
@@ -65,13 +70,15 @@ def main() -> None:
     with patch.object(
         gpu_trial,
         "_run_nvidia_smi",
-        side_effect=(completed(""), completed("34, 1200, 88.5, 0x0\n")),
+        side_effect=(completed(""), completed("34, 1200, 88.5, 0x0, 500.0\n")),
     ):
         sampler._sample_once()
     assert sampler.samples == 1
     assert sampler.sampling_errors == 0
     assert sampler.telemetry_samples == 1
     assert sampler.temperature_min_c == sampler.temperature_max_c == 34
+    assert sampler.power_limit_min_watts == 500.0
+    assert sampler.power_limit_max_watts == 500.0
 
     failed_sampler = gpu_trial.CotenantSampler("test-owner")
     with patch.object(gpu_trial, "_run_nvidia_smi", return_value=None):

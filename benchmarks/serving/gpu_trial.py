@@ -49,6 +49,30 @@ def _run_nvidia_smi(arguments: list[str]) -> subprocess.CompletedProcess[str] | 
     )
 
 
+def query_gpu_power_limits() -> tuple[float, ...]:
+    """Return one bounded snapshot of every visible GPU power-limit contract."""
+
+    result = _run_nvidia_smi(
+        ["--query-gpu=power.limit", "--format=csv,noheader,nounits"]
+    )
+    try:
+        limits = tuple(
+            float(line.strip())
+            for line in (result.stdout if result is not None else "").splitlines()
+            if line.strip()
+        )
+    except ValueError as error:
+        raise RuntimeError("GPU power-limit query returned invalid data") from error
+    if (
+        result is None
+        or result.returncode != 0
+        or not limits
+        or any(limit <= 0.0 for limit in limits)
+    ):
+        raise RuntimeError("GPU power-limit contract is unavailable")
+    return limits
+
+
 def wait_for_free_gpu(
     limit_mib: int = 8000,
     timeout_seconds: float = 600.0,
@@ -152,6 +176,8 @@ class CotenantSampler:
         self.graphics_clock_max_mhz: int | None = None
         self.graphics_clock_sum_mhz = 0
         self.power_max_watts = 0.0
+        self.power_limit_min_watts: float | None = None
+        self.power_limit_max_watts: float | None = None
         self.thermal_slowdown_samples = 0
         self.clock_reason_masks: set[int] = set()
         self._stop = threading.Event()
@@ -224,7 +250,7 @@ class CotenantSampler:
             result = _run_nvidia_smi(
                 [
                     "--query-gpu=temperature.gpu,clocks.current.graphics,"
-                    "power.draw,clocks_throttle_reasons.active",
+                    "power.draw,clocks_throttle_reasons.active,power.limit",
                     "--format=csv,noheader,nounits",
                 ]
             )
@@ -239,6 +265,7 @@ class CotenantSampler:
             clocks = [int(row[1]) for row in rows]
             powers = [float(row[2]) for row in rows]
             masks = [int(row[3], 0) for row in rows]
+            power_limits = [float(row[4]) for row in rows]
         except (OSError, IndexError, subprocess.TimeoutExpired, ValueError):
             self.telemetry_errors += 1
             return
@@ -269,6 +296,18 @@ class CotenantSampler:
         )
         self.graphics_clock_sum_mhz += sum(clocks) // len(clocks)
         self.power_max_watts = max(self.power_max_watts, max(powers))
+        minimum_limit = min(power_limits)
+        maximum_limit = max(power_limits)
+        self.power_limit_min_watts = (
+            minimum_limit
+            if self.power_limit_min_watts is None
+            else min(self.power_limit_min_watts, minimum_limit)
+        )
+        self.power_limit_max_watts = (
+            maximum_limit
+            if self.power_limit_max_watts is None
+            else max(self.power_limit_max_watts, maximum_limit)
+        )
         self.clock_reason_masks.update(masks)
         # NVML clock-event bits 5 and 6 are software and hardware thermal
         # slowdown. Idle and power-cap reasons are recorded but are not thermal
@@ -309,6 +348,8 @@ class CotenantSampler:
                 else None
             ),
             "power_max_watts": self.power_max_watts,
+            "power_limit_min_watts": self.power_limit_min_watts,
+            "power_limit_max_watts": self.power_limit_max_watts,
             "thermal_slowdown_samples": self.thermal_slowdown_samples,
             "clock_reason_masks": [
                 f"0x{mask:016x}" for mask in sorted(self.clock_reason_masks)

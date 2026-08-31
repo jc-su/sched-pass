@@ -32,7 +32,12 @@ from experiments.serving_path_evidence import (  # noqa: E402
     require_exercised_paths,
     require_frontier_shape,
 )
-from gpu_trial import CotenantSampler, TRIAL_OWNER_ENV, wait_for_free_gpu  # noqa: E402
+from gpu_trial import (  # noqa: E402
+    CotenantSampler,
+    TRIAL_OWNER_ENV,
+    query_gpu_power_limits,
+    wait_for_free_gpu,
+)
 
 
 RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
@@ -430,6 +435,14 @@ def run(
         max_temperature_c=args.gpu_start_max_temperature_c,
         stable_samples=2,
     )
+    power_limits = query_gpu_power_limits()
+    if len(power_limits) != 1:
+        raise RuntimeError(
+            "SGLang serving artifact currently requires exactly one visible GPU"
+        )
+    environment["NTA_EXECUTION_CALIBRATION_GPU_POWER_LIMIT_WATTS"] = (
+        f"{power_limits[0]:.2f}"
+    )
     with CotenantSampler(owner_token) as sampler:
         completed = subprocess.run(
             command,
@@ -469,6 +482,19 @@ def run(
         failures.append(
             "GPU thermal slowdown contaminated "
             f"{gpu_telemetry['thermal_slowdown_samples']} samples"
+        )
+    observed_power_limits = (
+        gpu_telemetry["power_limit_min_watts"],
+        gpu_telemetry["power_limit_max_watts"],
+    )
+    if any(value is None for value in observed_power_limits) or any(
+        abs(float(value) - power_limits[0]) > 0.01
+        for value in observed_power_limits
+        if value is not None
+    ):
+        failures.append(
+            "GPU power limit changed during the serving arm "
+            f"(expected={power_limits[0]:.2f}, observed={observed_power_limits})"
         )
     if completed.returncode:
         failures.append(f"worker exited with status {completed.returncode}")

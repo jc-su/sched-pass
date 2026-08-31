@@ -19,11 +19,13 @@ sys.path.insert(0, str(ROOT / "python"))
 
 from nta_runtime.engines.sglang_calibration_profile import (  # noqa: E402
     PROFILE_CPU_AFFINITY_ENV,
+    PROFILE_GPU_POWER_LIMIT_ENV,
     PROFILE_PATH_ENV,
     PROFILE_READ_ONLY_ENV,
     SglangCalibrationProfileConfig,
     SglangCalibrationProfileStore,
     _declared_cpu_affinity,
+    _declared_gpu_power_limit,
 )
 from nta_runtime.execution_planner import HostCostModel  # noqa: E402
 
@@ -52,6 +54,15 @@ def main() -> None:
             assert PROFILE_CPU_AFFINITY_ENV in str(error)
         else:
             raise AssertionError("calibration profile accepted invalid CPU affinity")
+    with patch.dict(os.environ, {PROFILE_GPU_POWER_LIMIT_ENV: "500.00"}):
+        assert _declared_gpu_power_limit() == 500.0
+    with patch.dict(os.environ, {PROFILE_GPU_POWER_LIMIT_ENV: "nan"}):
+        try:
+            _declared_gpu_power_limit()
+        except ValueError as error:
+            assert PROFILE_GPU_POWER_LIMIT_ENV in str(error)
+        else:
+            raise AssertionError("calibration profile accepted invalid GPU power")
 
     with tempfile.TemporaryDirectory() as directory:
         profile_path = Path(directory) / "auto.json"
