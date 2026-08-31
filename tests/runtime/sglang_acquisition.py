@@ -273,12 +273,13 @@ def main() -> None:
     # adapter. Before calibration it emits one bounded probe; a frozen model
     # can publish the complete feasible suffix in one transition.
     def exercise_frontier(
-        *, calibrated: bool
+        *, calibrated: bool, frozen: bool = False
     ) -> tuple[list[tuple[int, int]], dict[str, int], set[int]]:
         frontier_owner, _pool, frontier_transport = coordinator(layer_count=36)
         frontier_owner._movers = types.SimpleNamespace(
             collect_profiles=lambda: None,
             lease_calibrated=lambda _pending: False,
+            calibration_frozen=frozen,
         )
         frontier_owner._calibration = types.SimpleNamespace(
             collect=lambda: None,
@@ -322,6 +323,12 @@ def main() -> None:
     assert probe_ranges == [(1, 5)]
     assert probe_stats["deadline_frontier_calibration_layers"] == 4
     assert not probe_modeled
+    frozen_ranges, frozen_stats, frozen_modeled = exercise_frontier(
+        calibrated=False, frozen=True
+    )
+    assert frozen_ranges == []
+    assert frozen_stats.get("deadline_frontier_calibration_layers", 0) == 0
+    assert not frozen_modeled
     modeled_ranges, modeled_stats, modeled_layers = exercise_frontier(calibrated=True)
     assert modeled_ranges == [(1, 36)]
     assert modeled_stats["deadline_frontier_published_layers"] == 35

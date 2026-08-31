@@ -614,7 +614,13 @@ class SglangHostAcquisitionCoordinator:
 
         if model is None:
             self._add("deadline_frontier_uncalibrated")
-            calibration_probe = not self._movers.lease_calibrated(pending)
+            # A read-only deployment profile is a hard learning boundary, not
+            # merely a persistence policy.  An unseen mover scale must use the
+            # structural, work-conserving submission path without issuing a
+            # bounded calibration frontier inside the measured request.
+            calibration_probe = not getattr(
+                self._movers, "calibration_frozen", False
+            ) and not self._movers.lease_calibrated(pending)
             if calibration_probe and ready_prefix not in pending.prefetched_layers:
                 probe_end = calibration_probe_end(
                     ready_prefix,

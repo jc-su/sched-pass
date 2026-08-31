@@ -286,6 +286,12 @@ class HostMoverController:
         return self._policy
 
     @property
+    def calibration_frozen(self) -> bool:
+        """Whether planning must remain observationally read-only."""
+
+        return self._frozen
+
+    @property
     def pending_profile_count(self) -> int:
         return len(self._profiles)
 
@@ -682,16 +688,24 @@ class HostMoverController:
         layout_cpu_ns = 0
         planner_policy = self._policy
         calibration_probe_sm = False
+        frozen_uncalibrated_reason: str | None = None
         layout_free_insufficient_gain = False
         execution_context_unbound = False
         if self._policy == "auto":
             if not self.scale_calibrated("sm", representative_sm_wave_bytes):
                 planner_policy = "sm"
-                calibration_probe_sm = True
+                if self._frozen:
+                    frozen_uncalibrated_reason = "frozen_uncalibrated_sm"
+                else:
+                    calibration_probe_sm = True
             elif not service_model.copy_calibrated and not any(
                 profile.engine == "copy_engine" for profile in self._profiles
             ):
-                planner_policy = "probe_copy"
+                if self._frozen:
+                    planner_policy = "sm"
+                    frozen_uncalibrated_reason = "frozen_uncalibrated_copy_engine"
+                else:
+                    planner_policy = "probe_copy"
             elif layer_curve is None or not layer_curve.calibrated:
                 # Dense HiCache transport may start before SGLang binds the
                 # eventual ForwardBatch. An isolated copy-engine curve cannot
@@ -757,6 +771,8 @@ class HostMoverController:
                 (
                     "calibration_probe_sm"
                     if calibration_probe_sm
+                    else frozen_uncalibrated_reason
+                    if frozen_uncalibrated_reason is not None
                     else "execution_context_unbound"
                     if execution_context_unbound
                     else "insufficient_gain"
@@ -770,6 +786,8 @@ class HostMoverController:
             selection_reason = (
                 "calibration_probe_sm"
                 if calibration_probe_sm
+                else frozen_uncalibrated_reason
+                if frozen_uncalibrated_reason is not None
                 else tensor_plan.selection_reason
             )
             plan = HostMoverLeasePlan(
@@ -802,6 +820,12 @@ class HostMoverController:
             ),
             "uncalibrated_copy_engine": (
                 "prefetch_mover_plan_uncalibrated_copy_engine_leases"
+            ),
+            "frozen_uncalibrated_sm": (
+                "prefetch_mover_plan_frozen_uncalibrated_sm_leases"
+            ),
+            "frozen_uncalibrated_copy_engine": (
+                "prefetch_mover_plan_frozen_uncalibrated_copy_engine_leases"
             ),
             "insufficient_gain": "prefetch_mover_plan_insufficient_gain_leases",
             "service_cost": "prefetch_mover_plan_service_cost_leases",

@@ -395,6 +395,85 @@ def main() -> None:
         "copy_engine", 1 << 30, complete_calibration=True
     )
     assert frozen_owner.export_state() == mover_state
+
+    def frozen_pending() -> SimpleNamespace:
+        return SimpleNamespace(
+            mover_plan=None,
+            prefetch_tensors=(),
+            materialize_device_index_map=lambda: SimpleNamespace(
+                source_indices=torch.tensor((0, 2, 4), dtype=torch.int32),
+                destination_indices=torch.tensor((1, 3, 5), dtype=torch.int32),
+            ),
+        )
+
+    frozen_unknown_stats: dict[str, int] = {}
+    frozen_unknown = HostMoverController(
+        policy="auto",
+        frozen=True,
+        default_service_model=IndexedMoverServiceModel(
+            sm_bandwidth_bytes_per_second=10,
+            minimum_calibration_samples=3,
+        ),
+        calibration_samples=3,
+        copy_engine_max_operations=64,
+        frontier_layers_per_wave=2,
+        profile_transfer=True,
+        frontier_enabled=True,
+        profile_index_layout=False,
+        profile_index_min_bytes=64 * 1024,
+        verify_index_map=False,
+        stats=frozen_unknown_stats,
+    )
+    frozen_sm_plan = frozen_unknown.plan(
+        frozen_pending(),
+        ((1024, 1024),) * 4,
+        3,
+        layer_service_key=None,
+        layer_curve=None,
+        collect_layer_profiles=lambda: None,
+    )
+    assert frozen_unknown.calibration_frozen
+    assert frozen_sm_plan.kind == "sm"
+    assert frozen_sm_plan.selection_reason == "frozen_uncalibrated_sm"
+    assert (
+        frozen_unknown_stats["prefetch_mover_plan_frozen_uncalibrated_sm_leases"] == 1
+    )
+    assert not any("calibration_probe" in key for key in frozen_unknown_stats)
+
+    frozen_copy_stats: dict[str, int] = {}
+    frozen_copy = HostMoverController(
+        policy="auto",
+        frozen=True,
+        default_service_model=IndexedMoverServiceModel(
+            sm_bandwidth_bytes_per_second=10,
+            sm_samples=3,
+            minimum_calibration_samples=3,
+        ),
+        calibration_samples=3,
+        copy_engine_max_operations=64,
+        frontier_layers_per_wave=2,
+        profile_transfer=True,
+        frontier_enabled=True,
+        profile_index_layout=False,
+        profile_index_min_bytes=64 * 1024,
+        verify_index_map=False,
+        stats=frozen_copy_stats,
+    )
+    frozen_copy_plan = frozen_copy.plan(
+        frozen_pending(),
+        ((1024, 1024),) * 4,
+        3,
+        layer_service_key=None,
+        layer_curve=None,
+        collect_layer_profiles=lambda: None,
+    )
+    assert frozen_copy_plan.kind == "sm"
+    assert frozen_copy_plan.selection_reason == ("frozen_uncalibrated_copy_engine")
+    assert (
+        frozen_copy_stats["prefetch_mover_plan_frozen_uncalibrated_copy_engine_leases"]
+        == 1
+    )
+    assert not any("calibration_probe" in key for key in frozen_copy_stats)
     hybrid_scale = 1 << 23
     hybrid_curve = IndexedMoverServiceModel(
         sm_bandwidth_bytes_per_second=10,
