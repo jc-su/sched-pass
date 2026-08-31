@@ -1107,6 +1107,7 @@ def _required_placement_pressure_tokens(
     device_pool_tokens: int,
     page_tokens: int,
     external_cache_tokens: int,
+    largest_external_object_tokens: int,
     exact_manifest: bool,
     eviction_rounds: int | None,
     churn_tokens: int,
@@ -1123,14 +1124,21 @@ def _required_placement_pressure_tokens(
 
     if min(device_pool_tokens, page_tokens, churn_tokens) <= 0:
         raise ValueError("cache placement geometry must be positive")
-    if external_cache_tokens < 0:
+    if min(external_cache_tokens, largest_external_object_tokens) < 0:
         raise ValueError("external cache working set cannot be negative")
     if eviction_rounds is not None and eviction_rounds < 0:
         raise ValueError("cache placement eviction rounds cannot be negative")
 
     pool_frontier = device_pool_tokens + page_tokens
     if exact_manifest:
-        required = pool_frontier + external_cache_tokens
+        # Radix eviction is object-granular: a leaf cannot be partially
+        # displaced to satisfy a token-count target. One largest-object slack
+        # turns the continuous pool budget into a safe discrete frontier.
+        required = (
+            pool_frontier
+            + external_cache_tokens
+            + largest_external_object_tokens
+        )
         if eviction_rounds is not None:
             required = max(required, eviction_rounds * churn_tokens)
         return required
@@ -2230,6 +2238,11 @@ def main() -> int:
         device_pool_tokens=args.max_total_tokens,
         page_tokens=placement_page_tokens,
         external_cache_tokens=external_cache_tokens,
+        largest_external_object_tokens=(
+            max(workload_metadata["external_cached_prefix_tokens"])
+            if workload_metadata is not None
+            else 0
+        ),
         exact_manifest=workload_metadata is not None,
         eviction_rounds=args.eviction_rounds,
         churn_tokens=args.churn_tokens,

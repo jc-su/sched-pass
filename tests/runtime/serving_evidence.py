@@ -351,14 +351,16 @@ def main() -> None:
         device_pool_tokens=40_000,
         page_tokens=16,
         external_cache_tokens=16_704,
+        largest_external_object_tokens=7_872,
         exact_manifest=True,
         eviction_rounds=None,
         churn_tokens=32_700,
-    ) == 56_720
+    ) == 64_592
     assert serving._required_placement_pressure_tokens(
         device_pool_tokens=40_000,
         page_tokens=1,
         external_cache_tokens=0,
+        largest_external_object_tokens=0,
         exact_manifest=False,
         eviction_rounds=None,
         churn_tokens=32_700,
@@ -367,6 +369,7 @@ def main() -> None:
         device_pool_tokens=40_000,
         page_tokens=16,
         external_cache_tokens=16_704,
+        largest_external_object_tokens=7_872,
         exact_manifest=True,
         eviction_rounds=2,
         churn_tokens=32_700,
