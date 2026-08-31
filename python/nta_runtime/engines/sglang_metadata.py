@@ -18,7 +18,12 @@ from nta_runtime.adapters.sglang import (
     SglangExecutionConfig,
     forward_metadata,
 )
-from nta_runtime.execution_planner import HostCostModel, HostExecutionMode, HostExecutionPlan
+from nta_runtime.execution_planner import (
+    HostCostModel,
+    HostExecutionForm,
+    HostExecutionMode,
+    HostExecutionPlan,
+)
 from nta_runtime.flashinfer_schedule import (
     Schedule,
     decode_schedule,
@@ -246,7 +251,12 @@ class SglangMetadataPlanner:
             mode=self._execution_config.host_execution_mode,
         )
         if direct is not None:
-            return direct
+            return (
+                replace(direct, form=HostExecutionForm.SCHEDULED_BULK)
+                if self._execution_config.host_execution_mode
+                is HostExecutionMode.AUTO
+                else direct
+            )
         acquisition = pending.acquisition
         if (
             self._execution_config.host_execution_mode is not HostExecutionMode.AUTO
@@ -262,7 +272,7 @@ class SglangMetadataPlanner:
             host_staged=True,
             tenant_isolation=self._tenant_isolation_enabled,
             model=host_cost_model,
-            mode=HostExecutionMode.DIRECT,
+            mode=HostExecutionMode.SCHEDULED_BULK,
         )
         if scheduled is None:  # pragma: no cover - forced DIRECT is total
             raise RuntimeError("scheduled-preacquired execution has no direct plan")
@@ -270,7 +280,7 @@ class SglangMetadataPlanner:
             block_counts=scheduled.block_counts,
             predicted_atomic_ns=scheduled.predicted_atomic_ns,
             predicted_incremental_ns=scheduled.predicted_incremental_ns,
-            form=scheduled.form,
+            form=HostExecutionForm.SCHEDULED_BULK,
             overlap_initial=False,
             selection_reason="scheduled_preacquired",
             scope_units=scheduled.scope_units,
@@ -347,6 +357,18 @@ class SglangMetadataPlanner:
             ),
             tenant_isolation=self._tenant_isolation_enabled,
         )
+        if (
+            self._execution_config.host_execution_mode is HostExecutionMode.AUTO
+            and host_execution.form is HostExecutionForm.DIRECT
+        ):
+            # AUTO captures no eager lease: even its whole-layer numerical
+            # choice is owned by the scheduler-bound acquisition queue. Keep
+            # that ownership explicit so telemetry, lifetime, and the A2/A3
+            # causal boundary cannot mistake it for forced A1 eager staging.
+            host_execution = replace(
+                host_execution,
+                form=HostExecutionForm.SCHEDULED_BULK,
+            )
         if (
             pending.consumer_policy_probe
             and not calibration_probe

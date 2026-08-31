@@ -120,7 +120,13 @@ def main() -> None:
         "multi_axis_heterogeneous_batches": 1,
     }
     model_snapshot = object()
-    direct_candidate = object()
+    direct_candidate = HostExecutionPlan(
+        block_counts=(2,),
+        predicted_atomic_ns=100,
+        predicted_incremental_ns=100,
+        form=HostExecutionForm.DIRECT,
+        selection_reason="insufficient_gain",
+    )
     direct_pending = types.SimpleNamespace(consumer_policy_probe=False)
     fastpath_planner = SglangMetadataPlanner.__new__(SglangMetadataPlanner)
     fastpath_planner._tier_service = types.SimpleNamespace(is_host_staged=True)
@@ -132,17 +138,33 @@ def main() -> None:
         "nta_runtime.engines.sglang_metadata.prove_direct_metadata_execution",
         return_value=direct_candidate,
     ) as direct_proof:
-        assert (
-            fastpath_planner._bounded_direct_plan(
-                {7: object()},
-                direct_pending,
-                (binding,),
-                host_cost_model=model_snapshot,
-                calibration_probe=False,
-            )
-            is direct_candidate
+        bounded = fastpath_planner._bounded_direct_plan(
+            {7: object()},
+            direct_pending,
+            (binding,),
+            host_cost_model=model_snapshot,
+            calibration_probe=False,
         )
+        assert bounded is not None
+        assert bounded.form is HostExecutionForm.SCHEDULED_BULK
+        assert bounded.uses_scheduler_bound_acquisition
+        assert bounded.selection_reason == "insufficient_gain"
         assert direct_proof.call_args.kwargs["model"] is model_snapshot
+        fastpath_planner._execution_config = types.SimpleNamespace(
+            host_execution_mode=HostExecutionMode.DIRECT
+        )
+        forced_direct = fastpath_planner._bounded_direct_plan(
+            {7: object()},
+            direct_pending,
+            (binding,),
+            host_cost_model=model_snapshot,
+            calibration_probe=False,
+        )
+        assert forced_direct is direct_candidate
+        assert not forced_direct.uses_scheduler_bound_acquisition
+        fastpath_planner._execution_config = types.SimpleNamespace(
+            host_execution_mode=HostExecutionMode.AUTO
+        )
         direct_proof.reset_mock()
         assert (
             fastpath_planner._bounded_direct_plan(
@@ -177,10 +199,13 @@ def main() -> None:
             calibration_probe=False,
         )
         assert scheduled is not None
-        assert scheduled.form is HostExecutionForm.DIRECT
+        assert scheduled.form is HostExecutionForm.SCHEDULED_BULK
         assert scheduled.selection_reason == "scheduled_preacquired"
         assert direct_proof.call_count == 2
-        assert direct_proof.call_args.kwargs["mode"] is HostExecutionMode.DIRECT
+        assert (
+            direct_proof.call_args.kwargs["mode"]
+            is HostExecutionMode.SCHEDULED_BULK
+        )
     assert not _requires_feasible_edf((binding,), tenant_isolation=False)
     assert _requires_feasible_edf((binding,), tenant_isolation=True)
     homogeneous_peer = RequestBinding(
