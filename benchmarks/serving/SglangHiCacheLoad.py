@@ -1560,6 +1560,34 @@ def _reusable_prefix_tokens(prefix: TokenInput, prompt: TokenInput) -> int:
     return reusable
 
 
+def _placement_probe_groups(
+    prefixes: Sequence[Sequence[int]],
+) -> tuple[tuple[int, ...], ...]:
+    """Group equal objects and order destructive probes by radix inclusion.
+
+    A probe promotes the observed prefix.  Probing a longer shared prefix
+    before a shorter one can therefore make the shorter request appear
+    device-resident even though their shared object was host-backed before
+    verification.  Equal prefixes are one content object and need one probe;
+    shortest-first ordering proves every distinct radix frontier before a
+    strict superset can promote it.
+    """
+
+    groups: dict[TokenInput, list[int]] = {}
+    for index, prefix in enumerate(prefixes):
+        identity = tuple(int(value) for value in prefix)
+        if not identity:
+            raise ValueError("placement probe prefix cannot be empty")
+        groups.setdefault(identity, []).append(index)
+    return tuple(
+        tuple(indices)
+        for _, indices in sorted(
+            groups.items(),
+            key=lambda item: (len(item[0]), item[0]),
+        )
+    )
+
+
 def _generate_one(
     engine: Any,
     input_ids: TokenInput,
@@ -2174,6 +2202,7 @@ def main() -> int:
     ) = _exact_prefix_materialization_inputs(
         tokenizer, external_prefixes, external_prompts
     )
+    placement_probe_groups = _placement_probe_groups(external_prefixes)
     if any(
         len(prompt)
         >= _max_request_input_tokens(args.context_length, args.max_total_tokens)
@@ -2401,30 +2430,41 @@ def main() -> int:
             for attempt in range(1, 4):
                 observations: list[dict[str, int]] = []
                 missing: list[dict[str, int]] = []
-                # Probe sequentially so cache-source metadata is captured at
-                # admission, before queued requests can become device-ready.
-                for index, (prompt, expected) in enumerate(
-                    zip(
-                        external_materialization_prompts,
-                        external_cached_prefix_lengths,
-                        strict=True,
-                    )
-                ):
+                # A probe is itself a promotion. Verify one representative of
+                # each content object, shortest prefix first, so a longer
+                # shared radix object cannot invalidate a later observation
+                # of its strict prefix. Equal prefixes share one physical
+                # placement and therefore one source observation.
+                for group in placement_probe_groups:
+                    representative = group[0]
+                    prompt = external_materialization_prompts[representative]
+                    expected = external_cached_prefix_lengths[representative]
                     result = _generate_one(engine, prompt, setup_sampling)
                     device = device_cached_tokens(result)
                     host = host_cached_tokens(result)
-                    observation = {
-                        "index": index,
-                        "expected": int(expected),
-                        "device": device,
-                        "host": host,
-                    }
-                    observations.append(observation)
-                    if host <= 0 or host + device != expected:
-                        missing.append(observation)
+                    group_missing = host <= 0 or host + device != expected
+                    for index in group:
+                        if external_cached_prefix_lengths[index] != expected:
+                            raise RuntimeError(
+                                "equal placement identities disagree on token length"
+                            )
+                        observation = {
+                            "index": index,
+                            "expected": int(expected),
+                            "device": device,
+                            "host": host,
+                            "representative_index": representative,
+                            "shared_identity_group_size": len(group),
+                        }
+                        observations.append(observation)
+                        if group_missing:
+                            missing.append(observation)
+                    if group_missing:
                         # One repair hit closes selective write-through for a
                         # cold or still-device-only radix leaf.
                         generated_text(_generate_one(engine, prompt, setup_sampling))
+                observations.sort(key=lambda value: value["index"])
+                missing.sort(key=lambda value: value["index"])
                 placement_probe_history.append(
                     {
                         "reason": reason,
@@ -2441,6 +2481,8 @@ def main() -> int:
                         "attempt": attempt,
                         "observations": observations,
                         "destructive_probe_followed_by_disjoint_replay": True,
+                        "probe_order": "shortest_distinct_prefix_first",
+                        "unique_prefix_groups": len(placement_probe_groups),
                     }
                     return
             raise RuntimeError(

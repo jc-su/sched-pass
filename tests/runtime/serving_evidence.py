@@ -386,6 +386,9 @@ def main() -> None:
     )
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3)) == 2
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3, 4)) == 3
+    assert serving._placement_probe_groups(
+        ((1, 2), (1, 2, 3), (4,), (1, 2))
+    ) == ((2,), (0, 3), (1,))
     try:
         serving._reusable_prefix_tokens((1, 2), (1, 3, 4))
     except RuntimeError as error:
