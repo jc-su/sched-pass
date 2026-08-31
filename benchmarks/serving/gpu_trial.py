@@ -362,6 +362,7 @@ def trial_environment_evidence(
     *,
     expected_power_limit_watts: float,
     start_max_temperature_c: int,
+    expected_graphics_clock_limit_mhz: int | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     """Seal one serving arm's shared, fail-closed GPU environment evidence."""
 
@@ -369,6 +370,11 @@ def trial_environment_evidence(
         raise ValueError("expected GPU power limit must be positive")
     if start_max_temperature_c <= 0:
         raise ValueError("GPU start temperature must be positive")
+    if (
+        expected_graphics_clock_limit_mhz is not None
+        and expected_graphics_clock_limit_mhz <= 0
+    ):
+        raise ValueError("expected GPU graphics-clock limit must be positive")
 
     failures: list[str] = []
     if not sampler.complete:
@@ -400,6 +406,20 @@ def trial_environment_evidence(
             "GPU thermal slowdown contaminated "
             f"{telemetry['thermal_slowdown_samples']} samples"
         )
+    observed_graphics_clock_max = telemetry["graphics_clock_max_mhz"]
+    if expected_graphics_clock_limit_mhz is not None and (
+        observed_graphics_clock_max is None
+        or abs(
+            int(observed_graphics_clock_max)
+            - expected_graphics_clock_limit_mhz
+        )
+        > 15
+    ):
+        failures.append(
+            "GPU graphics clock did not match the declared sustainable limit "
+            f"(expected={expected_graphics_clock_limit_mhz} MHz, "
+            f"observed={observed_graphics_clock_max})"
+        )
     observed_power_limits = (
         telemetry["power_limit_min_watts"],
         telemetry["power_limit_max_watts"],
@@ -423,5 +443,6 @@ def trial_environment_evidence(
         "cotenant_pids_seen": sorted(sampler.foreign_pids),
         "gpu_environment": telemetry,
         "gpu_start_max_temperature_c": start_max_temperature_c,
+        "gpu_graphics_clock_limit_mhz": expected_graphics_clock_limit_mhz,
     }
     return evidence, failures

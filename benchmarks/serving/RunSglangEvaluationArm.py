@@ -45,6 +45,7 @@ _OWNED_EXECUTION_ENV = {
     "NTA_EXECUTION_HOST_FORM",
     "NTA_EXECUTION_HOST_MOVER",
     "NTA_EXECUTION_CALIBRATION_PROBES",
+    "NTA_EXECUTION_CALIBRATION_GPU_CLOCK_LIMIT_MHZ",
     "NTA_EXECUTION_MAX_ROUNDS",
 }
 
@@ -61,6 +62,14 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
         type=int,
         default=60,
         help="maximum GPU temperature for two samples before the arm",
+    )
+    parser.add_argument(
+        "--gpu-graphics-clock-limit-mhz",
+        type=int,
+        help=(
+            "externally configured sustainable graphics-clock ceiling, "
+            "verified from arm telemetry"
+        ),
     )
     parser.add_argument("load_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -83,6 +92,11 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
         parser.error("GPU wait timeout must be positive")
     if args.gpu_start_max_temperature_c <= 0:
         parser.error("GPU start temperature must be positive")
+    if (
+        args.gpu_graphics_clock_limit_mhz is not None
+        and args.gpu_graphics_clock_limit_mhz <= 0
+    ):
+        parser.error("GPU graphics-clock limit must be positive")
     return args, load_args
 
 
@@ -141,6 +155,10 @@ def main() -> int:
     environment["NTA_EXECUTION_CALIBRATION_GPU_POWER_LIMIT_WATTS"] = (
         f"{power_limits[0]:.2f}"
     )
+    if args.gpu_graphics_clock_limit_mhz is not None:
+        environment["NTA_EXECUTION_CALIBRATION_GPU_CLOCK_LIMIT_MHZ"] = str(
+            args.gpu_graphics_clock_limit_mhz
+        )
     with CotenantSampler(owner_token) as sampler:
         completed = subprocess.run(
             command,
@@ -157,6 +175,7 @@ def main() -> int:
         sampler,
         expected_power_limit_watts=power_limits[0],
         start_max_temperature_c=args.gpu_start_max_temperature_c,
+        expected_graphics_clock_limit_mhz=args.gpu_graphics_clock_limit_mhz,
     )
     if completed.returncode:
         failures.append(f"worker exited with status {completed.returncode}")

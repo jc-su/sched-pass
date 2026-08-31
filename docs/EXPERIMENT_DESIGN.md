@@ -180,11 +180,15 @@ GPU power and temperature are nuisance variables, not deployment
 preconditions or scheduler inputs. A formal paired campaign records one
 administrator-selected power limit, begins both arms below the same thermal
 bound, rejects foreign GPU processes and actual thermal slowdown, and reports
-the observed clock/power range. It does not require a fixed runtime clock or
-claim that production holds temperature constant. The production selector
-adapts from measured transfer and compute observations; power-limit
-sensitivity is a separate robustness experiment and must use identical limits
-for stock and NTA.
+the observed clock/power range. It does not claim that production holds
+temperature constant. If the installed chassis cannot sustain even the GPU's
+minimum firmware power limit, an implementation-independent saturation test
+may prequalify one graphics-clock ceiling. That ceiling must be declared,
+machine-checked, bound into AUTO calibration compatibility, and identical for
+all arms; it must not be selected from stock/NTA performance results. The
+production selector adapts from measured transfer and compute observations;
+power/clock sensitivity is a separate robustness experiment and must use
+identical settings for stock and NTA.
 
 Likewise, the causal A1--A3 arms fix one common transport engine only to
 separate acquisition and consumer effects. Natural-trace full-system runs must

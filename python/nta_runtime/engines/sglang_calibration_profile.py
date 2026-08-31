@@ -34,6 +34,7 @@ PROFILE_READ_ONLY_ENV = "NTA_EXECUTION_CALIBRATION_PROFILE_READ_ONLY"
 PROFILE_TAG_ENV = "NTA_EXECUTION_CALIBRATION_PROFILE_TAG"
 PROFILE_CPU_AFFINITY_ENV = "NTA_EXECUTION_CALIBRATION_CPU_AFFINITY"
 PROFILE_GPU_POWER_LIMIT_ENV = "NTA_EXECUTION_CALIBRATION_GPU_POWER_LIMIT_WATTS"
+PROFILE_GPU_CLOCK_LIMIT_ENV = "NTA_EXECUTION_CALIBRATION_GPU_CLOCK_LIMIT_MHZ"
 _MAX_PROFILE_BYTES = 64 * 1024 * 1024
 
 
@@ -97,6 +98,19 @@ def _declared_gpu_power_limit() -> float | None:
         raise ValueError(f"{PROFILE_GPU_POWER_LIMIT_ENV} must be numeric") from error
     if not math.isfinite(result) or result <= 0.0:
         raise ValueError(f"{PROFILE_GPU_POWER_LIMIT_ENV} must be positive and finite")
+    return result
+
+
+def _declared_gpu_clock_limit() -> int | None:
+    value = os.environ.get(PROFILE_GPU_CLOCK_LIMIT_ENV, "").strip()
+    if not value:
+        return None
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise ValueError(f"{PROFILE_GPU_CLOCK_LIMIT_ENV} must be an integer") from error
+    if result <= 0:
+        raise ValueError(f"{PROFILE_GPU_CLOCK_LIMIT_ENV} must be positive")
     return result
 
 
@@ -232,6 +246,7 @@ def build_sglang_calibration_compatibility(
             "multiprocessors": int(properties.multi_processor_count),
             "total_memory": int(properties.total_memory),
             "power_limit_watts": _declared_gpu_power_limit(),
+            "graphics_clock_limit_mhz": _declared_gpu_clock_limit(),
         },
         "cpu": {
             "declared_affinity": affinity,

@@ -109,6 +109,14 @@ def parse_args() -> argparse.Namespace:
         help="maximum GPU temperature for two samples before either paired arm",
     )
     parser.add_argument(
+        "--gpu-graphics-clock-limit-mhz",
+        type=int,
+        help=(
+            "externally configured sustainable graphics-clock ceiling, "
+            "verified identically for every arm"
+        ),
+    )
+    parser.add_argument(
         "--batch-mode",
         choices=("coalesced", "separate"),
         default="coalesced",
@@ -234,6 +242,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("setup idle timeout must be positive")
     if args.gpu_start_max_temperature_c <= 0:
         parser.error("GPU start temperature must be positive")
+    if (
+        args.gpu_graphics_clock_limit_mhz is not None
+        and args.gpu_graphics_clock_limit_mhz <= 0
+    ):
+        parser.error("GPU graphics-clock limit must be positive")
     if args.incremental_setup_ns is not None and args.incremental_setup_ns < 0:
         parser.error("incremental setup cost must be nonnegative")
     if not args.nta_calibration_profile_tag.strip():
@@ -391,6 +404,7 @@ def run(
         "NTA_EXECUTION_CALIBRATION_PROFILE",
         "NTA_EXECUTION_CALIBRATION_PROFILE_READ_ONLY",
         "NTA_EXECUTION_CALIBRATION_PROFILE_TAG",
+        "NTA_EXECUTION_CALIBRATION_GPU_CLOCK_LIMIT_MHZ",
     ):
         environment.pop(name, None)
     environment["NTA_EXECUTION_ADMISSION"] = "1"
@@ -449,6 +463,10 @@ def run(
     environment["NTA_EXECUTION_CALIBRATION_GPU_POWER_LIMIT_WATTS"] = (
         f"{power_limits[0]:.2f}"
     )
+    if args.gpu_graphics_clock_limit_mhz is not None:
+        environment["NTA_EXECUTION_CALIBRATION_GPU_CLOCK_LIMIT_MHZ"] = str(
+            args.gpu_graphics_clock_limit_mhz
+        )
     with CotenantSampler(owner_token) as sampler:
         completed = subprocess.run(
             command,
@@ -474,6 +492,7 @@ def run(
         sampler,
         expected_power_limit_watts=power_limits[0],
         start_max_temperature_c=args.gpu_start_max_temperature_c,
+        expected_graphics_clock_limit_mhz=args.gpu_graphics_clock_limit_mhz,
     )
     if completed.returncode:
         failures.append(f"worker exited with status {completed.returncode}")
