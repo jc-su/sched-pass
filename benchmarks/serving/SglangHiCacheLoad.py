@@ -57,6 +57,7 @@ from SglangHiCache import (
 
 
 _HICACHE_WRITE_POLICY = "write_through_selective"
+_CALIBRATION_CPU_AFFINITY_ENV = "NTA_EXECUTION_CALIBRATION_CPU_AFFINITY"
 
 
 _MEASUREMENT_COUNTERS = frozenset(
@@ -2004,6 +2005,9 @@ def main() -> int:
     requested_cpu_affinity = _parse_cpu_affinity(args.cpu_affinity)
     if requested_cpu_affinity is not None:
         os.sched_setaffinity(0, requested_cpu_affinity)
+        os.environ[_CALIBRATION_CPU_AFFINITY_ENV] = ",".join(
+            str(cpu) for cpu in sorted(requested_cpu_affinity)
+        )
     if args.numa_node is not None:
         requested_numa_node = str(args.numa_node)
         configured_numa_node = os.environ.get("SGLANG_HICACHE_HOST_NUMA_NODE")

@@ -32,6 +32,7 @@ PROFILE_CLASSIFICATION = "nta-sglang-auto-calibration"
 PROFILE_PATH_ENV = "NTA_EXECUTION_CALIBRATION_PROFILE"
 PROFILE_READ_ONLY_ENV = "NTA_EXECUTION_CALIBRATION_PROFILE_READ_ONLY"
 PROFILE_TAG_ENV = "NTA_EXECUTION_CALIBRATION_PROFILE_TAG"
+PROFILE_CPU_AFFINITY_ENV = "NTA_EXECUTION_CALIBRATION_CPU_AFFINITY"
 _MAX_PROFILE_BYTES = 64 * 1024 * 1024
 
 
@@ -50,6 +51,39 @@ def _parallel_value(model_runner: Any, name: str, default: int) -> int:
     if result < 0:
         raise ValueError(f"SGLang parallel field {name} cannot be negative")
     return result
+
+
+def _declared_cpu_affinity() -> list[int] | None:
+    """Return the stable deployment contract, never a startup-time mask.
+
+    SGLang changes scheduler affinity while constructing its worker tree.  The
+    mask visible inside attention-backend initialization is consequently an
+    incidental framework state and cannot identify reusable timing data.  An
+    artifact or deployment that pins CPUs declares that policy explicitly;
+    the serving harness verifies the actual process/thread masks separately.
+    """
+
+    value = os.environ.get(PROFILE_CPU_AFFINITY_ENV, "").strip()
+    if not value:
+        return None
+    cpus: set[int] = set()
+    for segment in value.split(","):
+        fields = segment.strip().split("-", 1)
+        try:
+            first = int(fields[0])
+            last = first if len(fields) == 1 else int(fields[1])
+        except ValueError as error:
+            raise ValueError(
+                f"{PROFILE_CPU_AFFINITY_ENV} has an invalid segment {segment!r}"
+            ) from error
+        if first < 0 or last < first:
+            raise ValueError(
+                f"{PROFILE_CPU_AFFINITY_ENV} has an invalid segment {segment!r}"
+            )
+        cpus.update(range(first, last + 1))
+    if not cpus:
+        raise ValueError(f"{PROFILE_CPU_AFFINITY_ENV} cannot be empty")
+    return sorted(cpus)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +191,7 @@ def build_sglang_calibration_compatibility(
     model_config = model_runner.model_config
     server_args = getattr(model_runner, "server_args", None)
     ps = getattr(model_runner, "ps", None)
-    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
+    affinity = _declared_cpu_affinity()
     host_model = tuning.host_cost_model
     mover_model = tuning.host_mover_default_service_model
     return {
@@ -184,7 +218,10 @@ def build_sglang_calibration_compatibility(
             "multiprocessors": int(properties.multi_processor_count),
             "total_memory": int(properties.total_memory),
         },
-        "cpu": {"affinity": affinity},
+        "cpu": {
+            "declared_affinity": affinity,
+            "numa_node": os.environ.get("SGLANG_HICACHE_HOST_NUMA_NODE"),
+        },
         "model": {
             "path": str(getattr(model_config, "model_path", "unknown")),
             "architectures": list(

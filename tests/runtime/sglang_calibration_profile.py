@@ -18,10 +18,12 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 from nta_runtime.engines.sglang_calibration_profile import (  # noqa: E402
+    PROFILE_CPU_AFFINITY_ENV,
     PROFILE_PATH_ENV,
     PROFILE_READ_ONLY_ENV,
     SglangCalibrationProfileConfig,
     SglangCalibrationProfileStore,
+    _declared_cpu_affinity,
 )
 from nta_runtime.execution_planner import HostCostModel  # noqa: E402
 
@@ -41,6 +43,16 @@ class Owner:
 
 
 def main() -> None:
+    with patch.dict(os.environ, {PROFILE_CPU_AFFINITY_ENV: "16-18,20,18"}):
+        assert _declared_cpu_affinity() == [16, 17, 18, 20]
+    with patch.dict(os.environ, {PROFILE_CPU_AFFINITY_ENV: "18-16"}):
+        try:
+            _declared_cpu_affinity()
+        except ValueError as error:
+            assert PROFILE_CPU_AFFINITY_ENV in str(error)
+        else:
+            raise AssertionError("calibration profile accepted invalid CPU affinity")
+
     with tempfile.TemporaryDirectory() as directory:
         profile_path = Path(directory) / "auto.json"
         compatibility = {
