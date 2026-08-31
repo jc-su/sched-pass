@@ -286,9 +286,7 @@ def main() -> None:
             "prefill_launches": 2,
         }
     )
-    activation = module.require_clean_mechanism(
-        mixed, require_physical_compaction=True
-    )
+    activation = module.require_clean_mechanism(mixed, require_physical_compaction=True)
     assert activation["native_work_unit_active"]
     assert activation["external_attention_stock_consumer"]
     assert activation["framework_preacquired_verified"]
@@ -347,33 +345,42 @@ def main() -> None:
     assert serving._max_request_input_tokens(32_768, 18_000) == 17_992
     assert serving._max_request_input_tokens(16_000, 18_000) == 15_992
     assert serving._HICACHE_WRITE_POLICY == "write_through_selective"
-    assert serving._required_placement_pressure_tokens(
-        device_pool_tokens=40_000,
-        page_tokens=16,
-        external_cache_tokens=16_704,
-        largest_external_object_tokens=7_872,
-        exact_manifest=True,
-        eviction_rounds=None,
-        churn_tokens=32_700,
-    ) == 64_592
-    assert serving._required_placement_pressure_tokens(
-        device_pool_tokens=40_000,
-        page_tokens=1,
-        external_cache_tokens=0,
-        largest_external_object_tokens=0,
-        exact_manifest=False,
-        eviction_rounds=None,
-        churn_tokens=32_700,
-    ) == 40_001
-    assert serving._required_placement_pressure_tokens(
-        device_pool_tokens=40_000,
-        page_tokens=16,
-        external_cache_tokens=16_704,
-        largest_external_object_tokens=7_872,
-        exact_manifest=True,
-        eviction_rounds=2,
-        churn_tokens=32_700,
-    ) == 65_400
+    assert (
+        serving._required_placement_pressure_tokens(
+            device_pool_tokens=40_000,
+            page_tokens=16,
+            external_cache_tokens=16_704,
+            largest_external_object_tokens=7_872,
+            exact_manifest=True,
+            eviction_rounds=None,
+            churn_tokens=32_700,
+        )
+        == 64_592
+    )
+    assert (
+        serving._required_placement_pressure_tokens(
+            device_pool_tokens=40_000,
+            page_tokens=1,
+            external_cache_tokens=0,
+            largest_external_object_tokens=0,
+            exact_manifest=False,
+            eviction_rounds=None,
+            churn_tokens=32_700,
+        )
+        == 40_001
+    )
+    assert (
+        serving._required_placement_pressure_tokens(
+            device_pool_tokens=40_000,
+            page_tokens=16,
+            external_cache_tokens=16_704,
+            largest_external_object_tokens=7_872,
+            exact_manifest=True,
+            eviction_rounds=2,
+            churn_tokens=32_700,
+        )
+        == 65_400
+    )
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3)) == 2
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3, 4)) == 3
     try:
@@ -523,20 +530,21 @@ def main() -> None:
         barrier.set()
         record = await request
         assert record["workload_gate_wait_seconds"] >= 0.005
-        assert abs(
-            record["arrival_offset_seconds"]
-            - record["workload_gate_wait_seconds"]
-        ) < 1e-6
-        assert abs(
-            record["admission_delay_seconds"]
-            - (
-                record["submitted_offset_seconds"]
-                - record["arrival_offset_seconds"]
+        assert (
+            abs(record["arrival_offset_seconds"] - record["workload_gate_wait_seconds"])
+            < 1e-6
+        )
+        assert (
+            abs(
+                record["admission_delay_seconds"]
+                - (
+                    record["submitted_offset_seconds"]
+                    - record["arrival_offset_seconds"]
+                )
             )
-        ) < 1e-6
-        assert record["admission_delay_seconds"] < record[
-            "workload_gate_wait_seconds"
-        ]
+            < 1e-6
+        )
+        assert record["admission_delay_seconds"] < record["workload_gate_wait_seconds"]
 
     asyncio.run(exercise_gated_arrival_accounting())
     try:
@@ -654,6 +662,24 @@ def main() -> None:
 
         def __len__(self) -> int:
             return self.vocab_size
+
+    pressure_roots = {11, 21}
+    pressure_a = serving._unique_pressure_input(
+        _Tokenizer(),
+        label="pressure-a",
+        token_count=32,
+        forbidden_first_tokens=pressure_roots,
+    )
+    pressure_b = serving._unique_pressure_input(
+        _Tokenizer(),
+        label="pressure-b",
+        token_count=32,
+        forbidden_first_tokens=pressure_roots,
+    )
+    assert len(pressure_a) == len(pressure_b) == 32
+    assert pressure_a[0] != pressure_b[0]
+    assert pressure_a[0] not in {11, 21}
+    assert pressure_b[0] not in {11, 21}
 
     prefix = (11, 12, 13)
     measured_input = prefix + (14, 15)
@@ -890,9 +916,9 @@ def main() -> None:
         < 1e-9
     )
     assert measured["consumer_contract"]["kind"] == "framework_reference"
-    assert [
-        contract["kind"] for contract in measured["consumer_contracts"]
-    ] == ["framework_reference"]
+    assert [contract["kind"] for contract in measured["consumer_contracts"]] == [
+        "framework_reference"
+    ]
     assert [
         contract["kind"]
         for contract in serving._measured_consumer_contracts(

@@ -367,9 +367,10 @@ def _require_closed_auto_calibration(
     ]
     failures: list[str] = []
     for report in auto_reports:
-        if report.get("incremental_setup_calibrated") is not True or int(
-            report.get("incremental_calibration_probes_remaining", -1)
-        ) != 0:
+        if (
+            report.get("incremental_setup_calibrated") is not True
+            or int(report.get("incremental_calibration_probes_remaining", -1)) != 0
+        ):
             failures.append("execution-form setup")
         consumer = report.get("consumer_policy_calibration")
         if (
@@ -489,10 +490,7 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
     elif incremental and not direct:
         if native_launches:
             kind = "native_incremental"
-        elif (
-            counters["host_acquisition_jobs_submitted"] > 0
-            and stock_launches > 0
-        ):
+        elif counters["host_acquisition_jobs_submitted"] > 0 and stock_launches > 0:
             # Deadline scheduling may complete every exact job before its
             # numerical arrival.  The optimized ready-stock consumer is then
             # the intended consume decision, not a mechanism fallback.
@@ -518,12 +516,12 @@ def _measurement_delta(
     final_schema = _cumulative_counter_schema(final)
     baseline_schema = _cumulative_counter_schema(baseline)
     if final_schema != baseline_schema:
-        raise RuntimeError("engine cumulative-counter schema changed during measurement")
+        raise RuntimeError(
+            "engine cumulative-counter schema changed during measurement"
+        )
     counter_names.update(final_schema)
     counter_names.update(
-        name
-        for name in set(final) | set(baseline)
-        if name.startswith("admission_")
+        name for name in set(final) | set(baseline) if name.startswith("admission_")
     )
     counter_names.update(
         name
@@ -533,13 +531,13 @@ def _measurement_delta(
     counter_names.update(
         name
         for name in set(final) | set(baseline)
-        if name.startswith("native_dispatch_prefix_layers_") and name.endswith("_batches")
+        if name.startswith("native_dispatch_prefix_layers_")
+        and name.endswith("_batches")
     )
     counter_names.update(
         name
         for name in set(final) | set(baseline)
-        if name.startswith("progressive_consumer_layers_")
-        and name.endswith("_batches")
+        if name.startswith("progressive_consumer_layers_") and name.endswith("_batches")
     )
     # Frontier fields are all monotone work/accounting counters. Keep this
     # family-based so adding one scheduler observation cannot silently leak
@@ -570,8 +568,7 @@ def _measurement_delta(
     counter_names.update(
         name
         for name in set(final) | set(baseline)
-        if name.startswith("forward_")
-        and name.endswith(("_count", "_ms_total"))
+        if name.startswith("forward_") and name.endswith(("_count", "_ms_total"))
     )
     counter_names.update(
         name
@@ -583,14 +580,10 @@ def _measurement_delta(
     # quantities are projected; rates and maxima are derived/gauge values and
     # must never be subtracted as counters.
     counter_names.update(
-        name
-        for name in set(final) | set(baseline)
-        if name.endswith("_cpu_ns")
+        name for name in set(final) | set(baseline) if name.endswith("_cpu_ns")
     )
     counter_names.update(
-        name
-        for name in set(final) | set(baseline)
-        if name.endswith("_enqueue_layers")
+        name for name in set(final) | set(baseline) if name.endswith("_enqueue_layers")
     )
     counter_names.update(
         name
@@ -632,9 +625,7 @@ def _measurement_delta(
                 )
             value = float(end) - float(begin)
             if value < 0.0:
-                raise RuntimeError(
-                    f"measurement field {map_name}[{layer!r}] decreased"
-                )
+                raise RuntimeError(f"measurement field {map_name}[{layer!r}] decreased")
             if value > 0.0:
                 projected[str(layer)] = value
         measured[map_name] = dict(
@@ -655,15 +646,11 @@ def _measurement_delta(
         transfer_bytes = int(measured.get(f"{prefix}_bytes", 0))
         rate_name = f"{prefix}_gib_per_second"
         if elapsed_ms > 0.0 and transfer_bytes > 0:
-            measured[rate_name] = (
-                transfer_bytes / (1 << 30) / (elapsed_ms / 1_000.0)
-            )
+            measured[rate_name] = transfer_bytes / (1 << 30) / (elapsed_ms / 1_000.0)
         else:
             measured.pop(rate_name, None)
     measured["measurement_scope"] = "timed_load_delta"
-    measured["measurement_baseline_unix_ns"] = int(
-        baseline.get("snapshot_unix_ns", 0)
-    )
+    measured["measurement_baseline_unix_ns"] = int(baseline.get("snapshot_unix_ns", 0))
     measured["measurement_counter_fields"] = sorted(counter_names)
     measured["consumer_contracts"] = _measured_consumer_contracts(measured)
     measured["consumer_contract"] = measured["consumer_contracts"][0]
@@ -698,9 +685,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SGLANG_INPUT_MARGIN_TOKENS = 8
 
 
-def _max_request_input_tokens(
-    context_length: int, max_total_tokens: int
-) -> int:
+def _max_request_input_tokens(context_length: int, max_total_tokens: int) -> int:
     """Return the input envelope enforced by the configured SGLang engine.
 
     SGLang bounds one request by both the model context and the engine's KV
@@ -1045,11 +1030,14 @@ def parse_args() -> argparse.Namespace:
         _parse_cpu_affinity(args.cpu_affinity)
     except ValueError as error:
         parser.error(str(error))
-    if min(
-        args.slo_ttft_seconds,
-        args.slo_tpot_seconds,
-        args.slo_p99_itl_seconds,
-    ) <= 0:
+    if (
+        min(
+            args.slo_ttft_seconds,
+            args.slo_tpot_seconds,
+            args.slo_p99_itl_seconds,
+        )
+        <= 0
+    ):
         parser.error("SLO thresholds must be positive")
     if args.request_rate <= 0:
         parser.error("request rate must be positive")
@@ -1135,9 +1123,7 @@ def _required_placement_pressure_tokens(
         # displaced to satisfy a token-count target. One largest-object slack
         # turns the continuous pool budget into a safe discrete frontier.
         required = (
-            pool_frontier
-            + external_cache_tokens
-            + largest_external_object_tokens
+            pool_frontier + external_cache_tokens + largest_external_object_tokens
         )
         if eviction_rounds is not None:
             required = max(required, eviction_rounds * churn_tokens)
@@ -1180,9 +1166,7 @@ def _structure_token_inputs(
     for ordinal, page_id in enumerate(page_ids):
         values = [safe_tokens[ordinal]]
         for position in range(1, block_size):
-            digest = hashlib.sha256(
-                f"{page_id}:{position}".encode("utf-8")
-            ).digest()
+            digest = hashlib.sha256(f"{page_id}:{position}".encode("utf-8")).digest()
             values.append(
                 safe_tokens[int.from_bytes(digest[:8], "big") % len(safe_tokens)]
             )
@@ -1419,16 +1403,12 @@ def _load_workload(
         float(row["arrival_seconds"]) - origin for row in external_rows
     )
     request_arrival_offsets = {
-        str(row["request_id"]): float(row["arrival_seconds"]) - origin
-        for row in rows
+        str(row["request_id"]): float(row["arrival_seconds"]) - origin for row in rows
     }
     block_size = int(manifest["block_size"])
-    inputs, token_identity_digest = _structure_token_inputs(
-        tokenizer, rows, block_size
-    )
+    inputs, token_identity_digest = _structure_token_inputs(tokenizer, rows, block_size)
     source_input_by_request = {
-        str(row["request_id"]): values
-        for row, values in zip(rows, inputs, strict=True)
+        str(row["request_id"]): values for row, values in zip(rows, inputs, strict=True)
     }
     external_request_ids = tuple(str(row["request_id"]) for row in external_rows)
     source_external_inputs = tuple(
@@ -1505,17 +1485,11 @@ def _load_workload(
         # Bailian prefix pages occur once in the combined pressure budget.
         "resident_input_cache_pages": len(resident_page_ids),
         "external_input_cache_pages": len(external_cached_page_ids),
-        "combined_input_cache_pages": len(
-            resident_page_ids | external_cached_page_ids
-        ),
-        "shared_input_cache_pages": len(
-            resident_page_ids & external_cached_page_ids
-        ),
+        "combined_input_cache_pages": len(resident_page_ids | external_cached_page_ids),
+        "shared_input_cache_pages": len(resident_page_ids & external_cached_page_ids),
     }
     return LoadedWorkload(
-        resident_request_ids=tuple(
-            str(row["request_id"]) for row in resident_rows
-        ),
+        resident_request_ids=tuple(str(row["request_id"]) for row in resident_rows),
         external_request_ids=external_request_ids,
         resident_inputs=tuple(
             input_by_request[str(row["request_id"])] for row in resident_rows
@@ -1537,6 +1511,7 @@ def _meta(result: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("SGLang omitted request metadata")
     return meta
 
+
 def _token_input(tokenizer: Any, prompt: str) -> TokenInput:
     token_ids = tuple(
         int(value) for value in tokenizer.encode(prompt, add_special_tokens=False)
@@ -1544,6 +1519,28 @@ def _token_input(tokenizer: Any, prompt: str) -> TokenInput:
     if not token_ids:
         raise RuntimeError("serving request tokenized to an empty input")
     return token_ids
+
+
+def _unique_pressure_input(
+    tokenizer: Any,
+    *,
+    label: str,
+    token_count: int,
+    forbidden_first_tokens: set[int],
+) -> TokenInput:
+    """Build one exact-length pressure object with a disjoint radix root."""
+
+    values = list(_token_input(tokenizer, make_prompt(tokenizer, label, token_count)))
+    special = {int(value) for value in getattr(tokenizer, "all_special_ids", ())}
+    vocabulary_size = int(len(tokenizer))
+    seed = int.from_bytes(hashlib.sha256(label.encode("utf-8")).digest()[:8], "big")
+    for offset in range(vocabulary_size):
+        candidate = (seed + offset) % vocabulary_size
+        if candidate not in special and candidate not in forbidden_first_tokens:
+            values[0] = candidate
+            forbidden_first_tokens.add(candidate)
+            return tuple(values)
+    raise RuntimeError("tokenizer has no disjoint placement-pressure root token")
 
 
 def _reusable_prefix_tokens(prefix: TokenInput, prompt: TokenInput) -> int:
@@ -1613,8 +1610,7 @@ def _flush_cache_when_idle(
     run_until_complete = getattr(event_loop, "run_until_complete", None)
     if manager is None or not callable(flush_cache) or not callable(run_until_complete):
         raise RuntimeError(
-            "SGLang engine lacks the deferred idle-flush contract required "
-            f"to {reason}"
+            f"SGLang engine lacks the deferred idle-flush contract required to {reason}"
         )
 
     started = time.perf_counter()
@@ -1751,9 +1747,7 @@ async def _stream_request(
     if gate is not None:
         await gate.wait()
         schedule_origin = time.perf_counter()
-        workload_gate_wait_seconds = max(
-            0.0, schedule_origin - load_start_seconds
-        )
+        workload_gate_wait_seconds = max(0.0, schedule_origin - load_start_seconds)
     if offset_seconds:
         await asyncio.sleep(offset_seconds)
     scheduled_arrival = schedule_origin + offset_seconds
@@ -1818,12 +1812,8 @@ async def _stream_request(
         "finished_seconds": finished,
         "ttft_seconds": first - submitted,
         "e2e_seconds": finished - submitted,
-        "admission_delay_seconds": max(
-            0.0, submitted - scheduled_arrival
-        ),
-        "system_time_seconds": max(
-            0.0, finished - scheduled_arrival
-        ),
+        "admission_delay_seconds": max(0.0, submitted - scheduled_arrival),
+        "system_time_seconds": max(0.0, finished - scheduled_arrival),
         "tpot_seconds": (
             (token_times[-1] - first) / (completion_tokens - 1)
             if completion_tokens > 1
@@ -1923,17 +1913,13 @@ async def _run_load(
             gate=None,
             first_token_event=residents_started,
             offset_seconds=(
-                float(resident_offsets[index])
-                if resident_offsets is not None
-                else 0.0
+                float(resident_offsets[index]) if resident_offsets is not None else 0.0
             ),
             load_start_seconds=started,
         )
         return record
 
-    if resident_offsets is not None and len(resident_offsets) != len(
-        resident_prompts
-    ):
+    if resident_offsets is not None and len(resident_offsets) != len(resident_prompts):
         raise RuntimeError("workload arrival count does not match resident prompts")
     if external_offsets is not None:
         if len(external_offsets) != len(external_prompts):
@@ -2094,12 +2080,9 @@ def main() -> int:
         args.resident_requests = len(resident_prompts)
         args.external_requests = len(external_prompts)
         args.resident_tokens = max(workload_metadata["resident_input_tokens"])
-        args.external_tokens = max(
-            workload_metadata["source_external_input_tokens"]
-        )
+        args.external_tokens = max(workload_metadata["source_external_input_tokens"])
         cached_prefix_lengths = [
-            int(value)
-            for value in workload_metadata["external_cached_prefix_tokens"]
+            int(value) for value in workload_metadata["external_cached_prefix_tokens"]
         ]
         if len(cached_prefix_lengths) != len(external_prompts) or any(
             length <= 0 or length >= len(prompt)
@@ -2200,11 +2183,9 @@ def main() -> int:
     combined_cache_tokens = 0
     shared_cache_tokens = 0
     placement_page_tokens = (
-        int(workload_metadata["block_size"])
-        if workload_metadata is not None
-        else 1
+        int(workload_metadata["block_size"]) if workload_metadata is not None else 1
     )
-    placement_eviction_prompts: list[TokenInput] = []
+    placement_eviction_token_counts: list[int] = []
     if workload_metadata is not None:
         block_size = int(workload_metadata["block_size"])
         resident_cache_tokens = (
@@ -2254,21 +2235,25 @@ def main() -> int:
     )
     while remaining > 0:
         token_count = min(maximum_pressure_prompt_tokens, remaining)
-        placement_eviction_prompts.append(
-            _token_input(
-                tokenizer,
-                make_prompt(
-                    tokenizer,
-                    f"load-placement-eviction-{len(placement_eviction_prompts)}",
-                    token_count,
-                ),
-            )
-        )
+        placement_eviction_token_counts.append(token_count)
         remaining -= token_count
 
     measurement_baseline: dict[str, dict[str, Any]] = {}
     cpu_affinity_contract: dict[str, Any] = {}
     setup_cache_flush_wait_seconds: list[float] = []
+    placement_pressure_applications = 0
+    placement_pressure_total_tokens = 0
+    placement_probe_history: list[dict[str, Any]] = []
+    final_placement_proof: dict[str, Any] = {}
+    pressure_forbidden_first_tokens = {
+        int(prompt[0])
+        for prompt in (
+            *resident_prompts,
+            *external_prompts,
+            *external_materialization_prompts,
+            shape_prompt,
+        )
+    }
     load_started = time.perf_counter()
     with sgl.Engine(
         model_path=str(args.model.resolve()),
@@ -2377,19 +2362,80 @@ def main() -> int:
                 )
             )
 
-        warm_external_prefixes()
-        for prompt in placement_eviction_prompts:
-            generated_text(_generate_one(engine, prompt, setup_sampling))
-        if workload_metadata is None:
-            external_probe = _generate_one(engine, external_prefixes[0], setup_sampling)
-            if host_cached_tokens(external_probe) <= 0:
-                raise RuntimeError("external JIT warmup did not load from host cache")
-        # The probe above promotes the external prefix back to the device.
-        # Replay the capacity-sized pressure set to leave it host-resident.
-        # These prompts are setup-only and the cache is reset before every
-        # subsequent calibration/timed placement.
-        for prompt in placement_eviction_prompts:
-            generated_text(_generate_one(engine, prompt, setup_sampling))
+        def apply_placement_pressure() -> None:
+            """Apply one disjoint, L2-ineligible pressure window."""
+
+            nonlocal placement_pressure_applications
+            nonlocal placement_pressure_total_tokens
+            application = placement_pressure_applications
+            for index, token_count in enumerate(placement_eviction_token_counts):
+                prompt = _unique_pressure_input(
+                    tokenizer,
+                    label=f"load-placement-pressure-{application}-{index}",
+                    token_count=token_count,
+                    forbidden_first_tokens=pressure_forbidden_first_tokens,
+                )
+                generated_text(_generate_one(engine, prompt, setup_sampling))
+                placement_pressure_total_tokens += len(prompt)
+            placement_pressure_applications += 1
+
+        def construct_external_placement(*, reason: str) -> None:
+            """Build and destructively verify the exact host-backed frontier."""
+
+            nonlocal final_placement_proof
+            warm_external_prefixes()
+            apply_placement_pressure()
+            for attempt in range(1, 4):
+                observations: list[dict[str, int]] = []
+                missing: list[dict[str, int]] = []
+                # Probe sequentially so cache-source metadata is captured at
+                # admission, before queued requests can become device-ready.
+                for index, (prompt, expected) in enumerate(
+                    zip(
+                        external_materialization_prompts,
+                        external_cached_prefix_lengths,
+                        strict=True,
+                    )
+                ):
+                    result = _generate_one(engine, prompt, setup_sampling)
+                    device = device_cached_tokens(result)
+                    host = host_cached_tokens(result)
+                    observation = {
+                        "index": index,
+                        "expected": int(expected),
+                        "device": device,
+                        "host": host,
+                    }
+                    observations.append(observation)
+                    if host <= 0 or host + device != expected:
+                        missing.append(observation)
+                        # One repair hit closes selective write-through for a
+                        # cold or still-device-only radix leaf.
+                        generated_text(_generate_one(engine, prompt, setup_sampling))
+                placement_probe_history.append(
+                    {
+                        "reason": reason,
+                        "attempt": attempt,
+                        "missing": missing,
+                    }
+                )
+                # The probe is destructive because it promotes host pages.
+                # A fresh disjoint pressure window replays the proven split.
+                apply_placement_pressure()
+                if not missing:
+                    final_placement_proof = {
+                        "reason": reason,
+                        "attempt": attempt,
+                        "observations": observations,
+                        "destructive_probe_followed_by_disjoint_replay": True,
+                    }
+                    return
+            raise RuntimeError(
+                "external placement did not converge after bounded backing probes: "
+                + json.dumps(missing, sort_keys=True)
+            )
+
+        construct_external_placement(reason="jit_warmup")
         warm_residents()
 
         def establish_final_placement() -> None:
@@ -2418,9 +2464,7 @@ def main() -> int:
                     reason="reset cache before rebuilding measured placement",
                 )
             )
-            warm_external_prefixes()
-            for prompt in placement_eviction_prompts:
-                generated_text(_generate_one(engine, prompt, setup_sampling))
+            construct_external_placement(reason="measured_reconstruction")
             warm_residents()
 
         establish_final_placement()
@@ -2450,9 +2494,9 @@ def main() -> int:
             ]
             warmup_records, _ = engine.loop.run_until_complete(
                 _run_load(
-                engine,
-                resident_prompts,
-                calibration_external_prompts,
+                    engine,
+                    resident_prompts,
+                    calibration_external_prompts,
                     args,
                     resident_offsets,
                     external_offsets,
@@ -2530,13 +2574,12 @@ def main() -> int:
             "host": record["host_cached_tokens"],
         }
         for record in external
-        if record["host_cached_tokens"] <= 0
-        or record["host_cached_tokens"] + record["device_cached_tokens"]
+        if record["host_cached_tokens"] + record["device_cached_tokens"]
         != expected_external_prefixes[record["index"]]
     ]
     if missing_external:
         raise RuntimeError(
-            "a timed external request was not served from host cache: "
+            "a timed external request did not retain its exact cached prefix: "
             + json.dumps(missing_external, sort_keys=True)
         )
     expected_resident_prefixes = [len(value) - 1 for value in resident_prompts]
@@ -2552,6 +2595,9 @@ def main() -> int:
         or record["host_cached_tokens"] != 0
     ]
     minimum_host_prefix = min(record["host_cached_tokens"] for record in external)
+    execution_ready_external = [
+        int(record["index"]) for record in external if record["host_cached_tokens"] == 0
+    ]
     if missing_resident:
         raise RuntimeError(
             "a timed resident request was not device-resident: "
@@ -2769,13 +2815,17 @@ def main() -> int:
         "external_tokens": args.external_tokens,
         "external_suffix_tokens": args.external_suffix_tokens,
         "minimum_external_host_cached_tokens": minimum_host_prefix,
+        "execution_ready_external_requests": execution_ready_external,
         "resident_requests": args.resident_requests,
         "resident_tokens": args.resident_tokens,
         "resident_output_tokens": args.resident_output_tokens,
         "external_output_tokens": args.external_output_tokens,
         "eviction_rounds": eviction_rounds,
-        "placement_eviction_rounds": len(placement_eviction_prompts),
-        "placement_eviction_tokens": sum(map(len, placement_eviction_prompts)),
+        "placement_eviction_rounds": len(placement_eviction_token_counts),
+        "placement_eviction_tokens": placement_pressure_total_tokens,
+        "placement_pressure_applications": placement_pressure_applications,
+        "placement_probe_history": placement_probe_history,
+        "initial_placement_proof": final_placement_proof,
         "resident_input_cache_tokens": resident_cache_tokens,
         "external_input_cache_tokens": external_cache_tokens,
         "combined_input_cache_tokens": combined_cache_tokens,
@@ -2809,8 +2859,7 @@ def main() -> int:
             "excluded_from_timed_window": True,
         },
         "load_warmup_excluded": (
-            args.load_warmup_iterations >= 2
-            and calibration_contract["verified"]
+            args.load_warmup_iterations >= 2 and calibration_contract["verified"]
         ),
         "calibration_input_contract": calibration_contract,
         "batch_heterogeneity": batch_heterogeneity,
