@@ -131,12 +131,8 @@ def wait_for_free_gpu(
             and applications.returncode == 0
             and used_mib is not None
         ):
-            temperature_ready = (
-                max_temperature_c is None
-                or (
-                    temperature_c is not None
-                    and temperature_c <= max_temperature_c
-                )
+            temperature_ready = max_temperature_c is None or (
+                temperature_c is not None and temperature_c <= max_temperature_c
             )
             if used_mib < limit_mib and not compute_pids and temperature_ready:
                 ready_samples += 1
@@ -209,26 +205,20 @@ class CotenantSampler:
         if pid in descendants:
             return True
         try:
-            environment = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(
-                b"\0"
-            )
+            environment = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         except OSError:
             return False
         marker = f"{TRIAL_OWNER_ENV}={self.owner_token}".encode()
         return marker in environment
 
     def _sample_once(self) -> None:
-        result = _run_nvidia_smi(
-            ["--query-compute-apps=pid", "--format=csv,noheader"]
-        )
+        result = _run_nvidia_smi(["--query-compute-apps=pid", "--format=csv,noheader"])
         if result is None or result.returncode != 0:
             self.sampling_errors += 1
             return
         try:
             applications = {
-                int(line)
-                for line in result.stdout.split()
-                if line.strip().isdigit()
+                int(line) for line in result.stdout.split() if line.strip().isdigit()
             }
         except ValueError:
             self.sampling_errors += 1
@@ -236,9 +226,7 @@ class CotenantSampler:
         self.samples += 1
         descendants = self._descendants()
         foreign = {
-            pid
-            for pid in applications
-            if not self._owned_by_trial(pid, descendants)
+            pid for pid in applications if not self._owned_by_trial(pid, descendants)
         }
         if foreign:
             self.foreign_samples += 1
@@ -351,6 +339,11 @@ class CotenantSampler:
             "power_limit_min_watts": self.power_limit_min_watts,
             "power_limit_max_watts": self.power_limit_max_watts,
             "thermal_slowdown_samples": self.thermal_slowdown_samples,
+            "thermal_slowdown_sample_fraction": (
+                self.thermal_slowdown_samples / self.telemetry_samples
+                if self.telemetry_samples
+                else None
+            ),
             "clock_reason_masks": [
                 f"0x{mask:016x}" for mask in sorted(self.clock_reason_masks)
             ],
@@ -366,8 +359,11 @@ def trial_environment_evidence(
 ) -> tuple[dict[str, object], list[str]]:
     """Seal one serving arm's shared, fail-closed GPU environment evidence.
 
-    Power, temperature, and clock observations are trial-validity telemetry,
-    never mechanism inputs.  An explicit graphics-clock limit identifies a
+    Power, temperature, and clock observations are nuisance/outcome telemetry,
+    never mechanism inputs. Missing telemetry, a changed administrator policy,
+    or a foreign process invalidates a trial. Natural temperature and thermal-
+    slowdown variation remains in the report and is handled by randomized
+    paired repetitions. An explicit graphics-clock limit identifies a
     diagnostic sensitivity run; omission identifies the production-default
     DVFS policy used by headline serving trials.
     """
@@ -407,18 +403,10 @@ def trial_environment_evidence(
             "GPU telemetry sampler lost environmental samples: "
             f"{telemetry['errors']} errors"
         )
-    if int(telemetry["thermal_slowdown_samples"]):
-        failures.append(
-            "GPU thermal slowdown contaminated "
-            f"{telemetry['thermal_slowdown_samples']} samples"
-        )
     observed_graphics_clock_max = telemetry["graphics_clock_max_mhz"]
     if expected_graphics_clock_limit_mhz is not None and (
         observed_graphics_clock_max is None
-        or abs(
-            int(observed_graphics_clock_max)
-            - expected_graphics_clock_limit_mhz
-        )
+        or abs(int(observed_graphics_clock_max) - expected_graphics_clock_limit_mhz)
         > 15
     ):
         failures.append(

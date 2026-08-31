@@ -526,14 +526,25 @@ def _validate_environment(report: dict[str, Any], *, require_complete: bool) -> 
             telemetry.get("thermal_slowdown_samples"),
             "GPU thermal-slowdown sample count",
         )
+        thermal_fraction = _finite(
+            telemetry.get("thermal_slowdown_sample_fraction"),
+            "GPU thermal-slowdown sample fraction",
+        )
         _require(
             telemetry_samples == samples,
             "GPU occupancy and telemetry sample counts disagree",
         )
         _require(telemetry_errors == 0, "formal serving evidence lost GPU telemetry")
         _require(
-            thermal_samples == 0,
-            "formal serving evidence contains GPU thermal slowdown",
+            thermal_samples <= telemetry_samples
+            and 0.0 <= thermal_fraction <= 1.0
+            and math.isclose(
+                thermal_fraction,
+                thermal_samples / telemetry_samples,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ),
+            "formal serving evidence has inconsistent thermal-slowdown telemetry",
         )
         temperature_min = _finite(
             telemetry.get("temperature_min_c"), "minimum GPU temperature"

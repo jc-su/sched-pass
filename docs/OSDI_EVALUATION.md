@@ -258,9 +258,10 @@ throttling reasons, and co-tenants are recorded as nuisance-variable evidence;
 they are never scheduler inputs, workload-selection criteria, or deployment
 preconditions. Arms use the same hardware configuration and are interleaved or
 run in reversed paired order. A trial is rejected only by predeclared validity
-rules such as a foreign GPU process, a changed power-limit setting, telemetry
-loss, or an actual thermal-slowdown event—not because one ordinary temperature
-sample differs between arms. `--gpu-graphics-clock-limit-mhz` is reserved for
+rules such as a foreign GPU process, a changed power-limit setting, or telemetry
+loss. Thermal slowdown under the unchanged production policy is retained as an
+observed sample fraction and analyzed for arm-order sensitivity; it is neither
+hidden nor used to select requests. `--gpu-graphics-clock-limit-mhz` is reserved for
 diagnostic sensitivity experiments, is labeled `fixed_diagnostic` in the
 artifact, and must not be mixed into the headline production-DVFS aggregate.
 

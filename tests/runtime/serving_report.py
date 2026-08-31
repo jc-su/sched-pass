@@ -109,6 +109,7 @@ def single() -> dict[str, object]:
             "power_limit_min_watts": 500.0,
             "power_limit_max_watts": 500.0,
             "thermal_slowdown_samples": 0,
+            "thermal_slowdown_sample_fraction": 0.0,
             "clock_reason_masks": ["0x0000000000000000"],
         },
         "verification_failures": 0,
@@ -573,12 +574,20 @@ def main() -> None:
         raise AssertionError("co-tenant-contaminated serving evidence was accepted")
     thermal_environment = copy.deepcopy(comparison)
     thermal_environment["nta"]["gpu_environment"]["thermal_slowdown_samples"] = 1
+    thermal_environment["nta"]["gpu_environment"][
+        "thermal_slowdown_sample_fraction"
+    ] = 1.0
+    validate(thermal_environment)
+    inconsistent_thermal = copy.deepcopy(thermal_environment)
+    inconsistent_thermal["nta"]["gpu_environment"][
+        "thermal_slowdown_sample_fraction"
+    ] = 0.0
     try:
-        validate(thermal_environment)
+        validate(inconsistent_thermal)
     except ValueError as error:
-        assert "thermal slowdown" in str(error)
+        assert "thermal-slowdown telemetry" in str(error)
     else:
-        raise AssertionError("thermally contaminated serving evidence was accepted")
+        raise AssertionError("inconsistent thermal telemetry was accepted")
     unstable_power = copy.deepcopy(comparison)
     unstable_power["nta"]["gpu_environment"]["power_limit_max_watts"] = 450.0
     try:

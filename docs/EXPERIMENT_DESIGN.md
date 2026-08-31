@@ -189,8 +189,8 @@ and artifacts must contain that revision and complete activation metadata.
 GPU power and temperature are nuisance variables, not deployment
 preconditions or scheduler inputs. A formal paired campaign records one
 administrator-selected power limit, begins both arms below the same thermal
-bound, rejects foreign GPU processes and actual thermal slowdown, and reports
-the observed clock/power range. It does not claim that production holds
+bound, rejects foreign GPU processes and telemetry/configuration loss, and
+reports the observed clock/power/thermal range. It does not claim that production holds
 temperature constant, nor wait for a favorable exact temperature. The bound is
 a predeclared contamination gate, not a workload condition. Headline trials use
 the production-default DVFS policy. If the installed chassis cannot sustain
@@ -201,6 +201,12 @@ identical for all arms; it must not be selected from stock/NTA performance
 results. The production selector adapts from measured transfer and compute
 observations; power/clock sensitivity is a separate robustness experiment and
 must use identical settings for stock and NTA.
+
+Thermal-slowdown events under that unchanged policy are recorded as an observed
+rate, not deleted or treated as mechanism input. Randomized paired order and
+repetitions expose carryover or arm-order bias; the aggregate reports thermal
+sensitivity alongside performance. This preserves deployment behavior while
+preventing an administrator setting or hidden co-tenant from changing one arm.
 
 Likewise, the causal A1--A3 arms fix one common transport engine only to
 separate acquisition and consumer effects. Natural-trace full-system runs must

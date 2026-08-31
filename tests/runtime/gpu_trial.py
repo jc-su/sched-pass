@@ -46,9 +46,7 @@ def main() -> None:
         )
     assert len(calls) == 2
 
-    with patch.object(
-        gpu_trial, "_run_nvidia_smi", return_value=completed("500.00\n")
-    ):
+    with patch.object(gpu_trial, "_run_nvidia_smi", return_value=completed("500.00\n")):
         assert gpu_trial.query_gpu_power_limits() == (500.0,)
 
     with (
@@ -91,14 +89,18 @@ def main() -> None:
     telemetry = evidence["gpu_environment"]
     assert isinstance(telemetry, dict)
     assert telemetry["thermal_slowdown_samples"] == 0
+    assert telemetry["thermal_slowdown_sample_fraction"] == 0.0
 
     sampler.thermal_slowdown_samples = 1
-    _, failures = gpu_trial.trial_environment_evidence(
+    thermal_evidence, failures = gpu_trial.trial_environment_evidence(
         sampler,
         expected_power_limit_watts=500.0,
         start_max_temperature_c=40,
     )
-    assert any("thermal slowdown" in failure for failure in failures)
+    assert not failures
+    thermal_telemetry = thermal_evidence["gpu_environment"]
+    assert isinstance(thermal_telemetry, dict)
+    assert thermal_telemetry["thermal_slowdown_sample_fraction"] == 1.0
 
     sampler.thermal_slowdown_samples = 0
     _, failures = gpu_trial.trial_environment_evidence(
