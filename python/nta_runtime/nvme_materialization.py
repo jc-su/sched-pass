@@ -21,7 +21,7 @@ from typing import Any
 
 from nta_runtime.indexed_transfer import ContiguousPairRun
 from nta_runtime.nvme_granularity import NvmeSourceSpan, NvmeSpanPlan
-from nta_runtime.runtime import RegisteredNvmeObjectInstall
+from nta_runtime.runtime import ObjectScope, RegisteredNvmeObjectInstall
 
 
 IndexPair = tuple[tuple[int, ...], tuple[int, ...]]
@@ -540,11 +540,16 @@ def prepare_nvme_runs(
     layer_id: int,
     object_version: int,
     object_id_base: int,
+    object_scope: ObjectScope,
     first_object_slot: int = 0,
     lifetime: NvmeSlotLifetime,
 ) -> PreparedNvmeRunPublication:
     """Validate and materialize one run image without native mutation."""
 
+    try:
+        object_scope = ObjectScope(object_scope)
+    except (TypeError, ValueError) as error:
+        raise ValueError("NVMe publication object scope is invalid") from error
     if (
         not lanes
         or object_version <= 0
@@ -606,7 +611,8 @@ def prepare_nvme_runs(
                 int(extent.bytes),
                 lane.region,
                 destination,
-                quiescence,
+                scope=object_scope,
+                prior_consumer_event=quiescence,
             )
         )
         previous_destinations.append(previous)
@@ -704,11 +710,16 @@ def prepare_nvme_spans(
     layer_id: int,
     object_version: int,
     object_id_base: int,
+    object_scope: ObjectScope,
     first_object_slot: int,
     lifetime: NvmeSlotLifetime,
 ) -> PreparedNvmeSpanPublication:
     """Prepare exact source-span DMA and its post-DMA HBM compaction image."""
 
+    try:
+        object_scope = ObjectScope(object_scope)
+    except (TypeError, ValueError) as error:
+        raise ValueError("NVMe publication object scope is invalid") from error
     if (
         tuple(lane.row_bytes for lane in lanes) != plan.lane_element_bytes
         or len(lanes) == 0
@@ -751,7 +762,8 @@ def prepare_nvme_spans(
                     transfer_bytes,
                     scratch.region,
                     destination,
-                    lifetime.prior_consumer_event(slot),
+                    scope=object_scope,
+                    prior_consumer_event=lifetime.prior_consumer_event(slot),
                 )
             )
             spans_by_object.append(span)
@@ -864,6 +876,7 @@ def publish_nvme_runs(
     layer_id: int,
     object_version: int,
     object_id_base: int,
+    object_scope: ObjectScope,
     first_object_slot: int = 0,
     stream: Any,
     lifetime: NvmeSlotLifetime,
@@ -877,6 +890,7 @@ def publish_nvme_runs(
         layer_id=layer_id,
         object_version=object_version,
         object_id_base=object_id_base,
+        object_scope=object_scope,
         first_object_slot=first_object_slot,
         lifetime=lifetime,
     )

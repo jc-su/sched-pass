@@ -90,9 +90,9 @@ def main() -> None:
     try:
         cross_tenant.require_single_tenant_groups()
     except ValueError as error:
-        assert "cross tenant credit domains" in str(error)
+        assert "cross tenant ownership domains" in str(error)
     else:
-        raise AssertionError("cross-tenant acquisition group bypassed isolation")
+        raise AssertionError("cross-tenant acquisition group bypassed ownership")
     print("indexed_acquisition_plan=pass")
 
 

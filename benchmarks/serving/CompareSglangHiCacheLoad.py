@@ -22,6 +22,7 @@ from CompareSglangHiCache import require_clean_mechanism  # noqa: E402
 from experiments.atomic_io import atomic_write_json, atomic_write_text  # noqa: E402
 from experiments.serving_metrics import (  # noqa: E402
     preregistered_goodput,
+    preregistered_joint_goodput,
     relative_goodput,
     relative_thresholds,
     safe_ratio,
@@ -82,7 +83,14 @@ def parse_args() -> argparse.Namespace:
             "churn for a capacity-fit workload"
         ),
     )
-    parser.add_argument("--load-warmup-iterations", type=int, default=2)
+    parser.add_argument("--load-warmup-iterations", type=int, default=8)
+    parser.add_argument("--setup-idle-timeout-seconds", type=float, default=120.0)
+    parser.add_argument(
+        "--gpu-start-max-temperature-c",
+        type=int,
+        default=60,
+        help="maximum GPU temperature for two samples before either paired arm",
+    )
     parser.add_argument(
         "--batch-mode",
         choices=("coalesced", "separate"),
@@ -90,6 +98,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--slo-scale", type=float, default=1.5)
     parser.add_argument("--slo-ttft-seconds", type=float, default=8.0)
+    parser.add_argument("--slo-tpot-seconds", type=float, default=0.050)
     parser.add_argument("--slo-p99-itl-seconds", type=float, default=0.100)
     parser.add_argument("--admission-max-delay-us", type=int, default=10000)
     parser.add_argument(
@@ -100,6 +109,19 @@ def parse_args() -> argparse.Namespace:
             "optional deployment calibration; when omitted, the runtime starts "
             "uncalibrated and may use its explicitly counted calibration probe"
         ),
+    )
+    parser.add_argument(
+        "--nta-calibration-profile",
+        type=pathlib.Path,
+        help=(
+            "compatibility-bound AUTO profile for the NTA arm; paired timing "
+            "always opens it read-only and rejects online calibration"
+        ),
+    )
+    parser.add_argument(
+        "--nta-calibration-profile-tag",
+        default="default",
+        help="deployment tag used when validating --nta-calibration-profile",
     )
     parser.add_argument("--build-dir", default="build")
     parser.add_argument(
@@ -171,6 +193,7 @@ def parse_args() -> argparse.Namespace:
     if (
         args.slo_scale <= 0
         or args.slo_ttft_seconds <= 0
+        or args.slo_tpot_seconds <= 0
         or args.slo_p99_itl_seconds <= 0
     ):
         parser.error("SLO scale and thresholds must be positive")
@@ -182,8 +205,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("NUMA node cannot be negative")
     if args.load_warmup_iterations < 0:
         parser.error("load warmup iterations cannot be negative")
+    if args.setup_idle_timeout_seconds <= 0.0:
+        parser.error("setup idle timeout must be positive")
+    if args.gpu_start_max_temperature_c <= 0:
+        parser.error("GPU start temperature must be positive")
     if args.incremental_setup_ns is not None and args.incremental_setup_ns < 0:
         parser.error("incremental setup cost must be nonnegative")
+    if not args.nta_calibration_profile_tag.strip():
+        parser.error("calibration profile tag cannot be empty")
     if not 0.0 < args.mem_fraction_static < 1.0:
         parser.error("--mem-fraction-static must be between zero and one")
     if args.external_suffix_tokens < 0:
@@ -280,6 +309,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         args.batch_mode,
         "--slo-ttft-seconds",
         str(args.slo_ttft_seconds),
+        "--slo-tpot-seconds",
+        str(args.slo_tpot_seconds),
         "--slo-p99-itl-seconds",
         str(args.slo_p99_itl_seconds),
         "--seed",
@@ -298,11 +329,20 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     if args.cpu_affinity is not None:
         command.extend(("--cpu-affinity", args.cpu_affinity))
     command.extend(("--load-warmup-iterations", str(args.load_warmup_iterations)))
+    command.extend(
+        ("--setup-idle-timeout-seconds", str(args.setup_idle_timeout_seconds))
+    )
     if args.workload_manifest is not None:
         command.extend(("--workload-manifest", str(args.workload_manifest.resolve())))
     if args.allow_oversubscribed_pool:
         command.append("--allow-oversubscribed-pool")
     environment = os.environ.copy()
+    for name in (
+        "NTA_EXECUTION_CALIBRATION_PROFILE",
+        "NTA_EXECUTION_CALIBRATION_PROFILE_READ_ONLY",
+        "NTA_EXECUTION_CALIBRATION_PROFILE_TAG",
+    ):
+        environment.pop(name, None)
     environment["NTA_EXECUTION_ADMISSION"] = "1"
     environment["NTA_EXECUTION_ADMISSION_MAX_DELAY_US"] = str(
         args.admission_max_delay_us
@@ -316,6 +356,14 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
         environment["NTA_EXECUTION_HOST_FORM"] = os.environ.get(
             "NTA_COMPARE_EXECUTION_HOST_FORM", "auto"
         )
+        if args.nta_calibration_profile is not None:
+            environment["NTA_EXECUTION_CALIBRATION_PROFILE"] = str(
+                args.nta_calibration_profile.expanduser().resolve()
+            )
+            environment["NTA_EXECUTION_CALIBRATION_PROFILE_READ_ONLY"] = "1"
+            environment["NTA_EXECUTION_CALIBRATION_PROFILE_TAG"] = (
+                args.nta_calibration_profile_tag.strip()
+            )
     if backend == "nta_flashinfer" and args.batch_mode == "coalesced":
         # Exercise the production selector.  The benchmark must not silently
         # force a one-wave/direct arm: doing so turns a mechanism comparison
@@ -337,7 +385,10 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
             override = os.environ.get(compare_name)
             if override is not None:
                 environment[runtime_name] = override
-    wait_for_free_gpu()
+    wait_for_free_gpu(
+        max_temperature_c=args.gpu_start_max_temperature_c,
+        stable_samples=2,
+    )
     with CotenantSampler(owner_token) as sampler:
         completed = subprocess.run(
             command,
@@ -367,8 +418,36 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
             "co-tenant sampler lost environmental samples: "
             f"{sampler.sampling_errors} errors"
         )
+    gpu_telemetry = sampler.telemetry()
+    if int(gpu_telemetry["errors"]):
+        failures.append(
+            "GPU telemetry sampler lost environmental samples: "
+            f"{gpu_telemetry['errors']} errors"
+        )
+    if int(gpu_telemetry["thermal_slowdown_samples"]):
+        failures.append(
+            "GPU thermal slowdown contaminated "
+            f"{gpu_telemetry['thermal_slowdown_samples']} samples"
+        )
     if completed.returncode:
         failures.append(f"worker exited with status {completed.returncode}")
+    environment_path = log_path.with_suffix(".environment.json")
+    atomic_write_json(
+        environment_path,
+        {
+            "schema": 1,
+            "classification": "sglang-hicache-arm-environment",
+            "backend": backend,
+            "returncode": completed.returncode,
+            "failures": failures,
+            "gpu_environment": gpu_telemetry,
+            "gpu_start_max_temperature_c": args.gpu_start_max_temperature_c,
+            "cotenant_gpu_samples": sampler.foreign_samples,
+            "gpu_sampling_errors": sampler.sampling_errors,
+            "gpu_sampling_complete": sampler.complete,
+            "cotenant_pids_seen": sorted(sampler.foreign_pids),
+        },
+    )
     if failures:
         raise RuntimeError(
             f"{backend} load trial failed ({'; '.join(failures)}):\n"
@@ -380,6 +459,9 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     report["gpu_sampling_errors"] = sampler.sampling_errors
     report["gpu_sampling_complete"] = sampler.complete
     report["cotenant_pids_seen"] = sorted(sampler.foreign_pids)
+    report["gpu_environment"] = gpu_telemetry
+    report["gpu_start_max_temperature_c"] = args.gpu_start_max_temperature_c
+    report["arm_environment"] = str(environment_path)
     report["arm_log"] = str(log_path)
     return report
 
@@ -440,6 +522,9 @@ def main() -> int:
             require_graph_replay=args.cuda_graph_decode == "full",
             require_demand_graph=args.require_demand_graph,
             require_physical_compaction=args.batch_mode == "coalesced",
+            require_read_only_calibration_profile=(
+                args.nta_calibration_profile is not None
+            ),
         )
         batch_heterogeneity = nta.get("batch_heterogeneity")
         activation["batch_heterogeneity_proven"] = bool(
@@ -622,8 +707,14 @@ def main() -> int:
     nta_goodput = relative_goodput(nta, thresholds)
     stock_prereg = preregistered_goodput(stock)
     nta_prereg = preregistered_goodput(nta)
+    stock_joint_prereg = preregistered_joint_goodput(stock)
+    nta_joint_prereg = preregistered_joint_goodput(nta)
     stock_rate = float(stock["output_token_throughput"])
     nta_rate = float(nta["output_token_throughput"])
+    stock_resident_rate = float(stock["resident_output_token_throughput"])
+    nta_resident_rate = float(nta["resident_output_token_throughput"])
+    stock_external_rate = float(stock["external_output_token_throughput"])
+    nta_external_rate = float(nta["external_output_token_throughput"])
     stock_gp = float(stock_goodput["goodput_requests_per_second"])
     nta_gp = float(nta_goodput["goodput_requests_per_second"])
     resident_ttft_ratio = safe_ratio(
@@ -712,6 +803,7 @@ def main() -> int:
         "batch_mode": args.batch_mode,
         "slo_scale": args.slo_scale,
         "slo_ttft_seconds": args.slo_ttft_seconds,
+        "slo_tpot_seconds": args.slo_tpot_seconds,
         "slo_p99_itl_seconds": args.slo_p99_itl_seconds,
         "incremental_setup_ns": args.incremental_setup_ns,
         "external_suffix_tokens": args.external_suffix_tokens,
@@ -732,11 +824,23 @@ def main() -> int:
         "nta_p99_itl_seconds": float(nta["p99_itl_seconds"]),
         "stock_preregistered_goodput": stock_prereg,
         "nta_preregistered_goodput": nta_prereg,
+        "stock_preregistered_joint_goodput": stock_joint_prereg,
+        "nta_preregistered_joint_goodput": nta_joint_prereg,
         "output_throughput_ratio": safe_ratio(nta_rate, stock_rate),
+        "resident_output_throughput_ratio": safe_ratio(
+            nta_resident_rate, stock_resident_rate
+        ),
+        "external_output_throughput_ratio": safe_ratio(
+            nta_external_rate, stock_external_rate
+        ),
         "goodput_ratio": safe_ratio(nta_gp, stock_gp),
         "preregistered_goodput_ratio": safe_ratio(
             float(nta_prereg["goodput_requests_per_second"]),
             float(stock_prereg["goodput_requests_per_second"]),
+        ),
+        "preregistered_joint_goodput_ratio": safe_ratio(
+            float(nta_joint_prereg["goodput_requests_per_second"]),
+            float(stock_joint_prereg["goodput_requests_per_second"]),
         ),
         "resident_p95_ttft_ratio": resident_ttft_ratio,
         "resident_p95_tpot_ratio": resident_tpot_ratio,

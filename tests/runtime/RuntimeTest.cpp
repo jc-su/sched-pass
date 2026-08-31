@@ -476,6 +476,51 @@ int main() {
         reusablePlan.workItems();
     const nta::abi::AcquireRequirement *const reusableDependencyAddress =
         reusablePlan.dependencies();
+    nta::WorkPlan nonlocalTicketPlan = hostPlan;
+    nonlocalTicketPlan.workItems[0].workTicket = 1;
+    bool nonlocalTicketRejected = false;
+    try {
+      reusablePlan.upload(nonlocalTicketPlan);
+    } catch (const std::invalid_argument &) {
+      nonlocalTicketRejected = true;
+    }
+    require(nonlocalTicketRejected,
+            "device work plan accepted a nonlocal work-ticket index");
+    nta::WorkPlan nonlocalReductionPlan = hostPlan;
+    nonlocalReductionPlan.workItems[0].reductionGroup = 1;
+    bool nonlocalReductionRejected = false;
+    try {
+      reusablePlan.upload(nonlocalReductionPlan);
+    } catch (const std::invalid_argument &) {
+      nonlocalReductionRejected = true;
+    }
+    require(nonlocalReductionRejected,
+            "device work plan accepted a nonlocal reduction-group index");
+    nta::WorkPlan exclusivePlan = hostPlan;
+    exclusivePlan.dependencies[1].flags = nta::abi::AcquireOnlineExclusive;
+    reusablePlan.upload(exclusivePlan);
+    nta::WorkPlanBuilder duplicateExclusiveBuilder(1);
+    const std::uint32_t duplicateRequest =
+        duplicateExclusiveBuilder.addRequest({0, 7});
+    const nta::abi::AcquireRequirement exclusiveRequirement =
+        exclusivePlan.dependencies[1];
+    (void)duplicateExclusiveBuilder.addWork(
+        duplicateRequest, 0,
+        std::span<const nta::abi::AcquireRequirement>(&exclusiveRequirement,
+                                                      1));
+    (void)duplicateExclusiveBuilder.addWork(
+        duplicateRequest, 1,
+        std::span<const nta::abi::AcquireRequirement>(&exclusiveRequirement,
+                                                      1));
+    bool duplicateExclusiveRejected = false;
+    try {
+      reusablePlan.upload(duplicateExclusiveBuilder.finish());
+    } catch (const std::invalid_argument &) {
+      duplicateExclusiveRejected = true;
+    }
+    require(duplicateExclusiveRejected,
+            "device work plan accepted a multiply referenced "
+            "online-exclusive object");
     reusablePlan.uploadAsync(hostPlan, uploadStream);
     reusablePlan.waitOn(consumerStream);
     nta::abi::WorkItem asynchronouslyUploaded{};

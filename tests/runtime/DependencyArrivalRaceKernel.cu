@@ -39,10 +39,58 @@ prepareIntent(nta::abi::RuntimeView *runtime, std::uint32_t slotIndex,
   slot.intent.bytes = 4096;
   slot.intent.requestSlot = requestSlot;
   slot.intent.generation = generation;
+  slot.intent.workTicket = nta::abi::InvalidIndex;
   slot.intent.objectSlot = slotIndex;
   slot.intent.priority = priority;
   slot.intent.deadlineClock = deadlineClock;
   slot.intent.valid = 1;
+}
+
+__device__ void prepareCancelledIntent(nta::abi::RuntimeView *runtime,
+                                       std::uint32_t epoch) {
+  using namespace nta;
+  constexpr abi::SourceKind source = abi::SourceKind::HostStaged;
+  constexpr std::uint64_t bytes = 4096;
+  resetIntentQueue(runtime, source, epoch);
+  runtime->failedCount = 0;
+  runtime->stickyFailedCount = 0;
+  runtime->requests[0] = {42, 700, UINT64_MAX, 0, 3, 0, 2, 1};
+  runtime->tenants[0] = {UINT64_MAX, 0};
+  runtime->objects[0] = {
+      701, 0, bytes, 0, 5,
+      static_cast<std::uint32_t>(abi::ObjectState::Queued),
+      0,   0, 0,     0, 0,
+  };
+  runtime->workTickets[0] = {
+      42,    0,    3,
+      static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+      1,     0,    0, epoch,
+      bytes, 1000, 0, 1,
+  };
+  runtime->workDeadlineClocks[0] = 700;
+  runtime->requestProgress[0] = {42, 3, 1, 1, 0, 0, 0, 0,
+                                 epoch, bytes, 0, 0, 1000, 1000, 0};
+  runtime->dependencies[0] = {701, 0, 5};
+  runtime->dependencyNext[0] = abi::InvalidIndex;
+  runtime->dependencySatisfied[0] = 0;
+  runtime->remainingDependencies[0] = 1;
+  runtime->objectDependentHeads[0] = 0;
+  abi::IntentSlot &slot = runtime->intents[0];
+  slot = {};
+  slot.sequence = 9;
+  slot.sourceKind = static_cast<std::uint32_t>(source);
+  slot.epoch = epoch;
+  slot.intent = {701, 0, bytes, 0, 3, 0, 5, 0, 1, 2, 0, 700};
+  *runtime->intentPool = {1, 0, runtime->intentCapacity, 1, 0, 0,
+                          {0, 0, 0, 0}};
+  abi::BackendView &backend =
+      runtime->backends[static_cast<std::uint32_t>(source)];
+  backend.active = 1;
+  backend.sourceKind = static_cast<std::uint32_t>(source);
+  backend.backendIndex = static_cast<std::uint32_t>(source);
+  backend.maxOutstandingBytes = UINT64_MAX;
+  backend.outstandingBytes = 0;
+  backend.pendingAcquisitions = 1;
 }
 
 } // namespace
@@ -214,6 +262,196 @@ nta_test_cancelled_intent_credit_release(nta::abi::RuntimeView *runtime,
   observation[3] = static_cast<std::uint32_t>(backend.outstandingBytes);
   observation[4] = static_cast<std::uint32_t>(slot.chargedRequestBytes);
   observation[5] = static_cast<std::uint32_t>(slot.chargedBackendBytes);
+}
+
+extern "C" __global__ void
+nta_test_shared_acquisition_owner(nta::abi::RuntimeView *runtime,
+                                  std::uint32_t *observation) {
+  using namespace nta;
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  runtime->epoch = 11;
+  runtime->requests[0].generation = 3;
+  runtime->requests[0].tenantId = 0;
+  runtime->requests[0].priority = 1;
+  runtime->requests[0].cancelled = 0;
+  runtime->requests[1].generation = 4;
+  runtime->requests[1].tenantId = 0;
+  runtime->requests[1].priority = 7;
+  runtime->requests[1].cancelled = 0;
+  runtime->tenants[0].maxOutstandingBytes = 8192;
+  runtime->objects[0] = {
+      501, 0, 4096, 0, 9, static_cast<std::uint32_t>(abi::ObjectState::Queued),
+      0,   0, 0,    0, 0,
+  };
+  runtime->workTickets[0] = {
+      100,  0,    3, static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+      1,    0,    0, 11,
+      4096, 1000, 0, 1,
+  };
+  runtime->workTickets[1] = {
+      200,  1,    4, static_cast<std::uint32_t>(abi::WorkTicketState::Pending),
+      1,    1,    1, 11,
+      4096, 2000, 1, 1,
+  };
+  runtime->workDeadlineClocks[0] = 900;
+  runtime->workDeadlineClocks[1] = 500;
+  runtime->dependencies[0] = {501, 0, 9};
+  runtime->dependencies[1] = {501, 0, 9};
+  runtime->dependencyNext[0] = 1;
+  runtime->dependencyNext[1] = abi::InvalidIndex;
+  runtime->objectDependentHeads[0] = 0;
+  abi::AcquireIntent intent{};
+  intent.objectId = 501;
+  intent.objectSlot = 0;
+  intent.objectVersion = 9;
+  intent.bytes = 4096;
+  intent.requestSlot = 0;
+  intent.generation = 3;
+  intent.workTicket = 0;
+  intent.tenantId = 0;
+  intent.priority = 1;
+  intent.deadlineClock = 900;
+
+  const device::IntentBindingState selected =
+      device::bindIntentToEarliestLiveConsumer(runtime, intent);
+  observation[0] = selected == device::IntentBindingState::Bound ? 1U : 0U;
+  observation[1] = intent.workTicket;
+  observation[2] = intent.requestSlot;
+  observation[3] = static_cast<std::uint32_t>(intent.deadlineClock);
+  observation[4] = intent.priority;
+
+  runtime->requests[1].cancelled = 1;
+  const device::IntentBindingState rebound =
+      device::ensureIntentHasLiveConsumer(runtime, intent);
+  observation[5] = rebound == device::IntentBindingState::Bound ? 1U : 0U;
+  observation[6] = intent.workTicket;
+  observation[7] = intent.requestSlot;
+  observation[8] = static_cast<std::uint32_t>(intent.deadlineClock);
+  observation[9] = intent.priority;
+
+  runtime->requests[0].cancelled = 1;
+  const device::IntentBindingState orphan =
+      device::ensureIntentHasLiveConsumer(runtime, intent);
+  observation[10] =
+      orphan == device::IntentBindingState::NoLiveConsumer ? 0U : 1U;
+  observation[11] = intent.workTicket;
+
+  runtime->requests[0].cancelled = 0;
+  runtime->requests[1].cancelled = 0;
+  runtime->requests[1].tenantId = 1;
+  runtime->tenants[0].maxOutstandingBytes = 4096;
+  runtime->tenants[1].maxOutstandingBytes = 4096;
+  intent.requestSlot = 0;
+  intent.generation = 3;
+  intent.workTicket = 0;
+  intent.tenantId = 0;
+  const device::IntentBindingState crossTenant =
+      device::bindIntentToEarliestLiveConsumer(runtime, intent);
+  observation[12] = crossTenant == device::IntentBindingState::Bound ? 1U : 0U;
+  observation[13] = intent.workTicket;
+
+  // The same fan-out is legal only when the directory explicitly identifies
+  // immutable runtime-shared state. Its earliest request remains the liveness
+  // and EDF representative, while backend credit is the sole byte ledger.
+  runtime->objects[0].metadata =
+      abi::packObjectMetadata(abi::ObjectScope::GlobalShared);
+  runtime->requests[0].maxOutstandingBytes = 4096;
+  runtime->requests[0].outstandingBytes = 0;
+  runtime->requests[1].maxOutstandingBytes = 4096;
+  runtime->requests[1].outstandingBytes = 0;
+  runtime->tenants[0].outstandingBytes = 0;
+  runtime->tenants[1].outstandingBytes = 0;
+  constexpr abi::SourceKind source = abi::SourceKind::HostStaged;
+  abi::BackendView &backend =
+      runtime->backends[static_cast<std::uint32_t>(source)];
+  backend = {0, 0, 1, 0, 8192, static_cast<std::uint32_t>(source),
+             1, static_cast<std::uint32_t>(source), 0, 0};
+  intent.requestSlot = 0;
+  intent.generation = 3;
+  intent.workTicket = 0;
+  intent.tenantId = 0;
+  const device::IntentBindingState shared =
+      device::bindIntentToEarliestLiveConsumer(runtime, intent);
+  observation[14] = shared == device::IntentBindingState::Bound ? 1U : 0U;
+  observation[15] = intent.workTicket;
+  observation[16] = intent.tenantId;
+  observation[17] =
+      device::intentCreditState(runtime, intent, source) ==
+              device::DispatchCreditState::Ready
+          ? 1U
+          : 0U;
+  std::uint64_t requestBytes = 0;
+  std::uint64_t backendBytes = 0;
+  const bool reserved = device::reserveIntentCredits(
+      runtime, intent, source, requestBytes, backendBytes);
+  observation[18] = reserved ? 1U : 0U;
+  observation[19] = static_cast<std::uint32_t>(
+      runtime->requests[0].outstandingBytes +
+      runtime->requests[1].outstandingBytes);
+  observation[20] = static_cast<std::uint32_t>(
+      runtime->tenants[0].outstandingBytes +
+      runtime->tenants[1].outstandingBytes);
+  observation[21] = static_cast<std::uint32_t>(backend.outstandingBytes);
+  observation[22] = static_cast<std::uint32_t>(requestBytes);
+  observation[23] = static_cast<std::uint32_t>(backendBytes);
+  device::releaseIntentCredits(runtime, intent, source, requestBytes,
+                               backendBytes);
+  observation[24] = static_cast<std::uint32_t>(
+      runtime->requests[0].outstandingBytes +
+      runtime->requests[1].outstandingBytes);
+  observation[25] = static_cast<std::uint32_t>(
+      runtime->tenants[0].outstandingBytes +
+      runtime->tenants[1].outstandingBytes);
+  observation[26] = static_cast<std::uint32_t>(backend.outstandingBytes);
+}
+
+extern "C" __global__ void
+nta_test_no_live_intent_retirement(nta::abi::RuntimeView *runtime,
+                                   std::uint32_t *observation) {
+  using namespace nta;
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  constexpr abi::SourceKind source = abi::SourceKind::HostStaged;
+  prepareCancelledIntent(runtime, 17);
+  abi::IntentSlot &queuedSlot = runtime->intents[0];
+  const bool queued = device::queueIntent(runtime, queuedSlot, source);
+  const device::AdmittedIntent queuedDispatch =
+      device::claimAdmissibleIntent(runtime, source);
+  if (queuedDispatch.slotIndex != abi::InvalidIndex) {
+    device::retireTerminalIntent(runtime, queuedSlot, queuedDispatch.terminal);
+  }
+  observation[0] = queued ? 1U : 0U;
+  observation[1] = static_cast<std::uint32_t>(queuedDispatch.terminal);
+  observation[2] = runtime->objects[0].state;
+  observation[3] = queuedSlot.intent.valid;
+  observation[4] = runtime->intentPool->active;
+  observation[5] = static_cast<std::uint32_t>(
+      runtime->backends[static_cast<std::uint32_t>(source)]
+          .pendingAcquisitions);
+  observation[6] = runtime->workTickets[0].state;
+  observation[7] = runtime->stickyFailedCount;
+
+  prepareCancelledIntent(runtime, 18);
+  abi::IntentSlot &orderedSlot = runtime->intents[0];
+  std::uint32_t cursor = 0;
+  const device::AdmittedIntent orderedDispatch =
+      device::claimOrderedAdmissibleIntent(runtime, source, 0, 1, cursor);
+  if (orderedDispatch.slotIndex != abi::InvalidIndex) {
+    device::retireTerminalIntent(runtime, orderedSlot, orderedDispatch.terminal);
+  }
+  observation[8] = static_cast<std::uint32_t>(orderedDispatch.terminal);
+  observation[9] = runtime->objects[0].state;
+  observation[10] = orderedSlot.intent.valid;
+  observation[11] = runtime->intentPool->active;
+  observation[12] = static_cast<std::uint32_t>(
+      runtime->backends[static_cast<std::uint32_t>(source)]
+          .pendingAcquisitions);
+  observation[13] = runtime->workTickets[0].state;
+  observation[14] = runtime->stickyFailedCount;
+  observation[15] = cursor;
 }
 
 extern "C" __global__ void

@@ -304,13 +304,27 @@ tensorMap(abi::RuntimeView *runtime, const WorkContext &context,
 }
 
 [[nodiscard]] __device__ __forceinline__ void *
-acquireAddress(abi::RuntimeView *runtime, const BoundRequest &request,
-               const abi::AcquireRequirement &requirement) {
+acquireExclusiveAddress(abi::RuntimeView *runtime, const BoundRequest &request,
+                        const abi::AcquireRequirement &requirement) {
+  // Preserve the compiler-visible request token used to prove that the
+  // following defer is generation-bound, even though the exclusive miss API
+  // does not itself need lowering.
   __nta_bind_request(request.requestSlot, request.generation);
-  return __nta_acquire_marker(
-      runtime, reinterpret_cast<const void *>(requirement.directBase),
-      requirement.objectSlot, requirement.objectId, requirement.objectVersion,
-      requirement.offset, requirement.bytes, request.workTicket);
+  if (runtime == nullptr || request.requestSlot >= runtime->requestCapacity) {
+    return nullptr;
+  }
+  const abi::RequestContext &context = runtime->requests[request.requestSlot];
+  if (context.generation != request.generation || context.cancelled != 0) {
+    return nullptr;
+  }
+  if (requirement.directBase != 0) {
+    return reinterpret_cast<std::byte *>(requirement.directBase) +
+           requirement.offset;
+  }
+  return nta_acquire_exclusive_slow(
+      runtime, request.requestSlot, request.generation, requirement.objectSlot,
+      requirement.objectId, requirement.objectVersion, requirement.offset,
+      requirement.bytes, request.workTicket, requirement.flags);
 }
 
 [[nodiscard]] __device__ __forceinline__ void *

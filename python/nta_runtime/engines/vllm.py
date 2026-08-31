@@ -102,6 +102,7 @@ from nta_runtime.runtime import (
     DeviceWorkPlan,
     IndexedHostIndexBinding,
     IndexedAcquisitionPlan,
+    ObjectScope,
     RegisteredNvmeObjectInstall,
     JitPhaseProgram,
     Runtime,
@@ -404,6 +405,7 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
     ) -> None:
         if not self._nta_config.compare_stock:
             return
+        VLLM_STATS["native_stock_comparisons"] += 1
         stock_output = torch.empty_like(output)
         stock_wrapper.run(query, kv_cache, out=stock_output)
         torch.cuda.synchronize()
@@ -913,7 +915,8 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                     run.source.bytes,
                     destination.region,
                     destination_address,
-                    prior_consumer,
+                    scope=ObjectScope.TENANT_LOCAL,
+                    prior_consumer_event=prior_consumer,
                 )
             )
         if bindings:
@@ -1062,8 +1065,10 @@ class NtaVllmFlashInferImpl(FlashInferImpl):
                 direct_base=runtime.device_view,
                 object_id_base=0x4E54414800000000,
             )
-            if owner.tenant_isolation_enabled:
-                indexed_plan.require_single_tenant_groups()
+            # Request-owned KV remains tenant-local when budget isolation is
+            # disabled.  Cross-tenant physical sharing needs a separate,
+            # explicitly immutable GLOBAL_SHARED resource contract.
+            indexed_plan.require_single_tenant_groups()
             if any(
                 span.count > max_dependencies for span in indexed_plan.dependency_spans
             ):

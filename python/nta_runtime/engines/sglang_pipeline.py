@@ -165,11 +165,12 @@ class SglangHostTransport:
         transfer_objects = transfer_plan.indexed_objects
         copy_groups = transfer_plan.copy_groups
         paired_copy = transfer_plan.paired_indexed_copy
-        ordered_sm_waves = (
-            use_sm_mover
-            and transfer_plan.sm_waves_per_layer > 1
-            and paired_copy
-        )
+        # A CUDA event recorded after each bounded pair kernel is both the
+        # completion and memory-visibility edge for sub-layer waves.  Internal
+        # object state is transport bookkeeping, not a numerical-consumer
+        # fence: producer failure also reaches a terminal object state.  Keep
+        # the cross-component contract event-owned and fail closed if a wave
+        # cannot publish a completion event.
         ready_events = self._events_for(
             pending,
             layer_count,
@@ -265,7 +266,6 @@ class SglangHostTransport:
                         paired_copy=paired_copy,
                         objects_per_layer=objects_per_layer,
                         ready_events=ready_events,
-                        ordered_sm_waves=ordered_sm_waves,
                         sm_wave_bytes=sm_wave_bytes,
                         wave_bytes=wave_bytes,
                         mover_selection_reason=mover_plan.selection_reason,
@@ -315,14 +315,6 @@ class SglangHostTransport:
                         key_bytes, value_bytes = layer_geometry[ready_layer]
                         layer_events = ready_events[ready_layer]
                         layer_transfer = transfer_plan.layers[ready_layer]
-                        if shared_ready_event is None and ordered_sm_waves:
-                            # Object-owned waves can complete independently
-                            # inside the persistent mover. Waiting for one
-                            # layer's objects does not order the whole group,
-                            # so retain a distinct full-layer fence identity.
-                            layer_events[
-                                transfer_plan.sm_waves_per_layer - 1
-                            ].record(self._prefetch_stream)
                         ready_event = (
                             shared_ready_event
                             if shared_ready_event is not None
@@ -360,32 +352,14 @@ class SglangHostTransport:
                                 if use_sm_mover
                                 else None
                             ),
-                            registration_event=(
-                                phase_start if ordered_sm_waves else None
-                            ),
                             wave_events=(
-                                ()
-                                if ordered_sm_waves
-                                else (
-                                    (ready_event,)
-                                    if shared_ready_event is not None
-                                    and transfer_plan.sm_waves_per_layer == 1
-                                    else layer_events[
-                                        : transfer_plan.sm_waves_per_layer
-                                    ]
-                                    if use_sm_mover
-                                    else ()
-                                )
-                            ),
-                            wave_object_slots=(
-                                tuple(
-                                    layer_first_slot + 2 * wave
-                                    for wave in range(
-                                        transfer_plan.sm_waves_per_layer
-                                    )
-                                )
-                                if ordered_sm_waves
-                                and layer_first_slot is not None
+                                (ready_event,)
+                                if shared_ready_event is not None
+                                and transfer_plan.sm_waves_per_layer == 1
+                                else layer_events[
+                                    : transfer_plan.sm_waves_per_layer
+                                ]
+                                if use_sm_mover
                                 else ()
                             ),
                             wave_row_ends=layer_transfer.wave_row_ends,
@@ -479,7 +453,6 @@ class SglangHostTransport:
         paired_copy: bool,
         objects_per_layer: int,
         ready_events: tuple[tuple[torch.cuda.Event, ...], ...],
-        ordered_sm_waves: bool,
         sm_wave_bytes: int,
         wave_bytes: int,
         mover_selection_reason: str,
@@ -534,27 +507,6 @@ class SglangHostTransport:
                         2 * (wave_end - local_layer),
                         self._prefetch_stream,
                     )
-                submissions = 1
-            elif ordered_sm_waves:
-                if not paired_copy:
-                    raise RuntimeError("ordered SM waves require paired KV objects")
-                first_slot = transfer_first_slot + objects_per_layer * local_layer
-                pair_count = (
-                    (wave_end - local_layer) * objects_per_layer // 2
-                )
-                worker_blocks, throttled = bounded_sm_pair_worker_grid(
-                    pair_count,
-                    self._sm_mover_max_worker_ctas,
-                )
-                phase_program.preload_host_pairs_ordered(
-                    self._runtime,
-                    first_slot,
-                    pair_count,
-                    worker_blocks,
-                    self._ordered_task_head,
-                    self._prefetch_stream,
-                )
-                worker_ctas = worker_blocks
                 submissions = 1
             else:
                 if objects_per_layer <= 2 or objects_per_layer % 2:

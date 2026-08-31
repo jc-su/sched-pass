@@ -59,6 +59,7 @@ def _candidate(
     max_input_tokens: int,
     max_output_tokens: int,
     min_resident_output_tokens: int,
+    min_external_output_tokens: int,
     min_external_cached_tokens: int,
     min_external_query_rows: int,
     max_external_query_rows: int | None,
@@ -78,6 +79,8 @@ def _candidate(
             return None
         cached = input_tokens - 1
     elif role == "external":
+        if output_tokens < min_external_output_tokens:
+            return None
         if external_source == "followup" and not _is_followup(row):
             return None
         cached = min(
@@ -141,6 +144,7 @@ def _select_diverse(
     max_input_tokens: int,
     max_output_tokens: int,
     min_resident_output_tokens: int,
+    min_external_output_tokens: int,
     min_external_cached_tokens: int,
     min_external_query_rows: int,
     max_external_query_rows: int | None,
@@ -162,6 +166,7 @@ def _select_diverse(
                     max_input_tokens=max_input_tokens,
                     max_output_tokens=max_output_tokens,
                     min_resident_output_tokens=min_resident_output_tokens,
+                    min_external_output_tokens=min_external_output_tokens,
                     min_external_cached_tokens=min_external_cached_tokens,
                     min_external_query_rows=min_external_query_rows,
                     max_external_query_rows=max_external_query_rows,
@@ -376,6 +381,7 @@ def build_cohort(
     max_input_tokens: int | None = None,
     max_output_tokens: int | None = None,
     min_resident_output_tokens: int = 1,
+    min_external_output_tokens: int = 1,
     min_external_cached_tokens: int = 1,
     min_external_query_rows: int = 1,
     max_external_query_rows: int | None = None,
@@ -402,6 +408,7 @@ def build_cohort(
         or max_input_tokens <= 0
         or max_output_tokens <= 0
         or min_resident_output_tokens <= 0
+        or min_external_output_tokens <= 0
         or min_external_cached_tokens <= 0
         or min_external_query_rows <= 0
         or (
@@ -424,6 +431,7 @@ def build_cohort(
         max_input_tokens=max_input_tokens,
         max_output_tokens=max_output_tokens,
         min_resident_output_tokens=min_resident_output_tokens,
+        min_external_output_tokens=min_external_output_tokens,
         min_external_cached_tokens=min_external_cached_tokens,
         min_external_query_rows=min_external_query_rows,
         max_external_query_rows=max_external_query_rows,
@@ -458,6 +466,7 @@ def build_cohort(
             "max_input_tokens": max_input_tokens,
             "max_output_tokens": max_output_tokens,
             "min_resident_output_tokens": min_resident_output_tokens,
+            "min_external_output_tokens": min_external_output_tokens,
             "min_external_cached_tokens": min_external_cached_tokens,
             "min_external_query_rows": min_external_query_rows,
             "max_external_query_rows": max_external_query_rows,
@@ -525,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
         help="bound trace selection without truncating any completion",
     )
     parser.add_argument("--min-resident-output-tokens", type=int, default=1)
+    parser.add_argument("--min-external-output-tokens", type=int, default=1)
     parser.add_argument("--min-external-cached-tokens", type=int, default=1)
     parser.add_argument("--min-external-query-rows", type=int, default=1)
     parser.add_argument(
@@ -555,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
             max_input_tokens=args.max_input_tokens,
             max_output_tokens=args.max_output_tokens,
             min_resident_output_tokens=args.min_resident_output_tokens,
+            min_external_output_tokens=args.min_external_output_tokens,
             min_external_cached_tokens=args.min_external_cached_tokens,
             min_external_query_rows=args.min_external_query_rows,
             max_external_query_rows=args.max_external_query_rows,

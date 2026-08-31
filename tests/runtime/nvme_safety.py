@@ -352,8 +352,21 @@ def main() -> None:
     )
     assert "begin < mutable[-1]" in planner
     assert "HBM registration plan contains duplicate destination keys" in planner
-    epoch = (ROOT / "python" / "nta_runtime" / "epoch.py").read_text(encoding="utf-8")
-    assert "self.phases.progress_nvme_until_idle(" in epoch
+    flashinfer = (
+        ROOT / "python" / "nta_runtime" / "flashinfer.py"
+    ).read_text(encoding="utf-8")
+    enqueue_begin = flashinfer.index("    def enqueue_nvme(")
+    enqueue_end = flashinfer.index("    def check(", enqueue_begin)
+    enqueue_nvme = flashinfer[enqueue_begin:enqueue_end]
+    # NVMe numerical work must be discovered under the sealed typed contract
+    # before finite progress.  The deferred consumer may run only after the
+    # until-idle boundary has made every published dependency terminal.
+    discover = enqueue_nvme.index("self.epoch.phases.discover(")
+    progress = enqueue_nvme.index("self.epoch.phases.progress_nvme_until_idle(")
+    deferred_consumer = enqueue_nvme.rindex("DYNAMIC_RUNNABLE_WINDOW")
+    assert discover < progress < deferred_consumer
+    assert "self.epoch.max_progress_rounds != 1" in enqueue_nvme
+    assert "if min(issue_budget, completion_budget, timeout_ns) <= 0" in enqueue_nvme
     devices = sorted((Path("/sys/bus/pci/devices")).glob("*:*:*.*"))
     if devices:
         runner.validate_bdf(devices[0].name)

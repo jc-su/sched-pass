@@ -7,8 +7,10 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -39,9 +41,12 @@ void validate(const WorkPlan &plan) {
   const std::uint32_t workTicketBase = plan.workItems.front().workTicket;
   const std::uint32_t reductionGroupBase =
       plan.workItems.front().reductionGroup;
-  if (workTicketBase > abi::InvalidIndex - workCount ||
-      reductionGroupBase > abi::InvalidIndex - plan.requests.size()) {
-    throw std::invalid_argument("work plan global index range overflows");
+  // Device consumers use ready work-ticket and reduction-group identities as
+  // direct indices into this plan's compact arrays. They are plan-local ABI
+  // indices, not caller-owned global identifiers.
+  if (workTicketBase != 0 || reductionGroupBase != 0) {
+    throw std::invalid_argument(
+        "work plan indices must use zero-based plan-local identities");
   }
   std::uint32_t workCursor = 0;
   for (std::uint32_t requestIndex = 0; requestIndex < plan.requests.size();
@@ -69,13 +74,27 @@ void validate(const WorkPlan &plan) {
   if (workCursor != workCount) {
     throw std::invalid_argument("work plan contains unowned work items");
   }
+  struct ObjectUse {
+    std::uint32_t references = 0;
+    std::uint32_t exclusiveReferences = 0;
+  };
+  using ObjectKey =
+      std::tuple<std::uint32_t, std::uint64_t, std::uint32_t>;
+  std::map<ObjectKey, ObjectUse> externalUses;
   for (std::uint32_t index = 0; index < workCount; ++index) {
     const abi::WorkItem &work = plan.workItems[index];
+    const bool eventPartition =
+        (work.flags & abi::WorkItemEventPartition) != 0;
     if (work.workTicket != workTicketBase + index || work.dependencyCount == 0 ||
         work.directDependencyCount > work.dependencyCount ||
         work.dependencyBegin > dependencyCount ||
         work.dependencyCount > dependencyCount - work.dependencyBegin ||
-        work.reserved2 != 0 || work.reserved3 != 0) {
+        (work.flags & ~abi::WorkItemSupportedFlags) != 0 ||
+        (!eventPartition && work.completionClass != 0) ||
+        (eventPartition &&
+         (work.directDependencyCount != work.dependencyCount ||
+          (work.completionClass != abi::InvalidIndex &&
+           work.completionClass >= abi::MaximumEventCompletionClasses)))) {
       throw std::invalid_argument("work plan contains an invalid work item");
     }
     std::uint32_t directCount = 0;
@@ -83,15 +102,35 @@ void validate(const WorkPlan &plan) {
          ++dependency) {
       const abi::AcquireRequirement &requirement =
           plan.dependencies[work.dependencyBegin + dependency];
-      if (requirement.bytes == 0 || requirement.flags != 0) {
+      if (requirement.bytes == 0 ||
+          (requirement.flags & ~abi::AcquireRequirementSupportedFlags) != 0 ||
+          (requirement.directBase != 0 && requirement.flags != 0)) {
         throw std::invalid_argument(
             "work plan contains an invalid acquisition requirement");
       }
       directCount += requirement.directBase != 0 ? 1U : 0U;
+      if (requirement.directBase == 0) {
+        ObjectUse &use = externalUses[ObjectKey{
+            requirement.objectSlot, requirement.objectId,
+            requirement.objectVersion}];
+        ++use.references;
+        use.exclusiveReferences +=
+            (requirement.flags & abi::AcquireOnlineExclusive) != 0 ? 1U
+                                                                  : 0U;
+      }
     }
     if (directCount != work.directDependencyCount) {
       throw std::invalid_argument(
           "work plan direct dependency count is inconsistent");
+    }
+  }
+  for (const auto &[object, use] : externalUses) {
+    (void)object;
+    if (use.exclusiveReferences != 0 &&
+        (use.exclusiveReferences != 1 || use.references != 1)) {
+      throw std::invalid_argument(
+          "online-exclusive acquisition objects need exactly one "
+          "work-ticket reference");
     }
   }
 }

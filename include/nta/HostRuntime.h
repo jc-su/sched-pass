@@ -106,6 +106,7 @@ struct NvmeObjectInstallSpec {
   std::size_t bytes;
   cudaEvent_t priorConsumerEvent;
   std::unique_ptr<NvmeBuffer> destination;
+  abi::ObjectScope scope = abi::ObjectScope::TenantLocal;
 };
 
 struct IndexedHostObjectSpec {
@@ -121,6 +122,7 @@ struct IndexedHostObjectSpec {
   std::uint32_t stagingStrideBytes;
   std::uint32_t sourceIndexLimit;
   std::uint32_t stagingIndexLimit;
+  abi::ObjectScope scope = abi::ObjectScope::TenantLocal;
 };
 
 // One lease-scoped provenance proof shared by a batch of indexed objects.
@@ -177,11 +179,15 @@ public:
   ObjectHandle installObject(std::uint32_t slot, std::uint64_t objectId,
                              std::uint32_t version,
                              std::span<const std::byte> contents,
-                             Placement placement);
+                             Placement placement,
+                             abi::ObjectScope scope =
+                                 abi::ObjectScope::TenantLocal);
   ObjectHandle
   installReplicatedObject(std::uint32_t slot, std::uint64_t objectId,
                           std::uint32_t version,
-                          std::span<const HostReplicaSpec> replicas);
+                          std::span<const HostReplicaSpec> replicas,
+                          abi::ObjectScope scope =
+                              abi::ObjectScope::TenantLocal);
   // Registration replaces the device directory entry. A slot may be reused
   // only after the acquisition epoch that referenced its previous entry has
   // been reset and quiesced; the runtime rejects an in-flight replacement.
@@ -190,7 +196,9 @@ public:
   ObjectHandle registerObject(std::uint32_t slot, std::uint64_t objectId,
                               std::uint32_t version, std::size_t bytes,
                               void *stagingDeviceAddress,
-                              std::span<const RegisteredReplicaSpec> replicas);
+                              std::span<const RegisteredReplicaSpec> replicas,
+                              abi::ObjectScope scope =
+                                  abi::ObjectScope::TenantLocal);
   // Register a non-owning pinned-host to HBM row gather. Index arrays must be
   // uint32_t CUDA allocations and remain live through the acquisition epoch.
   ObjectHandle registerIndexedHostObject(
@@ -200,7 +208,8 @@ public:
       const std::uint32_t *stagingIndicesDevice, std::uint32_t indexCount,
       std::uint32_t elementBytes, std::uint32_t sourceStrideBytes,
       std::uint32_t stagingStrideBytes, std::uint32_t sourceIndexLimit,
-      std::uint32_t stagingIndexLimit);
+      std::uint32_t stagingIndexLimit,
+      abi::ObjectScope scope = abi::ObjectScope::TenantLocal);
   void registerIndexedHostObjects(
       std::uint32_t firstSlot, std::span<const IndexedHostObjectSpec> objects);
   void registerIndexedHostObjectsAsync(
@@ -232,12 +241,16 @@ public:
   ObjectHandle installNvmeObject(std::uint32_t slot, std::uint64_t objectId,
                                  std::uint32_t version,
                                  std::uint64_t sourceByteOffset,
-                                 std::size_t bytes);
+                                 std::size_t bytes,
+                                 abi::ObjectScope scope =
+                                     abi::ObjectScope::TenantLocal);
   ObjectHandle installNvmeObject(std::uint32_t slot, std::uint64_t objectId,
                                  std::uint32_t version,
                                  std::uint64_t sourceByteOffset,
                                  std::size_t bytes,
-                                 std::unique_ptr<NvmeBuffer> destination);
+                                 std::unique_ptr<NvmeBuffer> destination,
+                                 abi::ObjectScope scope =
+                                     abi::ObjectScope::TenantLocal);
   // Stream-ordered NVMe directory replacement.  ``priorConsumerEvent`` must
   // cover every consumer of the old slot generation.  The new directory
   // entry is published on ``stream`` and the old runtime-owned destination is
@@ -247,7 +260,8 @@ public:
   ObjectHandle installNvmeObjectAsync(
       std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
       std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
-      cudaEvent_t priorConsumerEvent);
+      cudaEvent_t priorConsumerEvent,
+      abi::ObjectScope scope = abi::ObjectScope::TenantLocal);
   // Same stream-ordered publication contract, with a caller-owned HBM
   // destination whose NVMe mapping lease is transferred to the object slot.
   // The destination memory itself remains owned by the caller; only the DMA
@@ -255,7 +269,8 @@ public:
   ObjectHandle installNvmeObjectAsync(
       std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
       std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
-      cudaEvent_t priorConsumerEvent, std::unique_ptr<NvmeBuffer> destination);
+      cudaEvent_t priorConsumerEvent, std::unique_ptr<NvmeBuffer> destination,
+      abi::ObjectScope scope = abi::ObjectScope::TenantLocal);
   // Validate the complete image before publication, enqueue each distinct
   // prior-consumer dependency once, and publish all objects through one
   // pinned upload-ring entry. This is the serving data-plane API; the scalar

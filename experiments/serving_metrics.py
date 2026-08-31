@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 
 
 PREREGISTERED_TTFT_SECONDS = 8.0
+PREREGISTERED_TPOT_SECONDS = 0.050
 PREREGISTERED_P99_ITL_SECONDS = 0.100
 
 
@@ -106,8 +107,54 @@ def relative_goodput(
     }
 
 
+def joint_slo_goodput(
+    report: Mapping[str, Any],
+    *,
+    ttft_seconds: float,
+    tpot_seconds: float,
+    p99_itl_seconds: float,
+) -> dict[str, Any]:
+    """Compute request goodput under one fixed TTFT/TPOT/ITL contract."""
+
+    thresholds = (ttft_seconds, tpot_seconds, p99_itl_seconds)
+    if any(not math.isfinite(value) or value <= 0.0 for value in thresholds):
+        raise ValueError("joint serving SLO thresholds must be positive and finite")
+
+    records = _records(report)
+    token_level = sum(
+        int(record.get("itl_sample_count", 0)) > 0
+        and record.get("token_timestamps_exact") is True
+        for record in records
+    )
+    qualified = sum(
+        float(record["ttft_seconds"]) <= ttft_seconds
+        and int(record.get("itl_sample_count", 0)) > 0
+        and record.get("token_timestamps_exact") is True
+        and float(record["tpot_seconds"]) <= tpot_seconds
+        and float(record["p99_itl_seconds"]) <= p99_itl_seconds
+        for record in records
+    )
+    total = len(records)
+    return {
+        "qualified_requests": qualified,
+        "total_requests": total,
+        "requests_with_token_level_itl": token_level,
+        "attainment": qualified / total,
+        "goodput_requests_per_second": qualified / _elapsed(report),
+        "thresholds_seconds": {
+            "ttft": ttft_seconds,
+            "tpot": tpot_seconds,
+            "p99_itl": p99_itl_seconds,
+        },
+    }
+
+
 def preregistered_goodput(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Compute the fixed, pre-registered TTFT-and-token-ITL goodput."""
+    """Compute the legacy fixed TTFT-and-token-ITL goodput.
+
+    Keep this historical metric stable so banked artifacts retain one meaning.
+    New formal evaluations use :func:`preregistered_joint_goodput`.
+    """
 
     records = _records(report)
     token_level = sum(
@@ -135,3 +182,14 @@ def preregistered_goodput(report: Mapping[str, Any]) -> dict[str, Any]:
             "p99_itl": PREREGISTERED_P99_ITL_SECONDS,
         },
     }
+
+
+def preregistered_joint_goodput(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Compute the fixed joint TTFT/TPOT/p99-ITL serving goodput."""
+
+    return joint_slo_goodput(
+        report,
+        ttft_seconds=PREREGISTERED_TTFT_SECONDS,
+        tpot_seconds=PREREGISTERED_TPOT_SECONDS,
+        p99_itl_seconds=PREREGISTERED_P99_ITL_SECONDS,
+    )

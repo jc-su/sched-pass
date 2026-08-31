@@ -2,6 +2,7 @@
 #include "benchmarks/kv/KvTypes.h"
 #include "nta/FinitePhase.h"
 #include "nta/HostRuntime.h"
+#include "nta/JitPhase.h"
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -23,6 +24,9 @@
 
 #ifndef NTA_KV_CUBIN_PATH
 #error "NTA_KV_CUBIN_PATH must identify the instrumented device image"
+#endif
+#ifndef NTA_TRANSPORT_PROGRAM_PATH
+#error "NTA_TRANSPORT_PROGRAM_PATH must identify the typed discovery program"
 #endif
 
 namespace {
@@ -204,7 +208,6 @@ public:
   KernelModule() {
     checkDriver(cuModuleLoad(&module_, NTA_KV_CUBIN_PATH),
                 "cuModuleLoad MoE cubin");
-    load(tile_, "nta_moe_tile_kernel");
     load(ready_, "nta_moe_ready_kernel");
     load(baseline_, "nta_moe_baseline_kernel");
     load(advanceEpoch_, "nta_moe_advance_epoch_kernel");
@@ -262,12 +265,11 @@ public:
     launch(route_, tokens, 32, stream, arguments, "route MoE experts");
   }
 
-  void compute(CUfunction kernel, CUstream stream,
-               nta::abi::RuntimeView *runtime,
-               const nta::abi::WorkItem *workItems,
-               const nta::abi::AcquireRequirement *requirements,
-               std::uint32_t workCount, const float *input, float *output,
-               std::uint32_t hidden) const {
+  void consumeReady(CUstream stream, nta::abi::RuntimeView *runtime,
+                    const nta::abi::WorkItem *workItems,
+                    const nta::abi::AcquireRequirement *requirements,
+                    std::uint32_t workCount, const float *input, float *output,
+                    std::uint32_t hidden) const {
     CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
     CUdeviceptr workAddress = reinterpret_cast<CUdeviceptr>(workItems);
     CUdeviceptr requirementAddress =
@@ -277,8 +279,8 @@ public:
     void *arguments[] = {
         &runtimeAddress, &workAddress,   &workCount, &requirementAddress,
         &inputAddress,   &outputAddress, &hidden};
-    launch(kernel, workCount, hidden, stream, arguments,
-           kernel == tile_ ? "initial MoE compute" : "resumed MoE compute");
+    launch(ready_, workCount, hidden, stream, arguments,
+           "consume ready MoE work");
   }
 
   void baseline(CUstream stream, const nta::abi::WorkItem *workItems,
@@ -305,8 +307,6 @@ public:
            "copy all MoE experts");
   }
 
-  [[nodiscard]] CUfunction tile() const noexcept { return tile_; }
-  [[nodiscard]] CUfunction ready() const noexcept { return ready_; }
   [[nodiscard]] CUmodule module() const noexcept { return module_; }
 
 private:
@@ -323,7 +323,6 @@ private:
   }
 
   CUmodule module_ = nullptr;
-  CUfunction tile_ = nullptr;
   CUfunction ready_ = nullptr;
   CUfunction baseline_ = nullptr;
   CUfunction advanceEpoch_ = nullptr;
@@ -364,7 +363,8 @@ int main(int argc, char **argv) {
       objects[expert] = runtime.installObject(
           expert, 700000U + expert, 1,
           std::as_bytes(std::span<const float>(weights[expert])),
-          placement(options.mode, expert));
+          placement(options.mode, expert),
+          nta::abi::ObjectScope::GlobalShared);
       const nta::abi::ObjectEntry object = runtime.readObject(expert);
       const nta::abi::ReplicaEntry replica = runtime.readReplica(expert);
       const bool staged =
@@ -429,6 +429,7 @@ int main(int argc, char **argv) {
 
     KernelModule kernels;
     nta::FinitePhaseProgram phases(kernels.module());
+    nta::JitPhaseProgram typedPhases(NTA_TRANSPORT_PROGRAM_PATH);
     cudaStream_t stream = nullptr;
     cudaStream_t overfetchStream = nullptr;
     cudaGraph_t graph = nullptr;
@@ -471,17 +472,11 @@ int main(int argc, char **argv) {
                     deviceSelected.get(), options.tokens, options.experts,
                     options.topK, options.hidden, preacquired);
     };
-    const auto initialCompute = [&] {
-      kernels.compute(kernels.tile(), driverStream, runtime.deviceView(),
-                      deviceWork.get(), deviceRequirements.get(),
-                      options.tokens, deviceInput.get(), deviceOutput.get(),
-                      options.hidden);
-    };
     const auto readyCompute = [&] {
-      kernels.compute(kernels.ready(), driverStream, runtime.deviceView(),
-                      deviceWork.get(), deviceRequirements.get(),
-                      options.tokens, deviceInput.get(), deviceOutput.get(),
-                      options.hidden);
+      kernels.consumeReady(driverStream, runtime.deviceView(), deviceWork.get(),
+                           deviceRequirements.get(), options.tokens,
+                           deviceInput.get(), deviceOutput.get(),
+                           options.hidden);
     };
 
     const auto enqueueLateBound = [&] {
@@ -491,7 +486,8 @@ int main(int argc, char **argv) {
           [&] {
             clearOutput();
             route(false);
-            initialCompute();
+            typedPhases.discover(stream, runtime.deviceView(), deviceWork.get(),
+                                 deviceRequirements.get(), options.tokens);
           },
           readyCompute);
     };
@@ -533,12 +529,11 @@ int main(int argc, char **argv) {
                                 cudaMemcpyDeviceToHost, stream),
                 "publish MoE route to CPU");
       checkCuda(cudaStreamSynchronize(stream), "synchronize CPU-visible route");
-      initialCompute();
-      phases.complete(driverStream, runtime.deviceView(), options.tokens);
-      phases.progressHost(driverStream, runtime.deviceView(), intentCapacity);
-      phases.publish(driverStream, runtime.deviceView(), options.tokens);
+      typedPhases.discover(stream, runtime.deviceView(), deviceWork.get(),
+                           deviceRequirements.get(), options.tokens);
       readyCompute();
-      phases.complete(driverStream, runtime.deviceView(), options.tokens);
+      phases.progressHost(driverStream, runtime.deviceView(), intentCapacity);
+      readyCompute();
     };
 
     if (options.policy != Policy::CpuSync) {

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -117,6 +118,41 @@ def main() -> None:
             "conservative_interval_ns": 100_000,
         }
     ]
+    layer_state = calibration.export_state()
+    restored_layer_stats = {
+        "layer_service_profiled_intervals": 0,
+        "layer_service_calibrated_shapes": 0,
+    }
+    restored_layer = SglangLayerServiceCalibration(
+        enabled=True,
+        minimum_samples=2,
+        maximum_samples=4,
+        model_start_layer=10,
+        model_layer_count=4,
+        stats=restored_layer_stats,
+    )
+    assert restored_layer.import_state(layer_state) == 2
+    assert restored_layer.export_state() == layer_state
+    assert restored_layer.curve(("extend", 32, 2), calibrated_only=True) == curve
+
+    incompatible_layer = copy.deepcopy(layer_state)
+    incompatible_layer["model_layer_count"] = 5
+    try:
+        SglangLayerServiceCalibration(
+            enabled=True,
+            minimum_samples=2,
+            maximum_samples=4,
+            model_start_layer=10,
+            model_layer_count=4,
+            stats={
+                "layer_service_profiled_intervals": 0,
+                "layer_service_calibrated_shapes": 0,
+            },
+        ).import_state(incompatible_layer)
+    except ValueError as error:
+        assert "incompatible" in str(error)
+    else:
+        raise AssertionError("layer-service calibration accepted stale geometry")
 
     disabled = SglangLayerServiceCalibration(
         enabled=False,
@@ -146,6 +182,8 @@ def main() -> None:
         "consumer_policy_arrival_samples": 0,
         "consumer_policy_stock_samples": 0,
         "consumer_policy_partial_samples": 0,
+        "consumer_policy_partial_setup_samples": 0,
+        "consumer_policy_partial_reuse_samples": 0,
     }
     policy = SglangConsumerPolicyCalibration(
         enabled=True,
@@ -174,6 +212,7 @@ def main() -> None:
         minimum_gain=1.03,
     )
     assert key is not None and pending.arrival_profiling
+    assert not policy.shape_closed(key)
     assert not pending.arrival_profile_active
     assert not pending.consumer_policy_probe
     assert not pending.planned_progressive_layers
@@ -229,10 +268,12 @@ def main() -> None:
     assert policy_stats["consumer_policy_stock_samples"] == 4
     assert policy_stats["consumer_policy_partial_samples"] == 0
     assert not policy.profitable_layers(key, minimum_gain=1.03)
+    assert not policy.shape_closed(key)
 
     # Persistent stock lateness unlocks a finite partial-consumer probe. Two
-    # independent leases establish a worst-case 0.22 ms operator cost.
-    for forward, cost in enumerate((0.2, 0.22)):
+    # independent leases separate the first-layer partition cost from the
+    # forward-local reusable critical path.
+    for forward, (cold_cost, reuse_cost) in enumerate(((0.2, 0.15), (0.22, 0.16))):
         pending.partial_profile_recorded = False
         rebound = policy.bind_lease(
             pending,
@@ -248,10 +289,21 @@ def main() -> None:
         policy.record_partial_profile(
             pending=pending,
             start=Event(float(forward)),
-            finish=Event(float(forward) + cost),
+            dispatch_ready=Event(float(forward) + 0.01),
+            finish=Event(float(forward) + cold_cost),
+            partition_prepared=True,
+        )
+        policy.record_partial_profile(
+            pending=pending,
+            start=Event(float(forward) + 1.0),
+            dispatch_ready=Event(float(forward) + 1.01),
+            finish=Event(float(forward) + 1.0 + reuse_cost),
+            partition_prepared=False,
         )
     policy.collect()
-    assert policy_stats["consumer_policy_partial_samples"] == 2
+    assert policy_stats["consumer_policy_partial_samples"] == 4
+    assert policy_stats["consumer_policy_partial_setup_samples"] == 2
+    assert policy_stats["consumer_policy_partial_reuse_samples"] == 2
     assert policy.profitable_layers(key, minimum_gain=1.03) == frozenset({0})
 
     pending.partial_profile_recorded = False
@@ -267,6 +319,7 @@ def main() -> None:
     assert not pending.arrival_profiling
     assert not pending.consumer_policy_probe
     assert pending.planned_progressive_layers == frozenset({0})
+    assert policy.shape_closed(key)
     assert policy.report() == {
         "minimum_samples": 2,
         "maximum_samples": 4,
@@ -276,7 +329,11 @@ def main() -> None:
         "calibrated_stock_layers": 2,
         "partial_shapes": 1,
         "calibrated_partial_shapes": 1,
+        "calibrated_partial_reuse_shapes": 1,
         "probe_rejected_shapes": 0,
+        "closed_shapes": 1,
+        "open_shapes": 0,
+        "last_shape_closed": True,
         "shapes": [
             {
                 "phase": "extend",
@@ -291,12 +348,64 @@ def main() -> None:
                 "calibrated_stock_layers": 2,
                 "maximum_conservative_lateness_ns": 500000,
                 "minimum_stock_service_ns": 100000,
-                "maximum_partial_service_ns": 220000,
+                "maximum_partial_cold_critical_path_ns": 220000,
+                "maximum_partial_reuse_critical_path_ns": 160000,
+                "maximum_partial_cold_dispatch_ns": 10000,
+                "maximum_partial_reuse_dispatch_ns": 10000,
+                "maximum_partial_cold_device_ns": 210000,
+                "maximum_partial_reuse_device_ns": 150000,
+                "estimated_partial_fixed_setup_ns": 60000,
                 "profitable_layers": 1,
+                "probe_attempts": 2,
                 "probe_misses": 0,
+                "closed": True,
             }
         ],
     }
+    policy_state = policy.export_state()
+    restored_policy_stats = {name: 0 for name in policy_stats}
+    restored_policy = SglangConsumerPolicyCalibration(
+        enabled=True,
+        model_start_layer=10,
+        model_layer_count=2,
+        minimum_samples=2,
+        maximum_samples=4,
+        stats=restored_policy_stats,
+    )
+    assert restored_policy.import_state(policy_state) == 20
+    assert restored_policy.export_state() == policy_state
+    assert restored_policy.shape_closed(key)
+    pending.partial_profile_recorded = False
+    assert (
+        restored_policy.bind_lease(
+            pending,
+            layer_service_key=("extend", 32, 2),
+            mover_kind="sm",
+            layers_per_submission=2,
+            sm_waves_per_layer=1,
+            minimum_gain=1.03,
+        )
+        == key
+    )
+    assert not pending.arrival_profiling
+    assert not pending.consumer_policy_probe
+    assert pending.planned_progressive_layers == frozenset({0})
+
+    inconsistent_partial = copy.deepcopy(policy_state)
+    inconsistent_partial["partial_device_curves"] = []
+    try:
+        SglangConsumerPolicyCalibration(
+            enabled=True,
+            model_start_layer=10,
+            model_layer_count=2,
+            minimum_samples=2,
+            maximum_samples=4,
+            stats={name: 0 for name in policy_stats},
+        ).import_state(inconsistent_partial)
+    except ValueError as error:
+        assert "inconsistent" in str(error)
+    else:
+        raise AssertionError("consumer calibration accepted a torn partial sample")
 
     rejected_stats = {
         "consumer_policy_profiled_leases": 0,
@@ -307,6 +416,8 @@ def main() -> None:
         "consumer_policy_arrival_samples": 0,
         "consumer_policy_stock_samples": 0,
         "consumer_policy_partial_samples": 0,
+        "consumer_policy_partial_setup_samples": 0,
+        "consumer_policy_partial_reuse_samples": 0,
     }
     rejected = SglangConsumerPolicyCalibration(
         enabled=True,

@@ -54,6 +54,7 @@ def main() -> None:
         calibration_probe_end as _calibration_probe_end,
         demand_overlap_policy as _demand_overlap_policy,
         maximum_mover_wave_bytes as _maximum_mover_wave_bytes,
+        minimum_saturating_pair_layers as _minimum_saturating_pair_layers,
         mover_layout_required as _mover_layout_required,
         requires_feasible_edf as _requires_feasible_edf,
     )
@@ -265,6 +266,17 @@ def main() -> None:
             pass
         else:
             raise AssertionError("invalid mover calibration frontier was accepted")
+    assert _minimum_saturating_pair_layers(1) == 1
+    assert _minimum_saturating_pair_layers(2) == 1
+    assert _minimum_saturating_pair_layers(8) == 4
+    assert _minimum_saturating_pair_layers(9) == 5
+    for invalid in (0, 65):
+        try:
+            _minimum_saturating_pair_layers(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid SM worker bound was accepted")
     assert not _mover_layout_required("sm", False)
     assert _mover_layout_required("sm", True)
     assert _mover_layout_required("probe_copy", False)
@@ -1396,15 +1408,21 @@ def main() -> None:
         {
             "NTA_VERIFY_ATTENTION": "1",
             "NTA_VERIFY_ATTENTION_MIXED_ONLY": "1",
+            "NTA_VERIFY_ATTENTION_LAYER": "17",
+            "NTA_VERIFY_ATTENTION_FIRST_PARTIAL": "0",
             "NTA_VERIFY_EXECUTION": "1",
             "NTA_VERIFY_TRANSFER": "1",
+            "NTA_VERIFY_TRANSFER_LAYER": "19",
             "NTA_VERIFY_INDEX_MAP": "1",
         },
         clear=False,
     ):
         verification = SglangVerificationConfig.from_environment()
     assert verification.attention and verification.attention_mixed_only
+    assert verification.attention_layer == 17
+    assert not verification.attention_first_partial
     assert verification.execution and verification.transfer
+    assert verification.transfer_layer == 19
     assert verification.index_map
     with patch.dict(
         os.environ,
@@ -1422,6 +1440,33 @@ def main() -> None:
             raise AssertionError(
                 "mixed-only verification lacked attention verification"
             )
+    with patch.dict(
+        os.environ,
+        {
+            "NTA_VERIFY_ATTENTION": "0",
+            "NTA_VERIFY_ATTENTION_MIXED_ONLY": "0",
+            "NTA_VERIFY_ATTENTION_LAYER": "17",
+        },
+        clear=False,
+    ):
+        try:
+            SglangVerificationConfig.from_environment()
+        except RuntimeError as error:
+            assert "requires NTA_VERIFY_ATTENTION" in str(error)
+        else:
+            raise AssertionError("layer verification lacked attention verification")
+    with patch.dict(
+        os.environ,
+        {
+            "NTA_VERIFY_ATTENTION": "1",
+            "NTA_VERIFY_ATTENTION_MIXED_ONLY": "0",
+            "NTA_VERIFY_ATTENTION_LAYER": "",
+            "NTA_VERIFY_ATTENTION_FIRST_PARTIAL": "1",
+        },
+        clear=False,
+    ):
+        verification = SglangVerificationConfig.from_environment()
+    assert verification.attention_first_partial
     model_runner = types.SimpleNamespace(
         model_config=types.SimpleNamespace(model_path="fixture-model")
     )

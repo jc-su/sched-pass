@@ -55,7 +55,9 @@ std::uint32_t WorkPlanBuilder::addWork(
         "work dependency count exceeds its configured bound");
   }
   for (const abi::AcquireRequirement &requirement : requirements) {
-    if (requirement.bytes == 0 || requirement.flags != 0) {
+    if (requirement.bytes == 0 ||
+        (requirement.flags & ~abi::AcquireRequirementSupportedFlags) != 0 ||
+        (requirement.directBase != 0 && requirement.flags != 0)) {
       throw std::invalid_argument(
           "work dependencies need non-zero bytes and supported flags");
     }

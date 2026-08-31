@@ -462,7 +462,11 @@ extern "C" __global__ void nta_attention_ready_kernel(
   if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
+  // The runnable queue stores canonical WorkItem indices. logicalTile is a
+  // framework semantic coordinate and may be request-local (FlashInfer KV
+  // tile indices restart at zero for each request), so it cannot index this
+  // batch-global task array.
+  const std::uint32_t taskIndex = workTicket;
   if (taskIndex < taskCount) {
     runAttentionTile(runtime, tasks, workItems, requirements, taskIndex,
                      queries, partials);
@@ -494,7 +498,7 @@ extern "C" __global__ void nta_attention_tma_ready_kernel(
   if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
+  const std::uint32_t taskIndex = workTicket;
   if (taskIndex < taskCount) {
     runAttentionTileTma(runtime, tasks, workItems, requirements, taskIndex,
                         queries, partials);
@@ -575,7 +579,7 @@ extern "C" __global__ void nta_sparse_partial_ready_kernel(
   if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
+  const std::uint32_t taskIndex = workTicket;
   runSelectedSparseTile(runtime, catalog, queries, taskIndex, selectedCount,
                         topK, workItems, requirements, selectedObjectSlots,
                         partials);
@@ -624,8 +628,7 @@ extern "C" __global__ void nta_sparse_attention_ready_kernel(
   if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t requestIndex =
-      runtime->workTickets[workTicket].logicalTile;
+  const std::uint32_t requestIndex = workTicket;
   if (requestIndex < requestCount) {
     runSelectedSparseAttention(runtime, catalog, queries, requestIndex,
                                requestCount, topK, workItems, requirements,

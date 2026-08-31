@@ -68,7 +68,7 @@ from nta_runtime.nvme_granularity import (
     NvmeTransferServiceModel,
 )
 from nta_runtime.requests import RequestBinding
-from nta_runtime.runtime import DeviceWorkPlan, JitPhaseProgram, Runtime
+from nta_runtime.runtime import DeviceWorkPlan, JitPhaseProgram, ObjectScope, Runtime
 
 
 _OBJECT_ID_BASE = 0x4E54410000000000
@@ -393,6 +393,7 @@ class SglangNvmeAcquisitionPipeline:
                     layer_id=layer_id,
                     object_version=version,
                     object_id_base=_OBJECT_ID_BASE + first_slot,
+                    object_scope=ObjectScope.TENANT_LOCAL,
                     first_object_slot=first_slot,
                     lifetime=self._slot_lifetime,
                 )
@@ -410,6 +411,7 @@ class SglangNvmeAcquisitionPipeline:
                     layer_id=layer_id,
                     object_version=version,
                     object_id_base=_OBJECT_ID_BASE + first_slot,
+                    object_scope=ObjectScope.TENANT_LOCAL,
                     first_object_slot=first_slot,
                     lifetime=self._slot_lifetime,
                 )

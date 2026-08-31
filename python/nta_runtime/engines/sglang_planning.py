@@ -66,6 +66,21 @@ def calibration_probe_end(
     return min(layer_count, ready_prefix + layers_per_wave)
 
 
+def minimum_saturating_pair_layers(maximum_worker_ctas: int) -> int:
+    """Return the finest layer group that fills a paired K/V worker grid.
+
+    One exact layer contributes a K/V pair and the transport program assigns
+    at most two workers to that pair. Grouping fewer layers underfills the
+    bounded grid; grouping more delays the shared readiness fence without
+    exposing additional workers. The result is therefore an occupancy-derived
+    completion granularity, not a byte or model-size threshold.
+    """
+
+    if not 0 < maximum_worker_ctas <= 64:
+        raise ValueError("SM mover worker bound must be in [1, 64]")
+    return (maximum_worker_ctas + 1) // 2
+
+
 def mover_layout_required(policy: str, profile_layout: bool) -> bool:
     """Return whether the selected mover needs a host run decomposition."""
 

@@ -46,7 +46,7 @@ int main() {
   CUmodule module = nullptr;
   std::uint32_t *deviceObservation = nullptr;
   try {
-    nta::RuntimeConfig config{4, 4, 4, 4, 1, 1, -1, false, 1};
+    nta::RuntimeConfig config{4, 4, 4, 4, 1, 1, -1, false, 2};
     nta::HostRuntime runtime(config);
     runtime.setRequest(0, 42, 3);
     runtime.setRequest(1, 43, 4);
@@ -58,7 +58,7 @@ int main() {
                                     "nta_test_dependency_arrival_race"),
                 "cuModuleGetFunction");
     checkCuda(cudaMalloc(reinterpret_cast<void **>(&deviceObservation),
-                         24 * sizeof(std::uint32_t)),
+                         32 * sizeof(std::uint32_t)),
               "cudaMalloc observation");
     CUdeviceptr runtimeAddress =
         reinterpret_cast<CUdeviceptr>(runtime.deviceView());
@@ -69,7 +69,7 @@ int main() {
                                nullptr),
                 "cuLaunchKernel");
 
-    std::array<std::uint32_t, 24> observation{};
+    std::array<std::uint32_t, 32> observation{};
     checkCuda(cudaMemcpy(observation.data(), deviceObservation,
                          sizeof(observation), cudaMemcpyDeviceToHost),
               "download dependency-race observation");
@@ -256,6 +256,67 @@ int main() {
     require(std::equal(observation.begin(), observation.begin() + 6,
                        std::array<std::uint32_t, 6>{1, 0, 0, 0, 0, 0}.begin()),
             "cancellation leaked indexed request, tenant, or backend credits");
+
+    checkDriver(cuModuleGetFunction(&kernel, module,
+                                    "nta_test_shared_acquisition_owner"),
+                "cuModuleGetFunction shared acquisition owner");
+    checkCuda(cudaMemset(deviceObservation, 0, sizeof(observation)),
+              "clear shared-owner observation");
+    checkDriver(cuLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0, nullptr, arguments,
+                               nullptr),
+                "cuLaunchKernel shared acquisition owner");
+    checkCuda(cudaMemcpy(observation.data(), deviceObservation,
+                         sizeof(observation), cudaMemcpyDeviceToHost),
+              "download shared-owner observation");
+    require(
+        std::equal(
+            observation.begin(), observation.begin() + 14,
+            std::array<std::uint32_t, 14>{
+                1, 1, 1, 500, 7, 1, 0, 0, 500, 7, 0,
+                nta::abi::InvalidIndex, 0, nta::abi::InvalidIndex}
+                .begin()),
+        "shared acquisition did not select the deterministic earliest live "
+        "consumer, retain its EDF key across cancellation, or reject an "
+        "ambiguous finite cross-tenant charge");
+    require(
+        std::equal(
+            observation.begin() + 14, observation.begin() + 27,
+            std::array<std::uint32_t, 13>{
+                1, 1, nta::abi::InvalidIndex, 1, 1, 0, 0, 4096, 0, 4096,
+                0, 0, 0}
+                .begin()),
+        "global-shared acquisition did not use one deterministic request "
+        "representative and backend-only credit ownership");
+
+    checkDriver(cuModuleGetFunction(&kernel, module,
+                                    "nta_test_no_live_intent_retirement"),
+                "cuModuleGetFunction no-live intent retirement");
+    checkCuda(cudaMemset(deviceObservation, 0, sizeof(observation)),
+              "clear no-live retirement observation");
+    checkDriver(cuLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0, nullptr, arguments,
+                               nullptr),
+                "cuLaunchKernel no-live intent retirement");
+    checkCuda(cudaMemcpy(observation.data(), deviceObservation,
+                         sizeof(observation), cudaMemcpyDeviceToHost),
+              "download no-live retirement observation");
+    require(
+        std::equal(
+            observation.begin(), observation.begin() + 16,
+            std::array<std::uint32_t, 16>{
+                1, 1,
+                static_cast<std::uint32_t>(nta::abi::ObjectState::New),
+                0, 0, 0,
+                static_cast<std::uint32_t>(
+                    nta::abi::WorkTicketState::Cancelled),
+                0, 1,
+                static_cast<std::uint32_t>(nta::abi::ObjectState::New),
+                0, 0, 0,
+                static_cast<std::uint32_t>(
+                    nta::abi::WorkTicketState::Cancelled),
+                0, 1}
+                .begin()),
+        "generic or ordered cancellation issued DMA, leaked an intent, or "
+        "poisoned the runtime");
 
     checkDriver(
         cuModuleGetFunction(&kernel, module,

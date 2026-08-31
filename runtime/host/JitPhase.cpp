@@ -20,9 +20,9 @@ using DiscoverOrderedNvme = cudaError_t (*)(void *, const void *, const void *,
                                             std::uint32_t, std::uint32_t,
                                             std::uint32_t, cudaStream_t);
 using PrepareReadyWindow = cudaError_t (*)(void *, std::uint32_t, cudaStream_t);
-using PrepareEventWorkPartition = cudaError_t (*)(void *, const void *,
-                                                  std::uint32_t, std::uint32_t,
-                                                  cudaStream_t);
+using PrepareEventWorkPartition = cudaError_t (*)(
+    void *, const void *, std::uint32_t, std::uint32_t, std::uint32_t,
+    cudaStream_t);
 using InvalidateCachedObjects = cudaError_t (*)(void *, std::uint32_t,
                                                 std::uint32_t, cudaStream_t);
 using ValidateIndexedHostRange = cudaError_t (*)(void *, std::uint32_t,
@@ -293,14 +293,15 @@ void JitPhaseProgram::prepareReadyWindow(cudaStream_t stream,
 void JitPhaseProgram::prepareEventWorkPartition(
     cudaStream_t stream, abi::RuntimeView *runtime,
     const abi::WorkItem *workItems, std::uint32_t workItemCount,
-    std::uint32_t directWorkCount) const {
+    std::uint32_t directWorkCount, std::uint32_t waveCount) const {
   if (runtime == nullptr || workItems == nullptr || workItemCount == 0 ||
-      directWorkCount == 0 || directWorkCount >= workItemCount) {
+      directWorkCount == 0 || directWorkCount >= workItemCount ||
+      waveCount == 0 || waveCount > abi::MaximumEventCompletionClasses) {
     throw std::invalid_argument(
-        "event work partition needs mixed direct/deferred work");
+        "event work partition needs mixed direct/wave work");
   }
   check(impl_->prepareEventWorkPartition(runtime, workItems, workItemCount,
-                                         directWorkCount, stream),
+                                         directWorkCount, waveCount, stream),
         "nta_jit_prepare_event_work_partition");
 }
 

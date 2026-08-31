@@ -3,6 +3,7 @@
 #include "nta/DeviceWorkPlan.h"
 #include "nta/FinitePhase.h"
 #include "nta/HostRuntime.h"
+#include "nta/JitPhase.h"
 #include "nta/WorkPlan.h"
 
 #include <cuda.h>
@@ -152,13 +153,6 @@ public:
   KernelModule() {
     checkDriver(cuModuleLoad(&module_, NTA_KV_CUBIN_PATH),
                 "cuModuleLoad instrumented cubin");
-    checkDriver(cuModuleGetFunction(&compute_, module_, "nta_kv_tile_kernel"),
-                "cuModuleGetFunction nta_kv_tile_kernel");
-    checkDriver(cuModuleGetFunction(&ready_, module_, "nta_kv_ready_kernel"),
-                "cuModuleGetFunction nta_kv_ready_kernel");
-    checkDriver(cuModuleGetFunction(&dependencyCompute_, module_,
-                                    "nta_dependency_tile_kernel"),
-                "cuModuleGetFunction nta_dependency_tile_kernel");
     checkDriver(cuModuleGetFunction(&dependencyReady_, module_,
                                     "nta_dependency_ready_kernel"),
                 "cuModuleGetFunction nta_dependency_ready_kernel");
@@ -174,60 +168,6 @@ public:
   }
   KernelModule(const KernelModule &) = delete;
   KernelModule &operator=(const KernelModule &) = delete;
-
-  void launchCompute(CUstream stream, nta::abi::RuntimeView *runtime,
-                     const nta::benchmark::TileTask *tasks,
-                     std::uint32_t taskCount, const float *query, float *output,
-                     std::uint32_t phase) const {
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
-    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(query);
-    CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
-    void *arguments[] = {
-        &runtimeAddress, &taskAddress,   &taskCount,
-        &queryAddress,   &outputAddress, &phase,
-    };
-    checkDriver(cuLaunchKernel(compute_, taskCount, 1, 1, 256, 1, 1, 0, stream,
-                               arguments, nullptr),
-                "cuLaunchKernel compute");
-  }
-
-  void launchReady(CUstream stream, nta::abi::RuntimeView *runtime,
-                   const nta::benchmark::TileTask *tasks,
-                   std::uint32_t taskCount, const float *query,
-                   float *output) const {
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
-    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(query);
-    CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
-    void *arguments[] = {
-        &runtimeAddress, &taskAddress,   &taskCount,
-        &queryAddress,   &outputAddress,
-    };
-    checkDriver(cuLaunchKernel(ready_, taskCount, 1, 1, 256, 1, 1, 0, stream,
-                               arguments, nullptr),
-                "cuLaunchKernel ready compute");
-  }
-
-  void launchDependencyCompute(CUstream stream, nta::abi::RuntimeView *runtime,
-                               const nta::abi::WorkItem *tasks,
-                               std::uint32_t taskCount,
-                               const nta::abi::AcquireRequirement *requirements,
-                               const float *query, float *output,
-                               std::uint32_t phase) const {
-    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
-    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(tasks);
-    CUdeviceptr requirementAddress =
-        reinterpret_cast<CUdeviceptr>(requirements);
-    CUdeviceptr queryAddress = reinterpret_cast<CUdeviceptr>(query);
-    CUdeviceptr outputAddress = reinterpret_cast<CUdeviceptr>(output);
-    void *arguments[] = {
-        &runtimeAddress, &taskAddress,   &taskCount, &requirementAddress,
-        &queryAddress,   &outputAddress, &phase};
-    checkDriver(cuLaunchKernel(dependencyCompute_, taskCount, 1, 1, 256, 1, 1,
-                               0, stream, arguments, nullptr),
-                "cuLaunchKernel dependency compute");
-  }
 
   void launchDependencyReady(CUstream stream, nta::abi::RuntimeView *runtime,
                              const nta::abi::WorkItem *tasks,
@@ -268,9 +208,6 @@ public:
 
 private:
   CUmodule module_ = nullptr;
-  CUfunction compute_ = nullptr;
-  CUfunction ready_ = nullptr;
-  CUfunction dependencyCompute_ = nullptr;
   CUfunction dependencyReady_ = nullptr;
   CUfunction dependencyBaseline_ = nullptr;
 };
@@ -458,7 +395,6 @@ int main(int argc, char **argv) {
     registeredObjects.reserve(options.externalRegistration ? objectCount : 0);
     nta::HostRuntime runtime({options.requests, objectCount, objectCount,
                               options.requests, 1, options.dependencies});
-    std::vector<nta::benchmark::TileTask> tasks(options.requests);
     std::vector<nta::abi::AcquireRequirement> requirements(
         static_cast<std::size_t>(options.requests) * options.dependencies);
     nta::WorkPlanBuilder planBuilder(options.dependencies);
@@ -497,7 +433,8 @@ int main(int argc, char **argv) {
 
     for (std::uint32_t task = 0; task < options.requests; ++task) {
       const std::uint32_t generation = 100U + task;
-      runtime.setRequest(task, 100000U + task, generation, task % 4, task % 3);
+      runtime.setRequest(task, 100000U + task, generation,
+                         (task / options.coalesce) % 4, task % 3);
       if (options.cancelStride != 0 && task % options.cancelStride == 0) {
         runtime.cancelRequest(task, generation);
         cancelled[task] = true;
@@ -535,20 +472,6 @@ int main(int argc, char **argv) {
       }
       expected[task] = static_cast<float>(reference);
 
-      tasks[task] = {
-          reinterpret_cast<std::uint64_t>(
-              objects[objectBegin].directDeviceBase),
-          200000U + objectBegin,
-          0,
-          task,
-          taskGeneration,
-          objectBegin,
-          1,
-          options.tileBytes,
-          task,
-          0,
-          0,
-      };
       const std::uint32_t request =
           planBuilder.addRequest({task, taskGeneration});
       const std::span<const nta::abi::AcquireRequirement> taskRequirements(
@@ -561,19 +484,15 @@ int main(int argc, char **argv) {
     nta::WorkPlan workPlan = planBuilder.finish();
     nta::DeviceWorkPlan deviceWorkPlan = runtime.uploadWorkPlan(workPlan);
 
-    DeviceBuffer<nta::benchmark::TileTask> deviceTasks(tasks.size());
     DeviceBuffer<float> deviceQuery(query.size());
     DeviceBuffer<float> deviceOutput(options.requests);
-    checkCuda(cudaMemcpy(deviceTasks.get(), tasks.data(),
-                         sizeof(tasks.front()) * tasks.size(),
-                         cudaMemcpyHostToDevice),
-              "upload tasks");
     checkCuda(cudaMemcpy(deviceQuery.get(), query.data(),
                          sizeof(float) * query.size(), cudaMemcpyHostToDevice),
               "upload query");
 
     KernelModule kernels;
     nta::FinitePhaseProgram phases(kernels.module());
+    nta::JitPhaseProgram typedPhases(NTA_TRANSPORT_PROGRAM_PATH);
     cudaStream_t stream = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graphExec = nullptr;
@@ -599,24 +518,14 @@ int main(int argc, char **argv) {
                 driverStream, deviceWorkPlan.workItems(), options.requests,
                 deviceWorkPlan.dependencies(), deviceQuery.get(),
                 deviceOutput.get());
-          } else if (options.dependencies == 1 &&
-                     options.objectStaleStride == 0) {
-            kernels.launchCompute(driverStream, runtime.deviceView(),
-                                  deviceTasks.get(), options.requests,
-                                  deviceQuery.get(), deviceOutput.get(), 0);
           } else {
-            kernels.launchDependencyCompute(
-                driverStream, runtime.deviceView(), deviceWorkPlan.workItems(),
-                options.requests, deviceWorkPlan.dependencies(),
-                deviceQuery.get(), deviceOutput.get(), 0);
+            typedPhases.discover(
+                stream, runtime.deviceView(), deviceWorkPlan.workItems(),
+                deviceWorkPlan.dependencies(), options.requests);
           }
         },
         [&] {
-          if (options.dependencies == 1 && options.objectStaleStride == 0) {
-            kernels.launchReady(driverStream, runtime.deviceView(),
-                                deviceTasks.get(), options.requests,
-                                deviceQuery.get(), deviceOutput.get());
-          } else {
+          if (!options.baseline) {
             kernels.launchDependencyReady(
                 driverStream, runtime.deviceView(), deviceWorkPlan.workItems(),
                 options.requests, deviceWorkPlan.dependencies(),
@@ -642,7 +551,7 @@ int main(int argc, char **argv) {
             task,
             100000ULL + static_cast<std::uint64_t>(epoch) * options.requests +
                 task,
-            generation, task % 4, task % 3);
+            generation, (task / options.coalesce) % 4, task % 3);
         cancelled[task] = options.cancelStride != 0 &&
                           (task + epoch) % options.cancelStride == 0;
         if (cancelled[task]) {
@@ -656,8 +565,6 @@ int main(int argc, char **argv) {
         stale[task] = taskGeneration != generation;
         objectStale[task] = options.objectStaleStride != 0 &&
                             (task + epoch) % options.objectStaleStride == 0;
-        tasks[task].generation = taskGeneration;
-        tasks[task].objectVersion = objectStale[task] ? 2U : 1U;
         workPlan.requests[task].generation = taskGeneration;
         workPlan.workItems[task].generation = taskGeneration;
         for (std::uint32_t dependency = 0; dependency < options.dependencies;
@@ -671,10 +578,6 @@ int main(int argc, char **argv) {
               requirements[index].objectVersion;
         }
       }
-      checkCuda(cudaMemcpyAsync(deviceTasks.get(), tasks.data(),
-                                sizeof(tasks.front()) * tasks.size(),
-                                cudaMemcpyHostToDevice, stream),
-                "upload lifecycle tasks");
       deviceWorkPlan.uploadAsync(workPlan, stream);
     };
 
@@ -690,6 +593,9 @@ int main(int argc, char **argv) {
           const float tolerance =
               std::max(0.02F, std::abs(expected[task]) * 2.0e-5F);
           if (std::abs(output[task] - expected[task]) > tolerance) {
+            std::cerr << "baseline mismatch task=" << task
+                      << " output=" << output[task]
+                      << " expected=" << expected[task] << '\n';
             ++failures;
           }
         } else if (cancelled[task] || stale[task]) {
@@ -697,12 +603,18 @@ int main(int argc, char **argv) {
                   static_cast<std::uint32_t>(
                       nta::abi::WorkTicketState::Cancelled) ||
               output[task] != 0.0F) {
+            std::cerr << "cancel/stale mismatch task=" << task
+                      << " state=" << workTicket.state
+                      << " output=" << output[task] << '\n';
             ++failures;
           }
         } else if (objectStale[task]) {
           if (workTicket.state != static_cast<std::uint32_t>(
                                         nta::abi::WorkTicketState::Failed) ||
               output[task] != 0.0F) {
+            std::cerr << "object-stale mismatch task=" << task
+                      << " state=" << workTicket.state
+                      << " output=" << output[task] << '\n';
             ++failures;
           }
         } else {
@@ -711,6 +623,11 @@ int main(int argc, char **argv) {
           if (workTicket.state != static_cast<std::uint32_t>(
                                         nta::abi::WorkTicketState::Done) ||
               std::abs(output[task] - expected[task]) > tolerance) {
+            std::cerr << "ready mismatch task=" << task
+                      << " state=" << workTicket.state
+                      << " logical=" << workTicket.logicalTile
+                      << " output=" << output[task]
+                      << " expected=" << expected[task] << '\n';
             ++failures;
           }
         }

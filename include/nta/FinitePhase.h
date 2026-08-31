@@ -58,11 +58,15 @@ public:
                    Ready &&ready) const {
     reset(stream, runtime, config.objectCount, config.workTicketCount);
     initial();
-    complete(stream, runtime, config.workTicketCount);
+    // Discovery may publish an arbitrary resident/direct subset before any
+    // transport progress is needed. The numerical consumer is the sole owner
+    // of Ready -> Done: a bulk completion sweep cannot distinguish queue
+    // entries actually consumed by this launch from concurrently published
+    // work. Every later progress round follows the same publish/consume rule.
+    ready();
     for (std::uint32_t round = 0; round < config.progressRounds; ++round) {
       progressHost(stream, runtime, config.progressBlocks);
       ready();
-      complete(stream, runtime, config.workTicketCount);
     }
   }
 
@@ -72,13 +76,12 @@ public:
                    Ready &&ready) const {
     reset(stream, runtime, config.objectCount, config.workTicketCount);
     initial();
-    complete(stream, runtime, config.workTicketCount);
+    ready();
     for (std::uint32_t round = 0; round < config.progressRounds; ++round) {
       progressNvmeUntilIdle(stream, runtime, config.issueBudget,
                             config.completionBudget,
                             config.progressTimeoutNs);
       ready();
-      complete(stream, runtime, config.workTicketCount);
     }
   }
 

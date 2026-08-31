@@ -196,8 +196,6 @@ def main() -> None:
     wave_publication = SimpleNamespace(
         transfer_first_slot=8,
         wave_events=wave_events,
-        wave_object_slots=(),
-        registration_event=None,
         wave_count=3,
     )
     wave_acquisition = acquired_layer(

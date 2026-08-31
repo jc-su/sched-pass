@@ -64,19 +64,11 @@ class _Runtime:
     device_ordinal = 0
     device_view_tensor = object()
 
-    def __init__(self) -> None:
-        self.object_waits: list[tuple[int, object]] = []
-
-    def wait_object_range_terminal(
-        self, object_slot: int, object_count: int, stream: object
-    ) -> None:
-        assert object_count == 1
-        self.object_waits.append((object_slot, stream))
-
 
 class _Plan:
     device_ordinal = 0
     work_item_count = 4
+    direct_work_count = 0
     has_external = True
     work_items_tensor = object()
     dependencies_tensor = object()
@@ -115,9 +107,18 @@ class _Phases:
         runtime: object,
         plan: object,
         direct_work_count: int,
+        wave_count: int,
         stream: object,
     ) -> None:
-        self.calls.append(("event_partition", plan, direct_work_count, stream))
+        self.calls.append(
+            (
+                "event_partition",
+                plan,
+                direct_work_count,
+                wave_count,
+                stream,
+            )
+        )
 
     def progress_validated_indexed_host_range_parallel(
         self,
@@ -129,6 +130,29 @@ class _Phases:
     ) -> None:
         self.calls.append(
             ("progress", first_object, object_count, copy_blocks, stream)
+        )
+
+    def progress_host(
+        self, runtime: object, object_count: int, stream: object
+    ) -> None:
+        self.calls.append(("progress", object_count, stream))
+
+    def progress_nvme_until_idle(
+        self,
+        runtime: object,
+        issue_budget: int,
+        completion_budget: int,
+        timeout_ns: int,
+        stream: object,
+    ) -> None:
+        self.calls.append(
+            (
+                "progress_nvme",
+                issue_budget,
+                completion_budget,
+                timeout_ns,
+                stream,
+            )
         )
 
     def complete_stream_ordered(
@@ -156,6 +180,112 @@ class _NumericalWrapper:
         **_options: object,
     ) -> None:
         self.launches.append((work_count, flags))
+
+
+def _check_nonpipelined_sealed_discovery() -> None:
+    runtime = _Runtime()
+    plan = _Plan()
+    plan.direct_work_count = 1
+    phases = _Phases()
+    wrapper = _NumericalWrapper()
+    compute = _Stream(1)
+    epoch = FlashInferLayerEpoch(
+        runtime,  # type: ignore[arg-type]
+        plan,  # type: ignore[arg-type]
+        phases,  # type: ignore[arg-type]
+        object_count=3,
+        max_progress_rounds=1,
+        wait_for_plan=False,
+    )
+
+    rounds = epoch.enqueue_host(
+        wrapper,
+        object(),
+        object(),
+        object(),
+        progress_blocks=3,
+        sm_scale=1.0,
+        stream=compute,
+    )
+
+    assert rounds == 1
+    assert [call[0] for call in phases.calls] == [
+        "reset",
+        "discover",
+        "prepare",
+        "progress",
+        "prepare",
+    ]
+    assert wrapper.launches == [
+        (
+            1,
+            BIND_CURRENT_GENERATION
+            | RUNNABLE_WORK
+            | DYNAMIC_RUNNABLE_WINDOW
+            | SKIP_MERGE,
+        ),
+        (
+            3,
+            BIND_CURRENT_GENERATION
+            | RUNNABLE_WORK
+            | DYNAMIC_RUNNABLE_WINDOW,
+        ),
+    ]
+    assert plan.consumed == [compute, compute]
+
+
+def _check_nvme_sealed_discovery() -> None:
+    runtime = _Runtime()
+    plan = _Plan()
+    plan.direct_work_count = 1
+    phases = _Phases()
+    wrapper = _NumericalWrapper()
+    compute = _Stream(1)
+    epoch = FlashInferLayerEpoch(
+        runtime,  # type: ignore[arg-type]
+        plan,  # type: ignore[arg-type]
+        phases,  # type: ignore[arg-type]
+        object_count=3,
+        max_progress_rounds=1,
+        wait_for_plan=False,
+    )
+
+    rounds = epoch.enqueue_nvme(
+        wrapper,
+        object(),
+        object(),
+        object(),
+        issue_budget=8,
+        completion_budget=16,
+        timeout_ns=1_000,
+        sm_scale=1.0,
+        stream=compute,
+    )
+
+    assert rounds == 1
+    assert [call[0] for call in phases.calls] == [
+        "reset",
+        "discover",
+        "prepare",
+        "progress_nvme",
+        "prepare",
+    ]
+    assert wrapper.launches == [
+        (
+            1,
+            BIND_CURRENT_GENERATION
+            | RUNNABLE_WORK
+            | DYNAMIC_RUNNABLE_WINDOW
+            | SKIP_MERGE,
+        ),
+        (
+            3,
+            BIND_CURRENT_GENERATION
+            | RUNNABLE_WORK
+            | DYNAMIC_RUNNABLE_WINDOW,
+        ),
+    ]
+    assert plan.consumed == [compute, compute]
 
 
 def _check_stream_ordered_multiwave() -> None:
@@ -338,8 +468,6 @@ def _check_stream_ordered_multiwave() -> None:
             object(),
             object(),
             ready_events=ready,
-            ready_object_slots=(),
-            registration_event=None,
             direct_work_count=2,
             wave_work_counts=(1, 1),
             prepare_partition=True,
@@ -347,7 +475,7 @@ def _check_stream_ordered_multiwave() -> None:
             stream=compute,
         )
         assert event_phases.calls == [
-            ("event_partition", event_plan, 2, compute)
+            ("event_partition", event_plan, 2, 2, compute)
         ]
         assert event_wrapper.launches == [
             (
@@ -371,42 +499,6 @@ def _check_stream_ordered_multiwave() -> None:
         assert compute.waits[-2:] == list(ready)
         assert event_plan.consumed == [compute]
 
-        object_plan = _Plan()
-        object_phases = _Phases()
-        object_wrapper = _NumericalWrapper()
-        registration = _Event()
-        enqueue_event_partitioned_attention(
-            runtime,  # type: ignore[arg-type]
-            object_plan,  # type: ignore[arg-type]
-            object_phases,  # type: ignore[arg-type]
-            object_wrapper,
-            object(),
-            object(),
-            object(),
-            ready_events=(),
-            ready_object_slots=(10, 12),
-            registration_event=registration,
-            direct_work_count=2,
-            wave_work_counts=(0, 2),
-            prepare_partition=True,
-            sm_scale=1.0,
-            stream=compute,
-        )
-        assert compute.waits[-1] is registration
-        assert runtime.object_waits[-2:] == [(10, compute), (12, compute)]
-        assert object_wrapper.launches == [
-            (
-                2,
-                PREACQUIRED_LAUNCH_FLAGS | RUNNABLE_WORK | SKIP_MERGE,
-            ),
-            (
-                2,
-                PREACQUIRED_LAUNCH_FLAGS
-                | RUNNABLE_WORK
-                | (2 << RUNNABLE_OFFSET_SHIFT),
-            ),
-        ]
-        assert object_plan.consumed == [compute]
     finally:
         flashinfer_runtime._stream_is_capturing = original_capture
 
@@ -454,7 +546,17 @@ def main() -> None:
     else:
         raise AssertionError("FlashInfer accepted an unplanned source wrapper")
 
-    _check_stream_ordered_multiwave()
+    # This is a CPU contract test.  Capturing-state detection is a CUDA driver
+    # concern covered by the hooked fixture; do not initialize a GPU merely to
+    # validate queue geometry and ownership.
+    original_capture = flashinfer_runtime._stream_is_capturing
+    flashinfer_runtime._stream_is_capturing = lambda: False
+    try:
+        _check_stream_ordered_multiwave()
+        _check_nonpipelined_sealed_discovery()
+        _check_nvme_sealed_discovery()
+    finally:
+        flashinfer_runtime._stream_is_capturing = original_capture
 
 
 if __name__ == "__main__":

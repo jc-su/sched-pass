@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
         default="disabled",
     )
     parser.add_argument("--slo-ttft-seconds", type=float, default=8.0)
+    parser.add_argument("--slo-tpot-seconds", type=float, default=0.050)
     parser.add_argument("--slo-p99-itl-seconds", type=float, default=0.100)
     parser.add_argument("--build-dir", default="build")
     parser.add_argument(
@@ -101,6 +102,12 @@ def parse_args() -> argparse.Namespace:
         or not math.isfinite(args.output_length_scale)
         or args.output_length_scale <= 0.0
         or not 0.0 < args.mem_fraction_static < 1.0
+        or min(
+            args.slo_ttft_seconds,
+            args.slo_tpot_seconds,
+            args.slo_p99_itl_seconds,
+        )
+        <= 0.0
     ):
         parser.error("time scale and memory fraction are invalid")
     return args
@@ -168,6 +175,8 @@ def _worker_command(
         args.cuda_graph_prefill,
         "--slo-ttft-seconds",
         str(args.slo_ttft_seconds),
+        "--slo-tpot-seconds",
+        str(args.slo_tpot_seconds),
         "--slo-p99-itl-seconds",
         str(args.slo_p99_itl_seconds),
         "--flashinfer-workspace-base",

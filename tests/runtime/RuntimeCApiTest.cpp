@@ -101,8 +101,9 @@ int main() {
         reinterpret_cast<std::uintptr_t>(deviceObject);
     replica.placement = NTA_PLACEMENT_HBM;
     std::uint64_t directBase = 0;
-    requireOk(nta_runtime_register_object(runtime, 0, 101, 7, 4096, 0, &replica,
-                                          1, &directBase),
+    requireOk(nta_runtime_register_object(
+                  runtime, 0, 101, 7, NTA_OBJECT_SCOPE_TENANT_LOCAL, 4096, 0,
+                  &replica, 1, &directBase),
               "register C object");
     require(directBase == reinterpret_cast<std::uintptr_t>(deviceObject),
             "C object direct base mismatch");
@@ -205,12 +206,14 @@ int main() {
     require(nta_copy_strided_host_runs_async(nullptr, 0, nullptr, 0, 0) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "C API accepted an empty strided host-copy batch");
-    require(nta_runtime_install_registered_nvme_object(nullptr, 0, 0, 0, 0, 0,
-                                                       nullptr, 0, nullptr) ==
+    require(nta_runtime_install_registered_nvme_object(
+                nullptr, 0, 0, 0, NTA_OBJECT_SCOPE_TENANT_LOCAL, 0, 0,
+                nullptr, 0, nullptr) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "C API accepted a null registered NVMe runtime");
     require(nta_runtime_install_registered_nvme_object_async(
-                nullptr, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, nullptr) ==
+                nullptr, 0, 0, 0, NTA_OBJECT_SCOPE_TENANT_LOCAL, 0, 0,
+                nullptr, 0, 0, 0, nullptr) ==
                 NTA_STATUS_INVALID_ARGUMENT,
             "C API accepted a null registered async NVMe runtime");
     require(nta_runtime_install_registered_nvme_objects_async(

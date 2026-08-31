@@ -154,11 +154,38 @@ def main() -> None:
             "host_execution_mode": "auto",
             "incremental_setup_calibrated": True,
             "incremental_calibration_probes_remaining": 0,
+            "consumer_policy_calibration": {"last_shape_closed": True},
         }
     )
     activation = module.require_clean_mechanism(calibrated_auto)
     assert activation["auto_calibration_applicable"]
     assert activation["auto_calibration_closed"]
+    calibrated_auto["engine_stats"][0].update(
+        {
+            "calibration_profile_status": "loaded_read_only",
+            "calibration_profile_read_only": True,
+            "calibration_profile_loaded_samples": 17,
+            "calibration_profile_sha256": "b" * 64,
+            "calibration_profile_save_count": 0,
+            "calibration_profile_checkpoint_failures": 0,
+            "calibration_profile_deferred_checkpoints": 0,
+        }
+    )
+    activation = module.require_clean_mechanism(
+        calibrated_auto, require_read_only_calibration_profile=True
+    )
+    assert activation["calibration_profile_digests"] == ["b" * 64]
+    writable_profile = report(compact_ctas=1, canonical_ctas=1)
+    writable_profile["engine_stats"][0].update(calibrated_auto["engine_stats"][0])
+    writable_profile["engine_stats"][0]["calibration_profile_read_only"] = False
+    try:
+        module.require_clean_mechanism(
+            writable_profile, require_read_only_calibration_profile=True
+        )
+    except RuntimeError as error:
+        assert "profile is writable" in str(error)
+    else:
+        raise AssertionError("a writable calibration profile passed the timed gate")
     uncalibrated_auto = report(compact_ctas=1, canonical_ctas=1)
     uncalibrated_auto["engine_stats"][0].update(
         {
@@ -166,6 +193,7 @@ def main() -> None:
             "host_execution_mode": "auto",
             "incremental_setup_calibrated": False,
             "incremental_calibration_probes_remaining": 1,
+            "consumer_policy_calibration": {"last_shape_closed": False},
         }
     )
     try:
@@ -174,6 +202,24 @@ def main() -> None:
         assert "calibration closed" in str(error)
     else:
         raise AssertionError("uncalibrated host AUTO trial passed the evidence gate")
+
+    timed_probe = report(compact_ctas=1, canonical_ctas=1)
+    timed_probe["engine_stats"][0].update(
+        {
+            "serving_tier": "host_staged",
+            "host_execution_mode": "auto",
+            "incremental_setup_calibrated": True,
+            "incremental_calibration_probes_remaining": 0,
+            "consumer_policy_calibration": {"last_shape_closed": True},
+            "consumer_policy_probe_leases": 1,
+        }
+    )
+    try:
+        module.require_clean_mechanism(timed_probe)
+    except RuntimeError as error:
+        assert "timed window for calibration" in str(error)
+    else:
+        raise AssertionError("timed AUTO calibration passed the evidence gate")
 
     # A complete exact prefetch is allowed to use the framework consumer after
     # the acquisition fence.  It must still be counted as external work, but
@@ -234,8 +280,9 @@ def main() -> None:
             "stock_prefetched_external_attention_launches": 1,
             "external_launches": 2,
             "native_external_attention_launches": 1,
-            "prefetched_layers": 1,
+            "prefetched_layers": 2,
             "demand_host_layers": 1,
+            "host_acquisition_layers_consumed": 2,
             "prefill_launches": 2,
         }
     )
@@ -276,6 +323,27 @@ def main() -> None:
         raise AssertionError("a native path without compiler proof passed the gate")
 
     serving = load_serving_module()
+    closed_snapshot = {
+        "scheduler": {
+            "backend": "nta_flashinfer",
+            "serving_tier": "host_staged",
+            "host_execution_mode": "auto",
+            "incremental_setup_calibrated": True,
+            "incremental_calibration_probes_remaining": 0,
+            "consumer_policy_calibration": {"last_shape_closed": True},
+        }
+    }
+    serving._require_closed_auto_calibration(closed_snapshot)
+    open_snapshot = {"scheduler": dict(closed_snapshot["scheduler"])}
+    open_snapshot["scheduler"]["consumer_policy_calibration"] = {
+        "last_shape_closed": False
+    }
+    try:
+        serving._require_closed_auto_calibration(open_snapshot)
+    except RuntimeError as error:
+        assert "warmup ended before AUTO calibration closed" in str(error)
+    else:
+        raise AssertionError("an open consumer policy entered timed serving")
     assert serving._max_request_input_tokens(32_768, 18_000) == 17_992
     assert serving._max_request_input_tokens(16_000, 18_000) == 15_992
     assert serving._reusable_prefix_tokens((1, 2, 3), (1, 2, 3)) == 2
@@ -286,6 +354,60 @@ def main() -> None:
         assert "does not extend" in str(error)
     else:
         raise AssertionError("serving placement accepted a mismatched prefix")
+
+    class _FlushResult:
+        def __init__(self, success: bool, message: str = "") -> None:
+            self.success = success
+            self.message = message
+
+    class _FlushManager:
+        def __init__(self, result: _FlushResult) -> None:
+            self.result = result
+            self.timeout_seconds: float | None = None
+
+        async def flush_cache(self, *, timeout_s: float) -> _FlushResult:
+            self.timeout_seconds = timeout_s
+            await asyncio.sleep(0)
+            return self.result
+
+    class _FlushLoop:
+        @staticmethod
+        def run_until_complete(awaitable):
+            return asyncio.run(awaitable)
+
+    class _FlushEngine:
+        def __init__(self, result: _FlushResult) -> None:
+            self.tokenizer_manager = _FlushManager(result)
+            self.loop = _FlushLoop()
+
+    flush_engine = _FlushEngine(_FlushResult(True))
+    flush_wait = serving._flush_cache_when_idle(
+        flush_engine,
+        timeout_seconds=17.0,
+        reason="exercise fixture placement",
+    )
+    assert flush_wait >= 0.0
+    assert flush_engine.tokenizer_manager.timeout_seconds == 17.0
+    failed_flush_engine = _FlushEngine(_FlushResult(False, "still busy"))
+    try:
+        serving._flush_cache_when_idle(
+            failed_flush_engine,
+            timeout_seconds=3.0,
+            reason="exercise failed fixture placement",
+        )
+    except RuntimeError as error:
+        assert "exercise failed fixture placement" in str(error)
+        assert "still busy" in str(error)
+    else:
+        raise AssertionError("failed deferred cache flush passed the setup gate")
+    try:
+        serving._flush_cache_when_idle(
+            object(), timeout_seconds=3.0, reason="exercise missing fixture contract"
+        )
+    except RuntimeError as error:
+        assert "lacks the deferred idle-flush contract" in str(error)
+    else:
+        raise AssertionError("missing deferred cache-flush API passed the setup gate")
 
     class _StreamingEngine:
         def __init__(self, completion_counts: tuple[int, ...]) -> None:
@@ -346,6 +468,49 @@ def main() -> None:
         barrier.set()
 
     asyncio.run(exercise_first_token_barrier())
+
+    async def exercise_gated_arrival_accounting() -> None:
+        barrier = serving._FirstTokenBarrier(1)
+        started = time.perf_counter()
+        request = asyncio.create_task(
+            serving._stream_request(
+                _StreamingEngine((1,)),
+                (1, 2, 3, 4),
+                {
+                    "temperature": 0,
+                    "max_new_tokens": 1,
+                    "ignore_eos": True,
+                    "stream_interval": 1,
+                },
+                kind="fixture",
+                index=0,
+                request_id="fixture-gated-arrival",
+                gate=barrier,
+                first_token_event=None,
+                offset_seconds=0.0,
+                load_start_seconds=started,
+            )
+        )
+        await asyncio.sleep(0.01)
+        barrier.set()
+        record = await request
+        assert record["workload_gate_wait_seconds"] >= 0.005
+        assert abs(
+            record["arrival_offset_seconds"]
+            - record["workload_gate_wait_seconds"]
+        ) < 1e-6
+        assert abs(
+            record["admission_delay_seconds"]
+            - (
+                record["submitted_offset_seconds"]
+                - record["arrival_offset_seconds"]
+            )
+        ) < 1e-6
+        assert record["admission_delay_seconds"] < record[
+            "workload_gate_wait_seconds"
+        ]
+
+    asyncio.run(exercise_gated_arrival_accounting())
     try:
         serving._FirstTokenBarrier(0)
     except ValueError as error:
@@ -444,17 +609,6 @@ def main() -> None:
     assert dispatch_stats["native_dispatch_nonprefix_batches"] == 1
     assert dispatch_stats["native_dispatch_nonprefix_layers_2_batches"] == 1
     assert dispatch_stats["native_dispatch_prefix_observations"] == 1
-
-    churn = tuple((index,) for index in range(12))
-    assert tuple(serving._churn_window(churn, 0, 3)) == churn[0:3]
-    assert tuple(serving._churn_window(churn, 1, 3)) == churn[3:6]
-    assert tuple(serving._churn_window(churn, 3, 3)) == churn[9:12]
-    try:
-        serving._churn_window(churn, 4, 3)
-    except ValueError as error:
-        assert "does not cover" in str(error)
-    else:
-        raise AssertionError("overlapping churn allocation was not bounded")
 
     class _Tokenizer:
         vocab_size = 256

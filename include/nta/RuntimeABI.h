@@ -6,9 +6,10 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 37;
+inline constexpr std::uint32_t Version = 42;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 6;
+inline constexpr std::uint32_t MaximumEventCompletionClasses = 64;
 
 enum class SourceKind : std::uint32_t {
   Hbm = 0,
@@ -58,6 +59,45 @@ enum class ObjectState : std::uint32_t {
   Ready = 3,
   Failed = 4,
 };
+
+// Resource ownership is part of the object identity contract. TenantLocal is
+// the fail-closed default for request-owned state such as KV pages. A
+// GlobalShared object is immutable runtime/model state (for example, an MoE
+// expert) whose one physical acquisition may serve consumers from multiple
+// tenants. Shared objects consume backend credits, never an arbitrary
+// request's or tenant's staging budget.
+enum class ObjectScope : std::uint32_t {
+  TenantLocal = 0,
+  GlobalShared = 1,
+};
+
+inline constexpr std::uint32_t ObjectScopeSharedBit = 1U << 31U;
+inline constexpr std::uint32_t ObjectAuxiliaryCountMask =
+    ~ObjectScopeSharedBit;
+
+[[nodiscard]] constexpr bool validObjectScope(ObjectScope scope) noexcept {
+  return scope == ObjectScope::TenantLocal ||
+         scope == ObjectScope::GlobalShared;
+}
+
+[[nodiscard]] constexpr std::uint32_t
+packObjectMetadata(ObjectScope scope,
+                   std::uint32_t auxiliaryCount = 0) noexcept {
+  return (auxiliaryCount & ObjectAuxiliaryCountMask) |
+         (scope == ObjectScope::GlobalShared ? ObjectScopeSharedBit : 0U);
+}
+
+[[nodiscard]] constexpr ObjectScope
+objectScope(std::uint32_t metadata) noexcept {
+  return (metadata & ObjectScopeSharedBit) != 0
+             ? ObjectScope::GlobalShared
+             : ObjectScope::TenantLocal;
+}
+
+[[nodiscard]] constexpr std::uint32_t
+objectAuxiliaryCount(std::uint32_t metadata) noexcept {
+  return metadata & ObjectAuxiliaryCountMask;
+}
 
 enum class WorkTicketState : std::uint32_t {
   New = 0,
@@ -126,7 +166,9 @@ struct alignas(64) ObjectEntry {
   std::uint32_t replicaStart;
   std::uint32_t replicaCount;
   std::uint32_t selectedReplica;
-  std::uint32_t flags;
+  // High bit: ObjectScope. Low 31 bits: type-specific immutable metadata;
+  // indexed host objects use it for their registered row capacity.
+  std::uint32_t metadata;
   std::uint64_t stagingTensorMapAddress;
 };
 static_assert(sizeof(ObjectEntry) == 64);
@@ -288,6 +330,17 @@ struct alignas(32) IntentQueueControl {
 };
 static_assert(sizeof(IntentQueueControl) == 32);
 
+enum AcquireRequirementFlags : std::uint32_t {
+  // This external object generation has exactly one consumer work ticket in
+  // the acquisition epoch.  Only this stronger contract may initiate an
+  // acquisition from an already-running numerical kernel, because that path
+  // has no grid-wide discovery seal.  Shared objects must use typed discovery
+  // so the runtime can bind one deterministic owner from the complete fanout.
+  AcquireOnlineExclusive = 1U << 0,
+};
+inline constexpr std::uint32_t AcquireRequirementSupportedFlags =
+    AcquireOnlineExclusive;
+
 // A kernel work item may require several independently resident objects. The
 // compiler treats an array of these records as one finite deferral boundary.
 struct alignas(16) AcquireRequirement {
@@ -329,12 +382,16 @@ struct alignas(32) WorkItem {
   // describe transformer-layer arrival order without translating the GPU
   // global timer into a host clock domain.
   std::uint64_t readyDeadlineOffsetNs;
-  // Explicit tail padding keeps the C, Python, and device-array stride equal.
-  // A non-zero value denotes an ABI extension this runtime cannot interpret.
-  std::uint32_t reserved2;
-  std::uint32_t reserved3;
+  // A producer-independent completion class for event-owned partial
+  // consumers. InvalidIndex denotes direct work. Unlike an object slot, this
+  // identity is stable across transformer layers and tier backends.
+  std::uint32_t completionClass;
+  std::uint32_t flags;
 };
 static_assert(sizeof(WorkItem) == 64);
+
+inline constexpr std::uint32_t WorkItemEventPartition = 1U << 0;
+inline constexpr std::uint32_t WorkItemSupportedFlags = WorkItemEventPartition;
 
 struct alignas(32) WorkTicket {
   std::uint64_t requestId;
@@ -446,6 +503,11 @@ struct alignas(64) RuntimeView {
   // Relative device-global nanoseconds at which each ticket first became
   // runnable in the current epoch. Zero denotes work available at epoch start.
   std::uint64_t *workRunnableNs;
+  // Absolute device-global deadline used to aggregate the scheduling key of a
+  // physical acquisition shared by several work tickets. This is separate
+  // from workRunnableNs: pending work must never masquerade as runnable in
+  // progress telemetry.
+  std::uint64_t *workDeadlineClocks;
   WorkDependency *dependencies;
   IntentPool *intentPool;
   IntentQueueEntry *intentQueueEntries;
@@ -510,7 +572,7 @@ struct alignas(64) RuntimeView {
   // Runtime-lifetime failure sequence; epoch reset deliberately preserves it.
   std::uint32_t stickyFailedCount;
 };
-static_assert(sizeof(RuntimeView) == 320);
+static_assert(sizeof(RuntimeView) == 384);
 
 static_assert(std::is_standard_layout_v<RequestContext>);
 static_assert(std::is_standard_layout_v<TenantContext>);

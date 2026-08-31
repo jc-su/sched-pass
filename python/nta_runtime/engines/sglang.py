@@ -69,6 +69,10 @@ from nta_runtime.engines.sglang_calibration import (
     SglangConsumerPolicyCalibration,
     SglangLayerServiceCalibration,
 )
+from nta_runtime.engines.sglang_calibration_profile import (
+    SglangCalibrationProfileStore,
+    build_sglang_calibration_compatibility,
+)
 from nta_runtime.engines.sglang_graphs import DemandGraphCache
 from nta_runtime.engines.sglang_execution import (
     AttentionDispatchKind,
@@ -104,7 +108,7 @@ from nta_runtime.runtime_resources import (
     ServingRuntimeResources,
 )
 from nta_runtime.tier import ServingTierConfig
-from nta_runtime.runtime import TierKind
+from nta_runtime.runtime import API_VERSION, TierKind
 
 
 class NtaFlashInferAttnBackend(FlashInferAttnBackend):
@@ -129,6 +133,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         self._kernels: SglangKernelResources | None = None
         self._attention_executor: SglangAttentionExecutor | None = None
         self._attention_verifier: SglangAttentionVerifier | None = None
+        self._calibration_profile: SglangCalibrationProfileStore | None = None
         self._resources_closed = True
         self._closed = True
         if model_runner.server_args.speculative_algorithm is not None:
@@ -515,6 +520,89 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             verify_index_map=self._verification.index_map,
             stats=self._stats,
         )
+        self._stats.update(
+            {
+                "calibration_profile_enabled": False,
+                "calibration_profile_status": "disabled",
+                "calibration_profile_loaded_samples": 0,
+                "calibration_profile_save_count": 0,
+                "calibration_profile_deferred_checkpoints": 0,
+                "calibration_profile_checkpoint_failures": 0,
+            }
+        )
+        if tuning.calibration_profile.enabled:
+            compatibility = build_sglang_calibration_compatibility(
+                model_runner=model_runner,
+                token_pool=self.token_to_kv_pool,
+                model_partition=tuning.model,
+                execution_config=self._execution_config,
+                tuning=tuning,
+                engine_version=observability.engine_version,
+                revision=observability.revision,
+                runtime_api_version=API_VERSION,
+            )
+            self._calibration_profile = SglangCalibrationProfileStore(
+                config=tuning.calibration_profile,
+                compatibility=compatibility,
+                stats=self._stats,
+            )
+            restored_calibration = self._calibration_profile.restore(
+                layer_calibration=self._layer_calibration,
+                consumer_calibration=self._consumer_calibration,
+                host_movers=self._host_movers,
+                host_cost_model=self._host_cost_model,
+                incremental_calibration_probes=(
+                    self._incremental_calibration_probes_remaining
+                ),
+                incremental_initialization_probes=(
+                    self._incremental_initialization_probes_remaining
+                ),
+                incremental_setup_samples=self._incremental_setup_samples,
+                incremental_service_samples=self._incremental_service_samples,
+                cost_model_transfer_samples=int(
+                    self._stats["cost_model_transfer_samples"]
+                ),
+            )
+            self._host_cost_model = restored_calibration.host_cost_model
+            self._incremental_calibration_probes_remaining = (
+                restored_calibration.incremental_calibration_probes_remaining
+            )
+            self._incremental_initialization_probes_remaining = (
+                restored_calibration.incremental_initialization_probes_remaining
+            )
+            self._incremental_setup_samples = (
+                restored_calibration.incremental_setup_samples
+            )
+            self._incremental_service_samples = (
+                restored_calibration.incremental_service_samples
+            )
+            self._stats.update(
+                {
+                    "cost_model_bandwidth_bps": (
+                        self._host_cost_model.bandwidth_bytes_per_second
+                    ),
+                    "cost_model_transfer_samples": (
+                        restored_calibration.cost_model_transfer_samples
+                    ),
+                    "incremental_calibration_probes_remaining": (
+                        self._incremental_calibration_probes_remaining
+                    ),
+                    "incremental_setup_samples": self._incremental_setup_samples,
+                    "incremental_setup_ns": self._host_cost_model.incremental_setup_ns,
+                    "incremental_setup_calibrated": (
+                        self._host_cost_model.incremental_setup_ns is not None
+                    ),
+                    "incremental_service_samples": (
+                        self._incremental_service_samples
+                    ),
+                    "incremental_service_scale": (
+                        self._host_cost_model.incremental_service_scale
+                    ),
+                    "incremental_service_calibrated": (
+                        self._host_cost_model.incremental_service_scale is not None
+                    ),
+                }
+            )
         self._host_transport = SglangHostTransport(
             runtime=self._runtime,
             host_movers=self._host_movers,
@@ -613,7 +701,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 prepare=self._host_acquisition.prepare_admission,
                 start=self._host_acquisition.start_admission,
             )
-            if tuning.requires_typed_host_modules(bootstrap):
+            if tuning.requires_typed_host_modules(
+                bootstrap,
+                host_cost_model=self._host_cost_model,
+                calibration_probes_remaining=(
+                    self._incremental_calibration_probes_remaining
+                ),
+            ):
                 self._require_kernels().prepare_typed_execution_modules(
                     runtime=self._runtime,
                     host_staged=True,
@@ -697,6 +791,13 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         committed_before = int(self._stats["layer_service_profiled_intervals"])
         self._layer_calibration.collect()
         self._consumer_calibration.collect()
+        if self._calibration_profile is not None:
+            # The framework may terminate workers without running backend
+            # ``atexit`` handlers. Request retirement is the first lifecycle
+            # edge after the response reaches CPU where completed CUDA timing
+            # state can be checkpointed without entering the forward path.
+            self._collect_transfer_profiles()
+            self._checkpoint_calibration_profile()
         self._stats["layer_service_retirement_commits"] += (
             int(self._stats["layer_service_profiled_intervals"]) - committed_before
         )
@@ -760,6 +861,52 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             raise RuntimeError(
                 "CUDA observations remained pending after a synchronized "
                 f"measurement boundary: {pending}"
+            )
+
+    def _save_calibration_profile(self) -> None:
+        profile = self._calibration_profile
+        if profile is None:
+            return
+        profile.save(
+            layer_calibration=self._layer_calibration,
+            consumer_calibration=self._consumer_calibration,
+            host_movers=self._host_movers,
+            host_cost_model=self._host_cost_model,
+            incremental_calibration_probes_remaining=(
+                self._incremental_calibration_probes_remaining
+            ),
+            incremental_initialization_probes_remaining=(
+                self._incremental_initialization_probes_remaining
+            ),
+            incremental_setup_samples=self._incremental_setup_samples,
+            incremental_service_samples=self._incremental_service_samples,
+            cost_model_transfer_samples=int(
+                self._stats["cost_model_transfer_samples"]
+            ),
+        )
+
+    def _checkpoint_calibration_profile(self) -> None:
+        pending = (
+            self._host_movers.pending_profile_count
+            + len(self._transfer_profiles)
+            + len(self._operator_profiles)
+            + self._layer_calibration.pending_count
+            + self._consumer_calibration.pending_count
+        )
+        if pending:
+            self._stats["calibration_profile_deferred_checkpoints"] = (
+                self._stats.get("calibration_profile_deferred_checkpoints", 0) + 1
+            )
+            return
+        try:
+            self._save_calibration_profile()
+        except BaseException:
+            # Profile persistence is observability/control state, not numerical
+            # correctness. A filesystem failure must never revoke a completed
+            # request, but explicit artifact gates can and must reject the run.
+            self._stats["calibration_profile_status"] = "checkpoint_failed"
+            self._stats["calibration_profile_checkpoint_failures"] = (
+                self._stats.get("calibration_profile_checkpoint_failures", 0) + 1
             )
 
     def _close_resources(self) -> None:
@@ -1005,6 +1152,22 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             engine_batch = self._forward_lifecycle.engine_batch
             if engine_batch is None:
                 raise RuntimeError("execution verification has no engine batch epoch")
+            if (
+                semantic.dependency_kind == "typed_lease"
+                and wrapper_id not in batch.verified_projection_wrappers
+            ):
+                pending = batch.pending_host_load
+                if pending is None:
+                    raise RuntimeError(
+                        "typed projection verification has no HiCache lease"
+                    )
+                self._require_attention_verifier().verify_typed_projection(
+                    wrapper,
+                    semantic,
+                    pending,
+                    default_page_size=int(self.token_to_kv_pool.page_size),
+                )
+                batch.verified_projection_wrappers.add(wrapper_id)
             batch.execution = build_execution_plan(
                 engine_batch=engine_batch,
                 protocol=self._execution_config.protocol,
@@ -1957,6 +2120,32 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             and batch.host_execution.selection_reason == "calibration_probe"
             and not batch.incremental_setup_observed
         )
+        verify_attention = self._verification.attention
+        if verify_attention and self._verification.attention_mixed_only:
+            verify_attention = len(batch.bindings) > 1
+        if verify_attention and self._verification.attention_layer is not None:
+            verify_attention = (
+                int(layer.layer_id) == self._verification.attention_layer
+            )
+        if verify_attention and self._verification.attention_first_partial:
+            verify_attention = (
+                dispatch.kind is AttentionDispatchKind.ARRIVING_PREFETCH
+                and self._stats.get(
+                    "attention_first_partial_verification_attempts", 0
+                )
+                == 0
+            )
+            if verify_attention:
+                self._stats["attention_first_partial_verification_attempts"] = 1
+                self._stats["attention_first_partial_verified_layer"] = int(
+                    layer.layer_id
+                )
+        verify_execution = verify_attention or self._verification.execution
+        verify_transfer = self._verification.transfer
+        if verify_transfer and self._verification.transfer_layer is not None:
+            verify_transfer = (
+                int(layer.layer_id) == self._verification.transfer_layer
+            )
         # The typed wrapper may alias a stock numerical wrapper after adopting
         # the same validated FlashInfer plan.  Use that zero-overhead alias only
         # after the transport event is complete.  An ARRIVING_PREFETCH owns an
@@ -1974,17 +2163,23 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 layer,
                 causal=causal,
                 window_left=window_left,
+                verify_attention=verify_attention,
+                verify_execution=verify_execution,
+                verify_transfer=verify_transfer,
             )
 
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         output = torch.empty_like(q)
-        verify_attention = self._verification.attention
-        if verify_attention and self._verification.attention_mixed_only:
-            verify_attention = len(batch.bindings) > 1
-        verify_execution = verify_attention or self._verification.execution
-        verify_transfer = self._verification.transfer
         if verify_execution:
             output.fill_(float("nan"))
+        if (
+            verify_attention
+            and dispatch.kind is AttentionDispatchKind.ARRIVING_PREFETCH
+        ):
+            self._require_attention_verifier().poison_prefill_split_scratch(
+                wrapper,
+                q,
+            )
         wrapper._causal = causal
         wrapper._window_left = window_left
         wrapper._logits_soft_cap = 0.0
@@ -2033,12 +2228,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             and pending.arrival_profile_key is not None
         )
         gpu_profile = None
+        partial_dispatch_ready = None
         if self._profile_gpu or service_probe or partial_policy_probe:
             gpu_profile = (
                 torch.cuda.Event(enable_timing=True),
                 torch.cuda.Event(enable_timing=True),
             )
             gpu_profile[0].record(stream)
+        if partial_policy_probe:
+            partial_dispatch_ready = torch.cuda.Event(enable_timing=True)
 
         executor = self._require_attention_executor()
         if dispatch.kind in {
@@ -2083,6 +2281,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 verify_execution=verify_execution,
                 verify_transfer=verify_transfer,
                 tile_compute_ns=self._host_cost_model.tile_compute_ns,
+                dispatch_ready_profile=partial_dispatch_ready,
             )
 
         elapsed_ns = time.perf_counter_ns() - enqueue_started
@@ -2122,7 +2321,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._consumer_calibration.record_partial_profile(
                     pending=pending,
                     start=gpu_profile[0],
+                    dispatch_ready=partial_dispatch_ready,
                     finish=gpu_profile[1],
+                    partition_prepared=outcome.partition_prepared,
                 )
             service_prediction_ns = None
             service_prediction_scale = None
@@ -2160,6 +2361,25 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 batch,
                 int(layer.layer_id),
                 kv_cache,
+            )
+        if (
+            verify_attention
+            and dispatch.kind is AttentionDispatchKind.ARRIVING_PREFETCH
+        ):
+            runtime_failures = self._runtime.sticky_failed_count
+            self._stats["attention_partial_runtime_failures"] = runtime_failures
+            self._stats["attention_partial_partition_prepared"] = int(
+                outcome.partition_prepared
+            )
+            if runtime_failures != 0:
+                raise RuntimeError(
+                    "partial consumer poisoned the runtime before numerical "
+                    f"verification (sticky_failures={runtime_failures}, "
+                    f"partition_prepared={outcome.partition_prepared})"
+                )
+            self._require_attention_verifier().verify_prefill_split_scratch_coverage(
+                wrapper,
+                q,
             )
         if verify_execution:
             if outcome.epoch is None:
@@ -2289,12 +2509,22 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         *,
         causal: bool,
         window_left: int,
+        verify_attention: bool,
+        verify_execution: bool,
+        verify_transfer: bool,
     ) -> torch.Tensor:
         batch = self._forward_lifecycle.active
         if batch is None or batch.pending_host_load is None:
             raise RuntimeError("preloaded stock layer has no external lease")
         pending = batch.pending_host_load
         local_layer = self._wait_for_stock_external_layer(batch, layer)
+        if verify_execution:
+            self._validate_semantic_wrapper_plan(
+                typed_wrapper,
+                layer,
+                kv_cache,
+                verify=True,
+            )
         profile = None
         stream = torch.cuda.current_stream()
         if self._profile_gpu:
@@ -2316,6 +2546,23 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._operator_profiles.append(
                 _OperatorProfile(*profile, "preloaded_stock", 1)
             )
+        query = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if verify_execution:
+            stream.synchronize()
+            if not torch.isfinite(output).all():
+                raise RuntimeError(
+                    f"stock FlashInfer did not write layer {layer.layer_id}"
+                )
+        if verify_attention:
+            self._require_attention_verifier().verify_attention_output(
+                typed_wrapper,
+                query,
+                kv_cache,
+                output,
+                layer,
+                causal=causal,
+                window_left=window_left,
+            )
         self._stats["stock_attention_launches"] += 1
         self._stats["lookahead_bound_launches"] += 1
         if (
@@ -2334,7 +2581,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 self._stats.get("nvme_ready_stock_launches", 0) + 1
             )
         if (
-            self._verification.transfer
+            verify_transfer
             and batch.acquisition is not None
             and batch.acquisition.tier is AcquisitionTier.HOST_STAGED
         ):
@@ -2350,6 +2597,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             local_layer=local_layer,
             native_dispatch=False,
             progressive_consumer=False,
+            record_semantic=verify_execution,
         )
         return output.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -2797,6 +3045,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._quiesce_observation_boundary()
         except BaseException as error:
             shutdown_error = error
+        try:
+            self._save_calibration_profile()
+        except BaseException as error:
+            self._stats["calibration_profile_status"] = "save_failed"
+            if shutdown_error is None:
+                shutdown_error = error
         try:
             if self._stats_publisher is not None:
                 self._stats_publisher.publish(

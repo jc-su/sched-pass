@@ -36,6 +36,9 @@ struct RequestWorkRange {
 };
 
 struct WorkPlan {
+  // workTicket and reductionGroup are compact plan-local array indices. A
+  // finished plan starts both domains at zero; external/global identities
+  // belong in request, generation, logicalWork, and object fields instead.
   std::vector<abi::AcquireRequirement> dependencies;
   std::vector<WorkItem> workItems;
   std::vector<RequestWorkRange> requests;

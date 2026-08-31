@@ -59,6 +59,12 @@ static_assert(offsetof(nta_work_item, estimated_compute_ns) ==
               offsetof(nta::abi::WorkItem, estimatedComputeNs));
 static_assert(offsetof(nta_work_item, ready_deadline_offset_ns) ==
               offsetof(nta::abi::WorkItem, readyDeadlineOffsetNs));
+static_assert(offsetof(nta_work_item, completion_class) ==
+              offsetof(nta::abi::WorkItem, completionClass));
+static_assert(offsetof(nta_work_item, flags) ==
+              offsetof(nta::abi::WorkItem, flags));
+static_assert(NTA_MAX_EVENT_COMPLETION_CLASSES ==
+              nta::abi::MaximumEventCompletionClasses);
 static_assert(sizeof(nta_request_progress) ==
               sizeof(nta::abi::RequestProgress));
 static_assert(offsetof(nta_request_progress, dropped_attributions) ==
@@ -75,11 +81,12 @@ static_assert(sizeof(nta_request_spec) == 40);
 static_assert(sizeof(nta_contiguous_copy_run) == 16);
 static_assert(sizeof(nta_strided_copy_group) == 40);
 static_assert(sizeof(nta_nvme_hbm_registration_range) == 32);
-static_assert(sizeof(nta_registered_nvme_object) == 56);
+static_assert(sizeof(nta_registered_nvme_object) == 64);
 static_assert(offsetof(nta_registered_nvme_object, region) == 24);
 static_assert(offsetof(nta_registered_nvme_object,
                        destination_device_address) == 32);
 static_assert(offsetof(nta_registered_nvme_object, slot) == 48);
+static_assert(offsetof(nta_registered_nvme_object, scope) == 56);
 static_assert(offsetof(nta_request_spec, request_id) == 0);
 static_assert(offsetof(nta_request_spec, deadline_clock) == 8);
 static_assert(offsetof(nta_request_spec, max_outstanding_bytes) == 16);
@@ -190,6 +197,17 @@ nta::Placement placement(std::uint32_t value) {
   }
 }
 
+nta::abi::ObjectScope objectScope(std::uint32_t value) {
+  switch (value) {
+  case NTA_OBJECT_SCOPE_TENANT_LOCAL:
+    return nta::abi::ObjectScope::TenantLocal;
+  case NTA_OBJECT_SCOPE_GLOBAL_SHARED:
+    return nta::abi::ObjectScope::GlobalShared;
+  default:
+    throw std::invalid_argument("object scope is invalid");
+  }
+}
+
 cudaStream_t stream(std::uint64_t address) noexcept {
   return reinterpret_cast<cudaStream_t>(static_cast<std::uintptr_t>(address));
 }
@@ -208,10 +226,6 @@ indexedHostObjects(const nta_indexed_host_object *objects,
   result.reserve(objectCount);
   for (std::uint32_t index = 0; index < objectCount; ++index) {
     const nta_indexed_host_object &object = objects[index];
-    if (object.reserved != 0) {
-      throw std::invalid_argument(
-          "indexed host object reserved field must be zero");
-    }
     result.push_back({
         object.object_id,
         object.version,
@@ -229,6 +243,7 @@ indexedHostObjects(const nta_indexed_host_object *objects,
         object.staging_stride_bytes,
         object.source_index_limit,
         object.staging_index_limit,
+        objectScope(object.scope),
     });
   }
   return result;
@@ -301,8 +316,16 @@ nta::WorkPlan makeWorkPlan(const nta_work_item *workItems,
   result.requests.reserve(requestCount);
   for (std::uint32_t index = 0; index < workItemCount; ++index) {
     const nta_work_item &source = workItems[index];
-    if (source.reserved2 != 0 || source.reserved3 != 0) {
-      throw std::invalid_argument("work-item reserved fields must be zero");
+    const bool eventPartition =
+        (source.flags & nta::abi::WorkItemEventPartition) != 0;
+    if ((source.flags & ~nta::abi::WorkItemSupportedFlags) != 0 ||
+        (!eventPartition && source.completion_class != 0) ||
+        (eventPartition &&
+         (source.direct_dependency_count != source.dependency_count ||
+          (source.completion_class != nta::abi::InvalidIndex &&
+           source.completion_class >=
+               nta::abi::MaximumEventCompletionClasses)))) {
+      throw std::invalid_argument("work-item completion metadata is invalid");
     }
     result.workItems.push_back(
         {source.request_index, source.request_slot, source.generation,
@@ -310,7 +333,8 @@ nta::WorkPlan makeWorkPlan(const nta_work_item *workItems,
          source.direct_dependency_count, source.work_ticket,
          source.reduction_group, source.contributor_index,
          source.contributor_count, source.estimated_compute_ns,
-         source.ready_deadline_offset_ns, 0, 0});
+         source.ready_deadline_offset_ns, source.completion_class,
+         source.flags});
   }
   for (std::uint32_t index = 0; index < dependencyCount; ++index) {
     const nta_acquire_requirement &source = dependencies[index];
@@ -685,7 +709,7 @@ nta_status nta_runtime_set_tenant_budget(nta_runtime *runtime,
 
 nta_status nta_runtime_register_object(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
-    std::uint32_t version, std::uint64_t bytes,
+    std::uint32_t version, std::uint32_t scope, std::uint64_t bytes,
     std::uint64_t stagingDeviceAddress, const nta_registered_replica *replicas,
     std::uint32_t replicaCount, std::uint64_t *directDeviceBaseOut) {
   if (directDeviceBaseOut != nullptr) {
@@ -718,7 +742,7 @@ nta_status nta_runtime_register_object(
         slot, objectId, version, checkedSize(bytes, "object bytes"),
         reinterpret_cast<void *>(
             static_cast<std::uintptr_t>(stagingDeviceAddress)),
-        native);
+        native, objectScope(scope));
     if (directDeviceBaseOut != nullptr) {
       *directDeviceBaseOut =
           reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
@@ -728,7 +752,8 @@ nta_status nta_runtime_register_object(
 
 nta_status nta_runtime_register_indexed_host_object(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
-    std::uint32_t version, std::uint64_t sourceDeviceAddress,
+    std::uint32_t version, std::uint32_t scope,
+    std::uint64_t sourceDeviceAddress,
     std::uint64_t stagingDeviceAddress,
     std::uint64_t sourceIndicesDeviceAddress,
     std::uint64_t stagingIndicesDeviceAddress, std::uint32_t indexCount,
@@ -748,7 +773,7 @@ nta_status nta_runtime_register_indexed_host_object(
         reinterpret_cast<const std::uint32_t *>(
             static_cast<std::uintptr_t>(stagingIndicesDeviceAddress)),
         indexCount, elementBytes, sourceStrideBytes, stagingStrideBytes,
-        sourceIndexLimit, stagingIndexLimit);
+        sourceIndexLimit, stagingIndexLimit, objectScope(scope));
   });
 }
 
@@ -838,7 +863,8 @@ nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
 
 nta_status nta_runtime_install_nvme_object(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
-    std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
+    std::uint32_t version, std::uint32_t scope,
+    std::uint64_t sourceByteOffset, std::uint64_t bytes,
     std::uint64_t *destinationDeviceAddressOut) {
   if (destinationDeviceAddressOut != nullptr) {
     *destinationDeviceAddressOut = 0;
@@ -851,7 +877,8 @@ nta_status nta_runtime_install_nvme_object(
     }
     const std::size_t nativeBytes = checkedSize(bytes, "NVMe object bytes");
     const nta::ObjectHandle object = runtime->value->installNvmeObject(
-        slot, objectId, version, sourceByteOffset, nativeBytes);
+        slot, objectId, version, sourceByteOffset, nativeBytes,
+        objectScope(scope));
     if (destinationDeviceAddressOut != nullptr) {
       *destinationDeviceAddressOut =
           reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
@@ -861,7 +888,8 @@ nta_status nta_runtime_install_nvme_object(
 
 nta_status nta_runtime_install_nvme_object_async(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
-    std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
+    std::uint32_t version, std::uint32_t scope,
+    std::uint64_t sourceByteOffset, std::uint64_t bytes,
     std::uint64_t cudaStream, std::uint64_t priorConsumerEvent,
     std::uint64_t *destinationDeviceAddressOut) {
   if (destinationDeviceAddressOut != nullptr) {
@@ -880,7 +908,7 @@ nta_status nta_runtime_install_nvme_object_async(
     const nta::ObjectHandle object = runtime->value->installNvmeObjectAsync(
         slot, objectId, version, sourceByteOffset,
         checkedSize(bytes, "NVMe object bytes"), stream(cudaStream),
-        event(priorConsumerEvent));
+        event(priorConsumerEvent), objectScope(scope));
     if (destinationDeviceAddressOut != nullptr) {
       *destinationDeviceAddressOut =
           reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
@@ -890,7 +918,8 @@ nta_status nta_runtime_install_nvme_object_async(
 
 nta_status nta_runtime_install_registered_nvme_object(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
-    std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
+    std::uint32_t version, std::uint32_t scope,
+    std::uint64_t sourceByteOffset, std::uint64_t bytes,
     nta_nvme_hbm_region *region, std::uint64_t destinationDeviceAddress,
     std::uint64_t *destinationDeviceAddressOut) {
   if (destinationDeviceAddressOut != nullptr) {
@@ -917,7 +946,7 @@ nta_status nta_runtime_install_registered_nvme_object(
         nativeBytes);
     const nta::ObjectHandle object = runtime->value->installNvmeObject(
         slot, objectId, version, sourceByteOffset, nativeBytes,
-        std::move(destination));
+        std::move(destination), objectScope(scope));
     if (destinationDeviceAddressOut != nullptr) {
       *destinationDeviceAddressOut =
           reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
@@ -927,7 +956,8 @@ nta_status nta_runtime_install_registered_nvme_object(
 
 nta_status nta_runtime_install_registered_nvme_object_async(
     nta_runtime *runtime, std::uint32_t slot, std::uint64_t objectId,
-    std::uint32_t version, std::uint64_t sourceByteOffset, std::uint64_t bytes,
+    std::uint32_t version, std::uint32_t scope,
+    std::uint64_t sourceByteOffset, std::uint64_t bytes,
     nta_nvme_hbm_region *region, std::uint64_t destinationDeviceAddress,
     std::uint64_t cudaStream, std::uint64_t priorConsumerEvent,
     std::uint64_t *destinationDeviceAddressOut) {
@@ -956,7 +986,8 @@ nta_status nta_runtime_install_registered_nvme_object_async(
         nativeBytes);
     const nta::ObjectHandle object = runtime->value->installNvmeObjectAsync(
         slot, objectId, version, sourceByteOffset, nativeBytes,
-        stream(cudaStream), event(priorConsumerEvent), std::move(destination));
+        stream(cudaStream), event(priorConsumerEvent), std::move(destination),
+        objectScope(scope));
     if (destinationDeviceAddressOut != nullptr) {
       *destinationDeviceAddressOut =
           reinterpret_cast<std::uintptr_t>(object.directDeviceBase);
@@ -986,6 +1017,11 @@ nta_status nta_runtime_install_registered_nvme_objects_async(
     for (std::uint32_t index = 0; index < objectCount; ++index) {
       const nta_registered_nvme_object &object = objects[index];
       requireHandle(object.region, "NVMe HBM region");
+      if (object.reserved != 0) {
+        throw std::invalid_argument(
+            "registered NVMe object reserved field must be zero");
+      }
+      (void)objectScope(object.scope);
       if (object.slot != firstSlot + index) {
         throw std::invalid_argument(
             "registered NVMe batch slots must be contiguous and increasing");
@@ -1018,6 +1054,7 @@ nta_status nta_runtime_install_registered_nvme_objects_async(
           nativeBytes,
           event(object.prior_consumer_event),
           std::move(destination),
+          objectScope(object.scope),
       });
     }
 
@@ -1856,14 +1893,15 @@ nta_status nta_jit_phase_prepare_ready_window(
 nta_status nta_jit_phase_prepare_event_work_partition(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     std::uint64_t workItems, std::uint32_t workItemCount,
-    std::uint32_t directWorkCount, std::uint64_t cudaStream) {
+    std::uint32_t directWorkCount, std::uint32_t waveCount,
+    std::uint64_t cudaStream) {
   return protect([&] {
     requireHandle(program, "JIT phase program");
     requireHandle(runtime, "runtime");
     program->value->prepareEventWorkPartition(
         stream(cudaStream), runtime->value->deviceView(),
-        reinterpret_cast<const nta::abi::WorkItem *>(workItems), workItemCount,
-        directWorkCount);
+        reinterpret_cast<const nta::abi::WorkItem *>(workItems),
+        workItemCount, directWorkCount, waveCount);
   });
 }
 

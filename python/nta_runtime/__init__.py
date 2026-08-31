@@ -13,7 +13,13 @@ from typing import Any
 
 _EXPORTS = {
     "API_VERSION": ("runtime", "API_VERSION"),
+    "INVALID_INDEX": ("runtime", "INVALID_INDEX"),
+    "MAX_EVENT_COMPLETION_CLASSES": (
+        "runtime",
+        "MAX_EVENT_COMPLETION_CLASSES",
+    ),
     "AcquireRequirement": ("runtime", "AcquireRequirement"),
+    "AcquireRequirementFlag": ("runtime", "AcquireRequirementFlag"),
     "WorkTicketState": ("runtime", "WorkTicketState"),
     "DeviceWorkPlan": ("runtime", "DeviceWorkPlan"),
     "EpochStatus": ("runtime", "EpochStatus"),
@@ -88,6 +94,7 @@ _EXPORTS = {
     "ServingRuntimeResources": ("runtime_resources", "ServingRuntimeResources"),
     "RuntimeError": ("runtime", "RuntimeError"),
     "WorkItem": ("runtime", "WorkItem"),
+    "WorkItemFlag": ("runtime", "WorkItemFlag"),
     "Availability": ("work_unit", "Availability"),
     "DemandDescriptor": ("work_unit", "DemandDescriptor"),
     "DemandSemantics": ("work_unit", "DemandSemantics"),

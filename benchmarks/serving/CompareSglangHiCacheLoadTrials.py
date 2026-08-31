@@ -31,19 +31,34 @@ from experiments.validate_serving_trials import (  # noqa: E402
 
 RESULTS_ROOT = pathlib.Path(os.environ.get("NTA_RESULTS_DIR", "/tmp/nta-results"))
 RATIO_FIELDS = (
-    # The registered primary: absolute-SLO goodput (TTFT <= 8.0s AND P99
-    # ITL <= 100ms, all requests). Its omission until 2026-08-15 made the
-    # aggregate report only the legacy relative-threshold goodput_ratio;
-    # campaign records before that date were corrected from the banked
-    # per-trial artifacts, which always carried both fields.
+    # Preserve the legacy fixed TTFT/P99-ITL series for historical audit.
+    # Formal evaluations additionally gate the fixed TTFT/TPOT/P99-ITL joint
+    # series; neither field is renamed or overloaded with the other's meaning.
     "preregistered_goodput_ratio",
+    "preregistered_joint_goodput_ratio",
     "output_throughput_ratio",
+    "resident_output_throughput_ratio",
+    "external_output_throughput_ratio",
     "goodput_ratio",
     "resident_p95_ttft_ratio",
     "resident_p95_tpot_ratio",
     "resident_p99_itl_ratio",
     "external_p95_ttft_ratio",
 )
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,9 +88,29 @@ def parse_args() -> argparse.Namespace:
         "--require-native-consumer",
         action="store_true",
         help=(
-            "require every timed external attention launch to use NTA's native "
-            "work-unit consumer; by default the measured optimizer may select "
-            "the exact framework consumer after NTA acquisition completes"
+            "fail each paired trial unless every timed external attention launch "
+            "uses NTA's native work-unit consumer; this also applies in diagnostic "
+            "mode when explicitly requested"
+        ),
+    )
+    parser.add_argument(
+        "--min-external-observations",
+        type=_positive_int,
+        default=100,
+        help=(
+            "minimum external request observations required in each arm for formal "
+            "qualification (default: 100); diagnostic runs record but do not "
+            "qualify against the threshold"
+        ),
+    )
+    parser.add_argument(
+        "--min-distinct-external-requests",
+        type=_nonnegative_int,
+        default=0,
+        help=(
+            "minimum distinct external request_id values required in each arm for "
+            "formal qualification (default: 0, disabled); diagnostic runs record "
+            "but do not qualify against the threshold"
         ),
     )
     parser.add_argument(
@@ -96,6 +131,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("qualification requires at least three paired trials")
     if not args.diagnostic and args.trials < 10:
         parser.error("formal qualification requires at least ten paired trials")
+    if not args.diagnostic and args.min_external_observations < 100:
+        parser.error(
+            "formal qualification requires at least 100 external observations "
+            "per arm"
+        )
     if not args.diagnostic and args.allow_mixed_revisions:
         parser.error("formal qualification cannot mix revisions")
     if args.comparison_args[:1] == ["--"]:
@@ -193,6 +233,7 @@ def _aggregate(reports: list[dict[str, Any]], seed: int) -> dict[str, Any]:
         if zero_values and field in (
             "goodput_ratio",
             "preregistered_goodput_ratio",
+            "preregistered_joint_goodput_ratio",
         ):
             # A zero goodput arm makes the geometric mean undefined. Report
             # the zero-trial count and aggregate the positive trials instead
@@ -216,6 +257,74 @@ def _aggregate(reports: list[dict[str, Any]], seed: int) -> dict[str, Any]:
     return result
 
 
+def _registered_goodput_bar(
+    ratio_summary: dict[str, Any], *, token_level_eligible: bool
+) -> dict[str, Any]:
+    geometric_mean = ratio_summary.get("geometric_mean")
+    ci_floor = (ratio_summary.get("bootstrap_95_percent_ci") or [None])[0]
+    return {
+        "bar": 1.5,
+        "geometric_mean": geometric_mean,
+        "ci_floor": ci_floor,
+        "all_requests_have_token_level_itl": token_level_eligible,
+        "passes": bool(
+            token_level_eligible
+            and geometric_mean is not None
+            and ci_floor is not None
+            and geometric_mean >= 1.5
+            and ci_floor > 1.0
+        ),
+    }
+
+
+def _ratio_bar(
+    ratio_summary: dict[str, Any],
+    *,
+    threshold: float,
+    at_most: bool,
+    bootstrap_bound: str | None = None,
+) -> dict[str, Any]:
+    if bootstrap_bound not in {None, "lower", "upper"}:
+        raise ValueError("bootstrap bound must be lower, upper, or None")
+    geometric_mean = ratio_summary.get("geometric_mean")
+    geometric_mean_valid = bool(
+        isinstance(geometric_mean, (int, float))
+        and not isinstance(geometric_mean, bool)
+        and math.isfinite(float(geometric_mean))
+    )
+    result = {
+        "bar": threshold,
+        "geometric_mean": geometric_mean,
+    }
+    compared_value = geometric_mean
+    bound_valid = True
+    if bootstrap_bound is not None:
+        interval = ratio_summary.get("bootstrap_95_percent_ci")
+        index = 0 if bootstrap_bound == "lower" else 1
+        compared_value = (
+            interval[index]
+            if isinstance(interval, list) and len(interval) == 2
+            else None
+        )
+        bound_valid = bool(
+            isinstance(compared_value, (int, float))
+            and not isinstance(compared_value, bool)
+            and math.isfinite(float(compared_value))
+        )
+        result[f"bootstrap_95_percent_ci_{bootstrap_bound}"] = compared_value
+    passes = bool(
+        geometric_mean_valid
+        and bound_valid
+        and (
+            float(compared_value) <= threshold
+            if at_most
+            else float(compared_value) >= threshold
+        )
+    )
+    result["passes"] = passes
+    return result
+
+
 def _canonical_digest(value: Any) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -227,6 +336,232 @@ def _file_digest(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _validate_worktree_status(
+    returncode: int, stdout: str, stderr: str = ""
+) -> None:
+    if returncode != 0:
+        detail = stderr.strip() or stdout.strip() or f"exit status {returncode}"
+        raise RuntimeError(
+            "formal serving qualification could not determine worktree status: "
+            + detail
+        )
+    dirty_paths = [line for line in stdout.splitlines() if line.strip()]
+    if dirty_paths:
+        preview = ", ".join(line.strip() for line in dirty_paths[:5])
+        if len(dirty_paths) > 5:
+            preview += f", ... ({len(dirty_paths)} paths total)"
+        raise RuntimeError(
+            "formal serving qualification requires a clean worktree before any "
+            f"trial starts: {preview}"
+        )
+
+
+def _require_clean_worktree(*, diagnostic: bool) -> None:
+    if diagnostic:
+        return
+    completed = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=normal"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    _validate_worktree_status(
+        completed.returncode, completed.stdout, completed.stderr
+    )
+
+
+def _native_consumer_evidence(report: dict[str, Any]) -> dict[str, Any]:
+    activation = report.get("mechanism_activation")
+    if not isinstance(activation, dict):
+        raise RuntimeError("paired trial has no mechanism activation record")
+
+    counters: dict[str, int] = {}
+    for field in (
+        "external_launches",
+        "transformed_external_launches",
+        "stock_prefetched_external_launches",
+    ):
+        value = activation.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RuntimeError(
+                f"paired trial has an invalid native-consumer counter {field}"
+            )
+        counters[field] = value
+    all_external_launches_native = bool(
+        counters["external_launches"] > 0
+        and counters["transformed_external_launches"]
+        == counters["external_launches"]
+        and counters["stock_prefetched_external_launches"] == 0
+        and activation.get("native_work_unit_active") is True
+        and activation.get("external_attention_transformed") is True
+    )
+    return {
+        **counters,
+        "native_work_unit_active": activation.get("native_work_unit_active") is True,
+        "external_attention_transformed": (
+            activation.get("external_attention_transformed") is True
+        ),
+        "all_external_launches_native": all_external_launches_native,
+    }
+
+
+def _require_native_consumer(report: dict[str, Any], *, trial: int) -> None:
+    evidence = _native_consumer_evidence(report)
+    if not evidence["all_external_launches_native"]:
+        raise RuntimeError(
+            "paired trial "
+            f"{trial} did not use the native consumer for every external launch: "
+            f"external={evidence['external_launches']}, "
+            f"native={evidence['transformed_external_launches']}, "
+            f"stock={evidence['stock_prefetched_external_launches']}"
+        )
+
+
+def _external_request_evidence(
+    reports: list[dict[str, Any]],
+    *,
+    min_observations: int,
+    min_distinct_requests: int,
+) -> dict[str, Any]:
+    if min_observations <= 0 or min_distinct_requests < 0:
+        raise ValueError("external request thresholds are invalid")
+
+    observations = {"stock": 0, "nta": 0}
+    request_ids: dict[str, set[str]] = {"stock": set(), "nta": set()}
+    for trial, report in enumerate(reports):
+        trial_ids: dict[str, list[str]] = {"stock": [], "nta": []}
+        for arm in ("stock", "nta"):
+            arm_report = report.get(arm)
+            records = (
+                arm_report.get("records") if isinstance(arm_report, dict) else None
+            )
+            if not isinstance(records, list):
+                raise RuntimeError(
+                    f"paired trial {trial} arm {arm} has no request records"
+                )
+            for record_index, record in enumerate(records):
+                if not isinstance(record, dict):
+                    raise RuntimeError(
+                        f"paired trial {trial} arm {arm} record {record_index} "
+                        "is not an object"
+                    )
+                if record.get("kind") != "external":
+                    continue
+                request_id = record.get("request_id")
+                if not isinstance(request_id, str) or not request_id:
+                    raise RuntimeError(
+                        f"paired trial {trial} arm {arm} external record "
+                        f"{record_index} has no non-empty string request_id"
+                    )
+                trial_ids[arm].append(request_id)
+                observations[arm] += 1
+                request_ids[arm].add(request_id)
+        if trial_ids["stock"] != trial_ids["nta"]:
+            raise RuntimeError(
+                f"paired trial {trial} stock/NTA external request_id order differs"
+            )
+
+    per_arm = {
+        arm: {
+            "external_observations": observations[arm],
+            "distinct_external_request_ids": len(request_ids[arm]),
+            "observations_threshold_met": observations[arm] >= min_observations,
+            "distinct_requests_threshold_met": (
+                len(request_ids[arm]) >= min_distinct_requests
+            ),
+        }
+        for arm in ("stock", "nta")
+    }
+    paired_observation_counts_match = observations["stock"] == observations["nta"]
+    paired_distinct_request_ids_match = request_ids["stock"] == request_ids["nta"]
+    passes = bool(
+        paired_observation_counts_match
+        and paired_distinct_request_ids_match
+        and all(
+            arm["observations_threshold_met"]
+            and arm["distinct_requests_threshold_met"]
+            for arm in per_arm.values()
+        )
+    )
+    evidence = {
+        "schema": 1,
+        "minimum_external_observations_per_arm": min_observations,
+        "minimum_distinct_external_request_ids_per_arm": min_distinct_requests,
+        "per_arm": per_arm,
+        "paired_observation_counts_match": paired_observation_counts_match,
+        "paired_distinct_request_ids_match": paired_distinct_request_ids_match,
+        "passes": passes,
+    }
+    _validate_external_request_evidence(evidence)
+    return evidence
+
+
+def _validate_external_request_evidence(evidence: dict[str, Any]) -> None:
+    if evidence.get("schema") != 1:
+        raise RuntimeError("external request evidence has an unsupported schema")
+    minimum_observations = evidence.get("minimum_external_observations_per_arm")
+    minimum_distinct = evidence.get(
+        "minimum_distinct_external_request_ids_per_arm"
+    )
+    if (
+        not isinstance(minimum_observations, int)
+        or isinstance(minimum_observations, bool)
+        or minimum_observations <= 0
+        or not isinstance(minimum_distinct, int)
+        or isinstance(minimum_distinct, bool)
+        or minimum_distinct < 0
+    ):
+        raise RuntimeError("external request evidence has invalid thresholds")
+    per_arm = evidence.get("per_arm")
+    if not isinstance(per_arm, dict) or set(per_arm) != {"stock", "nta"}:
+        raise RuntimeError("external request evidence has an invalid arm set")
+
+    expected_arm_passes: list[bool] = []
+    for arm in ("stock", "nta"):
+        arm_evidence = per_arm[arm]
+        if not isinstance(arm_evidence, dict):
+            raise RuntimeError(f"external request evidence arm {arm} is invalid")
+        observations = arm_evidence.get("external_observations")
+        distinct = arm_evidence.get("distinct_external_request_ids")
+        if (
+            not isinstance(observations, int)
+            or isinstance(observations, bool)
+            or observations < 0
+            or not isinstance(distinct, int)
+            or isinstance(distinct, bool)
+            or distinct < 0
+            or distinct > observations
+        ):
+            raise RuntimeError(f"external request evidence arm {arm} has bad counts")
+        observations_met = observations >= minimum_observations
+        distinct_met = distinct >= minimum_distinct
+        if arm_evidence.get("observations_threshold_met") is not observations_met:
+            raise RuntimeError(
+                f"external request evidence arm {arm} observation verdict is stale"
+            )
+        if arm_evidence.get("distinct_requests_threshold_met") is not distinct_met:
+            raise RuntimeError(
+                f"external request evidence arm {arm} distinct verdict is stale"
+            )
+        expected_arm_passes.append(observations_met and distinct_met)
+
+    stock = per_arm["stock"]
+    nta = per_arm["nta"]
+    observations_match = (
+        stock["external_observations"] == nta["external_observations"]
+    )
+    if evidence.get("paired_observation_counts_match") is not observations_match:
+        raise RuntimeError("external request observation-pair verdict is stale")
+    ids_match = evidence.get("paired_distinct_request_ids_match")
+    if not isinstance(ids_match, bool):
+        raise RuntimeError("external request identity-pair verdict is missing")
+    expected_passes = observations_match and ids_match and all(expected_arm_passes)
+    if evidence.get("passes") is not expected_passes:
+        raise RuntimeError("external request evidence aggregate verdict is stale")
+
+
 def _validate_trial(
     report: dict[str, Any],
     *,
@@ -235,11 +570,14 @@ def _validate_trial(
     first: str,
     expected_args: dict[str, Any],
     require_full_itl: bool,
+    require_native_consumer: bool,
 ) -> None:
     try:
         validate_serving_report(report)
     except ValueError as error:
-        raise RuntimeError(f"paired trial {trial} failed validation: {error}") from error
+        raise RuntimeError(
+            f"paired trial {trial} failed validation: {error}"
+        ) from error
     if report.get("harness_args") != expected_args:
         mismatched = {
             key: (report.get("harness_args", {}).get(key), expected_args.get(key))
@@ -254,6 +592,8 @@ def _validate_trial(
         raise RuntimeError(f"paired trial {trial} did not preserve its registered seed")
     if report.get("execution_order", [None])[0] != first:
         raise RuntimeError(f"paired trial {trial} did not preserve arm balancing")
+    if require_native_consumer:
+        _require_native_consumer(report, trial=trial)
     if require_full_itl:
         incomplete = {
             arm: sum(
@@ -277,6 +617,7 @@ def _validate_trial(
 
 def main() -> int:
     args = parse_args()
+    _require_clean_worktree(diagnostic=args.diagnostic)
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     expected_args = _expected_harness_args(args.comparison_args)
     if not expected_args.get("workload_manifest"):
@@ -313,6 +654,7 @@ def main() -> int:
                 first=first,
                 expected_args=expected_args,
                 require_full_itl=not args.diagnostic,
+                require_native_consumer=args.require_native_consumer,
             )
             reports.append(report)
             artifact_paths.append(artifact)
@@ -349,6 +691,7 @@ def main() -> int:
             first=first,
             expected_args=expected_args,
             require_full_itl=not args.diagnostic,
+            require_native_consumer=args.require_native_consumer,
         )
         reports.append(report)
         artifact_paths.append(artifact)
@@ -380,6 +723,14 @@ def main() -> int:
             "demand_digest": result_demand_digest(report),
         }
         for artifact, report in zip(artifact_paths, reports, strict=True)
+    ]
+    external_request_evidence = _external_request_evidence(
+        reports,
+        min_observations=args.min_external_observations,
+        min_distinct_requests=args.min_distinct_external_requests,
+    )
+    native_consumer_evidence = [
+        _native_consumer_evidence(report) for report in reports
     ]
     aggregate = {
         "schema": 2,
@@ -413,6 +764,11 @@ def main() -> int:
         "all_native_work_unit_active": all(
             bool(report["mechanism_activation"].get("native_work_unit_active"))
             for report in reports
+        ),
+        "native_consumer_required": args.require_native_consumer,
+        "all_external_launches_native": all(
+            evidence["all_external_launches_native"]
+            for evidence in native_consumer_evidence
         ),
         "all_heterogeneous_work_unit_active": all(
             bool(
@@ -460,6 +816,7 @@ def main() -> int:
             for arm in ("stock", "nta")
             for record in report[arm]["records"]
         ),
+        "external_request_evidence": external_request_evidence,
         "harness_args": expected_args,
         "selected_bytes_per_trial": [
             report.get("nta_selected_bytes") for report in reports
@@ -475,33 +832,48 @@ def main() -> int:
     # Registered-bar status: "qualified" alone only certifies trial count
     # and mechanism purity; this block states each pre-registered bar's
     # verdict so no consumer mistakes one passing bar for a passing run.
-    registered = aggregate["ratios"].get("preregistered_goodput_ratio", {})
-    resident = aggregate["ratios"].get("resident_p99_itl_ratio", {})
-    goodput_geomean = registered.get("geometric_mean")
-    goodput_floor = (registered.get("bootstrap_95_percent_ci") or [None])[0]
-    resident_geomean = resident.get("geometric_mean")
+    legacy_registered = aggregate["ratios"].get(
+        "preregistered_goodput_ratio", {}
+    )
+    joint_registered = aggregate["ratios"].get(
+        "preregistered_joint_goodput_ratio", {}
+    )
+    resident_itl = aggregate["ratios"].get("resident_p99_itl_ratio", {})
+    resident_tpot = aggregate["ratios"].get("resident_p95_tpot_ratio", {})
+    resident_output = aggregate["ratios"].get(
+        "resident_output_throughput_ratio", {}
+    )
+    global_output = aggregate["ratios"].get("output_throughput_ratio", {})
     aggregate["bars"] = {
-        "registered_goodput": {
-            "bar": 1.5,
-            "geometric_mean": goodput_geomean,
-            "ci_floor": goodput_floor,
-            "all_requests_have_token_level_itl": aggregate[
-                "all_requests_have_token_level_itl"
-            ],
-            "passes": bool(
-                aggregate["all_requests_have_token_level_itl"]
-                and
-                goodput_geomean is not None
-                and goodput_floor is not None
-                and goodput_geomean >= 1.5
-                and goodput_floor > 1.0
-            ),
-        },
-        "resident_p99_itl": {
-            "bar": 1.05,
-            "geometric_mean": resident_geomean,
-            "passes": bool(resident_geomean is not None and resident_geomean <= 1.05),
-        },
+        "registered_goodput": _registered_goodput_bar(
+            legacy_registered,
+            token_level_eligible=aggregate["all_requests_have_token_level_itl"],
+        ),
+        "registered_joint_goodput": _registered_goodput_bar(
+            joint_registered,
+            token_level_eligible=aggregate["all_requests_have_token_level_itl"],
+        ),
+        "resident_p99_itl": _ratio_bar(
+            resident_itl, threshold=1.05, at_most=True
+        ),
+        "resident_p95_tpot": _ratio_bar(
+            resident_tpot,
+            threshold=1.05,
+            at_most=True,
+            bootstrap_bound="upper",
+        ),
+        "resident_output_throughput": _ratio_bar(
+            resident_output,
+            threshold=0.95,
+            at_most=False,
+            bootstrap_bound="lower",
+        ),
+        "output_throughput": _ratio_bar(
+            global_output,
+            threshold=0.95,
+            at_most=False,
+            bootstrap_bound="lower",
+        ),
         "outputs": {
             # With divergence reporting armed, a recorded divergence is
             # not a bar failure — the scored quality battery is the
@@ -515,14 +887,30 @@ def main() -> int:
             or "--allow-output-divergence" in args.comparison_args,
         },
         "mechanism": {
-            "required_consumer": "native_heterogeneous_work_unit",
+            "required_consumer": (
+                "all_external_native_work_unit"
+                if args.require_native_consumer
+                else "native_heterogeneous_work_unit"
+            ),
+            "native_consumer_required": args.require_native_consumer,
+            "all_external_launches_native": aggregate[
+                "all_external_launches_native"
+            ],
+            "external_request_evidence_passes": external_request_evidence[
+                "passes"
+            ],
             "passes": aggregate["all_external_attention_accounted"]
             and aggregate["all_compiler_contracts_verified"]
             and aggregate["all_fallback_free"]
             and aggregate["all_external_attention_transformed"]
             and aggregate["all_native_work_unit_active"]
             and aggregate["all_heterogeneous_work_unit_active"]
-            and aggregate["all_batch_heterogeneity_proven"],
+            and aggregate["all_batch_heterogeneity_proven"]
+            and external_request_evidence["passes"]
+            and (
+                not args.require_native_consumer
+                or aggregate["all_external_launches_native"]
+            ),
         },
         "physical_bytes": {
             # The registered evidence standard records physically staged
@@ -562,6 +950,7 @@ def main() -> int:
         if formally_qualified
         else "failed"
     )
+    _validate_external_request_evidence(aggregate["external_request_evidence"])
     validate_serving_trials(aggregate)
     atomic_write_json(args.output, aggregate)
     print(json.dumps(aggregate, sort_keys=True))

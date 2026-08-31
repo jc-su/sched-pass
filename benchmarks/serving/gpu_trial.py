@@ -10,51 +10,107 @@ import time
 
 
 TRIAL_OWNER_ENV = "NTA_BENCHMARK_TRIAL_OWNER"
+NVIDIA_SMI_TIMEOUT_SECONDS = 5.0
 
 
-def wait_for_free_gpu(limit_mib: int = 8000, timeout_seconds: float = 600.0) -> None:
-    """Wait until no compute process owns the benchmark GPU."""
+def _run_nvidia_smi(arguments: list[str]) -> subprocess.CompletedProcess[str] | None:
+    """Run one bounded telemetry query.
+
+    ``nvidia-smi`` can block in driver teardown even when the GPU is otherwise
+    healthy.  A readiness probe must therefore be a bounded observation, not
+    an unbounded prerequisite that can strand an entire trial campaign.
+    """
+
+    try:
+        return subprocess.run(
+            ["nvidia-smi", *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=NVIDIA_SMI_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def wait_for_free_gpu(
+    limit_mib: int = 8000,
+    timeout_seconds: float = 600.0,
+    *,
+    max_temperature_c: int | None = None,
+    stable_samples: int = 1,
+) -> None:
+    """Wait for an unoccupied GPU at a reproducible thermal starting point."""
+
+    if stable_samples <= 0:
+        raise ValueError("GPU readiness stable-sample count must be positive")
+    if max_temperature_c is not None and max_temperature_c <= 0:
+        raise ValueError("GPU readiness temperature must be positive")
 
     deadline = time.monotonic() + timeout_seconds
     used_mib: int | None = None
+    temperature_c: int | None = None
+    ready_samples = 0
     while True:
-        memory = subprocess.run(
+        gpu_state = _run_nvidia_smi(
             [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
+                "--query-gpu=memory.used,temperature.gpu",
                 "--format=csv,noheader,nounits",
-            ],
-            stdout=subprocess.PIPE,
-            text=True,
-            check=False,
+            ]
         )
         try:
-            used_mib = max(
-                int(line) for line in memory.stdout.split() if line.strip()
-            )
-        except ValueError:
+            rows = [
+                tuple(part.strip() for part in line.split(","))
+                for line in (
+                    gpu_state.stdout if gpu_state is not None else ""
+                ).splitlines()
+                if line.strip()
+            ]
+            used_mib = max(int(row[0]) for row in rows)
+            temperature_c = max(int(row[1]) for row in rows)
+        except (IndexError, ValueError):
             used_mib = None
-        applications = subprocess.run(
+            temperature_c = None
+        applications = _run_nvidia_smi(
             [
-                "nvidia-smi",
                 "--query-compute-apps=pid",
                 "--format=csv,noheader",
-            ],
-            stdout=subprocess.PIPE,
-            text=True,
-            check=False,
+            ]
         )
         compute_pids = [
-            line for line in applications.stdout.split() if line.strip()
+            line
+            for line in (
+                applications.stdout if applications is not None else ""
+            ).split()
+            if line.strip()
         ]
-        if memory.returncode == 0 and used_mib is not None:
-            if used_mib < limit_mib and not compute_pids:
-                return
+        if (
+            gpu_state is not None
+            and applications is not None
+            and gpu_state.returncode == 0
+            and applications.returncode == 0
+            and used_mib is not None
+        ):
+            temperature_ready = (
+                max_temperature_c is None
+                or (
+                    temperature_c is not None
+                    and temperature_c <= max_temperature_c
+                )
+            )
+            if used_mib < limit_mib and not compute_pids and temperature_ready:
+                ready_samples += 1
+                if ready_samples >= stable_samples:
+                    return
+            else:
+                ready_samples = 0
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"GPU memory still at {used_mib} MiB after "
-                f"{timeout_seconds:.0f}s; refusing to launch a serving arm into "
-                "an occupied device"
+                f"{timeout_seconds:.0f}s (temperature={temperature_c}C, "
+                f"required<={max_temperature_c}C); refusing to launch a "
+                "serving arm from an occupied or thermally biased device"
             )
         time.sleep(5.0)
 
@@ -73,6 +129,16 @@ class CotenantSampler:
         self.sampling_errors = 0
         self.foreign_samples = 0
         self.foreign_pids: set[int] = set()
+        self.telemetry_samples = 0
+        self.telemetry_errors = 0
+        self.temperature_min_c: int | None = None
+        self.temperature_max_c: int | None = None
+        self.graphics_clock_min_mhz: int | None = None
+        self.graphics_clock_max_mhz: int | None = None
+        self.graphics_clock_sum_mhz = 0
+        self.power_max_watts = 0.0
+        self.thermal_slowdown_samples = 0
+        self.clock_reason_masks: set[int] = set()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -139,6 +205,69 @@ class CotenantSampler:
         if foreign:
             self.foreign_samples += 1
             self.foreign_pids |= foreign
+        self._sample_telemetry()
+
+    def _sample_telemetry(self) -> None:
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=temperature.gpu,clocks.current.graphics,"
+                    "power.draw,clocks_throttle_reasons.active",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            rows = [
+                tuple(part.strip() for part in line.split(","))
+                for line in result.stdout.splitlines()
+                if line.strip()
+            ]
+            if result.returncode != 0 or not rows:
+                raise ValueError("nvidia-smi returned no GPU telemetry")
+            temperatures = [int(row[0]) for row in rows]
+            clocks = [int(row[1]) for row in rows]
+            powers = [float(row[2]) for row in rows]
+            masks = [int(row[3], 0) for row in rows]
+        except (OSError, IndexError, subprocess.TimeoutExpired, ValueError):
+            self.telemetry_errors += 1
+            return
+
+        temperature_min = min(temperatures)
+        temperature_max = max(temperatures)
+        clock_min = min(clocks)
+        clock_max = max(clocks)
+        self.temperature_min_c = (
+            temperature_min
+            if self.temperature_min_c is None
+            else min(self.temperature_min_c, temperature_min)
+        )
+        self.temperature_max_c = (
+            temperature_max
+            if self.temperature_max_c is None
+            else max(self.temperature_max_c, temperature_max)
+        )
+        self.graphics_clock_min_mhz = (
+            clock_min
+            if self.graphics_clock_min_mhz is None
+            else min(self.graphics_clock_min_mhz, clock_min)
+        )
+        self.graphics_clock_max_mhz = (
+            clock_max
+            if self.graphics_clock_max_mhz is None
+            else max(self.graphics_clock_max_mhz, clock_max)
+        )
+        self.graphics_clock_sum_mhz += sum(clocks) // len(clocks)
+        self.power_max_watts = max(self.power_max_watts, max(powers))
+        self.clock_reason_masks.update(masks)
+        # NVML clock-event bits 5 and 6 are software and hardware thermal
+        # slowdown. Idle and power-cap reasons are recorded but are not thermal
+        # contamination by themselves.
+        if any(mask & 0x60 for mask in masks):
+            self.thermal_slowdown_samples += 1
+        self.telemetry_samples += 1
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -157,3 +286,23 @@ class CotenantSampler:
     @property
     def complete(self) -> bool:
         return not self._thread.is_alive()
+
+    def telemetry(self) -> dict[str, object]:
+        return {
+            "samples": self.telemetry_samples,
+            "errors": self.telemetry_errors,
+            "temperature_min_c": self.temperature_min_c,
+            "temperature_max_c": self.temperature_max_c,
+            "graphics_clock_min_mhz": self.graphics_clock_min_mhz,
+            "graphics_clock_max_mhz": self.graphics_clock_max_mhz,
+            "graphics_clock_mean_mhz": (
+                self.graphics_clock_sum_mhz / self.telemetry_samples
+                if self.telemetry_samples
+                else None
+            ),
+            "power_max_watts": self.power_max_watts,
+            "thermal_slowdown_samples": self.thermal_slowdown_samples,
+            "clock_reason_masks": [
+                f"0x{mask:016x}" for mask in sorted(self.clock_reason_masks)
+            ],
+        }

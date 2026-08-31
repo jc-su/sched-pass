@@ -82,6 +82,10 @@ class AttentionDispatchOutcome:
     output: torch.Tensor | None = None
     deadline_fragment: DeadlineFragment | None = None
     setup_dispatch_elapsed_ns: int | None = None
+    # True only for the first partial layer that constructs the reusable
+    # direct/deferred work partition for this forward.  The consumer policy
+    # must not charge this one-time cost to every later layer.
+    partition_prepared: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,6 +544,7 @@ class SglangAttentionExecutor:
         verify_execution: bool,
         verify_transfer: bool,
         tile_compute_ns: int,
+        dispatch_ready_profile: torch.cuda.Event | None = None,
     ) -> AttentionDispatchOutcome:
         """Execute a non-host-demand form selected by the pure dispatcher."""
 
@@ -563,6 +568,7 @@ class SglangAttentionExecutor:
                 verify_execution=verify_execution,
                 verify_transfer=verify_transfer,
                 tile_compute_ns=tile_compute_ns,
+                dispatch_ready_profile=dispatch_ready_profile,
             )
         if dispatch.kind is AttentionDispatchKind.PRELOADED:
             return self._execute_preloaded(
@@ -594,6 +600,7 @@ class SglangAttentionExecutor:
         verify_execution: bool,
         verify_transfer: bool,
         tile_compute_ns: int,
+        dispatch_ready_profile: torch.cuda.Event | None = None,
     ) -> AttentionDispatchOutcome:
         pending = batch.pending_host_load
         acquisition = dispatch.acquisition
@@ -648,6 +655,13 @@ class SglangAttentionExecutor:
             wave_work_counts,
         )
         prepare_partition = batch.arriving_partition_key != partition_key
+        # Everything before this marker is host-side validation/materializer
+        # dispatch.  Everything after it is the stream-ordered partition,
+        # wave waits, numerical kernels, and merge.  Keeping the marker on the
+        # same stream gives the policy a causal decomposition without a host
+        # synchronization or an extra steady-state event.
+        if dispatch_ready_profile is not None:
+            dispatch_ready_profile.record(stream)
         acquisition.owner.consume_layer(
             acquisition,
             stream,
@@ -662,8 +676,6 @@ class SglangAttentionExecutor:
             kv_cache,
             output,
             ready_events=publication.wave_events,
-            ready_object_slots=publication.wave_object_slots,
-            registration_event=publication.registration_event,
             direct_work_count=initial_ready_work_count,
             wave_work_counts=wave_work_counts,
             prepare_partition=prepare_partition,
@@ -704,6 +716,7 @@ class SglangAttentionExecutor:
         return AttentionDispatchOutcome(
             progress_rounds=nonempty_wave_count,
             progressive_consumer=True,
+            partition_prepared=prepare_partition,
         )
 
     def _execute_preloaded(
@@ -1308,10 +1321,10 @@ class SglangAttentionExecutor:
         )
         external_requests = {
             prepared.schedule.request_indices[index]
-            for index, object_slots in enumerate(
-                prepared.allocation.external_object_slots
+            for index, external in enumerate(
+                prepared.allocation.external_work_mask
             )
-            if object_slots
+            if external
         }
         if any(
             item.failed_work != 0

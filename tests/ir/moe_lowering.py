@@ -26,13 +26,16 @@ def main() -> None:
     assert "store i64" in route
     assert "nta.acquire-set" not in route
 
-    for name in ("nta_moe_tile_kernel", "nta_moe_ready_kernel"):
-        consumer = kernel_body(module, name)
-        assert "@_ZZ20nta_acquire_set_slowE8ctaReady" in consumer
-        assert "llvm.nvvm.barrier.cta.sync" in consumer
-        assert "call void @nta_defer" in consumer
-        assert "!nta.acquire" in consumer
-        assert "__nta_acquire_set_marker" not in consumer
+    # Typed discovery owns acquisition publication. The only MoE numerical
+    # entry consumes the compact ready queue; the old full-grid tile entry was
+    # intentionally removed because it could rediscover a shared expert from
+    # independent CTAs before the complete fan-out was sealed.
+    consumer = kernel_body(module, "nta_moe_ready_kernel")
+    assert "@_ZZ20nta_acquire_set_slowE8ctaReady" in consumer
+    assert "llvm.nvvm.barrier.cta.sync" in consumer
+    assert "call void @nta_defer" in consumer
+    assert "!nta.acquire" in consumer
+    assert "__nta_acquire_set_marker" not in consumer
 
     print("moe_lowering=pass")
 

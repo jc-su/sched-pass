@@ -138,6 +138,33 @@ so the demand digest is not merely an offline annotation.
 Synthetic matrix timing is contract evidence only.  A speedup claim requires a
 structured serving artifact with the same demand trace and correctness digest.
 
+The headline serving verdict is not TTFT alone.  Formal load reports use one
+fixed joint request SLO: TTFT <= 8 s, TPOT <= 50 ms, and request p99 ITL <=
+100 ms, with exact token timestamps required.  Goodput is the number of
+requests satisfying all three conditions divided by measured elapsed time.
+The older TTFT+p99-ITL metric remains in artifacts under its explicit legacy
+name; it is never relabeled as the joint metric.  Repeated controlled trials
+also gate resident p95 TPOT and p99 ITL at no more than 1.05x stock, resident
+and total output-token throughput at no less than 0.95x stock, exact output,
+fallback freedom, and at least 100 external-request observations per arm.
+
+An overloaded rate must be selected without looking at NTA.  First collect
+stock-only reports at at least three offered rates, with at least 100 requests
+and exact token timing in every report.  Freeze the first stable multi-signal
+knee before running either paired arm:
+
+```bash
+python experiments/freeze_serving_overload_rate.py \
+  --input 8=/path/stock-rate-8.json \
+  --input 12=/path/stock-rate-12.json \
+  --input 18=/path/stock-rate-18.json \
+  --output /path/frozen-overload-rate.json
+```
+
+The frozen artifact records all input hashes, the stock revision, workload,
+machine, SLO contract, and deterministic selection rule.  A rate chosen after
+observing NTA is diagnostic only and cannot support the SLO-goodput claim.
+
 The target serving tiers are HBM reference, host-staged memory, VFIO NVMe, and
 CXL DAX. The current serving path names host memory explicitly as
 `host_staged`; it does not silently switch between mapped and staged host

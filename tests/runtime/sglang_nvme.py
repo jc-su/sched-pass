@@ -22,12 +22,22 @@ def semantic(*request_indices: int):
     )
 
 
-def geometry(*, isolated: bool, capacity: int = 32, work_ticket_capacity: int = 32):
+def geometry(
+    *,
+    isolated: bool,
+    capacity: int = 32,
+    work_ticket_capacity: int = 32,
+    tenant_ids: tuple[int, int] = (4, 9),
+):
     return plan_nvme_batch_geometry(
         semantic_plans={7: semantic(0, 1)},
         bindings=(
-            RequestBinding(0, 3, 11, 101, deadline_clock=900, tenant_id=4),
-            RequestBinding(1, 8, 17, 202, deadline_clock=500, tenant_id=9),
+            RequestBinding(
+                0, 3, 11, 101, deadline_clock=900, tenant_id=tenant_ids[0]
+            ),
+            RequestBinding(
+                1, 8, 17, 202, deadline_clock=500, tenant_id=tenant_ids[1]
+            ),
         ),
         row_bytes=(4096, 4096),
         lba_size=4096,
@@ -38,31 +48,48 @@ def geometry(*, isolated: bool, capacity: int = 32, work_ticket_capacity: int = 
     )
 
 
-def test_batch_deduplicates_shared_runs_without_isolation() -> None:
+def test_request_owned_kv_never_fans_out_across_tenants() -> None:
     planned = geometry(isolated=False)
-    assert len(planned.scopes) == 1
-    assert planned.object_count == 4
-    # Two shared transfer groups fan out to both request generations.  DMA is
-    # deduplicated, but cancellation-safe readiness remains per consumer.
-    assert planned.work_item_count == 4
-    assert planned.logical_transfer_bytes == 4 * 8192
-
-
-def test_tenant_isolation_scopes_shared_physical_bytes() -> None:
-    planned = geometry(isolated=True)
     assert tuple(scope.tenant_id for scope in planned.scopes) == (4, 9)
     assert planned.object_count == 8
     assert planned.work_item_count == 4
     assert planned.logical_transfer_bytes == 4 * 8192
+    assert planned.scoped_exact_transfer_bytes == 8 * 8192
+    assert planned.unique_source_transfer_bytes == 8 * 8192
+    for scope in planned.scopes:
+        expected_consumer = 0 if scope.tenant_id == 4 else 1
+        assert all(
+            group.consumer_indices == (expected_consumer,) for group in scope.groups
+        )
 
 
-def test_isolated_geometry_fails_before_partial_publication() -> None:
+def test_budget_isolation_flag_does_not_change_object_scope() -> None:
+    unbudgeted = geometry(isolated=False)
+    isolated = geometry(isolated=True)
+    assert unbudgeted == isolated
+
+
+def test_same_tenant_deduplication_is_preserved() -> None:
+    planned = geometry(isolated=False, tenant_ids=(4, 4))
+    assert tuple(scope.tenant_id for scope in planned.scopes) == (4,)
+    assert planned.object_count == 4
+    assert planned.work_item_count == 4
+    assert planned.logical_transfer_bytes == 4 * 8192
+    assert planned.scoped_exact_transfer_bytes == planned.logical_transfer_bytes
+    assert planned.unique_source_transfer_bytes == planned.logical_transfer_bytes
+    assert all(
+        group.consumer_indices == (0, 1)
+        for group in planned.scopes[0].groups
+    )
+
+
+def test_tenant_scoped_geometry_fails_before_partial_publication() -> None:
     try:
-        geometry(isolated=True, capacity=7)
+        geometry(isolated=False, capacity=7)
     except RuntimeError as error:
         assert "more concurrent acquisition objects" in str(error)
     else:
-        raise AssertionError("an over-capacity isolated plan was accepted")
+        raise AssertionError("an over-capacity tenant-scoped plan was accepted")
 
 
 def test_fanout_ticket_capacity_fails_before_publication() -> None:
@@ -186,9 +213,10 @@ def test_window_planner_reaches_refill_steady_state() -> None:
 
 
 def main() -> None:
-    test_batch_deduplicates_shared_runs_without_isolation()
-    test_tenant_isolation_scopes_shared_physical_bytes()
-    test_isolated_geometry_fails_before_partial_publication()
+    test_request_owned_kv_never_fans_out_across_tenants()
+    test_budget_isolation_flag_does_not_change_object_scope()
+    test_same_tenant_deduplication_is_preserved()
+    test_tenant_scoped_geometry_fails_before_partial_publication()
     test_fanout_ticket_capacity_fails_before_publication()
     test_nonphysical_semantics_fail_closed()
     test_measured_service_cost_selects_exact_span_compaction()

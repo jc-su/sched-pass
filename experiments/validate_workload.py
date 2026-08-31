@@ -123,6 +123,9 @@ def validate(path: Path) -> dict[str, Any]:
         min_resident_output_tokens = selection.get(
             "min_resident_output_tokens"
         )
+        min_external_output_tokens = selection.get(
+            "min_external_output_tokens"
+        )
         min_external_cached_tokens = selection.get(
             "min_external_cached_tokens"
         )
@@ -135,6 +138,7 @@ def validate(path: Path) -> dict[str, Any]:
                 max_input_tokens,
                 max_output_tokens,
                 min_resident_output_tokens,
+                min_external_output_tokens,
                 min_external_cached_tokens,
                 min_external_query_rows,
             )
@@ -176,7 +180,9 @@ def validate(path: Path) -> dict[str, Any]:
             or (
                 row.get("request_state") == "external"
                 and (
-                    int(row["cached_prefix_tokens"])
+                    max(1, int(row["output_length"]))
+                    < min_external_output_tokens
+                    or int(row["cached_prefix_tokens"])
                     < min_external_cached_tokens
                     or int(row["input_length"])
                     - int(row["cached_prefix_tokens"])

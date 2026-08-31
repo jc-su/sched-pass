@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, replace
 import os
 import time
@@ -24,6 +24,42 @@ from nta_runtime.engines.sglang_planning import (
     mover_layout_required,
 )
 from nta_runtime.acquisition_scheduler import AcquisitionServiceCurve
+
+
+_HOST_MOVER_STATE_SCHEMA = 1
+
+
+def _profile_int(
+    value: Any,
+    owner: str,
+    *,
+    minimum: int = 0,
+    maximum: int = (1 << 63) - 1,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{owner} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{owner} is outside its bound")
+    return value
+
+
+def _profile_mapping(value: Any, owner: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) for key in value
+    ):
+        raise ValueError(f"{owner} must be a string-keyed object")
+    return value
+
+
+def _profile_fields(
+    value: Mapping[str, Any], expected: frozenset[str], owner: str
+) -> None:
+    actual = frozenset(value)
+    if actual != expected:
+        raise ValueError(
+            f"{owner} fields disagree "
+            f"(missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)})"
+        )
 
 
 def host_mover_service_model_from_environment(
@@ -374,6 +410,208 @@ class HostMoverController:
 
     def record_profile(self, profile: MoverProfile) -> None:
         self._profiles.append(profile)
+
+    @staticmethod
+    def _service_model_state(
+        bucket: int, model: IndexedMoverServiceModel
+    ) -> dict[str, Any]:
+        return {
+            "scale_bucket": bucket,
+            "sm_bandwidth_bytes_per_second": model.sm_bandwidth_bytes_per_second,
+            "copy_bandwidth_bytes_per_second": (
+                model.copy_bandwidth_bytes_per_second
+            ),
+            "copy_operation_ns": model.copy_operation_ns,
+            "hybrid_join_ns": model.hybrid_join_ns,
+            "minimum_gain": model.minimum_gain,
+            "sm_samples": model.sm_samples,
+            "copy_samples": model.copy_samples,
+            "minimum_calibration_samples": model.minimum_calibration_samples,
+            "calibration_scale_bucket": model.calibration_scale_bucket,
+            "copy_compute_overlap_efficiency": (
+                model.copy_compute_overlap_efficiency
+            ),
+            "overlap_samples": model.overlap_samples,
+        }
+
+    def export_state(self) -> dict[str, Any]:
+        """Return deployment-local mover curves without event ownership."""
+
+        if self._profiles:
+            raise RuntimeError("host mover cannot snapshot pending CUDA events")
+        return {
+            "schema": _HOST_MOVER_STATE_SCHEMA,
+            "policy": self._policy,
+            "calibration_samples": self._calibration_samples,
+            "copy_engine_max_operations": self._copy_engine_max_operations,
+            "frontier_layers_per_wave": self._frontier_layers_per_wave,
+            "curves": [
+                self._service_model_state(bucket, curve)
+                for bucket, curve in sorted(self._service_models.items())
+            ],
+            "maximum_sample_bytes": dict(self._profile_max_sample_bytes),
+        }
+
+    def import_state(self, value: Any) -> int:
+        """Restore validated mover curves before any lease is planned."""
+
+        if self._profiles or self._service_models:
+            raise RuntimeError("host mover calibration is not empty")
+        state = _profile_mapping(value, "host-mover calibration")
+        _profile_fields(
+            state,
+            frozenset(
+                {
+                    "schema",
+                    "policy",
+                    "calibration_samples",
+                    "copy_engine_max_operations",
+                    "frontier_layers_per_wave",
+                    "curves",
+                    "maximum_sample_bytes",
+                }
+            ),
+            "host-mover calibration",
+        )
+        policy = state["policy"]
+        if not isinstance(policy, str) or policy != self._policy:
+            raise ValueError("host-mover calibration policy is incompatible")
+        expected = (
+            _HOST_MOVER_STATE_SCHEMA,
+            self._calibration_samples,
+            self._copy_engine_max_operations,
+            self._frontier_layers_per_wave,
+        )
+        actual = tuple(
+            _profile_int(state[name], f"host-mover {name}")
+            for name in (
+                "schema",
+                "calibration_samples",
+                "copy_engine_max_operations",
+                "frontier_layers_per_wave",
+            )
+        )
+        if actual != expected:
+            raise ValueError("host-mover calibration geometry is incompatible")
+        rows = state["curves"]
+        if not isinstance(rows, list) or len(rows) > 1024:
+            raise ValueError("host-mover service curves exceed their bound")
+        curve_fields = frozenset(
+            {
+                "scale_bucket",
+                "sm_bandwidth_bytes_per_second",
+                "copy_bandwidth_bytes_per_second",
+                "copy_operation_ns",
+                "hybrid_join_ns",
+                "minimum_gain",
+                "sm_samples",
+                "copy_samples",
+                "minimum_calibration_samples",
+                "calibration_scale_bucket",
+                "copy_compute_overlap_efficiency",
+                "overlap_samples",
+            }
+        )
+        restored: dict[int, IndexedMoverServiceModel] = {}
+        for raw in rows:
+            row = _profile_mapping(raw, "host-mover curve")
+            _profile_fields(row, curve_fields, "host-mover curve")
+            bucket = _profile_int(row["scale_bucket"], "host-mover bucket", maximum=62)
+            if bucket in restored:
+                raise ValueError("host-mover profile repeats a scale bucket")
+            optional_ints: dict[str, int | None] = {}
+            for name in (
+                "copy_bandwidth_bytes_per_second",
+                "copy_operation_ns",
+                "calibration_scale_bucket",
+            ):
+                raw_value = row[name]
+                optional_ints[name] = (
+                    None
+                    if raw_value is None
+                    else _profile_int(raw_value, f"host-mover {name}")
+                )
+            raw_gain = row["minimum_gain"]
+            raw_overlap = row["copy_compute_overlap_efficiency"]
+            if (
+                isinstance(raw_gain, bool)
+                or not isinstance(raw_gain, (int, float))
+                or isinstance(raw_overlap, bool)
+                or not isinstance(raw_overlap, (int, float))
+            ):
+                raise ValueError("host-mover floating calibration is invalid")
+            curve = IndexedMoverServiceModel(
+                sm_bandwidth_bytes_per_second=_profile_int(
+                    row["sm_bandwidth_bytes_per_second"],
+                    "host-mover SM bandwidth",
+                    minimum=1,
+                ),
+                copy_bandwidth_bytes_per_second=optional_ints[
+                    "copy_bandwidth_bytes_per_second"
+                ],
+                copy_operation_ns=optional_ints["copy_operation_ns"],
+                hybrid_join_ns=_profile_int(
+                    row["hybrid_join_ns"], "host-mover hybrid join"
+                ),
+                minimum_gain=float(raw_gain),
+                sm_samples=_profile_int(
+                    row["sm_samples"], "host-mover SM samples", maximum=1 << 20
+                ),
+                copy_samples=_profile_int(
+                    row["copy_samples"],
+                    "host-mover copy samples",
+                    maximum=1 << 20,
+                ),
+                minimum_calibration_samples=_profile_int(
+                    row["minimum_calibration_samples"],
+                    "host-mover minimum samples",
+                    minimum=1,
+                ),
+                calibration_scale_bucket=optional_ints[
+                    "calibration_scale_bucket"
+                ],
+                copy_compute_overlap_efficiency=float(raw_overlap),
+                overlap_samples=_profile_int(
+                    row["overlap_samples"],
+                    "host-mover overlap samples",
+                    maximum=1 << 20,
+                ),
+            )
+            default = self._default_service_model
+            if (
+                curve.calibration_scale_bucket != bucket
+                or curve.minimum_calibration_samples != self._calibration_samples
+                or curve.minimum_gain != default.minimum_gain
+                or curve.hybrid_join_ns != default.hybrid_join_ns
+            ):
+                raise ValueError("host-mover curve contract is incompatible")
+            restored[bucket] = curve
+        maximum_bytes = _profile_mapping(
+            state["maximum_sample_bytes"], "host-mover maximum sample bytes"
+        )
+        _profile_fields(
+            maximum_bytes,
+            frozenset({"sm", "copy_engine"}),
+            "host-mover maximum sample bytes",
+        )
+        self._service_models = restored
+        self._profile_buckets = {
+            "sm": {bucket: curve.sm_samples for bucket, curve in restored.items()},
+            "copy_engine": {
+                bucket: curve.copy_samples for bucket, curve in restored.items()
+            },
+        }
+        self._profile_max_sample_bytes = {
+            "sm": _profile_int(maximum_bytes["sm"], "host-mover SM maximum bytes"),
+            "copy_engine": _profile_int(
+                maximum_bytes["copy_engine"], "host-mover copy maximum bytes"
+            ),
+        }
+        self._publish_service_stats()
+        return sum(
+            curve.sm_samples + curve.copy_samples + curve.overlap_samples
+            for curve in restored.values()
+        )
 
     def plan(
         self,
@@ -748,6 +986,9 @@ class HostMoverController:
                 "host_mover_complete_calibration_wave_samples", sample_count
             )
 
+        self._publish_service_stats()
+
+    def _publish_service_stats(self) -> None:
         model = (
             self._default_service_model
             if self._last_service_bucket is None

@@ -4,6 +4,9 @@ set -euo pipefail
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 module_dir=$root_dir/kernel/nta_nvme_p2p
 kernel_release=$(uname -r)
+installed_module=/lib/modules/$kernel_release/updates/nta_nvme_p2p.ko
+modules_load_config=/etc/modules-load.d/nta-nvme-p2p.conf
+udev_config=/etc/udev/rules.d/99-nta-nvme-p2p.rules
 
 die() {
   printf 'nta-nvme-p2p-module: %s\n' "$*" >&2
@@ -51,9 +54,29 @@ load)
   else
     as_root insmod "$module_dir/nta_nvme_p2p.ko"
   fi
+  udevadm settle
   [[ -c /dev/nta_nvme_p2p ]] || die "module loaded without a device node"
   printf 'module=nta_nvme_p2p state=loaded device=/dev/nta_nvme_p2p kernel=%s\n' \
     "$kernel_release"
+  ;;
+install)
+  build_module
+  as_root install -D -m 0644 \
+    "$module_dir/nta_nvme_p2p.ko" "$installed_module"
+  as_root install -D -m 0644 \
+    "$root_dir/config/modules-load.d/nta-nvme-p2p.conf" \
+    "$modules_load_config"
+  as_root install -D -m 0644 \
+    "$root_dir/config/udev/99-nta-nvme-p2p.rules" "$udev_config"
+  as_root depmod -a "$kernel_release"
+  as_root udevadm control --reload-rules
+  if [[ ! -d /sys/module/nta_nvme_p2p ]]; then
+    as_root modprobe nta_nvme_p2p
+  fi
+  udevadm settle
+  [[ -c /dev/nta_nvme_p2p ]] || die "installed module has no device node"
+  printf 'module=nta_nvme_p2p state=installed device=/dev/nta_nvme_p2p kernel=%s path=%s\n' \
+    "$kernel_release" "$installed_module"
   ;;
 unload)
   if [[ -d /sys/module/nta_nvme_p2p ]]; then
@@ -71,6 +94,6 @@ status)
   fi
   ;;
 *)
-  die "usage: $0 {build|load|unload|status}"
+  die "usage: $0 {build|load|install|unload|status}"
   ;;
 esac

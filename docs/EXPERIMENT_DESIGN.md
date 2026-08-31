@@ -113,6 +113,13 @@ All arms report:
 - request-generation and epoch rejection counts;
 - TTFT, TPOT, ITL, tail SLO, throughput, and goodput.
 
+TTFT is a latency component, not the acceptance criterion.  The primary
+loaded-serving metric is joint TTFT/TPOT/p99-ITL SLO-goodput at a stock-only
+pre-frozen overload point.  Output-token throughput is reported globally and
+by resident/external cohort.  Resident p95 TPOT, resident p99 ITL, and resident
+throughput are explicit no-regression controls, so faster external prefill
+cannot hide damage to decode service.
+
 ## RQ3: diagnostic interventions and robustness
 
 The D0--D6 synthetic profiles can disable exactly one boundary at a time. The

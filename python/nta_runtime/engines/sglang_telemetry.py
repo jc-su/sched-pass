@@ -271,6 +271,8 @@ _ZERO_COUNTERS = (
     "consumer_policy_arrival_samples",
     "consumer_policy_stock_samples",
     "consumer_policy_partial_samples",
+    "consumer_policy_partial_setup_samples",
+    "consumer_policy_partial_reuse_samples",
     "resident_reference_batches",
     "resident_reference_metadata_calls",
     "resident_reference_metadata_cpu_ns",

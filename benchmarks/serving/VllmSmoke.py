@@ -31,7 +31,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=pathlib.Path, required=True)
     parser.add_argument(
-        "--backend", choices=("stock", "stock_offload", "nta"), required=True
+        "--backend",
+        choices=(
+            "stock",
+            "stock_offload",
+            "nta",
+            "nta_reference",
+        ),
+        required=True,
+        help=(
+            "nta_reference keeps the NTA connector/worker lifecycle but uses "
+            "stock FlashInfer numerics as a lifecycle diagnostic"
+        ),
     )
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=2)
@@ -54,6 +65,18 @@ def parse_args() -> argparse.Namespace:
         help="deterministic long-prefix scale for controlled Host reload sweeps",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
+    parser.add_argument(
+        "--prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable vLLM's resident prefix cache",
+    )
+    parser.add_argument(
+        "--compare-stock",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="compare every native attention result against stock in-process",
+    )
     parser.add_argument(
         "--async-scheduling",
         action=argparse.BooleanOptionalAction,
@@ -95,7 +118,6 @@ def parse_args() -> argparse.Namespace:
             args.requests,
             args.max_new_tokens,
             args.iterations,
-            args.warmup_iterations,
             args.max_model_len,
             args.max_num_seqs,
             args.long_prefix_repetitions,
@@ -103,6 +125,8 @@ def parse_args() -> argparse.Namespace:
         <= 0
     ):
         parser.error("request, token, iteration, and model limits must be positive")
+    if args.warmup_iterations < 0:
+        parser.error("--warmup-iterations cannot be negative")
     if args.max_num_seqs < args.requests:
         parser.error("--max-num-seqs must cover the request batch")
     if not 0.0 < args.gpu_memory_utilization < 1.0:
@@ -111,6 +135,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("stock backend supports only the resident HBM smoke")
     if args.backend == "stock_offload" and args.serving_tier != "host_staged":
         parser.error("stock_offload requires --serving-tier host_staged")
+    if args.backend == "nta_reference" and args.serving_tier != "hbm":
+        parser.error("NTA reference diagnostics are resident-HBM only")
+    if args.compare_stock and args.backend != "nta":
+        parser.error("--compare-stock requires --backend nta")
     if args.kv_cache_memory_bytes is not None and args.kv_cache_memory_bytes <= 0:
         parser.error("--kv-cache-memory-bytes must be positive")
     if args.host_cache_bytes <= 0:
@@ -200,10 +228,10 @@ def main() -> int:
     else:
         os.environ["NTA_TENANT_BUDGETS"] = f"0:{args.tenant_budget_bytes}"
         os.environ["NTA_TENANT_CAPACITY"] = "1"
-    if args.backend == "nta":
+    if args.backend in {"nta", "nta_reference"}:
         os.environ.update(
             {
-                "NTA_VLLM_NATIVE": "1",
+                "NTA_VLLM_NATIVE": "1" if args.backend == "nta" else "0",
                 "NTA_VLLM_ALLOW_STOCK_FALLBACK": "0",
                 "NTA_SERVING_TIER": args.serving_tier,
             }
@@ -212,11 +240,19 @@ def main() -> int:
             os.environ["NTA_VLLM_VERIFY_TRANSFER"] = "1"
         else:
             os.environ.pop("NTA_VLLM_VERIFY_TRANSFER", None)
+        if args.compare_stock:
+            os.environ["NTA_VLLM_COMPARE_STOCK"] = "1"
+            os.environ["NTA_VERIFY_EXECUTION"] = "1"
+        else:
+            os.environ.pop("NTA_VLLM_COMPARE_STOCK", None)
+            os.environ.pop("NTA_VERIFY_EXECUTION", None)
     else:
         os.environ.pop("NTA_VLLM_NATIVE", None)
         os.environ.pop("NTA_VLLM_ALLOW_STOCK_FALLBACK", None)
         os.environ.pop("NTA_VLLM_VERIFY_TRANSFER", None)
         os.environ.pop("NTA_SERVING_TIER", None)
+        os.environ.pop("NTA_VLLM_COMPARE_STOCK", None)
+        os.environ.pop("NTA_VERIFY_EXECUTION", None)
 
     import torch
     from vllm import LLM, SamplingParams
@@ -243,22 +279,27 @@ def main() -> int:
             f"Request {index}: explain one property of finite GPU kernels."
             for index in range(args.requests)
         ]
-    sampling = SamplingParams(
-        temperature=0.0,
-        max_tokens=args.max_new_tokens,
-        seed=0,
+    def sampling_params() -> Any:
+        # Construct request-local state afresh so repeated batches cannot share
+        # mutable harness metadata.
+        return SamplingParams(
+            temperature=0.0,
+            max_tokens=args.max_new_tokens,
+            seed=0,
+        )
+    attention_backend = (
+        "CUSTOM" if args.backend in {"nta", "nta_reference"} else "FLASHINFER"
     )
-    attention_backend = "CUSTOM" if args.backend == "nta" else "FLASHINFER"
     connector_config = (
         {
             "kv_connector": (
                 "NtaVllmConnector"
-                if args.backend == "nta"
+                if args.backend in {"nta", "nta_reference"}
                 else "SimpleCPUOffloadConnector"
             ),
             **(
                 {"kv_connector_module_path": "nta_runtime.connectors.vllm"}
-                if args.backend == "nta"
+                if args.backend in {"nta", "nta_reference"}
                 else {}
             ),
             "kv_role": "kv_both",
@@ -267,7 +308,12 @@ def main() -> int:
                 "lazy_offload": False,
             },
         }
-        if args.backend in {"nta", "stock_offload"}
+        if args.backend
+        in {
+            "nta",
+            "nta_reference",
+            "stock_offload",
+        }
         else None
     )
     load_started = time.perf_counter()
@@ -280,7 +326,7 @@ def main() -> int:
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype="float16",
         seed=0,
-        enable_prefix_caching=True,
+        enable_prefix_caching=args.prefix_caching,
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         kv_transfer_config=connector_config,
         async_scheduling=args.async_scheduling,
@@ -288,9 +334,11 @@ def main() -> int:
     try:
         load_seconds = time.perf_counter() - load_started
         samples: list[float] = []
+        warmup_token_batches: list[list[list[int]]] = []
+        measured_token_batches: list[list[list[int]]] = []
         results: list[Any] | None = None
         if args.serving_tier == "host_staged":
-            baseline = engine.generate(prompts, sampling)
+            baseline = engine.generate(prompts, sampling_params())
             baseline_tokens = tuple(output_token_ids(result) for result in baseline)
 
             def reset_resident_cache(attempt: int) -> None:
@@ -300,7 +348,7 @@ def main() -> int:
                 # while resetting only vLLM's resident prefix cache.
                 engine.generate(
                     [f"Drain {attempt}: give one word about stream ordering."],
-                    sampling,
+                    sampling_params(),
                 )
                 if not engine.reset_prefix_cache(reset_connector=False):
                     raise RuntimeError(
@@ -310,7 +358,7 @@ def main() -> int:
             for iteration in range(args.warmup_iterations + args.iterations):
                 reset_resident_cache(iteration)
                 started = time.perf_counter()
-                current = engine.generate(prompts, sampling)
+                current = engine.generate(prompts, sampling_params())
                 elapsed = time.perf_counter() - started
                 if (
                     tuple(output_token_ids(result) for result in current)
@@ -322,11 +370,17 @@ def main() -> int:
                     results = current
         else:
             for _ in range(args.warmup_iterations):
-                engine.generate(prompts, sampling)
+                warmup = engine.generate(prompts, sampling_params())
+                warmup_token_batches.append(
+                    [list(output_token_ids(result)) for result in warmup]
+                )
             for _ in range(args.iterations):
                 started = time.perf_counter()
-                results = engine.generate(prompts, sampling)
+                results = engine.generate(prompts, sampling_params())
                 samples.append(time.perf_counter() - started)
+                measured_token_batches.append(
+                    [list(output_token_ids(result)) for result in results]
+                )
     finally:
         # vLLM 0.26's offline LLM wrapper is not a context manager.  Explicit
         # EngineCore shutdown is required so worker atexit evidence is flushed
@@ -372,6 +426,20 @@ def main() -> int:
             for contract in contracts
             if isinstance(contract, dict) and contract.get("kind") == "native_work_unit"
         )
+    elif args.backend == "nta_reference":
+        consumer_contract = next(
+            (
+                contract
+                for contract in contracts
+                if isinstance(contract, dict)
+                and contract.get("kind") == "framework_reference"
+            ),
+            None,
+        )
+        if consumer_contract is None:
+            raise RuntimeError(
+                "NTA reference arm did not publish worker bridge evidence"
+            )
     else:
         consumer_contract = {
             "schema": 1,
@@ -399,6 +467,21 @@ def main() -> int:
         for entry in evidence
         if isinstance(entry, dict)
     )
+    native_stock_comparisons = sum(
+        int(entry.get("stats", {}).get("native_stock_comparisons", 0))
+        for entry in evidence
+        if isinstance(entry, dict)
+    )
+    native_stock_diff_max_e9 = max(
+        (
+            int(entry.get("stats", {}).get("native_stock_diff_max_e9", 0))
+            for entry in evidence
+            if isinstance(entry, dict)
+        ),
+        default=0,
+    )
+    if args.compare_stock and native_stock_comparisons <= 0:
+        raise RuntimeError("vLLM differential gate executed no native/stock comparisons")
     host_transfer_blocks = sum(
         int(entry.get("stats", {}).get("host_transfer_blocks", 0))
         for entry in evidence
@@ -615,8 +698,12 @@ def main() -> int:
         "serving_tier": args.serving_tier,
         "backend_selected": True,
         "native_execution_verified": native_verified,
+        "worker_bridge_verified": bool(evidence),
         "native_launches": native_launches,
         "reference_fallback_launches": reference_fallback_launches,
+        "differential_verification": args.compare_stock,
+        "native_stock_comparisons": native_stock_comparisons,
+        "native_stock_diff_max_e9": native_stock_diff_max_e9,
         "host_launches": host_launches,
         "host_acquisition_batches": host_acquisition_batches,
         "host_acquisition_jobs": host_acquisition_jobs,
@@ -682,6 +769,7 @@ def main() -> int:
         "max_model_len": args.max_model_len,
         "max_num_seqs": args.max_num_seqs,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "prefix_caching": args.prefix_caching,
         "prompt_profile": prompt_profile,
         "long_prefix_repetitions": args.long_prefix_repetitions,
         "async_scheduling": args.async_scheduling,
@@ -692,7 +780,16 @@ def main() -> int:
         "tenant_budget_bytes": args.tenant_budget_bytes,
         "iterations": args.iterations,
         "warmup_iterations": args.warmup_iterations,
+        "warmup_generated_token_id_batches": warmup_token_batches,
+        "measured_generated_token_id_batches": measured_token_batches,
         "generated_tokens": generated,
+        # Token IDs are the actionable correctness witness.  Text digests can
+        # hide where two backends first diverged and decoding the text can be
+        # tokenizer-dependent; this small integration gate emits only the
+        # generated IDs, never prompt content or model logits.
+        "generated_token_id_sequences": [
+            list(output_token_ids(result)) for result in results
+        ],
         "generated_text_sha256": digest.hexdigest(),
         "generated_token_ids_sha256": token_digest.hexdigest(),
         "load_seconds": load_seconds,

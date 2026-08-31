@@ -51,9 +51,9 @@ class NvmeAcquisitionGroupPlan:
 
 @dataclass(frozen=True, slots=True)
 class NvmeScopedMaterializationPlan:
-    """Materialization deduplicated within one accounting/isolation scope."""
+    """Request-owned materialization deduplicated within one tenant scope."""
 
-    tenant_id: int | None
+    tenant_id: int
     plan: NvmeRunPlan | NvmeSpanPlan
     groups: tuple[NvmeAcquisitionGroupPlan, ...]
     span_scratch_offset: int = 0
@@ -63,7 +63,7 @@ class NvmeScopedMaterializationPlan:
 class _ScopedMaterializationCandidate:
     """Allocation-light alternatives retained until policy is decided."""
 
-    tenant_id: int | None
+    tenant_id: int
     consumers: tuple[tuple[PagePair, tuple[int, ...]], ...]
     direct: NvmeRunSummary
     direct_owners: tuple[tuple[tuple[int, int, int], tuple[int, ...]], ...]
@@ -162,12 +162,12 @@ def plan_nvme_batch_geometry(
 ) -> NvmeBatchGeometry:
     """Factor exact numerical demand into shared transport acquisition groups.
 
-    Without tenant isolation, identical runs are transferred once across the
-    batch.  With isolation, deduplication is scoped to a tenant: this prevents
-    one tenant from consuming another tenant's finite byte budget.  Cross-
-    tenant sharing may therefore duplicate physical bytes, an explicit and
-    conservative isolation cost rather than nondeterministic first-CTA
-    charging.
+    KV objects are request-owned, so identical runs are deduplicated only among
+    consumers with the same tenant ID.  ``tenant_isolation`` controls budget
+    policy outside this geometry planner; disabling that policy never widens
+    object ownership or permits cross-tenant fan-out.  Immutable resources may
+    be shared globally only through an explicit ``GLOBAL_SHARED`` contract and
+    therefore do not enter this request-KV planner.
     """
 
     if (
@@ -180,6 +180,8 @@ def plan_nvme_batch_geometry(
         or scratch_alignment <= 0
     ):
         raise ValueError("NVMe batch geometry requires non-empty bounded inputs")
+    if not isinstance(tenant_isolation, bool):
+        raise TypeError("NVMe tenant isolation policy must be boolean")
     binding_by_index = {binding.request_index: binding for binding in bindings}
     if len(binding_by_index) != len(bindings):
         raise ValueError("NVMe request bindings repeat an engine request index")
@@ -203,16 +205,13 @@ def plan_nvme_batch_geometry(
     if not pair_consumers:
         raise RuntimeError("NVMe external batch contains no physical demand")
 
-    scoped_pairs: dict[int | None, dict[_PagePairKey, set[int]]] = defaultdict(
+    scoped_pairs: dict[int, dict[_PagePairKey, set[int]]] = defaultdict(
         lambda: defaultdict(set)
     )
     for pair_key, consumers in pair_consumers.items():
-        if tenant_isolation:
-            for request_index in consumers:
-                tenant = binding_by_index[request_index].tenant_id
-                scoped_pairs[tenant][pair_key].add(request_index)
-        else:
-            scoped_pairs[None][pair_key].update(consumers)
+        for request_index in consumers:
+            tenant = binding_by_index[request_index].tenant_id
+            scoped_pairs[tenant][pair_key].add(request_index)
 
     model = service_model or NvmeTransferServiceModel()
     if not isinstance(model, NvmeTransferServiceModel):
@@ -236,9 +235,7 @@ def plan_nvme_batch_geometry(
     span_physical_bytes = 0
     span_exact_bytes = 0
     scratch_cursor = 0
-    for tenant_id in sorted(
-        scoped_pairs, key=lambda value: -1 if value is None else value
-    ):
+    for tenant_id in sorted(scoped_pairs):
         consumers = scoped_pairs[tenant_id]
         normalized_consumers = tuple(
             (pair_key.pair, tuple(sorted(indices)))

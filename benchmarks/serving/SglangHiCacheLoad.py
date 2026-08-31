@@ -27,6 +27,7 @@ try:
     )
     from experiments.atomic_io import atomic_write_json
     from experiments.queueing import finite_window_system_accounting
+    from experiments.serving_metrics import joint_slo_goodput
     from experiments.validate_workload import validate as validate_workload
     from experiments.workload_heterogeneity import serving_batch_heterogeneity
 except ModuleNotFoundError:
@@ -39,6 +40,7 @@ except ModuleNotFoundError:
     )
     from experiments.atomic_io import atomic_write_json
     from experiments.queueing import finite_window_system_accounting
+    from experiments.serving_metrics import joint_slo_goodput
     from experiments.validate_workload import validate as validate_workload
     from experiments.workload_heterogeneity import serving_batch_heterogeneity
 
@@ -345,6 +347,38 @@ def _publish_engine_stats_snapshot(
         prior_paths,
         after_unix_ns=snapshot_started_ns,
     )
+
+
+def _require_closed_auto_calibration(
+    reports: dict[str, dict[str, Any]],
+) -> None:
+    """Reject a timed AUTO window that would still perform exploration."""
+
+    auto_reports = [
+        report
+        for report in reports.values()
+        if report.get("backend") == "nta_flashinfer"
+        and report.get("serving_tier") == "host_staged"
+        and report.get("host_execution_mode") == "auto"
+    ]
+    failures: list[str] = []
+    for report in auto_reports:
+        if report.get("incremental_setup_calibrated") is not True or int(
+            report.get("incremental_calibration_probes_remaining", -1)
+        ) != 0:
+            failures.append("execution-form setup")
+        consumer = report.get("consumer_policy_calibration")
+        if (
+            not isinstance(consumer, dict)
+            or consumer.get("last_shape_closed") is not True
+        ):
+            failures.append("partial-consumer policy")
+    if failures:
+        raise RuntimeError(
+            "performance warmup ended before AUTO calibration closed: "
+            + ", ".join(sorted(set(failures)))
+            + "; increase --load-warmup-iterations"
+        )
 
 
 def _consumer_contract(kind: str) -> dict[str, Any]:
@@ -943,10 +977,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--load-warmup-iterations",
         type=int,
-        default=2,
-        help="performance-excluded mixed arrivals before measurement",
+        default=8,
+        help=(
+            "performance-excluded exact-shape mixed arrivals; the NTA arm "
+            "also fails closed unless deployment calibration is complete"
+        ),
+    )
+    parser.add_argument(
+        "--setup-idle-timeout-seconds",
+        type=float,
+        default=120.0,
+        help=(
+            "setup-only timeout for SGLang requests and asynchronous HiCache "
+            "I/O to retire before deterministic cache reconstruction"
+        ),
     )
     parser.add_argument("--slo-ttft-seconds", type=float, default=8.0)
+    parser.add_argument("--slo-tpot-seconds", type=float, default=0.050)
     parser.add_argument("--slo-p99-itl-seconds", type=float, default=0.100)
     args = parser.parse_args()
     if not args.model.is_dir():
@@ -976,6 +1023,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("churn token count exceeds the SGLang request input budget")
     if args.load_warmup_iterations < 0:
         parser.error("load warmup iterations cannot be negative")
+    if args.setup_idle_timeout_seconds <= 0.0:
+        parser.error("setup idle timeout must be positive")
     if args.eviction_rounds is not None and args.eviction_rounds < 0:
         parser.error("eviction rounds cannot be negative")
     if args.numa_node is not None and args.numa_node < 0:
@@ -984,7 +1033,11 @@ def parse_args() -> argparse.Namespace:
         _parse_cpu_affinity(args.cpu_affinity)
     except ValueError as error:
         parser.error(str(error))
-    if args.slo_ttft_seconds <= 0 or args.slo_p99_itl_seconds <= 0:
+    if min(
+        args.slo_ttft_seconds,
+        args.slo_tpot_seconds,
+        args.slo_p99_itl_seconds,
+    ) <= 0:
         parser.error("SLO thresholds must be positive")
     if args.request_rate <= 0:
         parser.error("request rate must be positive")
@@ -1033,20 +1086,6 @@ class _AsyncGate(Protocol):
 
 class _Signal(Protocol):
     def set(self) -> Any: ...
-
-
-def _churn_window(
-    prompts: Sequence[TokenInput], ordinal: int, width: int
-) -> Sequence[TokenInput]:
-    """Return one disjoint setup/warmup eviction window."""
-
-    if ordinal < 0 or width < 0:
-        raise ValueError("churn window bounds cannot be negative")
-    begin = ordinal * width
-    end = begin + width
-    if end > len(prompts):
-        raise ValueError("churn prompt allocation does not cover the requested window")
-    return prompts[begin:end]
 
 
 def _structure_token_inputs(
@@ -1420,6 +1459,46 @@ def _generate_many(
     )
 
 
+def _flush_cache_when_idle(
+    engine: Any,
+    *,
+    timeout_seconds: float,
+    reason: str,
+) -> float:
+    """Flush SGLang after requests and asynchronous HiCache I/O retire.
+
+    ``Engine.generate`` returning is not a HiCache lifetime boundary: with
+    write-through enabled, the scheduler may still own a D-to-H operation for
+    the completed request.  SGLang's immediate ``Engine.flush_cache`` wrapper
+    therefore races legitimately with setup traffic.  The tokenizer-manager
+    contract carries a bounded timeout to the scheduler, whose deferred flush
+    waits for request queues and all HiCache I/O to become idle.
+    """
+
+    if timeout_seconds <= 0.0:
+        raise ValueError("SGLang idle-flush timeout must be positive")
+    manager = getattr(engine, "tokenizer_manager", None)
+    event_loop = getattr(engine, "loop", None)
+    flush_cache = getattr(manager, "flush_cache", None)
+    run_until_complete = getattr(event_loop, "run_until_complete", None)
+    if manager is None or not callable(flush_cache) or not callable(run_until_complete):
+        raise RuntimeError(
+            "SGLang engine lacks the deferred idle-flush contract required "
+            f"to {reason}"
+        )
+
+    started = time.perf_counter()
+    result = run_until_complete(flush_cache(timeout_s=timeout_seconds))
+    elapsed = time.perf_counter() - started
+    if not bool(getattr(result, "success", False)):
+        message = str(getattr(result, "message", "")) or "unspecified failure"
+        raise RuntimeError(
+            f"failed to {reason} after waiting at most "
+            f"{timeout_seconds:.3f}s for SGLang/HiCache retirement: {message}"
+        )
+    return elapsed
+
+
 def _exact_calibration_input(
     tokenizer: Any,
     prefix: Sequence[int],
@@ -1530,10 +1609,24 @@ async def _stream_request(
     offset_seconds: float,
     load_start_seconds: float,
 ) -> dict[str, Any]:
+    # Natural-trace arrivals are scheduled from the load origin.  The
+    # synthetic mixed-batch workload is different: its external cohort is not
+    # released until every resident request has produced a first token.  That
+    # barrier defines the synthetic cohort's arrival, rather than client or
+    # engine admission delay.  Keeping the old load-origin timestamp made the
+    # deliberate workload gate look like tens of milliseconds of admission
+    # queueing and corrupted finite-window queueing/accounting evidence.
+    schedule_origin = load_start_seconds
+    workload_gate_wait_seconds = 0.0
     if gate is not None:
         await gate.wait()
+        schedule_origin = time.perf_counter()
+        workload_gate_wait_seconds = max(
+            0.0, schedule_origin - load_start_seconds
+        )
     if offset_seconds:
         await asyncio.sleep(offset_seconds)
+    scheduled_arrival = schedule_origin + offset_seconds
     submitted = time.perf_counter()
     stream = await engine.async_generate(
         input_ids=list(input_ids),
@@ -1584,8 +1677,9 @@ async def _stream_request(
         "kind": kind,
         "index": index,
         "request_id": request_id or f"nta-load-{kind}-{index}",
-        "arrival_offset_seconds": offset_seconds,
-        "arrival_seconds": offset_seconds,
+        "arrival_offset_seconds": scheduled_arrival - load_start_seconds,
+        "arrival_seconds": scheduled_arrival - load_start_seconds,
+        "workload_gate_wait_seconds": workload_gate_wait_seconds,
         "submitted_offset_seconds": submitted - load_start_seconds,
         "first_token_offset_seconds": first - load_start_seconds,
         "finished_offset_seconds": finished - load_start_seconds,
@@ -1595,10 +1689,10 @@ async def _stream_request(
         "ttft_seconds": first - submitted,
         "e2e_seconds": finished - submitted,
         "admission_delay_seconds": max(
-            0.0, submitted - (load_start_seconds + offset_seconds)
+            0.0, submitted - scheduled_arrival
         ),
         "system_time_seconds": max(
-            0.0, finished - (load_start_seconds + offset_seconds)
+            0.0, finished - scheduled_arrival
         ),
         "tpot_seconds": (
             (token_times[-1] - first) / (completion_tokens - 1)
@@ -1789,37 +1883,6 @@ def _itl_values(records: list[dict[str, Any]]) -> list[float]:
     ] or [0.0]
 
 
-def _slo_goodput(
-    records: list[dict[str, Any]],
-    elapsed: float,
-    *,
-    ttft_seconds: float,
-    p99_itl_seconds: float,
-) -> dict[str, Any]:
-    qualified = sum(
-        float(record["ttft_seconds"]) <= ttft_seconds
-        and int(record["itl_sample_count"]) > 0
-        and record["token_timestamps_exact"] is True
-        and float(record["p99_itl_seconds"]) <= p99_itl_seconds
-        for record in records
-    )
-    return {
-        "qualified_requests": qualified,
-        "total_requests": len(records),
-        "requests_with_token_level_itl": sum(
-            int(record["itl_sample_count"]) > 0
-            and record["token_timestamps_exact"] is True
-            for record in records
-        ),
-        "attainment": qualified / len(records),
-        "goodput_requests_per_second": qualified / elapsed,
-        "thresholds_seconds": {
-            "ttft": ttft_seconds,
-            "p99_itl": p99_itl_seconds,
-        },
-    }
-
-
 def main() -> int:
     args = parse_args()
     requested_cpu_affinity = _parse_cpu_affinity(args.cpu_affinity)
@@ -1996,19 +2059,21 @@ def main() -> int:
         if args.eviction_rounds is not None
         else args.max_total_tokens // args.churn_tokens + 1
     )
-    churn_prompts = [
-        _token_input(
-            tokenizer,
-            make_prompt(tokenizer, f"load-churn-{index}", args.churn_tokens),
-        )
-        for index in range((2 + args.load_warmup_iterations) * eviction_rounds)
-    ]
     setup_sampling = {"temperature": 0, "max_new_tokens": 1}
     resident_cache_tokens = 0
     external_cache_tokens = 0
     combined_cache_tokens = 0
     shared_cache_tokens = 0
-    required_placement_pressure = 0
+    placement_page_tokens = (
+        int(workload_metadata["block_size"])
+        if workload_metadata is not None
+        else 1
+    )
+    required_placement_pressure = (
+        args.max_total_tokens + placement_page_tokens
+        if workload_metadata is not None or args.eviction_rounds is None
+        else args.eviction_rounds * args.churn_tokens
+    )
     placement_eviction_prompts: list[TokenInput] = []
     if workload_metadata is not None:
         block_size = int(workload_metadata["block_size"])
@@ -2038,27 +2103,28 @@ def main() -> int:
         # pool-sized unique pressure window makes every non-shared external
         # page older than the eviction frontier.  Warming residents afterwards
         # then restores only the exact pages shared with the resident set.
-        required_placement_pressure = args.max_total_tokens + block_size
-        remaining = max(args.churn_tokens, required_placement_pressure)
-        maximum_prompt_tokens = (
-            _max_request_input_tokens(args.context_length, args.max_total_tokens) - 1
-        )
-        while remaining > 0:
-            token_count = min(maximum_prompt_tokens, remaining)
-            placement_eviction_prompts.append(
-                _token_input(
+    remaining = required_placement_pressure
+    maximum_pressure_prompt_tokens = min(
+        args.churn_tokens,
+        _max_request_input_tokens(args.context_length, args.max_total_tokens) - 1,
+    )
+    while remaining > 0:
+        token_count = min(maximum_pressure_prompt_tokens, remaining)
+        placement_eviction_prompts.append(
+            _token_input(
+                tokenizer,
+                make_prompt(
                     tokenizer,
-                    make_prompt(
-                        tokenizer,
-                        f"load-placement-eviction-{len(placement_eviction_prompts)}",
-                        token_count,
-                    ),
-                )
+                    f"load-placement-eviction-{len(placement_eviction_prompts)}",
+                    token_count,
+                ),
             )
-            remaining -= token_count
+        )
+        remaining -= token_count
 
     measurement_baseline: dict[str, dict[str, Any]] = {}
     cpu_affinity_contract: dict[str, Any] = {}
+    setup_cache_flush_wait_seconds: list[float] = []
     load_started = time.perf_counter()
     with sgl.Engine(
         model_path=str(args.model.resolve()),
@@ -2124,6 +2190,20 @@ def main() -> int:
         load_seconds = time.perf_counter() - load_started
         generated_text(_generate_one(engine, shape_prompt, setup_sampling))
         generated_text(_generate_one(engine, shape_prompt, setup_sampling))
+        # Shape/JIT warmup uses a deliberately disjoint prompt so it cannot
+        # pre-populate the measured request.  It must not remain in HiCache,
+        # either: retaining that otherwise-dead prefix adds one full-context
+        # object to the setup working set and can evict the exact external
+        # prefix from a host pool that is large enough for the measured
+        # placement.  JIT modules and allocator state survive a radix-cache
+        # flush, so clear only cache contents before constructing placement.
+        setup_cache_flush_wait_seconds.append(
+            _flush_cache_when_idle(
+                engine,
+                timeout_seconds=args.setup_idle_timeout_seconds,
+                reason="clear shape warmup before external placement",
+            )
+        )
 
         def warm_external_prefixes() -> None:
             """Create a reusable, write-through-backed external prefix.
@@ -2151,16 +2231,17 @@ def main() -> int:
             )
 
         warm_external_prefixes()
-        for prompt in _churn_window(churn_prompts, 0, eviction_rounds):
+        for prompt in placement_eviction_prompts:
             generated_text(_generate_one(engine, prompt, setup_sampling))
         if workload_metadata is None:
             external_probe = _generate_one(engine, external_prefixes[0], setup_sampling)
             if host_cached_tokens(external_probe) <= 0:
                 raise RuntimeError("external JIT warmup did not load from host cache")
-        # Window 1 is setup-only.  Windows 2..N are reserved for excluded
-        # load warmups below; consuming the tail here would replay already
-        # cached churn prompts and weaken the intended eviction pressure.
-        for prompt in _churn_window(churn_prompts, 1, eviction_rounds):
+        # The probe above promotes the external prefix back to the device.
+        # Replay the capacity-sized pressure set to leave it host-resident.
+        # These prompts are setup-only and the cache is reset before every
+        # subsequent calibration/timed placement.
+        for prompt in placement_eviction_prompts:
             generated_text(_generate_one(engine, prompt, setup_sampling))
         warm_residents()
 
@@ -2183,20 +2264,15 @@ def main() -> int:
             causal arm.
             """
 
-            flush_result = engine.flush_cache()
-            if not bool(getattr(flush_result, "success", False)):
-                message = str(getattr(flush_result, "message", ""))
-                raise RuntimeError(
-                    "failed to reset SGLang cache before rebuilding the "
-                    f"measured placement: {message}"
+            setup_cache_flush_wait_seconds.append(
+                _flush_cache_when_idle(
+                    engine,
+                    timeout_seconds=args.setup_idle_timeout_seconds,
+                    reason="reset cache before rebuilding measured placement",
                 )
-            warm_external_prefixes()
-            placement_pressure = (
-                placement_eviction_prompts
-                if workload_metadata is not None
-                else _churn_window(churn_prompts, 0, eviction_rounds)
             )
-            for prompt in placement_pressure:
+            warm_external_prefixes()
+            for prompt in placement_eviction_prompts:
                 generated_text(_generate_one(engine, prompt, setup_sampling))
             warm_residents()
 
@@ -2268,6 +2344,8 @@ def main() -> int:
             if args.attention_backend == "nta_flashinfer"
             else {}
         )
+        if args.attention_backend == "nta_flashinfer":
+            _require_closed_auto_calibration(measurement_baseline)
         records, elapsed = engine.loop.run_until_complete(
             _run_load(
                 engine,
@@ -2480,10 +2558,10 @@ def main() -> int:
         "p95": _percentile(itl_values, 0.95),
         "p99": _percentile(itl_values, 0.99),
     }
-    slo_goodput = _slo_goodput(
-        records,
-        elapsed,
+    slo_goodput = joint_slo_goodput(
+        {"records": records, "elapsed_seconds": elapsed},
         ttft_seconds=args.slo_ttft_seconds,
+        tpot_seconds=args.slo_tpot_seconds,
         p99_itl_seconds=args.slo_p99_itl_seconds,
     )
     correctness = {
@@ -2562,6 +2640,14 @@ def main() -> int:
         "cuda_graph_decode": args.cuda_graph_decode,
         "cuda_graph_prefill": args.cuda_graph_prefill,
         "load_warmup_iterations": args.load_warmup_iterations,
+        "setup_cache_flush": {
+            "contract": "sglang_deferred_fully_idle",
+            "timeout_seconds": args.setup_idle_timeout_seconds,
+            "count": len(setup_cache_flush_wait_seconds),
+            "wait_seconds_total": sum(setup_cache_flush_wait_seconds),
+            "wait_seconds_max": max(setup_cache_flush_wait_seconds, default=0.0),
+            "excluded_from_timed_window": True,
+        },
         "load_warmup_excluded": (
             args.load_warmup_iterations >= 2
             and calibration_contract["verified"]
@@ -2585,6 +2671,12 @@ def main() -> int:
         "elapsed_seconds": elapsed,
         "request_throughput": len(records) / elapsed,
         "output_token_throughput": total_tokens / elapsed,
+        "resident_output_token_throughput": (
+            sum(int(record["completion_tokens"]) for record in resident) / elapsed
+        ),
+        "external_output_token_throughput": (
+            sum(int(record["completion_tokens"]) for record in external) / elapsed
+        ),
         "p50_ttft_seconds": ttft["p50"],
         "p95_ttft_seconds": ttft["p95"],
         "p99_ttft_seconds": ttft["p99"],

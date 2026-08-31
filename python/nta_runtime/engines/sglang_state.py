@@ -254,6 +254,9 @@ class SglangForwardEpoch:
     # republishes on the same consumer stream, while repeated transformer layers
     # reuse the immutable order without reset or dependency discovery.
     arriving_partition_key: tuple[int, int, int, int, tuple[int, ...]] | None = None
+    # Expensive page-table/lease projection checks are verification-only and
+    # run once per adopted wrapper, never once per transformer layer.
+    verified_projection_wrappers: set[int] = field(default_factory=set)
     execution: ExecutionPlan | None = None
     verification_session: ExecutionSession | None = None
     # Measured recurring control work between the direct/incremental decision
@@ -331,6 +334,7 @@ class SglangForwardEpoch:
             or self.planned_progressive_consumer_layers
             or self.host_layer_templates
             or self.arriving_partition_key is not None
+            or self.verified_projection_wrappers
             or self.execution is not None
             or self.verification_session is not None
             or self.incremental_metadata_setup_ns != 0

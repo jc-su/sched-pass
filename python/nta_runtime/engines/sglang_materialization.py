@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 
-from nta_runtime.flashinfer import direct_requirement, object_requirement
+from nta_runtime.flashinfer import direct_requirement
 from nta_runtime.engines.sglang_planning import (
     DEMAND_OBJECT_ID_BASE,
     MAX_ABI_BYTES,
@@ -28,6 +28,7 @@ from nta_runtime.flashinfer_schedule import Schedule
 from nta_runtime.indexed_transfer import IndexedTensorLane
 from nta_runtime.runtime import (
     DeviceWorkPlan,
+    INVALID_INDEX,
     IndexedAcquisitionPlan,
     IndexedHostIndexBinding,
     JitPhaseProgram,
@@ -54,6 +55,7 @@ class MaterializedAttentionPlan:
     event_partitioned: bool
     event_wave_work_counts: tuple[int, ...]
     external_object_slots: tuple[tuple[int, ...], ...]
+    external_work_mask: tuple[bool, ...]
 
 
 @dataclass
@@ -75,6 +77,7 @@ class _PlanAllocation:
     event_partitioned: bool = False
     event_wave_work_counts: tuple[int, ...] = ()
     external_object_slots: tuple[tuple[int, ...], ...] = ()
+    external_work_mask: tuple[bool, ...] = ()
 
     def view(self) -> MaterializedAttentionPlan:
         return MaterializedAttentionPlan(
@@ -89,6 +92,7 @@ class _PlanAllocation:
             self.event_partitioned,
             self.event_wave_work_counts,
             self.external_object_slots,
+            self.external_work_mask,
         )
 
 
@@ -227,6 +231,7 @@ class SglangPlanMaterializer:
         allocation.object_count = 0
         allocation.direct_work_count = schedule.work_count
         allocation.external_object_slots = tuple(() for _ in range(schedule.work_count))
+        allocation.external_work_mask = (False,) * schedule.work_count
         return plan
 
     def close(self) -> tuple[BaseException, ...]:
@@ -415,6 +420,7 @@ class SglangPlanMaterializer:
                 host_execution is None
                 or allocation.object_count != 0
                 or allocation.event_partitioned != arriving_prefetch
+                or len(allocation.external_work_mask) != schedule.work_count
                 or (
                     arriving_prefetch
                     and sum(allocation.event_wave_work_counts)
@@ -609,8 +615,10 @@ class SglangPlanMaterializer:
                 direct_base=self._runtime.device_view,
                 object_id_base=DEMAND_OBJECT_ID_BASE,
             )
-            if self._tenant_isolation_enabled:
-                indexed_acquisition_plan.require_single_tenant_groups()
+            # Request-owned KV is tenant-local independently of whether finite
+            # byte-budget enforcement is enabled.  A policy toggle may change
+            # admission/accounting, never resource ownership.
+            indexed_acquisition_plan.require_single_tenant_groups()
             if self._profile_cpu:
                 self._stats["plan_indexed_materialization_cpu_ns"] = (
                     self._stats.get("plan_indexed_materialization_cpu_ns", 0)
@@ -626,6 +634,7 @@ class SglangPlanMaterializer:
             unresolved_dependencies: list[int] = []
             direct_work_count = 0
             external_object_slots: list[tuple[int, ...]] = []
+            external_work_mask: list[bool] = []
         else:
             dependency_spans = list(indexed_acquisition_plan.dependency_spans)
             dependencies = indexed_acquisition_plan.dependencies
@@ -635,8 +644,9 @@ class SglangPlanMaterializer:
             ]
             direct_work_count = indexed_acquisition_plan.direct_work_count
             external_object_slots = list(indexed_acquisition_plan.external_object_slots)
+            external_work_mask = [bool(slots) for slots in external_object_slots]
         event_wave_work_counts: list[int] = []
-        event_completion_waves: list[int] = []
+        event_completion_classes: list[int] | None = None
         operation_by_id = {}
         if arriving_prefetch:
             if prefetched is None or prefetched.transfer_first_slot is None:
@@ -646,6 +656,7 @@ class SglangPlanMaterializer:
             ):
                 raise RuntimeError("arriving plan has incomplete wave readiness")
             event_wave_work_counts = [0] * prefetched.wave_count
+            event_completion_classes = [INVALID_INDEX] * schedule.work_count
             operation_by_id = {
                 operation.operation_id: operation
                 for operation in pending.operation_ranges()
@@ -673,6 +684,7 @@ class SglangPlanMaterializer:
         ) in work_entries:
             dependency_begin = len(dependencies)
             if external_rows > 0:
+                external_work_mask.append(True)
                 if prefetched is None:
                     raise RuntimeError(
                         "host demand work bypassed its compact indexed plan"
@@ -705,49 +717,26 @@ class SglangPlanMaterializer:
                         wave_begin = wave_end
                     if not wave_indices:
                         raise RuntimeError("arriving work has no completion wave")
-                    if 2 * len(wave_indices) > self._max_dependencies_per_work_ticket:
-                        raise RuntimeError(
-                            "arriving wave fan-in exceeds the work dependency bound"
+                    # Transfer ownership and its physical object slots belong
+                    # to LayerAcquisition. The numerical plan is preacquired
+                    # and reusable across layers; only completionClass carries
+                    # the stable producer/consumer ordering relation.
+                    dependencies.extend(
+                        (
+                            direct_requirement(self._runtime.device_view, 1),
+                            direct_requirement(self._runtime.device_view, 1),
                         )
-                    first_slot = prefetched.transfer_first_slot
-                    object_id_base = prefetched.transfer_object_id_base
-                    if object_id_base is None:
-                        raise RuntimeError(
-                            "arriving work lost its producer object identity"
-                        )
-                    work_slots: list[int] = []
-                    for wave in wave_indices:
-                        wave_start = (
-                            0 if wave == 0 else prefetched.wave_row_ends[wave - 1]
-                        )
-                        wave_rows = prefetched.wave_row_ends[wave] - wave_start
-                        key_slot = first_slot + 2 * wave
-                        value_slot = key_slot + 1
-                        dependencies.extend(
-                            (
-                                object_requirement(
-                                    object_slot=key_slot,
-                                    object_id=object_id_base + 2 * wave,
-                                    object_version=prefetched.transfer_object_version,
-                                    bytes=wave_rows * key_element_bytes,
-                                ),
-                                object_requirement(
-                                    object_slot=value_slot,
-                                    object_id=object_id_base + 2 * wave + 1,
-                                    object_version=prefetched.transfer_object_version,
-                                    bytes=wave_rows * value_element_bytes,
-                                ),
-                            )
-                        )
-                        object_fanout[key_slot] += 1
-                        object_fanout[value_slot] += 1
-                        work_slots.extend((key_slot, value_slot))
+                    )
                     completion_wave = wave_indices[-1]
                     event_wave_work_counts[completion_wave] += 1
-                    event_completion_waves.append(completion_wave)
+                    if event_completion_classes is None:  # pragma: no cover
+                        raise RuntimeError(
+                            "arriving completion classes were not initialized"
+                        )
+                    event_completion_classes[work_ticket] = completion_wave
                     unresolved_dependencies.append(2 * len(wave_indices))
-                    external_object_slots.append(tuple(work_slots))
-                    direct_dependencies = 0
+                    external_object_slots.append(())
+                    direct_dependencies = 2
                 else:
                     # A completed per-layer event is the sole completion edge;
                     # the numerical plan is therefore all-direct.
@@ -761,6 +750,7 @@ class SglangPlanMaterializer:
                     external_object_slots.append(())
                     direct_dependencies = 2
             else:
+                external_work_mask.append(False)
                 if transfer_dependency is not None:
                     raise RuntimeError("direct work retained a transfer dependency")
                 dependencies.extend(
@@ -781,12 +771,8 @@ class SglangPlanMaterializer:
                 )
             )
 
-        if arriving_prefetch and event_completion_waves != sorted(
-            event_completion_waves
-        ):
-            raise RuntimeError(
-                "FlashInfer external work order is not monotone in acquisition waves"
-            )
+        if len(external_work_mask) != schedule.work_count:
+            raise RuntimeError("materialized external-work identity is incomplete")
 
         if self._profile_cpu:
             self._stats["plan_dependency_build_cpu_ns"] = self._stats.get(
@@ -890,6 +876,7 @@ class SglangPlanMaterializer:
                 topology,
                 dependency_spans,
                 dependencies,
+                completion_classes=event_completion_classes,
                 stream=stream,
             )
             if self._profile_cpu:
@@ -915,6 +902,7 @@ class SglangPlanMaterializer:
         allocation.event_partitioned = arriving_prefetch
         allocation.event_wave_work_counts = tuple(event_wave_work_counts)
         allocation.external_object_slots = tuple(external_object_slots)
+        allocation.external_work_mask = tuple(external_work_mask)
         if prefetched is None:
             self._record_demand_plan_stats(
                 batch,

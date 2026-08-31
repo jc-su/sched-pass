@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define NTA_RUNTIME_C_API_VERSION 55U
+#define NTA_RUNTIME_C_API_VERSION 58U
 #define NTA_RUNTIME_USE_CURRENT_DEVICE (-1)
 
 typedef struct nta_runtime nta_runtime;
@@ -61,6 +61,15 @@ typedef enum nta_tier_owner {
   NTA_TIER_OWNER_TRANSPORT = 3,
 } nta_tier_owner;
 
+typedef enum nta_object_scope {
+  // Request-owned state such as a tenant's KV pages. Cross-tenant fan-out is
+  // rejected and bytes are charged to request, tenant, and backend windows.
+  NTA_OBJECT_SCOPE_TENANT_LOCAL = 0,
+  // Immutable runtime/model state such as expert weights. One acquisition may
+  // serve multiple tenants and is charged only to the shared backend window.
+  NTA_OBJECT_SCOPE_GLOBAL_SHARED = 1,
+} nta_object_scope;
+
 typedef struct nta_runtime_config {
   uint32_t struct_size;
   uint32_t api_version;
@@ -109,7 +118,7 @@ typedef struct nta_indexed_host_object {
   uint32_t staging_stride_bytes;
   uint32_t source_index_limit;
   uint32_t staging_index_limit;
-  uint32_t reserved;
+  uint32_t scope;
 } nta_indexed_host_object;
 
 typedef struct nta_indexed_host_index_binding {
@@ -151,9 +160,15 @@ typedef struct nta_work_item {
   uint32_t contributor_count;
   uint32_t estimated_compute_ns;
   uint64_t ready_deadline_offset_ns;
-  uint32_t reserved2;
-  uint32_t reserved3;
+  uint32_t completion_class;
+  uint32_t flags;
 } nta_work_item;
+
+typedef enum nta_work_item_flag {
+  NTA_WORK_ITEM_EVENT_PARTITION = 1U << 0,
+} nta_work_item_flag;
+
+#define NTA_MAX_EVENT_COMPLETION_CLASSES 64U
 
 typedef struct nta_request_work_range {
   uint32_t work_begin;
@@ -215,7 +230,7 @@ typedef struct nta_nvme_hbm_registration_range {
   uint64_t registration_bytes;
 } nta_nvme_hbm_registration_range;
 
-// C API v48: one entry in an all-or-nothing host-validated, stream-ordered
+// C API v58: one entry in an all-or-nothing host-validated, stream-ordered
 // registered-HBM directory publication. Entries must name a contiguous,
 // strictly increasing slot range. The region is a setup-time mapping lease;
 // publication performs no allocation, pin, map, or per-I/O ioctl.
@@ -228,6 +243,8 @@ typedef struct nta_registered_nvme_object {
   uint64_t prior_consumer_event;
   uint32_t slot;
   uint32_t version;
+  uint32_t scope;
+  uint32_t reserved;
 } nta_registered_nvme_object;
 
 typedef struct nta_cxl_dax_options {
@@ -390,6 +407,7 @@ nta_status nta_runtime_set_tenant_budget(nta_runtime *runtime,
                                          uint64_t max_outstanding_bytes);
 nta_status nta_runtime_register_object(nta_runtime *runtime, uint32_t slot,
                                        uint64_t object_id, uint32_t version,
+                                       uint32_t scope,
                                        uint64_t bytes,
                                        uint64_t staging_device_address,
                                        const nta_registered_replica *replicas,
@@ -397,6 +415,7 @@ nta_status nta_runtime_register_object(nta_runtime *runtime, uint32_t slot,
                                        uint64_t *direct_device_base_out);
 nta_status nta_runtime_register_indexed_host_object(
     nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
+    uint32_t scope,
     uint64_t source_device_address, uint64_t staging_device_address,
     uint64_t source_indices_device_address,
     uint64_t staging_indices_device_address, uint32_t index_count,
@@ -434,21 +453,25 @@ nta_status nta_runtime_bind_tensor_maps(nta_runtime *runtime,
 nta_status
 nta_runtime_install_nvme_object(nta_runtime *runtime, uint32_t slot,
                                 uint64_t object_id, uint32_t version,
+                                uint32_t scope,
                                 uint64_t source_byte_offset, uint64_t bytes,
                                 uint64_t *destination_device_address_out);
 nta_status nta_runtime_install_nvme_object_async(
     nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
+    uint32_t scope,
     uint64_t source_byte_offset, uint64_t bytes, uint64_t cuda_stream,
     uint64_t prior_consumer_event, uint64_t *destination_device_address_out);
 // Publish an MDTS-bounded view of a setup-time registered caller-owned HBM
 // region. Publication owns no allocation or mapping operation.
 nta_status nta_runtime_install_registered_nvme_object(
     nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
+    uint32_t scope,
     uint64_t source_byte_offset, uint64_t bytes, nta_nvme_hbm_region *region,
     uint64_t destination_device_address,
     uint64_t *destination_device_address_out);
 nta_status nta_runtime_install_registered_nvme_object_async(
     nta_runtime *runtime, uint32_t slot, uint64_t object_id, uint32_t version,
+    uint32_t scope,
     uint64_t source_byte_offset, uint64_t bytes, nta_nvme_hbm_region *region,
     uint64_t destination_device_address, uint64_t cuda_stream,
     uint64_t prior_consumer_event, uint64_t *destination_device_address_out);
@@ -605,12 +628,13 @@ nta_status
 nta_jit_phase_prepare_ready_window(const nta_jit_phase_program *program,
                                    nta_runtime *runtime, uint32_t maximum_work,
                                    uint64_t cuda_stream);
-/* C API v45: publish one stable direct/deferred work partition for a
- * producer-event-owned proactive acquisition. */
+/* C API v57: publish one stable direct/completion-class work partition for a
+ * proactive acquisition. Completion classes are producer-independent typed
+ * WorkItem metadata; transport object slots never enter numerical policy. */
 nta_status nta_jit_phase_prepare_event_work_partition(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint64_t work_items, uint32_t work_item_count, uint32_t direct_work_count,
-    uint64_t cuda_stream);
+    uint32_t wave_count, uint64_t cuda_stream);
 nta_status nta_jit_phase_progress_indexed_host_range(
     const nta_jit_phase_program *program, nta_runtime *runtime,
     uint32_t first_object, uint32_t object_count, uint64_t cuda_stream);

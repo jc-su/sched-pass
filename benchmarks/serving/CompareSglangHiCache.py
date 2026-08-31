@@ -104,6 +104,7 @@ def require_clean_mechanism(
     require_graph_replay: bool = False,
     require_demand_graph: bool = False,
     require_physical_compaction: bool = False,
+    require_read_only_calibration_profile: bool = False,
 ) -> dict[str, Any]:
     """Validate the exact execution contract exercised by one serving arm."""
     stats = [
@@ -140,19 +141,93 @@ def require_clean_mechanism(
     auto_calibration_closed = all(
         entry.get("incremental_setup_calibrated") is True
         and int(entry.get("incremental_calibration_probes_remaining", -1)) == 0
+        and isinstance(entry.get("consumer_policy_calibration"), dict)
+        and entry["consumer_policy_calibration"].get("last_shape_closed") is True
         for entry in auto_host_entries
     )
     if auto_host_entries and not auto_calibration_closed:
         raise RuntimeError(
-            "host AUTO trial reached measurement before incremental setup "
-            "calibration closed"
+            "host AUTO trial reached measurement before execution-form and "
+            "consumer-policy calibration closed"
         )
+    timed_auto_calibration = sum(
+        total(name)
+        for name in (
+            "host_selection_calibration_probe_batches",
+            "host_selection_consumer_policy_probe_batches",
+            "consumer_policy_profiled_leases",
+            "consumer_policy_probe_leases",
+        )
+    )
+    if auto_host_entries and timed_auto_calibration:
+        raise RuntimeError(
+            "host AUTO trial used the timed window for calibration "
+            f"({timed_auto_calibration} calibration actions)"
+        )
+    calibration_profile_digests: set[str] = set()
+    if require_read_only_calibration_profile:
+        if not auto_host_entries or len(auto_host_entries) != len(stats):
+            raise RuntimeError(
+                "a read-only calibration profile requires host-staged AUTO "
+                "execution in every NTA worker"
+            )
+        profile_calibration_actions = sum(
+            total(name)
+            for name in (
+                "consumer_policy_arrival_samples",
+                "consumer_policy_stock_samples",
+                "consumer_policy_partial_samples",
+                "consumer_policy_partial_reuse_samples",
+                "consumer_policy_partial_setup_samples",
+                "layer_service_profiled_intervals",
+                "incremental_initialization_samples",
+                "incremental_setup_samples",
+                "incremental_service_samples",
+                "cost_model_transfer_samples",
+                "prefetch_mover_plan_calibration_probe_copy_leases",
+                "prefetch_mover_plan_calibration_probe_sm_leases",
+            )
+        )
+        invalid_profiles: list[str] = []
+        for index, entry in enumerate(auto_host_entries):
+            digest = entry.get("calibration_profile_sha256")
+            if not isinstance(digest, str) or len(digest) != 64:
+                invalid_profiles.append(f"worker {index} omitted the profile digest")
+            else:
+                calibration_profile_digests.add(digest)
+            if entry.get("calibration_profile_status") != "loaded_read_only":
+                invalid_profiles.append(f"worker {index} did not load read-only")
+            if entry.get("calibration_profile_read_only") is not True:
+                invalid_profiles.append(f"worker {index} profile is writable")
+            if int(entry.get("calibration_profile_loaded_samples", 0)) <= 0:
+                invalid_profiles.append(f"worker {index} loaded no samples")
+            for counter in (
+                "calibration_profile_save_count",
+                "calibration_profile_checkpoint_failures",
+                "calibration_profile_deferred_checkpoints",
+            ):
+                if int(entry.get(counter, 0)) != 0:
+                    invalid_profiles.append(
+                        f"worker {index} reported {counter}="
+                        f"{entry.get(counter)!r}"
+                    )
+        if invalid_profiles:
+            raise RuntimeError(
+                "read-only calibration profile contract failed: "
+                + "; ".join(invalid_profiles)
+            )
+        if profile_calibration_actions:
+            raise RuntimeError(
+                "read-only calibrated trial performed calibration in the timed "
+                f"window ({profile_calibration_actions} actions)"
+            )
 
     fallbacks = total("hicache_fallback_batches")
     external_batches = total("hicache_external_batches")
     external_launches = total("external_launches")
     prefetched_layers = total("prefetched_layers")
     demand_layers = total("demand_host_layers")
+    owned_host_layers = total("host_acquisition_layers_consumed")
     transformed = total("transformed_direct_launches")
     incremental = total("ticketed_incremental_launches")
     event_ordered_incremental = total("event_ordered_incremental_launches")
@@ -164,7 +239,17 @@ def require_clean_mechanism(
     native_external_launches = total("native_external_attention_launches")
     accounted_external_launches = external_launches
     tier_external_layers = total("tier_external_layers")
-    acquisition_layers = prefetched_layers + demand_layers + tier_external_layers
+    # A proactive Host acquisition and its partial numerical consumer are two
+    # roles of the same layer, not two acquisitions. Once the typed owner is
+    # active, retirement is the exact ownership counter; demand_host_layers is
+    # consumer-path telemetry and may overlap it. Eager/demand-only forms have
+    # no acquisition owner and retain the disjoint physical counters.
+    host_acquisition_layers = (
+        owned_host_layers
+        if owned_host_layers != 0
+        else prefetched_layers + demand_layers
+    )
+    acquisition_layers = host_acquisition_layers + tier_external_layers
     if fallbacks:
         raise RuntimeError(f"NTA HiCache trial used {fallbacks} fallback batches")
     if external_batches == 0 or accounted_external_launches == 0:
@@ -172,8 +257,9 @@ def require_clean_mechanism(
     if accounted_external_launches != acquisition_layers:
         raise RuntimeError(
             "external attention layers do not match acquisition layers "
-            f"({accounted_external_launches} != {prefetched_layers} + "
-            f"{demand_layers} + {tier_external_layers})"
+            f"({accounted_external_launches} != host-owned "
+            f"{host_acquisition_layers} + tier {tier_external_layers}; "
+            f"prefetched={prefetched_layers}, consumers={demand_layers})"
         )
     if external_launches != native_external_launches + stock_external_launches:
         raise RuntimeError(
@@ -376,6 +462,10 @@ def require_clean_mechanism(
         "execution_protocol": protocol,
         "auto_calibration_applicable": bool(auto_host_entries),
         "auto_calibration_closed": auto_calibration_closed,
+        "read_only_calibration_profile_required": (
+            require_read_only_calibration_profile
+        ),
+        "calibration_profile_digests": sorted(calibration_profile_digests),
     }
 
 

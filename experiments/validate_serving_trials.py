@@ -30,6 +30,78 @@ def _finite(value: Any, name: str) -> float:
     return float(value)
 
 
+def _validate_external_request_evidence(
+    evidence: Any, *, formal: bool
+) -> None:
+    _require(
+        isinstance(evidence, dict) and evidence.get("schema") == 1,
+        "serving trial aggregate has no external-request evidence",
+    )
+    minimum = evidence.get("minimum_external_observations_per_arm")
+    minimum_distinct = evidence.get(
+        "minimum_distinct_external_request_ids_per_arm"
+    )
+    _require(
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and minimum > 0
+        and isinstance(minimum_distinct, int)
+        and not isinstance(minimum_distinct, bool)
+        and minimum_distinct >= 0,
+        "serving trial external-request thresholds are invalid",
+    )
+    _require(
+        not formal or minimum >= 100,
+        "formal serving evidence requires at least 100 external observations",
+    )
+    per_arm = evidence.get("per_arm")
+    _require(
+        isinstance(per_arm, dict) and set(per_arm) == {"stock", "nta"},
+        "serving trial external-request arm evidence is invalid",
+    )
+    arm_passes: list[bool] = []
+    for name in ("stock", "nta"):
+        arm = per_arm[name]
+        _require(isinstance(arm, dict), f"external-request arm {name} is invalid")
+        observations = arm.get("external_observations")
+        distinct = arm.get("distinct_external_request_ids")
+        _require(
+            isinstance(observations, int)
+            and not isinstance(observations, bool)
+            and observations >= 0
+            and isinstance(distinct, int)
+            and not isinstance(distinct, bool)
+            and 0 <= distinct <= observations,
+            f"external-request arm {name} has invalid counts",
+        )
+        observations_met = observations >= minimum
+        distinct_met = distinct >= minimum_distinct
+        _require(
+            arm.get("observations_threshold_met") is observations_met
+            and arm.get("distinct_requests_threshold_met") is distinct_met,
+            f"external-request arm {name} has a stale threshold verdict",
+        )
+        arm_passes.append(observations_met and distinct_met)
+    counts_match = (
+        per_arm["stock"]["external_observations"]
+        == per_arm["nta"]["external_observations"]
+    )
+    _require(
+        evidence.get("paired_observation_counts_match") is counts_match
+        and isinstance(evidence.get("paired_distinct_request_ids_match"), bool),
+        "external-request paired evidence is inconsistent",
+    )
+    expected = bool(
+        counts_match
+        and evidence["paired_distinct_request_ids_match"]
+        and all(arm_passes)
+    )
+    _require(
+        evidence.get("passes") is expected,
+        "external-request aggregate verdict is inconsistent",
+    )
+
+
 def validate(report: dict[str, Any]) -> dict[str, Any]:
     _require(report.get("schema") == 2, "unsupported serving trial schema")
     _require(
@@ -38,6 +110,9 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
     )
     mode = report.get("mode")
     _require(mode in {"formal", "diagnostic"}, "unknown serving trial mode")
+    _validate_external_request_evidence(
+        report.get("external_request_evidence"), formal=mode == "formal"
+    )
     trial_count = report.get("trial_count")
     _require(
         isinstance(trial_count, int)
@@ -99,7 +174,11 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
     _require(isinstance(bars, dict) and bars, "serving trial aggregate has no bars")
     required_bars = {
         "registered_goodput",
+        "registered_joint_goodput",
         "resident_p99_itl",
+        "resident_p95_tpot",
+        "resident_output_throughput",
+        "output_throughput",
         "outputs",
         "mechanism",
         "physical_bytes",
@@ -114,31 +193,71 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
             isinstance(bar, dict) and isinstance(bar.get("passes"), bool),
             f"serving trial bar {name} has no boolean verdict",
         )
-    registered = bars["registered_goodput"]
-    _finite(registered.get("bar"), "registered-goodput bar")
-    _require(
-        isinstance(registered.get("all_requests_have_token_level_itl"), bool),
-        "registered-goodput bar lacks token-level ITL eligibility",
-    )
-    _require(
-        registered["all_requests_have_token_level_itl"]
-        or registered.get("passes") is False,
-        "registered-goodput bar passed with requests lacking token-level ITL",
-    )
-    if registered.get("geometric_mean") is None or registered.get("ci_floor") is None:
+    for key, label in (
+        ("registered_goodput", "registered-goodput"),
+        ("registered_joint_goodput", "registered joint-goodput"),
+    ):
+        registered = bars[key]
+        threshold = _finite(registered.get("bar"), f"{label} bar")
         _require(
-            registered.get("passes") is False,
-            "registered-goodput bar passed without a finite estimate",
+            isinstance(registered.get("all_requests_have_token_level_itl"), bool),
+            f"{label} bar lacks token-level ITL eligibility",
         )
-    else:
-        _finite(
-            registered.get("geometric_mean"),
-            "registered-goodput geometric mean",
+        _require(
+            registered["all_requests_have_token_level_itl"]
+            or registered.get("passes") is False,
+            f"{label} bar passed with requests lacking token-level ITL",
         )
-        _finite(registered.get("ci_floor"), "registered-goodput CI floor")
-    resident = bars["resident_p99_itl"]
-    _finite(resident.get("bar"), "resident-ITL bar")
-    _finite(resident.get("geometric_mean"), "resident-ITL geometric mean")
+        if (
+            registered.get("geometric_mean") is None
+            or registered.get("ci_floor") is None
+        ):
+            _require(
+                registered.get("passes") is False,
+                f"{label} bar passed without a finite estimate",
+            )
+        else:
+            geometric_mean = _finite(
+                registered.get("geometric_mean"), f"{label} geometric mean"
+            )
+            ci_floor = _finite(registered.get("ci_floor"), f"{label} CI floor")
+            expected = bool(
+                registered["all_requests_have_token_level_itl"]
+                and geometric_mean >= threshold
+                and ci_floor > 1.0
+            )
+            _require(
+                registered.get("passes") is expected,
+                f"{label} verdict is inconsistent",
+            )
+
+    ratio_bars = (
+        ("resident_p99_itl", 1.05, True, None),
+        ("resident_p95_tpot", 1.05, True, "upper"),
+        ("resident_output_throughput", 0.95, False, "lower"),
+        ("output_throughput", 0.95, False, "lower"),
+    )
+    for name, expected_threshold, at_most, bound in ratio_bars:
+        bar = bars[name]
+        threshold = _finite(bar.get("bar"), f"{name} bar")
+        _require(
+            threshold == expected_threshold,
+            f"{name} threshold does not match the registered contract",
+        )
+        geometric_mean = _finite(
+            bar.get("geometric_mean"), f"{name} geometric mean"
+        )
+        compared = geometric_mean
+        if bound is not None:
+            compared = _finite(
+                bar.get(f"bootstrap_95_percent_ci_{bound}"),
+                f"{name} bootstrap CI {bound}",
+            )
+        expected = compared <= threshold if at_most else compared >= threshold
+        _require(
+            bar.get("passes") is expected,
+            f"{name} verdict is inconsistent",
+        )
 
     all_bars_pass = all(bool(bar["passes"]) for bar in bars.values())
     _require(

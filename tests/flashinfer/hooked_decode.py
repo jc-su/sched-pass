@@ -8,6 +8,7 @@ import math
 import os
 import pathlib
 import statistics
+from types import SimpleNamespace
 
 import flashinfer
 import torch
@@ -15,6 +16,7 @@ from nta_runtime import (
     AcquireRequirement,
     DeviceWorkPlan,
     FlashInferLayerEpoch,
+    INVALID_INDEX,
     IndexedHostObject,
     JitOperatorModule,
     JitPhaseProgram,
@@ -38,16 +40,20 @@ from nta_runtime import (
     Runtime,
     RuntimeConfig,
     WorkItem,
+    WorkItemFlag,
     require_operator_pair,
 )
 from nta_runtime.flashinfer import (
     BIND_CURRENT_GENERATION,
+    DYNAMIC_RUNNABLE_WINDOW,
     RUNNABLE_OFFSET_SHIFT,
     RUNNABLE_WORK,
+    SKIP_MERGE,
     enqueue_event_partitioned_attention,
     request_bound_attention_jit_args,
 )
 from nta_runtime.flashinfer_schedule import decode_schedule, paged_prefill_schedule
+from nta_runtime.engines.sglang_verification import SglangAttentionVerifier
 from nta_runtime.transport_program import load_activated_transport_program
 
 
@@ -72,6 +78,9 @@ class RuntimeFixture:
         destination_indices: torch.Tensor | None = None,
         direct_work_indices: set[int] | None = None,
         partitioned_objects: bool = False,
+        partition_object_slots: list[int] | None = None,
+        runtime_object_capacity: int | None = None,
+        event_completion_classes: list[int] | None = None,
     ) -> None:
         if work_count <= 0:
             raise ValueError("work_count must be positive")
@@ -80,6 +89,19 @@ class RuntimeFixture:
             request_indices = [0] * work_count
         if len(request_indices) != work_count or min(request_indices) < 0:
             raise ValueError("request_indices must identify every work item")
+        if event_completion_classes is not None:
+            if len(event_completion_classes) != work_count:
+                raise ValueError(
+                    "event completion classes must identify every work item"
+                )
+            if direct_work_indices is None or any(
+                (completion_class == INVALID_INDEX)
+                != (index in direct_work_indices)
+                for index, completion_class in enumerate(event_completion_classes)
+            ):
+                raise ValueError(
+                    "event completion classes disagree with direct work"
+                )
         request_count = max(request_indices) + 1
         self.kv = kv
         self.host_source = host_source
@@ -109,11 +131,33 @@ class RuntimeFixture:
             self.destination_indices = None
             element_bytes = 0
             transfer_bytes = byte_count
-        object_count = work_count if partitioned_objects else 1
+        if partition_object_slots is not None:
+            if (
+                not partitioned_objects
+                or len(partition_object_slots) != work_count
+                or min(partition_object_slots) < 0
+            ):
+                raise ValueError(
+                    "partition object slots must identify every work item"
+                )
+            object_count = max(partition_object_slots) + 1
+            if set(partition_object_slots) != set(range(object_count)):
+                raise ValueError("partition object slots must form a dense range")
+        else:
+            object_count = work_count if partitioned_objects else 1
+        if runtime_object_capacity is not None:
+            if runtime_object_capacity < object_count:
+                raise ValueError("runtime object capacity cannot truncate the fixture")
+            runtime_object_count = runtime_object_capacity
+        else:
+            runtime_object_count = max(2, object_count)
         self.native_runtime = Runtime(
             RuntimeConfig(
                 request_capacity=request_count,
-                object_capacity=object_count,
+                # Event-partitioned serving publishes one K/V object pair per
+                # completion wave. Single-object fixtures still use slot zero,
+                # but retain enough directory geometry to exercise that ABI.
+                object_capacity=runtime_object_count,
                 intent_capacity=object_count,
                 work_ticket_capacity=work_count,
                 max_dependencies_per_work_ticket=1,
@@ -135,22 +179,31 @@ class RuntimeFixture:
         direct_bases = [0] * work_count
         self.partition_indices: list[torch.Tensor] = []
         if partitioned_objects:
-            if kv.shape[0] % work_count != 0:
-                raise ValueError("KV rows do not divide across partitioned objects")
-            rows_per_object = kv.shape[0] // work_count
+            if kv.shape[0] < work_count:
+                raise ValueError("partitioned objects need at least one KV row per work")
             element_bytes = kv[0].numel() * kv.element_size()
-            transfer_bytes = rows_per_object * element_bytes
-            for index in range(work_count):
-                rows = torch.arange(
-                    index * rows_per_object,
-                    (index + 1) * rows_per_object,
-                    dtype=torch.int32,
-                    device="cuda",
+            work_slots = (
+                list(range(work_count))
+                if partition_object_slots is None
+                else list(partition_object_slots)
+            )
+            rows_by_slot: list[list[torch.Tensor]] = [
+                [] for _ in range(object_count)
+            ]
+            for index, object_slot in enumerate(work_slots):
+                begin = index * int(kv.shape[0]) // work_count
+                end = (index + 1) * int(kv.shape[0]) // work_count
+                rows_by_slot[object_slot].append(
+                    torch.arange(begin, end, dtype=torch.int32, device="cuda")
                 )
+            slot_bytes: list[int] = [0] * object_count
+            for object_slot, row_parts in enumerate(rows_by_slot):
+                rows = torch.cat(row_parts)
                 self.partition_indices.append(rows)
-                object_id = OBJECT_ID + index
+                transfer_bytes = rows.numel() * element_bytes
+                object_id = OBJECT_ID + object_slot
                 self.native_runtime.register_indexed_host_object(
-                    index,
+                    object_slot,
                     object_id,
                     1,
                     host_source.data_ptr(),
@@ -164,9 +217,11 @@ class RuntimeFixture:
                     int(host_source.shape[0]),
                     int(kv.shape[0]),
                 )
-                object_ids[index] = object_id
-                object_slots[index] = index
-                transfer_sizes[index] = transfer_bytes
+                slot_bytes[object_slot] = transfer_bytes
+            for index, object_slot in enumerate(work_slots):
+                object_ids[index] = OBJECT_ID + object_slot
+                object_slots[index] = object_slot
+                transfer_sizes[index] = slot_bytes[object_slot]
         elif indexed:
             self.native_runtime.register_indexed_host_object(
                 0,
@@ -202,17 +257,19 @@ class RuntimeFixture:
         direct_counts = []
         for index in range(work_count):
             direct_base = direct_bases[index]
-            if direct_work_indices is not None:
+            if event_completion_classes is not None:
+                direct_base = kv.data_ptr()
+            elif direct_work_indices is not None:
                 direct_base = kv.data_ptr() if index in direct_work_indices else 0
             dependencies.append(
                 AcquireRequirement(
                     direct_base,
                     0,
-                    object_ids[index],
+                    0 if event_completion_classes is not None else object_ids[index],
                     0,
-                    object_slots[index],
-                    1,
-                    transfer_sizes[index],
+                    0 if event_completion_classes is not None else object_slots[index],
+                    0 if event_completion_classes is not None else 1,
+                    1 if event_completion_classes is not None else transfer_sizes[index],
                     0,
                 )
             )
@@ -238,6 +295,17 @@ class RuntimeFixture:
                     contributor_indices[request_index],
                     contributor_counts[request_index],
                     2500,
+                    0,
+                    (
+                        0
+                        if event_completion_classes is None
+                        else event_completion_classes[index]
+                    ),
+                    (
+                        0
+                        if event_completion_classes is None
+                        else int(WorkItemFlag.EVENT_PARTITION)
+                    ),
                 )
             )
             contributor_indices[request_index] += 1
@@ -417,12 +485,14 @@ def make_request_bound_decode_wrapper(
 
 def make_prefill_wrapper(
     module_name: str = "nta_batch_prefill_default_v2_hooked",
+    workspace_bytes: int = 64 * 1024 * 1024,
+    dtype: torch.dtype = torch.float16,
 ) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
     jit_args = [
         module_name,
-        torch.float16,
-        torch.float16,
-        torch.float16,
+        dtype,
+        dtype,
+        dtype,
         torch.int32,
         128,
         128,
@@ -433,7 +503,7 @@ def make_prefill_wrapper(
         VARIANT_NAME,
         VARIANT_DECL,
     ]
-    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device="cuda")
     return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace, "NHD", backend="fa2", jit_args=jit_args
     )
@@ -548,6 +618,13 @@ def paired_overhead_percent(
     ) * 100.0
 
 
+def checkpoint(options: argparse.Namespace, name: str) -> bool:
+    """Publish a finite GPU-test boundary and optionally stop there."""
+
+    print(f"flashinfer_checkpoint={name}", flush=True)
+    return options.stop_after == name
+
+
 def run_hooked(
     wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper,
     q: torch.Tensor,
@@ -580,7 +657,10 @@ def run_prefill_hooked(
     fixture: RuntimeFixture,
     output: torch.Tensor,
     skip_merge: bool = False,
+    launch_flags: int | None = None,
+    launch_work_count: int | None = None,
 ) -> None:
+    flags = int(skip_merge) if launch_flags is None else launch_flags
     wrapper.run(
         q,
         kv,
@@ -588,8 +668,8 @@ def run_prefill_hooked(
         fixture.work_items,
         fixture.requirements,
         1.0 / math.sqrt(128),
-        fixture.work_count,
-        int(skip_merge),
+        fixture.work_count if launch_work_count is None else launch_work_count,
+        flags,
         out=output,
     )
     fixture.plan.mark_consumed(torch.cuda.current_stream())
@@ -826,6 +906,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sanitizer", action="store_true")
     parser.add_argument("--nvme-numerical-only", action="store_true")
+    parser.add_argument(
+        "--stop-after",
+        choices=(
+            "host",
+            "indexed",
+            "split-k",
+            "heterogeneous-decode",
+            "prefill",
+            "request-bound",
+        ),
+    )
     options = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -863,8 +954,11 @@ def main() -> None:
     deferred = RuntimeFixture(staging_kv, host_kv)
     phases.call("nta_jit_reset_epoch", deferred, 1, 1)
     deferred_output = torch.full_like(expected, math.nan)
-    run_hooked(hooked, q, staging_kv, deferred, deferred_output)
-    phases.call("nta_jit_complete_launched", deferred, 1)
+    phases.program.discover(
+        deferred.native_runtime,
+        deferred.plan,
+        torch.cuda.current_stream(),
+    )
     torch.cuda.synchronize()
     deferred.assert_all_states(1)
     if not torch.isnan(deferred_output).all():
@@ -876,7 +970,15 @@ def main() -> None:
     deferred.assert_all_states(2)
     if deferred.native_runtime.work_runnable_ns(1)[0] <= 0:
         raise RuntimeError("external FlashInfer work omitted its GPU arrival time")
-    run_hooked(hooked, q, staging_kv, deferred, deferred_output)
+    run_hooked(
+        hooked,
+        q,
+        staging_kv,
+        deferred,
+        deferred_output,
+        launch_flags=BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+        launch_work_count=1,
+    )
     phases.call("nta_jit_complete_launched", deferred, 1)
     torch.cuda.synchronize()
     deferred.assert_all_states(3)
@@ -938,6 +1040,7 @@ def main() -> None:
         destination_indices=torch.arange(
             mixed_pages, 2 * mixed_pages, dtype=torch.int32
         ),
+        event_completion_classes=[INVALID_INDEX, 0],
     )
     arriving_output = torch.full_like(mixed_expected, math.nan)
     arriving_stream = torch.cuda.Stream(priority=0)
@@ -954,8 +1057,6 @@ def main() -> None:
         arriving_staging_kv,
         arriving_output,
         ready_events=(arriving_ready,),
-        ready_object_slots=(),
-        registration_event=None,
         direct_work_count=1,
         wave_work_counts=(1,),
         prepare_partition=True,
@@ -1039,6 +1140,8 @@ def main() -> None:
     lookahead.assert_all_states(3)
     torch.testing.assert_close(lookahead_staging_kv, mixed_reference_kv, rtol=0, atol=0)
     torch.testing.assert_close(lookahead_output, mixed_expected, rtol=2e-3, atol=2e-3)
+    if checkpoint(options, "host"):
+        return
 
     plan(hooked)
     indexed_staging = torch.zeros_like(reference_kv)
@@ -1050,7 +1153,11 @@ def main() -> None:
     )
     phases.call("nta_jit_reset_epoch", indexed, 1, 1)
     indexed_output = torch.full_like(expected, math.nan)
-    run_hooked(hooked, q, indexed_staging, indexed, indexed_output)
+    phases.program.discover(
+        indexed.native_runtime,
+        indexed.plan,
+        torch.cuda.current_stream(),
+    )
     phases.program.progress_indexed_host_range(
         indexed.native_runtime, 0, 1, torch.cuda.current_stream()
     )
@@ -1081,12 +1188,10 @@ def main() -> None:
     )
     phases.call("nta_jit_reset_epoch", queued_indexed, 1, 1)
     queued_indexed_output = torch.full_like(expected, math.nan)
-    run_hooked(
-        hooked,
-        q,
-        queued_indexed_staging,
-        queued_indexed,
-        queued_indexed_output,
+    phases.program.discover(
+        queued_indexed.native_runtime,
+        queued_indexed.plan,
+        torch.cuda.current_stream(),
     )
     phases.call("nta_jit_progress_host", queued_indexed, 1)
     phases.call("nta_jit_publish_ready", queued_indexed, 1)
@@ -1218,8 +1323,11 @@ def main() -> None:
     )
     phases.call("nta_jit_reset_epoch", invalid_indexed, 1, 1)
     invalid_output = torch.full_like(expected, math.nan)
-    run_hooked(hooked, q, invalid_staging, invalid_indexed, invalid_output)
-    phases.call("nta_jit_complete_launched", invalid_indexed, 1)
+    phases.program.discover(
+        invalid_indexed.native_runtime,
+        invalid_indexed.plan,
+        torch.cuda.current_stream(),
+    )
     phases.program.progress_indexed_host_range(
         invalid_indexed.native_runtime, 0, 1, torch.cuda.current_stream()
     )
@@ -1235,6 +1343,8 @@ def main() -> None:
     torch.cuda.synchronize()
     if invalid_indexed.native_runtime.sticky_failed_count != sticky_failures:
         raise RuntimeError("epoch reset erased a sticky acquisition failure")
+    if checkpoint(options, "indexed"):
+        return
     split_pages = 256
     split_shape = (split_pages, 2, 16, 2, 128)
     split_host_kv = torch.randn(split_shape, dtype=torch.float16, pin_memory=True)
@@ -1250,17 +1360,28 @@ def main() -> None:
     split = RuntimeFixture(split_staging_kv, split_host_kv, split_work)
     phases.call("nta_jit_reset_epoch", split, 1, split_work)
     split_output = torch.full_like(split_expected, 17)
-    # Request a merge even though every split-K CTA defers. The device-side
-    # epoch gate must leave the output untouched instead of consuming scratch.
-    run_hooked(hooked, q, split_staging_kv, split, split_output)
-    phases.call("nta_jit_complete_launched", split, split_work)
+    # Sealed discovery publishes no numerical work until every exact dependency
+    # is ready, so incomplete split-K scratch cannot be consumed or merged.
+    phases.program.discover(
+        split.native_runtime,
+        split.plan,
+        torch.cuda.current_stream(),
+    )
     torch.cuda.synchronize()
     split.assert_all_states(1)
     if not torch.all(split_output == 17):
         raise RuntimeError("deferred split-K launch consumed incomplete scratch state")
     phases.call("nta_jit_progress_host", split, 1)
     phases.call("nta_jit_publish_ready", split, split_work)
-    run_hooked(hooked, q, split_staging_kv, split, split_output, skip_merge=True)
+    run_hooked(
+        hooked,
+        q,
+        split_staging_kv,
+        split,
+        split_output,
+        launch_flags=BIND_CURRENT_GENERATION | RUNNABLE_WORK | SKIP_MERGE,
+        launch_work_count=split_work,
+    )
     phases.call("nta_jit_complete_launched", split, split_work)
     torch.cuda.synchronize()
     split.assert_all_states(3)
@@ -1300,13 +1421,10 @@ def main() -> None:
     )
     phases.call("nta_jit_reset_epoch", fragmented, split_work, split_work)
     fragmented_output = torch.full_like(split_expected, 19)
-    run_hooked(
-        hooked,
-        q,
-        fragmented_staging,
-        fragmented,
-        fragmented_output,
-        launch_flags=BIND_CURRENT_GENERATION,
+    phases.program.discover(
+        fragmented.native_runtime,
+        fragmented.plan,
+        torch.cuda.current_stream(),
     )
     phases.call("nta_jit_progress_host", fragmented, split_work // 2)
     run_hooked(
@@ -1381,6 +1499,76 @@ def main() -> None:
     fragmented.assert_all_states(3)
     torch.testing.assert_close(fragmented_output, split_expected, rtol=2e-3, atol=2e-3)
 
+    # FlashInfer's canonical split-K order is independent of transport order.
+    # Exercise a deliberately descending object-slot permutation so the
+    # producer completion classes are non-monotone in scheduler index. The
+    # one-time typed partition must stable-bucket canonical work identities;
+    # requiring framework CTA order to match transport would reject this exact
+    # and otherwise profitable schedule.
+    if split_work < 4:
+        raise RuntimeError(
+            f"completion-wave permutation needs at least four work items: {split_work}"
+        )
+    permuted_slots = [0, *reversed(range(1, split_work))]
+    completion_waves = [slot // 2 for slot in permuted_slots[1:]]
+    if completion_waves == sorted(completion_waves):
+        raise RuntimeError("completion-wave fixture is accidentally monotone")
+    permuted_staging = torch.zeros_like(split_reference_kv)
+    permuted = RuntimeFixture(
+        permuted_staging,
+        split_host_kv,
+        split_work,
+        request_indices=list(split_schedule.request_indices),
+        direct_work_indices={0},
+        partitioned_objects=True,
+        partition_object_slots=permuted_slots,
+        event_completion_classes=[INVALID_INDEX, *completion_waves],
+    )
+    direct_rows = split_pages // split_work
+    permuted_staging[:direct_rows].copy_(split_reference_kv[:direct_rows])
+    registration = torch.cuda.Event()
+    registration.record()
+    producer = torch.cuda.Stream(priority=0)
+    wave_count = split_work // 2
+    ready_events: list[torch.cuda.Event] = []
+    with torch.cuda.stream(producer):
+        producer.wait_event(registration)
+        for wave in range(wave_count):
+            for object_slot in range(2 * wave, 2 * wave + 2):
+                if object_slot == permuted_slots[0]:
+                    continue
+                phases.program.preload_host(
+                    permuted.native_runtime, object_slot, 1, producer
+                )
+            ready = torch.cuda.Event()
+            ready.record(producer)
+            ready_events.append(ready)
+    wave_work_counts = tuple(
+        completion_waves.count(wave) for wave in range(wave_count)
+    )
+    permuted_output = torch.full_like(split_expected, math.nan)
+    enqueue_event_partitioned_attention(
+        permuted.native_runtime,
+        permuted.plan,
+        phases.program,
+        hooked,
+        q,
+        permuted_staging,
+        permuted_output,
+        ready_events=tuple(ready_events),
+        direct_work_count=1,
+        wave_work_counts=wave_work_counts,
+        prepare_partition=True,
+        stream=torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    if permuted.native_runtime.sticky_failed_count != 0:
+        raise RuntimeError("completion-wave partition poisoned the runtime")
+    torch.testing.assert_close(permuted_staging, split_reference_kv, rtol=0, atol=0)
+    torch.testing.assert_close(permuted_output, split_expected, rtol=2e-3, atol=2e-3)
+    if checkpoint(options, "split-k"):
+        return
+
     mixed_pages = 128
     mixed_shape = (2 * mixed_pages, 2, 16, 2, 128)
     mixed_host_kv = torch.randn(mixed_shape, dtype=torch.float16, pin_memory=True)
@@ -1413,7 +1601,27 @@ def main() -> None:
     )
     phases.call("nta_jit_reset_epoch", mixed, 1, mixed_schedule.work_count)
     mixed_output = torch.full_like(mixed_expected, 17)
-    run_hooked(hooked, mixed_q, mixed_staging_kv, mixed, mixed_output)
+    phases.program.discover(
+        mixed.native_runtime,
+        mixed.plan,
+        torch.cuda.current_stream(),
+    )
+    phases.program.prepare_ready_window(
+        mixed.native_runtime,
+        len(resident_work),
+        torch.cuda.current_stream(),
+    )
+    run_hooked(
+        hooked,
+        mixed_q,
+        mixed_staging_kv,
+        mixed,
+        mixed_output,
+        launch_flags=(
+            BIND_CURRENT_GENERATION | RUNNABLE_WORK | DYNAMIC_RUNNABLE_WINDOW
+        ),
+        launch_work_count=len(resident_work),
+    )
     torch.cuda.synchronize()
     mixed_states = [
         mixed.work_ticket_state(index) for index in range(mixed_schedule.work_count)
@@ -1433,13 +1641,20 @@ def main() -> None:
         index not in resident_work for index in range(mixed_schedule.work_count)
     )
     phases.call("nta_jit_progress_host", mixed, 1)
+    phases.program.prepare_ready_window(
+        mixed.native_runtime,
+        external_work,
+        torch.cuda.current_stream(),
+    )
     run_hooked(
         hooked,
         mixed_q,
         mixed_staging_kv,
         mixed,
         mixed_output,
-        launch_flags=BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+        launch_flags=(
+            BIND_CURRENT_GENERATION | RUNNABLE_WORK | DYNAMIC_RUNNABLE_WINDOW
+        ),
         launch_work_count=external_work,
     )
     torch.cuda.synchronize()
@@ -1481,6 +1696,86 @@ def main() -> None:
     compact.assert_all_states(3)
     torch.testing.assert_close(compact_staging_kv, mixed_reference_kv, rtol=0, atol=0)
     torch.testing.assert_close(compact_output, mixed_expected, rtol=2e-3, atol=2e-3)
+
+    # The serving path may execute every resident request first and then split
+    # one external request across multiple producer-completion waves.  A
+    # single-request oracle cannot detect corruption of another request's
+    # split-K scratch or an incorrectly scoped final merge, so exercise that
+    # exact batch topology here.  External slots are packed first to make the
+    # completion-wave identity independent of FlashInfer's canonical order.
+    external_indices = [
+        index
+        for index in range(mixed_schedule.work_count)
+        if index not in resident_work
+    ]
+    resident_indices = sorted(resident_work)
+    if len(external_indices) < 4:
+        raise RuntimeError(
+            "mixed event fixture needs at least four external work items"
+        )
+    mixed_event_slots = [0] * mixed_schedule.work_count
+    for object_slot, work_index in enumerate(external_indices + resident_indices):
+        mixed_event_slots[work_index] = object_slot
+    mixed_event_staging = torch.zeros_like(mixed_reference_kv)
+    mixed_event_staging[:mixed_pages].copy_(mixed_reference_kv[:mixed_pages])
+    mixed_event_completion = [INVALID_INDEX] * mixed_schedule.work_count
+    for position, work_index in enumerate(external_indices):
+        mixed_event_completion[work_index] = position // 2
+    mixed_event = RuntimeFixture(
+        mixed_event_staging,
+        mixed_host_kv,
+        mixed_schedule.work_count,
+        request_indices=mixed_request_indices,
+        direct_work_indices=resident_work,
+        partitioned_objects=True,
+        partition_object_slots=mixed_event_slots,
+        event_completion_classes=mixed_event_completion,
+    )
+    mixed_event_registration = torch.cuda.Event()
+    mixed_event_registration.record()
+    mixed_event_producer = torch.cuda.Stream(priority=0)
+    mixed_event_wave_count = (len(external_indices) + 1) // 2
+    mixed_event_ready: list[torch.cuda.Event] = []
+    mixed_event_wave_work: list[int] = []
+    with torch.cuda.stream(mixed_event_producer):
+        mixed_event_producer.wait_event(mixed_event_registration)
+        for wave in range(mixed_event_wave_count):
+            begin = 2 * wave
+            end = min(begin + 2, len(external_indices))
+            for object_slot in range(begin, end):
+                phases.program.preload_host(
+                    mixed_event.native_runtime, object_slot, 1, mixed_event_producer
+                )
+            ready = torch.cuda.Event()
+            ready.record(mixed_event_producer)
+            mixed_event_ready.append(ready)
+            mixed_event_wave_work.append(end - begin)
+    mixed_event_output = torch.full_like(mixed_expected, math.nan)
+    enqueue_event_partitioned_attention(
+        mixed_event.native_runtime,
+        mixed_event.plan,
+        phases.program,
+        hooked,
+        mixed_q,
+        mixed_event_staging,
+        mixed_event_output,
+        ready_events=tuple(mixed_event_ready),
+        direct_work_count=len(resident_indices),
+        wave_work_counts=tuple(mixed_event_wave_work),
+        prepare_partition=True,
+        stream=torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    if mixed_event.native_runtime.sticky_failed_count != 0:
+        raise RuntimeError("mixed completion-wave partition poisoned the runtime")
+    torch.testing.assert_close(
+        mixed_event_staging, mixed_reference_kv, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        mixed_event_output, mixed_expected, rtol=2e-3, atol=2e-3
+    )
+    if checkpoint(options, "heterogeneous-decode"):
+        return
 
     prefill_query_tokens = 256
     prefill_q = torch.randn(
@@ -1527,15 +1822,11 @@ def main() -> None:
     )
     prefill_phases.call("nta_jit_reset_epoch", prefill_deferred, 1, prefill_work)
     prefill_output = torch.full_like(prefill_expected, math.nan)
-    run_prefill_hooked(
-        hooked_prefill,
-        prefill_q,
-        prefill_staging_kv,
-        prefill_deferred,
-        prefill_output,
-        skip_merge=True,
+    prefill_phases.program.discover(
+        prefill_deferred.native_runtime,
+        prefill_deferred.plan,
+        torch.cuda.current_stream(),
     )
-    prefill_phases.call("nta_jit_complete_launched", prefill_deferred, prefill_work)
     torch.cuda.synchronize()
     prefill_deferred.assert_all_states(1)
     prefill_phases.call("nta_jit_progress_host", prefill_deferred, 1)
@@ -1548,7 +1839,8 @@ def main() -> None:
         prefill_staging_kv,
         prefill_deferred,
         prefill_output,
-        skip_merge=True,
+        launch_flags=BIND_CURRENT_GENERATION | RUNNABLE_WORK | SKIP_MERGE,
+        launch_work_count=prefill_work,
     )
     prefill_phases.call("nta_jit_complete_launched", prefill_deferred, prefill_work)
     torch.cuda.synchronize()
@@ -1565,6 +1857,438 @@ def main() -> None:
     prefill_maximum = (
         (prefill_output.float() - prefill_expected.float()).abs().max().item()
     )
+
+    # Serving combines short resident decode rows with a long external
+    # prefill in one paged-prefill launch.  Verify the exact two-wave consumer
+    # on that heterogeneous geometry, including the final merge of resident
+    # and external reduction groups.  The staging image starts numerically
+    # complete so this fixture isolates consumer partitioning from transport;
+    # the producer still publishes the typed objects/events required by the
+    # production preacquired contract.
+    # Match the serving diagnostic that exercises four resident decode rows
+    # beside one 32K cold prefill.  The smaller 512-row version had too few
+    # split-K contributors to cover the production runnable-offset geometry.
+    # SGLang admits the cold external request first in this workload, so its
+    # split-K contributors occupy the canonical prefix and the four resident
+    # direct items occupy the tail.  This ordering is important: it forces the
+    # runnable partition to perform the same non-prefix permutation as serving.
+    heterogeneous_q_tokens = (256, 1, 1, 1, 1)
+    heterogeneous_kv_pages = (32_256, 256, 256, 256, 256)
+    heterogeneous_q_offsets = [0]
+    for query_count in heterogeneous_q_tokens:
+        heterogeneous_q_offsets.append(
+            heterogeneous_q_offsets[-1] + query_count
+        )
+    heterogeneous_q_indptr = torch.tensor(
+        heterogeneous_q_offsets,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    heterogeneous_kv_offsets = [0]
+    for page_count in heterogeneous_kv_pages:
+        heterogeneous_kv_offsets.append(
+            heterogeneous_kv_offsets[-1] + page_count
+        )
+    heterogeneous_kv_indptr = torch.tensor(
+        heterogeneous_kv_offsets,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    heterogeneous_pages = sum(heterogeneous_kv_pages)
+    # Qwen-family serving uses BF16.  The surrounding fixtures retain FP16
+    # coverage, while this production-sized split-consumer regression must
+    # exercise the actual serving dtype as well as its geometry.
+    heterogeneous_dtype = torch.bfloat16
+    heterogeneous_host_kv = torch.randn(
+        (heterogeneous_pages, 2, 1, 2, 128),
+        dtype=heterogeneous_dtype,
+        pin_memory=True,
+    )
+    heterogeneous_reference_kv = heterogeneous_host_kv.to("cuda")
+    heterogeneous_q = torch.randn(
+        (sum(heterogeneous_q_tokens), 16, 128),
+        dtype=heterogeneous_dtype,
+        device="cuda",
+    )
+    heterogeneous_indices = torch.arange(
+        heterogeneous_pages, dtype=torch.int32, device="cuda"
+    )
+    heterogeneous_last_page = torch.ones(5, dtype=torch.int32)
+
+    def plan_heterogeneous_prefill(wrapper: object) -> None:
+        wrapper.plan(
+            heterogeneous_q_indptr,
+            heterogeneous_kv_indptr,
+            heterogeneous_indices,
+            heterogeneous_last_page,
+            16,
+            2,
+            128,
+            1,
+            q_data_type=heterogeneous_dtype,
+            kv_data_type=heterogeneous_dtype,
+            causal=True,
+        )
+
+    heterogeneous_stock = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        backend="fa2",
+    )
+    heterogeneous_module = "nta_batch_prefill_default_v2_hooked_bf16"
+    heterogeneous_hooked = make_prefill_wrapper(
+        module_name=heterogeneous_module,
+        workspace_bytes=512 * 1024 * 1024,
+        dtype=heterogeneous_dtype,
+    )
+    heterogeneous_phases = PhaseFunctions(heterogeneous_module)
+    plan_heterogeneous_prefill(heterogeneous_stock)
+    heterogeneous_expected = heterogeneous_stock.run(
+        heterogeneous_q, heterogeneous_reference_kv
+    )
+    plan_heterogeneous_prefill(heterogeneous_hooked)
+    heterogeneous_schedule = paged_prefill_schedule(heterogeneous_hooked)
+    heterogeneous_requests = list(heterogeneous_schedule.request_indices)
+    heterogeneous_resident = {
+        index
+        for index, request_index in enumerate(heterogeneous_requests)
+        if request_index > 0
+    }
+    heterogeneous_external = [
+        index
+        for index, request_index in enumerate(heterogeneous_requests)
+        if request_index == 0
+    ]
+    if len(heterogeneous_resident) < 4 or len(heterogeneous_external) < 4:
+        raise RuntimeError(
+            "unexpected heterogeneous paged-prefill schedule: "
+            f"{heterogeneous_schedule}"
+        )
+    first_wave_work = (len(heterogeneous_external) + 1) // 2
+    heterogeneous_slots = [4] * heterogeneous_schedule.work_count
+    for position, work_index in enumerate(heterogeneous_external):
+        wave = int(position >= first_wave_work)
+        within_wave = position if wave == 0 else position - first_wave_work
+        heterogeneous_slots[work_index] = 2 * wave + within_wave % 2
+    heterogeneous_staging = torch.zeros_like(heterogeneous_reference_kv)
+    heterogeneous_staging[
+        heterogeneous_kv_pages[0] :
+    ].copy_(heterogeneous_reference_kv[heterogeneous_kv_pages[0] :])
+    heterogeneous_completion = [INVALID_INDEX] * heterogeneous_schedule.work_count
+    for position, work_index in enumerate(heterogeneous_external):
+        heterogeneous_completion[work_index] = int(position >= first_wave_work)
+    heterogeneous_fixture = RuntimeFixture(
+        heterogeneous_staging,
+        heterogeneous_host_kv,
+        heterogeneous_schedule.work_count,
+        request_indices=heterogeneous_requests,
+        direct_work_indices=heterogeneous_resident,
+        partitioned_objects=True,
+        partition_object_slots=heterogeneous_slots,
+        runtime_object_capacity=160,
+        event_completion_classes=heterogeneous_completion,
+    )
+    heterogeneous_registration = torch.cuda.Event()
+    heterogeneous_registration.record()
+    heterogeneous_producer = torch.cuda.Stream(priority=0)
+    heterogeneous_events: list[torch.cuda.Event] = []
+    with torch.cuda.stream(heterogeneous_producer):
+        heterogeneous_producer.wait_event(heterogeneous_registration)
+        for first_object in (0, 2):
+            heterogeneous_phases.program.preload_host(
+                heterogeneous_fixture.native_runtime,
+                first_object,
+                2,
+                heterogeneous_producer,
+            )
+            ready = torch.cuda.Event()
+            ready.record(heterogeneous_producer)
+            heterogeneous_events.append(ready)
+    heterogeneous_output = torch.full_like(heterogeneous_expected, math.nan)
+    enqueue_event_partitioned_attention(
+        heterogeneous_fixture.native_runtime,
+        heterogeneous_fixture.plan,
+        heterogeneous_phases.program,
+        heterogeneous_hooked,
+        heterogeneous_q,
+        heterogeneous_staging,
+        heterogeneous_output,
+        ready_events=tuple(heterogeneous_events),
+        direct_work_count=len(heterogeneous_resident),
+        wave_work_counts=(
+            first_wave_work,
+            len(heterogeneous_external) - first_wave_work,
+        ),
+        prepare_partition=True,
+        stream=torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    if heterogeneous_fixture.native_runtime.sticky_failed_count != 0:
+        raise RuntimeError("heterogeneous prefill partition poisoned the runtime")
+    torch.testing.assert_close(
+        heterogeneous_staging, heterogeneous_reference_kv, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        heterogeneous_output, heterogeneous_expected, rtol=2e-3, atol=2e-3
+    )
+    # SGLang exposes K and V as separate page tensors, while FlashInfer also
+    # accepts the packed [page, 2, ...] form used above.  Runnable work and the
+    # final split-K merge must be layout independent; otherwise a packed-only
+    # fixture can pass while the serving adapter corrupts every query row.
+    heterogeneous_tuple_kv = (
+        heterogeneous_reference_kv[:, 0].contiguous(),
+        heterogeneous_reference_kv[:, 1].contiguous(),
+    )
+    heterogeneous_tuple_expected = heterogeneous_stock.run(
+        heterogeneous_q, heterogeneous_tuple_kv
+    )
+    heterogeneous_tuple_output = torch.full_like(
+        heterogeneous_tuple_expected, math.nan
+    )
+    enqueue_event_partitioned_attention(
+        heterogeneous_fixture.native_runtime,
+        heterogeneous_fixture.plan,
+        heterogeneous_phases.program,
+        heterogeneous_hooked,
+        heterogeneous_q,
+        heterogeneous_tuple_kv,
+        heterogeneous_tuple_output,
+        ready_events=tuple(heterogeneous_events),
+        direct_work_count=len(heterogeneous_resident),
+        wave_work_counts=(
+            first_wave_work,
+            len(heterogeneous_external) - first_wave_work,
+        ),
+        prepare_partition=False,
+        stream=torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        heterogeneous_tuple_output,
+        heterogeneous_tuple_expected,
+        rtol=2e-3,
+        atol=2e-3,
+        msg="separate K/V event partition differs from packed FlashInfer layout",
+    )
+    # A serving forward reuses the immutable runnable partition and the same
+    # FlashInfer wrapper for every transformer layer.  One numerically exact
+    # launch does not prove that split-K scratch is reset between layers.  Run
+    # several distinct Q/KV images through the reusable event-owned form after
+    # the initial partition preparation; stale partials, a mutated queue, or
+    # an incomplete per-layer merge must become visible here.
+    for repeated_layer in range(8):
+        repeated_q = torch.randn_like(heterogeneous_q)
+        repeated_kv = torch.randn_like(heterogeneous_reference_kv)
+        repeated_expected = heterogeneous_stock.run(repeated_q, repeated_kv)
+        repeated_output = torch.full_like(repeated_expected, math.nan)
+        enqueue_event_partitioned_attention(
+            heterogeneous_fixture.native_runtime,
+            heterogeneous_fixture.plan,
+            heterogeneous_phases.program,
+            heterogeneous_hooked,
+            repeated_q,
+            repeated_kv,
+            repeated_output,
+            ready_events=tuple(heterogeneous_events),
+            direct_work_count=len(heterogeneous_resident),
+            wave_work_counts=(
+                first_wave_work,
+                len(heterogeneous_external) - first_wave_work,
+            ),
+            prepare_partition=False,
+            stream=torch.cuda.current_stream(),
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            repeated_output,
+            repeated_expected,
+            rtol=2e-3,
+            atol=2e-3,
+            msg=f"reused event partition differs at synthetic layer {repeated_layer}",
+        )
+
+    # Exercise the complete cross-layer synchronization shape: two K/V waves
+    # per layer, four layers per bounded submission, distinct directory slots,
+    # and a producer completion fence while the producer remains in flight.
+    # The preceding fixture already proves exact per-wave publication.  This
+    # one intentionally publishes both numerical waves from the full-layer
+    # fence so its synthetic row split cannot claim a completion-class mapping
+    # that only FlashInfer's real work topology can prove.
+    producer_layer_count = 8
+    producer_first_slot = 8
+    producer_external_begin = 0
+    producer_external_rows = heterogeneous_kv_pages[0]
+    producer_wave_rows = (producer_external_rows + 1) // 2
+    producer_indices = torch.arange(
+        producer_external_begin,
+        producer_external_begin + producer_external_rows,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    producer_sources: list[torch.Tensor] = []
+    producer_references: list[torch.Tensor] = []
+    producer_staging: list[torch.Tensor] = []
+    producer_queries: list[torch.Tensor] = []
+    producer_expected: list[torch.Tensor] = []
+    producer_outputs: list[torch.Tensor] = []
+    producer_objects: list[tuple[IndexedHostObject, ...]] = []
+    for producer_layer in range(producer_layer_count):
+        source = torch.randn(
+            heterogeneous_host_kv.shape,
+            dtype=heterogeneous_host_kv.dtype,
+            pin_memory=True,
+        )
+        reference = source.to(device="cuda")
+        staging = torch.zeros_like(reference)
+        if producer_external_begin != 0:
+            staging[:producer_external_begin].copy_(
+                reference[:producer_external_begin]
+            )
+        producer_external_end = producer_external_begin + producer_external_rows
+        staging[producer_external_end:].copy_(reference[producer_external_end:])
+        query = torch.randn_like(heterogeneous_q)
+        expected = heterogeneous_stock.run(query, reference)
+        output = torch.full_like(expected, math.nan)
+        layer_objects: list[IndexedHostObject] = []
+        for wave in range(2):
+            row_begin = wave * producer_wave_rows
+            row_end = min(producer_external_rows, row_begin + producer_wave_rows)
+            rows = producer_indices[row_begin:row_end]
+            for lane in range(2):
+                source_lane = source[:, lane]
+                staging_lane = staging[:, lane]
+                slot = producer_first_slot + 4 * producer_layer + 2 * wave + lane
+                layer_objects.append(
+                    IndexedHostObject(
+                        object_id=0xD000_0000 + slot,
+                        version=1,
+                        source_device_address=source_lane.data_ptr(),
+                        staging_device_address=staging_lane.data_ptr(),
+                        source_indices_device_address=rows.data_ptr(),
+                        staging_indices_device_address=rows.data_ptr(),
+                        index_count=int(rows.numel()),
+                        element_bytes=int(source_lane[0].numel())
+                        * source_lane.element_size(),
+                        source_stride_bytes=source_lane.stride(0)
+                        * source_lane.element_size(),
+                        staging_stride_bytes=staging_lane.stride(0)
+                        * staging_lane.element_size(),
+                        source_index_limit=int(source_lane.shape[0]),
+                        staging_index_limit=int(staging_lane.shape[0]),
+                    )
+                )
+        producer_sources.append(source)
+        producer_references.append(reference)
+        producer_staging.append(staging)
+        producer_queries.append(query)
+        producer_expected.append(expected)
+        producer_outputs.append(output)
+        producer_objects.append(tuple(layer_objects))
+
+    producer_stream = torch.cuda.Stream(priority=0)
+    producer_ready_events: list[tuple[torch.cuda.Event, ...]] = []
+    current_stream = torch.cuda.current_stream()
+    for frontier_begin in range(0, producer_layer_count, 4):
+        frontier_objects = tuple(
+            item
+            for layer_objects in producer_objects[frontier_begin : frontier_begin + 4]
+            for item in layer_objects
+        )
+        frontier_first_slot = producer_first_slot + 4 * frontier_begin
+        heterogeneous_fixture.native_runtime.register_indexed_host_objects(
+            frontier_first_slot,
+            frontier_objects,
+            stream=current_stream,
+        )
+        registration = torch.cuda.Event()
+        registration.record(current_stream)
+        producer_stream.wait_event(registration)
+        for producer_layer in range(
+            frontier_begin, min(producer_layer_count, frontier_begin + 4)
+        ):
+            layer_first_slot = producer_first_slot + 4 * producer_layer
+            for wave in range(2):
+                heterogeneous_phases.program.preload_host_pairs(
+                    heterogeneous_fixture.native_runtime,
+                    layer_first_slot + 2 * wave,
+                    1,
+                    producer_stream,
+                )
+            ready = torch.cuda.Event()
+            ready.record(producer_stream)
+            producer_ready_events.append((ready, ready))
+
+    for producer_layer in range(producer_layer_count):
+        enqueue_event_partitioned_attention(
+            heterogeneous_fixture.native_runtime,
+            heterogeneous_fixture.plan,
+            heterogeneous_phases.program,
+            heterogeneous_hooked,
+            producer_queries[producer_layer],
+            producer_staging[producer_layer],
+            producer_outputs[producer_layer],
+            ready_events=producer_ready_events[producer_layer],
+            direct_work_count=len(heterogeneous_resident),
+            wave_work_counts=(
+                first_wave_work,
+                len(heterogeneous_external) - first_wave_work,
+            ),
+            prepare_partition=False,
+            stream=current_stream,
+        )
+    current_stream.synchronize()
+    for producer_layer, (actual, expected, staging, reference) in enumerate(
+        zip(
+            producer_outputs,
+            producer_expected,
+            producer_staging,
+            producer_references,
+            strict=True,
+        )
+    ):
+        torch.testing.assert_close(staging, reference, rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=2e-3,
+            atol=2e-3,
+            msg=f"ordered producer differs at synthetic layer {producer_layer}",
+        )
+    heterogeneous_maximum = float(
+        (heterogeneous_output.float() - heterogeneous_expected.float())
+        .abs()
+        .max()
+    )
+    heterogeneous_verifier_stats: dict[str, object] = {}
+    SglangAttentionVerifier(
+        decode_use_tensor_cores=False,
+        stats=heterogeneous_verifier_stats,
+    ).verify_attention_output(
+        heterogeneous_hooked,
+        heterogeneous_q,
+        (heterogeneous_staging[:, 0], heterogeneous_staging[:, 1]),
+        heterogeneous_output,
+        SimpleNamespace(
+            layer_id=0,
+            scaling=1.0 / math.sqrt(128),
+            k_scale_float=1.0,
+            v_scale_float=1.0,
+        ),
+        causal=True,
+        window_left=-1,
+    )
+    if (
+        heterogeneous_verifier_stats.get("attention_verification_passes") != 1
+        or heterogeneous_verifier_stats.get(
+            "attention_verification_workspace_bytes"
+        )
+        != 512 * 1024 * 1024
+    ):
+        raise RuntimeError(
+            "long-context verifier did not inherit production workspace capacity"
+        )
+    if checkpoint(options, "prefill"):
+        return
 
     tiny_prefill_q = torch.randn((1, 4, 128), dtype=torch.float16, device="cuda")
     plan_prefill(stock_prefill, 1, 4)
@@ -1654,6 +2378,8 @@ def main() -> None:
     torch.cuda.synchronize()
     if not torch.all(cancelled_output == 17):
         raise RuntimeError("cancelled planless request wrote attention output")
+    if checkpoint(options, "request-bound"):
+        return
 
     benchmark_batch = 64
     benchmark_pages = 4
@@ -1784,6 +2510,11 @@ def main() -> None:
         f"max_abs_error={maximum:.6g} "
         f"split_work={split_work} split_max_abs_error={split_maximum:.6g} "
         f"prefill_work={prefill_work} prefill_max_abs_error={prefill_maximum:.6g} "
+        f"heterogeneous_prefill=pass "
+        f"heterogeneous_work={heterogeneous_schedule.work_count} "
+        f"heterogeneous_padded={heterogeneous_schedule.padded_work_count} "
+        f"heterogeneous_chunk={heterogeneous_schedule.kv_chunk_tokens} "
+        f"heterogeneous_prefill_max_abs_error={heterogeneous_maximum:.6g} "
         f"tiny_prefill_baseline_us={tiny_baseline_us:.3f} "
         f"tiny_prefill_hooked_us={tiny_hooked_us:.3f} "
         f"tiny_prefill_overhead_pct={tiny_overhead:.2f} "

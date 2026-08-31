@@ -34,6 +34,7 @@ from experiments.bailian_replay import (  # noqa: E402
 )
 from experiments.atomic_io import atomic_write_json  # noqa: E402
 from experiments.queueing import finite_window_system_accounting  # noqa: E402
+from experiments.serving_metrics import joint_slo_goodput  # noqa: E402
 from SglangHiCache import configure_environment, git_value  # noqa: E402
 from SglangHiCacheLoad import (  # noqa: E402
     SGLANG_INPUT_MARGIN_TOKENS,
@@ -46,7 +47,6 @@ from SglangHiCacheLoad import (  # noqa: E402
     _percentile,
     _publish_engine_stats_snapshot,
     _read_engine_stats,
-    _slo_goodput,
     _stream_request,
 )
 
@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
         default="disabled",
     )
     parser.add_argument("--slo-ttft-seconds", type=float, default=8.0)
+    parser.add_argument("--slo-tpot-seconds", type=float, default=0.050)
     parser.add_argument("--slo-p99-itl-seconds", type=float, default=0.100)
     parser.add_argument("--flashinfer-workspace-base", type=pathlib.Path, required=True)
     parser.add_argument("--cuda-home", type=pathlib.Path)
@@ -115,7 +116,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("time scale must be finite and positive")
     if not math.isfinite(args.output_length_scale) or args.output_length_scale <= 0.0:
         parser.error("output length scale must be finite and positive")
-    if args.slo_ttft_seconds <= 0.0 or args.slo_p99_itl_seconds <= 0.0:
+    if min(
+        args.slo_ttft_seconds,
+        args.slo_tpot_seconds,
+        args.slo_p99_itl_seconds,
+    ) <= 0.0:
         parser.error("SLO thresholds must be positive")
     return args
 
@@ -665,10 +670,10 @@ def main() -> int:
             "tpot_seconds": tpot,
             "inter_token_seconds": itl,
         },
-        "slo_goodput": _slo_goodput(
-            records,
-            elapsed,
+        "slo_goodput": joint_slo_goodput(
+            {"records": records, "elapsed_seconds": elapsed},
             ttft_seconds=args.slo_ttft_seconds,
+            tpot_seconds=args.slo_tpot_seconds,
             p99_itl_seconds=args.slo_p99_itl_seconds,
         ),
         "finite_window_accounting": accounting,

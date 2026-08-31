@@ -27,7 +27,9 @@ from .requests import RequestBinding
 from .resource_contract import ResourceCapability, ResourceOwner
 
 
-API_VERSION = 55
+API_VERSION = 58
+INVALID_INDEX = (1 << 32) - 1
+MAX_EVENT_COMPLETION_CLASSES = 64
 _INT32_MAX = (1 << 31) - 1
 
 
@@ -44,6 +46,13 @@ class Placement(enum.IntEnum):
     HOST_MAPPED = 1
     HOST_STAGED = 2
     CXL_MAPPED = 3
+
+
+class ObjectScope(enum.IntEnum):
+    """Ownership and byte-accounting domain for an external object."""
+
+    TENANT_LOCAL = 0
+    GLOBAL_SHARED = 1
 
 
 class TierKind(enum.IntEnum):
@@ -378,6 +387,12 @@ class _Replica(ctypes.Structure):
     ]
 
 
+class AcquireRequirementFlag(enum.IntFlag):
+    """Strengthened contracts for an external acquisition requirement."""
+
+    ONLINE_EXCLUSIVE = 1 << 0
+
+
 class AcquireRequirement(ctypes.Structure):
     _fields_ = [
         ("direct_base", ctypes.c_uint64),
@@ -405,7 +420,7 @@ class _IndexedHostObject(ctypes.Structure):
         ("staging_stride_bytes", ctypes.c_uint32),
         ("source_index_limit", ctypes.c_uint32),
         ("staging_index_limit", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
+        ("scope", ctypes.c_uint32),
     ]
 
 
@@ -461,9 +476,13 @@ class WorkItem(ctypes.Structure):
         ("contributor_count", ctypes.c_uint32),
         ("estimated_compute_ns", ctypes.c_uint32),
         ("ready_deadline_offset_ns", ctypes.c_uint64),
-        ("reserved2", ctypes.c_uint32),
-        ("reserved3", ctypes.c_uint32),
+        ("completion_class", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
     ]
+
+
+class WorkItemFlag(enum.IntFlag):
+    EVENT_PARTITION = 1 << 0
 
 
 class RequestRange(ctypes.Structure):
@@ -546,10 +565,12 @@ class _RegisteredNvmeObject(ctypes.Structure):
         ("prior_consumer_event", ctypes.c_uint64),
         ("slot", ctypes.c_uint32),
         ("version", ctypes.c_uint32),
+        ("scope", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
     ]
 
 
-_REGISTERED_NVME_OBJECT_PACKER = struct.Struct("@QQQPQQII")
+_REGISTERED_NVME_OBJECT_PACKER = struct.Struct("@QQQPQQIIII")
 
 
 class _CxlOptions(ctypes.Structure):
@@ -634,7 +655,7 @@ def _validate_abi_layouts() -> None:
         ("WorkItem", ctypes.sizeof(WorkItem), 64),
         ("RequestProgress", ctypes.sizeof(_RequestProgress), 96),
         ("RequestSpec", ctypes.sizeof(_RequestSpec), 40),
-        ("RegisteredNvmeObject", ctypes.sizeof(_RegisteredNvmeObject), 56),
+        ("RegisteredNvmeObject", ctypes.sizeof(_RegisteredNvmeObject), 64),
     )
     invalid = [
         f"{name}={observed} (expected {expected})"
@@ -766,6 +787,7 @@ class IndexedHostObject:
     staging_stride_bytes: int
     source_index_limit: int
     staging_index_limit: int
+    scope: ObjectScope = ObjectScope.TENANT_LOCAL
 
     def __post_init__(self) -> None:
         _u64(self.object_id, "indexed object id")
@@ -786,6 +808,10 @@ class IndexedHostObject:
             "staging_index_limit",
         ):
             _u32(getattr(self, name), f"indexed {name}", positive=True)
+        try:
+            object.__setattr__(self, "scope", ObjectScope(self.scope))
+        except (TypeError, ValueError) as error:
+            raise ValueError("indexed object scope is invalid") from error
 
     def native(self) -> _IndexedHostObject:
         return _IndexedHostObject(
@@ -801,7 +827,7 @@ class IndexedHostObject:
             self.staging_stride_bytes,
             self.source_index_limit,
             self.staging_index_limit,
-            0,
+            int(self.scope),
         )
 
 
@@ -1015,13 +1041,14 @@ class IndexedAcquisitionPlan:
         self.min_unresolved_dependencies = min(unresolved_counts, default=1)
 
     def require_single_tenant_groups(self) -> None:
-        """Reject a shared transfer whose byte-credit owner is ambiguous.
+        """Reject a request-owned transfer whose tenant owner is ambiguous.
 
-        The device reserves one tenant credit for one physical acquisition.
-        Sharing that acquisition across requests in the same tenant is exact
-        and charged once.  A cross-tenant group would make the first CTA to
-        discover it choose the charged tenant nondeterministically, so finite
-        tenant isolation must reject such a topology before publication.
+        Sharing one acquisition across requests in the same tenant is exact.
+        A cross-tenant group would make lifetime, cancellation, and accounting
+        ownership depend on whichever CTA discovers it first.  Request-owned
+        KV therefore rejects that topology before publication regardless of
+        whether finite tenant budgets are enabled.  Immutable global sharing
+        uses a separate explicit object scope.
         """
 
         ambiguous = tuple(
@@ -1031,7 +1058,7 @@ class IndexedAcquisitionPlan:
         )
         if ambiguous:
             raise ValueError(
-                "indexed acquisition groups cross tenant credit domains: "
+                "indexed acquisition groups cross tenant ownership domains: "
                 f"{ambiguous[:16]}"
             )
 
@@ -1448,6 +1475,7 @@ _runtime_register_object = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint32,
+    ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint64,
     ctypes.POINTER(_Replica),
@@ -1460,6 +1488,7 @@ _runtime_register_indexed_host_object = _function(
     _Handle,
     ctypes.c_uint32,
     ctypes.c_uint64,
+    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint64,
@@ -1526,6 +1555,7 @@ _runtime_install_nvme_object = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint32,
+    ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint64,
     ctypes.POINTER(ctypes.c_uint64),
@@ -1536,6 +1566,7 @@ _runtime_install_nvme_object_async = _function(
     _Handle,
     ctypes.c_uint32,
     ctypes.c_uint64,
+    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint64,
@@ -1550,6 +1581,7 @@ _runtime_install_registered_nvme_object = _function(
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint32,
+    ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint64,
     _Handle,
@@ -1562,6 +1594,7 @@ _runtime_install_registered_nvme_object_async = _function(
     _Handle,
     ctypes.c_uint32,
     ctypes.c_uint64,
+    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
     ctypes.c_uint64,
@@ -1893,6 +1926,7 @@ _phase_prepare_event_work_partition = _function(
     _Handle,
     _Handle,
     ctypes.c_uint64,
+    ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint32,
     ctypes.c_uint64,
@@ -2304,8 +2338,9 @@ class RegisteredNvmeObjectInstall:
     bytes: int
     region: NvmeHbmRegion
     destination_device_address: int
+    scope: ObjectScope = dataclasses.field(kw_only=True)
     prior_consumer_event: Any = dataclasses.field(
-        default=None, repr=False, compare=False, hash=False
+        default=None, repr=False, compare=False, hash=False, kw_only=True
     )
 
     def __post_init__(self) -> None:
@@ -2335,6 +2370,10 @@ class RegisteredNvmeObjectInstall:
                 positive=True,
             ),
         )
+        try:
+            object.__setattr__(self, "scope", ObjectScope(self.scope))
+        except (TypeError, ValueError) as error:
+            raise ValueError("NVMe object scope is invalid") from error
         try:
             region_address_value = self.region.address
             region_bytes_value = self.region.bytes
@@ -2375,6 +2414,8 @@ class RegisteredNvmeObjectInstall:
             prior_consumer_event,
             self.slot,
             self.version,
+            int(self.scope),
+            0,
         )
 
 
@@ -2648,6 +2689,7 @@ class Runtime(_Owner):
         replicas: Iterable[Replica],
         *,
         staging_device_address: int = 0,
+        scope: ObjectScope = ObjectScope.TENANT_LOCAL,
     ) -> int:
         values = [replica.native() for replica in replicas]
         if not values:
@@ -2660,6 +2702,7 @@ class Runtime(_Owner):
                 slot,
                 object_id,
                 version,
+                int(ObjectScope(scope)),
                 bytes,
                 staging_device_address,
                 array,
@@ -2684,6 +2727,8 @@ class Runtime(_Owner):
         staging_stride_bytes: int,
         source_index_limit: int,
         staging_index_limit: int,
+        *,
+        scope: ObjectScope = ObjectScope.TENANT_LOCAL,
     ) -> None:
         """Register a non-owning indexed pinned-host to HBM transfer."""
         _check(
@@ -2692,6 +2737,7 @@ class Runtime(_Owner):
                 slot,
                 object_id,
                 version,
+                int(ObjectScope(scope)),
                 source_device_address,
                 staging_device_address,
                 source_indices_device_address,
@@ -2856,6 +2902,8 @@ class Runtime(_Owner):
         version: int,
         source_byte_offset: int,
         bytes: int,
+        *,
+        scope: ObjectScope = ObjectScope.TENANT_LOCAL,
     ) -> int:
         """Republish an exact NVMe range, reusing the slot buffer when possible."""
         destination = ctypes.c_uint64()
@@ -2865,6 +2913,7 @@ class Runtime(_Owner):
                 slot,
                 object_id,
                 version,
+                int(ObjectScope(scope)),
                 source_byte_offset,
                 bytes,
                 ctypes.byref(destination),
@@ -2881,6 +2930,8 @@ class Runtime(_Owner):
         bytes: int,
         stream: Any,
         prior_consumer_event: Any = None,
+        *,
+        scope: ObjectScope = ObjectScope.TENANT_LOCAL,
     ) -> int:
         """Publish an NVMe range without a device-wide replacement fence.
 
@@ -2897,6 +2948,7 @@ class Runtime(_Owner):
                 slot,
                 object_id,
                 version,
+                int(ObjectScope(scope)),
                 source_byte_offset,
                 bytes,
                 _stream_address(stream),
@@ -2915,6 +2967,8 @@ class Runtime(_Owner):
         bytes: int,
         region: NvmeHbmRegion,
         destination_device_address: int,
+        *,
+        scope: ObjectScope = ObjectScope.TENANT_LOCAL,
     ) -> int:
         """Publish one transfer view of a setup-time registered HBM region."""
         if not isinstance(region, NvmeHbmRegion) or not region._handle:
@@ -2928,6 +2982,7 @@ class Runtime(_Owner):
                 slot,
                 object_id,
                 version,
+                int(ObjectScope(scope)),
                 source_byte_offset,
                 bytes,
                 region._handle,
@@ -2948,6 +3003,8 @@ class Runtime(_Owner):
         destination_device_address: int,
         stream: Any,
         prior_consumer_event: Any = None,
+        *,
+        scope: ObjectScope = ObjectScope.TENANT_LOCAL,
     ) -> int:
         """Stream-order one view of a setup-time registered HBM region."""
         if not isinstance(region, NvmeHbmRegion) or not region._handle:
@@ -2963,6 +3020,7 @@ class Runtime(_Owner):
                 slot,
                 object_id,
                 version,
+                int(ObjectScope(scope)),
                 source_byte_offset,
                 bytes,
                 region._handle,
@@ -3029,6 +3087,8 @@ class Runtime(_Owner):
                 ),
                 value.slot,
                 value.version,
+                int(value.scope),
+                0,
             )
         destinations = (ctypes.c_uint64 * len(values))()
         _check(
@@ -3216,10 +3276,12 @@ class DeviceWorkPlan(_Owner):
         self._work_items_tensor = None
         self._dependencies_tensor = None
         self._has_external = False
+        self._direct_work_count = 0
 
     def close(self) -> None:
         self._work_items_tensor = None
         self._dependencies_tensor = None
+        self._direct_work_count = 0
         super().close()
 
     def upload(
@@ -3267,9 +3329,18 @@ class DeviceWorkPlan(_Owner):
                 _stream_address(stream),
             )
         )
-        self._has_external = any(
-            item.direct_dependency_count != item.dependency_count for item in work_items
-        )
+        def is_direct(item: WorkItem) -> bool:
+            event_partition = bool(
+                item.flags & int(WorkItemFlag.EVENT_PARTITION)
+            )
+            return (
+                item.completion_class == INVALID_INDEX
+                if event_partition
+                else item.direct_dependency_count == item.dependency_count
+            )
+
+        self._direct_work_count = sum(is_direct(item) for item in work_items)
+        self._has_external = self._direct_work_count != work_count
 
     def upload_exact(
         self,
@@ -3277,6 +3348,7 @@ class DeviceWorkPlan(_Owner):
         dependency_spans: Iterable[WorkDependencySpan],
         dependencies: Iterable[AcquireRequirement],
         *,
+        completion_classes: Iterable[int] | None = None,
         stream: Any = None,
     ) -> None:
         """Materialize a compact exact topology into the native ticket ABI.
@@ -3315,6 +3387,34 @@ class DeviceWorkPlan(_Owner):
             ):
                 raise ValueError("exact work dependency span exceeds its array")
 
+        completion_values = (
+            None
+            if completion_classes is None
+            else tuple(
+                _u32(value, "event completion class")
+                for value in completion_classes
+            )
+        )
+        if completion_values is not None:
+            if len(completion_values) != topology.work_count:
+                raise ValueError(
+                    "event completion classes must identify every work item"
+                )
+            for span, completion_class in zip(
+                spans, completion_values, strict=True
+            ):
+                if span.direct_count != span.count:
+                    raise ValueError(
+                        "event-partitioned work must be preacquired"
+                    )
+                if (
+                    completion_class != INVALID_INDEX
+                    and completion_class >= MAX_EVENT_COMPLETION_CLASSES
+                ):
+                    raise ValueError(
+                        "event completion class exceeds the runtime bound"
+                    )
+
         work_items = (WorkItem * topology.work_count)()
         for request in topology.requests:
             for contributor_index in range(request.work_count):
@@ -3336,8 +3436,16 @@ class DeviceWorkPlan(_Owner):
                     request.work_count,
                     topology.estimated_compute_ns[work_ticket],
                     topology.ready_deadline_offset_ns[work_ticket],
-                    0,
-                    0,
+                    (
+                        0
+                        if completion_values is None
+                        else completion_values[work_ticket]
+                    ),
+                    (
+                        0
+                        if completion_values is None
+                        else int(WorkItemFlag.EVENT_PARTITION)
+                    ),
                 )
         native_requests = (RequestRange * len(topology.requests))()
         for index, request in enumerate(topology.requests):
@@ -3405,6 +3513,12 @@ class DeviceWorkPlan(_Owner):
     @property
     def has_external(self) -> bool:
         return self._has_external
+
+    @property
+    def direct_work_count(self) -> int:
+        """Number of work items runnable before external acquisition."""
+
+        return self._direct_work_count
 
 
 def _verify_module_digest(
@@ -3734,9 +3848,10 @@ class JitPhaseProgram(_Owner):
         runtime: Runtime,
         plan: DeviceWorkPlan,
         direct_work_count: int,
+        wave_count: int,
         stream: Any = None,
     ) -> None:
-        """Publish one exact direct/deferred order for an event-owned mover."""
+        """Publish one exact direct/completion-wave runnable order."""
 
         if runtime.device_ordinal != plan.device_ordinal:
             raise ValueError("runtime and work plan must own the same CUDA device")
@@ -3744,8 +3859,10 @@ class JitPhaseProgram(_Owner):
             direct_work_count <= 0
             or direct_work_count >= plan.work_item_count
             or plan.work_item_count > runtime.config.work_ticket_capacity
+            or wave_count <= 0
+            or wave_count > MAX_EVENT_COMPLETION_CLASSES
         ):
-            raise ValueError("event work partition requires mixed bounded work")
+            raise ValueError("event work partition requires mixed bounded waves")
         _check(
             _phase_prepare_event_work_partition(
                 self._handle,
@@ -3753,6 +3870,7 @@ class JitPhaseProgram(_Owner):
                 plan.work_items_address,
                 plan.work_item_count,
                 direct_work_count,
+                wave_count,
                 _stream_address(stream),
             )
         )

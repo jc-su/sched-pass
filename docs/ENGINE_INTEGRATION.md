@@ -246,6 +246,27 @@ model, request count, seed, and limits. The NTA run requires the worker's
 digests. It is a correctness/integration gate, not a remote-tier performance
 claim.
 
+`benchmarks/serving/CompareVllmSmoke.py` is the paired, fail-closed form of
+that gate. It launches a clean stock process and a long-lived NTA process,
+rejects ambient NTA activation in the stock arm, and requires matching token
+IDs for the first batch. More importantly, diagnostic NTA execution runs the
+native and stock FlashInfer attention paths on the same layer inputs for every
+batch and rejects any output outside the configured numerical tolerance. The
+gate also requires native worker evidence with zero fallback. This avoids
+mistaking history-sensitive final-token choices in an upstream serving engine
+for an attention correctness result. Configure CMake with a local model
+directory to register it as `nta-vllm-serving-e2e`:
+
+```bash
+cmake -S . -B build -DNTA_TEST_VLLM_MODEL=/absolute/path/to/model
+ctest --test-dir build -R '^nta-vllm-serving-e2e$' --output-on-failure
+```
+
+The model must satisfy the pinned native FlashInfer geometry (in particular,
+the currently qualified 128-element attention head). The paired gate records
+timing only as diagnostics and does not turn engine startup into a performance
+claim.
+
 vLLM's V1 `KVConnector` remains the seam for a future upstream-compatible
 prefix-cache ownership/readiness path: scheduler metadata and worker
 load/fence lifecycle belong there, while `AttentionImpl` remains the numerical

@@ -115,9 +115,11 @@ def main() -> None:
     assert direct_owner._stats["initial_typed_gap_layers"] == 0
     assert direct_owner._stats["lease_acquisition_groups_started"] == 1
 
-    # The explicit dependency-aware causal form cannot be preempted by an
-    # eager whole-layer producer. Its first exact groups are bound only after
-    # typed FlashInfer metadata exists.
+    # The explicit dependency-aware causal form shares AUTO's scheduler-bound
+    # producer queue. It is not eager at lease capture, but admission may bind
+    # and submit exact layer groups once the scheduler shape is known. This is
+    # what separates progressive consumption from the old per-layer demand
+    # transport path.
     typed_owner, typed_pool, typed_transport = coordinator(
         mode=HostExecutionMode.DEPENDENCY_AWARE
     )
@@ -130,7 +132,7 @@ def main() -> None:
     assert not typed_transport.ranges
     assert typed_owner._stats["initial_acquisition_layers"] == 0
     assert typed_owner._stats["schedule_bound_acquisition_batches"] == 1
-    assert not typed_owner.prepare_admission(typed, object())
+    assert typed_owner.proactive_layer_queue_enabled
 
     # Tenant accounting must be bound before transport, so capture remains
     # claim-free and publishes no layer for an isolated lease.

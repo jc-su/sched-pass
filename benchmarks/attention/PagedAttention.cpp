@@ -6,6 +6,7 @@
 #include "nta/FinitePhase.h"
 #include "nta/FlashInferAdapter.h"
 #include "nta/HostRuntime.h"
+#include "nta/JitPhase.h"
 #include "nta/NvmeRuntime.h"
 
 #include <cuda.h>
@@ -998,6 +999,7 @@ int runSparseAttention(
 
   KernelModule kernels;
   nta::FinitePhaseProgram phases(kernels.module());
+  nta::JitPhaseProgram typedPhases(NTA_TRANSPORT_PROGRAM_PATH);
   cudaStream_t stream = nullptr;
   cudaGraph_t graph = nullptr;
   cudaGraphExec_t graphExec = nullptr;
@@ -1099,10 +1101,18 @@ int runSparseAttention(
                                deviceOffsets.get(), deviceSummaries.get(),
                                deviceQueries.get(), requestCount, topK,
                                devicePlan, deviceSelections.get(), false, true);
-          kernels.discoverPartialSparse(
-              driverStream, runtime.deviceView(), deviceCatalog.get(),
-              deviceQueries.get(), selectedCount, topK, devicePlan,
-              deviceSelections.get(), devicePartials.get());
+          typedPhases.discover(stream, runtime.deviceView(),
+                               devicePlan.workItems(),
+                               devicePlan.dependencies(), workTicketCount);
+        } else if (wholeAcquire) {
+          kernels.selectSparse(driverStream, deviceCatalog.get(),
+                               deviceOffsets.get(), deviceSummaries.get(),
+                               deviceQueries.get(), requestCount, topK,
+                               devicePlan, deviceSelections.get(), false,
+                               false);
+          typedPhases.discover(stream, runtime.deviceView(),
+                               devicePlan.workItems(),
+                               devicePlan.dependencies(), workTicketCount);
         } else {
           kernels.discoverSparse(
               driverStream, runtime.deviceView(), deviceCatalog.get(),
@@ -1597,6 +1607,7 @@ int main(int argc, char **argv) {
 
     KernelModule kernels;
     nta::FinitePhaseProgram phases(kernels.module());
+    nta::JitPhaseProgram typedPhases(NTA_TRANSPORT_PROGRAM_PATH);
     cudaStream_t stream = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graphExec = nullptr;
@@ -1615,23 +1626,6 @@ int main(int argc, char **argv) {
                                                  options.mode == Mode::Nvme
                                              ? options.progressRounds
                                              : 0;
-    auto initialPhase = [&] {
-      checkCuda(cudaMemsetAsync(devicePartials.get(), 0,
-                                tasks.size() * sizeof(AttentionTilePartial),
-                                stream),
-                "clear attention partials");
-      checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
-                                expected.size() * sizeof(float), stream),
-                "clear attention output");
-      if (options.copyMode == CopyMode::Tma) {
-        kernels.discoverTma(driverStream, runtime.deviceView(),
-                            deviceTasks.get(), devicePlan, deviceQueries.get(),
-                            devicePartials.get());
-      } else {
-        kernels.discover(driverStream, runtime.deviceView(), deviceTasks.get(),
-                         devicePlan, deviceQueries.get(), devicePartials.get());
-      }
-    };
     auto readyPhase = [&] {
       if (options.copyMode == CopyMode::Tma) {
         kernels.readyTma(driverStream, runtime.deviceView(), deviceTasks.get(),
@@ -1640,6 +1634,17 @@ int main(int argc, char **argv) {
         kernels.ready(driverStream, runtime.deviceView(), deviceTasks.get(),
                       devicePlan, deviceQueries.get(), devicePartials.get());
       }
+    };
+    auto initialPhase = [&] {
+      checkCuda(cudaMemsetAsync(devicePartials.get(), 0,
+                                tasks.size() * sizeof(AttentionTilePartial),
+                                stream),
+                "clear attention partials");
+      checkCuda(cudaMemsetAsync(deviceOutput.get(), 0,
+                                expected.size() * sizeof(float), stream),
+                "clear attention output");
+      typedPhases.discover(stream, runtime.deviceView(), devicePlan.workItems(),
+                           devicePlan.dependencies(), taskCount);
     };
     if (options.mode == Mode::Nvme) {
       phases.enqueueNvme(driverStream, runtime.deviceView(),
@@ -1707,7 +1712,8 @@ int main(int argc, char **argv) {
           static_cast<std::uint32_t>(nta::abi::WorkTicketState::Done)) {
         ++workTicketFailures;
       }
-      const nta::abi::ObjectEntry object = runtime.readObject(task);
+      const nta::abi::ObjectEntry object =
+          runtime.readObject(tasks[task].objectSlot);
       if (object.state !=
           static_cast<std::uint32_t>(nta::abi::ObjectState::Ready)) {
         ++objectFailures;

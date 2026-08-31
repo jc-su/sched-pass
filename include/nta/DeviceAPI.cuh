@@ -9,6 +9,9 @@
 extern "C" __device__ void __nta_bind_request(std::uint32_t requestSlot,
                                               std::uint32_t generation);
 
+// Generic compiler-visible sites are readiness guards. A miss must have been
+// published by typed discovery; it cannot create a shared group from inside a
+// numerical grid because no complete-fanout seal exists there.
 extern "C" __device__ void *
 __nta_acquire_marker(nta::abi::RuntimeView *runtime, const void *directBase,
                      std::uint32_t objectSlot, std::uint64_t objectId,
@@ -20,6 +23,16 @@ extern "C" __device__ void *__nta_acquire_tensor_map_marker(
     std::uint32_t objectSlot, std::uint64_t objectId,
     std::uint32_t objectVersion, std::uint64_t offset, std::uint32_t bytes,
     std::uint32_t workTicket);
+
+// Explicit online-miss entry point. The caller must provide
+// AcquireOnlineExclusive and guarantee that the object generation has exactly
+// one external consumer work ticket in the current acquisition epoch.
+extern "C" __device__ void *nta_acquire_exclusive_slow(
+    nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+    std::uint32_t generation, std::uint32_t objectSlot,
+    std::uint64_t objectId, std::uint32_t objectVersion, std::uint64_t offset,
+    std::uint32_t bytes, std::uint32_t workTicket,
+    std::uint32_t requirementFlags);
 
 // Collective CTA operation. True means every requirement can be consumed;
 // false must lead to exactly one __nta_defer_marker call and a kernel return.

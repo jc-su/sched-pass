@@ -18,6 +18,13 @@ set(NTA_TEST_JIT_CACHE_ROOT
     "${CMAKE_CURRENT_BINARY_DIR}/flashinfer-jit-cache"
     CACHE PATH
     "Writable external root for FlashInfer/JIT CTest artifacts")
+set(NTA_TEST_VLLM_MODEL "$ENV{NTA_TEST_VLLM_MODEL}" CACHE PATH
+    "Local model directory for the optional paired vLLM serving E2E gate")
+if(NTA_TEST_VLLM_MODEL AND NOT IS_DIRECTORY "${NTA_TEST_VLLM_MODEL}")
+  message(FATAL_ERROR
+    "NTA_TEST_VLLM_MODEL is configured but is not a directory: "
+    "${NTA_TEST_VLLM_MODEL}")
+endif()
 
 # Physical tests never guess a PCI function or bind one as a side effect of a
 # normal build. Once an operator has explicitly qualified and (optionally)
@@ -970,6 +977,11 @@ if(NTA_ENABLE_CUDA)
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_calibration.py
     )
     add_test(
+      NAME nta-sglang-calibration-profile
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_calibration_profile.py
+    )
+    add_test(
       NAME nta-sglang-acquisition
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/sglang_acquisition.py
@@ -1008,6 +1020,21 @@ if(NTA_ENABLE_CUDA)
       NAME nta-qualification-runner
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/qualification_runner.py
+    )
+    add_test(
+      NAME nta-serving-trial-gates
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_trial_gates.py
+    )
+    add_test(
+      NAME nta-serving-overload-rate
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/serving_overload_rate.py
+    )
+    add_test(
+      NAME nta-gpu-trial
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/gpu_trial.py
     )
     add_test(
       NAME nta-serving-evidence
@@ -1076,10 +1103,13 @@ if(NTA_ENABLE_CUDA)
     )
     set_tests_properties(
       nta-request-slots nta-sglang-plugin nta-sglang-calibration
+      nta-sglang-calibration-profile
       nta-sglang-lifecycle
       nta-sglang-storage-connector
       nta-bounded-staging
       nta-qualification-runner
+      nta-serving-trial-gates nta-serving-overload-rate
+      nta-gpu-trial
       nta-serving-evidence nta-serving-path-evidence nta-jit-operator-family
       nta-stats-publisher nta-vllm-lifecycle
       nta-opportunity-analysis
@@ -1091,12 +1121,18 @@ if(NTA_ENABLE_CUDA)
     set_tests_properties(nta-python-runtime nta-sglang-plugin PROPERTIES
       ENVIRONMENT
         "NTA_RUNTIME_LIBRARY=$<TARGET_FILE:nta-runtime>;PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
-      TIMEOUT 60
     )
+    # This integration test imports SGLang in both the parent and a spawned
+    # worker.  On a cold artifact machine those imports legitimately exceed
+    # the 60-second unit-test budget even though no runtime work is hung.
+    set_tests_properties(nta-sglang-plugin PROPERTIES TIMEOUT 300)
     set_tests_properties(nta-request-slots PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
     )
     set_tests_properties(nta-sglang-calibration PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+    )
+    set_tests_properties(nta-sglang-calibration-profile PROPERTIES
       ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
     )
     set_tests_properties(nta-sglang-lifecycle PROPERTIES
@@ -1528,6 +1564,27 @@ if(Python3_Interpreter_FOUND)
                    RUN_SERIAL TRUE
                    TIMEOUT 300
       )
+      if(NTA_TEST_VLLM_MODEL)
+        add_test(
+          NAME nta-vllm-serving-e2e
+          COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/serving/CompareVllmSmoke.py
+            --model ${NTA_TEST_VLLM_MODEL}
+            --cache-root ${NTA_TEST_JIT_CACHE_ROOT}/vllm-serving-e2e
+            --output
+              ${CMAKE_CURRENT_BINARY_DIR}/artifacts/vllm-serving-e2e.json
+        )
+        set_tests_properties(
+          nta-vllm-serving-e2e
+          PROPERTIES DEPENDS nta-vllm-native
+                     RUN_SERIAL TRUE
+                     TIMEOUT 1200
+                     LABELS "gpu;integration;vllm;serving;e2e"
+                     PASS_REGULAR_EXPRESSION
+                       "\\\"numerically_equivalent\\\": true"
+        )
+      endif()
     endif()
   endif()
 
@@ -1600,13 +1657,15 @@ if(Python3_Interpreter_FOUND)
   )
 
   add_executable(nta-kv-bench benchmarks/kv/KvAcquire.cpp)
-  add_dependencies(nta-kv-bench nta-kv-kernel)
+  add_dependencies(nta-kv-bench nta-kv-kernel nta-transport-program)
   target_include_directories(nta-kv-bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
   )
   target_compile_definitions(
-    nta-kv-bench PRIVATE NTA_KV_CUBIN_PATH="${NTA_KV_CUBIN}"
+    nta-kv-bench PRIVATE
+    NTA_KV_CUBIN_PATH="${NTA_KV_CUBIN}"
+    NTA_TRANSPORT_PROGRAM_PATH="${NTA_TRANSPORT_PROGRAM}"
   )
   target_link_libraries(
     nta-kv-bench PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
@@ -1618,13 +1677,15 @@ if(Python3_Interpreter_FOUND)
   endif()
 
   add_executable(nta-moe-bench benchmarks/moe/MoeExperts.cpp)
-  add_dependencies(nta-moe-bench nta-kv-kernel)
+  add_dependencies(nta-moe-bench nta-kv-kernel nta-transport-program)
   target_include_directories(nta-moe-bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
   )
   target_compile_definitions(
-    nta-moe-bench PRIVATE NTA_KV_CUBIN_PATH="${NTA_KV_CUBIN}"
+    nta-moe-bench PRIVATE
+    NTA_KV_CUBIN_PATH="${NTA_KV_CUBIN}"
+    NTA_TRANSPORT_PROGRAM_PATH="${NTA_TRANSPORT_PROGRAM}"
   )
   target_link_libraries(
     nta-moe-bench PRIVATE nta-runtime-host CUDA::cuda_driver CUDA::cudart
@@ -1733,14 +1794,18 @@ if(Python3_Interpreter_FOUND)
   add_executable(
     nta-paged-attention benchmarks/attention/PagedAttention.cpp
   )
-  add_dependencies(nta-paged-attention nta-attention-kernel)
+  add_dependencies(
+    nta-paged-attention nta-attention-kernel nta-transport-program
+  )
   target_include_directories(nta-paged-attention PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
   )
   target_compile_definitions(
     nta-paged-attention
-    PRIVATE NTA_ATTENTION_CUBIN_PATH="${NTA_ATTENTION_CUBIN}"
+    PRIVATE
+    NTA_ATTENTION_CUBIN_PATH="${NTA_ATTENTION_CUBIN}"
+    NTA_TRANSPORT_PROGRAM_PATH="${NTA_TRANSPORT_PROGRAM}"
   )
   target_link_libraries(
     nta-paged-attention PRIVATE nta-runtime-host nta-flashinfer-adapter
@@ -1763,6 +1828,33 @@ if(Python3_Interpreter_FOUND)
     )
   endif()
   add_test(NAME nta-runtime COMMAND nta-runtime-test)
+
+  add_executable(
+    nta-indexed-intent-lifecycle-test
+    tests/runtime/IndexedIntentLifecycleTest.cpp
+  )
+  add_dependencies(nta-indexed-intent-lifecycle-test nta-transport-program)
+  target_include_directories(nta-indexed-intent-lifecycle-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_compile_definitions(
+    nta-indexed-intent-lifecycle-test PRIVATE
+    NTA_TRANSPORT_PROGRAM_PATH="${NTA_TRANSPORT_PROGRAM}"
+  )
+  target_link_libraries(
+    nta-indexed-intent-lifecycle-test PRIVATE nta-runtime-host CUDA::cudart
+  )
+  if(NTA_WARNINGS_AS_ERRORS)
+    target_compile_options(
+      nta-indexed-intent-lifecycle-test
+      PRIVATE -Wall -Wextra -Wpedantic -Werror
+    )
+  endif()
+  add_test(
+    NAME nta-indexed-intent-lifecycle
+    COMMAND nta-indexed-intent-lifecycle-test
+  )
+  set_tests_properties(nta-indexed-intent-lifecycle PROPERTIES TIMEOUT 60)
 
   set(NTA_DEPENDENCY_RACE_PTX
       "${CMAKE_CURRENT_BINARY_DIR}/kernel/DependencyArrivalRace.ptx")

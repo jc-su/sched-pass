@@ -197,6 +197,7 @@ def main() -> None:
             assert plan.work_items_tensor.data_ptr() == plan.work_items_address
             assert plan.dependencies_tensor.data_ptr() == plan.dependencies_address
             assert not plan.has_external
+            assert plan.direct_work_count == 1
         assert runtime.device_view_tensor.data_ptr() == runtime.device_view
         host_backing = torch.arange(128, dtype=torch.uint8, pin_memory=True).view(
             4, 2, 16

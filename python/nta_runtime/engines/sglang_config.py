@@ -21,8 +21,12 @@ from nta_runtime.engines.sglang_planning import (
     demand_overlap_policy,
     host_mover_environment,
     mover_stream_priority,
+    minimum_saturating_pair_layers,
     nonnegative_environment,
     positive_environment,
+)
+from nta_runtime.engines.sglang_calibration_profile import (
+    SglangCalibrationProfileConfig,
 )
 from nta_runtime.engines.sglang_transfer import (
     host_mover_service_model_from_environment,
@@ -154,8 +158,11 @@ class SglangVerificationConfig:
 
     attention: bool
     attention_mixed_only: bool
+    attention_layer: int | None
+    attention_first_partial: bool
     execution: bool
     transfer: bool
+    transfer_layer: int | None
     index_map: bool
 
     @classmethod
@@ -166,11 +173,41 @@ class SglangVerificationConfig:
             raise RuntimeError(
                 "NTA_VERIFY_ATTENTION_MIXED_ONLY requires NTA_VERIFY_ATTENTION"
             )
+        layer_text = os.environ.get("NTA_VERIFY_ATTENTION_LAYER", "").strip()
+        attention_layer = None if not layer_text else int(layer_text)
+        if attention_layer is not None and (attention_layer < 0 or not attention):
+            raise RuntimeError(
+                "NTA_VERIFY_ATTENTION_LAYER requires NTA_VERIFY_ATTENTION and "
+                "a nonnegative global layer id"
+            )
+        first_partial = boolean_environment(
+            "NTA_VERIFY_ATTENTION_FIRST_PARTIAL", False
+        )
+        if first_partial and (not attention or attention_layer is not None):
+            raise RuntimeError(
+                "NTA_VERIFY_ATTENTION_FIRST_PARTIAL requires "
+                "NTA_VERIFY_ATTENTION and excludes NTA_VERIFY_ATTENTION_LAYER"
+            )
+        transfer = boolean_environment("NTA_VERIFY_TRANSFER", False)
+        transfer_layer_text = os.environ.get(
+            "NTA_VERIFY_TRANSFER_LAYER", ""
+        ).strip()
+        transfer_layer = (
+            None if not transfer_layer_text else int(transfer_layer_text)
+        )
+        if transfer_layer is not None and (transfer_layer < 0 or not transfer):
+            raise RuntimeError(
+                "NTA_VERIFY_TRANSFER_LAYER requires NTA_VERIFY_TRANSFER and "
+                "a nonnegative global layer id"
+            )
         return cls(
             attention=attention,
             attention_mixed_only=mixed_only,
+            attention_layer=attention_layer,
+            attention_first_partial=first_partial,
             execution=boolean_environment("NTA_VERIFY_EXECUTION", False),
-            transfer=boolean_environment("NTA_VERIFY_TRANSFER", False),
+            transfer=transfer,
+            transfer_layer=transfer_layer,
             index_map=boolean_environment("NTA_VERIFY_INDEX_MAP", False),
         )
 
@@ -277,6 +314,7 @@ class SglangExecutionTuning:
     grouping: str
     demand_graph_capacity: int
     model: SglangModelPartition
+    calibration_profile: SglangCalibrationProfileConfig
     verification: SglangVerificationConfig
     observability: SglangObservabilityConfig
 
@@ -322,12 +360,16 @@ class SglangExecutionTuning:
         indexed_blocks = min(
             64, positive_environment("NTA_EXECUTION_INDEXED_COPY_MAX_CTAS", 32)
         )
-        frontier_wave = min(
-            64, positive_environment("NTA_EXECUTION_FRONTIER_LAYERS_PER_WAVE", 4)
-        )
         sm_mover_max_worker_ctas = min(
             64,
             positive_environment("NTA_EXECUTION_HOST_SM_MAX_WORKER_CTAS", 8),
+        )
+        frontier_wave = min(
+            64,
+            positive_environment(
+                "NTA_EXECUTION_FRONTIER_LAYERS_PER_WAVE",
+                minimum_saturating_pair_layers(sm_mover_max_worker_ctas),
+            ),
         )
         overlap_enabled = bootstrap.execution.protocol.allow_overlap
         frontier_enabled = (
@@ -371,6 +413,14 @@ class SglangExecutionTuning:
                 "eager execution"
             )
         model = SglangModelPartition.from_runner(model_runner, token_pool)
+        calibration_profile = SglangCalibrationProfileConfig.from_environment(
+            model_runner=model_runner,
+            applicable=(
+                tier.is_host_staged
+                and bootstrap.execution.protocol.kind is not ProtocolKind.CONVENTIONAL
+                and bootstrap.execution.host_execution_mode is HostExecutionMode.AUTO
+            ),
+        )
         graph_capacity = positive_environment(
             "NTA_EXECUTION_GRAPH_CAPACITY", max(64, 4 * model.layer_count)
         )
@@ -398,6 +448,7 @@ class SglangExecutionTuning:
             grouping=bootstrap.execution.grouping,
             demand_graph_capacity=graph_capacity,
             model=model,
+            calibration_profile=calibration_profile,
             verification=SglangVerificationConfig.from_environment(),
             observability=SglangObservabilityConfig.from_environment(
                 model_runner=model_runner,
@@ -406,22 +457,37 @@ class SglangExecutionTuning:
             ),
         )
 
-    def requires_typed_host_modules(self, bootstrap: SglangBootstrapConfig) -> bool:
+    def requires_typed_host_modules(
+        self,
+        bootstrap: SglangBootstrapConfig,
+        *,
+        host_cost_model: HostCostModel | None = None,
+        calibration_probes_remaining: int | None = None,
+    ) -> bool:
         """Whether setup must build typed modules before engine readiness."""
+
+        model = self.host_cost_model if host_cost_model is None else host_cost_model
+        probes = (
+            self.incremental_calibration_probes
+            if calibration_probes_remaining is None
+            else calibration_probes_remaining
+        )
+        if probes < 0:
+            raise ValueError("remaining calibration probes cannot be negative")
 
         return (
             bootstrap.execution.protocol.kind is not ProtocolKind.CONVENTIONAL
             and (
                 bootstrap.execution.host_execution_mode
                 in {HostExecutionMode.DEVICE_BULK, HostExecutionMode.DEPENDENCY_AWARE}
-                or self.host_cost_model.max_rounds > 1
+                or model.max_rounds > 1
                 or bootstrap.tenant_isolation_enabled
             )
             and (
                 bootstrap.execution.host_execution_mode
                 in {HostExecutionMode.DEVICE_BULK, HostExecutionMode.DEPENDENCY_AWARE}
-                or self.host_cost_model.incremental_setup_ns is not None
-                or self.incremental_calibration_probes > 0
+                or model.incremental_setup_ns is not None
+                or probes > 0
                 or bootstrap.tenant_isolation_enabled
             )
         )

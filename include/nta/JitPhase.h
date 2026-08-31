@@ -54,7 +54,8 @@ public:
   void prepareEventWorkPartition(cudaStream_t stream, abi::RuntimeView *runtime,
                                  const abi::WorkItem *workItems,
                                  std::uint32_t workItemCount,
-                                 std::uint32_t directWorkCount) const;
+                                 std::uint32_t directWorkCount,
+                                 std::uint32_t waveCount) const;
   void invalidateCachedObjects(cudaStream_t stream, abi::RuntimeView *runtime,
                                std::uint32_t firstObject,
                                std::uint32_t objectCount) const;
@@ -175,11 +176,13 @@ public:
                    Ready &&ready) const {
     reset(stream, runtime, config.objectCount, config.workTicketCount);
     initial();
-    complete(stream, runtime, config.workTicketCount);
+    // A typed discovery pass can make resident dependencies runnable without
+    // entering a transport round. Numerical consumers publish their own exact
+    // completion; dynamic ready queues must never use a bulk completion sweep.
+    ready();
     for (std::uint32_t round = 0; round < config.progressRounds; ++round) {
       progressHost(stream, runtime, config.progressBlocks);
       ready();
-      complete(stream, runtime, config.workTicketCount);
     }
   }
 
@@ -189,12 +192,11 @@ public:
                    Ready &&ready) const {
     reset(stream, runtime, config.objectCount, config.workTicketCount);
     initial();
-    complete(stream, runtime, config.workTicketCount);
+    ready();
     for (std::uint32_t round = 0; round < config.progressRounds; ++round) {
       progressNvmeUntilIdle(stream, runtime, config.issueBudget,
                             config.completionBudget, config.progressTimeoutNs);
       ready();
-      complete(stream, runtime, config.workTicketCount);
     }
   }
 

@@ -7,7 +7,13 @@ from collections.abc import Callable
 from typing import Any
 
 from .epoch import BoundedEpoch, EpochResult
-from .runtime import AcquireRequirement, DeviceWorkPlan, JitPhaseProgram, Runtime
+from .runtime import (
+    MAX_EVENT_COMPLETION_CLASSES,
+    AcquireRequirement,
+    DeviceWorkPlan,
+    JitPhaseProgram,
+    Runtime,
+)
 
 
 TENSOR_NAMES = ["nta_runtime", "nta_work_items", "nta_dependencies"]
@@ -342,8 +348,6 @@ def enqueue_event_partitioned_attention(
     out: Any,
     *,
     ready_events: tuple[Any, ...],
-    ready_object_slots: tuple[int, ...],
-    registration_event: Any | None,
     direct_work_count: int,
     wave_work_counts: tuple[int, ...],
     prepare_partition: bool,
@@ -354,11 +358,11 @@ def enqueue_event_partitioned_attention(
     """Overlap one exact direct subset with producer-event-owned acquisitions.
 
     The plan encodes only the compiler-verified work mapping and a stable
-    direct/deferred partition.  The producer owns transfer, lifetime, and the
-    readiness events, so this path deliberately allocates no acquisition
-    objects or work tickets and performs no dependency discovery.  Direct and
-    intermediate wave launches leave FlashInfer partials unmerged; the final
-    non-empty wave performs the one exact merge.
+    direct/deferred partition.  The producer owns transfer, lifetime, and one
+    CUDA completion event per wave, so this path deliberately allocates no
+    acquisition objects or work tickets and performs no dependency discovery.
+    Direct and intermediate wave launches leave FlashInfer partials unmerged;
+    the final non-empty wave performs the one exact merge.
     """
 
     if runtime.device_ordinal != plan.device_ordinal:
@@ -366,7 +370,6 @@ def enqueue_event_partitioned_attention(
     total_work = plan.work_item_count
     direct_work_count = int(direct_work_count)
     event_values = tuple(ready_events)
-    object_slots = tuple(int(slot) for slot in ready_object_slots)
     wave_counts = tuple(int(count) for count in wave_work_counts)
     deferred_work_count = sum(wave_counts)
     if (
@@ -375,27 +378,21 @@ def enqueue_event_partitioned_attention(
         or deferred_work_count <= 0
         or direct_work_count + deferred_work_count != total_work
         or any(count < 0 for count in wave_counts)
+        or len(wave_counts) > MAX_EVENT_COMPLETION_CLASSES
+        or len(event_values) != len(wave_counts)
+        or any(event is None for event in event_values)
+        or stream is None
     ):
         raise ValueError("event-partitioned attention requires mixed exact work")
-    event_owned = (
-        len(event_values) == len(wave_counts)
-        and not object_slots
-        and registration_event is None
-        and all(event is not None for event in event_values)
-    )
-    object_owned = (
-        len(object_slots) == len(wave_counts)
-        and not event_values
-        and registration_event is not None
-        and all(slot >= 0 for slot in object_slots)
-    )
-    if event_owned == object_owned or stream is None:
-        raise ValueError("event-partitioned attention has an invalid readiness owner")
     if _stream_is_capturing():
         raise RuntimeError("event-partitioned attention cannot mutate a captured queue")
     if prepare_partition:
         phases.prepare_event_work_partition(
-            runtime, plan, direct_work_count, stream
+            runtime,
+            plan,
+            direct_work_count,
+            len(wave_counts),
+            stream,
         )
 
     scale = 1.0 / math.sqrt(q.shape[-1]) if sm_scale is None else sm_scale
@@ -422,18 +419,10 @@ def enqueue_event_partitioned_attention(
         raise ValueError("event-partitioned attention has no deferred wave")
     offset = direct_work_count
     last_wave = nonempty_waves[-1]
-    if object_owned:
-        stream.wait_event(registration_event)
     for wave, work_count in enumerate(wave_counts):
-        if event_owned:
-            ready_event = event_values[wave]
-            if work_count != 0:
-                stream.wait_event(ready_event)
-        else:
-            # Object waves may complete out of order within the bounded
-            # persistent gather. Wait through zero-work waves as well so a
-            # later completion class inherits every earlier exact segment.
-            runtime.wait_object_range_terminal(object_slots[wave], 1, stream)
+        ready_event = event_values[wave]
+        if work_count != 0:
+            stream.wait_event(ready_event)
         if work_count == 0:
             continue
         flags = (
@@ -504,6 +493,7 @@ class FlashInferLayerEpoch:
         out: Any,
         sm_scale: float,
         launch_flags: int,
+        stream: Any,
         launch_work_count: int | None = None,
         run_options: dict[str, Any] | None = None,
         mark_consumed: bool = True,
@@ -529,7 +519,9 @@ class FlashInferLayerEpoch:
             **options,
         )
         if mark_consumed and not _stream_is_capturing():
-            self.plan.mark_consumed(_current_cuda_stream())
+            self.plan.mark_consumed(
+                _current_cuda_stream() if stream is None else stream
+            )
 
     def mark_consumed_after_replay(self, stream: Any) -> None:
         """Publish the plan fence after a graph replay has completed enqueue."""
@@ -587,6 +579,7 @@ class FlashInferLayerEpoch:
             out,
             scale,
             PREACQUIRED_LAUNCH_FLAGS,
+            stream,
             None,
             run_options,
         )
@@ -605,7 +598,7 @@ class FlashInferLayerEpoch:
         ready_event: Any = None,
         ready_work_counts: int | tuple[int, ...] | None = None,
         ready_work_offsets: tuple[int, ...] | None = None,
-        initial_ready_work_count: int = 0,
+        initial_ready_work_count: int | None = None,
         indexed_host_first_object: int | None = None,
         indexed_host_range_prevalidated: bool = False,
         indexed_host_order_prevalidated: bool = False,
@@ -638,13 +631,19 @@ class FlashInferLayerEpoch:
                 raise ValueError(
                     "host progress rounds must match the finite epoch bound"
                 )
+        initial_ready_work_count = (
+            self.plan.direct_work_count
+            if initial_ready_work_count is None
+            else int(initial_ready_work_count)
+        )
         if ready_work_counts is None:
-            launch_counts = (self.plan.work_item_count,) * len(block_counts)
+            launch_counts = (
+                self.plan.work_item_count - initial_ready_work_count,
+            ) * len(block_counts)
         elif isinstance(ready_work_counts, int):
             launch_counts = (int(ready_work_counts),) * len(block_counts)
         else:
             launch_counts = tuple(int(count) for count in ready_work_counts)
-        initial_ready_work_count = int(initial_ready_work_count)
         if not 0 <= initial_ready_work_count <= self.plan.work_item_count:
             raise ValueError("initial runnable work count is outside the active plan")
         if ready_work_offsets is None:
@@ -772,16 +771,15 @@ class FlashInferLayerEpoch:
                 raise ValueError("preloaded host work requires an explicit CUDA stream")
             stream.wait_event(ready_event)
 
-        def launch() -> None:
-            # Discovery uses FlashInfer's canonical grid. Resume waves below
-            # remap a bounded physical prefix through the device runnable set.
+        def launch_resident() -> None:
             self._launch(
                 wrapper,
                 q,
                 paged_kv_cache,
                 out,
                 scale,
-                BIND_CURRENT_GENERATION if has_external else PREACQUIRED_LAUNCH_FLAGS,
+                PREACQUIRED_LAUNCH_FLAGS,
+                stream,
                 None,
                 run_options,
             )
@@ -793,7 +791,7 @@ class FlashInferLayerEpoch:
                 self.epoch.work_ticket_count,
                 stream,
             )
-            launch()
+            launch_resident()
             return 0
 
         nonempty_launch_rounds = tuple(
@@ -846,6 +844,7 @@ class FlashInferLayerEpoch:
                 out,
                 scale,
                 launch_flags,
+                stream,
                 launch_counts[progress_round - 1],
                 run_options,
                 mark_consumed=not self._stream_ordered_retirement,
@@ -860,6 +859,33 @@ class FlashInferLayerEpoch:
                 self.retire_stream_ordered(stream)
                 if retirement_profile is not None:
                     retirement_profile[1].record(stream)
+
+        def consume_initial_ready() -> None:
+            if initial_ready_work_count == 0:
+                return
+            begin_consumer_profile()
+            initial_flags = BIND_CURRENT_GENERATION | RUNNABLE_WORK
+            if dynamic_runnable_window:
+                self.epoch.phases.prepare_ready_window(
+                    self.runtime,
+                    initial_ready_work_count,
+                    stream,
+                )
+                initial_flags |= DYNAMIC_RUNNABLE_WINDOW
+            if final_launch_round != 0:
+                initial_flags |= SKIP_MERGE
+            self._launch(
+                wrapper,
+                q,
+                paged_kv_cache,
+                out,
+                scale,
+                initial_flags,
+                stream,
+                initial_ready_work_count,
+                run_options,
+                mark_consumed=not self._stream_ordered_retirement,
+            )
 
         stream_address = int(getattr(stream, "cuda_stream", stream or 0))
         progress_address = int(
@@ -883,9 +909,15 @@ class FlashInferLayerEpoch:
         if not pipelined:
             if progress_profile is not None:
                 progress_profile[0].record(stream)
-            launch()
+            if indexed_host_order_prevalidated:
+                self.epoch.phases.discover_unqueued_host(
+                    self.runtime, self.plan, stream
+                )
+            else:
+                self.epoch.phases.discover(self.runtime, self.plan, stream)
             if on_discovered is not None:
                 on_discovered(stream)
+            consume_initial_ready()
             for progress_round, blocks in enumerate(block_counts, 1):
                 progress(blocks, stream)
                 ready(progress_round, progress_round == len(block_counts))
@@ -922,29 +954,7 @@ class FlashInferLayerEpoch:
         progress_stream.wait_event(discovery_done)
         if progress_profile is not None:
             progress_profile[0].record(progress_stream)
-        if initial_ready_work_count:
-            begin_consumer_profile()
-            initial_flags = BIND_CURRENT_GENERATION | RUNNABLE_WORK
-            if dynamic_runnable_window:
-                self.epoch.phases.prepare_ready_window(
-                    self.runtime,
-                    initial_ready_work_count,
-                    stream,
-                )
-                initial_flags |= DYNAMIC_RUNNABLE_WINDOW
-            if final_launch_round != 0:
-                initial_flags |= SKIP_MERGE
-            self._launch(
-                wrapper,
-                q,
-                paged_kv_cache,
-                out,
-                scale,
-                initial_flags,
-                initial_ready_work_count,
-                run_options,
-                mark_consumed=not self._stream_ordered_retirement,
-            )
+        consume_initial_ready()
         for progress_round, blocks in enumerate(block_counts, 1):
             progress(blocks, progress_stream)
             arrival = arrival_events[progress_round - 1]
@@ -1003,6 +1013,7 @@ class FlashInferLayerEpoch:
             out,
             scale,
             PREACQUIRED_LAUNCH_FLAGS,
+            stream,
             None,
             run_options,
         )
@@ -1058,6 +1069,7 @@ class FlashInferLayerEpoch:
             out,
             scale,
             BIND_CURRENT_GENERATION | RUNNABLE_WORK,
+            stream,
             initial_ready_work_count,
             run_options,
         )
@@ -1072,6 +1084,7 @@ class FlashInferLayerEpoch:
             BIND_CURRENT_GENERATION
             | RUNNABLE_WORK
             | (initial_ready_work_count << RUNNABLE_OFFSET_SHIFT),
+            stream,
             deferred_work_count,
             run_options,
         )
@@ -1122,42 +1135,72 @@ class FlashInferLayerEpoch:
         """Enqueue a fixed NVMe epoch; call ``check`` after execution."""
         if not self.plan.has_external:
             raise ValueError("NVMe launch needs external dependencies")
+        if self.epoch.max_progress_rounds != 1:
+            raise ValueError(
+                "NVMe progress-until-idle requires exactly one finite round"
+            )
+        if min(issue_budget, completion_budget, timeout_ns) <= 0:
+            raise ValueError("NVMe progress requires positive budgets and timeout")
         scale = 1.0 / math.sqrt(q.shape[-1]) if sm_scale is None else sm_scale
         self._prepare(stream)
+        initial_ready_work_count = self.plan.direct_work_count
+        deferred_work_count = self.plan.work_item_count - initial_ready_work_count
+        if deferred_work_count <= 0:
+            raise ValueError("NVMe launch has no deferred work")
 
-        def initial() -> None:
-            self._launch(
-                wrapper,
-                q,
-                paged_kv_cache,
-                out,
-                scale,
-                BIND_CURRENT_GENERATION,
-                None,
-                run_options,
-            )
-
-        def ready(_progress_round: int, _final_round: bool) -> None:
-            self._launch(
-                wrapper,
-                q,
-                paged_kv_cache,
-                out,
-                scale,
-                BIND_CURRENT_GENERATION | RUNNABLE_WORK,
-                None,
-                run_options,
-            )
-
-        self.epoch.enqueue_nvme_fixed(
-            initial,
-            ready,
-            issue_budget=issue_budget,
-            completion_budget=completion_budget,
-            timeout_ns=timeout_ns,
-            stream=stream,
+        self.epoch.phases.reset(
+            self.runtime,
+            self.epoch.object_count,
+            self.epoch.work_ticket_count,
+            stream,
         )
-        return self.epoch.max_progress_rounds
+        self.epoch.phases.discover(self.runtime, self.plan, stream)
+        if initial_ready_work_count:
+            self.epoch.phases.prepare_ready_window(
+                self.runtime,
+                initial_ready_work_count,
+                stream,
+            )
+            self._launch(
+                wrapper,
+                q,
+                paged_kv_cache,
+                out,
+                scale,
+                BIND_CURRENT_GENERATION
+                | RUNNABLE_WORK
+                | DYNAMIC_RUNNABLE_WINDOW
+                | SKIP_MERGE,
+                stream,
+                initial_ready_work_count,
+                run_options,
+            )
+        self.epoch.phases.progress_nvme_until_idle(
+            self.runtime,
+            issue_budget,
+            completion_budget,
+            timeout_ns,
+            stream,
+        )
+        self.epoch.phases.prepare_ready_window(
+            self.runtime,
+            deferred_work_count,
+            stream,
+        )
+        self._launch(
+            wrapper,
+            q,
+            paged_kv_cache,
+            out,
+            scale,
+            BIND_CURRENT_GENERATION
+            | RUNNABLE_WORK
+            | DYNAMIC_RUNNABLE_WINDOW,
+            stream,
+            deferred_work_count,
+            run_options,
+        )
+        return 1
 
     def check(self, progress_rounds: int, stream: Any = None) -> EpochResult:
         return self.epoch.check(progress_rounds, stream)

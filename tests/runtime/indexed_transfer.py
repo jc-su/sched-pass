@@ -327,6 +327,51 @@ def main() -> None:
         observed_copy.sm_bandwidth_bytes_per_second
     )
     assert observed_copy.calibration_scale_bucket == 20
+    profile_owner = HostMoverController(
+        policy="auto",
+        default_service_model=IndexedMoverServiceModel(
+            sm_bandwidth_bytes_per_second=10,
+            minimum_calibration_samples=3,
+        ),
+        calibration_samples=3,
+        copy_engine_max_operations=64,
+        frontier_layers_per_wave=2,
+        profile_transfer=False,
+        frontier_enabled=True,
+        profile_index_layout=False,
+        profile_index_min_bytes=64 * 1024,
+        verify_index_map=False,
+        stats={},
+    )
+    profile_owner._service_models[20] = observed_copy
+    profile_owner._profile_buckets = {
+        "sm": {20: observed_copy.sm_samples},
+        "copy_engine": {20: observed_copy.copy_samples},
+    }
+    profile_owner._profile_max_sample_bytes = {
+        "sm": 1 << 20,
+        "copy_engine": 1 << 20,
+    }
+    mover_state = profile_owner.export_state()
+    restored_owner = HostMoverController(
+        policy="auto",
+        default_service_model=IndexedMoverServiceModel(
+            sm_bandwidth_bytes_per_second=10,
+            minimum_calibration_samples=3,
+        ),
+        calibration_samples=3,
+        copy_engine_max_operations=64,
+        frontier_layers_per_wave=2,
+        profile_transfer=False,
+        frontier_enabled=True,
+        profile_index_layout=False,
+        profile_index_min_bytes=64 * 1024,
+        verify_index_map=False,
+        stats={},
+    )
+    assert restored_owner.import_state(mover_state) == 6
+    assert restored_owner.export_state() == mover_state
+    assert restored_owner.service_model(1 << 20) == observed_copy
     hybrid_scale = 1 << 23
     hybrid_curve = IndexedMoverServiceModel(
         sm_bandwidth_bytes_per_second=10,

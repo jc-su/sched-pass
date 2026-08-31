@@ -22,6 +22,7 @@ from experiments.bailian import normalize, write_workload  # noqa: E402
 from experiments.validate_workload import validate as validate_workload  # noqa: E402
 from experiments.serving_metrics import (  # noqa: E402
     preregistered_goodput,
+    preregistered_joint_goodput,
     relative_goodput,
     relative_thresholds,
 )
@@ -104,13 +105,19 @@ def single() -> dict[str, object]:
         "elapsed_seconds": 0.2,
         "request_throughput": 5.0,
         "output_token_throughput": 10.0,
+        "resident_output_token_throughput": 10.0,
+        "external_output_token_throughput": 0.0,
         "slo_goodput": {
             "qualified_requests": 1,
             "total_requests": 1,
             "requests_with_token_level_itl": 1,
             "attainment": 1.0,
             "goodput_requests_per_second": 5.0,
-            "thresholds_seconds": {"ttft": 8.0, "p99_itl": 0.1},
+            "thresholds_seconds": {
+                "ttft": 8.0,
+                "tpot": 0.05,
+                "p99_itl": 0.1,
+            },
         },
         "finite_window_accounting": {
             "method": "finite_window_arrival_departure_accounting",
@@ -194,6 +201,12 @@ def main() -> None:
     stock = single()
     stock["attention_backend"] = "flashinfer"
     stock["engine_stats"] = []
+    joint_boundary = copy.deepcopy(stock)
+    joint_boundary["records"][0]["tpot_seconds"] = 0.060
+    assert preregistered_goodput(joint_boundary)["qualified_requests"] == 1
+    assert (
+        preregistered_joint_goodput(joint_boundary)["qualified_requests"] == 0
+    )
     nta = copy.deepcopy(stock)
     nta["attention_backend"] = "nta_flashinfer"
     nta["engine_stats"] = single()["engine_stats"]
@@ -258,6 +271,8 @@ def main() -> None:
     nta_goodput = relative_goodput(nta, thresholds)
     stock_preregistered = preregistered_goodput(stock)
     nta_preregistered = preregistered_goodput(nta)
+    stock_joint_preregistered = preregistered_joint_goodput(stock)
+    nta_joint_preregistered = preregistered_joint_goodput(nta)
     comparison.update(
         {
             "slo_thresholds_seconds": thresholds,
@@ -265,6 +280,8 @@ def main() -> None:
             "nta_goodput": nta_goodput,
             "stock_preregistered_goodput": stock_preregistered,
             "nta_preregistered_goodput": nta_preregistered,
+            "stock_preregistered_joint_goodput": stock_joint_preregistered,
+            "nta_preregistered_joint_goodput": nta_joint_preregistered,
             "stock_slo_goodput": 5.0,
             "nta_slo_goodput": 5.0,
             "stock_p50_ttft_seconds": 0.1,
@@ -277,7 +294,10 @@ def main() -> None:
             "nta_p99_itl_seconds": 0.01,
             "goodput_ratio": 1.0,
             "preregistered_goodput_ratio": 1.0,
+            "preregistered_joint_goodput_ratio": 1.0,
             "output_throughput_ratio": 1.0,
+            "resident_output_throughput_ratio": 1.0,
+            "external_output_throughput_ratio": 1.0,
             "resident_p95_ttft_ratio": 1.0,
             "resident_p95_tpot_ratio": 1.0,
             "resident_p99_itl_ratio": 1.0,
@@ -510,9 +530,34 @@ def main() -> None:
             "all_requests_have_token_level_itl": True,
             "passes": True,
         },
+        "registered_joint_goodput": {
+            "bar": 1.5,
+            "geometric_mean": 1.6,
+            "ci_floor": 1.1,
+            "all_requests_have_token_level_itl": True,
+            "passes": True,
+        },
         "resident_p99_itl": {
             "bar": 1.05,
             "geometric_mean": 1.0,
+            "passes": True,
+        },
+        "resident_p95_tpot": {
+            "bar": 1.05,
+            "geometric_mean": 1.0,
+            "bootstrap_95_percent_ci_upper": 1.02,
+            "passes": True,
+        },
+        "resident_output_throughput": {
+            "bar": 0.95,
+            "geometric_mean": 1.0,
+            "bootstrap_95_percent_ci_lower": 0.98,
+            "passes": True,
+        },
+        "output_throughput": {
+            "bar": 0.95,
+            "geometric_mean": 1.0,
+            "bootstrap_95_percent_ci_lower": 0.98,
             "passes": True,
         },
         "outputs": {"passes": True},
@@ -529,6 +574,23 @@ def main() -> None:
         "revisions": ["test-revision"],
         "machine_digests": ["test-machine"],
         "demand_digests": ["test-demand"],
+        "external_request_evidence": {
+            "schema": 1,
+            "minimum_external_observations_per_arm": 100,
+            "minimum_distinct_external_request_ids_per_arm": 0,
+            "per_arm": {
+                arm: {
+                    "external_observations": 100,
+                    "distinct_external_request_ids": 10,
+                    "observations_threshold_met": True,
+                    "distinct_requests_threshold_met": True,
+                }
+                for arm in ("stock", "nta")
+            },
+            "paired_observation_counts_match": True,
+            "paired_distinct_request_ids_match": True,
+            "passes": True,
+        },
         "bars": passing_bars,
         "all_bars_pass": True,
         "evidence_grade": "qualified",
@@ -546,6 +608,7 @@ def main() -> None:
     else:
         raise AssertionError("ITL-ineligible workload passed the goodput bar")
     overstated = copy.deepcopy(qualification)
+    overstated["bars"]["registered_goodput"]["geometric_mean"] = 1.4
     overstated["bars"]["registered_goodput"]["passes"] = False
     overstated["all_bars_pass"] = False
     try:

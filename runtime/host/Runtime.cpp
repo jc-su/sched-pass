@@ -330,6 +330,8 @@ void validateIndexedHostObject(const IndexedHostObjectSpec &object,
       object.sourceStrideBytes < object.elementBytes ||
       object.stagingStrideBytes < object.elementBytes ||
       object.sourceIndexLimit == 0 || object.stagingIndexLimit == 0 ||
+      !abi::validObjectScope(object.scope) ||
+      object.indexCount > abi::ObjectAuxiliaryCountMask ||
       object.indexCount >
           std::numeric_limits<std::uint32_t>::max() / object.elementBytes) {
     throw std::invalid_argument("invalid indexed host transfer geometry");
@@ -376,9 +378,7 @@ abi::ObjectEntry makeIndexedHostObject(const IndexedHostObjectSpec &object,
       replicaStart,
       1,
       abi::InvalidIndex,
-      // For indexed objects, flags carries the registered index-array
-      // capacity so a device-side row-count update can validate against it.
-      object.indexCount,
+      abi::packObjectMetadata(object.scope, object.indexCount),
       reinterpret_cast<std::uint64_t>(object.stagingIndicesDevice),
   };
 }
@@ -574,9 +574,14 @@ struct HostRuntime::Impl {
       intents = deviceAllocate<abi::IntentSlot>(config.intentCapacity);
       workTickets = deviceAllocate<abi::WorkTicket>(config.workTicketCapacity);
       workRunnableNs = deviceAllocate<std::uint64_t>(config.workTicketCapacity);
+      workDeadlineClocks =
+          deviceAllocate<std::uint64_t>(config.workTicketCapacity);
       checkCuda(cudaMemset(workRunnableNs, 0,
                            config.workTicketCapacity * sizeof(std::uint64_t)),
                 "initialize work runnable timestamps");
+      checkCuda(cudaMemset(workDeadlineClocks, 0,
+                           config.workTicketCapacity * sizeof(std::uint64_t)),
+                "initialize work deadline clocks");
       dependencies = deviceAllocate<abi::WorkDependency>(dependencyCapacity);
       intentPool = deviceAllocate<abi::IntentPool>(1);
       intentQueueEntries =
@@ -784,6 +789,7 @@ struct HostRuntime::Impl {
           intents,
           workTickets,
           workRunnableNs,
+          workDeadlineClocks,
           dependencies,
           intentPool,
           intentQueueEntries,
@@ -1153,6 +1159,10 @@ struct HostRuntime::Impl {
       (void)cudaFree(workRunnableNs);
       workRunnableNs = nullptr;
     }
+    if (workDeadlineClocks != nullptr) {
+      (void)cudaFree(workDeadlineClocks);
+      workDeadlineClocks = nullptr;
+    }
     if (dependencies != nullptr) {
       (void)cudaFree(dependencies);
       dependencies = nullptr;
@@ -1256,6 +1266,7 @@ struct HostRuntime::Impl {
   abi::IntentSlot *intents = nullptr;
   abi::WorkTicket *workTickets = nullptr;
   std::uint64_t *workRunnableNs = nullptr;
+  std::uint64_t *workDeadlineClocks = nullptr;
   abi::WorkDependency *dependencies = nullptr;
   abi::IntentPool *intentPool = nullptr;
   abi::IntentQueueEntry *intentQueueEntries = nullptr;
@@ -1478,18 +1489,23 @@ ObjectHandle HostRuntime::installObject(std::uint32_t slot,
                                         std::uint64_t objectId,
                                         std::uint32_t version,
                                         std::span<const std::byte> contents,
-                                        Placement placement) {
+                                        Placement placement,
+                                        abi::ObjectScope scope) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   const HostReplicaSpec replica{contents, placement};
   return installReplicatedObject(slot, objectId, version,
-                                 std::span<const HostReplicaSpec>(&replica, 1));
+                                 std::span<const HostReplicaSpec>(&replica, 1),
+                                 scope);
 }
 
 ObjectHandle HostRuntime::installReplicatedObject(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
-    std::span<const HostReplicaSpec> replicas) {
+    std::span<const HostReplicaSpec> replicas, abi::ObjectScope scope) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
+  if (!abi::validObjectScope(scope)) {
+    throw std::invalid_argument("object scope is invalid");
+  }
   if (replicas.empty() ||
       replicas.size() > impl_->config.maxReplicasPerObject) {
     throw std::invalid_argument(
@@ -1593,7 +1609,7 @@ ObjectHandle HostRuntime::installReplicatedObject(
         replicaStart,
         static_cast<std::uint32_t>(replicaEntries.size()),
         abi::InvalidIndex,
-        0,
+        abi::packObjectMetadata(scope),
         0,
     };
 
@@ -1619,9 +1635,13 @@ ObjectHandle
 HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
                             std::uint32_t version, std::size_t bytes,
                             void *stagingDeviceAddress,
-                            std::span<const RegisteredReplicaSpec> replicas) {
+                            std::span<const RegisteredReplicaSpec> replicas,
+                            abi::ObjectScope scope) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
+  if (!abi::validObjectScope(scope)) {
+    throw std::invalid_argument("object scope is invalid");
+  }
   if (bytes == 0 || bytes > std::numeric_limits<std::uint32_t>::max() ||
       replicas.empty() ||
       replicas.size() > impl_->config.maxReplicasPerObject) {
@@ -1702,7 +1722,7 @@ HostRuntime::registerObject(std::uint32_t slot, std::uint64_t objectId,
       replicaStart,
       static_cast<std::uint32_t>(entries.size()),
       abi::InvalidIndex,
-      0,
+      abi::packObjectMetadata(scope),
       0,
   };
   checkCuda(cudaMemcpy(impl_->replicaEntries + replicaStart, entries.data(),
@@ -1725,7 +1745,7 @@ ObjectHandle HostRuntime::registerIndexedHostObject(
     const std::uint32_t *stagingIndicesDevice, std::uint32_t indexCount,
     std::uint32_t elementBytes, std::uint32_t sourceStrideBytes,
     std::uint32_t stagingStrideBytes, std::uint32_t sourceIndexLimit,
-    std::uint32_t stagingIndexLimit) {
+    std::uint32_t stagingIndexLimit, abi::ObjectScope scope) {
   const IndexedHostObjectSpec object{
       objectId,
       version,
@@ -1739,6 +1759,7 @@ ObjectHandle HostRuntime::registerIndexedHostObject(
       stagingStrideBytes,
       sourceIndexLimit,
       stagingIndexLimit,
+      scope,
   };
   registerIndexedHostObjects(
       slot, std::span<const IndexedHostObjectSpec>(&object, 1));
@@ -1926,12 +1947,17 @@ void HostRuntime::waitObjectRangeTerminal(std::uint32_t firstSlot,
   // cuStreamBatchMemOp accepts fewer than 256 operations.  A layer can own
   // more objects than that, so use bounded stack storage and preserve range
   // order across batches without allocating in the serving hot path.
-  constexpr std::uint32_t MaxBatchOperations = 255;
+  // One GPU-scope barrier follows each wait batch.  The producer publishes
+  // Ready with a device-scope release; this barrier is the stream-side acquire
+  // edge that makes all data covered by those states visible to downstream
+  // kernels.  Reserve one of the driver's 255 bounded operations for it.
+  constexpr std::uint32_t MaxBatchWaits = 254;
+  constexpr std::uint32_t MaxBatchOperations = MaxBatchWaits + 1;
   std::array<CUstreamBatchMemOpParams, MaxBatchOperations> operations{};
   std::uint32_t relative = 0;
   while (relative < objectCount) {
     const std::uint32_t batchCount =
-        std::min(MaxBatchOperations, objectCount - relative);
+        std::min(MaxBatchWaits, objectCount - relative);
     for (std::uint32_t index = 0; index < batchCount; ++index) {
       CUstreamBatchMemOpParams &operation = operations[index];
       operation = {};
@@ -1944,8 +1970,12 @@ void HostRuntime::waitObjectRangeTerminal(std::uint32_t firstSlot,
           static_cast<std::uint32_t>(abi::ObjectState::Ready);
       operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
     }
-    checkDriver(cuStreamBatchMemOp(reinterpret_cast<CUstream>(stream), batchCount,
-                                   operations.data(), 0),
+    CUstreamBatchMemOpParams &barrier = operations[batchCount];
+    barrier = {};
+    barrier.memoryBarrier.operation = CU_STREAM_MEM_OP_BARRIER;
+    barrier.memoryBarrier.flags = CU_STREAM_MEMORY_BARRIER_TYPE_GPU;
+    checkDriver(cuStreamBatchMemOp(reinterpret_cast<CUstream>(stream),
+                                   batchCount + 1, operations.data(), 0),
                 "wait for object terminal range");
     relative += batchCount;
   }
@@ -1954,11 +1984,14 @@ void HostRuntime::waitObjectRangeTerminal(std::uint32_t firstSlot,
 ObjectHandle HostRuntime::installNvmeObject(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::uint64_t sourceByteOffset, std::size_t bytes,
-    std::unique_ptr<NvmeBuffer> destination) {
+    std::unique_ptr<NvmeBuffer> destination, abi::ObjectScope scope) {
   detail::CudaDeviceGuard deviceGuard(impl_->config.deviceOrdinal);
   impl_->checkObjectSlot(slot);
   if (impl_->nvme == nullptr) {
     throw std::invalid_argument("NVMe transport is required");
+  }
+  if (!abi::validObjectScope(scope)) {
+    throw std::invalid_argument("object scope is invalid");
   }
   impl_->ensureObjectReplaceable(slot);
   const NvmeCapabilities &capabilities = impl_->nvme->capabilities();
@@ -2020,7 +2053,7 @@ ObjectHandle HostRuntime::installNvmeObject(
       replicaStart,
       1,
       abi::InvalidIndex,
-      buffer->dmaTarget() == NvmeDmaTarget::HbmPeer ? abi::ReplicaDmaHbm : 0U,
+      abi::packObjectMetadata(scope),
       0,
   };
   uploadOne(impl_->replicaEntries, replicaStart, replica);
@@ -2044,19 +2077,20 @@ ObjectHandle HostRuntime::installNvmeObject(
 ObjectHandle HostRuntime::installNvmeObjectAsync(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
-    cudaEvent_t priorConsumerEvent) {
+    cudaEvent_t priorConsumerEvent, abi::ObjectScope scope) {
   return installNvmeObjectAsync(slot, objectId, version, sourceByteOffset,
                                 bytes, stream, priorConsumerEvent,
-                                std::unique_ptr<NvmeBuffer>{});
+                                std::unique_ptr<NvmeBuffer>{}, scope);
 }
 
 ObjectHandle HostRuntime::installNvmeObjectAsync(
     std::uint32_t slot, std::uint64_t objectId, std::uint32_t version,
     std::uint64_t sourceByteOffset, std::size_t bytes, cudaStream_t stream,
-    cudaEvent_t priorConsumerEvent, std::unique_ptr<NvmeBuffer> destination) {
+    cudaEvent_t priorConsumerEvent, std::unique_ptr<NvmeBuffer> destination,
+    abi::ObjectScope scope) {
   std::vector<NvmeObjectInstallSpec> objects;
   objects.push_back({slot, objectId, version, sourceByteOffset, bytes,
-                     priorConsumerEvent, std::move(destination)});
+                     priorConsumerEvent, std::move(destination), scope});
   std::vector<ObjectHandle> installed =
       installNvmeObjectsAsync(std::move(objects), stream);
   return installed.front();
@@ -2102,6 +2136,9 @@ std::vector<ObjectHandle> HostRuntime::installNvmeObjectsAsync(
         object.bytes > capabilities.namespaceBytes - object.sourceByteOffset) {
       throw std::invalid_argument(
           "NVMe object range is invalid or unaligned");
+    }
+    if (!abi::validObjectScope(object.scope)) {
+      throw std::invalid_argument("object scope is invalid");
     }
     const bool installed = impl_->objectInstalled[object.slot];
     const bool hasCurrent = impl_->objects[object.slot].has_value();
@@ -2211,7 +2248,7 @@ std::vector<ObjectHandle> HostRuntime::installNvmeObjectsAsync(
             replicaStart,
             1,
             abi::InvalidIndex,
-            dmaFlag,
+            abi::packObjectMetadata(spec.scope),
             0,
         },
     });
@@ -2308,9 +2345,10 @@ ObjectHandle HostRuntime::installNvmeObject(std::uint32_t slot,
                                             std::uint64_t objectId,
                                             std::uint32_t version,
                                             std::uint64_t sourceByteOffset,
-                                            std::size_t bytes) {
+                                            std::size_t bytes,
+                                            abi::ObjectScope scope) {
   return installNvmeObject(slot, objectId, version, sourceByteOffset, bytes,
-                           std::unique_ptr<NvmeBuffer>{});
+                           std::unique_ptr<NvmeBuffer>{}, scope);
 }
 
 void HostRuntime::bindTensorMaps(std::uint32_t objectSlot,

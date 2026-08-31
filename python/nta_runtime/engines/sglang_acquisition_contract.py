@@ -75,9 +75,7 @@ class HostLayerPublication:
     transfer_first_slot: int | None
     transfer_object_id_base: int | None
     transfer_object_version: int | None
-    registration_event: torch.cuda.Event | None
     wave_events: tuple[torch.cuda.Event, ...]
-    wave_object_slots: tuple[int, ...]
     wave_row_ends: tuple[int, ...]
     # A lease-unique timing marker is present only while the bounded consumer
     # policy is collecting producer-vs-attention arrival samples. Numerical
@@ -91,9 +89,7 @@ class HostLayerPublication:
             if (
                 self.transfer_object_id_base is not None
                 or self.transfer_object_version is not None
-                or self.registration_event is not None
                 or self.wave_events
-                or self.wave_object_slots
                 or self.wave_row_ends
             ):
                 raise ValueError("copy-engine layer retained SM wave state")
@@ -109,24 +105,12 @@ class HostLayerPublication:
             or tuple(sorted(set(self.wave_row_ends))) != self.wave_row_ends
         ):
             raise ValueError("SM-published layer wave geometry is invalid")
-        event_owned = (
-            len(self.wave_events) == len(self.wave_row_ends)
-            and not self.wave_object_slots
-            and self.registration_event is None
-            and self.ready_event is self.wave_events[-1]
-        )
-        object_owned = (
-            not self.wave_events
-            and len(self.wave_object_slots) == len(self.wave_row_ends)
-            and self.registration_event is not None
-            and self.wave_object_slots
-            == tuple(
-                self.transfer_first_slot + 2 * wave
-                for wave in range(len(self.wave_row_ends))
-            )
-        )
-        if event_owned == object_owned:
-            raise ValueError("SM-published layer readiness owner is ambiguous")
+        if (
+            len(self.wave_events) != len(self.wave_row_ends)
+            or self.ready_event is not self.wave_events[-1]
+            or any(event is None for event in self.wave_events)
+        ):
+            raise ValueError("SM-published layer requires one event per wave")
 
     @property
     def wave_count(self) -> int:

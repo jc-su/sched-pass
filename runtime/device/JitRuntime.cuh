@@ -107,7 +107,7 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
       item.reductionGroup >= runtime->workTicketCapacity ||
       item.contributorCount == 0 ||
       item.contributorIndex >= item.contributorCount ||
-      item.directDependencyCount > item.dependencyCount) {
+      item.directDependencyCount > item.dependencyCount || item.flags != 0) {
     nta::device::failWorkTicket(runtime, item.workTicket,
                                 nta::abi::WorkTicketState::Failed);
     return;
@@ -120,7 +120,7 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
     ticket.contributorCount = item.contributorCount;
   }
   const nta::abi::RequestContext &request = runtime->requests[item.requestSlot];
-  const std::uint32_t generation = request.generation;
+  const std::uint32_t generation = item.generation;
   std::uint64_t deadlineClock = request.deadlineClock;
   if (item.readyDeadlineOffsetNs != 0) {
     const std::uint64_t workDeadline = nta::device::saturatingAdd(
@@ -135,7 +135,8 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
   const bool available = nta_acquire_set_leader_with_deadline(
       runtime, item.requestSlot, generation,
       dependencies + item.dependencyBegin, item.dependencyCount,
-      item.directDependencyCount, item.workTicket, deadlineClock, true);
+      item.directDependencyCount, item.workTicket, deadlineClock,
+      nta::device::AcquisitionPublicationMode::SealedDiscovery);
   if (nta::device::ticketMatches(runtime, ticket, item.requestSlot,
                                  generation)) {
     ticket.logicalTile = item.logicalWork;
@@ -143,11 +144,19 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
   if (available &&
       atomicAdd(&ticket.state, 0U) ==
           static_cast<std::uint32_t>(nta::abi::WorkTicketState::New)) {
-    // Available work needs only canonical identity publication. Keep its
-    // ticket New so the application CTA performs the normal generation-bound
-    // completion transition without paying the dependency protocol used by a
-    // suspended ticket. changedQueued is reset per epoch and serves as the
-    // exact-once discovery publication guard.
+    // Available work needs canonical identity but no dependency protocol.
+    // Publish the descriptor before its ready-queue index. The queue entry is
+    // the canonical WorkItem index; logicalTile remains the framework's
+    // semantic coordinate and is not a physical launch-array index. Keep the
+    // ticket New so completion retains the cheaper generation-bound path.
+    ticket.requestId = request.requestId;
+    ticket.requestSlot = item.requestSlot;
+    ticket.generation = generation;
+    ticket.dependencyCount = 0;
+    ticket.logicalTile = item.logicalWork;
+    ticket.dependencyStart = nta::abi::InvalidIndex;
+    ticket.epoch = nta::device::currentEpoch(runtime);
+    ticket.unavailableBytes = 0;
     if (runtime->changedQueued == nullptr || runtime->readyCount == nullptr ||
         runtime->readyWorkTickets == nullptr ||
         atomicCAS(&runtime->changedQueued[item.workTicket], 0U, 2U) != 0U) {
@@ -165,32 +174,6 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
   }
 }
 
-namespace nta::jit {
-
-__device__ __forceinline__ void
-queueDiscoveredIntents(abi::RuntimeView *runtime) {
-  if (runtime == nullptr || runtime->intents == nullptr ||
-      runtime->intentPool == nullptr) {
-    return;
-  }
-  for (std::uint32_t index = 0; index < runtime->intentCapacity; ++index) {
-    abi::IntentSlot &slot = runtime->intents[index];
-    if (atomicAdd(&slot.intent.valid, 0U) != 1U ||
-        slot.epoch != device::currentEpoch(runtime)) {
-      continue;
-    }
-    const auto source = static_cast<abi::SourceKind>(slot.sourceKind);
-    if (!device::backendAcceptsIntent(runtime, source)) {
-      continue;
-    }
-    if (!device::queueIntent(runtime, slot, source)) {
-      atomicAdd(&runtime->intentPool->overflow, 1U);
-    }
-  }
-}
-
-} // namespace nta::jit
-
 // Discovery is embarrassingly parallel until intents enter one backend EDF
 // heap. Let discovery threads publish lock-free intent slots, then have one
 // finite builder insert them without thousands of resident threads spinning
@@ -201,7 +184,7 @@ nta_queue_discovered_intents(nta::abi::RuntimeView *runtime) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
-  nta::jit::queueDiscoveredIntents(runtime);
+  nta::device::queueDiscoveredIntents(runtime);
 }
 
 // Prove that a finite NVMe discovery image is already laid out in the exact
@@ -224,11 +207,29 @@ nta_validate_ordered_nvme_intents(nta::abi::RuntimeView *runtime,
   if (control == nullptr) {
     return;
   }
+  for (std::uint32_t index = firstIntent + threadIdx.x;
+       index < firstIntent + intentCount; index += blockDim.x) {
+    abi::IntentSlot &slot = runtime->intents[index];
+    if (atomicAdd(&slot.intent.valid, 0U) == 1U &&
+        slot.epoch == device::currentEpoch(runtime)) {
+      const device::IntentBindingState binding =
+          device::bindIntentToEarliestLiveConsumer(runtime, slot.intent);
+      if (binding != device::IntentBindingState::Bound &&
+          device::claimIntent(slot)) {
+        device::retireTerminalIntent(
+            runtime, slot,
+            binding == device::IntentBindingState::NoLiveConsumer
+                ? device::AdmittedIntent::TerminalReason::NoLiveConsumer
+                : device::AdmittedIntent::TerminalReason::Invalid);
+      }
+    }
+  }
+  __syncthreads();
   __shared__ device::OrderedIntentValidationScratch scratch;
   const bool ordered = device::validateOrderedIntentWindow(
       runtime, abi::SourceKind::Nvme, firstIntent, intentCount, scratch);
   if (threadIdx.x == 0 && !ordered) {
-    nta::jit::queueDiscoveredIntents(runtime);
+    nta::device::queueDiscoveredIntents(runtime);
   }
 }
 
@@ -349,15 +350,14 @@ nta_jit_prepare_ready_window(void *runtime, std::uint32_t maximumWork,
   return nta::jit::launchStatus();
 }
 
-// Build one immutable, event-ordered consumer partition.  Proactive transport
-// owns data readiness and publishes a CUDA event; the attention plan owns only
-// the exact CTA-to-request map and whether each work item is resident or waits
-// for that event.  Keeping this partition in the existing runnable queue avoids
-// rebuilding object requirements or running dependency discovery for every
-// transformer layer.
+// Build one immutable, producer-independent consumer partition. Proactive
+// transport owns data readiness; each typed work item names only its logical
+// completion class. Keeping physical object slots out of numerical policy
+// makes the partition reusable across layers and tier backends.
 extern "C" __global__ void nta_prepare_event_work_partition(
     nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *workItems,
-    std::uint32_t workItemCount, std::uint32_t directWorkCount) {
+    std::uint32_t workItemCount, std::uint32_t directWorkCount,
+    std::uint32_t waveCount) {
   if (blockIdx.x != 0 || threadIdx.x != 0 || runtime == nullptr ||
       workItems == nullptr) {
     return;
@@ -365,6 +365,8 @@ extern "C" __global__ void nta_prepare_event_work_partition(
   if (workItemCount == 0 || directWorkCount == 0 ||
       directWorkCount >= workItemCount ||
       workItemCount > runtime->workTicketCapacity ||
+      waveCount == 0 ||
+      waveCount > nta::abi::MaximumEventCompletionClasses ||
       runtime->readyWorkTickets == nullptr || runtime->readyCount == nullptr ||
       runtime->readyHead == nullptr) {
     atomicAdd(&runtime->failedCount, 1U);
@@ -372,40 +374,53 @@ extern "C" __global__ void nta_prepare_event_work_partition(
     return;
   }
 
+  std::uint32_t waveCounts[nta::abi::MaximumEventCompletionClasses] = {};
+  std::uint32_t waveCursors[nta::abi::MaximumEventCompletionClasses] = {};
   std::uint32_t direct = 0;
-  std::uint32_t deferred = directWorkCount;
+  bool invalid = false;
   for (std::uint32_t work = 0; work < workItemCount; ++work) {
     const nta::abi::WorkItem item = workItems[work];
-    if (item.dependencyCount == 0 ||
-        item.directDependencyCount > item.dependencyCount) {
-      atomicAdd(&runtime->failedCount, 1U);
-      atomicAdd(&runtime->stickyFailedCount, 1U);
-      atomicExch(runtime->readyCount, 0U);
-      return;
+    if (item.flags != nta::abi::WorkItemEventPartition) {
+      invalid = true;
+      break;
     }
-    if (item.directDependencyCount == item.dependencyCount) {
+    if (item.completionClass == nta::abi::InvalidIndex) {
       if (direct >= directWorkCount) {
-        atomicAdd(&runtime->failedCount, 1U);
-        atomicAdd(&runtime->stickyFailedCount, 1U);
-        atomicExch(runtime->readyCount, 0U);
-        return;
+        invalid = true;
+        break;
       }
-      runtime->readyWorkTickets[direct++] = work;
+      ++direct;
     } else {
-      if (deferred >= workItemCount) {
-        atomicAdd(&runtime->failedCount, 1U);
-        atomicAdd(&runtime->stickyFailedCount, 1U);
-        atomicExch(runtime->readyCount, 0U);
-        return;
+      if (item.completionClass >= waveCount) {
+        invalid = true;
+        break;
       }
-      runtime->readyWorkTickets[deferred++] = work;
+      ++waveCounts[item.completionClass];
     }
   }
-  if (direct != directWorkCount || deferred != workItemCount) {
+  std::uint32_t cursor = directWorkCount;
+  for (std::uint32_t wave = 0; wave < waveCount; ++wave) {
+    waveCursors[wave] = cursor;
+    cursor += waveCounts[wave];
+  }
+  if (invalid || direct != directWorkCount || cursor != workItemCount) {
     atomicAdd(&runtime->failedCount, 1U);
     atomicAdd(&runtime->stickyFailedCount, 1U);
     atomicExch(runtime->readyCount, 0U);
     return;
+  }
+
+  // Stable-bucket canonical work identities. FlashInfer consumes these
+  // identities through launchWorkIndex; its upstream scheduler arrays and the
+  // exact WorkItem reduction coordinates remain unchanged.
+  direct = 0;
+  for (std::uint32_t work = 0; work < workItemCount; ++work) {
+    const nta::abi::WorkItem item = workItems[work];
+    if (item.completionClass == nta::abi::InvalidIndex) {
+      runtime->readyWorkTickets[direct++] = work;
+      continue;
+    }
+    runtime->readyWorkTickets[waveCursors[item.completionClass]++] = work;
   }
   atomicExch(runtime->readyHead, 0U);
   runtime->readyWindowEnd = workItemCount;
@@ -417,15 +432,18 @@ extern "C" __attribute__((visibility("default"))) cudaError_t
 nta_jit_prepare_event_work_partition(void *runtime, const void *workItems,
                                      std::uint32_t workItemCount,
                                      std::uint32_t directWorkCount,
+                                     std::uint32_t waveCount,
                                      cudaStream_t stream) {
   if (runtime == nullptr || workItems == nullptr || workItemCount == 0 ||
-      directWorkCount == 0 || directWorkCount >= workItemCount) {
+      directWorkCount == 0 ||
+      directWorkCount >= workItemCount || waveCount == 0 ||
+      waveCount > nta::abi::MaximumEventCompletionClasses) {
     return cudaErrorInvalidValue;
   }
   nta_prepare_event_work_partition<<<1, 1, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime),
-      static_cast<const nta::abi::WorkItem *>(workItems), workItemCount,
-      directWorkCount);
+      static_cast<const nta::abi::WorkItem *>(workItems),
+      workItemCount, directWorkCount, waveCount);
   return nta::jit::launchStatus();
 }
 
@@ -583,7 +601,7 @@ nta_jit_progress_indexed_host_range(void *runtime, std::uint32_t firstObject,
 
 // Per-step selection needs a variable acquisition count: the selector
 // rewrites the registered index arrays in place with this step's misses and
-// then bounds the copy to that count. ObjectEntry::flags carries the
+// then bounds the copy to that count. ObjectEntry metadata carries the
 // registered capacity; element geometry is preserved by scaling bytes with
 // the count. State returns to New so a shrunken set can never appear Ready
 // from a previous step, and any violation fails the object closed.
@@ -609,8 +627,10 @@ nta_set_indexed_row_counts(nta::abi::RuntimeView *runtime,
   if (threadIdx.x == 0) {
     validGeometry =
         replica != nullptr && (replica->flags & abi::ReplicaIndexed) != 0 &&
-                rowCount != 0 && object.flags != 0 &&
-                rowCount <= object.flags && replica->dmaPageCount != 0
+                rowCount != 0 &&
+                abi::objectAuxiliaryCount(object.metadata) != 0 &&
+                rowCount <= abi::objectAuxiliaryCount(object.metadata) &&
+                replica->dmaPageCount != 0
             ? 1U
             : 0U;
     invalidIndex = 0;
@@ -740,7 +760,7 @@ extern "C" __global__ void nta_prepare_selected_indexed_rows(
           (replica->flags & abi::ReplicaIndexed) != 0 &&
           replica->dmaPageCount != 0 && object.bytes != 0 &&
           object.bytes % replica->dmaPageCount == 0 &&
-          object.flags >= capacity &&
+          abi::objectAuxiliaryCount(object.metadata) >= capacity &&
           replica->dmaPageListAddress ==
               reinterpret_cast<std::uint64_t>(sourceIndices) &&
           object.stagingTensorMapAddress ==
@@ -1009,7 +1029,7 @@ static __device__ void ntaPrepareSelectedRows(
           (replica->flags & abi::ReplicaIndexed) != 0 &&
           replica->dmaPageCount != 0 && object.bytes != 0 &&
           object.bytes % replica->dmaPageCount == 0 &&
-          object.flags >= capacity &&
+          abi::objectAuxiliaryCount(object.metadata) >= capacity &&
           replica->dmaPageListAddress ==
               reinterpret_cast<std::uint64_t>(sourceIndices) &&
           object.stagingTensorMapAddress ==

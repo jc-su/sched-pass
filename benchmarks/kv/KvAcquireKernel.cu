@@ -59,8 +59,10 @@ __device__ __forceinline__ void runKvTile(nta::abi::RuntimeView *runtime,
       task.directBase, 0,
       task.objectId,   task.offset,
       task.objectSlot, task.objectVersion,
-      task.bytes,      0};
-  void *address = nta::kernel::acquireAddress(runtime, request, requirement);
+      task.bytes,
+      task.directBase == 0 ? nta::abi::AcquireOnlineExclusive : 0U};
+  void *address =
+      nta::kernel::acquireExclusiveAddress(runtime, request, requirement);
   if (address == nullptr) {
     nta::kernel::defer(runtime, request);
     return;
@@ -103,15 +105,11 @@ runNvmeHash(nta::abi::RuntimeView *runtime,
   const nta::benchmark::TileTask task = tasks[taskIndex];
   const nta::kernel::BoundRequest request{task.requestSlot, task.generation,
                                           task.workTicket};
-  const nta::abi::AcquireRequirement requirement{0,
-                                                 0,
-                                                 task.objectId,
-                                                 task.offset,
-                                                 task.objectSlot,
-                                                 task.objectVersion,
-                                                 task.bytes,
-                                                 0};
-  void *address = nta::kernel::acquireAddress(runtime, request, requirement);
+  const nta::abi::AcquireRequirement requirement{
+      0, 0, task.objectId, task.offset, task.objectSlot, task.objectVersion,
+      task.bytes, nta::abi::AcquireOnlineExclusive};
+  void *address =
+      nta::kernel::acquireExclusiveAddress(runtime, request, requirement);
   if (address == nullptr) {
     nta::kernel::defer(runtime, request);
     return;
@@ -119,8 +117,12 @@ runNvmeHash(nta::abi::RuntimeView *runtime,
 
   const auto *values = static_cast<const std::uint32_t *>(address);
   const std::uint32_t count = task.bytes / sizeof(std::uint32_t);
+  const nta::abi::ObjectEntry &object = runtime->objects[task.objectSlot];
+  const nta::abi::ReplicaEntry *selected =
+      nta::device::replica(runtime, object, object.selectedReplica);
   const bool directHbm =
-      (runtime->objects[task.objectSlot].flags & nta::abi::ReplicaDmaHbm) != 0;
+      selected != nullptr &&
+      (selected->flags & nta::abi::ReplicaDmaHbm) != 0;
   std::uint64_t partial = 0;
   for (std::uint32_t element = threadIdx.x; element < count;
        element += blockDim.x) {
@@ -386,15 +388,13 @@ __device__ __forceinline__ void buildMoePlan(
   }
   const nta::abi::RequestContext request = runtime->requests[tokenIndex];
   const std::uint32_t dependencyBegin = tokenIndex * topK;
-  std::uint32_t directDependencyCount = topK;
+  std::uint32_t directDependencyCount = 0;
   for (std::uint32_t rank = 0; rank < topK; ++rank) {
     const std::uint32_t expert = topExperts[rank];
     const nta::benchmark::MoeExpertDescriptor descriptor = experts[expert];
     const std::uint64_t directBase =
         preacquired ? descriptor.consumeBase : descriptor.directBase;
-    if (directBase == 0) {
-      directDependencyCount = 0;
-    }
+    directDependencyCount += directBase != 0 ? 1U : 0U;
     selectedExperts[dependencyBegin + rank] = expert;
     requirements[dependencyBegin + rank] = {directBase,
                                             0,
@@ -445,7 +445,7 @@ extern "C" __global__ void nta_kv_ready_kernel(
   if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
+  const std::uint32_t taskIndex = workTicket;
   if (taskIndex < taskCount) {
     runKvTile(runtime, tasks, taskIndex, query, output);
   }
@@ -459,6 +459,55 @@ extern "C" __global__ void nta_nvme_hash_kernel(
     return;
   }
   runNvmeHash(runtime, tasks, taskIndex, output);
+}
+
+// Test/export seam for typed discovery. Unlike the numerical CTA entry above,
+// this phase must publish demand without exercising the one-shot NVMe direct
+// submission path; transport ownership begins only after the complete work
+// image has been sealed by the queue-builder phase.
+extern "C" __global__ void nta_nvme_deferred_discovery_kernel(
+    nta::abi::RuntimeView *runtime, const nta::benchmark::TileTask *tasks,
+    std::uint32_t taskCount) {
+  const std::uint32_t taskIndex = blockIdx.x;
+  if (threadIdx.x != 0 || taskIndex >= taskCount) {
+    return;
+  }
+  const nta::benchmark::TileTask task = tasks[taskIndex];
+  const nta::abi::AcquireRequirement requirement{
+      0, 0, task.objectId, task.offset, task.objectSlot, task.objectVersion,
+      task.bytes, 0};
+  const std::uint64_t deadline =
+      runtime != nullptr && task.requestSlot < runtime->requestCapacity
+          ? runtime->requests[task.requestSlot].deadlineClock
+          : 0;
+  (void)nta_acquire_set_leader_with_deadline(
+      runtime, task.requestSlot, task.generation, &requirement, 1, 0,
+      task.workTicket, deadline,
+      nta::device::AcquisitionPublicationMode::SealedDiscovery);
+}
+
+extern "C" __global__ void
+nta_nvme_seal_discovery_kernel(nta::abi::RuntimeView *runtime) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    nta::device::queueDiscoveredIntents(runtime);
+  }
+}
+
+// Contract regression seam: a generic inline consumer has no grid-wide seal
+// and therefore must fail closed on a miss instead of publishing an immediate
+// shared intent.
+extern "C" __global__ void nta_nvme_unsealed_guard_kernel(
+    nta::abi::RuntimeView *runtime, const nta::benchmark::TileTask *tasks) {
+  if (blockIdx.x != 0 || threadIdx.x != 0 || runtime == nullptr ||
+      tasks == nullptr) {
+    return;
+  }
+  const nta::benchmark::TileTask task = tasks[0];
+  const nta::abi::AcquireRequirement requirement{
+      0, 0, task.objectId, task.offset, task.objectSlot, task.objectVersion,
+      task.bytes, 0};
+  (void)nta_acquire_set_leader(runtime, task.requestSlot, task.generation,
+                               &requirement, 1, 0, task.workTicket);
 }
 
 extern "C" __global__ void
@@ -483,7 +532,7 @@ nta_nvme_ready_hash_kernel(nta::abi::RuntimeView *runtime,
   if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
+  const std::uint32_t taskIndex = workTicket;
   if (taskIndex < taskCount) {
     runNvmeHash(runtime, tasks, taskIndex, output);
   }
@@ -508,7 +557,7 @@ extern "C" __global__ void nta_dependency_ready_kernel(
   if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
+  const std::uint32_t taskIndex = workTicket;
   if (taskIndex < taskCount) {
     runDependencyTile(runtime, tasks, requirements, taskIndex, query, output);
   }
@@ -525,18 +574,6 @@ nta_dependency_baseline_kernel(const nta::abi::WorkItem *tasks,
   }
 }
 
-extern "C" __global__ void nta_moe_tile_kernel(
-    nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
-    std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
-    const float *input, float *output, std::uint32_t hiddenSize) {
-  const std::uint32_t taskIndex = blockIdx.x;
-  if (taskIndex >= taskCount || hiddenSize == 0 || blockDim.x != hiddenSize) {
-    return;
-  }
-  runMoeTile(runtime, tasks, requirements, taskIndex, input, output,
-             hiddenSize);
-}
-
 extern "C" __global__ void nta_moe_ready_kernel(
     nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *tasks,
     std::uint32_t taskCount, const nta::abi::AcquireRequirement *requirements,
@@ -548,7 +585,7 @@ extern "C" __global__ void nta_moe_ready_kernel(
   if (workTicket >= runtime->workTicketCapacity) {
     return;
   }
-  const std::uint32_t taskIndex = runtime->workTickets[workTicket].logicalTile;
+  const std::uint32_t taskIndex = workTicket;
   if (taskIndex < taskCount) {
     runMoeTile(runtime, tasks, requirements, taskIndex, input, output,
                hiddenSize);

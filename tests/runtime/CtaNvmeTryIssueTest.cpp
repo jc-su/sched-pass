@@ -95,6 +95,15 @@ public:
                 "cuModuleLoad test cubin");
     checkDriver(cuModuleGetFunction(&initial_, module_, "nta_nvme_hash_kernel"),
                 "cuModuleGetFunction initial");
+    checkDriver(cuModuleGetFunction(&deferred_, module_,
+                                    "nta_nvme_deferred_discovery_kernel"),
+                "cuModuleGetFunction deferred discovery");
+    checkDriver(cuModuleGetFunction(&seal_, module_,
+                                    "nta_nvme_seal_discovery_kernel"),
+                "cuModuleGetFunction seal discovery");
+    checkDriver(cuModuleGetFunction(&unsealedGuard_, module_,
+                                    "nta_nvme_unsealed_guard_kernel"),
+                "cuModuleGetFunction unsealed guard");
     checkDriver(
         cuModuleGetFunction(&ready_, module_, "nta_nvme_ready_hash_kernel"),
         "cuModuleGetFunction ready");
@@ -116,6 +125,35 @@ public:
              const nta::benchmark::TileTask *task, std::uint64_t *output,
              std::uint32_t count = 1) const {
     launch(ready_, stream, runtime, task, output, count, false);
+  }
+
+  void deferred(CUstream stream, nta::abi::RuntimeView *runtime,
+                const nta::benchmark::TileTask *task,
+                std::uint32_t count = 1) const {
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(task);
+    void *arguments[] = {&runtimeAddress, &taskAddress, &count};
+    checkDriver(cuLaunchKernel(deferred_, count, 1, 1, 1, 1, 1, 0, stream,
+                               arguments, nullptr),
+                "cuLaunchKernel deferred discovery");
+  }
+
+  void seal(CUstream stream, nta::abi::RuntimeView *runtime) const {
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    void *arguments[] = {&runtimeAddress};
+    checkDriver(cuLaunchKernel(seal_, 1, 1, 1, 1, 1, 1, 0, stream, arguments,
+                               nullptr),
+                "cuLaunchKernel seal discovery");
+  }
+
+  void unsealedGuard(CUstream stream, nta::abi::RuntimeView *runtime,
+                     const nta::benchmark::TileTask *task) const {
+    CUdeviceptr runtimeAddress = reinterpret_cast<CUdeviceptr>(runtime);
+    CUdeviceptr taskAddress = reinterpret_cast<CUdeviceptr>(task);
+    void *arguments[] = {&runtimeAddress, &taskAddress};
+    checkDriver(cuLaunchKernel(unsealedGuard_, 1, 1, 1, 1, 1, 1, 0, stream,
+                               arguments, nullptr),
+                "cuLaunchKernel unsealed guard");
   }
 
   [[nodiscard]] CUmodule module() const noexcept { return module_; }
@@ -142,6 +180,9 @@ private:
 
   CUmodule module_ = nullptr;
   CUfunction initial_ = nullptr;
+  CUfunction deferred_ = nullptr;
+  CUfunction seal_ = nullptr;
+  CUfunction unsealedGuard_ = nullptr;
   CUfunction ready_ = nullptr;
 };
 
@@ -359,6 +400,25 @@ public:
          0, nta::abi::InvalidIndex, 0, 0, 0, slot, 1},
         slot);
     tasks.upload({0, objectId, 0, slot, 8, slot, 4, Bytes, slot, 0, 0}, slot);
+  }
+
+  void initializeSharedConsumers(bool earliestFirst) {
+    nta::abi::RequestContext first = requests.download(0);
+    first.deadlineClock = 900;
+    requests.upload(first, 0);
+    requests.upload({2, 500, Bytes, 0, 8, 0, 9, 0}, 1);
+    requestProgress.upload({2, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+                           1);
+    workTickets.upload(
+        {0, 0, 0, static_cast<std::uint32_t>(nta::abi::WorkTicketState::New),
+         0, 0, nta::abi::InvalidIndex, 0, 0, 0, 1, 1},
+        1);
+    const nta::benchmark::TileTask later{
+        0, ObjectId, 0, 0, 7, 0, 3, Bytes, 0, 0, 0};
+    const nta::benchmark::TileTask earliest{
+        0, ObjectId, 0, 1, 8, 0, 3, Bytes, 1, 0, 0};
+    tasks.upload(earliestFirst ? earliest : later, 0);
+    tasks.upload(earliestFirst ? later : earliest, 1);
   }
 
   void completeCurrentSubmission(std::uint32_t statusCode = 0) {
@@ -627,6 +687,107 @@ void verifyDirectPath(QueueFixture &fixture, const KernelModule &kernels,
               completedProgress.completedComputeNs ==
                   completedProgress.expectedComputeNs,
           "request feedback did not account for completed work");
+}
+
+void verifyDeferredDiscoveryDoesNotBypassSeal(QueueFixture &fixture,
+                                              const KernelModule &kernels,
+                                              CUstream stream) {
+  kernels.deferred(stream, fixture.runtime.get(), fixture.tasks.get());
+  checkDriver(cuStreamSynchronize(stream),
+              "synchronize deferred NVMe discovery");
+  const nta::abi::NvmeQueueView queue = fixture.queue.download();
+  const nta::abi::IntentPool pool = fixture.intentPool.download();
+  const nta::abi::BackendView backend = fixture.backends.download(
+      static_cast<std::uint32_t>(nta::abi::SourceKind::Nvme));
+  require(queue.submitted == 0 && queue.directSubmitted == 0 &&
+              queue.outstanding == 0 && queue.ownerLock == 0,
+          "typed discovery bypassed the acquisition-group seal");
+  require(pool.active == 1 && pool.enqueued == 1 &&
+              backend.pendingAcquisitions == 1 &&
+              fixture.intents.download().intent.valid == 1 &&
+              fixture.objects.download().state == static_cast<std::uint32_t>(
+                                                        nta::abi::ObjectState::Queued),
+          "typed discovery did not publish exactly one deferred intent");
+  require(fixture.workTickets.download().state ==
+                  static_cast<std::uint32_t>(
+                      nta::abi::WorkTicketState::Pending) &&
+              fixture.objectDependentHeads.download() != nta::abi::InvalidIndex,
+          "typed discovery did not seal request/dependency identity");
+}
+
+void verifyUnsealedInlineMissFailsClosed(QueueFixture &fixture,
+                                         const KernelModule &kernels,
+                                         CUstream stream) {
+  kernels.unsealedGuard(stream, fixture.runtime.get(), fixture.tasks.get());
+  checkDriver(cuStreamSynchronize(stream),
+              "synchronize unsealed inline guard");
+  const nta::abi::NvmeQueueView queue = fixture.queue.download();
+  const nta::abi::BackendView backend = fixture.backends.download(
+      static_cast<std::uint32_t>(nta::abi::SourceKind::Nvme));
+  require(queue.submitted == 0 && queue.directSubmitted == 0 &&
+              queue.outstanding == 0 &&
+              fixture.intentPool.download().active == 0 &&
+              backend.pendingAcquisitions == 0,
+          "unsealed inline miss escaped into transport or the EDF queue");
+  require(fixture.objects.download().state ==
+                  static_cast<std::uint32_t>(nta::abi::ObjectState::New) &&
+              fixture.workTickets.download().state ==
+                  static_cast<std::uint32_t>(
+                      nta::abi::WorkTicketState::Failed),
+          "unsealed inline miss did not fail closed without mutating the "
+          "object");
+}
+
+void verifySharedDiscoveryCanonicalOwner(QueueFixture &fixture,
+                                         const KernelModule &kernels,
+                                         CUstream stream,
+                                         bool earliestFirst) {
+  fixture.initializeSharedConsumers(earliestFirst);
+  kernels.deferred(stream, fixture.runtime.get(), fixture.tasks.get(),
+                   QueueFixture::Capacity);
+  checkDriver(cuStreamSynchronize(stream),
+              "synchronize shared deferred discovery");
+  require(fixture.queue.download().submitted == 0 &&
+              fixture.queue.download().directSubmitted == 0 &&
+              fixture.queue.download().outstanding == 0,
+          "shared typed discovery submitted before the group seal");
+  const nta::abi::IntentPool discoveredPool = fixture.intentPool.download();
+  const nta::abi::WorkTicket firstTicket = fixture.workTickets.download(0);
+  const nta::abi::WorkTicket secondTicket = fixture.workTickets.download(1);
+  if (!(discoveredPool.active == 1 && discoveredPool.enqueued == 1 &&
+        firstTicket.state == static_cast<std::uint32_t>(
+                                 nta::abi::WorkTicketState::Pending) &&
+        secondTicket.state == static_cast<std::uint32_t>(
+                                  nta::abi::WorkTicketState::Pending))) {
+    throw std::runtime_error(
+          "shared typed discovery did not construct one group with two "
+          "consumers: active=" +
+        std::to_string(discoveredPool.active) +
+        " enqueued=" + std::to_string(discoveredPool.enqueued) +
+        " first=" + std::to_string(firstTicket.state) +
+        " second=" + std::to_string(secondTicket.state));
+  }
+
+  kernels.seal(stream, fixture.runtime.get());
+  checkDriver(cuStreamSynchronize(stream),
+              "synchronize shared discovery seal");
+  const nta::abi::AcquireIntent intent = fixture.intents.download(0).intent;
+  const nta::abi::IntentQueueEntry queueEntry =
+      fixture.intentQueueEntries.download(0);
+  const nta::abi::IntentQueueControl queueControl =
+      fixture.intentQueueControls.download(
+          static_cast<std::uint32_t>(nta::abi::SourceKind::Nvme));
+  require(intent.requestSlot == 1 && intent.generation == 8 &&
+              intent.workTicket == 1 && intent.tenantId == 0 &&
+              intent.deadlineClock == 500 && intent.priority == 9,
+          "sealed shared group retained the first-CAS claimant instead of "
+          "the canonical EDF owner");
+  require(queueControl.size == 1 &&
+              queueEntry.state == static_cast<std::uint32_t>(
+                                      nta::abi::IntentQueueState::Queued) &&
+              queueEntry.deadlineClock == 500 && queueEntry.priority == 9 &&
+              fixture.queue.download().directSubmitted == 0,
+          "sealed shared group did not publish exactly one canonical EDF node");
 }
 
 void verifyConcurrentDirectPath(QueueFixture &fixture,
@@ -959,6 +1120,16 @@ int main() {
     CUstream stream = nullptr;
     checkDriver(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING),
                 "cuStreamCreate");
+    QueueFixture deferredFixture;
+    verifyDeferredDiscoveryDoesNotBypassSeal(deferredFixture, kernels, stream);
+    QueueFixture unsealedFixture;
+    verifyUnsealedInlineMissFailsClosed(unsealedFixture, kernels, stream);
+    QueueFixture sharedLaterFirstFixture;
+    verifySharedDiscoveryCanonicalOwner(sharedLaterFirstFixture, kernels,
+                                        stream, false);
+    QueueFixture sharedEarliestFirstFixture;
+    verifySharedDiscoveryCanonicalOwner(sharedEarliestFirstFixture, kernels,
+                                        stream, true);
     QueueFixture directFixture;
     verifyDirectPath(directFixture, kernels, phases, stream);
     QueueFixture fallbackFixture;

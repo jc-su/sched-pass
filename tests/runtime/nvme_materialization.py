@@ -15,7 +15,7 @@ from nta_runtime.nvme_granularity import (
     choose_nvme_granularity,
     plan_nvme_spans,
 )
-from nta_runtime.runtime import RegisteredNvmeObjectInstall
+from nta_runtime.runtime import ObjectScope, RegisteredNvmeObjectInstall
 
 
 @dataclass(frozen=True)
@@ -305,6 +305,7 @@ def main() -> None:
         layer_id=7,
         object_version=1,
         object_id_base=0x4E54410000000000,
+        object_scope=ObjectScope.TENANT_LOCAL,
         stream=stream,
         lifetime=lifetime,
     )
@@ -329,6 +330,7 @@ def main() -> None:
         layer_id=7,
         object_version=2,
         object_id_base=0x4E54410000000000,
+        object_scope=ObjectScope.TENANT_LOCAL,
         stream=stream,
         lifetime=lifetime,
     )
@@ -345,6 +347,7 @@ def main() -> None:
         layer_id=7,
         object_version=2,
         object_id_base=0x4E54410000000004,
+        object_scope=ObjectScope.TENANT_LOCAL,
         first_object_slot=4,
         stream=stream,
         lifetime=lifetime,
@@ -367,6 +370,7 @@ def main() -> None:
             layer_id=7,
             object_version=3,
             object_id_base=0x4E54410000000000,
+            object_scope=ObjectScope.TENANT_LOCAL,
             stream=stream,
             lifetime=lifetime,
         )
@@ -387,6 +391,7 @@ def main() -> None:
         layer_id=8,
         object_version=4,
         object_id_base=0x4E54410000000000,
+        object_scope=ObjectScope.TENANT_LOCAL,
         first_object_slot=0,
         stream=stream,
         lifetime=lifetime,
@@ -399,6 +404,7 @@ def main() -> None:
         layer_id=8,
         object_version=4,
         object_id_base=0x4E54410000000004,
+        object_scope=ObjectScope.TENANT_LOCAL,
         first_object_slot=4,
         stream=stream,
         lifetime=lifetime,
@@ -411,10 +417,26 @@ def main() -> None:
     direct_runtime = _Runtime()
     direct_bindings = (
         RegisteredNvmeObjectInstall(
-            0, 100, 9, 0, 16, _Region(4_000, 64), 4_000, shared_event
+            0,
+            100,
+            9,
+            0,
+            16,
+            _Region(4_000, 64),
+            4_000,
+            scope=ObjectScope.TENANT_LOCAL,
+            prior_consumer_event=shared_event,
         ),
         RegisteredNvmeObjectInstall(
-            1, 101, 9, 16, 16, _Region(5_000, 64), 5_016, shared_event
+            1,
+            101,
+            9,
+            16,
+            16,
+            _Region(5_000, 64),
+            5_016,
+            scope=ObjectScope.TENANT_LOCAL,
+            prior_consumer_event=shared_event,
         ),
     )
     assert publish_registered_nvme_objects(
@@ -430,7 +452,15 @@ def main() -> None:
             (
                 direct_bindings[0],
                 RegisteredNvmeObjectInstall(
-                    2, 102, 10, 32, 16, _Region(6_000, 64), 6_000, shared_event
+                    2,
+                    102,
+                    10,
+                    32,
+                    16,
+                    _Region(6_000, 64),
+                    6_000,
+                    scope=ObjectScope.TENANT_LOCAL,
+                    prior_consumer_event=shared_event,
                 ),
             ),
             runtime=direct_runtime,
@@ -443,7 +473,16 @@ def main() -> None:
     assert direct_runtime.batch_calls == 1
 
     try:
-        RegisteredNvmeObjectInstall(0, 100, 1, 0, 32, _Region(4_000, 16), 4_000, None)
+        RegisteredNvmeObjectInstall(
+            0,
+            100,
+            1,
+            0,
+            32,
+            _Region(4_000, 16),
+            4_000,
+            scope=ObjectScope.TENANT_LOCAL,
+        )
     except ValueError as error:
         assert "registered HBM region" in str(error)
     else:

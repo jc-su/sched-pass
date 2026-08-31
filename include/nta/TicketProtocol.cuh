@@ -235,10 +235,13 @@ __device__ __forceinline__ void recordFailure(abi::RuntimeView *runtime) {
 __device__ __forceinline__ void failWorkTicket(abi::RuntimeView *runtime,
                                                std::uint32_t workTicket,
                                                abi::WorkTicketState state) {
-  if (runtime == nullptr || workTicket >= runtime->workTicketCapacity ||
-      threadIdx.x != 0) {
+  if (runtime == nullptr || workTicket >= runtime->workTicketCapacity) {
     return;
   }
+  // Callers include both collective numerical CTAs and typed-discovery
+  // threads where one arbitrary physical lane owns one independent work item.
+  // The state CAS below is the exact-once guard; a threadIdx.x restriction
+  // would silently drop failures for every discovery item except lane zero.
   abi::WorkTicket &ticket = runtime->workTickets[workTicket];
   ticket.epoch = currentEpoch(runtime);
   const std::uint32_t terminal = static_cast<std::uint32_t>(state);
@@ -285,6 +288,37 @@ failBoundWorkTicket(abi::RuntimeView *runtime, std::uint32_t workTicket,
     recordTerminalWork(runtime, record, abi::WorkTicketState::Pending,
                        abi::WorkTicketState::Failed);
     recordFailure(runtime);
+  }
+}
+
+// Cancellation is a normal lifecycle transition, including when the last
+// consumer of a not-yet-issued acquisition disappears. Unlike failWorkTicket,
+// this helper is safe for any designated device worker and verifies the exact
+// request-generation binding before changing accounting.
+__device__ __forceinline__ void
+cancelBoundWorkTicket(abi::RuntimeView *runtime, std::uint32_t workTicket,
+                      std::uint32_t requestSlot, std::uint32_t generation) {
+  if (runtime == nullptr || workTicket >= runtime->workTicketCapacity) {
+    return;
+  }
+  abi::WorkTicket &record = runtime->workTickets[workTicket];
+  if (!ticketMatches(runtime, record, requestSlot, generation)) {
+    return;
+  }
+  const std::uint32_t cancelled =
+      static_cast<std::uint32_t>(abi::WorkTicketState::Cancelled);
+  const abi::WorkTicketState candidates[] = {
+      abi::WorkTicketState::New,
+      abi::WorkTicketState::Pending,
+      abi::WorkTicketState::Ready,
+  };
+  for (const abi::WorkTicketState candidate : candidates) {
+    const std::uint32_t state = static_cast<std::uint32_t>(candidate);
+    if (atomicCAS(&record.state, state, cancelled) == state) {
+      recordTerminalWork(runtime, record, candidate,
+                         abi::WorkTicketState::Cancelled);
+      return;
+    }
   }
 }
 

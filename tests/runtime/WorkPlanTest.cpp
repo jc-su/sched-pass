@@ -58,6 +58,25 @@ int main() {
     (void)invalid.finish();
   });
   ok &= rejects([] {
+    nta::WorkPlanBuilder invalid(1);
+    const std::uint32_t request = invalid.addRequest({0, 1});
+    const nta::abi::AcquireRequirement directWithExternalFlag{
+        0x1000, 0, 1, 0, 0, 1, 4, nta::abi::AcquireOnlineExclusive};
+    (void)invalid.addWork(
+        request, 0,
+        std::span<const nta::abi::AcquireRequirement>(&directWithExternalFlag,
+                                                      1));
+  });
+  ok &= rejects([] {
+    nta::WorkPlanBuilder invalid(1);
+    const std::uint32_t request = invalid.addRequest({0, 1});
+    const nta::abi::AcquireRequirement unknownFlag{
+        0, 0, 1, 0, 0, 1, 4, 1U << 31U};
+    (void)invalid.addWork(
+        request, 0,
+        std::span<const nta::abi::AcquireRequirement>(&unknownFlag, 1));
+  });
+  ok &= rejects([] {
     const nta::ObjectBinding object{0, 0, 1, 0, 1, 4096};
     (void)nta::makeRequirement(object, 4090, 16);
   });

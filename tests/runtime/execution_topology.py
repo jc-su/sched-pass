@@ -3,7 +3,12 @@ from nta_runtime.execution_topology import (
     WorkDependencySpan,
 )
 from nta_runtime.requests import RequestBinding
-from nta_runtime.runtime import AcquireRequirement, DeviceWorkPlan
+from nta_runtime.runtime import (
+    INVALID_INDEX,
+    AcquireRequirement,
+    DeviceWorkPlan,
+    WorkItemFlag,
+)
 
 
 def main() -> None:
@@ -55,6 +60,42 @@ def main() -> None:
     assert tuple(item.contributor_index for item in work) == (0, 1, 0)
     assert tuple(item.contributor_count for item in work) == (2, 2, 1)
     assert tuple(item.estimated_compute_ns for item in work) == (100, 200, 300)
+
+    direct_dependencies = tuple(
+        AcquireRequirement(1, 0, 0, 0, 0, 0, 1, 0) for _ in range(3)
+    )
+    direct_spans = tuple(WorkDependencySpan(index, 1, 1) for index in range(3))
+    plan.upload_exact(
+        topology,
+        direct_spans,
+        direct_dependencies,
+        completion_classes=(INVALID_INDEX, 1, 0),
+    )
+    event_work = captured["work"]
+    assert tuple(item.completion_class for item in event_work) == (
+        INVALID_INDEX,
+        1,
+        0,
+    )
+    assert all(
+        item.flags == int(WorkItemFlag.EVENT_PARTITION) for item in event_work
+    )
+
+    try:
+        plan.upload_exact(
+            topology,
+            (
+                WorkDependencySpan(0, 1, 0),
+                WorkDependencySpan(1, 1, 0),
+                WorkDependencySpan(2, 1, 0),
+            ),
+            dependencies,
+            completion_classes=(INVALID_INDEX, 1, 0),
+        )
+    except ValueError as error:
+        assert "must be preacquired" in str(error)
+    else:  # pragma: no cover - fail-closed contract
+        raise AssertionError("event partition retained physical dependencies")
 
     try:
         ExactWorkTopology.from_schedule(

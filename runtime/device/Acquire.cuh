@@ -3,6 +3,7 @@
 #include "nta/RuntimeABI.h"
 #include "nta/TicketProtocol.cuh"
 
+#include <cuda/atomic>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -192,7 +193,8 @@ __device__ __forceinline__ bool
 initializeWorkTicket(abi::RuntimeView *runtime, std::uint32_t requestSlot,
                      std::uint32_t generation, std::uint32_t workTicket,
                      const abi::AcquireRequirement *requirements,
-                     std::uint32_t requirementCount) {
+                     std::uint32_t requirementCount,
+                     std::uint64_t deadlineClock) {
   std::uint32_t dependencyStart = 0;
   if (requirementCount == 0 ||
       !dependencyRange(runtime, workTicket, requirementCount,
@@ -238,6 +240,9 @@ initializeWorkTicket(abi::RuntimeView *runtime, std::uint32_t requestSlot,
   record.logicalTile = workTicket;
   record.dependencyStart = dependencyStart;
   record.epoch = currentEpoch(runtime);
+  if (runtime->workDeadlineClocks != nullptr) {
+    runtime->workDeadlineClocks[workTicket] = deadlineClock;
+  }
   std::uint64_t unavailableBytes = 0;
   for (std::uint32_t index = 0; index < requirementCount; ++index) {
     if (requirements[index].directBase == 0) {
@@ -1106,8 +1111,231 @@ struct AdmittedIntent {
   std::uint64_t requestBytes = 0;
   std::uint64_t backendBytes = 0;
   bool admitted = false;
-  bool terminal = false;
+  enum class TerminalReason : std::uint32_t {
+    None,
+    NoLiveConsumer,
+    Invalid,
+  } terminal = TerminalReason::None;
 };
+
+enum class IntentBindingState : std::uint32_t {
+  Bound,
+  NoLiveConsumer,
+  Invalid,
+};
+
+struct IntentConsumer {
+  std::uint64_t deadlineClock = 0;
+  std::uint32_t priority = 0;
+  std::uint32_t workTicket = abi::InvalidIndex;
+  std::uint32_t requestSlot = abi::InvalidIndex;
+  std::uint32_t generation = 0;
+  std::uint32_t tenantId = abi::InvalidIndex;
+};
+
+__device__ __forceinline__ bool
+intentConsumerPrecedes(const IntentConsumer &left,
+                       const IntentConsumer &right) {
+  if (right.workTicket == abi::InvalidIndex) {
+    return true;
+  }
+  const bool leftTimed = left.deadlineClock != 0;
+  const bool rightTimed = right.deadlineClock != 0;
+  if (leftTimed != rightTimed) {
+    return leftTimed;
+  }
+  if (leftTimed && left.deadlineClock != right.deadlineClock) {
+    return left.deadlineClock < right.deadlineClock;
+  }
+  if (left.priority != right.priority) {
+    return left.priority > right.priority;
+  }
+  return left.workTicket < right.workTicket;
+}
+
+__device__ __forceinline__ void clearIntentConsumer(abi::AcquireIntent &intent) {
+  intent.requestSlot = abi::InvalidIndex;
+  intent.generation = 0;
+  intent.workTicket = abi::InvalidIndex;
+  intent.tenantId = abi::InvalidIndex;
+}
+
+// Credit bypass is permitted only when the complete object identity matches a
+// directory entry explicitly published as GlobalShared. A stale or malformed
+// intent therefore falls back to tenant-local accounting and cannot forge the
+// shared-resource bit.
+__device__ __forceinline__ bool
+intentHasGlobalSharedScope(const abi::RuntimeView *runtime,
+                           const abi::AcquireIntent &intent) {
+  if (runtime == nullptr || runtime->objects == nullptr ||
+      intent.objectSlot >= runtime->objectCapacity) {
+    return false;
+  }
+  const abi::ObjectEntry &object = runtime->objects[intent.objectSlot];
+  return object.objectId == intent.objectId &&
+         object.version == intent.objectVersion &&
+         abi::objectScope(object.metadata) == abi::ObjectScope::GlobalShared;
+}
+
+// Select from the complete reverse-dependency fan-out, not from the CTA that
+// happened to win ObjectState::New -> Queued. Discovery and the indexed/NVMe
+// producer phases are stream ordered, so every edge is visible before this
+// routine seals the immutable group key. A later cancellation may move byte-
+// credit ownership to another live consumer, but the physical acquisition's
+// sealed deadline and priority remain unchanged. This conservative obligation
+// preserves exact ordering of the admitted group without cancellation-time
+// heap repair.
+__device__ __forceinline__ IntentBindingState
+bindIntentToEarliestLiveConsumer(abi::RuntimeView *runtime,
+                                 abi::AcquireIntent &intent,
+                                 bool retainSchedulingKey = false) {
+  if (runtime == nullptr || runtime->objects == nullptr ||
+      runtime->tenants == nullptr || runtime->workTickets == nullptr ||
+      runtime->dependencies == nullptr ||
+      runtime->objectDependentHeads == nullptr ||
+      runtime->dependencyNext == nullptr ||
+      runtime->maxDependenciesPerWorkTicket == 0 ||
+      intent.objectSlot >= runtime->objectCapacity) {
+    clearIntentConsumer(intent);
+    return IntentBindingState::Invalid;
+  }
+  const abi::ObjectEntry &object = runtime->objects[intent.objectSlot];
+  if (object.objectId != intent.objectId ||
+      object.version != intent.objectVersion) {
+    clearIntentConsumer(intent);
+    return IntentBindingState::Invalid;
+  }
+  const bool shared =
+      abi::objectScope(object.metadata) == abi::ObjectScope::GlobalShared;
+
+  IntentConsumer selected{};
+  std::uint32_t firstTenant = abi::InvalidIndex;
+  bool crossTenant = false;
+  std::uint32_t dependency =
+      runtime->objectDependentHeads[intent.objectSlot];
+  std::uint32_t traversed = 0;
+  while (dependency != abi::InvalidIndex) {
+    if (dependency >= runtime->dependencyCapacity ||
+        traversed++ >= runtime->dependencyCapacity) {
+      clearIntentConsumer(intent);
+      return IntentBindingState::Invalid;
+    }
+    const std::uint32_t next = runtime->dependencyNext[dependency];
+    const abi::WorkDependency &edge = runtime->dependencies[dependency];
+    const std::uint32_t workTicket =
+        dependency / runtime->maxDependenciesPerWorkTicket;
+    if (edge.objectSlot != intent.objectSlot ||
+        edge.objectId != intent.objectId ||
+        edge.objectVersion != intent.objectVersion ||
+        workTicket >= runtime->workTicketCapacity) {
+      clearIntentConsumer(intent);
+      return IntentBindingState::Invalid;
+    }
+
+    const abi::WorkTicket &ticket = runtime->workTickets[workTicket];
+    if (ticket.epoch != currentEpoch(runtime) ||
+        ticket.requestSlot >= runtime->requestCapacity) {
+      clearIntentConsumer(intent);
+      return IntentBindingState::Invalid;
+    }
+    const abi::RequestContext &request = runtime->requests[ticket.requestSlot];
+    if (request.generation != ticket.generation ||
+        request.tenantId >= runtime->tenantCapacity) {
+      clearIntentConsumer(intent);
+      return IntentBindingState::Invalid;
+    }
+    if (firstTenant == abi::InvalidIndex) {
+      firstTenant = request.tenantId;
+    } else {
+      crossTenant |= firstTenant != request.tenantId;
+    }
+
+    const auto state = static_cast<abi::WorkTicketState>(
+        atomicAdd(const_cast<std::uint32_t *>(&ticket.state), 0U));
+    if ((state == abi::WorkTicketState::Initializing ||
+         state == abi::WorkTicketState::Pending) &&
+        request.cancelled == 0) {
+      IntentConsumer candidate{};
+      candidate.deadlineClock =
+          runtime->workDeadlineClocks == nullptr
+              ? request.deadlineClock
+              : runtime->workDeadlineClocks[workTicket];
+      candidate.priority = request.priority;
+      candidate.workTicket = workTicket;
+      candidate.requestSlot = ticket.requestSlot;
+      candidate.generation = ticket.generation;
+      candidate.tenantId = request.tenantId;
+      if (intentConsumerPrecedes(candidate, selected)) {
+        selected = candidate;
+      }
+    }
+    dependency = next;
+  }
+  // Tenant-local resources may never cross the isolation boundary. Immutable
+  // global resources use the backend credit window as their shared ledger and
+  // retain a request only as a liveness/deadline representative.
+  if (crossTenant && !shared) {
+    clearIntentConsumer(intent);
+    return IntentBindingState::Invalid;
+  }
+  if (selected.workTicket == abi::InvalidIndex) {
+    clearIntentConsumer(intent);
+    return IntentBindingState::NoLiveConsumer;
+  }
+
+  intent.requestSlot = selected.requestSlot;
+  intent.generation = selected.generation;
+  intent.workTicket = selected.workTicket;
+  intent.tenantId = shared ? abi::InvalidIndex : selected.tenantId;
+  if (!retainSchedulingKey) {
+    intent.deadlineClock = selected.deadlineClock;
+    intent.priority = selected.priority;
+  }
+  return IntentBindingState::Bound;
+}
+
+__device__ __forceinline__ IntentBindingState
+ensureIntentHasLiveConsumer(abi::RuntimeView *runtime,
+                            abi::AcquireIntent &intent) {
+  const bool shared = intentHasGlobalSharedScope(runtime, intent);
+  // Queue-only policy tests and embedders may use an unbound intent to test
+  // admission independently of a work plan. Production acquisition intents
+  // always carry a concrete ticket and take the stronger epoch/state path.
+  if (intent.workTicket == abi::InvalidIndex) {
+    if (requestLive(runtime, intent.requestSlot, intent.generation) &&
+        intent.requestSlot < runtime->requestCapacity &&
+        (shared ? intent.tenantId == abi::InvalidIndex
+                : runtime->requests[intent.requestSlot].tenantId ==
+                      intent.tenantId)) {
+      return IntentBindingState::Bound;
+    }
+    return IntentBindingState::NoLiveConsumer;
+  }
+  if (runtime != nullptr && runtime->workTickets != nullptr &&
+      intent.workTicket < runtime->workTicketCapacity &&
+      requestLive(runtime, intent.requestSlot, intent.generation)) {
+    const abi::WorkTicket &ticket = runtime->workTickets[intent.workTicket];
+    const auto state = static_cast<abi::WorkTicketState>(
+        atomicAdd(const_cast<std::uint32_t *>(&ticket.state), 0U));
+    if (ticket.epoch == currentEpoch(runtime) &&
+        ticket.requestSlot == intent.requestSlot &&
+        ticket.generation == intent.generation &&
+        (state == abi::WorkTicketState::Initializing ||
+         state == abi::WorkTicketState::Pending)) {
+      const abi::RequestContext &request = runtime->requests[intent.requestSlot];
+      const bool validOwner =
+          shared ? intent.tenantId == abi::InvalidIndex
+                 : request.tenantId == intent.tenantId &&
+                       intent.tenantId < runtime->tenantCapacity;
+      if (!validOwner) {
+        clearIntentConsumer(intent);
+        return IntentBindingState::Invalid;
+      }
+      return IntentBindingState::Bound;
+    }
+  }
+  return bindIntentToEarliestLiveConsumer(runtime, intent, true);
+}
 
 // IntentQueueControl::reserved is deliberately runtime-internal state.  The
 // first word records that discovery proved one finite intent range is already
@@ -1157,6 +1385,9 @@ intentCreditState(abi::RuntimeView *runtime, const abi::AcquireIntent &intent,
       creditState(&backendEntry->outstandingBytes,
                   backendEntry->maxOutstandingBytes, intent.bytes);
   if (!requestLive(runtime, intent.requestSlot, intent.generation)) {
+    return DispatchCreditState::Impossible;
+  }
+  if (intentHasGlobalSharedScope(runtime, intent)) {
     return state;
   }
   if (intent.requestSlot >= runtime->requestCapacity) {
@@ -1179,25 +1410,35 @@ __device__ __forceinline__ bool
 reserveIntentCredits(abi::RuntimeView *runtime,
                      const abi::AcquireIntent &intent, abi::SourceKind source,
                      std::uint64_t &requestBytes, std::uint64_t &backendBytes) {
+  requestBytes = 0;
+  backendBytes = 0;
   const bool live = requestLive(runtime, intent.requestSlot, intent.generation);
-  if (live && !tryReserveRequestBytes(runtime, intent.requestSlot,
-                                      intent.generation, intent.bytes)) {
+  if (!live) {
     return false;
   }
-  if (live && !tryReserveTenantBytes(runtime, intent.tenantId, intent.bytes)) {
+  if (intentHasGlobalSharedScope(runtime, intent)) {
+    if (!tryReserveBackendBytes(runtime, source, intent.bytes)) {
+      return false;
+    }
+    backendBytes = intent.bytes;
+    return true;
+  }
+  if (!tryReserveRequestBytes(runtime, intent.requestSlot, intent.generation,
+                              intent.bytes)) {
+    return false;
+  }
+  if (!tryReserveTenantBytes(runtime, intent.tenantId, intent.bytes)) {
     releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
                         intent.bytes);
     return false;
   }
   if (!tryReserveBackendBytes(runtime, source, intent.bytes)) {
-    if (live) {
-      releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
-                          intent.bytes);
-      releaseTenantBytes(runtime, intent.tenantId, intent.bytes);
-    }
+    releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
+                        intent.bytes);
+    releaseTenantBytes(runtime, intent.tenantId, intent.bytes);
     return false;
   }
-  requestBytes = live ? intent.bytes : 0;
+  requestBytes = intent.bytes;
   backendBytes = intent.bytes;
   return true;
 }
@@ -1249,15 +1490,27 @@ claimAdmissibleIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
   lockIntentQueue(*control);
   std::uint32_t readyIndex = abi::InvalidIndex;
   std::uint32_t impossibleIndex = abi::InvalidIndex;
+  AdmittedIntent::TerminalReason impossibleReason =
+      AdmittedIntent::TerminalReason::None;
   if (control->size != 0) {
     abi::IntentQueueEntry *root = nullptr;
     if (intentQueueNodeCurrent(runtime, source, heap[0], root)) {
-      const DispatchCreditState rootState = intentCreditState(
-          runtime, runtime->intents[heap[0].slotIndex].intent, source);
+      abi::AcquireIntent &rootIntent =
+          runtime->intents[heap[0].slotIndex].intent;
+      const IntentBindingState rootBinding =
+          ensureIntentHasLiveConsumer(runtime, rootIntent);
+      const DispatchCreditState rootState =
+          rootBinding == IntentBindingState::Bound
+              ? intentCreditState(runtime, rootIntent, source)
+              : DispatchCreditState::Impossible;
       if (rootState == DispatchCreditState::Ready) {
         readyIndex = 0;
       } else if (rootState == DispatchCreditState::Impossible) {
         impossibleIndex = 0;
+        impossibleReason =
+            rootBinding == IntentBindingState::NoLiveConsumer
+                ? AdmittedIntent::TerminalReason::NoLiveConsumer
+                : AdmittedIntent::TerminalReason::Invalid;
       }
     }
   }
@@ -1267,9 +1520,14 @@ claimAdmissibleIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
     if (!intentQueueNodeCurrent(runtime, source, heap[index], entry)) {
       continue;
     }
-    const abi::IntentSlot &slot = runtime->intents[heap[index].slotIndex];
+    abi::AcquireIntent &candidateIntent =
+        runtime->intents[heap[index].slotIndex].intent;
+    const IntentBindingState binding =
+        ensureIntentHasLiveConsumer(runtime, candidateIntent);
     const DispatchCreditState state =
-        intentCreditState(runtime, slot.intent, source);
+        binding == IntentBindingState::Bound
+            ? intentCreditState(runtime, candidateIntent, source)
+            : DispatchCreditState::Impossible;
     std::uint32_t *selected = nullptr;
     if (state == DispatchCreditState::Ready) {
       selected = &readyIndex;
@@ -1280,17 +1538,31 @@ claimAdmissibleIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
     }
     if (*selected == abi::InvalidIndex) {
       *selected = index;
+      if (selected == &impossibleIndex) {
+        impossibleReason =
+            binding == IntentBindingState::NoLiveConsumer
+                ? AdmittedIntent::TerminalReason::NoLiveConsumer
+                : AdmittedIntent::TerminalReason::Invalid;
+      }
       continue;
     }
     abi::IntentQueueEntry *previous = nullptr;
     if (!intentQueueNodeCurrent(runtime, source, heap[*selected], previous) ||
         intentQueueEntryPrecedes(*entry, *previous)) {
       *selected = index;
+      if (selected == &impossibleIndex) {
+        impossibleReason =
+            binding == IntentBindingState::NoLiveConsumer
+                ? AdmittedIntent::TerminalReason::NoLiveConsumer
+                : AdmittedIntent::TerminalReason::Invalid;
+      }
     }
   }
 
-  const bool terminal =
-      readyIndex == abi::InvalidIndex && impossibleIndex != abi::InvalidIndex;
+  AdmittedIntent::TerminalReason terminal =
+      readyIndex == abi::InvalidIndex && impossibleIndex != abi::InvalidIndex
+          ? impossibleReason
+          : AdmittedIntent::TerminalReason::None;
   const std::uint32_t selectedIndex =
       readyIndex != abi::InvalidIndex ? readyIndex : impossibleIndex;
   if (selectedIndex == abi::InvalidIndex) {
@@ -1302,11 +1574,19 @@ claimAdmissibleIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
   abi::IntentQueueEntry &entry =
       runtime->intentQueueEntries[selectedNode.slotIndex];
   abi::IntentSlot &slot = runtime->intents[selectedNode.slotIndex];
-  if (!terminal &&
-      !reserveIntentCredits(runtime, slot.intent, source, result.requestBytes,
-                            result.backendBytes)) {
-    unlockIntentQueue(*control);
-    return {};
+  if (terminal == AdmittedIntent::TerminalReason::None) {
+    const IntentBindingState binding =
+        ensureIntentHasLiveConsumer(runtime, slot.intent);
+    if (binding != IntentBindingState::Bound) {
+      terminal = binding == IntentBindingState::NoLiveConsumer
+                     ? AdmittedIntent::TerminalReason::NoLiveConsumer
+                     : AdmittedIntent::TerminalReason::Invalid;
+    } else if (!reserveIntentCredits(runtime, slot.intent, source,
+                                     result.requestBytes,
+                                     result.backendBytes)) {
+      unlockIntentQueue(*control);
+      return {};
+    }
   }
   const std::uint32_t queued =
       static_cast<std::uint32_t>(abi::IntentQueueState::Queued);
@@ -1328,7 +1608,7 @@ claimAdmissibleIntent(abi::RuntimeView *runtime, abi::SourceKind source) {
     return {};
   }
   result.slotIndex = selectedNode.slotIndex;
-  result.admitted = !terminal;
+  result.admitted = terminal == AdmittedIntent::TerminalReason::None;
   result.terminal = terminal;
   unlockIntentQueue(*control);
   return result;
@@ -1468,12 +1748,19 @@ __device__ __forceinline__ AdmittedIntent claimOrderedAdmissibleIntent(
 
   std::uint32_t ready = abi::InvalidIndex;
   std::uint32_t impossible = abi::InvalidIndex;
+  AdmittedIntent::TerminalReason impossibleReason =
+      AdmittedIntent::TerminalReason::None;
   for (std::uint32_t index = cursor; index < end; ++index) {
     if (!orderedIntentCurrent(runtime, source, index)) {
       continue;
     }
+    abi::AcquireIntent &candidate = runtime->intents[index].intent;
+    const IntentBindingState binding =
+        ensureIntentHasLiveConsumer(runtime, candidate);
     const DispatchCreditState state =
-        intentCreditState(runtime, runtime->intents[index].intent, source);
+        binding == IntentBindingState::Bound
+            ? intentCreditState(runtime, candidate, source)
+            : DispatchCreditState::Impossible;
     if (state == DispatchCreditState::Ready) {
       ready = index;
       break;
@@ -1481,10 +1768,16 @@ __device__ __forceinline__ AdmittedIntent claimOrderedAdmissibleIntent(
     if (state == DispatchCreditState::Impossible &&
         impossible == abi::InvalidIndex) {
       impossible = index;
+      impossibleReason =
+          binding == IntentBindingState::NoLiveConsumer
+              ? AdmittedIntent::TerminalReason::NoLiveConsumer
+              : AdmittedIntent::TerminalReason::Invalid;
     }
   }
-  const bool terminal =
-      ready == abi::InvalidIndex && impossible != abi::InvalidIndex;
+  AdmittedIntent::TerminalReason terminal =
+      ready == abi::InvalidIndex && impossible != abi::InvalidIndex
+          ? impossibleReason
+          : AdmittedIntent::TerminalReason::None;
   const std::uint32_t selected =
       ready != abi::InvalidIndex ? ready : impossible;
   if (selected == abi::InvalidIndex) {
@@ -1492,13 +1785,21 @@ __device__ __forceinline__ AdmittedIntent claimOrderedAdmissibleIntent(
   }
 
   abi::IntentSlot &slot = runtime->intents[selected];
-  if (!terminal &&
-      !reserveIntentCredits(runtime, slot.intent, source, result.requestBytes,
-                            result.backendBytes)) {
-    return result;
+  if (terminal == AdmittedIntent::TerminalReason::None) {
+    const IntentBindingState binding =
+        ensureIntentHasLiveConsumer(runtime, slot.intent);
+    if (binding != IntentBindingState::Bound) {
+      terminal = binding == IntentBindingState::NoLiveConsumer
+                     ? AdmittedIntent::TerminalReason::NoLiveConsumer
+                     : AdmittedIntent::TerminalReason::Invalid;
+    } else if (!reserveIntentCredits(runtime, slot.intent, source,
+                                     result.requestBytes,
+                                     result.backendBytes)) {
+      return result;
+    }
   }
   if (!claimIntent(slot)) {
-    if (!terminal) {
+    if (terminal == AdmittedIntent::TerminalReason::None) {
       releaseIntentCredits(runtime, slot.intent, source, result.requestBytes,
                            result.backendBytes);
     }
@@ -1510,7 +1811,7 @@ __device__ __forceinline__ AdmittedIntent claimOrderedAdmissibleIntent(
     ++cursor;
   }
   result.slotIndex = selected;
-  result.admitted = !terminal;
+  result.admitted = terminal == AdmittedIntent::TerminalReason::None;
   result.terminal = terminal;
   return result;
 }
@@ -1724,6 +2025,80 @@ __device__ __forceinline__ void consumeIntent(abi::RuntimeView *runtime,
       reinterpret_cast<unsigned long long *>(&runtime->intentPool->consumed),
       1ULL);
   atomicSub(&runtime->intentPool->active, 1U);
+}
+
+__device__ __forceinline__ void
+cancelDeadObjectDependents(abi::RuntimeView *runtime,
+                           const abi::AcquireIntent &intent) {
+  if (runtime == nullptr || runtime->objectDependentHeads == nullptr ||
+      runtime->dependencyNext == nullptr || runtime->dependencies == nullptr ||
+      runtime->maxDependenciesPerWorkTicket == 0 ||
+      intent.objectSlot >= runtime->objectCapacity) {
+    return;
+  }
+  std::uint32_t dependency = runtime->objectDependentHeads[intent.objectSlot];
+  std::uint32_t traversed = 0;
+  while (dependency != abi::InvalidIndex &&
+         dependency < runtime->dependencyCapacity &&
+         traversed++ < runtime->dependencyCapacity) {
+    const std::uint32_t next = runtime->dependencyNext[dependency];
+    const abi::WorkDependency &edge = runtime->dependencies[dependency];
+    const std::uint32_t workTicket =
+        dependency / runtime->maxDependenciesPerWorkTicket;
+    if (edge.objectSlot == intent.objectSlot &&
+        edge.objectId == intent.objectId &&
+        edge.objectVersion == intent.objectVersion &&
+        workTicket < runtime->workTicketCapacity) {
+      const abi::WorkTicket &ticket = runtime->workTickets[workTicket];
+      if (ticket.epoch == currentEpoch(runtime) &&
+          !requestLive(runtime, ticket.requestSlot, ticket.generation)) {
+        cancelBoundWorkTicket(runtime, workTicket, ticket.requestSlot,
+                              ticket.generation);
+      }
+    }
+    dependency = next;
+  }
+}
+
+// Retire a claimed intent that will never issue. NoLiveConsumer is ordinary
+// cancellation: release the acquisition group back to New so a later demand
+// can claim it, cancel dead tickets, and do not poison the runtime. Invalid is
+// a structural/identity failure and remains fail-closed.
+__device__ __forceinline__ void retireTerminalIntent(
+    abi::RuntimeView *runtime, abi::IntentSlot &slot,
+    AdmittedIntent::TerminalReason reason) {
+  abi::AcquireIntent &intent = slot.intent;
+  abi::ObjectEntry *object =
+      runtime != nullptr && runtime->objects != nullptr &&
+              intent.objectSlot < runtime->objectCapacity
+          ? &runtime->objects[intent.objectSlot]
+          : nullptr;
+  const bool objectCurrent =
+      object != nullptr && object->objectId == intent.objectId &&
+      object->version == intent.objectVersion;
+  if (reason == AdmittedIntent::TerminalReason::NoLiveConsumer &&
+      objectCurrent) {
+    const std::uint32_t queued =
+        static_cast<std::uint32_t>(abi::ObjectState::Queued);
+    if (atomicCAS(&object->state, queued,
+                  static_cast<std::uint32_t>(abi::ObjectState::New)) == queued) {
+      object->selectedReplica = abi::InvalidIndex;
+      cancelDeadObjectDependents(runtime, intent);
+      consumeIntent(runtime, slot);
+      return;
+    }
+  }
+
+  // One sticky increment records the acquisition-group integrity failure;
+  // publishObjectTransition may additionally account each affected work item.
+  recordFailure(runtime);
+  if (objectCurrent) {
+    atomicExch(&object->state,
+               static_cast<std::uint32_t>(abi::ObjectState::Failed));
+    publishObjectTransition(runtime, intent.objectSlot,
+                            abi::ObjectState::Failed);
+  }
+  consumeIntent(runtime, slot);
 }
 
 enum class TryIssueResult : std::uint32_t {
@@ -1944,26 +2319,27 @@ __device__ __forceinline__ NvmeAdmission
 tryAdmitNvme(abi::RuntimeView *runtime, const abi::AcquireIntent &intent,
              std::uint64_t bytes) {
   const bool live = requestLive(runtime, intent.requestSlot, intent.generation);
-  bool admitted = true;
-  if (live) {
+  if (live && intentHasGlobalSharedScope(runtime, intent)) {
+    const bool backendReserved =
+        tryReserveBackendBytes(runtime, abi::SourceKind::Nvme, bytes);
+    return {0, backendReserved ? bytes : 0, backendReserved};
+  }
+  bool admitted = live;
+  if (admitted) {
     admitted = tryReserveRequestBytes(runtime, intent.requestSlot,
                                       intent.generation, bytes);
-    if (admitted && !tryReserveTenantBytes(runtime, intent.tenantId, bytes)) {
-      releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
-                          bytes);
-      admitted = false;
-    }
+  }
+  if (admitted && !tryReserveTenantBytes(runtime, intent.tenantId, bytes)) {
+    releaseRequestBytes(runtime, intent.requestSlot, intent.generation, bytes);
+    admitted = false;
   }
   if (admitted &&
       !tryReserveBackendBytes(runtime, abi::SourceKind::Nvme, bytes)) {
-    if (live) {
-      releaseRequestBytes(runtime, intent.requestSlot, intent.generation,
-                          bytes);
-      releaseTenantBytes(runtime, intent.tenantId, bytes);
-    }
+    releaseRequestBytes(runtime, intent.requestSlot, intent.generation, bytes);
+    releaseTenantBytes(runtime, intent.tenantId, bytes);
     admitted = false;
   }
-  return {live && admitted ? bytes : 0, admitted ? bytes : 0, admitted};
+  return {admitted ? bytes : 0, admitted ? bytes : 0, admitted};
 }
 
 __device__ __forceinline__ void
@@ -2112,7 +2488,18 @@ selectNvmeIssue(abi::RuntimeView *runtime, abi::NvmeQueueView &queue,
 
   abi::IntentSlot &selectedSlot = runtime->intents[intentSlotIndex];
   abi::AcquireIntent &selected = selectedSlot.intent;
-  if (dispatch.terminal || selected.objectSlot >= runtime->objectCapacity) {
+  if (dispatch.terminal ==
+      AdmittedIntent::TerminalReason::NoLiveConsumer) {
+    retireTerminalIntent(runtime, selectedSlot, dispatch.terminal);
+    return NvmeIssueSelection::Retired;
+  }
+  if (dispatch.terminal == AdmittedIntent::TerminalReason::Invalid) {
+    retireTerminalIntent(runtime, selectedSlot, dispatch.terminal);
+    ++queue.failed;
+    queue.error = 0xfffffffbU;
+    return NvmeIssueSelection::Retired;
+  }
+  if (selected.objectSlot >= runtime->objectCapacity) {
     rejectNvmeDispatch(runtime, queue, selectedSlot, dispatch, 0xfffffffbU);
     return NvmeIssueSelection::Retired;
   }
@@ -2270,6 +2657,56 @@ __device__ __forceinline__ bool backendAcceptsIntent(abi::RuntimeView *runtime,
          nvmeQueueOnline(*queue);
 }
 
+// Seal every intent published by one finite typed-discovery launch. Keeping
+// this state transition in the core runtime (rather than in one host wrapper)
+// gives every frontend the same complete-fanout binding and terminal rules.
+__device__ __forceinline__ void
+queueDiscoveredIntents(abi::RuntimeView *runtime) {
+  if (runtime == nullptr || runtime->intents == nullptr ||
+      runtime->intentPool == nullptr) {
+    return;
+  }
+  for (std::uint32_t index = 0; index < runtime->intentCapacity; ++index) {
+    abi::IntentSlot &slot = runtime->intents[index];
+    if (atomicAdd(&slot.intent.valid, 0U) != 1U ||
+        slot.epoch != currentEpoch(runtime)) {
+      continue;
+    }
+    const auto source = static_cast<abi::SourceKind>(slot.sourceKind);
+    if (!backendAcceptsIntent(runtime, source)) {
+      continue;
+    }
+    const IntentBindingState binding =
+        bindIntentToEarliestLiveConsumer(runtime, slot.intent);
+    if (binding != IntentBindingState::Bound) {
+      if (claimIntent(slot)) {
+        retireTerminalIntent(
+            runtime, slot,
+            binding == IntentBindingState::NoLiveConsumer
+                ? AdmittedIntent::TerminalReason::NoLiveConsumer
+                : AdmittedIntent::TerminalReason::Invalid);
+      }
+      continue;
+    }
+    if (!queueIntent(runtime, slot, source)) {
+      atomicAdd(&runtime->intentPool->overflow, 1U);
+    }
+  }
+}
+
+enum class AcquisitionPublicationMode : std::uint32_t {
+  // Numerical kernels may consume an already-ready object, but a miss cannot
+  // create a shared group because the grid has no complete-fanout seal.
+  InlineGuard,
+  // A typed discovery launch publishes every reverse dependency before one
+  // stream-ordered builder binds and queues the group.
+  SealedDiscovery,
+  // Explicit opt-in for an object generation with exactly one consumer work
+  // ticket. This is the only mode allowed to queue or submit from a miss in an
+  // already-running numerical kernel.
+  OnlineExclusive,
+};
+
 } // namespace nta::device
 
 extern "C" __device__ __forceinline__ __attribute__((used)) bool
@@ -2320,8 +2757,9 @@ nta_acquire_slow_impl(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
                       std::uint32_t generation, std::uint32_t objectSlot,
                       std::uint64_t objectId, std::uint32_t objectVersion,
                       std::uint64_t offset, std::uint32_t bytes,
-                      std::uint32_t workTicket, bool designatedLeader,
-                      std::uint64_t deadlineClock, bool deferIntentQueue) {
+                      std::uint32_t workTicket, std::uint32_t requirementFlags,
+                      bool designatedLeader, std::uint64_t deadlineClock,
+                      nta::device::AcquisitionPublicationMode mode) {
   using namespace nta;
   if (!device::requestLive(runtime, requestSlot, generation)) {
     device::failWorkTicket(runtime, workTicket,
@@ -2408,15 +2846,32 @@ nta_acquire_slow_impl(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
     return nullptr;
   }
 
+  const bool supportedFlags =
+      (requirementFlags & ~abi::AcquireRequirementSupportedFlags) == 0;
+  const bool exclusive =
+      (requirementFlags & abi::AcquireOnlineExclusive) != 0;
+  if (!supportedFlags ||
+      mode == device::AcquisitionPublicationMode::InlineGuard ||
+      (mode == device::AcquisitionPublicationMode::OnlineExclusive &&
+       !exclusive)) {
+    if (designatedLeader) {
+      device::failWorkTicket(runtime, workTicket,
+                             abi::WorkTicketState::Failed);
+    }
+    return nullptr;
+  }
+
   if (designatedLeader) {
     abi::WorkTicket &record = runtime->workTickets[workTicket];
     const auto workTicketState =
         static_cast<abi::WorkTicketState>(atomicAdd(&record.state, 0U));
     if (workTicketState == abi::WorkTicketState::New) {
       const abi::AcquireRequirement requirement{
-          0, 0, objectId, offset, objectSlot, objectVersion, bytes, 0};
+          0, 0, objectId, offset, objectSlot, objectVersion, bytes,
+          requirementFlags};
       (void)device::initializeWorkTicket(runtime, requestSlot, generation,
-                                         workTicket, &requirement, 1);
+                                         workTicket, &requirement, 1,
+                                         deadlineClock);
     }
   }
 
@@ -2459,8 +2914,13 @@ nta_acquire_slow_impl(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
     atomicAdd(reinterpret_cast<unsigned long long *>(
                   &sourceBackend->pendingAcquisitions),
               1ULL);
+    // Sealed discovery deliberately defers transport ownership until every
+    // reverse dependency is visible. Only an explicitly exclusive online
+    // object may use the one-shot CTA submission path.
     const device::TryIssueResult directResult =
-        device::tryIssueFromCta(runtime, source, pending, object);
+        mode == device::AcquisitionPublicationMode::OnlineExclusive
+            ? device::tryIssueFromCta(runtime, source, pending, object)
+            : device::TryIssueResult::Unavailable;
     if (directResult != device::TryIssueResult::Unavailable) {
       atomicAdd(reinterpret_cast<unsigned long long *>(
                     &sourceBackend->pendingAcquisitions),
@@ -2474,8 +2934,10 @@ nta_acquire_slow_impl(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
         intentSlot->intent = pending;
         const bool backendQueued =
             device::backendAcceptsIntent(runtime, source);
-        device::publishIntent(runtime, *intentSlot, source,
-                              !deferIntentQueue || !backendQueued);
+        const bool queueImmediately =
+            mode == device::AcquisitionPublicationMode::OnlineExclusive ||
+            !backendQueued;
+        device::publishIntent(runtime, *intentSlot, source, queueImmediately);
         // Discovery publishes demand and dependency identity only.  Transport
         // ownership belongs to the selected progress backend: the generic
         // queue claims EDF/credit-governed intents, while the indexed-range
@@ -2521,7 +2983,31 @@ nta_acquire_slow(nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
           : 0;
   return nta_acquire_slow_impl(
       runtime, requestSlot, generation, objectSlot, objectId, objectVersion,
-      offset, bytes, workTicket, designatedLeader, deadlineClock, false);
+      offset, bytes, workTicket, 0, designatedLeader, deadlineClock,
+      nta::device::AcquisitionPublicationMode::InlineGuard);
+}
+
+// Explicit online-miss API for microbenchmarks and operators whose typed
+// frontend proves one external work-ticket reference for this object
+// generation. Shared serving objects must use nta_jit_discover_work instead.
+extern "C" __device__ __attribute__((used, noinline)) void *
+nta_acquire_exclusive_slow(
+    nta::abi::RuntimeView *runtime, std::uint32_t requestSlot,
+    std::uint32_t generation, std::uint32_t objectSlot,
+    std::uint64_t objectId, std::uint32_t objectVersion, std::uint64_t offset,
+    std::uint32_t bytes, std::uint32_t workTicket,
+    std::uint32_t requirementFlags) {
+  const bool designatedLeader =
+      threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0;
+  const std::uint64_t deadlineClock =
+      runtime != nullptr && requestSlot < runtime->requestCapacity
+          ? runtime->requests[requestSlot].deadlineClock
+          : 0;
+  return nta_acquire_slow_impl(
+      runtime, requestSlot, generation, objectSlot, objectId, objectVersion,
+      offset, bytes, workTicket, requirementFlags, designatedLeader,
+      deadlineClock,
+      nta::device::AcquisitionPublicationMode::OnlineExclusive);
 }
 
 extern "C" __device__ __attribute__((used, noinline)) void *
@@ -2569,7 +3055,7 @@ nta_acquire_set_leader_with_deadline(
     std::uint32_t generation, const nta::abi::AcquireRequirement *requirements,
     std::uint32_t requirementCount, std::uint32_t directRequirementCount,
     std::uint32_t workTicket, std::uint64_t deadlineClock,
-    bool deferIntentQueue) {
+    nta::device::AcquisitionPublicationMode mode) {
   using namespace nta;
   if (!device::requestLive(runtime, requestSlot, generation)) {
     device::failWorkTicket(runtime, workTicket,
@@ -2578,13 +3064,20 @@ nta_acquire_set_leader_with_deadline(
   }
 
   std::uint32_t dependencyStart = 0;
-  const bool validSet =
+  bool validSet =
       directRequirementCount <= requirementCount &&
       (requirementCount == 0 ||
        (requirements != nullptr &&
         (directRequirementCount == requirementCount ||
          device::dependencyRange(runtime, workTicket, requirementCount,
                                  dependencyStart))));
+  for (std::uint32_t index = 0; validSet && index < requirementCount; ++index) {
+    const abi::AcquireRequirement &requirement = requirements[index];
+    validSet =
+        requirement.bytes != 0 &&
+        (requirement.flags & ~abi::AcquireRequirementSupportedFlags) == 0 &&
+        (requirement.directBase == 0 || requirement.flags == 0);
+  }
   (void)dependencyStart;
   if (!validSet) {
     device::failWorkTicket(runtime, workTicket, abi::WorkTicketState::Failed);
@@ -2623,7 +3116,7 @@ nta_acquire_set_leader_with_deadline(
   }
   (void)device::initializeWorkTicket(runtime, requestSlot, generation,
                                      workTicket, requirements,
-                                     requirementCount);
+                                     requirementCount, deadlineClock);
   bool acquired = true;
   for (std::uint32_t index = 0; index < requirementCount; ++index) {
     const abi::AcquireRequirement &requirement = requirements[index];
@@ -2638,8 +3131,8 @@ nta_acquire_set_leader_with_deadline(
     acquired &= nta_acquire_slow_impl(
                     runtime, requestSlot, generation, requirement.objectSlot,
                     requirement.objectId, requirement.objectVersion,
-                    requirement.offset, requirement.bytes, workTicket, true,
-                    deadlineClock, deferIntentQueue) != nullptr;
+                    requirement.offset, requirement.bytes, workTicket,
+                    requirement.flags, true, deadlineClock, mode) != nullptr;
   }
   return acquired ? 1U : 0U;
 }
@@ -2655,9 +3148,24 @@ nta_acquire_set_leader(nta::abi::RuntimeView *runtime,
       runtime != nullptr && requestSlot < runtime->requestCapacity
           ? runtime->requests[requestSlot].deadlineClock
           : 0;
+  bool hasExternal = false;
+  bool onlineExclusive = requirements != nullptr;
+  for (std::uint32_t index = 0; requirements != nullptr &&
+                                index < requirementCount;
+       ++index) {
+    if (requirements[index].directBase != 0) {
+      continue;
+    }
+    hasExternal = true;
+    onlineExclusive &=
+        (requirements[index].flags & nta::abi::AcquireOnlineExclusive) != 0;
+  }
   return nta_acquire_set_leader_with_deadline(
       runtime, requestSlot, generation, requirements, requirementCount,
-      directRequirementCount, workTicket, deadlineClock, false);
+      directRequirementCount, workTicket, deadlineClock,
+      hasExternal && onlineExclusive
+          ? nta::device::AcquisitionPublicationMode::OnlineExclusive
+          : nta::device::AcquisitionPublicationMode::InlineGuard);
 }
 
 extern "C" __device__ __forceinline__ __attribute__((used)) bool
@@ -3733,21 +4241,27 @@ preloadIndexedHostPair(abi::RuntimeView *runtime, std::uint32_t firstObject,
                                   *valueReplica, pairBlock, BlocksPerPair);
     break;
   }
+  // __syncthreads establishes a strong happens-before edge from every copy
+  // thread to thread 0.  The acq_rel counter then carries that block-wide edge
+  // between the two pair CTAs.  The last CTA can therefore release-publish
+  // Ready without a fence in every data thread.  A consumer pairs the state
+  // wait with a stream GPU memory barrier before launching numerical work.
   __syncthreads();
   if (threadIdx.x == 0) {
+    cuda::atomic_ref<std::uint64_t, cuda::thread_scope_device> completion(
+        keyObject.issueCount);
     const std::uint64_t completed =
-        atomicAdd(reinterpret_cast<unsigned long long *>(&keyObject.issueCount),
-                  1ULL) +
-        1ULL;
+        completion.fetch_add(1ULL, cuda::memory_order_acq_rel) + 1ULL;
     if (completed == BlocksPerPair) {
-      __threadfence_system();
-      (void)atomicAdd(
-          reinterpret_cast<unsigned long long *>(&keyObject.issueCount),
-          0ULL - static_cast<unsigned long long>(BlocksPerPair));
-      atomicExch(&keyObject.state,
-                 static_cast<std::uint32_t>(abi::ObjectState::Ready));
-      atomicExch(&valueObject.state,
-                 static_cast<std::uint32_t>(abi::ObjectState::Ready));
+      completion.fetch_sub(static_cast<std::uint64_t>(BlocksPerPair),
+                           cuda::memory_order_relaxed);
+      cuda::atomic_ref<std::uint32_t, cuda::thread_scope_device>(keyObject.state)
+          .store(static_cast<std::uint32_t>(abi::ObjectState::Ready),
+                 cuda::memory_order_release);
+      cuda::atomic_ref<std::uint32_t, cuda::thread_scope_device>(
+          valueObject.state)
+          .store(static_cast<std::uint32_t>(abi::ObjectState::Ready),
+                 cuda::memory_order_release);
     } else if (completed > BlocksPerPair) {
       atomicExch(&keyObject.state,
                  static_cast<std::uint32_t>(abi::ObjectState::Failed));
@@ -3822,14 +4336,15 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
   __shared__ std::uint64_t backendBytes;
   if (threadIdx.x == 0) {
     selectedFromQueue = device::intentQueueAvailable(runtime) ? 1U : 0U;
-    terminalDispatch = 0;
+    terminalDispatch = static_cast<std::uint32_t>(
+        device::AdmittedIntent::TerminalReason::None);
     chargedBytes = 0;
     backendBytes = 0;
     if (selectedFromQueue != 0U) {
       const device::AdmittedIntent dispatch =
           device::claimAdmissibleIntent(runtime, abi::SourceKind::HostStaged);
       selectedIntent = dispatch.slotIndex;
-      terminalDispatch = dispatch.terminal ? 1U : 0U;
+      terminalDispatch = static_cast<std::uint32_t>(dispatch.terminal);
       chargedBytes = dispatch.requestBytes;
       backendBytes = dispatch.backendBytes;
     } else {
@@ -3917,17 +4432,12 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
       intent.offset == 0 && intent.bytes == object.bytes &&
       intent.offset <= object.bytes &&
       intent.bytes <= object.bytes - intent.offset && indexedShapeValid;
-  if (terminalDispatch != 0U) {
+  if (terminalDispatch != static_cast<std::uint32_t>(
+                              device::AdmittedIntent::TerminalReason::None)) {
     if (threadIdx.x == 0) {
-      if (objectCurrent) {
-        atomicExch(&object.state,
-                   static_cast<std::uint32_t>(abi::ObjectState::Failed));
-        device::publishObjectTransition(runtime, intent.objectSlot,
-                                        abi::ObjectState::Failed);
-      }
-      device::failBoundWorkTicket(runtime, intent.workTicket,
-                                  intent.requestSlot, intent.generation);
-      device::consumeIntent(runtime, intentSlot);
+      device::retireTerminalIntent(
+          runtime, intentSlot,
+          static_cast<device::AdmittedIntent::TerminalReason>(terminalDispatch));
     }
     return;
   }
@@ -3968,42 +4478,32 @@ nta_progress_host_staging(nta::abi::RuntimeView *runtime) {
     if (selectedFromQueue != 0U) {
       admitted = 1U;
     } else {
-      const bool live =
-          device::requestLive(runtime, intent.requestSlot, intent.generation);
-      bool accepted = true;
-      if (live) {
-        accepted = device::tryReserveRequestBytes(
-            runtime, intent.requestSlot, intent.generation, intent.bytes);
-        if (accepted && !device::tryReserveTenantBytes(runtime, intent.tenantId,
-                                                       intent.bytes)) {
-          device::releaseRequestBytes(runtime, intent.requestSlot,
-                                      intent.generation, intent.bytes);
-          accepted = false;
-        }
-      }
-      if (accepted && !device::tryReserveBackendBytes(
-                          runtime, abi::SourceKind::HostStaged, intent.bytes)) {
-        if (live) {
-          device::releaseRequestBytes(runtime, intent.requestSlot,
-                                      intent.generation, intent.bytes);
-          device::releaseTenantBytes(runtime, intent.tenantId, intent.bytes);
-        }
-        accepted = false;
+      std::uint64_t requestBytes = 0;
+      std::uint64_t transportBytes = 0;
+      const device::IntentBindingState binding =
+          device::bindIntentToEarliestLiveConsumer(runtime, intent);
+      bool accepted = binding == device::IntentBindingState::Bound;
+      if (!accepted && device::claimIntent(intentSlot)) {
+        device::retireTerminalIntent(
+            runtime, intentSlot,
+            binding == device::IntentBindingState::NoLiveConsumer
+                ? device::AdmittedIntent::TerminalReason::NoLiveConsumer
+                : device::AdmittedIntent::TerminalReason::Invalid);
+      } else if (accepted) {
+        accepted = device::reserveIntentCredits(
+            runtime, intent, abi::SourceKind::HostStaged, requestBytes,
+            transportBytes);
       }
       admitted = accepted ? 1U : 0U;
       if (accepted && !device::claimIntent(intentSlot)) {
-        if (live) {
-          device::releaseRequestBytes(runtime, intent.requestSlot,
-                                      intent.generation, intent.bytes);
-          device::releaseTenantBytes(runtime, intent.tenantId, intent.bytes);
-        }
-        device::releaseBackendBytes(runtime, abi::SourceKind::HostStaged,
-                                    intent.bytes);
+        device::releaseIntentCredits(runtime, intent,
+                                     abi::SourceKind::HostStaged, requestBytes,
+                                     transportBytes);
         accepted = false;
         admitted = 0;
       }
-      chargedBytes = live && accepted ? intent.bytes : 0;
-      backendBytes = accepted ? intent.bytes : 0;
+      chargedBytes = accepted ? requestBytes : 0;
+      backendBytes = accepted ? transportBytes : 0;
     }
   }
   __syncthreads();
@@ -4156,6 +4656,12 @@ nta_claim_indexed_host_range(nta::abi::RuntimeView *runtime,
   abi::IntentSlot &intentSlot = runtime->intents[objectSlot];
   abi::AcquireIntent &intent = intentSlot.intent;
   abi::ObjectEntry &object = runtime->objects[objectSlot];
+  __shared__ std::uint32_t bindingState;
+  if (threadIdx.x == 0) {
+    bindingState = static_cast<std::uint32_t>(
+        device::bindIntentToEarliestLiveConsumer(runtime, intent));
+  }
+  __syncthreads();
   const abi::ReplicaEntry *replica =
       device::replica(runtime, object, object.selectedReplica);
   const std::uint32_t sourceStride =
@@ -4174,6 +4680,8 @@ nta_claim_indexed_host_range(nta::abi::RuntimeView *runtime,
           ? 0
           : abi::destinationTransferIndexLimit(replica->tensorMapAddress);
   const bool valid =
+      bindingState ==
+          static_cast<std::uint32_t>(device::IntentBindingState::Bound) &&
       atomicAdd(&intent.valid, 0U) == 1U &&
       intentSlot.epoch == device::currentEpoch(runtime) &&
       intentSlot.sourceKind ==
@@ -4205,6 +4713,18 @@ nta_claim_indexed_host_range(nta::abi::RuntimeView *runtime,
   if (threadIdx.x != 0) {
     return;
   }
+  if (bindingState !=
+      static_cast<std::uint32_t>(device::IntentBindingState::Bound)) {
+    if (device::claimIntent(intentSlot)) {
+      device::retireTerminalIntent(
+          runtime, intentSlot,
+          bindingState == static_cast<std::uint32_t>(
+                              device::IntentBindingState::NoLiveConsumer)
+              ? device::AdmittedIntent::TerminalReason::NoLiveConsumer
+              : device::AdmittedIntent::TerminalReason::Invalid);
+    }
+    return;
+  }
   if (!valid || invalidIndex != 0) {
     if (device::claimIntent(intentSlot)) {
       atomicExch(&object.state,
@@ -4226,6 +4746,16 @@ nta_claim_indexed_host_range(nta::abi::RuntimeView *runtime,
     device::releaseIntentCredits(runtime, intent, abi::SourceKind::HostStaged,
                                  requestBytes, backendBytes);
     accepted = false;
+  }
+  if (!accepted && device::claimIntent(intentSlot)) {
+    // The unqueued range contract admits only homogeneous policy keys with
+    // unconstrained credits. A failed reservation is therefore a violated
+    // launch contract, not a retryable state; consume it loudly instead of
+    // leaving ObjectState::Queued stranded after the finite copy phase.
+    device::retireTerminalIntent(
+        runtime, intentSlot,
+        device::AdmittedIntent::TerminalReason::Invalid);
+    return;
   }
   if (accepted) {
     device::recordIntentCredits(intentSlot, requestBytes, backendBytes);
@@ -4634,6 +5164,9 @@ extern "C" __global__ void nta_reset_epoch(nta::abi::RuntimeView *runtime,
   if (index < workTicketCount && index < runtime->workTicketCapacity) {
     if (runtime->workRunnableNs != nullptr) {
       runtime->workRunnableNs[index] = 0;
+    }
+    if (runtime->workDeadlineClocks != nullptr) {
+      runtime->workDeadlineClocks[index] = 0;
     }
     abi::WorkTicket &workTicket = runtime->workTickets[index];
     workTicket.state = static_cast<std::uint32_t>(abi::WorkTicketState::New);

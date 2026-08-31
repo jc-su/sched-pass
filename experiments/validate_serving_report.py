@@ -15,6 +15,7 @@ try:
     from .consumer_contract import validate_consumer_contract
     from .serving_metrics import (
         preregistered_goodput,
+        preregistered_joint_goodput,
         relative_goodput,
         relative_thresholds,
         safe_ratio,
@@ -29,6 +30,7 @@ except ImportError:  # pragma: no cover - direct script execution
     from consumer_contract import validate_consumer_contract
     from serving_metrics import (
         preregistered_goodput,
+        preregistered_joint_goodput,
         relative_goodput,
         relative_thresholds,
         safe_ratio,
@@ -725,6 +727,20 @@ def _validate_single(
         sum(int(record["completion_tokens"]) for record in records) / elapsed,
         "output token throughput",
     )
+    resident_records = [record for record in records if record["kind"] == "resident"]
+    external_records = [record for record in records if record["kind"] == "external"]
+    _close(
+        report.get("resident_output_token_throughput"),
+        sum(int(record["completion_tokens"]) for record in resident_records)
+        / elapsed,
+        "resident output token throughput",
+    )
+    _close(
+        report.get("external_output_token_throughput"),
+        sum(int(record["completion_tokens"]) for record in external_records)
+        / elapsed,
+        "external output token throughput",
+    )
     for field, source, fraction in (
         ("p50_ttft_seconds", "ttft_seconds", 0.50),
         ("p95_ttft_seconds", "ttft_seconds", 0.95),
@@ -754,9 +770,10 @@ def _validate_single(
         "serving SLO goodput has no threshold identity",
     )
     ttft_threshold = _finite(thresholds.get("ttft"), "SLO TTFT threshold")
+    tpot_threshold = _finite(thresholds.get("tpot"), "SLO TPOT threshold")
     itl_threshold = _finite(thresholds.get("p99_itl"), "SLO ITL threshold")
     _require(
-        ttft_threshold > 0.0 and itl_threshold > 0.0,
+        min(ttft_threshold, tpot_threshold, itl_threshold) > 0.0,
         "serving SLO thresholds are not positive",
     )
     token_level_requests = sum(
@@ -768,6 +785,7 @@ def _validate_single(
         float(record["ttft_seconds"]) <= ttft_threshold
         and int(record["itl_sample_count"]) > 0
         and record["token_timestamps_exact"] is True
+        and float(record["tpot_seconds"]) <= tpot_threshold
         and float(record["p99_itl_seconds"]) <= itl_threshold
         for record in records
     )
@@ -952,6 +970,8 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
     nta_goodput = relative_goodput(nta, thresholds)
     stock_preregistered = preregistered_goodput(stock)
     nta_preregistered = preregistered_goodput(nta)
+    stock_joint_preregistered = preregistered_joint_goodput(stock)
+    nta_joint_preregistered = preregistered_joint_goodput(nta)
     _validate_derived_object(
         report.get("stock_goodput"), stock_goodput, "stock relative goodput"
     )
@@ -967,6 +987,16 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         report.get("nta_preregistered_goodput"),
         nta_preregistered,
         "NTA preregistered goodput",
+    )
+    _validate_derived_object(
+        report.get("stock_preregistered_joint_goodput"),
+        stock_joint_preregistered,
+        "stock preregistered joint goodput",
+    )
+    _validate_derived_object(
+        report.get("nta_preregistered_joint_goodput"),
+        nta_joint_preregistered,
+        "NTA preregistered joint goodput",
     )
     _close(
         report.get("stock_slo_goodput"),
@@ -999,6 +1029,22 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
         "output throughput ratio",
     )
     _validate_ratio(
+        report.get("resident_output_throughput_ratio"),
+        safe_ratio(
+            float(nta["resident_output_token_throughput"]),
+            float(stock["resident_output_token_throughput"]),
+        ),
+        "resident output throughput ratio",
+    )
+    _validate_ratio(
+        report.get("external_output_throughput_ratio"),
+        safe_ratio(
+            float(nta["external_output_token_throughput"]),
+            float(stock["external_output_token_throughput"]),
+        ),
+        "external output throughput ratio",
+    )
+    _validate_ratio(
         report.get("goodput_ratio"),
         safe_ratio(
             float(nta_goodput["goodput_requests_per_second"]),
@@ -1013,6 +1059,14 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
             float(stock_preregistered["goodput_requests_per_second"]),
         ),
         "preregistered-goodput ratio",
+    )
+    _validate_ratio(
+        report.get("preregistered_joint_goodput_ratio"),
+        safe_ratio(
+            float(nta_joint_preregistered["goodput_requests_per_second"]),
+            float(stock_joint_preregistered["goodput_requests_per_second"]),
+        ),
+        "preregistered joint-goodput ratio",
     )
     for field, numerator, denominator in (
         (
