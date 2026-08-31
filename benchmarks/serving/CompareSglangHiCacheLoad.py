@@ -127,6 +127,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--prepare-nta-calibration-profile",
+        action="store_true",
+        help=(
+            "run one excluded writable NTA calibration arm before the paired "
+            "trial, then reopen --nta-calibration-profile read-only for timing"
+        ),
+    )
+    parser.add_argument(
         "--nta-calibration-profile-tag",
         default="default",
         help="deployment tag used when validating --nta-calibration-profile",
@@ -221,6 +229,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("incremental setup cost must be nonnegative")
     if not args.nta_calibration_profile_tag.strip():
         parser.error("calibration profile tag cannot be empty")
+    if (
+        args.prepare_nta_calibration_profile
+        and args.nta_calibration_profile is None
+    ):
+        parser.error(
+            "--prepare-nta-calibration-profile requires --nta-calibration-profile"
+        )
     if not 0.0 < args.mem_fraction_static < 1.0:
         parser.error("--mem-fraction-static must be between zero and one")
     if args.external_suffix_tokens < 0:
@@ -265,7 +280,19 @@ def _report(output: str) -> dict[str, Any]:
     raise RuntimeError("load trial emitted no JSON report")
 
 
-def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
+def run(
+    args: argparse.Namespace,
+    backend: str,
+    *,
+    calibration_profile_access: str = "read_only",
+    trial_label: str | None = None,
+) -> dict[str, Any]:
+    if calibration_profile_access not in {"read_only", "writable"}:
+        raise ValueError("unknown calibration-profile access mode")
+    if calibration_profile_access == "writable" and (
+        backend != "nta_flashinfer" or args.nta_calibration_profile is None
+    ):
+        raise ValueError("writable calibration requires an NTA profile path")
     # Kernel-byte-forking toggles (e.g. NTA_STAGING_STREAMING) require a
     # variant-tagged cache so the shim's fail-closed guard can prove a
     # toggled env never reuses the other variant's compiled kernels.
@@ -359,7 +386,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     environment["NTA_EXECUTION_ADMISSION_MAX_DELAY_US"] = str(
         args.admission_max_delay_us
     )
-    owner_token = f"{os.getpid()}:{time.monotonic_ns()}:{backend}"
+    role = backend if trial_label is None else trial_label
+    owner_token = f"{os.getpid()}:{time.monotonic_ns()}:{role}"
     environment[TRIAL_OWNER_ENV] = owner_token
     if backend == "nta_flashinfer":
         # Execution form is orthogonal to the semantic protocol. ``auto`` is
@@ -372,7 +400,8 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
             environment["NTA_EXECUTION_CALIBRATION_PROFILE"] = str(
                 args.nta_calibration_profile.expanduser().resolve()
             )
-            environment["NTA_EXECUTION_CALIBRATION_PROFILE_READ_ONLY"] = "1"
+            if calibration_profile_access == "read_only":
+                environment["NTA_EXECUTION_CALIBRATION_PROFILE_READ_ONLY"] = "1"
             environment["NTA_EXECUTION_CALIBRATION_PROFILE_TAG"] = (
                 args.nta_calibration_profile_tag.strip()
             )
@@ -419,7 +448,7 @@ def run(args: argparse.Namespace, backend: str) -> dict[str, Any]:
     log_path = (
         args.output.resolve().parent
         / "logs"
-        / f"{args.output.stem}.seed-{args.seed}.{backend}.stdout.log"
+        / f"{args.output.stem}.seed-{args.seed}.{role}.stdout.log"
     )
     atomic_write_text(log_path, completed.stdout)
     failures: list[str] = []
@@ -500,6 +529,13 @@ def _write_failed_comparison(
 
 def main() -> int:
     args = parse_args()
+    if args.prepare_nta_calibration_profile:
+        run(
+            args,
+            "nta_flashinfer",
+            calibration_profile_access="writable",
+            trial_label="nta_calibration",
+        )
     order = ["flashinfer", "nta_flashinfer"]
     if args.execution_order == "seeded":
         random.Random(args.seed).shuffle(order)

@@ -154,7 +154,10 @@ def main() -> None:
             "host_execution_mode": "auto",
             "incremental_setup_calibrated": True,
             "incremental_calibration_probes_remaining": 0,
-            "consumer_policy_calibration": {"last_shape_closed": True},
+            "consumer_policy_calibration": {
+                "mode": "frozen",
+                "last_shape_closed": True,
+            },
         }
     )
     activation = module.require_clean_mechanism(calibrated_auto)

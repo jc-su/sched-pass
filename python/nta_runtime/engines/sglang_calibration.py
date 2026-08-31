@@ -165,6 +165,7 @@ class SglangLayerServiceCalibration:
         model_start_layer: int,
         model_layer_count: int,
         stats: dict[str, Any],
+        frozen: bool = False,
     ) -> None:
         if (
             minimum_samples <= 0
@@ -174,6 +175,7 @@ class SglangLayerServiceCalibration:
         ):
             raise ValueError("SGLang layer-service calibration geometry is invalid")
         self._enabled = bool(enabled)
+        self._frozen = bool(frozen)
         self._minimum_samples = minimum_samples
         self._maximum_samples = maximum_samples
         self._model_start_layer = model_start_layer
@@ -264,7 +266,12 @@ class SglangLayerServiceCalibration:
     ) -> None:
         """Record one adjacent attention arrival for a Host-backed forward."""
 
-        if not self._enabled or batch is None or batch.pending_host_load is None:
+        if (
+            not self._enabled
+            or self._frozen
+            or batch is None
+            or batch.pending_host_load is None
+        ):
             return
         query_rows = int(query.shape[0])
         key = (phase, query_rows, len(batch.bindings))
@@ -500,6 +507,7 @@ class SglangConsumerPolicyCalibration:
         maximum_samples: int = 8,
         maximum_probe_misses: int = 2,
         stats: dict[str, Any],
+        frozen: bool = False,
     ) -> None:
         if (
             model_start_layer < 0
@@ -510,6 +518,7 @@ class SglangConsumerPolicyCalibration:
         ):
             raise ValueError("SGLang consumer-policy calibration is invalid")
         self._enabled = bool(enabled)
+        self._frozen = bool(frozen)
         self._model_start_layer = model_start_layer
         self._model_layer_count = model_layer_count
         self._minimum_samples = minimum_samples
@@ -583,6 +592,25 @@ class SglangConsumerPolicyCalibration:
         self._last_key = key
         pending.arrival_profile_key = key
         pending.arrival_profile_active = False
+        if self._frozen:
+            calibrated = self.shape_closed(key)
+            pending.arrival_profiling = False
+            pending.consumer_policy_probe = False
+            pending.planned_progressive_layers = (
+                self.profitable_layers(key, minimum_gain=minimum_gain)
+                if calibrated
+                else frozenset()
+            )
+            counter = (
+                "consumer_policy_frozen_profile_leases"
+                if calibrated
+                else "consumer_policy_frozen_conservative_leases"
+            )
+            self._stats[counter] = self._stats.get(counter, 0) + 1
+            self._stats["consumer_policy_planned_layers"] += len(
+                pending.planned_progressive_layers
+            )
+            return key
         self._minimum_gain_by_key[key] = minimum_gain
         pending.arrival_profiling = any(
             min(
@@ -1382,6 +1410,7 @@ class SglangConsumerPolicyCalibration:
             )
         closed_shapes = sum(self.shape_closed(key) for key in keys)
         return {
+            "mode": "frozen" if self._frozen else "learning",
             "minimum_samples": self._minimum_samples,
             "maximum_samples": self._maximum_samples,
             "maximum_probe_misses": self._maximum_probe_misses,
@@ -1408,7 +1437,21 @@ class SglangConsumerPolicyCalibration:
             "closed_shapes": closed_shapes,
             "open_shapes": len(keys) - closed_shapes,
             "last_shape_closed": (
+                None
+                if self._last_key is None
+                else self._frozen or self.shape_closed(self._last_key)
+            ),
+            "last_shape_calibrated": (
                 None if self._last_key is None else self.shape_closed(self._last_key)
+            ),
+            "last_shape_decision": (
+                None
+                if self._last_key is None
+                else "profile"
+                if self.shape_closed(self._last_key)
+                else "conservative_stock"
+                if self._frozen
+                else "learning"
             ),
             "shapes": shapes,
         }

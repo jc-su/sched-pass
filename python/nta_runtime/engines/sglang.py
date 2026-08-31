@@ -279,6 +279,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             opportunity_parallel_slots=opportunity_parallel_slots,
         )
         observability = tuning.observability
+        self._calibration_frozen = tuning.calibration_profile.read_only
         mover_priority = tuning.mover_stream_priority
         self._progress_stream = torch.cuda.Stream(priority=mover_priority)
         self._host_cost_model = tuning.host_cost_model
@@ -396,12 +397,14 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             model_start_layer=self._model_start_layer,
             model_layer_count=self._model_layer_count,
             stats=self._stats,
+            frozen=self._calibration_frozen,
         )
         self._consumer_calibration = SglangConsumerPolicyCalibration(
             enabled=self._tier_service.is_host_staged,
             model_start_layer=self._model_start_layer,
             model_layer_count=self._model_layer_count,
             stats=self._stats,
+            frozen=self._calibration_frozen,
         )
         self._attention_verifier = SglangAttentionVerifier(
             decode_use_tensor_cores=self.decode_use_tensor_cores,
@@ -519,6 +522,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             profile_index_min_bytes=self._profile_index_min_bytes,
             verify_index_map=self._verification.index_map,
             stats=self._stats,
+            frozen=self._calibration_frozen,
         )
         self._stats.update(
             {
@@ -886,6 +890,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
 
     def _checkpoint_calibration_profile(self) -> None:
+        if (
+            self._calibration_profile is not None
+            and self._calibration_profile.read_only
+        ):
+            return
         pending = (
             self._host_movers.pending_profile_count
             + len(self._transfer_profiles)
@@ -2428,6 +2437,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         observed_ns = batch.incremental_setup_observation_ns
         if observed_ns <= 0:
             return
+        if getattr(self, "_calibration_frozen", False):
+            batch.incremental_setup_observation_ns = 0
+            self._stats["calibration_frozen_setup_observations"] = (
+                self._stats.get("calibration_frozen_setup_observations", 0) + 1
+            )
+            return
         is_probe = (
             batch.host_execution is not None
             and batch.host_execution.selection_reason == "calibration_probe"
@@ -2846,16 +2861,20 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 continue
             milliseconds = start.elapsed_time(finish)
             elapsed_ns = max(1, round(milliseconds * 1_000_000.0))
-            previous_bandwidth = self._host_cost_model.bandwidth_bytes_per_second
-            self._host_cost_model = self._host_cost_model.with_transfer_observation(
-                transfer_bytes=transfer_bytes,
-                elapsed_ns=elapsed_ns,
-            )
-            if self._host_cost_model.bandwidth_bytes_per_second != previous_bandwidth:
-                self._stats["cost_model_transfer_samples"] += 1
-                self._stats["cost_model_bandwidth_bps"] = (
-                    self._host_cost_model.bandwidth_bytes_per_second
+            if not getattr(self, "_calibration_frozen", False):
+                previous_bandwidth = self._host_cost_model.bandwidth_bytes_per_second
+                self._host_cost_model = self._host_cost_model.with_transfer_observation(
+                    transfer_bytes=transfer_bytes,
+                    elapsed_ns=elapsed_ns,
                 )
+                if (
+                    self._host_cost_model.bandwidth_bytes_per_second
+                    != previous_bandwidth
+                ):
+                    self._stats["cost_model_transfer_samples"] += 1
+                    self._stats["cost_model_bandwidth_bps"] = (
+                        self._host_cost_model.bandwidth_bytes_per_second
+                    )
             self._stats["profiled_transfer_batches"] = (
                 self._stats.get("profiled_transfer_batches", 0) + 1
             )
@@ -2898,7 +2917,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 pending_operators.append(profile)
                 continue
             milliseconds = profile.start.elapsed_time(profile.finish)
-            if profile.service_prediction_ns is not None:
+            if (
+                profile.service_prediction_ns is not None
+                and not getattr(self, "_calibration_frozen", False)
+            ):
                 elapsed_ns = max(1, round(milliseconds * 1_000_000.0))
                 first_sample = self._incremental_service_samples == 0
                 self._host_cost_model = (

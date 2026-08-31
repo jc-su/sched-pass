@@ -246,6 +246,7 @@ class HostMoverController:
         profile_index_min_bytes: int,
         verify_index_map: bool,
         stats: MutableMapping[str, Any],
+        frozen: bool = False,
     ) -> None:
         if policy not in {"auto", "sm", "copy_engine"}:
             raise ValueError("host mover policy is invalid")
@@ -260,6 +261,7 @@ class HostMoverController:
         ):
             raise ValueError("host mover configuration must be positive")
         self._policy = policy
+        self._frozen = bool(frozen)
         self._default_service_model = default_service_model
         self._calibration_samples = calibration_samples
         self._copy_engine_max_operations = copy_engine_max_operations
@@ -351,6 +353,8 @@ class HostMoverController:
             raise ValueError("unknown host mover engine")
         if transfer_bytes <= 0:
             raise ValueError("host mover profile bytes must be positive")
+        if self._frozen:
+            return False
         # A calibration decision applies to the complete acquisition frontier,
         # not whichever early waves happen to satisfy the minimum sample
         # count. Later waves can overlap resident compute and observe a very
@@ -409,6 +413,8 @@ class HostMoverController:
         )
 
     def record_profile(self, profile: MoverProfile) -> None:
+        if self._frozen:
+            raise RuntimeError("frozen host-mover policy cannot record calibration")
         self._profiles.append(profile)
 
     @staticmethod

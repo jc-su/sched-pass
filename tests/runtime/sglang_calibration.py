@@ -135,6 +135,28 @@ def main() -> None:
     assert restored_layer.export_state() == layer_state
     assert restored_layer.curve(("extend", 32, 2), calibrated_only=True) == curve
 
+    frozen_layer = SglangLayerServiceCalibration(
+        enabled=True,
+        frozen=True,
+        minimum_samples=2,
+        maximum_samples=4,
+        model_start_layer=10,
+        model_layer_count=4,
+        stats={
+            "layer_service_profiled_intervals": 0,
+            "layer_service_calibrated_shapes": 0,
+        },
+    )
+    assert frozen_layer.import_state(layer_state) == 2
+    frozen_layer.record(
+        batch=batch,
+        phase="extend",
+        query=SimpleNamespace(shape=(64,)),
+        global_layer=10,
+    )
+    assert frozen_layer.pending_count == 0
+    assert frozen_layer.export_state() == layer_state
+
     incompatible_layer = copy.deepcopy(layer_state)
     incompatible_layer["model_layer_count"] = 5
     try:
@@ -320,7 +342,9 @@ def main() -> None:
     assert not pending.consumer_policy_probe
     assert pending.planned_progressive_layers == frozenset({0})
     assert policy.shape_closed(key)
-    assert policy.report() == {
+    policy_report = policy.report()
+    assert policy_report == {
+        "mode": "learning",
         "minimum_samples": 2,
         "maximum_samples": 4,
         "maximum_probe_misses": 2,
@@ -334,6 +358,8 @@ def main() -> None:
         "closed_shapes": 1,
         "open_shapes": 0,
         "last_shape_closed": True,
+        "last_shape_calibrated": True,
+        "last_shape_decision": "profile",
         "shapes": [
             {
                 "phase": "extend",
@@ -361,7 +387,7 @@ def main() -> None:
                 "closed": True,
             }
         ],
-    }
+    }, policy_report
     policy_state = policy.export_state()
     restored_policy_stats = {name: 0 for name in policy_stats}
     restored_policy = SglangConsumerPolicyCalibration(
@@ -390,6 +416,64 @@ def main() -> None:
     assert not pending.arrival_profiling
     assert not pending.consumer_policy_probe
     assert pending.planned_progressive_layers == frozenset({0})
+
+    frozen_stats = {name: 0 for name in policy_stats}
+    frozen_policy = SglangConsumerPolicyCalibration(
+        enabled=True,
+        frozen=True,
+        model_start_layer=10,
+        model_layer_count=2,
+        minimum_samples=2,
+        maximum_samples=4,
+        stats=frozen_stats,
+    )
+    assert frozen_policy.import_state(policy_state) == 20
+    frozen_state = frozen_policy.export_state()
+    assert (
+        frozen_policy.bind_lease(
+            pending,
+            layer_service_key=("extend", 32, 2),
+            mover_kind="sm",
+            layers_per_submission=2,
+            sm_waves_per_layer=1,
+            minimum_gain=1.03,
+        )
+        == key
+    )
+    assert not pending.arrival_profiling
+    assert not pending.consumer_policy_probe
+    assert pending.planned_progressive_layers == frozenset({0})
+    assert frozen_stats["consumer_policy_frozen_profile_leases"] == 1
+
+    unknown = SimpleNamespace(
+        device_indices=SimpleNamespace(numel=lambda: 128),
+        layer_bytes=(1 << 20, 1 << 20),
+        arrival_profile_key=None,
+        arrival_profiling=False,
+        arrival_profile_active=False,
+        consumer_policy_probe=False,
+        partial_profile_recorded=False,
+        planned_progressive_layers=frozenset(),
+    )
+    unknown_key = frozen_policy.bind_lease(
+        unknown,
+        layer_service_key=("extend", 4096, 8),
+        mover_kind="copy_engine",
+        layers_per_submission=4,
+        sm_waves_per_layer=1,
+        minimum_gain=1.03,
+    )
+    assert unknown_key is not None and unknown_key != key
+    assert not unknown.arrival_profiling
+    assert not unknown.consumer_policy_probe
+    assert not unknown.planned_progressive_layers
+    assert frozen_stats["consumer_policy_frozen_conservative_leases"] == 1
+    assert frozen_policy.export_state() == frozen_state
+    frozen_report = frozen_policy.report()
+    assert frozen_report["mode"] == "frozen"
+    assert frozen_report["last_shape_closed"] is True
+    assert frozen_report["last_shape_calibrated"] is False
+    assert frozen_report["last_shape_decision"] == "conservative_stock"
 
     inconsistent_partial = copy.deepcopy(policy_state)
     inconsistent_partial["partial_device_curves"] = []

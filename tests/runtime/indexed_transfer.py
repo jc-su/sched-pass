@@ -372,6 +372,29 @@ def main() -> None:
     assert restored_owner.import_state(mover_state) == 6
     assert restored_owner.export_state() == mover_state
     assert restored_owner.service_model(1 << 20) == observed_copy
+    frozen_owner = HostMoverController(
+        policy="auto",
+        frozen=True,
+        default_service_model=IndexedMoverServiceModel(
+            sm_bandwidth_bytes_per_second=10,
+            minimum_calibration_samples=3,
+        ),
+        calibration_samples=3,
+        copy_engine_max_operations=64,
+        frontier_layers_per_wave=2,
+        profile_transfer=True,
+        frontier_enabled=True,
+        profile_index_layout=False,
+        profile_index_min_bytes=64 * 1024,
+        verify_index_map=False,
+        stats={},
+    )
+    assert frozen_owner.import_state(mover_state) == 6
+    assert not frozen_owner.profile_enabled("sm", 1 << 20)
+    assert not frozen_owner.profile_enabled(
+        "copy_engine", 1 << 30, complete_calibration=True
+    )
+    assert frozen_owner.export_state() == mover_state
     hybrid_scale = 1 << 23
     hybrid_curve = IndexedMoverServiceModel(
         sm_bandwidth_bytes_per_second=10,

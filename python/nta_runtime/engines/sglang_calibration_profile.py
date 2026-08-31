@@ -497,6 +497,10 @@ class SglangCalibrationProfileStore:
             }
         )
 
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
     def restore(
         self,
         *,
@@ -578,7 +582,9 @@ class SglangCalibrationProfileStore:
         self._last_state_encoding = json.dumps(
             state, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        self._stats["calibration_profile_status"] = "loaded"
+        self._stats["calibration_profile_status"] = (
+            "loaded_read_only" if self._read_only else "loaded"
+        )
         self._stats["calibration_profile_loaded_samples"] = loaded
         self._stats["calibration_profile_loaded_unix_ns"] = time.time_ns()
         self._stats["calibration_profile_sha256"] = hashlib.sha256(

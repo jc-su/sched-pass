@@ -190,6 +190,14 @@ def require_clean_mechanism(
         )
         invalid_profiles: list[str] = []
         for index, entry in enumerate(auto_host_entries):
+            consumer = entry.get("consumer_policy_calibration")
+            if (
+                not isinstance(consumer, dict)
+                or consumer.get("mode") != "frozen"
+            ):
+                invalid_profiles.append(
+                    f"worker {index} did not freeze the consumer policy"
+                )
             digest = entry.get("calibration_profile_sha256")
             if not isinstance(digest, str) or len(digest) != 64:
                 invalid_profiles.append(f"worker {index} omitted the profile digest")
