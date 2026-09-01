@@ -156,6 +156,39 @@ def main() -> None:
     assert opportunity["tier_overlap_candidate_requests"] == 1
     assert opportunity["selection_uses_measured_performance"] is False
     assert opportunity_stratum(opportunity) == "capacity_crossing_with_compute_wave"
+    exact_partial_block = build_replay_window(
+        [
+            {
+                "request_id": "same-0",
+                "parent_chat_id": -1,
+                "block_size": 16,
+                "input_length": 17,
+                "output_length": 2,
+                "hash_ids": ["same-a", "same-b"],
+                "cached_prefix_tokens": 0,
+                "arrival_seconds": 0.0,
+            },
+            {
+                "request_id": "same-1",
+                "parent_chat_id": "same-0",
+                "block_size": 16,
+                "input_length": 17,
+                "output_length": 2,
+                "hash_ids": ["same-a", "same-b"],
+                "cached_prefix_tokens": 0,
+                "arrival_seconds": 1.0,
+            },
+        ],
+        measured_start=1,
+        warmup_requests=1,
+        measured_requests=1,
+        context_length=64,
+        input_margin_tokens=4,
+        max_output_tokens=8,
+    )
+    # The serving adapter adds a reserved query boundary after these 17
+    # source rows, so all source rows—not only the first 16—are reusable.
+    assert exact_partial_block.measured_rows[0]["replayable_prefix_tokens"] == 17
     scaled_replay = build_replay_window(
         replay_source,
         measured_start=1,

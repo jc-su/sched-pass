@@ -60,7 +60,15 @@ def _finite_nonnegative(row: Mapping[str, Any], field: str) -> float:
 
 
 def _annotate_replayable_prefixes(rows: list[dict[str, Any]], block_size: int) -> None:
-    """Compute exact local reuse and an input-only reuse-distance lower bound."""
+    """Compute exact local reuse and an input-only reuse-distance lower bound.
+
+    ``replayable_prefix_tokens`` is expressed in source-input tokens.  The
+    serving adapter appends one request-boundary query row, so an identical
+    prior source input can make all of the current source input reusable; the
+    appended row, rather than the final source token, remains the query.  The
+    provider-length bound is also required for a target that extends a shorter
+    cached object whose final (partial) content block matches.
+    """
 
     page_rows = [input_page_ids(row, block_size=block_size) for row in rows]
     root = _PrefixNode()
@@ -75,8 +83,13 @@ def _annotate_replayable_prefixes(rows: list[dict[str, Any]], block_size: int) -
             blocks += 1
         provider_position = node.last_position if blocks else None
         row["replayable_prefix_blocks"] = blocks
+        provider_tokens = (
+            int(rows[provider_position]["input_length"])
+            if provider_position is not None
+            else 0
+        )
         row["replayable_prefix_tokens"] = min(
-            max(0, int(row["input_length"]) - 1), blocks * block_size
+            int(row["input_length"]), provider_tokens, blocks * block_size
         )
         if provider_position is None:
             row["replayable_prefix_provider_source_index"] = None
