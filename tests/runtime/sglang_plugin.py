@@ -812,6 +812,7 @@ def main() -> None:
 
     load_queue = []
     adder = types.SimpleNamespace(
+        can_run_list=[],
         tree_cache=types.SimpleNamespace(
             cache_controller=types.SimpleNamespace(load_queue=load_queue)
         )
@@ -826,6 +827,7 @@ def main() -> None:
         load_queue.append(operation)
         request.prefix_indices = operation.device_indices
         request.last_node = types.SimpleNamespace(id=41)
+        _adder.can_run_list.append(request)
 
     _capture_prefill_request_binding(load_external, adder, external_request)
     _capture_prefill_request_binding(
@@ -842,6 +844,70 @@ def main() -> None:
         SglangAcquisitionSpan.direct(),
     )
     assert external_request._nta_acquisition_span == SglangAcquisitionSpan.direct()
+
+    # SGLang can enqueue a host load before a later budget check rejects the
+    # request.  Keep the demand decision separate from physical prefetch so an
+    # unrelated forward never inherits request/tenant ownership for that row.
+    from nta_runtime.engines.sglang_hicache import (
+        SglangHiCacheBridge,
+        _register_bridge,
+    )
+
+    class DeferredDevicePool:
+        pass
+
+    deferred_pool = DeferredDevicePool()
+    deferred_bridge = SglangHiCacheBridge(deferred_pool)
+    deferred_queue = []
+    deferred_adder = types.SimpleNamespace(
+        can_run_list=[],
+        tree_cache=types.SimpleNamespace(
+            cache_controller=types.SimpleNamespace(
+                load_queue=deferred_queue,
+                mem_pool_device=deferred_pool,
+            )
+        ),
+    )
+    deferred_request = types.SimpleNamespace(
+        rid="deferred-external",
+        best_match_node=types.SimpleNamespace(id=51),
+        last_node=types.SimpleNamespace(id=51),
+        prefix_indices=torch.empty((0,), dtype=torch.int64),
+        needs_host_load_back=lambda: True,
+    )
+    _register_bridge(deferred_pool, deferred_bridge)
+
+    def enqueue_then_reject(_adder, request):
+        operation = types.SimpleNamespace(
+            id=180,
+            node_ids=[51],
+            device_indices=torch.arange(32, dtype=torch.int64),
+        )
+        deferred_queue.append(operation)
+        request.prefix_indices = operation.device_indices
+        request.last_node = types.SimpleNamespace(id=51)
+
+    _capture_prefill_request_binding(
+        enqueue_then_reject, deferred_adder, deferred_request
+    )
+    assert deferred_bridge._operation_admission == {180: False}
+
+    def admit_deferred(_adder, request):
+        _adder.can_run_list.append(request)
+
+    _capture_prefill_request_binding(
+        admit_deferred, deferred_adder, deferred_request
+    )
+    assert deferred_bridge._operation_admission == {180: True}
+    # Once a background prefetch drains the operation, the same request is a
+    # direct/device-resident input; the old operation identity must not revive.
+    deferred_queue.clear()
+    deferred_bridge._operation_admission.clear()
+    _capture_prefill_request_binding(
+        lambda _adder, _request: None, deferred_adder, deferred_request
+    )
+    assert deferred_request._nta_acquisition_span == SglangAcquisitionSpan.direct()
+    assert deferred_bridge._operation_admission == {}
 
     tenant_forward = types.SimpleNamespace(
         batch_size=2,
@@ -1318,12 +1384,46 @@ def main() -> None:
             ack_load_queue=[],
         )
 
+    partition_pool = DevicePool()
+    partition_pool._get_key_buffer = lambda *_args: None
+    partition_pool._get_value_buffer = lambda *_args: None
+    partition_bridge = SglangHiCacheBridge(partition_pool)
+    partition_bridge.set_acquire_callback(lambda _pending: None)
+    partition_controller = lease_controller(partition_pool)
+    deferred_operation = CacheOperation(
+        torch.tensor((3,)), torch.tensor((4,)), 9
+    )
+    partition_controller.load_queue.append(deferred_operation)
+    admitted_operation = partition_controller.load_queue[0]
+    partition_bridge.record_operation_admission(999, True)
+    try:
+        partition_bridge.record_operation_admission(999, False)
+    except RuntimeError as error:
+        assert "revoked an admitted" in str(error)
+    else:
+        raise AssertionError("HiCache accepted an admission ownership reversal")
+    partition_bridge.record_operation_admission(admitted_operation.id, True)
+    partition_bridge.record_operation_admission(deferred_operation.id, False)
+    assert partition_bridge.acquire_load(partition_controller) == 0
+    partition_pending = partition_bridge.get(0)
+    assert partition_pending is not None
+    assert tuple(
+        transfer.operation_id for transfer in partition_pending.operation_transfers
+    ) == (admitted_operation.id, deferred_operation.id)
+    assert partition_pending.demand_operation_ids == frozenset(
+        (admitted_operation.id,)
+    )
+    assert partition_controller.load_queue == []
+
     close_race_pool = DevicePool()
     close_race_pool._get_key_buffer = lambda *_args: None
     close_race_pool._get_value_buffer = lambda *_args: None
     close_race_bridge = SglangHiCacheBridge(close_race_pool)
     close_race_bridge.set_acquire_callback(lambda _pending: None)
     close_race_controller = lease_controller(close_race_pool)
+    close_race_bridge.record_operation_admission(
+        close_race_controller.load_queue[0].id, True
+    )
 
     def close_during_prepare(_pool, _indices):
         close_race_bridge.close()
@@ -1347,6 +1447,7 @@ def main() -> None:
     reused_bridge = SglangHiCacheBridge(reused_pool)
     reused_bridge.set_acquire_callback(lambda _pending: None)
     reused_controller = lease_controller(reused_pool)
+    reused_bridge.record_operation_admission(reused_controller.load_queue[0].id, True)
     reused_bridge._pending[0] = object()
     try:
         reused_bridge.acquire_load(reused_controller)

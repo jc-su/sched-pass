@@ -136,6 +136,7 @@ def resolve_request_acquisitions(
     operation_transfers: Mapping[int, LeaseOperationTransfer],
     *,
     lease_transfer_rows: int,
+    required_operation_ids: frozenset[int] | None = None,
 ) -> tuple[SglangAcquisitionSpan, ...]:
     """Join framework request identity to one exact acquisition lease."""
 
@@ -157,6 +158,13 @@ def resolve_request_acquisitions(
         normalized[operation_id] = transfer
     if sum(item.row_count for item in normalized.values()) != lease_transfer_rows:
         raise RuntimeError("SGLang acquisition operations do not cover the lease rows")
+    required = (
+        frozenset(normalized)
+        if required_operation_ids is None
+        else frozenset(int(value) for value in required_operation_ids)
+    )
+    if not required or not required.issubset(normalized):
+        raise RuntimeError("SGLang acquisition lease has invalid demand ownership")
 
     resolved = tuple(acquisitions)
     if any(not isinstance(item, SglangAcquisitionSpan) for item in resolved):
@@ -169,6 +177,10 @@ def resolve_request_acquisitions(
         if transfer is None:
             raise RuntimeError(
                 "SGLang request references an operation outside its acquisition lease"
+            )
+        if acquisition.operation_id not in required:
+            raise RuntimeError(
+                "SGLang request owns a speculative acquisition operation"
             )
         if (
             acquisition.node_id != transfer.node_id
@@ -184,7 +196,7 @@ def resolve_request_acquisitions(
             )
         referenced_operations.add(acquisition.operation_id)
 
-    missing_operations = set(normalized) - referenced_operations
+    missing_operations = set(required) - referenced_operations
     if missing_operations:
         raise RuntimeError(
             "SGLang forward metadata omits acquisition ownership for "

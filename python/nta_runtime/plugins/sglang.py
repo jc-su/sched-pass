@@ -671,15 +671,37 @@ def _capture_prefill_request_binding(original, adder, request, *args, **kwargs):
         previous = getattr(request, _ACQUISITION_ATTRIBUTE, None)
         if previous is not None and not isinstance(previous, SglangAcquisitionSpan):
             raise RuntimeError("SGLang request carries malformed acquisition metadata")
-        # A request may be revisited after add_one_req loaded its rows but did
-        # not admit it. Preserve that one-shot edge until ForwardBatch.init_new
-        # consumes it; otherwise this is a resident request.
+        # A request may be revisited after add_one_req queued its rows but did
+        # not admit it. Preserve that one-shot edge only while the operation is
+        # still physically queued. A speculative background load removes the
+        # operation and makes a later retry device-resident; carrying its old
+        # ID past that boundary would leak stale ownership into another lease.
+        previous_is_queued = bool(
+            isinstance(previous, SglangAcquisitionSpan)
+            and previous.is_external
+            and load_queue is not None
+            and any(
+                int(getattr(operation, "id", -1)) == previous.operation_id
+                for operation in load_queue
+            )
+        )
         acquisition = (
             previous
-            if isinstance(previous, SglangAcquisitionSpan) and previous.is_external
+            if previous_is_queued
             else SglangAcquisitionSpan.direct()
         )
     setattr(request, _ACQUISITION_ATTRIBUTE, acquisition)
+    if acquisition.is_external:
+        from nta_runtime.engines.sglang_hicache import find_bridge
+
+        device_pool = getattr(controller, "mem_pool_device", None)
+        bridge = None if device_pool is None else find_bridge(device_pool)
+        if bridge is not None:
+            admitted = any(
+                candidate is request
+                for candidate in tuple(getattr(adder, "can_run_list", ()) or ())
+            )
+            bridge.record_operation_admission(acquisition.operation_id, admitted)
     return result
 
 

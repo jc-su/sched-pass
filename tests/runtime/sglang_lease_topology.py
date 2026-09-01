@@ -66,6 +66,32 @@ def main() -> None:
         )
         == acquisitions
     )
+    # A framework-prefetched operation can share the physical lease without
+    # becoming request demand or tenant-owned numerical work in this forward.
+    transfers_with_prefetch = {
+        **transfers,
+        73: LeaseOperationTransfer(73, 63, 4),
+    }
+    assert (
+        resolve_request_acquisitions(
+            acquisitions,
+            transfers_with_prefetch,
+            lease_transfer_rows=44,
+            required_operation_ids=frozenset((71, 72)),
+        )
+        == acquisitions
+    )
+    try:
+        resolve_request_acquisitions(
+            (*acquisitions, SglangAcquisitionSpan(73, 63, 0, 4)),
+            transfers_with_prefetch,
+            lease_transfer_rows=44,
+            required_operation_ids=frozenset((71, 72)),
+        )
+    except RuntimeError as error:
+        assert "owns a speculative" in str(error)
+    else:
+        raise AssertionError("a request claimed a speculative prefetch operation")
     try:
         resolve_request_acquisitions(
             (acquisitions[0], acquisitions[0], acquisitions[2]),

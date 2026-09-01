@@ -185,6 +185,7 @@ class SglangMetadataPlanner:
             metadata.acquisitions,
             pending.transfers_by_operation(),
             lease_transfer_rows=lease_rows,
+            required_operation_ids=pending.demand_operation_ids,
         )
         sequence_lengths = cpu_sequence_lengths(forward_batch, len(bindings))
         self._record_heterogeneity(bindings, sequence_lengths, acquisitions)
