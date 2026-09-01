@@ -724,17 +724,37 @@ class IndexedMoverServiceModel:
         )
         if copy_service_ns is None:  # pragma: no cover - availability invariant
             raise RuntimeError("copy estimate disappeared during candidate analysis")
+        assert self.copy_operation_ns is not None
+        issue_ns = (
+            copy_run_count * copy_operations_per_run * self.copy_operation_ns
+        )
+        # Copy submission is synchronous on the framework scheduler thread.
+        # Its CUDA-event interval is already part of ``copy_service_ns``, so
+        # adding it to that path would double charge stream starvation.  It is
+        # nevertheless a distinct dependency of numerical execution: the
+        # framework cannot launch the rest of the forward until descriptor
+        # submission returns.  Model both resource paths and take their
+        # max-plus join.  Without measured copy/compute overlap this adds
+        # nothing (the serialized copy path already dominates); with overlap
+        # it prevents AUTO from hiding scheduler-thread stalls behind GPU work.
+        copy_compute_ns = self._copy_compute_ns(
+            copy_service_ns, overlap_compute_ns
+        )
+        scheduler_compute_ns = issue_ns + overlap_compute_ns
         sm_rows = total_rows - copy_rows
         if sm_rows == 0:
-            return self._copy_compute_ns(copy_service_ns, overlap_compute_ns)
+            return max(copy_compute_ns, scheduler_compute_ns)
         # SM and copy consume one host link and are therefore serialized. SM
         # gather also serializes with numerical compute. Only the copy/compute
-        # pair may overlap, and only by its measured efficiency.
-        return (
-            self._transfer_ns(sm_rows * row_bytes, self.sm_bandwidth_bytes_per_second)
-            + self._copy_compute_ns(copy_service_ns, overlap_compute_ns)
-            + self.hybrid_join_ns
+        # pair may overlap, and only by its measured efficiency. Descriptor
+        # issue precedes both the SM remainder and subsequent numerical work.
+        sm_service_ns = self._transfer_ns(
+            sm_rows * row_bytes, self.sm_bandwidth_bytes_per_second
         )
+        return max(
+            sm_service_ns + copy_compute_ns,
+            issue_ns + sm_service_ns + overlap_compute_ns,
+        ) + self.hybrid_join_ns
 
     def ideal_copy_can_qualify(
         self,

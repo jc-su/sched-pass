@@ -583,7 +583,9 @@ def main() -> None:
         overlap_compute_ns=5_000,
     )
     assert overlap_aware.kind == "copy_engine"
-    assert overlap_aware.predicted_selected_ns == 5_000
+    # GPU copy may overlap perfectly, but descriptor submission is a host-side
+    # predecessor of the numerical launch: 2.4 us issue + 5 us compute.
+    assert overlap_aware.predicted_selected_ns == 7_400
     try:
         service_model.with_copy_compute_overlap_observation(
             transfer_bytes=6 * 1024,
@@ -597,7 +599,8 @@ def main() -> None:
         raise AssertionError("an impossible overlap observation was accepted")
 
     # Copy CUDA elapsed already includes stream starvation from descriptor
-    # issue. The model takes the maximum resource bound, not their sum.
+    # issue. With no numerical work, the model takes the maximum resource
+    # bound rather than adding the same issue interval twice.
     assert (
         service_model.candidate_ns(
             total_rows=4,
@@ -607,6 +610,27 @@ def main() -> None:
             copy_operations_per_run=1,
         )
         == 1_024
+    )
+
+    scheduler_bound = replace(
+        _calibrated_model(
+            copy_bandwidth=1_000_000_000_000,
+            copy_operation_ns=5_000,
+            minimum_gain=1.0,
+        ),
+        copy_compute_overlap_efficiency=1.0,
+        overlap_samples=3,
+    )
+    assert (
+        scheduler_bound.candidate_ns(
+            total_rows=100,
+            copy_rows=100,
+            copy_run_count=1,
+            row_bytes=4_096,
+            copy_operations_per_run=8,
+            overlap_compute_ns=60_000,
+        )
+        == 100_000
     )
 
     # Three layouts exercise all auto outcomes under one measured service
