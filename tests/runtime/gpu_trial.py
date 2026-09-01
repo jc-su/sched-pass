@@ -91,6 +91,53 @@ def main() -> None:
     assert telemetry["thermal_slowdown_samples"] == 0
     assert telemetry["thermal_slowdown_sample_fraction"] == 0.0
 
+    # A trial-owned CUDA helper can exit after NVML captures its PID but
+    # before the sampler's post-query process-tree walk.  The pre/post union
+    # must retain ownership; an unrelated PID absent from both snapshots must
+    # still fail closed.
+    owner_pid = gpu_trial.os.getpid()
+    retiring_child = owner_pid + 1_000_000
+    retiring = gpu_trial.CotenantSampler("test-owner")
+    with (
+        patch.object(
+            gpu_trial,
+            "_run_nvidia_smi",
+            side_effect=(
+                completed(f"{retiring_child}\n"),
+                completed("34, 1200, 88.5, 0x0, 500.0\n"),
+            ),
+        ),
+        patch.object(
+            retiring,
+            "_descendants",
+            side_effect=({owner_pid, retiring_child}, {owner_pid}),
+        ),
+    ):
+        retiring._sample_once()
+    assert retiring.foreign_samples == 0
+    assert not retiring.foreign_pids
+
+    foreign_pid = retiring_child + 1
+    foreign = gpu_trial.CotenantSampler("test-owner")
+    with (
+        patch.object(
+            gpu_trial,
+            "_run_nvidia_smi",
+            side_effect=(
+                completed(f"{foreign_pid}\n"),
+                completed("34, 1200, 88.5, 0x0, 500.0\n"),
+            ),
+        ),
+        patch.object(
+            foreign,
+            "_descendants",
+            side_effect=({owner_pid}, {owner_pid}),
+        ),
+    ):
+        foreign._sample_once()
+    assert foreign.foreign_samples == 1
+    assert foreign.foreign_pids == {foreign_pid}
+
     sampler.thermal_slowdown_samples = 1
     thermal_evidence, failures = gpu_trial.trial_environment_evidence(
         sampler,

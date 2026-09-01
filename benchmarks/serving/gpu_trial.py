@@ -212,6 +212,13 @@ class CotenantSampler:
         return marker in environment
 
     def _sample_once(self) -> None:
+        # Snapshot both sides of the NVML query.  CUDA helper processes can
+        # retire while ``nvidia-smi`` is materializing its process list.  A
+        # post-query-only tree walk then loses the parent relation and labels
+        # the trial's own short-lived child as a co-tenant.  The union closes
+        # that exit race without weakening the fail-closed treatment of a PID
+        # absent from both owner-tree snapshots.
+        descendants_before = self._descendants()
         result = _run_nvidia_smi(["--query-compute-apps=pid", "--format=csv,noheader"])
         if result is None or result.returncode != 0:
             self.sampling_errors += 1
@@ -224,7 +231,7 @@ class CotenantSampler:
             self.sampling_errors += 1
             return
         self.samples += 1
-        descendants = self._descendants()
+        descendants = descendants_before | self._descendants()
         foreign = {
             pid for pid in applications if not self._owned_by_trial(pid, descendants)
         }
