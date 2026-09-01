@@ -557,10 +557,13 @@ def main() -> None:
         _PREFILL_REQUEST_BIND_TARGET,
         _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
         _PREFILL_GRAPH_LOAD_BATCH_TARGET,
+        _PREFILL_GRAPH_REPLAY_PREPARE_TARGET,
         _REQUEST_FINISH_TARGET,
         _RELEASE_TARGET,
         _FORWARD_BATCH_TARGET,
         _PREFILL_ADMISSION_TARGET,
+        _preserve_prefill_load_batch,
+        _preserve_prefill_replay_prepare,
     )
 
     HookRegistry.apply_hooks()
@@ -570,10 +573,68 @@ def main() -> None:
         _DECODE_GRAPH_REPLAY_VIEW_TARGET,
         _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
         _PREFILL_GRAPH_LOAD_BATCH_TARGET,
+        _PREFILL_GRAPH_REPLAY_PREPARE_TARGET,
     ):
         assert any(
             kind == HookType.AROUND for kind, _, _ in HookRegistry._hooks[target]
         )
+
+    # ``load_batch`` refreshes attention metadata before it returns the
+    # static view.  The external operation sidecar must therefore be present
+    # during that nested refresh, not copied after ``original`` returns.
+    from nta_runtime.adapters.sglang import (
+        FORWARD_METADATA_ATTRIBUTE,
+        SglangAcquisitionSpan,
+        SglangForwardMetadata,
+        forward_metadata,
+    )
+
+    graph_metadata = SglangForwardMetadata(
+        (7,),
+        (3,),
+        (11,),
+        (SglangAcquisitionSpan(152, 41, 32, 16),),
+    )
+    live_graph_batch = types.SimpleNamespace(
+        batch_size=1,
+        rids=("external-request",),
+        **{FORWARD_METADATA_ATTRIBUTE: graph_metadata},
+    )
+    graph_runner = types.SimpleNamespace()
+
+    def replay_prepare_original(
+        runner, forward_batch, static_forward_batch, num_tokens
+    ):
+        assert runner is graph_runner and num_tokens == 64
+        for view in (forward_batch, static_forward_batch):
+            assert view.rids == ("external-request",)
+            assert view._nta_raw_batch_size == 1
+            assert forward_metadata(view).acquisitions[0].operation_id == 152
+        return "prepared"
+
+    def load_batch_original(runner, forward_batch):
+        static = types.SimpleNamespace(batch_size=1)
+        assert (
+            _preserve_prefill_replay_prepare(
+                replay_prepare_original,
+                runner,
+                forward_batch,
+                static,
+                64,
+            )
+            == "prepared"
+        )
+        return static
+
+    with patch("nta_runtime.engines.sglang_telemetry.record_prefill_graph"):
+        static_graph_batch = _preserve_prefill_load_batch(
+            load_batch_original,
+            graph_runner,
+            live_graph_batch,
+        )
+    assert static_graph_batch.rids == ("external-request",)
+    assert forward_metadata(static_graph_batch) == graph_metadata
+    assert not hasattr(graph_runner, "_nta_prefill_replay_context")
 
     assert any(
         kind == HookType.AROUND

@@ -48,6 +48,10 @@ _PREFILL_GRAPH_LOAD_BATCH_TARGET = (
     "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
     "PrefillCudaGraphRunner.load_batch"
 )
+_PREFILL_GRAPH_REPLAY_PREPARE_TARGET = (
+    "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+    "PrefillCudaGraphRunner._prepare_forward_metadata_for_replay"
+)
 _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET = (
     "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
     "PrefillCudaGraphRunner.capture_prepare"
@@ -69,6 +73,7 @@ _REQUIRED_LIFECYCLE_HOOK_TARGETS = (
     _EAGER_LOAD_BATCH_TARGET,
     _PREFILL_ADMISSION_TARGET,
     _PREFILL_GRAPH_LOAD_BATCH_TARGET,
+    _PREFILL_GRAPH_REPLAY_PREPARE_TARGET,
     _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
     _DECODE_GRAPH_REPLAY_VIEW_TARGET,
     _CONTROL_RPC_TARGET,
@@ -282,6 +287,12 @@ def _preserve_prefill_graph_request_metadata() -> None:
     )
     _register_hook(
         HookRegistry,
+        _PREFILL_GRAPH_REPLAY_PREPARE_TARGET,
+        _preserve_prefill_replay_prepare,
+        HookType.AROUND,
+    )
+    _register_hook(
+        HookRegistry,
         _PREFILL_GRAPH_CAPTURE_PREPARE_TARGET,
         _preserve_prefill_capture_prepare,
         HookType.AROUND,
@@ -289,19 +300,69 @@ def _preserve_prefill_graph_request_metadata() -> None:
 
 
 def _preserve_prefill_load_batch(original, self, forward_batch, **kwargs):
-    """Copy live request metadata into a static prefill graph batch."""
+    """Keep live request metadata available while SGLang builds graph views.
+
+    SGLang refreshes attention metadata *inside* ``load_batch`` before the
+    static batch is returned.  Copying the sidecar only after ``original``
+    therefore loses an external acquisition edge: the nested refresh observes
+    a default/direct sidecar and can no longer join the live lease operation
+    to its request.  Snapshot the immutable live sidecar before entering
+    SGLang and let the nested replay hook publish it on both views.
+    """
     from nta_runtime.engines.sglang_telemetry import record_prefill_graph
     from nta_runtime.adapters.sglang import (
         FORWARD_METADATA_ATTRIBUTE,
         forward_metadata,
     )
 
-    static_batch = original(self, forward_batch, **kwargs)
-    static_batch.rids = getattr(forward_batch, "rids", None)
+    request_ids = tuple(getattr(forward_batch, "rids", ()) or ())
     metadata = forward_metadata(forward_batch)
+    raw_batch_size = int(getattr(forward_batch, "batch_size", 0) or 0)
+    if raw_batch_size <= 0 or len(request_ids) != raw_batch_size:
+        raise RuntimeError("SGLang prefill graph omitted live request identity")
+    if hasattr(self, "_nta_prefill_replay_context"):
+        raise RuntimeError("SGLang prefill graph replay context is re-entrant")
+    self._nta_prefill_replay_context = (request_ids, metadata, raw_batch_size)
+    try:
+        static_batch = original(self, forward_batch, **kwargs)
+    finally:
+        del self._nta_prefill_replay_context
+    static_batch.rids = request_ids
     setattr(static_batch, FORWARD_METADATA_ATTRIBUTE, metadata)
+    static_batch._nta_raw_batch_size = raw_batch_size
     record_prefill_graph("served")
     return static_batch
+
+
+def _preserve_prefill_replay_prepare(
+    original,
+    self,
+    forward_batch,
+    static_forward_batch,
+    num_tokens,
+):
+    """Publish the live sidecar before the nested attention-metadata refresh."""
+    from nta_runtime.adapters.sglang import FORWARD_METADATA_ATTRIBUTE
+
+    context = getattr(self, "_nta_prefill_replay_context", None)
+    if context is None:
+        raise RuntimeError("SGLang prefill graph replay lost its live context")
+    request_ids, metadata, raw_batch_size = context
+    for view in (forward_batch, static_forward_batch):
+        if int(getattr(view, "batch_size", 0) or 0) != raw_batch_size:
+            raise RuntimeError(
+                "SGLang prefill graph changed request cardinality before metadata "
+                "refresh"
+            )
+        view.rids = request_ids
+        setattr(view, FORWARD_METADATA_ATTRIBUTE, metadata)
+        view._nta_raw_batch_size = raw_batch_size
+    return original(
+        self,
+        forward_batch,
+        static_forward_batch,
+        num_tokens,
+    )
 
 
 def _preserve_eager_load_batch(original, runner, forward_batch, *args, **kwargs):
