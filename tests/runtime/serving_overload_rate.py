@@ -170,7 +170,8 @@ def main() -> None:
         assert frozen["knee"]["saturation_onset_rate"] == 18.0
         assert frozen["frozen_overload_rate"] == 18.0
         assert frozen["formal_overload"]["offered_rate"] == 18.0
-        assert frozen["rule"]["name"] == "first_sustained_stock_multisignal_knee_v1"
+        assert frozen["rule"]["name"] == "first_sustained_stock_multisignal_knee_v2"
+        assert frozen["knee"]["transition_gray_zone"] == []
         assert len(frozen["inputs"]) == 4
         assert all(len(item["sha256"]) == 64 for item in frozen["inputs"])
         # No timestamp or ambient state enters the freeze: identical evidence
@@ -185,6 +186,30 @@ def main() -> None:
         reversed_arguments.extend(("--output", str(output)))
         assert freeze_main(reversed_arguments) == 0
         assert output.read_bytes() == first_bytes
+
+        # A rate can cross the throughput/latency thresholds before the SLO
+        # threshold.  It is a measured transition gray-zone point, not a new
+        # sustainable knee and not a reason to hide a later formal collapse.
+        pilots = inputs(directory)
+        gray_path = directory / "stock-16.json"
+        write(
+            gray_path,
+            report(
+                rate=16.0,
+                throughput=14.3,
+                system_latency=1.7,
+                attainment=0.98,
+            ),
+        )
+        gray_pilots = [*pilots[:2], PilotInput(16.0, gray_path), *pilots[2:]]
+        gray_frozen = build_freeze(gray_pilots, FreezeRule())
+        assert gray_frozen["knee"]["offered_rate"] == 12.0
+        assert gray_frozen["knee"]["saturation_onset_rate"] == 18.0
+        assert [
+            item["offered_rate"]
+            for item in gray_frozen["knee"]["transition_gray_zone"]
+        ] == [16.0]
+        assert gray_frozen["frozen_overload_rate"] == 18.0
 
         no_knee = copy.deepcopy(pilots)
         for pilot in no_knee:

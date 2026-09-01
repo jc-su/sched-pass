@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - direct script execution
 
 
 CLASSIFICATION = "stock-serving-overload-rate-freeze"
-RULE_NAME = "first_sustained_stock_multisignal_knee_v1"
+RULE_NAME = "first_sustained_stock_multisignal_knee_v2"
 _HEX = frozenset("0123456789abcdef")
 _WORKLOAD_CONFIGURATION_FIELDS = (
     "model",
@@ -612,16 +612,20 @@ def build_freeze(inputs: Sequence[PilotInput], rule: FreezeRule) -> dict[str, An
         raise ValueError("lowest stock pilot rate is already saturated")
 
     transition_index: int | None = None
+    knee_index = 0
     transition_signals: dict[str, Any] | None = None
+    gray_zone_indices: list[int] = []
     for index in range(1, len(candidates)):
-        knee = candidates[index - 1]
         candidate = candidates[index]
-        if any(
-            value.throughput_efficiency <= efficiency_floor
-            or value.slo_attainment < rule.minimum_presaturation_slo_attainment
-            for value in candidates[:index]
+        if (
+            candidate.throughput_efficiency > efficiency_floor
+            and candidate.slo_attainment
+            >= rule.minimum_presaturation_slo_attainment
         ):
-            break
+            knee_index = index
+            gray_zone_indices.clear()
+            continue
+        knee = candidates[knee_index]
         signals = _saturation_signals(knee, candidate, rule)
         if all(
             signals[name]
@@ -635,10 +639,17 @@ def build_freeze(inputs: Sequence[PilotInput], rule: FreezeRule) -> dict[str, An
             transition_index = index
             transition_signals = signals
             break
+        # A continuous service curve can cross one threshold before the
+        # others.  Such a point is neither a sustainable knee nor formal
+        # multi-signal saturation.  Retain it as evidence and keep scanning
+        # relative to the last measured sustainable point.  Stopping here
+        # would make the result depend on whether the pilot grid happened to
+        # sample this transition gray zone.
+        gray_zone_indices.append(index)
     if transition_index is None or transition_signals is None:
         raise ValueError("no stable multi-signal stock saturation knee was found")
 
-    knee = candidates[transition_index - 1]
+    knee = candidates[knee_index]
     minimum_overload_rate = knee.offered_rate * (
         1.0 + rule.minimum_overload_margin_fraction
     )
@@ -675,9 +686,10 @@ def build_freeze(inputs: Sequence[PilotInput], rule: FreezeRule) -> dict[str, An
             "name": RULE_NAME,
             "thresholds": asdict(rule),
             "knee_definition": (
-                "highest measured sustainable stock rate immediately before the "
-                "first throughput-shortfall, p95-growth, p99-growth, and SLO-drop "
-                "transition"
+                "highest measured sustainable stock rate before the first "
+                "throughput-shortfall, p95-growth, p99-growth, and SLO-drop "
+                "transition; intermediate partial-signal rates are retained as "
+                "a transition gray zone"
             ),
             "overload_selection": (
                 "smallest measured rate above the knee and minimum margin that "
@@ -692,6 +704,9 @@ def build_freeze(inputs: Sequence[PilotInput], rule: FreezeRule) -> dict[str, An
             "candidate": asdict(knee),
             "saturation_onset_rate": candidates[transition_index].offered_rate,
             "onset_signals": transition_signals,
+            "transition_gray_zone": [
+                asdict(candidates[index]) for index in gray_zone_indices
+            ],
         },
         "formal_overload": {
             "offered_rate": selected.offered_rate,
