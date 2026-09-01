@@ -1586,6 +1586,10 @@ def validate_formal_arm(report: dict[str, Any]) -> dict[str, Any]:
         and calibration.get("kind") == "exact_token_content_graph_and_query_rows"
         and calibration.get("content_graph_preserved") is True
         and calibration.get("cache_reset_after_each_warmup") is True
+        and int(calibration.get("stabilization_iterations", 0)) >= 1
+        and calibration.get("shape_calibration_iterations") == 1
+        and calibration.get("final_calibration_matches_timed") is True
+        and calibration.get("tier_split_preserved") is True
         and calibration.get("verified") is True,
         "formal serving arm warmup changed the timed content-sharing graph",
     )

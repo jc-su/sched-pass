@@ -355,6 +355,10 @@ def main() -> None:
                 "kind": "exact_token_content_graph_and_query_rows",
                 "content_graph_preserved": True,
                 "cache_reset_after_each_warmup": True,
+                "stabilization_iterations": 1,
+                "shape_calibration_iterations": 1,
+                "final_calibration_matches_timed": True,
+                "tier_split_preserved": True,
                 "verified": True,
             },
         }
@@ -368,6 +372,26 @@ def main() -> None:
         assert "content-sharing graph" in str(error)
     else:
         raise AssertionError("a content-changing formal warmup passed validation")
+    unstable_calibration = copy.deepcopy(formal_arm)
+    unstable_calibration["calibration_input_contract"][
+        "final_calibration_matches_timed"
+    ] = False
+    try:
+        validate_formal_arm(unstable_calibration)
+    except ValueError as error:
+        assert "content-sharing graph" in str(error)
+    else:
+        raise AssertionError("a tier-unstable final calibration passed validation")
+    missing_stabilization = copy.deepcopy(formal_arm)
+    missing_stabilization["calibration_input_contract"][
+        "stabilization_iterations"
+    ] = 0
+    try:
+        validate_formal_arm(missing_stabilization)
+    except ValueError as error:
+        assert "content-sharing graph" in str(error)
+    else:
+        raise AssertionError("a formal arm without stabilization passed validation")
     standalone = copy.deepcopy(nta)
     for field in (
         "cotenant_gpu_samples",

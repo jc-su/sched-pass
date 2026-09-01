@@ -614,6 +614,10 @@ def main() -> int:
         or contract.get("kind") != "exact_token_content_graph_and_query_rows"
         or contract.get("content_graph_preserved") is not True
         or contract.get("cache_reset_after_each_warmup") is not True
+        or int(contract.get("stabilization_iterations", 0)) < 1
+        or contract.get("shape_calibration_iterations") != 1
+        or contract.get("final_calibration_matches_timed") is not True
+        or contract.get("tier_split_preserved") is not True
         or contract.get("verified") is not True
     }
     if invalid_calibration:
