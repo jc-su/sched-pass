@@ -156,6 +156,15 @@ def require_clean_mechanism(
         and int(entry.get("incremental_calibration_probes_remaining", -1)) == 0
         and isinstance(entry.get("consumer_policy_calibration"), dict)
         and entry["consumer_policy_calibration"].get("last_shape_closed") is True
+        and entry.get("host_mover_overlap_calibrated") is True
+        and all(
+            int(entry.get(name, 0)) == 0
+            for name in (
+                "prefetch_mover_plan_frozen_uncalibrated_sm_leases",
+                "prefetch_mover_plan_frozen_uncalibrated_copy_engine_leases",
+                "prefetch_mover_plan_frozen_uncalibrated_overlap_leases",
+            )
+        )
         for entry in auto_host_entries
     )
     if auto_host_entries and not auto_calibration_closed:
@@ -199,6 +208,7 @@ def require_clean_mechanism(
                 "cost_model_transfer_samples",
                 "prefetch_mover_plan_calibration_probe_copy_leases",
                 "prefetch_mover_plan_calibration_probe_sm_leases",
+                "host_mover_overlap_profiled_leases",
             )
         )
         invalid_profiles: list[str] = []

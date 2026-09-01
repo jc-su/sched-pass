@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from nta_runtime.engines.sglang_transfer import (
+    MoverCopyInterval,
     HostMoverLeasePlan,
     HostTransferLeasePlan,
 )
@@ -60,6 +61,12 @@ class PendingHostLoad:
     transfer_plan: HostTransferLeasePlan | None = None
     device_index_map: LeaseDeviceIndexMap | None = None
     transfer_events: tuple[Any, ...] = ()
+    # Calibration-only timing ownership for one copy-engine probe lease.  The
+    # transport publishes the physical copy interval; the attention adapter
+    # later binds the first/last compute arrivals from the same forward.  No
+    # event is queried on the serving hot path.
+    mover_overlap_copy_intervals: list[MoverCopyInterval] = field(default_factory=list)
+    mover_overlap_compute_start: Any = None
     selection_accounted: bool = False
     acquisition: LayerAcquisition | None = None
     arrival_profile_key: HostArrivalProfileKey | None = None

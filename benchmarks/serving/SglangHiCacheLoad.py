@@ -81,6 +81,7 @@ _TIMED_AUTO_CALIBRATION_COUNTERS = (
     "cost_model_transfer_samples",
     "prefetch_mover_plan_calibration_probe_copy_leases",
     "prefetch_mover_plan_calibration_probe_sm_leases",
+    "host_mover_overlap_profiled_leases",
 )
 
 
@@ -420,6 +421,17 @@ def _require_closed_auto_calibration(
             or int(report.get("incremental_calibration_probes_remaining", -1)) != 0
         ):
             failures.append("execution-form setup")
+        if report.get("host_mover_overlap_calibrated") is not True:
+            failures.append("copy/compute overlap")
+        if any(
+            int(report.get(name, 0)) != 0
+            for name in (
+                "prefetch_mover_plan_frozen_uncalibrated_sm_leases",
+                "prefetch_mover_plan_frozen_uncalibrated_copy_engine_leases",
+                "prefetch_mover_plan_frozen_uncalibrated_overlap_leases",
+            )
+        ):
+            failures.append("mover scale coverage")
         consumer = report.get("consumer_policy_calibration")
         if (
             not isinstance(consumer, dict)
@@ -649,6 +661,7 @@ def _measurement_delta(
         if name.startswith("host_mover_")
         and (
             name.endswith("_batches")
+            or name.startswith("host_mover_overlap_profiled_")
             or (
                 name.startswith("host_mover_profiled_")
                 and name.endswith(("_bytes", "_gpu_ms"))
@@ -3020,6 +3033,7 @@ def main() -> int:
     batch_heterogeneity = serving_batch_heterogeneity(records, stats)
     if (
         args.attention_backend == "nta_flashinfer"
+        and not args.auto_calibration_training_run
         and args.batch_mode == "coalesced"
         and resident
         and external

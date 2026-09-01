@@ -198,6 +198,7 @@ def main() -> None:
             "host_execution_mode": "auto",
             "incremental_setup_calibrated": True,
             "incremental_calibration_probes_remaining": 0,
+            "host_mover_overlap_calibrated": True,
             "consumer_policy_calibration": {
                 "mode": "frozen",
                 "last_shape_closed": True,
@@ -257,6 +258,7 @@ def main() -> None:
             "host_execution_mode": "auto",
             "incremental_setup_calibrated": True,
             "incremental_calibration_probes_remaining": 0,
+            "host_mover_overlap_calibrated": True,
             "consumer_policy_calibration": {"last_shape_closed": True},
             "consumer_policy_probe_leases": 1,
         }
@@ -443,6 +445,7 @@ def main() -> None:
             "host_execution_mode": "auto",
             "incremental_setup_calibrated": True,
             "incremental_calibration_probes_remaining": 0,
+            "host_mover_overlap_calibrated": True,
             "calibration_profile_enabled": True,
             "calibration_profile_read_only": True,
             "calibration_profile_status": "loaded_read_only",

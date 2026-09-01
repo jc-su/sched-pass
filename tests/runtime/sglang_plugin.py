@@ -61,7 +61,11 @@ def main() -> None:
     from nta_runtime.engines.sglang_materialization import SglangPlanMaterializer
     from nta_runtime.engines.sglang_metadata import SglangMetadataPlanner
     from nta_runtime.engines.sglang_pipeline import bounded_sm_pair_worker_grid
-    from nta_runtime.engines.sglang_transfer import HostMoverController, MoverProfile
+    from nta_runtime.engines.sglang_transfer import (
+        HostMoverController,
+        MoverOverlapProfile,
+        MoverProfile,
+    )
     from nta_runtime.execution_planner import (
         HostCostModel,
         HostExecutionForm,
@@ -1743,6 +1747,8 @@ def main() -> None:
                 copy_operation_ns=100,
                 sm_samples=samples,
                 copy_samples=samples,
+                copy_compute_overlap_efficiency=0.5 if calibrated else 0.0,
+                overlap_samples=samples,
             ),
             calibration_samples=3,
             copy_engine_max_operations=64,
@@ -1800,6 +1806,42 @@ def main() -> None:
     assert aggregate_movers._stats["host_mover_complete_calibration_frontiers"] == 1
     assert aggregate_movers._stats["host_mover_complete_calibration_wave_samples"] == 3
 
+    class _TimelineEvent:
+        def __init__(self, timestamp_ms: float) -> None:
+            self.timestamp_ms = timestamp_ms
+
+        def query(self) -> bool:
+            return True
+
+        def elapsed_time(self, finish) -> float:
+            return finish.timestamp_ms - self.timestamp_ms
+
+    overlap_movers = mover_controller(
+        policy="auto", frontier_enabled=False, calibrated=True
+    )
+    # Remove only the overlap prior: standalone mover service remains measured.
+    overlap_movers._default_service_model = replace(
+        overlap_movers._default_service_model,
+        copy_compute_overlap_efficiency=0.0,
+        overlap_samples=0,
+    )
+    for _ in range(3):
+        overlap_movers.record_overlap_profile(
+            MoverOverlapProfile(
+                _TimelineEvent(0.0),
+                _TimelineEvent(10.0),
+                _TimelineEvent(5.0),
+                _TimelineEvent(15.0),
+                1 << 20,
+            )
+        )
+    overlap_movers.collect_profiles()
+    overlap_curve = overlap_movers.service_model(1 << 20)
+    assert overlap_curve.overlap_samples == 3
+    assert overlap_curve.copy_compute_overlap_efficiency == 0.5
+    assert overlap_movers.pending_profile_count == 0
+    assert overlap_movers._stats["host_mover_overlap_profiled_leases"] == 3
+
     # A complete probe frontier can be composed of timer-dominated waves. The
     # observation methods reject these scales; collection must preserve that
     # fail-closed state instead of assigning samples to a missing copy curve.
@@ -1848,6 +1890,8 @@ def main() -> None:
             copy_operation_ns=10,
             sm_samples=3,
             copy_samples=3,
+            copy_compute_overlap_efficiency=0.5,
+            overlap_samples=3,
         ),
         calibration_samples=3,
         copy_engine_max_operations=64,

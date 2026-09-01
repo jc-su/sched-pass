@@ -223,6 +223,38 @@ class MoverProfile:
             raise ValueError("SM mover profiles cannot carry CPU issue time")
 
 
+@dataclass(frozen=True)
+class MoverCopyInterval:
+    """One physical copy interval retained by its calibration lease."""
+
+    start: torch.cuda.Event
+    finish: torch.cuda.Event
+    service_scale_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.service_scale_bytes <= 0:
+            raise ValueError("mover copy interval requires a positive scale")
+
+
+@dataclass(frozen=True)
+class MoverOverlapProfile:
+    """One lease-scoped copy/compute concurrency observation.
+
+    All four events belong to the same forward.  Their intervals are measured
+    only after completion, so calibration never synchronizes the launch path.
+    """
+
+    copy_start: torch.cuda.Event
+    copy_finish: torch.cuda.Event
+    compute_start: torch.cuda.Event
+    compute_finish: torch.cuda.Event
+    service_scale_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.service_scale_bytes <= 0:
+            raise ValueError("mover overlap profile requires a positive scale")
+
+
 class HostMoverController:
     """Own mover selection, calibration, and lease-scoped index analysis.
 
@@ -275,6 +307,7 @@ class HostMoverController:
         self._service_models: dict[int, IndexedMoverServiceModel] = {}
         self._last_service_bucket: int | None = None
         self._profiles: list[MoverProfile] = []
+        self._overlap_profiles: list[MoverOverlapProfile] = []
         self._profile_buckets: dict[str, dict[int, int]] = {
             "sm": {},
             "copy_engine": {},
@@ -293,7 +326,7 @@ class HostMoverController:
 
     @property
     def pending_profile_count(self) -> int:
-        return len(self._profiles)
+        return len(self._profiles) + len(self._overlap_profiles)
 
     def representative_wave_bytes(
         self,
@@ -396,9 +429,12 @@ class HostMoverController:
             return self.scale_calibrated("sm", representative_bytes)
         if self._policy == "copy_engine":
             return self.scale_calibrated("copy_engine", representative_bytes)
-        return self.scale_calibrated(
-            "sm", representative_bytes
-        ) and self.scale_calibrated("copy_engine", representative_bytes)
+        model = self.service_model(representative_bytes)
+        return (
+            model.sm_calibrated
+            and model.copy_calibrated
+            and model.overlap_calibrated
+        )
 
     def lease_calibrated(self, pending: Any) -> bool:
         mover = pending.mover_plan
@@ -422,6 +458,61 @@ class HostMoverController:
         if self._frozen:
             raise RuntimeError("frozen host-mover policy cannot record calibration")
         self._profiles.append(profile)
+
+    def record_overlap_profile(self, profile: MoverOverlapProfile) -> None:
+        if self._frozen:
+            raise RuntimeError("frozen host-mover policy cannot record calibration")
+        self._overlap_profiles.append(profile)
+
+    def record_overlap_arrival(
+        self,
+        pending: Any,
+        *,
+        local_layer: int,
+        model_layer_count: int,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Bind compute timing to one calibration-only copy probe lease."""
+
+        copy_intervals = pending.mover_overlap_copy_intervals
+        mover_plan = pending.mover_plan
+        probe_active = (
+            mover_plan is not None
+            and mover_plan.selection_reason == "calibration_probe_copy"
+        )
+        if not copy_intervals and not probe_active:
+            return
+        if not 0 <= local_layer < model_layer_count:
+            raise RuntimeError("mover-overlap arrival is outside the model")
+        if local_layer not in {0, model_layer_count - 1}:
+            return
+        if model_layer_count == 1:
+            copy_intervals.clear()
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        if local_layer == 0:
+            if pending.mover_overlap_compute_start is not None:
+                raise RuntimeError("mover-overlap compute interval started twice")
+            pending.mover_overlap_compute_start = event
+            pending.transfer_events += (event,)
+            return
+        compute_start = pending.mover_overlap_compute_start
+        if compute_start is None:
+            raise RuntimeError("mover-overlap compute interval has no start")
+        for interval in copy_intervals:
+            self.record_overlap_profile(
+                MoverOverlapProfile(
+                    interval.start,
+                    interval.finish,
+                    compute_start,
+                    event,
+                    interval.service_scale_bytes,
+                )
+            )
+        pending.transfer_events += (event,)
+        copy_intervals.clear()
+        pending.mover_overlap_compute_start = None
 
     @staticmethod
     def _service_model_state(
@@ -449,7 +540,7 @@ class HostMoverController:
     def export_state(self) -> dict[str, Any]:
         """Return deployment-local mover curves without event ownership."""
 
-        if self._profiles:
+        if self.pending_profile_count:
             raise RuntimeError("host mover cannot snapshot pending CUDA events")
         return {
             "schema": _HOST_MOVER_STATE_SCHEMA,
@@ -467,7 +558,7 @@ class HostMoverController:
     def import_state(self, value: Any) -> int:
         """Restore validated mover curves before any lease is planned."""
 
-        if self._profiles or self._service_models:
+        if self.pending_profile_count or self._service_models:
             raise RuntimeError("host mover calibration is not empty")
         state = _profile_mapping(value, "host-mover calibration")
         _profile_fields(
@@ -653,6 +744,10 @@ class HostMoverController:
             row_bytes_by_layer, transfer_count
         )
         service_model = self.service_model(representative_sm_wave_bytes)
+        # ``service_model`` binds the scale used by this lease. Publish after
+        # that binding so evidence never reports the default prior merely
+        # because profile import happened before the first plan.
+        self._publish_service_stats()
         self._stats["layer_service_last_plan_key"] = (
             None if layer_service_key is None else list(layer_service_key)
         )
@@ -698,12 +793,20 @@ class HostMoverController:
                     frozen_uncalibrated_reason = "frozen_uncalibrated_sm"
                 else:
                     calibration_probe_sm = True
-            elif not service_model.copy_calibrated and not any(
-                profile.engine == "copy_engine" for profile in self._profiles
+            elif (
+                not service_model.copy_calibrated
+                or not service_model.overlap_calibrated
+            ) and not (
+                any(profile.engine == "copy_engine" for profile in self._profiles)
+                or self._overlap_profiles
             ):
                 if self._frozen:
                     planner_policy = "sm"
-                    frozen_uncalibrated_reason = "frozen_uncalibrated_copy_engine"
+                    frozen_uncalibrated_reason = (
+                        "frozen_uncalibrated_copy_engine"
+                        if not service_model.copy_calibrated
+                        else "frozen_uncalibrated_overlap"
+                    )
                 else:
                     planner_policy = "probe_copy"
             elif layer_curve is None or not layer_curve.calibrated:
@@ -826,6 +929,9 @@ class HostMoverController:
             ),
             "frozen_uncalibrated_copy_engine": (
                 "prefetch_mover_plan_frozen_uncalibrated_copy_engine_leases"
+            ),
+            "frozen_uncalibrated_overlap": (
+                "prefetch_mover_plan_frozen_uncalibrated_overlap_leases"
             ),
             "insufficient_gain": "prefetch_mover_plan_insufficient_gain_leases",
             "service_cost": "prefetch_mover_plan_service_cost_leases",
@@ -1016,6 +1122,70 @@ class HostMoverController:
                 "host_mover_complete_calibration_wave_samples", sample_count
             )
 
+        pending_overlap: list[MoverOverlapProfile] = []
+        overlap_profiles = self._overlap_profiles
+        for index, profile in enumerate(overlap_profiles):
+            if not all(
+                event.query()
+                for event in (
+                    profile.copy_start,
+                    profile.copy_finish,
+                    profile.compute_start,
+                    profile.compute_finish,
+                )
+            ):
+                pending_overlap.append(profile)
+                continue
+            try:
+                copy_ns = max(
+                    1,
+                    round(
+                        profile.copy_start.elapsed_time(profile.copy_finish)
+                        * 1_000_000.0
+                    ),
+                )
+                compute_ns = max(
+                    1,
+                    round(
+                        profile.compute_start.elapsed_time(profile.compute_finish)
+                        * 1_000_000.0
+                    ),
+                )
+                compute_offset_ns = round(
+                    profile.copy_start.elapsed_time(profile.compute_start)
+                    * 1_000_000.0
+                )
+                concurrent_ns = max(
+                    copy_ns,
+                    compute_ns,
+                    max(copy_ns, compute_offset_ns + compute_ns)
+                    - min(0, compute_offset_ns),
+                )
+                # The four timestamps are deployment-service intervals, not
+                # synthetic kernels.  Their union gives the exact saved time
+                # identity used by the model even when PCIe/L2 contention has
+                # stretched either constituent interval.
+                bucket, previous = previous_curve(
+                    "copy_engine", profile.service_scale_bytes
+                )
+                updated = previous.with_copy_compute_overlap_observation(
+                    transfer_bytes=profile.service_scale_bytes,
+                    isolated_copy_ns=copy_ns,
+                    isolated_compute_ns=compute_ns,
+                    concurrent_ns=concurrent_ns,
+                    alpha=0.25,
+                )
+            except BaseException:
+                pending_overlap.extend(overlap_profiles[index:])
+                self._overlap_profiles = pending_overlap
+                raise
+            self._service_models[bucket] = updated
+            self._add_stat("host_mover_overlap_profiled_leases")
+            self._add_stat("host_mover_overlap_profiled_copy_ns", copy_ns)
+            self._add_stat("host_mover_overlap_profiled_compute_ns", compute_ns)
+            self._add_stat("host_mover_overlap_profiled_concurrent_ns", concurrent_ns)
+        self._overlap_profiles = pending_overlap
+
         self._publish_service_stats()
 
     def _publish_service_stats(self) -> None:
@@ -1034,6 +1204,11 @@ class HostMoverController:
             model.copy_bandwidth_bytes_per_second
         )
         self._stats["host_mover_copy_operation_ns"] = model.copy_operation_ns
+        self._stats["host_mover_overlap_samples"] = model.overlap_samples
+        self._stats["host_mover_overlap_calibrated"] = model.overlap_calibrated
+        self._stats["host_mover_copy_compute_overlap_efficiency"] = (
+            model.copy_compute_overlap_efficiency
+        )
         for engine, label in (("sm", "sm"), ("copy_engine", "copy")):
             buckets = self._profile_buckets[engine]
             self._stats[f"host_mover_{label}_calibrated_buckets"] = sum(
@@ -1060,6 +1235,10 @@ class HostMoverController:
                 "copy_operation_ns": curve.copy_operation_ns,
                 "sm_samples": curve.sm_samples,
                 "copy_samples": curve.copy_samples,
+                "copy_compute_overlap_efficiency": (
+                    curve.copy_compute_overlap_efficiency
+                ),
+                "overlap_samples": curve.overlap_samples,
             }
             for bucket, curve in sorted(self._service_models.items())
         ]

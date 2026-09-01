@@ -363,10 +363,19 @@ extern "C" __global__ void nta_prepare_event_work_partition(
     nta::abi::RuntimeView *runtime, const nta::abi::WorkItem *workItems,
     std::uint32_t workItemCount, std::uint32_t directWorkCount,
     std::uint32_t waveCount) {
-  if (blockIdx.x != 0 || threadIdx.x != 0 || runtime == nullptr ||
-      workItems == nullptr) {
+  if (blockIdx.x != 0 || runtime == nullptr || workItems == nullptr) {
     return;
   }
+  constexpr std::uint32_t Threads = 256;
+  constexpr std::uint32_t MaximumClasses =
+      nta::abi::MaximumEventCompletionClasses + 1;
+  __shared__ std::uint32_t classCounts[MaximumClasses];
+  __shared__ std::uint32_t classCursors[MaximumClasses];
+  __shared__ std::uint32_t chunkCounts[MaximumClasses];
+  __shared__ std::uint32_t chunkBases[MaximumClasses];
+  __shared__ std::uint32_t chunkClasses[Threads];
+  __shared__ std::uint32_t invalid;
+
   if (workItemCount == 0 || directWorkCount == 0 ||
       directWorkCount >= workItemCount ||
       workItemCount > runtime->workTicketCapacity ||
@@ -374,64 +383,112 @@ extern "C" __global__ void nta_prepare_event_work_partition(
       waveCount > nta::abi::MaximumEventCompletionClasses ||
       runtime->readyWorkTickets == nullptr || runtime->readyCount == nullptr ||
       runtime->readyHead == nullptr) {
-    atomicAdd(&runtime->failedCount, 1U);
-    atomicAdd(&runtime->stickyFailedCount, 1U);
+    if (threadIdx.x == 0) {
+      atomicAdd(&runtime->failedCount, 1U);
+      atomicAdd(&runtime->stickyFailedCount, 1U);
+    }
     return;
   }
 
-  std::uint32_t waveCounts[nta::abi::MaximumEventCompletionClasses] = {};
-  std::uint32_t waveCursors[nta::abi::MaximumEventCompletionClasses] = {};
-  std::uint32_t direct = 0;
-  bool invalid = false;
-  for (std::uint32_t work = 0; work < workItemCount; ++work) {
+  const std::uint32_t classCount = waveCount + 1;
+  if (threadIdx.x == 0) {
+    invalid = 0;
+  }
+  for (std::uint32_t index = threadIdx.x; index < classCount;
+       index += blockDim.x) {
+    classCounts[index] = 0;
+  }
+  __syncthreads();
+
+  // Count and validate in parallel. Class zero is direct work; producer
+  // completion wave N maps to class N+1. The second pass below preserves the
+  // canonical work-item order within every class.
+  for (std::uint32_t work = threadIdx.x; work < workItemCount;
+       work += blockDim.x) {
     const nta::abi::WorkItem item = workItems[work];
     if ((item.flags & ~nta::abi::WorkItemSupportedFlags) != 0 ||
         (item.flags & nta::abi::WorkItemEventPartition) == 0) {
-      invalid = true;
-      break;
+      atomicExch(&invalid, 1U);
+      continue;
     }
-    if (item.completionClass == nta::abi::InvalidIndex) {
-      if (direct >= directWorkCount) {
-        invalid = true;
-        break;
-      }
-      ++direct;
-    } else {
-      if (item.completionClass >= waveCount) {
-        invalid = true;
-        break;
-      }
-      ++waveCounts[item.completionClass];
+    const std::uint32_t workClass =
+        item.completionClass == nta::abi::InvalidIndex
+            ? 0
+            : item.completionClass < waveCount
+                  ? item.completionClass + 1
+                  : MaximumClasses;
+    if (workClass >= classCount) {
+      atomicExch(&invalid, 1U);
+      continue;
+    }
+    atomicAdd(&classCounts[workClass], 1U);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    std::uint32_t cursor = 0;
+    for (std::uint32_t workClass = 0; workClass < classCount; ++workClass) {
+      classCursors[workClass] = cursor;
+      cursor += classCounts[workClass];
+    }
+    if (classCounts[0] != directWorkCount || cursor != workItemCount) {
+      invalid = 1;
     }
   }
-  std::uint32_t cursor = directWorkCount;
-  for (std::uint32_t wave = 0; wave < waveCount; ++wave) {
-    waveCursors[wave] = cursor;
-    cursor += waveCounts[wave];
-  }
-  if (invalid || direct != directWorkCount || cursor != workItemCount) {
-    atomicAdd(&runtime->failedCount, 1U);
-    atomicAdd(&runtime->stickyFailedCount, 1U);
-    atomicExch(runtime->readyCount, 0U);
+  __syncthreads();
+  if (invalid != 0) {
+    if (threadIdx.x == 0) {
+      atomicAdd(&runtime->failedCount, 1U);
+      atomicAdd(&runtime->stickyFailedCount, 1U);
+      atomicExch(runtime->readyCount, 0U);
+    }
     return;
   }
 
-  // Stable-bucket canonical work identities. FlashInfer consumes these
-  // identities through launchWorkIndex; its upstream scheduler arrays and the
-  // exact WorkItem reduction coordinates remain unchanged.
-  direct = 0;
-  for (std::uint32_t work = 0; work < workItemCount; ++work) {
-    const nta::abi::WorkItem item = workItems[work];
-    if (item.completionClass == nta::abi::InvalidIndex) {
-      runtime->readyWorkTickets[direct++] = work;
-      continue;
+  // Stable bucket partition. Processing fixed-size chunks in order and using
+  // each thread's lane rank preserves canonical work identity without the
+  // previous single-thread O(workItemCount) global-memory dependency chain.
+  for (std::uint32_t begin = 0; begin < workItemCount;
+       begin += blockDim.x) {
+    for (std::uint32_t index = threadIdx.x; index < classCount;
+         index += blockDim.x) {
+      chunkCounts[index] = 0;
     }
-    runtime->readyWorkTickets[waveCursors[item.completionClass]++] = work;
+    __syncthreads();
+    const std::uint32_t work = begin + threadIdx.x;
+    std::uint32_t workClass = MaximumClasses;
+    if (work < workItemCount) {
+      const std::uint32_t completionClass = workItems[work].completionClass;
+      workClass = completionClass == nta::abi::InvalidIndex
+                      ? 0
+                      : completionClass + 1;
+      chunkClasses[threadIdx.x] = workClass;
+      atomicAdd(&chunkCounts[workClass], 1U);
+    } else {
+      chunkClasses[threadIdx.x] = MaximumClasses;
+    }
+    __syncthreads();
+    for (std::uint32_t index = threadIdx.x; index < classCount;
+         index += blockDim.x) {
+      chunkBases[index] = classCursors[index];
+      classCursors[index] += chunkCounts[index];
+    }
+    __syncthreads();
+    if (work < workItemCount) {
+      std::uint32_t rank = 0;
+      for (std::uint32_t prior = 0; prior < threadIdx.x; ++prior) {
+        rank += chunkClasses[prior] == workClass;
+      }
+      runtime->readyWorkTickets[chunkBases[workClass] + rank] = work;
+    }
+    __syncthreads();
   }
-  atomicExch(runtime->readyHead, 0U);
-  runtime->readyWindowEnd = workItemCount;
-  __threadfence();
-  atomicExch(runtime->readyCount, workItemCount);
+  if (threadIdx.x == 0) {
+    atomicExch(runtime->readyHead, 0U);
+    runtime->readyWindowEnd = workItemCount;
+    __threadfence();
+    atomicExch(runtime->readyCount, workItemCount);
+  }
 }
 
 extern "C" __attribute__((visibility("default"))) cudaError_t
@@ -446,7 +503,7 @@ nta_jit_prepare_event_work_partition(void *runtime, const void *workItems,
       waveCount > nta::abi::MaximumEventCompletionClasses) {
     return cudaErrorInvalidValue;
   }
-  nta_prepare_event_work_partition<<<1, 1, 0, stream>>>(
+  nta_prepare_event_work_partition<<<1, 256, 0, stream>>>(
       static_cast<nta::abi::RuntimeView *>(runtime),
       static_cast<const nta::abi::WorkItem *>(workItems),
       workItemCount, directWorkCount, waveCount);

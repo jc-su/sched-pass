@@ -21,6 +21,7 @@ from nta_runtime.engines.sglang_acquisition_contract import HostLayerPublication
 from nta_runtime.engines.sglang_transfer import (
     HostMoverController,
     HostTransferLeasePlan,
+    MoverCopyInterval,
     MoverProfile,
 )
 from nta_runtime.runtime import copy_strided_host_runs_async
@@ -621,4 +622,9 @@ class SglangHostTransport:
                     calibration_probe,
                 )
             )
+            if calibration_probe:
+                pending.mover_overlap_copy_intervals.append(
+                    MoverCopyInterval(profile_start, profile_finish, wave_bytes)
+                )
+                pending.transfer_events += (profile_start, profile_finish)
         return copy_done

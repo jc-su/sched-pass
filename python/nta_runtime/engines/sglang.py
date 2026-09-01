@@ -2668,6 +2668,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 query=q,
                 global_layer=int(layer.layer_id),
             )
+            self._host_movers.record_overlap_arrival(
+                batch.pending_host_load,
+                local_layer=int(layer.layer_id) - self._model_start_layer,
+                model_layer_count=self._model_layer_count,
+                stream=torch.cuda.current_stream(),
+            )
         if self._stock_forward:
             pending = batch.pending_host_load
             if pending is None:  # pragma: no cover - resident path returns above
@@ -2778,6 +2784,12 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 phase="extend",
                 query=q,
                 global_layer=int(layer.layer_id),
+            )
+            self._host_movers.record_overlap_arrival(
+                batch.pending_host_load,
+                local_layer=int(layer.layer_id) - self._model_start_layer,
+                model_layer_count=self._model_layer_count,
+                stream=torch.cuda.current_stream(),
             )
         if self._stock_forward:
             pending = batch.pending_host_load
