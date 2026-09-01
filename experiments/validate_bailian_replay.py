@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 from pathlib import Path
@@ -203,13 +204,14 @@ def _validate_workload(report: Mapping[str, Any], records: Sequence[Mapping[str,
 
 
 def _validate_native_dispatch(report: Mapping[str, Any], *, nta: bool) -> None:
-    dispatch = report.get("native_dispatch_prefix")
+    dispatch = report.get("native_dispatch")
     _require(
         isinstance(dispatch, dict),
         "natural replay lacks native-dispatch evidence",
     )
     _require(
-        dispatch.get("definition") == "native_numerical_dispatch_prefix_layers",
+        dispatch.get("definition")
+        == "native_numerical_dispatch_layers_per_external_batch",
         "natural replay mislabels native dispatch as readiness evidence",
     )
     histogram_value = dispatch.get("histogram")
@@ -234,9 +236,36 @@ def _validate_native_dispatch(report: Mapping[str, Any], *, nta: bool) -> None:
         observations == sum(histogram.values()) and observations >= 0,
         "native-dispatch observations disagree with the histogram",
     )
+    prefix_histogram_value = dispatch.get("monotone_prefix_histogram")
+    dynamic_histogram_value = dispatch.get("dynamic_histogram")
     _require(
-        dispatch.get("nonprefix_batches") == 0,
-        "natural replay observed non-prefix native dispatch",
+        isinstance(prefix_histogram_value, dict)
+        and isinstance(dynamic_histogram_value, dict),
+        "native-dispatch trajectory histograms are invalid",
+    )
+    prefix_histogram = {
+        int(depth): int(count) for depth, count in prefix_histogram_value.items()
+    }
+    dynamic_histogram = {
+        int(depth): int(count) for depth, count in dynamic_histogram_value.items()
+    }
+    _require(
+        Counter(histogram) == Counter(prefix_histogram) + Counter(dynamic_histogram),
+        "native-dispatch trajectory histograms disagree with the total",
+    )
+    prefix_observations = sum(prefix_histogram.values())
+    dynamic_observations = sum(dynamic_histogram.values())
+    _require(
+        dispatch.get("monotone_prefix_observations") == prefix_observations
+        and dispatch.get("dynamic_observations") == dynamic_observations,
+        "native-dispatch trajectory counters are inconsistent",
+    )
+    expected_monotone_fraction = (
+        prefix_observations / observations if observations else None
+    )
+    _require(
+        dispatch.get("monotone_prefix_fraction") == expected_monotone_fraction,
+        "native-dispatch monotone-prefix fraction is inconsistent",
     )
     if nta and observations:
         _require(
@@ -611,7 +640,7 @@ def validate(report: dict[str, Any]) -> dict[str, Any]:
             f"natural replay comparison has an invalid {field}",
         )
     _require(
-        report.get("native_dispatch_prefix") == nta.get("native_dispatch_prefix")
+        report.get("native_dispatch") == nta.get("native_dispatch")
         and report.get("progressive_consumer") == nta.get("progressive_consumer")
         and report.get("prefetch_arrival_readiness")
         == nta.get("prefetch_arrival_readiness"),

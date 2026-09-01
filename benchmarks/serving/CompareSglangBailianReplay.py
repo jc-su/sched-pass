@@ -380,7 +380,7 @@ def main() -> int:
         "p99_itl_ratio": _ratio(
             float(nta["p99_itl_seconds"]), float(stock["p99_itl_seconds"])
         ),
-        "native_dispatch_prefix": nta["native_dispatch_prefix"],
+        "native_dispatch": nta["native_dispatch"],
         "progressive_consumer": nta["progressive_consumer"],
         "prefetch_arrival_readiness": nta["prefetch_arrival_readiness"],
         "stock": stock,

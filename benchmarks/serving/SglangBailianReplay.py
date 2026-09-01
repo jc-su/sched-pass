@@ -281,32 +281,48 @@ def _heterogeneity(
 def _native_dispatch_distribution(
     stats: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    histogram: Counter[int] = Counter()
-    observations = 0
-    nonprefix = 0
+    prefix_histogram: Counter[int] = Counter()
+    nonprefix_histogram: Counter[int] = Counter()
+    prefix_observations = 0
+    nonprefix_observations = 0
     model_layers: set[int] = set()
     for report in stats:
-        observations += int(report.get("native_dispatch_prefix_observations", 0))
-        nonprefix += int(report.get("native_dispatch_nonprefix_batches", 0))
+        prefix_observations += int(
+            report.get("native_dispatch_prefix_observations", 0)
+        )
+        nonprefix_observations += int(
+            report.get("native_dispatch_nonprefix_batches", 0)
+        )
         if "model_layer_count" in report:
             model_layers.add(int(report["model_layer_count"]))
         for name, value in report.items():
-            if name.startswith("native_dispatch_prefix_layers_") and name.endswith("_batches"):
+            if name.startswith("native_dispatch_prefix_layers_") and name.endswith(
+                "_batches"
+            ):
                 depth = int(name.removeprefix("native_dispatch_prefix_layers_").removesuffix("_batches"))
-                histogram[depth] += int(value)
-    if sum(histogram.values()) != observations:
+                prefix_histogram[depth] += int(value)
+            elif name.startswith("native_dispatch_nonprefix_layers_") and name.endswith(
+                "_batches"
+            ):
+                depth = int(name.removeprefix("native_dispatch_nonprefix_layers_").removesuffix("_batches"))
+                nonprefix_histogram[depth] += int(value)
+    if sum(prefix_histogram.values()) != prefix_observations:
         raise RuntimeError(
-            "native-dispatch histogram disagrees with observations"
+            "native-dispatch prefix histogram disagrees with observations"
         )
-    if nonprefix:
-        raise RuntimeError("runtime observed non-prefix native dispatch")
+    if sum(nonprefix_histogram.values()) != nonprefix_observations:
+        raise RuntimeError(
+            "native-dispatch dynamic histogram disagrees with observations"
+        )
     if len(model_layers) > 1:
         raise RuntimeError("workers disagree on model layer count")
     layer_count = next(iter(model_layers), None)
+    histogram = prefix_histogram + nonprefix_histogram
+    observations = prefix_observations + nonprefix_observations
     if layer_count is not None and any(
         depth < 0 or depth > layer_count for depth in histogram
     ):
-        raise RuntimeError("native dispatch prefix exceeds the model layer count")
+        raise RuntimeError("native dispatch exceeds the model layer count")
     native_layer_observations = sum(
         depth * count for depth, count in histogram.items()
     )
@@ -316,11 +332,21 @@ def _native_dispatch_distribution(
         if layer_count is not None and 0 < depth < layer_count
     )
     return {
-        "schema": 1,
-        "definition": "native_numerical_dispatch_prefix_layers",
+        "schema": 2,
+        "definition": "native_numerical_dispatch_layers_per_external_batch",
+        "trajectory_semantics": (
+            "per-layer execution choice as the EDF/readiness frontier evolves; "
+            "not a batch-start readiness-prefix claim"
+        ),
         "model_layer_count": layer_count,
         "observations": observations,
         "histogram": {str(depth): count for depth, count in sorted(histogram.items())},
+        "monotone_prefix_histogram": {
+            str(depth): count for depth, count in sorted(prefix_histogram.items())
+        },
+        "dynamic_histogram": {
+            str(depth): count for depth, count in sorted(nonprefix_histogram.items())
+        },
         "mean_layers": (
             native_layer_observations / observations
             if observations
@@ -337,7 +363,11 @@ def _native_dispatch_distribution(
         "native_only_observations": (
             histogram.get(layer_count, 0) if layer_count is not None else 0
         ),
-        "nonprefix_batches": nonprefix,
+        "monotone_prefix_observations": prefix_observations,
+        "dynamic_observations": nonprefix_observations,
+        "monotone_prefix_fraction": (
+            prefix_observations / observations if observations else None
+        ),
     }
 
 
@@ -680,7 +710,7 @@ def main() -> int:
         "observed_cache_state_counts": dict(sorted(cache_counts.items())),
         "prefix_fidelity_violations": 0,
         "heterogeneity": _heterogeneity(records, stats),
-        "native_dispatch_prefix": _native_dispatch_distribution(stats),
+        "native_dispatch": _native_dispatch_distribution(stats),
         "progressive_consumer": _progressive_consumer_distribution(stats),
         "prefetch_arrival_readiness": _prefetch_arrival_readiness(stats),
         "selected_bytes": selected_bytes,

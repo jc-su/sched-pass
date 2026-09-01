@@ -237,24 +237,28 @@ def main() -> None:
             {
                 "model_layer_count": 36,
                 "native_dispatch_prefix_observations": 2,
-                "native_dispatch_nonprefix_batches": 0,
+                "native_dispatch_nonprefix_batches": 1,
                 "native_dispatch_prefix_layers_1_batches": 1,
                 "native_dispatch_prefix_layers_3_batches": 1,
+                "native_dispatch_nonprefix_layers_2_batches": 1,
             }
         ]
     )
-    assert dispatch["histogram"] == {"1": 1, "3": 1}
+    assert dispatch["histogram"] == {"1": 1, "2": 1, "3": 1}
     assert dispatch["mean_layers"] == 2.0
-    assert dispatch["native_layer_observations"] == 4
+    assert dispatch["native_layer_observations"] == 6
     assert dispatch["native_layer_fraction"] == 1 / 18
-    assert dispatch["mixed_dispatch_observations"] == 2
+    assert dispatch["mixed_dispatch_observations"] == 3
     assert dispatch["framework_only_observations"] == 0
     assert dispatch["native_only_observations"] == 0
-    _validate_native_dispatch({"native_dispatch_prefix": dispatch}, nta=True)
+    assert dispatch["monotone_prefix_observations"] == 2
+    assert dispatch["dynamic_observations"] == 1
+    assert dispatch["monotone_prefix_fraction"] == 2 / 3
+    _validate_native_dispatch({"native_dispatch": dispatch}, nta=True)
     invalid_dispatch = dict(dispatch, native_layer_observations=5)
     try:
         _validate_native_dispatch(
-            {"native_dispatch_prefix": invalid_dispatch}, nta=True
+            {"native_dispatch": invalid_dispatch}, nta=True
         )
     except ValueError as error:
         assert "derived counters" in str(error)
