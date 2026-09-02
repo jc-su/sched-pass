@@ -640,6 +640,24 @@ class SglangConsumerPolicyCalibration:
             < self._minimum_samples
             for layer in range(self._model_layer_count)
         )
+        # The first lease for an unseen shape may publish a finite frontier at
+        # admission before the batch-derived consumer key exists.  Those
+        # publications intentionally carry no timing-enabled marker.  Never
+        # manufacture a producer timestamp later or mix a partially marked
+        # lease into the arrival curves: skip this lease and let the next
+        # occurrence of the same shape collect a complete, ordered sample.
+        prepublished = tuple(getattr(pending, "prefetched_layers", {}).values())
+        if pending.arrival_profiling and any(
+            getattr(publication, "profile_ready_event", None) is None
+            for publication in prepublished
+        ):
+            pending.arrival_profiling = False
+            self._stats["consumer_policy_prepublication_skipped_leases"] = (
+                self._stats.get(
+                    "consumer_policy_prepublication_skipped_leases", 0
+                )
+                + 1
+            )
         potentially_late = (
             not pending.arrival_profiling
             and any(

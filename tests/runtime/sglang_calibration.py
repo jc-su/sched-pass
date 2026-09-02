@@ -225,6 +225,7 @@ def main() -> None:
         consumer_policy_probe=False,
         partial_profile_recorded=False,
         planned_progressive_layers=frozenset(),
+        prefetched_layers={},
     )
     key = policy.bind_lease(
         pending,
@@ -239,6 +240,43 @@ def main() -> None:
     assert not pending.arrival_profile_active
     assert not pending.consumer_policy_probe
     assert not pending.planned_progressive_layers
+
+    # A first unseen-shape lease can have a finite admission frontier before
+    # its batch-derived consumer key exists.  It is skipped as one complete
+    # profiling unit; a missing marker is never reconstructed after the fact.
+    skip_stats = defaultdict(int)
+    skip_policy = SglangConsumerPolicyCalibration(
+        enabled=True,
+        model_start_layer=10,
+        model_layer_count=2,
+        minimum_samples=2,
+        maximum_samples=4,
+        stats=skip_stats,
+    )
+    prepublished = SimpleNamespace(
+        device_indices=SimpleNamespace(numel=lambda: 8),
+        layer_bytes=(1024, 1024),
+        arrival_profile_key=None,
+        arrival_profiling=False,
+        arrival_profile_active=False,
+        consumer_policy_probe=False,
+        partial_profile_recorded=False,
+        planned_progressive_layers=frozenset(),
+        prefetched_layers={
+            0: SimpleNamespace(profile_ready_event=None),
+        },
+    )
+    prepublished_key = skip_policy.bind_lease(
+        prepublished,
+        layer_service_key=("extend", 64, 2),
+        producer_kind="sm",
+        layers_per_submission=2,
+        sm_waves_per_layer=1,
+        minimum_gain=1.03,
+    )
+    assert prepublished_key is not None
+    assert not prepublished.arrival_profiling
+    assert skip_stats["consumer_policy_prepublication_skipped_leases"] == 1
 
     nvme_pending = SimpleNamespace(
         device_indices=SimpleNamespace(numel=lambda: 1),
