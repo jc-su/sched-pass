@@ -29,7 +29,10 @@ from experiments.bailian_replay import (  # noqa: E402
     opportunity_stratum,
 )
 from experiments.check_regression import compare  # noqa: E402
-from experiments.prepare_serving_cohort import build_cohort  # noqa: E402
+from experiments.prepare_serving_cohort import (  # noqa: E402
+    _assign_arrivals,
+    build_cohort,
+)
 from experiments.run_evaluation import validate_spec  # noqa: E402
 from experiments.workload_scenario import describe_workload_scenario  # noqa: E402
 from experiments.validate_workload import validate  # noqa: E402
@@ -286,9 +289,7 @@ def main() -> None:
     _validate_native_dispatch({"native_dispatch": dispatch}, nta=True)
     invalid_dispatch = dict(dispatch, native_layer_observations=5)
     try:
-        _validate_native_dispatch(
-            {"native_dispatch": invalid_dispatch}, nta=True
-        )
+        _validate_native_dispatch({"native_dispatch": invalid_dispatch}, nta=True)
     except ValueError as error:
         assert "derived counters" in str(error)
     else:
@@ -552,6 +553,54 @@ def main() -> None:
         ]
         assert loaded_cohort.resident_arrival_offsets == (0.0,)
         assert loaded_cohort.external_arrival_offsets == (0.0,)
+
+        role_ordered = [
+            {
+                "request_id": "external-early",
+                "request_state": "external",
+                "timestamp_seconds": 1.0,
+                "arrival_seconds": 0.0,
+            },
+            {
+                "request_id": "resident-late",
+                "request_state": "resident",
+                "timestamp_seconds": 4.0,
+                "arrival_seconds": 0.0,
+            },
+            {
+                "request_id": "resident-early",
+                "request_state": "resident",
+                "timestamp_seconds": 2.0,
+                "arrival_seconds": 0.0,
+            },
+            {
+                "request_id": "external-late",
+                "request_state": "external",
+                "timestamp_seconds": 3.0,
+                "arrival_seconds": 0.0,
+            },
+        ]
+        role_arrival = _assign_arrivals(
+            role_ordered,
+            mode="resident_then_burst",
+            target_rate=40.0,
+            time_scale=1.0,
+            burst_size=2,
+        )
+        assert [row["request_id"] for row in role_ordered] == [
+            "resident-early",
+            "resident-late",
+            "external-early",
+            "external-late",
+        ]
+        assert [row["arrival_seconds"] for row in role_ordered] == [
+            0.0,
+            0.0,
+            0.05,
+            0.05,
+        ]
+        assert role_arrival["offline_order_is_arrival"] is True
+        assert role_arrival["production_arrival_claim"] is False
 
         cyclic_manifest, cyclic_rows = build_cohort(
             root / "manifest.json",

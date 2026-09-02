@@ -38,7 +38,13 @@ except ImportError:  # pragma: no cover - direct CLI execution
     from cache_identity import effective_cached_prefixes
 
 
-ARRIVAL_MODES = ("batch_release", "calibrated_open_loop", "burst", "trace_scaled")
+ARRIVAL_MODES = (
+    "batch_release",
+    "calibrated_open_loop",
+    "burst",
+    "resident_then_burst",
+    "trace_scaled",
+)
 EXTERNAL_SOURCES = ("reuse", "followup")
 
 
@@ -452,16 +458,31 @@ def _assign_arrivals(
         raise ValueError(f"unknown serving cohort arrival mode {mode}")
     if time_scale <= 0:
         raise ValueError("time_scale must be positive")
-    timestamps = [
-        float(
+
+    def source_timestamp(row: Mapping[str, Any]) -> float:
+        return float(
             row.get(
                 "cohort_order_seconds",
                 row.get("timestamp_seconds", row["arrival_seconds"]),
             )
         )
-        for row in rows
-    ]
-    if any(right < left for left, right in zip(timestamps, timestamps[1:])):
+
+    if mode == "resident_then_burst":
+        # This controlled regime first establishes useful resident decode, then
+        # injects external requests in bounded bursts. Keep source-time order
+        # within each role so only the explicitly declared role boundary is
+        # synthetic; content, shape, and within-role trace order are unchanged.
+        rows.sort(
+            key=lambda row: (
+                0 if row.get("request_state") == "resident" else 1,
+                source_timestamp(row),
+                str(row.get("request_id", "")),
+            )
+        )
+    timestamps = [source_timestamp(row) for row in rows]
+    if mode != "resident_then_burst" and any(
+        right < left for left, right in zip(timestamps, timestamps[1:])
+    ):
         raise ValueError("selected serving cohort is not timestamp ordered")
     if mode == "batch_release":
         offsets = [0.0] * len(rows)
@@ -483,7 +504,7 @@ def _assign_arrivals(
         for gap in gaps:
             offsets.append(offsets[-1] + gap * scale)
         source = "selection_conditioned_gaps_rate_calibrated"
-    else:
+    elif mode == "burst":
         if target_rate is None or target_rate <= 0:
             raise ValueError("burst mode requires a positive target rate")
         if burst_size < 2:
@@ -491,6 +512,22 @@ def _assign_arrivals(
         group_gap = burst_size / target_rate
         offsets = [(index // burst_size) * group_gap for index in range(len(rows))]
         source = "controlled_burst"
+    else:
+        if target_rate is None or target_rate <= 0:
+            raise ValueError("resident_then_burst mode requires a positive target rate")
+        if burst_size < 2:
+            raise ValueError("resident_then_burst mode requires burst_size >= 2")
+        resident_count = sum(row.get("request_state") == "resident" for row in rows)
+        if resident_count <= 0 or resident_count == len(rows):
+            raise ValueError(
+                "resident_then_burst requires resident and external requests"
+            )
+        group_gap = burst_size / target_rate
+        offsets = [0.0] * resident_count + [
+            (1 + index // burst_size) * group_gap
+            for index in range(len(rows) - resident_count)
+        ]
+        source = "controlled_resident_then_external_burst"
     for row, offset in zip(rows, offsets):
         row["arrival_seconds"] = float(offset)
         row["arrival_source"] = source
@@ -503,8 +540,10 @@ def _assign_arrivals(
         "has_original_timestamps": all("timestamp_seconds" in row for row in rows),
         "production_arrival_claim": False,
         "selection_conditioned": True,
-        "offline_order_is_arrival": False,
-        "burst_size": burst_size if mode == "burst" else None,
+        "offline_order_is_arrival": mode == "resident_then_burst",
+        "burst_size": (
+            burst_size if mode in {"burst", "resident_then_burst"} else None
+        ),
     }
 
 
