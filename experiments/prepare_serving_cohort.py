@@ -467,6 +467,35 @@ def _assign_arrivals(
             )
         )
 
+    def controlled_burst_offsets(
+        count: int, *, first_group: int = 0
+    ) -> tuple[list[float], float]:
+        """Return reproducible near-simultaneous arrivals at the target rate.
+
+        Giving every request in a burst the same timestamp leaves coroutine
+        wakeup order, framework batch formation, and therefore cache evolution
+        undefined.  Spread one burst over exactly one tenth of its group
+        interval while retaining ``burst_size / target_rate`` between group
+        starts.  The controlled workload remains bursty and preserves its
+        long-run offered rate, but repeated causal arms now have one declared
+        request order rather than an event-loop race.
+        """
+
+        if target_rate is None or target_rate <= 0:
+            raise ValueError("burst mode requires a positive target rate")
+        if burst_size < 2:
+            raise ValueError("burst mode requires burst_size >= 2")
+        group_gap = burst_size / target_rate
+        intra_burst_spacing = group_gap / (10 * burst_size)
+        return (
+            [
+                (first_group + index // burst_size) * group_gap
+                + (index % burst_size) * intra_burst_spacing
+                for index in range(count)
+            ],
+            intra_burst_spacing,
+        )
+
     if mode == "resident_then_burst":
         # This controlled regime first establishes useful resident decode, then
         # injects external requests in bounded bursts. Keep source-time order
@@ -505,29 +534,19 @@ def _assign_arrivals(
             offsets.append(offsets[-1] + gap * scale)
         source = "selection_conditioned_gaps_rate_calibrated"
     elif mode == "burst":
-        if target_rate is None or target_rate <= 0:
-            raise ValueError("burst mode requires a positive target rate")
-        if burst_size < 2:
-            raise ValueError("burst mode requires burst_size >= 2")
-        group_gap = burst_size / target_rate
-        offsets = [(index // burst_size) * group_gap for index in range(len(rows))]
-        source = "controlled_burst"
+        offsets, intra_burst_spacing = controlled_burst_offsets(len(rows))
+        source = "controlled_microordered_burst"
     else:
-        if target_rate is None or target_rate <= 0:
-            raise ValueError("resident_then_burst mode requires a positive target rate")
-        if burst_size < 2:
-            raise ValueError("resident_then_burst mode requires burst_size >= 2")
         resident_count = sum(row.get("request_state") == "resident" for row in rows)
         if resident_count <= 0 or resident_count == len(rows):
             raise ValueError(
                 "resident_then_burst requires resident and external requests"
             )
-        group_gap = burst_size / target_rate
-        offsets = [0.0] * resident_count + [
-            (1 + index // burst_size) * group_gap
-            for index in range(len(rows) - resident_count)
-        ]
-        source = "controlled_resident_then_external_burst"
+        external_offsets, intra_burst_spacing = controlled_burst_offsets(
+            len(rows) - resident_count, first_group=1
+        )
+        offsets = [0.0] * resident_count + external_offsets
+        source = "controlled_resident_then_microordered_external_burst"
     for row, offset in zip(rows, offsets):
         row["arrival_seconds"] = float(offset)
         row["arrival_source"] = source
@@ -544,6 +563,12 @@ def _assign_arrivals(
         "burst_size": (
             burst_size if mode in {"burst", "resident_then_burst"} else None
         ),
+        "intra_burst_spacing_seconds": (
+            intra_burst_spacing
+            if mode in {"burst", "resident_then_burst"}
+            else None
+        ),
+        "simultaneous_arrivals": mode == "batch_release",
     }
 
 

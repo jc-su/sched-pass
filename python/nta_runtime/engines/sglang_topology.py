@@ -15,7 +15,9 @@ from nta_runtime.adapters.sglang import SglangAcquisitionSpan
 from nta_runtime.engines.sglang_contracts import (
     LeaseAcquisitionGroup,
     LeaseAcquisitionSlice,
+    LeaseOperationDemand,
     LeaseOperationRange,
+    LeaseOperationRequest,
     LeaseOperationTransfer,
     PagePair,
 )
@@ -131,14 +133,108 @@ def page_pairs_for_schedule(
     return tuple(pairs)
 
 
+def project_forward_operation_owners(
+    request_ids: Sequence[str],
+    request_slots: Sequence[int],
+    operation_demands: Sequence[LeaseOperationDemand],
+    operation_requests: Sequence[LeaseOperationRequest],
+    *,
+    lease_operation_ids: frozenset[int],
+) -> tuple[int | None, ...]:
+    """Project lease-wide ownership onto one framework forward.
+
+    HiCache may flush several admitted load operations into one physical lease
+    even when SGLang later exposes only a subset of those requests in this
+    numerical forward.  The omitted operations remain exact prefetch owned by
+    the lease; they are not numerical dependencies of an unrelated request.
+
+    The projection is deliberately derived from request identity captured at
+    ``add_one_req`` rather than from the acquisition sidecar being verified.
+    This keeps the check non-circular: a missing, swapped, or stale sidecar
+    cannot redefine which operation the current forward is required to own.
+    """
+
+    normalized_ids = tuple(request_ids)
+    normalized_slots = tuple(int(value) for value in request_slots)
+    if (
+        not normalized_ids
+        or len(normalized_ids) != len(normalized_slots)
+        or any(not isinstance(value, str) or not value for value in normalized_ids)
+        or len(set(normalized_ids)) != len(normalized_ids)
+        or any(value < 0 for value in normalized_slots)
+        or len(set(normalized_slots)) != len(normalized_slots)
+    ):
+        raise RuntimeError("SGLang forward has invalid request identity geometry")
+
+    demands_by_request: dict[str, LeaseOperationDemand] = {}
+    demands_by_operation: dict[int, LeaseOperationDemand] = {}
+    for demand in operation_demands:
+        if not isinstance(demand, LeaseOperationDemand):
+            raise RuntimeError("SGLang acquisition lease has untyped demand ownership")
+        if (
+            demand.request_id in demands_by_request
+            or demand.operation_id in demands_by_operation
+        ):
+            raise RuntimeError("SGLang acquisition lease repeats demand ownership")
+        demands_by_request[demand.request_id] = demand
+        demands_by_operation[demand.operation_id] = demand
+    if not lease_operation_ids or frozenset(demands_by_operation) != frozenset(
+        int(value) for value in lease_operation_ids
+    ):
+        raise RuntimeError("SGLang acquisition lease has incomplete demand ownership")
+
+    requests_by_operation: dict[int, LeaseOperationRequest] = {}
+    if operation_requests:
+        for request in operation_requests:
+            if not isinstance(request, LeaseOperationRequest):
+                raise RuntimeError(
+                    "SGLang acquisition lease has untyped allocated ownership"
+                )
+            demand = demands_by_operation.get(request.operation_id)
+            if (
+                demand is None
+                or request.operation_id in requests_by_operation
+                or request.request_id != demand.request_id
+                or request.logical_begin != demand.logical_begin
+                or request.row_count != demand.row_count
+                or request.tenant_id != demand.tenant_id
+            ):
+                raise RuntimeError(
+                    "SGLang allocated ownership disagrees with acquisition demand"
+                )
+            requests_by_operation[request.operation_id] = request
+        if set(requests_by_operation) != set(demands_by_operation):
+            raise RuntimeError(
+                "SGLang acquisition lease has incomplete allocated ownership"
+            )
+
+    projected: list[int | None] = []
+    for request_id, request_slot in zip(
+        normalized_ids, normalized_slots, strict=True
+    ):
+        demand = demands_by_request.get(request_id)
+        if demand is None:
+            projected.append(None)
+            continue
+        allocated = requests_by_operation.get(demand.operation_id)
+        if allocated is not None and allocated.request_slot != request_slot:
+            raise RuntimeError(
+                "SGLang forward request slot disagrees with acquisition ownership"
+            )
+        projected.append(demand.operation_id)
+    if not any(operation_id is not None for operation_id in projected):
+        raise RuntimeError("SGLang forward has no request owned by its acquisition lease")
+    return tuple(projected)
+
+
 def resolve_request_acquisitions(
     acquisitions: Sequence[SglangAcquisitionSpan],
     operation_transfers: Mapping[int, LeaseOperationTransfer],
     *,
     lease_transfer_rows: int,
-    required_operation_ids: frozenset[int] | None = None,
+    expected_operation_ids: Sequence[int | None],
 ) -> tuple[SglangAcquisitionSpan, ...]:
-    """Join framework request identity to one exact acquisition lease."""
+    """Verify one independently-derived request-to-operation projection."""
 
     if lease_transfer_rows <= 0:
         raise RuntimeError("SGLang acquisition lease contains no rows")
@@ -158,29 +254,43 @@ def resolve_request_acquisitions(
         normalized[operation_id] = transfer
     if sum(item.row_count for item in normalized.values()) != lease_transfer_rows:
         raise RuntimeError("SGLang acquisition operations do not cover the lease rows")
-    required = (
-        frozenset(normalized)
-        if required_operation_ids is None
-        else frozenset(int(value) for value in required_operation_ids)
-    )
-    if not required or not required.issubset(normalized):
-        raise RuntimeError("SGLang acquisition lease has invalid demand ownership")
-
     resolved = tuple(acquisitions)
     if any(not isinstance(item, SglangAcquisitionSpan) for item in resolved):
         raise RuntimeError("SGLang forward carries untyped acquisition metadata")
+    expected = tuple(
+        None if value is None else int(value) for value in expected_operation_ids
+    )
+    if len(expected) != len(resolved):
+        raise RuntimeError("SGLang operation projection does not match the forward")
+    required = frozenset(value for value in expected if value is not None)
+    if (
+        not required
+        or len(required) != sum(value is not None for value in expected)
+        or not required.issubset(normalized)
+    ):
+        raise RuntimeError("SGLang acquisition lease has invalid demand projection")
+
     referenced_operations: set[int] = set()
-    for acquisition in resolved:
-        if not acquisition.is_external:
+    for acquisition, expected_operation_id in zip(resolved, expected, strict=True):
+        if expected_operation_id is None:
+            if acquisition.is_external:
+                raise RuntimeError(
+                    "SGLang request owns a speculative acquisition operation"
+                )
             continue
+        if not acquisition.is_external:
+            raise RuntimeError(
+                "SGLang forward metadata omits acquisition ownership for an "
+                "active request"
+            )
+        if acquisition.operation_id != expected_operation_id:
+            raise RuntimeError(
+                "SGLang acquisition operation disagrees with its request owner"
+            )
         transfer = normalized.get(acquisition.operation_id)
         if transfer is None:
             raise RuntimeError(
                 "SGLang request references an operation outside its acquisition lease"
-            )
-        if acquisition.operation_id not in required:
-            raise RuntimeError(
-                "SGLang request owns a speculative acquisition operation"
             )
         if (
             acquisition.node_id != transfer.node_id
@@ -196,16 +306,8 @@ def resolve_request_acquisitions(
             )
         referenced_operations.add(acquisition.operation_id)
 
-    missing_operations = set(required) - referenced_operations
-    if missing_operations:
-        raise RuntimeError(
-            "SGLang forward metadata omits acquisition ownership for "
-            f"{len(missing_operations)} operation(s): "
-            f"lease={tuple(sorted(normalized))}, "
-            f"requests={tuple(item.operation_id for item in resolved)}"
-        )
-    if not referenced_operations:
-        raise RuntimeError("SGLang forward has no request bound to its acquisition lease")
+    if referenced_operations != set(required):  # pragma: no cover - guarded above
+        raise RuntimeError("SGLang forward acquisition projection is incomplete")
     return resolved
 
 

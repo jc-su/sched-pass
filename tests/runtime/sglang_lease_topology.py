@@ -4,7 +4,9 @@ from nta_runtime.adapters.sglang import SglangAcquisitionSpan
 from nta_runtime.engines.sglang_contracts import (
     LeaseAcquisitionGroup,
     LeaseAcquisitionSlice,
+    LeaseOperationDemand,
     LeaseOperationRange,
+    LeaseOperationRequest,
     LeaseOperationTransfer,
 )
 from nta_runtime.engines.sglang_topology import (
@@ -12,6 +14,7 @@ from nta_runtime.engines.sglang_topology import (
     group_external_pages_by_request,
     lease_acquisition_topology,
     page_pairs_for_schedule,
+    project_forward_operation_owners,
     project_scheduled_acquisition_groups,
     project_acquisition_slices,
     request_batch_heterogeneity,
@@ -63,7 +66,10 @@ def main() -> None:
     }
     assert (
         resolve_request_acquisitions(
-            acquisitions, transfers, lease_transfer_rows=40
+            acquisitions,
+            transfers,
+            lease_transfer_rows=40,
+            expected_operation_ids=(71, None, 72),
         )
         == acquisitions
     )
@@ -78,7 +84,7 @@ def main() -> None:
             acquisitions,
             transfers_with_prefetch,
             lease_transfer_rows=44,
-            required_operation_ids=frozenset((71, 72)),
+            expected_operation_ids=(71, None, 72),
         )
         == acquisitions
     )
@@ -87,7 +93,7 @@ def main() -> None:
             (*acquisitions, SglangAcquisitionSpan(73, 63, 0, 4)),
             transfers_with_prefetch,
             lease_transfer_rows=44,
-            required_operation_ids=frozenset((71, 72)),
+            expected_operation_ids=(71, None, 72, None),
         )
     except RuntimeError as error:
         assert "owns a speculative" in str(error)
@@ -98,11 +104,89 @@ def main() -> None:
             (acquisitions[0], acquisitions[0], acquisitions[2]),
             transfers,
             lease_transfer_rows=40,
+            expected_operation_ids=(71, 72, None),
         )
     except RuntimeError as error:
-        assert "multiple requests" in str(error)
+        assert "disagrees with its request owner" in str(error)
     else:
         raise AssertionError("two requests shared one acquisition operation")
+
+    # One physical lease may carry a deferred request without allowing the
+    # current forward to define its own ownership projection.  Request IDs and
+    # allocated slots independently require 303--305; operation 306 remains a
+    # lease-owned prefetch and the unrelated resident row must stay direct.
+    subset_transfers = {
+        operation_id: LeaseOperationTransfer(operation_id, operation_id + 100, 4)
+        for operation_id in range(303, 307)
+    }
+    subset_demands = tuple(
+        LeaseOperationDemand(
+            operation_id,
+            f"request-{operation_id}",
+            operation_id - 303,
+            4,
+            0,
+        )
+        for operation_id in subset_transfers
+    )
+    subset_requests = tuple(
+        LeaseOperationRequest.bind(demand, 10 + index)
+        for index, demand in enumerate(subset_demands)
+    )
+    subset_projection = project_forward_operation_owners(
+        ("request-303", "request-304", "request-305", "resident"),
+        (10, 11, 12, 99),
+        subset_demands,
+        subset_requests,
+        lease_operation_ids=frozenset(subset_transfers),
+    )
+    assert subset_projection == (303, 304, 305, None)
+    subset_acquisitions = (
+        SglangAcquisitionSpan(303, 403, 0, 4),
+        SglangAcquisitionSpan(304, 404, 1, 4),
+        SglangAcquisitionSpan(305, 405, 2, 4),
+        SglangAcquisitionSpan.direct(),
+    )
+    assert resolve_request_acquisitions(
+        subset_acquisitions,
+        subset_transfers,
+        lease_transfer_rows=16,
+        expected_operation_ids=subset_projection,
+    ) == subset_acquisitions
+    try:
+        project_forward_operation_owners(
+            ("request-303",),
+            (11,),
+            subset_demands,
+            subset_requests,
+            lease_operation_ids=frozenset(subset_transfers),
+        )
+    except RuntimeError as error:
+        assert "request slot disagrees" in str(error)
+    else:
+        raise AssertionError("a stale request slot acquired lease ownership")
+    try:
+        resolve_request_acquisitions(
+            (*subset_acquisitions[:3], SglangAcquisitionSpan(306, 406, 3, 4)),
+            subset_transfers,
+            lease_transfer_rows=16,
+            expected_operation_ids=subset_projection,
+        )
+    except RuntimeError as error:
+        assert "speculative" in str(error)
+    else:
+        raise AssertionError("an unrelated request claimed deferred prefetch")
+    try:
+        resolve_request_acquisitions(
+            (subset_acquisitions[0], SglangAcquisitionSpan.direct()),
+            subset_transfers,
+            lease_transfer_rows=16,
+            expected_operation_ids=(303, 304),
+        )
+    except RuntimeError as error:
+        assert "omits acquisition ownership" in str(error)
+    else:
+        raise AssertionError("an active request omitted its acquisition operation")
 
     heterogeneous_bindings = (
         RequestBinding(0, 10, 1, stable_request_id("heterogeneous-0")),

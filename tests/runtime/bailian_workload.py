@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -593,14 +594,18 @@ def main() -> None:
             "external-early",
             "external-late",
         ]
-        assert [row["arrival_seconds"] for row in role_ordered] == [
-            0.0,
-            0.0,
-            0.05,
-            0.05,
-        ]
+        assert all(
+            math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12)
+            for actual, expected in zip(
+                (row["arrival_seconds"] for row in role_ordered),
+                (0.0, 0.0, 0.05, 0.0525),
+                strict=True,
+            )
+        )
         assert role_arrival["offline_order_is_arrival"] is True
         assert role_arrival["production_arrival_claim"] is False
+        assert role_arrival["intra_burst_spacing_seconds"] == 0.0025
+        assert role_arrival["simultaneous_arrivals"] is False
 
         cyclic_manifest, cyclic_rows = build_cohort(
             root / "manifest.json",

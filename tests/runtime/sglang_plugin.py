@@ -849,6 +849,101 @@ def main() -> None:
     )
     assert external_request._nta_acquisition_span == SglangAcquisitionSpan.direct()
 
+    # A live lease, rather than the transient request attribute, owns forward
+    # identity after start_loading(). Reconstruct all four active operations
+    # even when the last request's one-shot attribute was already cleared.
+    from nta_runtime.engines.sglang_contracts import (
+        LeaseOperationDemand,
+        LeaseOperationTransfer,
+    )
+    from nta_runtime.engines.sglang_hicache import PendingHostLoad, SglangHiCacheBridge
+
+    class SidecarDevicePool:
+        pass
+
+    sidecar_pool = SidecarDevicePool()
+    sidecar_bridge = SglangHiCacheBridge(sidecar_pool)
+    sidecar_requests = tuple(
+        types.SimpleNamespace(
+            rid=f"sidecar-{index}",
+            priority=0,
+            req_pool_idx=30 + index,
+            _nta_acquisition_span=(
+                SglangAcquisitionSpan(303 + index, 403 + index, index * 4, 4)
+                if index < 3
+                else SglangAcquisitionSpan.direct()
+            ),
+        )
+        for index in range(4)
+    )
+    sidecar_pending = PendingHostLoad(
+        lease_id=88,
+        consumer_index=5,
+        host_indices=torch.arange(16),
+        device_indices=torch.arange(16),
+        producer_event=object(),
+        controller=object(),
+        node_ids=tuple(range(403, 407)),
+        operation_transfers=tuple(
+            LeaseOperationTransfer(303 + index, 403 + index, 4)
+            for index in range(4)
+        ),
+        operation_demands=tuple(
+            LeaseOperationDemand(
+                303 + index,
+                f"sidecar-{index}",
+                index * 4,
+                4,
+                0,
+            )
+            for index in range(4)
+        ),
+        demand_operation_ids=frozenset(range(303, 307)),
+    )
+    sidecar_bridge._pending[5] = sidecar_pending
+    sidecar_forward = types.SimpleNamespace(
+        batch_size=4,
+        rids=tuple(request.rid for request in sidecar_requests),
+        req_pool_indices=torch.arange(30, 34, dtype=torch.int32),
+    )
+    sidecar_batch = types.SimpleNamespace(
+        reqs=sidecar_requests,
+        hicache_consumer_index=5,
+        tree_cache=types.SimpleNamespace(
+            cache_controller=types.SimpleNamespace(mem_pool_device=sidecar_pool)
+        ),
+    )
+    _attach_request_priorities(
+        sidecar_forward,
+        object,
+        sidecar_batch,
+        hook_runner,
+    )
+    assert sidecar_forward._nta_forward_metadata.acquisitions == tuple(
+        SglangAcquisitionSpan(303 + index, 403 + index, index * 4, 4)
+        for index in range(4)
+    )
+
+    missing_owner_batch = types.SimpleNamespace(
+        reqs=sidecar_requests,
+        hicache_consumer_index=999,
+        tree_cache=sidecar_batch.tree_cache,
+    )
+    try:
+        _attach_request_priorities(
+            types.SimpleNamespace(
+                rids=sidecar_forward.rids,
+                req_pool_indices=sidecar_forward.req_pool_indices,
+            ),
+            object,
+            missing_owner_batch,
+            hook_runner,
+        )
+    except RuntimeError as error:
+        assert "retired or unknown HiCache lease" in str(error)
+    else:
+        raise AssertionError("a missing live-lease owner used transient metadata")
+
     # SGLang can enqueue a host load before a later budget check rejects the
     # request.  Keep the demand decision separate from physical prefetch so an
     # unrelated forward never inherits request/tenant ownership for that row.

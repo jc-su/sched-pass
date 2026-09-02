@@ -54,6 +54,7 @@ from nta_runtime.engines.sglang_topology import (
     group_external_pages_by_request,
     project_acquisition_slices,
     project_scheduled_acquisition_groups,
+    project_forward_operation_owners,
     request_batch_heterogeneity,
     resolve_request_acquisitions,
 )
@@ -181,12 +182,36 @@ class SglangMetadataPlanner:
                 "SGLang acquisition metadata does not match request bindings"
             )
         lease_rows = int(pending.device_indices.numel())
+        transfers_by_operation = pending.transfers_by_operation()
+        request_ids = tuple(getattr(forward_batch, "rids", ()) or ())
+        expected_operation_ids = project_forward_operation_owners(
+            request_ids,
+            metadata.request_slots,
+            pending.operation_demands,
+            pending.operation_requests,
+            lease_operation_ids=(
+                pending.demand_operation_ids
+                if pending.demand_operation_ids is not None
+                else frozenset(
+                    transfer.operation_id for transfer in pending.operation_transfers
+                )
+            ),
+        )
         acquisitions = resolve_request_acquisitions(
             metadata.acquisitions,
-            pending.transfers_by_operation(),
+            transfers_by_operation,
             lease_transfer_rows=lease_rows,
-            required_operation_ids=pending.demand_operation_ids,
+            expected_operation_ids=expected_operation_ids,
         )
+        projected_operations = sum(
+            operation_id is not None for operation_id in expected_operation_ids
+        )
+        self._stats["forward_projected_acquisition_operations"] = self._stats.get(
+            "forward_projected_acquisition_operations", 0
+        ) + projected_operations
+        self._stats["lease_deferred_prefetch_operations"] = self._stats.get(
+            "lease_deferred_prefetch_operations", 0
+        ) + (len(transfers_by_operation) - projected_operations)
         sequence_lengths = cpu_sequence_lengths(forward_batch, len(bindings))
         self._record_heterogeneity(bindings, sequence_lengths, acquisitions)
         if self._tier_service.is_host_staged:

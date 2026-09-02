@@ -789,14 +789,31 @@ def _attach_request_priorities(
             tenant_ids = tuple(mapper(request_id) for request_id in request_ids)
     else:
         tenant_ids = tuple(int(tenant_id) for tenant_id in existing.tenant_ids)
-    acquisitions: list[SglangAcquisitionSpan] = []
-    for request in requests:
-        acquisition = getattr(
-            request, _ACQUISITION_ATTRIBUTE, SglangAcquisitionSpan.direct()
-        )
-        if not isinstance(acquisition, SglangAcquisitionSpan):
-            raise RuntimeError("SGLang request carries malformed acquisition metadata")
-        acquisitions.append(acquisition)
+    from nta_runtime.engines.sglang_forward_ownership import (
+        lease_forward_acquisitions,
+    )
+
+    acquisitions = lease_forward_acquisitions(
+        batch,
+        request_ids,
+        tuple(int(slot) for slot in request_slots),
+    )
+    if acquisitions is None:
+        # Before a load queue is leased, the request-local edge is the only
+        # available identity. Once ``hicache_consumer_index`` names a live
+        # lease, lease_forward_acquisitions() replaces this transient source
+        # with the lease owner's immutable demand records.
+        fallback_acquisitions: list[SglangAcquisitionSpan] = []
+        for request in requests:
+            acquisition = getattr(
+                request, _ACQUISITION_ATTRIBUTE, SglangAcquisitionSpan.direct()
+            )
+            if not isinstance(acquisition, SglangAcquisitionSpan):
+                raise RuntimeError(
+                    "SGLang request carries malformed acquisition metadata"
+                )
+            fallback_acquisitions.append(acquisition)
+        acquisitions = tuple(fallback_acquisitions)
     for request in requests:
         # The sidecar now owns this forward's immutable copy. Clearing the
         # mutable request attribute prevents a later decode or unrelated load
@@ -809,7 +826,7 @@ def _attach_request_priorities(
             tuple(int(slot) for slot in request_slots),
             priorities,
             tenant_ids,
-            tuple(acquisitions),
+            acquisitions,
         ),
     )
 
