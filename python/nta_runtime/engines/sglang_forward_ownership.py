@@ -16,6 +16,9 @@ from nta_runtime.engines.sglang_hicache import find_bridge
 from nta_runtime.engines.sglang_topology import project_forward_operation_owners
 
 
+_LEASE_ID_ATTRIBUTE = "_nta_hicache_lease_id"
+
+
 def lease_forward_acquisitions(
     batch: Any,
     request_ids: tuple[str, ...],
@@ -48,8 +51,23 @@ def lease_forward_acquisitions(
     if bridge is None:
         return None
     pending = bridge.get(consumer_index)
-    if pending is None:
-        raise RuntimeError("SGLang forward names a retired or unknown HiCache lease")
+    bound_lease_id = getattr(batch, _LEASE_ID_ATTRIBUTE, None)
+    if bound_lease_id is not None:
+        bound_lease_id = int(bound_lease_id)
+        if bound_lease_id <= 0:
+            raise RuntimeError("SGLang batch carries an invalid HiCache lease identity")
+        # ScheduleBatch survives the external prefill and becomes the running
+        # decode batch.  Its framework consumer index is not cleared when the
+        # final prefill layer retires NTA's lease, and the finite producer ring
+        # may subsequently reuse that index.  The monotone lease ID is the ABA
+        # guard: a historical batch is resident/direct after its own lease
+        # retires, regardless of what currently occupies the framework slot.
+        if pending is None or pending.lease_id != bound_lease_id:
+            return tuple(SglangAcquisitionSpan.direct() for _ in request_ids)
+    elif pending is None:
+        raise RuntimeError("SGLang forward names an unknown HiCache lease")
+    else:
+        setattr(batch, _LEASE_ID_ATTRIBUTE, int(pending.lease_id))
 
     transfers = pending.transfers_by_operation()
     lease_operation_ids = (

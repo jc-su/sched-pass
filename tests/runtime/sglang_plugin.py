@@ -923,6 +923,45 @@ def main() -> None:
         SglangAcquisitionSpan(303 + index, 403 + index, index * 4, 4)
         for index in range(4)
     )
+    assert sidecar_batch._nta_hicache_lease_id == 88
+
+    # SGLang keeps the prefill batch as its running decode batch and does not
+    # clear hicache_consumer_index after the final attention layer retires the
+    # acquisition.  A subsequent decode is resident and must not fail merely
+    # because the lease is gone.
+    del sidecar_bridge._pending[5]
+    retired_forward = types.SimpleNamespace(
+        rids=sidecar_forward.rids,
+        req_pool_indices=sidecar_forward.req_pool_indices,
+    )
+    _attach_request_priorities(
+        retired_forward,
+        object,
+        sidecar_batch,
+        hook_runner,
+    )
+    assert retired_forward._nta_forward_metadata.acquisitions == tuple(
+        SglangAcquisitionSpan.direct() for _ in sidecar_requests
+    )
+
+    # The producer-event ring can reuse consumer index 5.  The monotone lease
+    # binding prevents the old running batch from stealing the new lease's
+    # request ownership (an ABA error).
+    replacement_pending = replace(sidecar_pending, lease_id=89)
+    sidecar_bridge._pending[5] = replacement_pending
+    reused_slot_forward = types.SimpleNamespace(
+        rids=sidecar_forward.rids,
+        req_pool_indices=sidecar_forward.req_pool_indices,
+    )
+    _attach_request_priorities(
+        reused_slot_forward,
+        object,
+        sidecar_batch,
+        hook_runner,
+    )
+    assert reused_slot_forward._nta_forward_metadata.acquisitions == tuple(
+        SglangAcquisitionSpan.direct() for _ in sidecar_requests
+    )
 
     missing_owner_batch = types.SimpleNamespace(
         reqs=sidecar_requests,
@@ -940,7 +979,7 @@ def main() -> None:
             hook_runner,
         )
     except RuntimeError as error:
-        assert "retired or unknown HiCache lease" in str(error)
+        assert "unknown HiCache lease" in str(error)
     else:
         raise AssertionError("a missing live-lease owner used transient metadata")
 
