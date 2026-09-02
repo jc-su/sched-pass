@@ -19,13 +19,13 @@ from typing import Any
 
 try:
     from .atomic_io import atomic_write_json
-    from .bailian import read_jsonl
+    from .bailian import input_page_ids, read_jsonl
     from .bailian_replay import build_replay_window, opportunity_stratum
     from .validate_workload import validate as validate_workload
 except ImportError:  # pragma: no cover - direct CLI execution
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from experiments.atomic_io import atomic_write_json
-    from experiments.bailian import read_jsonl
+    from experiments.bailian import input_page_ids, read_jsonl
     from experiments.bailian_replay import build_replay_window, opportunity_stratum
     from experiments.validate_workload import validate as validate_workload
 
@@ -102,6 +102,15 @@ def select_windows(
         raise ValueError("natural replay selection requires absent source placement")
     records_path = path.parent / str(manifest["records_file"])
     rows = read_jsonl(records_path)
+    block_size = int(manifest["block_size"])
+    # A full census revisits every source row in several neighboring windows.
+    # Materialize exact logical pages once so each candidate does not allocate
+    # and stringify the same potentially long block sequence again.  The cache
+    # contains tuples of references to the normalized identities, not another
+    # copy of their strings.
+    page_id_rows = tuple(
+        input_page_ids(row, block_size=block_size) for row in rows
+    )
     candidates: list[dict[str, Any]] = []
     rejected: Counter[str] = Counter()
     last_start = len(rows) - measured_requests
@@ -121,6 +130,7 @@ def select_windows(
                 output_length_scale=output_length_scale,
                 device_token_capacity=device_token_capacity,
                 consumer_wave_tokens=consumer_wave_tokens,
+                page_id_rows=page_id_rows,
             )
         except ValueError as error:
             reason = str(error).split(":", 1)[0]

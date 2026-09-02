@@ -1085,8 +1085,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help=(
-            "performance-excluded exact-shape mixed arrivals; the NTA arm "
-            "also fails closed unless deployment calibration is complete"
+            "one or more performance-excluded exact-shape mixed arrivals; "
+            "the final occurrence proves that timed cache placement and query "
+            "geometry are reproducible"
         ),
     )
     parser.add_argument(
@@ -1135,8 +1136,11 @@ def parse_args() -> argparse.Namespace:
     )
     if args.churn_tokens >= max_request_input_tokens:
         parser.error("churn token count exceeds the SGLang request input budget")
-    if args.load_warmup_iterations < 0:
-        parser.error("load warmup iterations cannot be negative")
+    if args.load_warmup_iterations <= 0:
+        parser.error(
+            "at least one load warmup iteration is required for the exact "
+            "placement calibration"
+        )
     if args.setup_idle_timeout_seconds <= 0.0:
         parser.error("setup idle timeout must be positive")
     if args.eviction_rounds is not None and args.eviction_rounds < 0:

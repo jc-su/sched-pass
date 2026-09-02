@@ -18,6 +18,7 @@ from nta_runtime.engines.sglang_transfer import (
 from nta_runtime.engines.sglang_contracts import (
     LeaseAcquisitionGroup,
     LeaseDeviceIndexMap,
+    LeaseOperationDemand,
     LeaseOperationRange,
     LeaseOperationRequest,
     LeaseOperationTransfer,
@@ -48,7 +49,9 @@ class PendingHostLoad:
     # node. This avoids downloading and reverse-engineering the numerical page
     # table to recover request ownership.
     operation_transfers: tuple[LeaseOperationTransfer, ...]
-    operation_requests: tuple[LeaseOperationRequest, ...]
+    operation_demands: tuple[LeaseOperationDemand, ...] = ()
+    # Filled only after ScheduleBatch has allocated request-pool slots.
+    operation_requests: tuple[LeaseOperationRequest, ...] = ()
     # Only operations whose requests survived PrefillAdder's complete budget
     # checks are execution dependencies of the current forward.  SGLang can
     # still include rejected operations in the same physical load queue; those
@@ -264,7 +267,7 @@ class SglangHiCacheBridge:
         # operation identity so acquire_load() can form a lease containing
         # exactly the requests in the current forward.
         self._operation_admission: dict[int, bool] = {}
-        self._operation_requests: dict[int, LeaseOperationRequest] = {}
+        self._operation_demands: dict[int, LeaseOperationDemand] = {}
         self._next_lease_id = 1
         self._lock = threading.Lock()
         self._acquire_callback: Any = None
@@ -408,7 +411,7 @@ class SglangHiCacheBridge:
             self._latest_request_work.clear()
             self._latest_request_key.clear()
             self._operation_admission.clear()
-            self._operation_requests.clear()
+            self._operation_demands.clear()
         if first_error is not None:
             raise RuntimeError(
                 "SGLang HiCache bridge failed to retire one or more leases"
@@ -450,18 +453,18 @@ class SglangHiCacheBridge:
                 )
             self._operation_admission[operation_id] = admitted
 
-    def record_operation_request(self, request: LeaseOperationRequest) -> None:
-        """Bind one unmerged load operation to its scheduler request owner."""
+    def record_operation_demand(self, demand: LeaseOperationDemand) -> None:
+        """Bind one unmerged operation to its slot-independent request demand."""
 
-        if not isinstance(request, LeaseOperationRequest):
-            raise TypeError("SGLang operation ownership must use the typed contract")
+        if not isinstance(demand, LeaseOperationDemand):
+            raise TypeError("SGLang operation demand must use the typed contract")
         with self._lock:
-            previous = self._operation_requests.get(request.operation_id)
-            if previous is not None and previous != request:
+            previous = self._operation_demands.get(demand.operation_id)
+            if previous is not None and previous != demand:
                 raise RuntimeError(
-                    "SGLang load operation changed request ownership before capture"
+                    "SGLang load operation changed demand ownership before capture"
                 )
-            self._operation_requests[request.operation_id] = request
+            self._operation_demands[demand.operation_id] = demand
 
     def acquire_load(self, controller: Any) -> int | None:
         with self._lock:
@@ -483,7 +486,7 @@ class SglangHiCacheBridge:
         with self._lock:
             for operation_id in set(self._operation_admission) - queued_operation_ids:
                 self._operation_admission.pop(operation_id, None)
-                self._operation_requests.pop(operation_id, None)
+                self._operation_demands.pop(operation_id, None)
             missing = tuple(
                 int(getattr(operation, "id", -1))
                 for operation in queued_operations
@@ -500,22 +503,22 @@ class SglangHiCacheBridge:
                 for operation in queued_operations
                 if self._operation_admission[int(operation.id)]
             )
-            missing_requests = tuple(
+            missing_demands = tuple(
                 operation_id
                 for operation_id in demand_operation_ids
-                if operation_id not in self._operation_requests
+                if operation_id not in self._operation_demands
             )
-            if missing_requests:
+            if missing_demands:
                 raise RuntimeError(
-                    "SGLang admitted load operation omitted request ownership for "
-                    f"operation(s) {missing_requests}"
+                    "SGLang admitted load operation omitted demand ownership for "
+                    f"operation(s) {missing_demands}"
                 )
             # Preserve CacheOperation.merge_ops() order.  Logical operation
             # ranges, physical descriptor ranges, and request identities must
             # describe the same partition; sorting opaque operation IDs would
             # silently break that invariant after priority queueing.
-            operation_requests = tuple(
-                self._operation_requests[int(operation.id)]
+            operation_demands = tuple(
+                self._operation_demands[int(operation.id)]
                 for operation in queued_operations
                 if int(operation.id) in demand_operation_ids
             )
@@ -561,7 +564,7 @@ class SglangHiCacheBridge:
         with self._lock:
             for operation_id in leased_operation_ids:
                 self._operation_admission.pop(operation_id, None)
-                self._operation_requests.pop(operation_id, None)
+                self._operation_demands.pop(operation_id, None)
         event = controller.layer_done_counter.events[producer_id]
         from nta_runtime.connectors.sglang_storage import (
             maybe_resolve_sglang_storage_keys,
@@ -582,7 +585,7 @@ class SglangHiCacheBridge:
             controller=controller,
             node_ids=tuple(op.node_ids),
             operation_transfers=tuple(operation_transfers),
-            operation_requests=operation_requests,
+            operation_demands=operation_demands,
             demand_operation_ids=demand_operation_ids,
             storage_keys=storage_keys,
         )

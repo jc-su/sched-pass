@@ -46,6 +46,7 @@ def _arm_report(arm: str) -> dict:
         "hicache_external_batches": 1,
         "host_direct_batches": int(arm == "A1"),
         "host_scheduled_bulk_batches": int(arm == "A2"),
+        "stock_scheduled_frontier_batches": int(arm == "A2"),
         "host_device_bulk_batches": 0,
         "host_incremental_batches": int(arm == "A3"),
         "external_launches": 36,
@@ -63,8 +64,21 @@ def _arm_report(arm: str) -> dict:
         "lease_acquisition_groups_prepared": int(arm == "A1"),
         "lease_acquisition_groups_started": int(arm == "A1"),
         "host_acquisition_structural_owners": int(arm in {"A2", "A3"}),
-        "host_acquisition_jobs_submitted": 36,
+        "host_acquisition_jobs_submitted": 36 if arm == "A1" else 0,
+        "host_acquisition_layers_consumed": 36 if arm in {"A2", "A3"} else 0,
         "host_acquisition_models_bound": int(arm in {"A2", "A3"}),
+        "shared_acquisition_registered_groups": (
+            36 if arm in {"A2", "A3"} else 0
+        ),
+        "shared_acquisition_registered_cohorts": (
+            36 if arm in {"A2", "A3"} else 0
+        ),
+        "shared_acquisition_submitted_groups": (
+            36 if arm in {"A2", "A3"} else 0
+        ),
+        "shared_acquisition_submitted_cohorts": (
+            36 if arm in {"A2", "A3"} else 0
+        ),
         "initial_acquisition_layers": 36 if arm == "A1" else 0,
         "schedule_bound_acquisition_batches": int(arm in {"A2", "A3"}),
         "typed_exact_dependency_groups": int(arm == "A3"),
@@ -96,6 +110,14 @@ def main() -> None:
         assert "A2" in str(error)
     else:
         raise AssertionError("an unowned scheduled bulk launch passed as exact A2")
+    incomplete_bulk = _arm_report("A2")
+    incomplete_bulk["engine_stats"][0]["shared_acquisition_submitted_groups"] -= 1
+    try:
+        validate_arm_result(incomplete_bulk, "A2")
+    except ValueError as error:
+        assert "A2" in str(error)
+    else:
+        raise AssertionError("a partially submitted shared schedule passed as A2")
     unowned_progressive = _arm_report("A3")
     unowned_progressive["engine_stats"][0]["host_acquisition_structural_owners"] = 0
     try:

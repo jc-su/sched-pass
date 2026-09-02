@@ -240,6 +240,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "hicache_external_batches",
             "host_direct_batches",
             "host_scheduled_bulk_batches",
+            "stock_scheduled_frontier_batches",
             "host_device_bulk_batches",
             "host_incremental_batches",
             "external_launches",
@@ -258,7 +259,12 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "lease_acquisition_groups_started",
             "host_acquisition_structural_owners",
             "host_acquisition_jobs_submitted",
+            "host_acquisition_layers_consumed",
             "host_acquisition_models_bound",
+            "shared_acquisition_registered_groups",
+            "shared_acquisition_registered_cohorts",
+            "shared_acquisition_submitted_groups",
+            "shared_acquisition_submitted_cohorts",
             "initial_acquisition_layers",
             "schedule_bound_acquisition_batches",
             "typed_exact_dependency_groups",
@@ -327,7 +333,16 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["admission_acquisition_groups_prepared"] > 0
             and counters["admission_acquisition_groups_started"] > 0
             and counters["host_acquisition_structural_owners"] > 0
-            and counters["host_acquisition_jobs_submitted"] > 0
+            and counters["host_acquisition_jobs_submitted"] == 0
+            and counters["stock_scheduled_frontier_batches"] > 0
+            and counters["shared_acquisition_registered_groups"] > 0
+            and counters["shared_acquisition_registered_groups"]
+            == counters["shared_acquisition_submitted_groups"]
+            and counters["shared_acquisition_registered_cohorts"] > 0
+            and counters["shared_acquisition_registered_cohorts"]
+            == counters["shared_acquisition_submitted_cohorts"]
+            and counters["host_acquisition_layers_consumed"]
+            == counters["external_launches"]
             and counters["host_acquisition_models_bound"] > 0
             and counters["initial_acquisition_layers"] == 0
             and counters["schedule_bound_acquisition_batches"] > 0
@@ -351,7 +366,16 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["admission_acquisition_groups_prepared"] > 0
             and counters["admission_acquisition_groups_started"] > 0
             and counters["host_acquisition_structural_owners"] > 0
-            and counters["host_acquisition_jobs_submitted"] > 0
+            and counters["host_acquisition_jobs_submitted"] == 0
+            and counters["stock_scheduled_frontier_batches"] == 0
+            and counters["shared_acquisition_registered_groups"] > 0
+            and counters["shared_acquisition_registered_groups"]
+            == counters["shared_acquisition_submitted_groups"]
+            and counters["shared_acquisition_registered_cohorts"] > 0
+            and counters["shared_acquisition_registered_cohorts"]
+            == counters["shared_acquisition_submitted_cohorts"]
+            and counters["host_acquisition_layers_consumed"]
+            == counters["external_launches"]
             and counters["host_acquisition_models_bound"] > 0
             and counters["initial_acquisition_layers"] == 0
             and counters["schedule_bound_acquisition_batches"] > 0

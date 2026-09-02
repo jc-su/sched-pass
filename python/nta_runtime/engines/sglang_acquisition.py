@@ -32,7 +32,10 @@ from nta_runtime.engines.sglang_calibration import (
     SglangLayerServiceCalibration,
 )
 from nta_runtime.engines.sglang_hicache import PendingHostLoad
-from nta_runtime.engines.sglang_contracts import LeaseAcquisitionGroup
+from nta_runtime.engines.sglang_contracts import (
+    LeaseAcquisitionGroup,
+    LeaseOperationRequest,
+)
 from nta_runtime.engines.sglang_pipeline import SglangHostTransport
 from nta_runtime.engines.sglang_planning import (
     calibration_probe_end,
@@ -182,7 +185,7 @@ class SglangHostAcquisitionCoordinator:
             raise RuntimeError("HiCache load and model layer counts disagree")
         groups = tuple(
             LeaseAcquisitionGroup(request.operation_id, 0, request.row_count)
-            for request in pending.operation_requests
+            for request in pending.operation_demands
         )
         if not groups:
             raise RuntimeError("HiCache demand lease has no exact request segments")
@@ -303,7 +306,7 @@ class SglangHostAcquisitionCoordinator:
             return True
         if acquisition is None and pending.prefetched_layers:
             return False
-        self._bind_group_identities(pending)
+        self._bind_group_identities(pending, batch)
         shape_key = self._calibration.shape_key(batch)
         curve = self._calibration.curve_for_batch(batch)
         if shape_key is None or curve is None:
@@ -353,21 +356,48 @@ class SglangHostAcquisitionCoordinator:
         pending.acquisition = None
         return True
 
-    def _bind_group_identities(self, pending: PendingHostLoad) -> None:
+    def _bind_group_identities(self, pending: PendingHostLoad, batch: Any) -> None:
         """Assign request generations before scheduler-owned transport starts."""
 
-        requests = tuple(pending.operation_requests)
-        if not requests:
+        demands = tuple(pending.operation_demands)
+        if not demands:
             raise RuntimeError(
                 "scheduled HiCache acquisition has no request-operation ownership"
             )
-        operation_ids = tuple(request.operation_id for request in requests)
+        operation_ids = tuple(demand.operation_id for demand in demands)
         if len(set(operation_ids)) != len(operation_ids):
             raise RuntimeError("HiCache acquisition repeats request-operation identity")
         if pending.operation_bindings:
             if set(pending.operation_bindings) != set(operation_ids):
                 raise RuntimeError("HiCache acquisition request bindings changed")
             return
+        batch_requests = tuple(getattr(batch, "reqs", ()) or ())
+        slots_by_request: dict[str, int] = {}
+        for request in batch_requests:
+            request_id = str(getattr(request, "rid", "") or "")
+            request_slot = getattr(request, "req_pool_idx", None)
+            if not request_id or request_slot is None:
+                raise RuntimeError(
+                    "scheduled HiCache batch omitted allocated request identity"
+                )
+            if request_id in slots_by_request:
+                raise RuntimeError("scheduled HiCache batch repeated request identity")
+            slots_by_request[request_id] = int(request_slot)
+        missing = tuple(
+            demand.request_id
+            for demand in demands
+            if demand.request_id not in slots_by_request
+        )
+        if missing:
+            raise RuntimeError(
+                "scheduled HiCache demand is absent from the allocated batch: "
+                f"{missing}"
+            )
+        requests = tuple(
+            LeaseOperationRequest.bind(demand, slots_by_request[demand.request_id])
+            for demand in demands
+        )
+        pending.operation_requests = requests
         bindings = self._request_adapter.bind(
             tuple(request.request_id for request in requests),
             tuple(request.request_slot for request in requests),
@@ -556,14 +586,11 @@ class SglangHostAcquisitionCoordinator:
                 raise RuntimeError(
                     "HiCache shared acquisition was not prepared exactly once"
                 )
-            before = len(pending.prefetched_layers)
-            self.progress_shared_acquisition()
-            self._pump_shared_acquisition()
-            submitted = len(pending.prefetched_layers) - before
-            if submitted <= 0:
-                raise RuntimeError(
-                    "HiCache shared acquisition could not reserve its first cohort"
-                )
+            # The finite horizon is global. A legal pump may submit only an
+            # older lease, so local publication growth is not a valid start
+            # invariant. Follow EDF until this admitted lease owns its first
+            # layer fence; never bypass older work with a direct publication.
+            self.ensure_layer_published(pending, 0)
             self._add("admission_acquisition_groups_started")
             return
         acquisition = pending.acquisition
@@ -788,6 +815,52 @@ class SglangHostAcquisitionCoordinator:
         self.progress_shared_acquisition()
         self._pump_shared_acquisition()
 
+    def ensure_layer_published(
+        self, pending: PendingHostLoad, local_layer: int
+    ) -> None:
+        """Wait until shared EDF publishes one required whole-layer fence.
+
+        A mixed SGLang batch cannot always be held at admission: an older
+        acquisition may occupy the finite global-link horizon while resident
+        decode in the new batch remains runnable.  The A2 whole-layer stock
+        consumer nevertheless needs a concrete layer fence before numerical
+        execution starts.  Advance only by waiting for the oldest already-
+        submitted packet; never bypass EDF by publishing the target directly.
+        """
+
+        if not 0 <= local_layer < self._model_layer_count:
+            raise ValueError("required Host acquisition layer is outside the model")
+        if not getattr(pending, "shared_acquisition_registered", False):
+            raise RuntimeError("required Host layer has no shared acquisition owner")
+        if local_layer in pending.prefetched_layers:
+            return
+        self._add("shared_acquisition_publication_waits")
+        # No new jobs can be registered from this scheduler thread while it is
+        # inside metadata binding.  The current finite record count therefore
+        # bounds the number of completion edges needed to reach the target.
+        maximum_rounds = self._shared_queue.group_count + 1
+        for _ in range(maximum_rounds):
+            self.progress_shared_acquisition()
+            self._pump_shared_acquisition()
+            if local_layer in pending.prefetched_layers:
+                return
+            if not self._shared_active:
+                raise RuntimeError(
+                    "shared EDF has no in-flight packet for a required Host layer"
+                )
+            first_packet = self._shared_active[0]
+            if not first_packet:
+                raise RuntimeError("shared EDF retained an empty transport packet")
+            cohort = self._shared_cohorts.get(first_packet[0])
+            if cohort is None:
+                raise RuntimeError("shared EDF lost its oldest transport cohort")
+            publication = cohort.pending.prefetched_layers.get(cohort.local_layer)
+            if publication is None:
+                raise RuntimeError("shared EDF oldest cohort has no published fence")
+            publication.ready_event.synchronize()
+            self._add("shared_acquisition_publication_wait_rounds")
+        raise RuntimeError("shared EDF did not reach a required Host layer")
+
     def cancel_shared_acquisition(self, pending: PendingHostLoad) -> None:
         """Stop undispatched work and fence in-flight reservations before reuse."""
 
@@ -866,6 +939,50 @@ class SglangHostAcquisitionCoordinator:
             return
         batch.planned_progressive_consumer_layers.update(planned)
         self._add("partial_consumer_planned_layers", len(planned))
+
+    def plan_published_consumer_layer(
+        self,
+        pending: PendingHostLoad,
+        batch: SglangForwardEpoch,
+        local_layer: int,
+    ) -> bool:
+        """Authorize one layer published after the metadata-time snapshot.
+
+        The global queue can publish a later layer only when attention is
+        about to reach it.  Forced A3 and calibrated production policy must
+        apply the same authorization rule at that edge; otherwise a late
+        publication silently loses partial consumption and falls back to a
+        blocking whole-layer wait.
+        """
+
+        if batch.pending_host_load is not pending:
+            raise RuntimeError("consumer planning lost its active HiCache lease")
+        if not 0 <= local_layer < self._model_layer_count:
+            raise ValueError("progressive consumer layer is outside the model")
+        execution = batch.host_execution
+        publication = pending.prefetched_layers.get(local_layer)
+        if (
+            execution is None
+            or not execution.uses_progressive_consumer
+            or not execution.overlap_initial
+            or publication is None
+            or getattr(publication, "transfer_first_slot", None) is None
+            or local_layer in batch.modeled_ready_by_attention_layers
+        ):
+            return False
+        explicit_measurement = execution.selection_reason in {
+            "calibration_probe",
+            "consumer_policy_probe",
+            "forced_dependency_aware",
+        }
+        if not explicit_measurement and local_layer not in pending.planned_progressive_layers:
+            self._add("partial_consumer_unproven_layers")
+            return False
+        if local_layer in batch.planned_progressive_consumer_layers:
+            return True
+        batch.planned_progressive_consumer_layers.add(local_layer)
+        self._add("partial_consumer_planned_layers")
+        return True
 
     def publish_range(
         self,

@@ -17,8 +17,8 @@ from nta_runtime.engines.sglang_acquisition import (
 )
 from nta_runtime.engines.sglang_contracts import (
     LeaseAcquisitionGroup,
+    LeaseOperationDemand,
     LeaseOperationRange,
-    LeaseOperationRequest,
 )
 from nta_runtime.engines.sglang_state import SglangForwardEpoch, SglangForwardPlan
 from nta_runtime.execution_planner import HostExecutionMode
@@ -44,6 +44,7 @@ class FakeTransport:
         for local_layer in range(first_local_layer, last_local_layer):
             event = types.SimpleNamespace(ready=False)
             event.query = lambda item=event: item.ready
+            event.synchronize = lambda item=event: setattr(item, "ready", True)
             self.events[local_layer] = event
             pending.prefetched_layers[local_layer] = types.SimpleNamespace(
                 key_bytes=1,
@@ -114,7 +115,8 @@ def pending(pool):
         prefetched_layers={},
         transfer_plan=None,
         acquisition=None,
-        operation_requests=(LeaseOperationRequest(1, "request-1", 3, 0, 1, 0),),
+        operation_demands=(LeaseOperationDemand(1, "request-1", 0, 1, 0),),
+        operation_requests=(),
         operation_bindings={},
         scheduled_acquisition_groups=(LeaseAcquisitionGroup(1, 0, 1),),
         acquisition_group_identities={},
@@ -263,7 +265,10 @@ def main() -> None:
         bind_lease=bind_structural
     )
     structural_owner.capture(structural)
-    assert not structural_owner.prepare_owner(structural, object())
+    structural_batch = types.SimpleNamespace(
+        reqs=(types.SimpleNamespace(rid="request-1", req_pool_idx=3),)
+    )
+    assert not structural_owner.prepare_owner(structural, structural_batch)
     assert structural.operation_bindings[1].request_slot == 3
     assert structural.operation_bindings[1].generation == 1
     assert len(structural.acquisition_group_identities) == 4
@@ -294,7 +299,7 @@ def main() -> None:
     shared.layer_bytes = (2,) * 4
     shared.transfer_plan = object()
     shared_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
-    shared_owner._bind_group_identities(shared)
+    shared_owner._bind_group_identities(shared, structural_batch)
     shared_model = LayerAcquisitionModel(
         layer_bytes=shared.layer_bytes,
         transfer_service_ns=(50,) * 4,
@@ -314,6 +319,54 @@ def main() -> None:
     shared_owner.retire_layer(shared, 0)
     assert shared_owner._stats["shared_acquisition_retired_cohorts"] == 1
 
+    # A later mixed batch can reach metadata while an older lease owns the
+    # finite dispatch horizon.  Its whole-layer stock consumer waits for EDF
+    # to publish layer zero; it must not bypass the queue with eager full-model
+    # publication.
+    blocked = pending(shared_pool)
+    blocked.lease_id = 2
+    blocked.device_indices = torch.tensor((9,), dtype=torch.int32)
+    blocked.row_bytes_by_layer = ((1, 1),) * 4
+    blocked.layer_bytes = (2,) * 4
+    blocked.transfer_plan = object()
+    shared_owner._bind_group_identities(blocked, structural_batch)
+    shared_owner._register_shared_acquisition(blocked, shared_model)
+    assert 0 not in blocked.prefetched_layers
+    shared_owner.ensure_layer_published(blocked, 0)
+    assert 0 in blocked.prefetched_layers
+    assert shared_owner._stats["shared_acquisition_publication_waits"] == 1
+    assert shared_owner._stats["shared_acquisition_publication_wait_rounds"] > 0
+    blocked.prefetched_layers[0].transfer_first_slot = 0
+    progressive_batch = types.SimpleNamespace(
+        pending_host_load=blocked,
+        host_execution=types.SimpleNamespace(
+            uses_progressive_consumer=True,
+            overlap_initial=True,
+            selection_reason="forced_dependency_aware",
+        ),
+        modeled_ready_by_attention_layers=set(),
+        planned_progressive_consumer_layers=set(),
+    )
+    assert shared_owner.plan_published_consumer_layer(
+        blocked, progressive_batch, 0
+    )
+    assert progressive_batch.planned_progressive_consumer_layers == {0}
+    # Re-observing the same late publication is idempotent and cannot inflate
+    # activation evidence.
+    assert shared_owner.plan_published_consumer_layer(
+        blocked, progressive_batch, 0
+    )
+    assert shared_owner._stats["partial_consumer_planned_layers"] == 1
+    blocked_identity = blocked.acquisition_group_identities[0][0]
+    assert (
+        shared_owner._shared_queue.state(blocked_identity)
+        is SharedAcquisitionState.FENCE_PUBLISHED
+    )
+    shared_owner.retire_layer(blocked, 0)
+    blocked.prefetched_layers[0].ready_event.synchronize()
+    shared_owner.progress_shared_acquisition()
+    assert (blocked.lease_id, 0) not in shared_owner._shared_cohorts
+
     # Readiness and resource lifetime are group-scoped even when one finite
     # physical layer packet coalesces several request segments.  The first
     # wave releases only its own tenant/staging reservation and can be
@@ -326,9 +379,9 @@ def main() -> None:
     wave_owner._shared_layers_per_dispatch = 1
     wave_pending = pending(wave_pool)
     wave_pending.device_indices = torch.tensor((7, 8), dtype=torch.int32)
-    wave_pending.operation_requests = (
-        LeaseOperationRequest(1, "wave-request-1", 3, 0, 1, 0),
-        LeaseOperationRequest(2, "wave-request-2", 4, 0, 1, 0),
+    wave_pending.operation_demands = (
+        LeaseOperationDemand(1, "wave-request-1", 0, 1, 0),
+        LeaseOperationDemand(2, "wave-request-2", 0, 1, 0),
     )
     wave_pending.scheduled_acquisition_groups = (
         LeaseAcquisitionGroup(1, 0, 1),
@@ -342,7 +395,15 @@ def main() -> None:
     wave_pending.layer_bytes = (4,) * 4
     wave_pending.transfer_plan = object()
     wave_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
-    wave_owner._bind_group_identities(wave_pending)
+    wave_owner._bind_group_identities(
+        wave_pending,
+        types.SimpleNamespace(
+            reqs=(
+                types.SimpleNamespace(rid="wave-request-1", req_pool_idx=3),
+                types.SimpleNamespace(rid="wave-request-2", req_pool_idx=4),
+            )
+        ),
+    )
     wave_model = LayerAcquisitionModel(
         layer_bytes=wave_pending.layer_bytes,
         transfer_service_ns=(100,) * 4,

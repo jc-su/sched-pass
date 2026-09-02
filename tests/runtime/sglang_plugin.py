@@ -777,7 +777,10 @@ def main() -> None:
     external_request = types.SimpleNamespace(
         rid="external",
         priority=0,
-        req_pool_idx=7,
+        # PrefillAdder observes the operation before ScheduleBatch allocates
+        # the slot. The operation hook must capture semantic demand at this
+        # point without manufacturing a request-pool identity.
+        req_pool_idx=None,
         host_hit_length=32,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
@@ -830,6 +833,7 @@ def main() -> None:
         _adder.can_run_list.append(request)
 
     _capture_prefill_request_binding(load_external, adder, external_request)
+    external_request.req_pool_idx = 7
     _capture_prefill_request_binding(
         lambda _adder, _request: None, adder, resident_request
     )
@@ -950,8 +954,8 @@ def main() -> None:
     from nta_runtime.engines.sglang_contracts import (
         LeaseAcquisitionGroup,
         LeaseAcquisitionSlice,
+        LeaseOperationDemand,
         LeaseOperationRange,
-        LeaseOperationRequest,
         LeaseOperationTransfer,
     )
     from nta_runtime.engines.sglang_hicache import (
@@ -1459,9 +1463,9 @@ def main() -> None:
     else:
         raise AssertionError("HiCache accepted an admission ownership reversal")
     partition_bridge.record_operation_admission(admitted_operation.id, True)
-    partition_bridge.record_operation_request(
-        LeaseOperationRequest(
-            admitted_operation.id, "partition-request", 3, 0, 1, 0
+    partition_bridge.record_operation_demand(
+        LeaseOperationDemand(
+            admitted_operation.id, "partition-request", 0, 1, 0
         )
     )
     partition_bridge.record_operation_admission(deferred_operation.id, False)
@@ -1476,7 +1480,7 @@ def main() -> None:
     )
     assert partition_controller.load_queue == [deferred_operation]
     assert partition_bridge._operation_admission == {deferred_operation.id: False}
-    assert partition_bridge._operation_requests == {}
+    assert partition_bridge._operation_demands == {}
 
     close_race_pool = DevicePool()
     close_race_pool._get_key_buffer = lambda *_args: None
@@ -1487,11 +1491,10 @@ def main() -> None:
     close_race_bridge.record_operation_admission(
         close_race_controller.load_queue[0].id, True
     )
-    close_race_bridge.record_operation_request(
-        LeaseOperationRequest(
+    close_race_bridge.record_operation_demand(
+        LeaseOperationDemand(
             close_race_controller.load_queue[0].id,
             "close-race-request",
-            4,
             0,
             1,
             0,
@@ -1521,11 +1524,10 @@ def main() -> None:
     reused_bridge.set_acquire_callback(lambda _pending: None)
     reused_controller = lease_controller(reused_pool)
     reused_bridge.record_operation_admission(reused_controller.load_queue[0].id, True)
-    reused_bridge.record_operation_request(
-        LeaseOperationRequest(
+    reused_bridge.record_operation_demand(
+        LeaseOperationDemand(
             reused_controller.load_queue[0].id,
             "reused-request",
-            5,
             0,
             1,
             0,
@@ -2959,10 +2961,11 @@ def main() -> None:
         stats=stock_backend._stats,
     )
     stock_backend._forward_lifecycle = stock_lifecycle
-    prefetched = {0: object(), 1: object()}
+    prefetched = {0: object()}
     stock_pending = types.SimpleNamespace(
         prefetched_layers=prefetched,
         prefetch_tensors=(object(),),
+        shared_acquisition_registered=True,
         controller=types.SimpleNamespace(
             layer_num=2,
             mem_pool_device=types.SimpleNamespace(start_layer=0),
@@ -2979,6 +2982,17 @@ def main() -> None:
         host_execution=object(),
     )
     stock_lifecycle.activate(planned_stock_epoch)
+    stock_backend._activate_stock_prefetch(
+        (stock_binding,),
+        stock_pending,
+        finite_scheduler_frontier=True,
+    )
+    assert stock_lifecycle.active.pending_host_load is stock_pending
+    assert stock_lifecycle.active.semantic_plans == {}
+    # The scheduler-owned whole-layer consumer does not require an eager
+    # full-model publication.  Once the same lease is complete, the ordinary
+    # eager stock contract remains valid as well.
+    prefetched[1] = object()
     stock_backend._activate_stock_prefetch((stock_binding,), stock_pending)
     assert stock_lifecycle.active is not planned_stock_epoch
     assert stock_lifecycle.active.semantic_plans == {}
@@ -2993,6 +3007,20 @@ def main() -> None:
         assert "exact full-model prefetch" in str(error)
     else:
         raise AssertionError("partial prefetch entered the stock fast path")
+    try:
+        stock_backend._activate_stock_prefetch(
+            (stock_binding,),
+            types.SimpleNamespace(
+                prefetched_layers={0: object()},
+                prefetch_tensors=(),
+                shared_acquisition_registered=False,
+            ),
+            finite_scheduler_frontier=True,
+        )
+    except RuntimeError as error:
+        assert "initial acquisition frontier" in str(error)
+    else:
+        raise AssertionError("unowned finite frontier entered stock attention")
 
     source = inspect.getsource(SglangPlanMaterializer.upload_plan)
     assert "batch.host_execution" in source

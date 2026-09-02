@@ -59,7 +59,12 @@ def _finite_nonnegative(row: Mapping[str, Any], field: str) -> float:
     return float(value)
 
 
-def _annotate_replayable_prefixes(rows: list[dict[str, Any]], block_size: int) -> None:
+def _annotate_replayable_prefixes(
+    rows: list[dict[str, Any]],
+    block_size: int,
+    *,
+    page_rows: Sequence[Sequence[str]] | None = None,
+) -> None:
     """Compute exact local reuse and an input-only reuse-distance lower bound.
 
     ``replayable_prefix_tokens`` is expressed in source-input tokens.  The
@@ -70,9 +75,18 @@ def _annotate_replayable_prefixes(rows: list[dict[str, Any]], block_size: int) -
     cached object whose final (partial) content block matches.
     """
 
-    page_rows = [input_page_ids(row, block_size=block_size) for row in rows]
+    if page_rows is None:
+        materialized_page_rows = [
+            input_page_ids(row, block_size=block_size) for row in rows
+        ]
+    else:
+        if len(page_rows) != len(rows):
+            raise ValueError("precomputed replay pages do not match the selected rows")
+        materialized_page_rows = page_rows
     root = _PrefixNode()
-    for position, (row, page_ids) in enumerate(zip(rows, page_rows, strict=True)):
+    for position, (row, page_ids) in enumerate(
+        zip(rows, materialized_page_rows, strict=True)
+    ):
         node = root
         blocks = 0
         for page_id in page_ids:
@@ -108,14 +122,20 @@ def _annotate_replayable_prefixes(rows: list[dict[str, Any]], block_size: int) -
             row["replayable_reuse_gap_seconds"] = reuse_gap
             intervening = {
                 page_id
-                for intervening_pages in page_rows[provider_position + 1 : position]
+                for intervening_pages in materialized_page_rows[
+                    provider_position + 1 : position
+                ]
                 for page_id in intervening_pages
             }
             row["replayable_intervening_unique_input_pages"] = len(intervening)
 
         node = root
         for page_id in page_ids:
-            node = node.children.setdefault(page_id, _PrefixNode())
+            child = node.children.get(page_id)
+            if child is None:
+                child = _PrefixNode()
+                node.children[page_id] = child
+            node = child
             node.last_position = position
 
 
@@ -243,6 +263,7 @@ def build_replay_window(
     consumer_wave_tokens: int | None = None,
     output_length_scale: float = 1.0,
     time_scale: float = 1.0,
+    page_id_rows: Sequence[Sequence[str]] | None = None,
 ) -> ReplayWindow:
     """Build a deterministic, source-contiguous natural-cache replay window.
 
@@ -273,6 +294,8 @@ def build_replay_window(
         raise ValueError("Bailian opportunity parameters must be integers")
     if measured_start < 0 or warmup_requests < 0 or measured_requests <= 0:
         raise ValueError("Bailian replay window bounds are invalid")
+    if page_id_rows is not None and len(page_id_rows) != len(rows):
+        raise ValueError("precomputed replay pages do not match the source rows")
     if (
         context_length <= input_margin_tokens + input_adapter_tokens
         or input_margin_tokens < 0
@@ -320,15 +343,28 @@ def build_replay_window(
         )
         row["replay_output_tokens"] = replay_output
 
-    _annotate_replayable_prefixes(selected, block_size)
+    selected_page_rows = (
+        page_id_rows[warmup_begin:measured_end]
+        if page_id_rows is not None
+        else None
+    )
+    _annotate_replayable_prefixes(
+        selected,
+        block_size,
+        page_rows=selected_page_rows,
+    )
     warmup = selected[:warmup_requests]
     measured = selected[warmup_requests:]
     _phase_offsets(warmup, time_scale)
     _phase_offsets(measured, time_scale)
     unique_pages = {
         page_id
-        for row in selected
-        for page_id in input_page_ids(row, block_size=block_size)
+        for page_ids in (
+            selected_page_rows
+            if selected_page_rows is not None
+            else [input_page_ids(row, block_size=block_size) for row in selected]
+        )
+        for page_id in page_ids
     }
     measured_inputs = [int(row["input_length"]) for row in measured]
     measured_outputs = [int(row["replay_output_tokens"]) for row in measured]

@@ -29,14 +29,41 @@ class LeaseOperationTransfer:
 
 
 @dataclass(frozen=True, slots=True)
-class LeaseOperationRequest:
-    """Stable request owner captured at SGLang's unmerged operation edge.
+class LeaseOperationDemand:
+    """Slot-independent request owner captured at the load-operation edge.
 
-    Generation is intentionally absent here: SGLang allocates the request slot
-    before it constructs ``ForwardBatch``, while the runtime registry is the
-    sole authority allowed to assign a generation.  The acquisition owner binds
-    this record through that registry before any scheduled transfer is issued.
+    SGLang creates HiCache operations during ``PrefillAdder.add_one_req`` but
+    allocates request-pool slots later in ``ScheduleBatch.prepare_for_extend``.
+    This record deliberately stops at the earlier semantic boundary.  The
+    acquisition owner joins it with an allocated batch before constructing a
+    :class:`LeaseOperationRequest` or assigning a runtime generation.
     """
+
+    operation_id: int
+    request_id: str
+    logical_begin: int
+    row_count: int
+    tenant_id: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.operation_id < 0
+            or not isinstance(self.request_id, str)
+            or not self.request_id
+            or self.logical_begin < 0
+            or self.row_count <= 0
+            or not 0 <= self.tenant_id < 1 << 32
+        ):
+            raise ValueError("SGLang lease operation demand is invalid")
+
+    @property
+    def logical_end(self) -> int:
+        return self.logical_begin + self.row_count
+
+
+@dataclass(frozen=True, slots=True)
+class LeaseOperationRequest:
+    """Allocated request owner joined to one exact operation demand."""
 
     operation_id: int
     request_id: str
@@ -55,7 +82,20 @@ class LeaseOperationRequest:
             or self.row_count <= 0
             or not 0 <= self.tenant_id < 1 << 32
         ):
-            raise ValueError("SGLang lease request ownership is invalid")
+            raise ValueError("SGLang allocated request ownership is invalid")
+
+    @classmethod
+    def bind(cls, demand: LeaseOperationDemand, request_slot: int) -> "LeaseOperationRequest":
+        if not isinstance(demand, LeaseOperationDemand):
+            raise TypeError("SGLang request binding requires an operation demand")
+        return cls(
+            demand.operation_id,
+            demand.request_id,
+            request_slot,
+            demand.logical_begin,
+            demand.row_count,
+            demand.tenant_id,
+        )
 
     @property
     def logical_end(self) -> int:

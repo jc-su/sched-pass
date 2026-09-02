@@ -1561,13 +1561,32 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         pending: PendingHostLoad,
         *,
         count_batch: bool = True,
+        finite_scheduler_frontier: bool = False,
     ) -> None:
-        """Bind a complete exact prefetch without materializing an unused plan."""
-        _require_exact_prefetch_layers(
-            pending.prefetched_layers,
-            self._model_layer_count,
-            consumer="stock external attention",
-        )
+        """Bind exact stock attention to eager or scheduler-owned publication.
+
+        Direct acquisition publishes the complete model before metadata binds
+        the stock consumer.  Scheduled-bulk acquisition deliberately retains
+        a finite global-link horizon: only layer zero must be published at this
+        edge, and each preceding numerical consumer refills the horizon.  Both
+        forms consume a complete *layer* fence; only the producer ownership
+        and lookahead depth differ.
+        """
+
+        if finite_scheduler_frontier:
+            if (
+                not pending.shared_acquisition_registered
+                or 0 not in pending.prefetched_layers
+            ):
+                raise RuntimeError(
+                    "scheduled stock attention has no initial acquisition frontier"
+                )
+        else:
+            _require_exact_prefetch_layers(
+                pending.prefetched_layers,
+                self._model_layer_count,
+                consumer="stock external attention",
+            )
         replacement = SglangForwardEpoch(
             plan=SglangForwardPlan(
                 bindings=bindings,
@@ -1585,9 +1604,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._stats["batches"] += 1
             self._stats["hicache_external_batches"] += 1
         self._stats["stock_prefetched_external_batches"] += 1
-        self._stats["stock_prefetch_metadata_fastpath_batches"] = (
-            self._stats.get("stock_prefetch_metadata_fastpath_batches", 0) + 1
-        )
+        if not finite_scheduler_frontier:
+            self._stats["stock_prefetch_metadata_fastpath_batches"] = (
+                self._stats.get("stock_prefetch_metadata_fastpath_batches", 0) + 1
+            )
 
     def init_forward_metadata(self, forward_batch: Any) -> None:
         metadata_profile_started = time.perf_counter_ns() if self._profile_cpu else 0
@@ -1724,9 +1744,33 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     not in {"calibration_probe", "consumer_policy_probe"}
                 )
                 if ready_stock_fastpath or not selected.uses_dependency_protocol:
-                    self._host_acquisition.publish_missing(pending)
+                    finite_scheduler_frontier = bool(
+                        selected.uses_scheduler_bound_acquisition
+                        and pending.shared_acquisition_registered
+                        and not ready_stock_fastpath
+                    )
+                    # A2 changes only the numerical consumer.  Its producer
+                    # remains the finite shared EDF queue; publishing every
+                    # missing layer here would create a second transport owner
+                    # whose later queue refill duplicates already-published
+                    # layers.  Direct/AUTO-ready paths and an excluded first
+                    # calibration batch have no live shared owner and retain
+                    # complete lease-local publication.
+                    if not finite_scheduler_frontier:
+                        self._host_acquisition.publish_missing(pending)
+                    elif 0 not in pending.prefetched_layers:
+                        self._host_acquisition.ensure_layer_published(pending, 0)
                     self._stock_forward = True
-                    self._activate_stock_prefetch(bindings, pending, count_batch=False)
+                    self._activate_stock_prefetch(
+                        bindings,
+                        pending,
+                        count_batch=False,
+                        finite_scheduler_frontier=finite_scheduler_frontier,
+                    )
+                    if finite_scheduler_frontier:
+                        self._stats["stock_scheduled_frontier_batches"] = (
+                            self._stats.get("stock_scheduled_frontier_batches", 0) + 1
+                        )
                     bulk_counter = (
                         "host_scheduled_bulk_batches"
                         if selected.form is HostExecutionForm.SCHEDULED_BULK
@@ -2144,6 +2188,24 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
 
         pending = batch.pending_host_load
         local_layer = int(layer.layer_id) - self._model_start_layer
+        host_execution = batch.host_execution
+        if (
+            pending is not None
+            and pending.shared_acquisition_registered
+            and host_execution is not None
+            and host_execution.uses_dependency_protocol
+            and local_layer not in pending.prefetched_layers
+        ):
+            # A registered global producer is the sole acquisition owner.
+            # Publish this layer's finite event frontier before dispatch so A3
+            # cannot fall through to the legacy native-demand producer.
+            self._host_acquisition.ensure_layer_published(pending, local_layer)
+        if pending is not None and local_layer in pending.prefetched_layers:
+            self._host_acquisition.plan_published_consumer_layer(
+                pending,
+                batch,
+                local_layer,
+            )
         acquisition = (
             None if batch.acquisition is None else batch.acquisition.layer(local_layer)
         )
@@ -2577,6 +2639,18 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if acquisition is None:
             raise RuntimeError("stock external attention has no acquisition owner")
         local_layer = int(layer.layer_id) - self._model_start_layer
+        pending = batch.pending_host_load
+        if (
+            pending is not None
+            and pending.shared_acquisition_registered
+            and local_layer not in pending.prefetched_layers
+        ):
+            # The finite cross-batch horizon may be occupied by an earlier
+            # deadline when this whole-layer consumer arrives.  Wait for EDF
+            # to publish this layer's fence; never create an eager second
+            # producer.  A3 avoids this whole-layer publication dependency by
+            # consuming independently ready acquisition groups.
+            self._host_acquisition.ensure_layer_published(pending, local_layer)
         published = acquisition.layer(local_layer)
         if published is None:
             raise RuntimeError(

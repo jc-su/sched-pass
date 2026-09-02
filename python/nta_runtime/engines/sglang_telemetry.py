@@ -156,6 +156,9 @@ class SglangTelemetryConfig:
 _ZERO_COUNTERS = (
     "host_direct_batches",
     "host_scheduled_bulk_batches",
+    "stock_scheduled_frontier_batches",
+    "shared_acquisition_publication_waits",
+    "shared_acquisition_publication_wait_rounds",
     "host_device_bulk_batches",
     "host_incremental_batches",
     "host_typed_mixed_batches",

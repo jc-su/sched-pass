@@ -156,6 +156,35 @@ def main() -> None:
     assert opportunity["tier_overlap_candidate_requests"] == 1
     assert opportunity["selection_uses_measured_performance"] is False
     assert opportunity_stratum(opportunity) == "capacity_crossing_with_compute_wave"
+    precomputed_replay = build_replay_window(
+        replay_source,
+        measured_start=2,
+        warmup_requests=2,
+        measured_requests=2,
+        context_length=64,
+        input_margin_tokens=4,
+        max_output_tokens=8,
+        device_token_capacity=32,
+        consumer_wave_tokens=16,
+        time_scale=0.5,
+        page_id_rows=tuple(input_page_ids(row) for row in replay_source),
+    )
+    assert precomputed_replay == replay
+    try:
+        build_replay_window(
+            replay_source,
+            measured_start=2,
+            warmup_requests=2,
+            measured_requests=2,
+            context_length=64,
+            input_margin_tokens=4,
+            max_output_tokens=8,
+            page_id_rows=(input_page_ids(replay_source[0]),),
+        )
+    except ValueError as error:
+        assert "precomputed replay pages" in str(error)
+    else:
+        raise AssertionError("mismatched precomputed replay pages were accepted")
     exact_partial_block = build_replay_window(
         [
             {

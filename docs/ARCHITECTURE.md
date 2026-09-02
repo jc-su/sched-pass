@@ -42,6 +42,22 @@ The serving path is exact. Selection is an input trace, not a hidden runtime
 policy. Conventional, late-bound, and exact-partial forms
 share the same work-unit identity and demand trace.
 
+Framework discovery and runtime identity are deliberately separate lifecycle
+edges.  SGLang's load-operation hook records a slot-independent exact demand;
+only after `ScheduleBatch` allocates request-pool slots does the acquisition
+owner bind `(request, generation, layer, exact segment, resource version)`.
+Consequently neither an early framework hook nor the LLVM pass guesses a
+runtime slot or generation, and slot reuse cannot inherit stale readiness.
+
+Scheduler-bound Host acquisition has exactly one physical producer.  Exact
+groups from all active leases enter one finite, work-conserving EDF link queue;
+the queue owns transfer submission, staging/tenant reservations, readiness
+publication, and retirement.  A whole-layer consumer waits for the queue's
+published layer fence, while a progressive consumer may run independently
+ready group waves.  Neither consumer is allowed to fill a missing frontier by
+issuing an eager duplicate transfer.  The finite publication horizon is a
+transport-resource limit, not a special case for model layer zero.
+
 In the SGLang HiCache path, resident-only forwards take the framework's
 reference FlashInfer wrapper. This is an intentional zero-regression boundary:
 the compiler/runtime mechanism is entered only when that forward has an
