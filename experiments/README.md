@@ -9,7 +9,7 @@ it does not define a second runtime state machine or native ABI.
 
 | Question | Entrypoints | Output gate |
 | --- | --- | --- |
-| RQ0 workload opportunity | `prepare_bailian.py`, `validate_workload.py`, `analyze_workload.py` | structure/demand/arrival digests and explicit arrival provenance |
+| Prerequisite workload opportunity | `prepare_bailian.py`, `validate_workload.py`, `analyze_workload.py` | structure/demand/arrival digests and explicit arrival provenance |
 | Physical tier capability | `qualify_tiers.py`, `validate_tier_qualification.py` | exact HBM/host/NVMe/DAX qualification; missing hardware is skip |
 | Hardware preflight | `inspect_hardware.py` | read-only GPU/NVMe/CXL/DAX capability inventory; never binds devices |
 | RQ1--RQ3 paired execution | `run_evaluation.py`, `analyze_evaluation.py` | exact demand, paired metadata, six strata, causal comparisons, bootstrap CI, finite-window occupancy accounting |
@@ -68,7 +68,7 @@ consumption from a whole-layer stock consumer. It requires a concrete command
 for every arm and validates
 the resulting spec before writing it; no missing arm is silently treated as a
 baseline.
-Generated specifications carry `evaluation_profile=osdi-complete`. The runner
+Generated specifications carry `evaluation_profile=mechanism-study`. The runner
 requires all A0--A3 arms, all three causal boundaries in every declared
 stratum, at least six strata, and a machine-readable numerical consumer
 contract for every arm. `{trial_output}` is bound to a unique result path for
@@ -121,7 +121,7 @@ runtime.
 - Require a real tier qualification artifact before any NVMe/DAX trial.
 - Treat modeled matrix timing, missing profilers, and unavailable hardware as
   contract/status evidence, never as serving speedup evidence.
-- An `osdi-complete` artifact must include a `performance/` directory with
+- A `mechanism-study` artifact must include a `performance/` directory with
   `profile.json`, `baseline.json`, `measured.json`, `regression.json`, and
   `capture.json`. Compose it with `capture_performance.py`; do not hand-copy
   evidence files:

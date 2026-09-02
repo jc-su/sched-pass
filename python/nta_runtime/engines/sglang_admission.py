@@ -26,6 +26,7 @@ def _nonnegative_environment(name: str, default: int) -> int:
 class AdmissionConfig:
     enabled: bool
     max_delay_ns: int
+    max_staged_batches: int = 4
 
     @classmethod
     def from_environment(cls) -> "AdmissionConfig":
@@ -33,6 +34,12 @@ class AdmissionConfig:
             enabled=os.environ.get("NTA_EXECUTION_ADMISSION", "1") != "0",
             max_delay_ns=1_000
             * _nonnegative_environment("NTA_EXECUTION_ADMISSION_MAX_DELAY_US", 10_000),
+            max_staged_batches=max(
+                1,
+                _nonnegative_environment(
+                    "NTA_EXECUTION_ADMISSION_MAX_STAGED_BATCHES", 4
+                ),
+            ),
         )
 
 
@@ -99,11 +106,17 @@ class AcquisitionAdmission:
     ) -> None:
         self._config = config
         self._clock = clock
-        self._staged: _StagedBatch | None = None
+        if config.max_staged_batches <= 0:
+            raise ValueError("acquisition admission staging bound must be positive")
+        self._staged: list[_StagedBatch] = []
 
     @property
     def has_staged_batch(self) -> bool:
-        return self._staged is not None
+        return bool(self._staged)
+
+    @property
+    def can_stage_batch(self) -> bool:
+        return len(self._staged) < self._config.max_staged_batches
 
     def consider(
         self,
@@ -115,8 +128,8 @@ class AcquisitionAdmission:
     ) -> Any | None:
         if batch is None or not self._config.enabled or bridge is None:
             return batch
-        if self._staged is not None:
-            raise RuntimeError("acquisition admission already owns a batch")
+        if not self.can_stage_batch:
+            raise RuntimeError("acquisition admission staging ring is full")
         running = (
             running_batch
             if running_batch is not None
@@ -179,21 +192,22 @@ class AcquisitionAdmission:
             bridge.record_admission(admission_released_uncalibrated=1)
             return batch
         self._record_feasibility(bridge, feasibility)
-        if unpublished and (
-            feasibility.required_initial_slack_ns > self._config.max_delay_ns
-        ):
-            # Starting a finite queue that cannot recover inside the policy's
-            # SLO cap would turn exact metadata binding into avoidable delay.
-            # Leave the link untouched and bind exact work immediately.
-            bridge.record_admission(admission_released_partial_slo=1)
-            return batch
         if unpublished:
+            # Admission decides when numerical execution may start; it must not
+            # leave an otherwise idle transport link untouched merely because a
+            # deadline is currently infeasible. Issue the bounded shared-link
+            # horizon first, then enforce the hold-time cap independently.
             bridge.start_admission_acquisition(consumer_index, batch)
             progress = bridge.progress(consumer_index)
             if progress is None or progress.published_layers == 0:
                 raise RuntimeError(
                     "HiCache admission frontier did not publish transfer progress"
                 )
+        if unpublished and (
+            feasibility.required_initial_slack_ns > self._config.max_delay_ns
+        ):
+            bridge.record_admission(admission_released_partial_slo=1)
+            return batch
         if feasibility.feasible:
             bridge.record_admission(admission_released_feasible=1)
             return batch
@@ -202,11 +216,13 @@ class AcquisitionAdmission:
             return batch
 
         now = self._clock()
-        self._staged = _StagedBatch(
-            batch,
-            bridge,
-            consumer_index,
-            now,
+        self._staged.append(
+            _StagedBatch(
+                batch,
+                bridge,
+                consumer_index,
+                now,
+            )
         )
         bridge.record_admission(
             admission_delayed_batches=1,
@@ -244,77 +260,80 @@ class AcquisitionAdmission:
             )
 
     def poll(self, scheduler: Any, *, running_batch: Any | None = None) -> Any | None:
-        staged = self._staged
-        if staged is None:
-            raise RuntimeError("acquisition admission has no staged batch")
+        if not self._staged:
+            return None
         running = (
             running_batch
             if running_batch is not None
             else getattr(scheduler, "running_batch", None)
         )
         now = self._clock()
-        elapsed = now - staged.started_ns
-        staged.bridge.record_admission(admission_delay_polls=1)
+        for index, staged in enumerate(tuple(self._staged)):
+            elapsed = now - staged.started_ns
+            staged.bridge.record_admission(admission_delay_polls=1)
+            progress = staged.bridge.progress(staged.consumer_index)
 
-        progress = staged.bridge.progress(staged.consumer_index)
-
-        reason = ""
-        if staged.force_release:
-            reason = "cancelled"
-        elif progress is None:
-            reason = "lost"
-        elif progress.complete:
-            reason = "complete"
-        elif elapsed >= self._config.max_delay_ns:
-            reason = "slo_cap"
-        elif not _has_runnable_decode(running):
-            reason = "no_decode"
-        else:
-            feedback_reason = _compiler_feedback_reason(running, staged.bridge)
-            if feedback_reason is not None:
-                reason = f"feedback_{feedback_reason}"
+            reason = ""
+            if staged.force_release:
+                reason = "cancelled"
+            elif progress is None:
+                reason = "lost"
+            elif progress.complete:
+                reason = "complete"
+            elif elapsed >= self._config.max_delay_ns:
+                reason = "slo_cap"
+            elif not _has_runnable_decode(running):
+                reason = "no_decode"
             else:
-                feasibility = self._feasibility(
-                    staged.bridge, staged.batch, progress
-                )
-                if feasibility is None:
-                    reason = "uncalibrated"
+                feedback_reason = _compiler_feedback_reason(running, staged.bridge)
+                if feedback_reason is not None:
+                    reason = f"feedback_{feedback_reason}"
                 else:
-                    self._record_feasibility(staged.bridge, feasibility)
-                    if feasibility.feasible:
-                        reason = "feasible"
-        if not reason:
-            staged.bridge.record_admission(admission_hidden_decode_steps=1)
-            return None
+                    feasibility = self._feasibility(
+                        staged.bridge, staged.batch, progress
+                    )
+                    if feasibility is None:
+                        reason = "uncalibrated"
+                    else:
+                        self._record_feasibility(staged.bridge, feasibility)
+                        if feasibility.feasible:
+                            reason = "feasible"
+            if not reason:
+                staged.bridge.record_admission(admission_hidden_decode_steps=1)
+                continue
 
-        staged.bridge.record_admission(
-            admission_delay_ns=elapsed,
-            **{f"admission_released_{reason}": 1},
-        )
-        self._staged = None
-        return staged.batch
+            staged.bridge.record_admission(
+                admission_delay_ns=elapsed,
+                **{f"admission_released_{reason}": 1},
+            )
+            self._staged.pop(index)
+            return staged.batch
+        return None
 
     def cancel(self, request_id: str, *, all: bool) -> None:
-        staged = self._staged
-        if staged is None:
-            return
-        matches = [
-            request
-            for request in tuple(getattr(staged.batch, "reqs", ()) or ())
-            if all or str(getattr(request, "rid", "")).startswith(request_id)
-        ]
-        if not matches:
-            return
         from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
-        for request in matches:
-            if not request.finished():
-                request.to_finish = FINISH_ABORT()
-        staged.force_release = True
-        staged.bridge.record_admission(admission_cancelled_requests=len(matches))
+        for staged in self._staged:
+            matches = [
+                request
+                for request in tuple(getattr(staged.batch, "reqs", ()) or ())
+                if all or str(getattr(request, "rid", "")).startswith(request_id)
+            ]
+            if not matches:
+                continue
+            for request in matches:
+                if not request.finished():
+                    request.to_finish = FINISH_ABORT()
+            staged.force_release = True
+            staged.bridge.record_admission(
+                admission_cancelled_requests=len(matches)
+            )
 
     @staticmethod
     def _feasibility(bridge: Any, batch: Any, progress: Any) -> Any | None:
+        shared = getattr(bridge, "admission_feasibility", None)
+        if callable(shared):
+            return shared(progress.consumer_index, batch, progress)
         model = bridge.deadline_model(progress.consumer_index, batch)
         if model is None:
             return None
@@ -380,7 +399,11 @@ def route_prefill_admission(
     running_batch = _prefill_running_batch(args, kwargs)
     state = _state(scheduler)
     if state.has_staged_batch:
-        return state.poll(scheduler, running_batch=running_batch), running_batch
+        released = state.poll(scheduler, running_batch=running_batch)
+        if released is not None:
+            return released, running_batch
+        if not state.can_stage_batch:
+            return None, running_batch
     batch, next_running_batch = _split_prefill_result(
         original(scheduler, *args, **kwargs)
     )

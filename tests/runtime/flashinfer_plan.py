@@ -499,6 +499,43 @@ def _check_stream_ordered_multiwave() -> None:
         assert compute.waits[-2:] == list(ready)
         assert event_plan.consumed == [compute]
 
+        cold_plan = _Plan()
+        cold_phases = _Phases()
+        cold_wrapper = _NumericalWrapper()
+        cold_ready = (_Event(), _Event())
+        enqueue_event_partitioned_attention(
+            runtime,  # type: ignore[arg-type]
+            cold_plan,  # type: ignore[arg-type]
+            cold_phases,  # type: ignore[arg-type]
+            cold_wrapper,
+            object(),
+            object(),
+            object(),
+            ready_events=cold_ready,
+            direct_work_count=0,
+            wave_work_counts=(2, 2),
+            prepare_partition=True,
+            sm_scale=1.0,
+            stream=compute,
+        )
+        assert cold_phases.calls == [
+            ("event_partition", cold_plan, 0, 2, compute)
+        ]
+        assert cold_wrapper.launches == [
+            (
+                2,
+                PREACQUIRED_LAUNCH_FLAGS | RUNNABLE_WORK | SKIP_MERGE,
+            ),
+            (
+                2,
+                PREACQUIRED_LAUNCH_FLAGS
+                | RUNNABLE_WORK
+                | (2 << RUNNABLE_OFFSET_SHIFT),
+            ),
+        ]
+        assert compute.waits[-2:] == list(cold_ready)
+        assert cold_plan.consumed == [compute]
+
     finally:
         flashinfer_runtime._stream_is_capturing = original_capture
 

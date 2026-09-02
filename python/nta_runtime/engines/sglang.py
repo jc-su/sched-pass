@@ -44,8 +44,10 @@ from nta_runtime.engines.sglang_acquisition import (
 from nta_runtime.engines.sglang_transfer import HostMoverController
 from nta_runtime.engines.sglang_pipeline import SglangHostTransport
 from nta_runtime.engines.sglang_nvme import (
+    NvmeSchedulingMode,
     SglangNvmeAcquisitionPipeline,
 )
+from nta_runtime.engines.sglang_nvme_policy import plan_nvme_consumer_policy
 from nta_runtime.engines.sglang_nvme_resources import prepare_sglang_nvme_resources
 from nta_runtime.engines.sglang_acquisition_contract import (
     AcquisitionTier,
@@ -479,6 +481,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 regions=nvme_resources.regions,
                 scratch=nvme_resources.scratch,
                 stats=self._stats,
+                # SGLang currently binds exact NVMe demand when one forward's
+                # FlashInfer metadata becomes active. Admission-held batches
+                # are not yet one atomically published GPU cohort, so use the
+                # finite-cohort contract explicitly.
+                scheduling_mode=NvmeSchedulingMode.EXCLUSIVE_ORDERED,
             )
             if self._tier_service.is_nvme
             else None
@@ -637,6 +644,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             consumer_calibration=self._consumer_calibration,
             minimum_consumer_gain=self._host_cost_model.minimum_predicted_gain,
             transport=self._host_transport,
+            request_adapter=self._request_adapter,
+            staging_capacity_bytes=self._resources.config.staging_byte_capacity,
+            tenant_specs=bootstrap.tenant_specs,
+            max_inflight_groups=self._execution_config.protocol.max_inflight_units,
             stats=self._stats,
         )
         self._operator_profiles: list[_OperatorProfile] = []
@@ -704,6 +715,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             self._hicache.set_admission_acquisition_callbacks(
                 prepare=self._host_acquisition.prepare_admission,
                 start=self._host_acquisition.start_admission,
+            )
+            self._hicache.set_acquisition_progress_callback(
+                self._host_acquisition.poll_and_pump_shared_acquisition
+            )
+            self._hicache.set_admission_feasibility_callback(
+                self._host_acquisition.admission_feasibility
+            )
+            self._hicache.set_acquisition_retire_callback(
+                self._host_acquisition.cancel_shared_acquisition
             )
             if tuning.requires_typed_host_modules(
                 bootstrap,
@@ -1664,7 +1684,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     raise RuntimeError("host-staged batch has no execution decision")
                 self._record_host_selection(selected)
                 if (
-                    (pending.acquisition is None or pending.acquisition.model is None)
+                    pending.shared_deadline_model is None
+                    and (
+                        pending.acquisition is None
+                        or pending.acquisition.model is None
+                    )
                     and selected.uses_scheduler_bound_acquisition
                     and self._host_acquisition.proactive_layer_queue_enabled
                     and self._host_acquisition.prepare_owner(
@@ -1677,8 +1701,11 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         self._stats.get("metadata_acquisition_groups_prepared", 0) + 1
                     )
                 if (
-                    pending.acquisition is not None
-                    and not pending.acquisition.fully_published
+                    pending.shared_acquisition_registered
+                    or (
+                        pending.acquisition is not None
+                        and not pending.acquisition.fully_published
+                    )
                 ):
                     self._host_acquisition.submit(pending)
                 prefetch_fully_published = len(pending.prefetched_layers) == (
@@ -1806,6 +1833,23 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 typed_wrappers = self._adopt_typed_forward_metadata(
                     forward_batch, stock_metadata
                 )
+                def select_nvme_progressive_layers(
+                    geometry, frontier, window_count
+                ):
+                    return plan_nvme_consumer_policy(
+                        forward_batch=forward_batch,
+                        pending=pending,
+                        batch=batch,
+                        geometry=geometry,
+                        window_count=window_count,
+                        wave_count=0 if frontier is None else frontier.wave_count,
+                        layer_calibration=self._layer_calibration,
+                        consumer_calibration=self._consumer_calibration,
+                        model_layer_count=self._model_layer_count,
+                        minimum_gain=self._host_cost_model.minimum_predicted_gain,
+                        stats=self._stats,
+                    )
+
                 self._require_attention_executor().prepare_nvme_batch(
                     batch=batch,
                     wrappers=typed_wrappers,
@@ -1815,6 +1859,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                         self.token_to_kv_pool._get_key_buffer(layer_id),
                         self.token_to_kv_pool._get_value_buffer(layer_id),
                     ),
+                    select_progressive_layers=select_nvme_progressive_layers,
                 )
         except Exception as error:
             try:
@@ -2139,9 +2184,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._stats.get("stream_ordered_prefetch_events", 0) + 1
                 )
         typed_observation_required = (
-            batch.host_execution is not None
-            and batch.host_execution.selection_reason == "calibration_probe"
-            and not batch.incremental_setup_observed
+            (
+                batch.host_execution is not None
+                and batch.host_execution.selection_reason == "calibration_probe"
+                and not batch.incremental_setup_observed
+            )
+            or (
+                pending is not None
+                and pending.arrival_profile_active
+            )
         )
         verify_attention = self._verification.attention
         if verify_attention and self._verification.attention_mixed_only:
@@ -2245,14 +2296,23 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         )
         partial_policy_probe = (
             dispatch.kind is AttentionDispatchKind.ARRIVING_PREFETCH
-            and batch.host_execution is not None
-            and batch.host_execution.selection_reason == "consumer_policy_probe"
             and pending is not None
             and pending.arrival_profile_key is not None
+            and pending.consumer_policy_probe
+        )
+        stock_policy_profile = (
+            dispatch.kind is AttentionDispatchKind.PRELOADED
+            and pending is not None
+            and pending.arrival_profile_active
         )
         gpu_profile = None
         partial_dispatch_ready = None
-        if self._profile_gpu or service_probe or partial_policy_probe:
+        if (
+            self._profile_gpu
+            or service_probe
+            or partial_policy_probe
+            or stock_policy_profile
+        ):
             gpu_profile = (
                 torch.cuda.Event(enable_timing=True),
                 torch.cuda.Event(enable_timing=True),
@@ -2347,6 +2407,15 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     dispatch_ready=partial_dispatch_ready,
                     finish=gpu_profile[1],
                     partition_prepared=outcome.partition_prepared,
+                )
+            elif stock_policy_profile:
+                if pending is None:  # pragma: no cover - guarded above
+                    raise RuntimeError("stock policy profile lost its tier lease")
+                self._consumer_calibration.record_stock_profile(
+                    pending=pending,
+                    global_layer=int(layer.layer_id),
+                    start=gpu_profile[0],
+                    finish=gpu_profile[1],
                 )
             service_prediction_ns = None
             service_prediction_scale = None

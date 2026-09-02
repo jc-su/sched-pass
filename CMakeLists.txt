@@ -527,6 +527,16 @@ if(Python3_Interpreter_FOUND)
       ${CMAKE_CURRENT_SOURCE_DIR}/experiments/validate_evaluation.py
   )
   add_test(
+    NAME nta-osdi-campaign
+    COMMAND
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime/osdi_campaign.py
+  )
+  set_tests_properties(
+    nta-osdi-campaign PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  add_test(
     NAME nta-bailian-workload
     COMMAND
       ${Python3_EXECUTABLE}

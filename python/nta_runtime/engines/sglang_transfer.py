@@ -1342,6 +1342,7 @@ def build_host_transfer_lease_plan(
     object_id_bases: tuple[int, ...],
     object_version: int,
     sm_acquisition_waves: int,
+    preferred_wave_row_ends: tuple[int, ...] = (),
 ) -> HostTransferLeasePlan:
     """Materialize stable K/V descriptors exactly once for one HiCache lease."""
 
@@ -1354,6 +1355,13 @@ def build_host_transfer_lease_plan(
         or sm_acquisition_waves <= 0
     ):
         raise ValueError("host transfer lease layer geometry is invalid")
+    if preferred_wave_row_ends and (
+        tuple(sorted(set(preferred_wave_row_ends))) != preferred_wave_row_ends
+        or preferred_wave_row_ends[0] <= 0
+        or preferred_wave_row_ends[-1] != mover.row_count
+        or len(preferred_wave_row_ends) > sm_acquisition_waves
+    ):
+        raise ValueError("preferred Host completion waves are invalid")
     transfer_count = mover.row_count
     device_pool = getattr(controller, "mem_pool_device")
     host_pool = getattr(controller, "mem_pool_host")
@@ -1377,7 +1385,10 @@ def build_host_transfer_lease_plan(
     # is available rather than publishing optimistic partial readiness.
     wave_count = sm_acquisition_wave_count(mover, sm_acquisition_waves)
     wave_row_ends: tuple[int, ...] = ()
-    if wave_count:
+    if wave_count and not use_copy and preferred_wave_row_ends:
+        wave_row_ends = preferred_wave_row_ends
+        wave_count = len(wave_row_ends)
+    elif wave_count:
         covered_rows = mover.row_count
         quotient, remainder = divmod(covered_rows, wave_count)
         cursor = 0

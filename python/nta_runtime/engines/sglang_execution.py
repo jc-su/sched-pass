@@ -48,9 +48,12 @@ from nta_runtime.engines.sglang_state import (
     _OperatorProfile,
 )
 from nta_runtime.engines.sglang_nvme import (
+    NvmeBatchGeometry,
+    NvmeEventFrontier,
     NvmeForwardAcquisition,
     SglangNvmeAcquisitionPipeline,
 )
+from nta_runtime.runtime import INVALID_INDEX
 
 
 class AttentionDispatchKind(str, Enum):
@@ -213,12 +216,18 @@ def select_attention_dispatch(
             and host_execution is None
         ):
             raise RuntimeError("progressive Host attention has no execution decision")
+        progressive_form = (
+            host_execution is not None
+            and host_execution.uses_dependency_protocol
+            and host_execution.overlap_initial
+            if acquisition.tier is AcquisitionTier.HOST_STAGED
+            else host_execution is None
+            and acquisition.consumer_plan is AcquisitionConsumerPlan.PREACQUIRED
+        )
         arriving = (
             progressive_consumer_planned
             and acquisition.progressive
-            and host_execution is not None
-            and host_execution.uses_dependency_protocol
-            and host_execution.overlap_initial
+            and progressive_form
             and not prefetch_event_ordered
             and not acquisition.ready_event.query()
         )
@@ -327,6 +336,9 @@ class SglangAttentionExecutor:
         ordering_stream: torch.cuda.Stream,
         kv_cache_for_layer: Callable[[int], tuple[torch.Tensor, torch.Tensor]],
         tile_compute_ns: int,
+        select_progressive_layers: Callable[
+            [NvmeBatchGeometry, NvmeEventFrontier | None, int], frozenset[int]
+        ],
     ) -> None:
         """Bind exact consumers and enqueue every layer's NVMe producer."""
 
@@ -344,18 +356,37 @@ class SglangAttentionExecutor:
             for semantic in batch.semantic_plans.values()
         ) * tile_compute_ns
 
-        def prepare_consumers(stream: torch.cuda.Stream) -> None:
+        def prepare_consumers(
+            stream: torch.cuda.Stream,
+            geometry: NvmeBatchGeometry,
+            frontier: NvmeEventFrontier | None,
+        ) -> None:
             for wrapper in wrappers:
                 semantic = batch.semantic_plans[id(wrapper)]
+                completion_classes = (
+                    None
+                    if frontier is None
+                    else tuple(
+                        INVALID_INDEX
+                        if group is None
+                        else frontier.group_wave_indices[group]
+                        for group in geometry.groups_for_wrapper(id(wrapper))
+                    )
+                )
                 plan = self._materializer.upload_preacquired_plan(
                     batch,
                     wrapper,
                     semantic.schedule,
                     semantic.topology,
+                    completion_classes=completion_classes,
                     stream=stream,
                 )
                 allocation = self._materializer.require_allocation(wrapper)
-                if plan.has_external or allocation.object_count != 0:
+                if (
+                    allocation.object_count != 0
+                    or plan.has_external != (frontier is not None)
+                    or allocation.event_partitioned != (frontier is not None)
+                ):
                     raise RuntimeError(
                         "event-ready NVMe consumer retained transport ownership"
                     )
@@ -365,6 +396,7 @@ class SglangAttentionExecutor:
             bindings=batch.bindings,
             ordering_stream=ordering_stream,
             prepare_consumers=prepare_consumers,
+            select_progressive_layers=select_progressive_layers,
             kv_cache_for_layer=kv_cache_for_layer,
             inter_layer_compute_ns=inter_layer_compute_ns,
         )
@@ -489,7 +521,7 @@ class SglangAttentionExecutor:
                     f"{getattr(getattr(allocation, 'plan', None), 'work_item_count', None)} "
                     f"planned_wrappers={planned}"
                 )
-            if allocation.plan.has_external:
+            if allocation.plan.has_external and not allocation.event_partitioned:
                 raise RuntimeError(
                     "event-complete attention retained transport dependencies"
                 )
@@ -554,6 +586,23 @@ class SglangAttentionExecutor:
             )
             return AttentionDispatchOutcome()
         if dispatch.kind is AttentionDispatchKind.ARRIVING_PREFETCH:
+            if (
+                dispatch.acquisition is not None
+                and dispatch.acquisition.tier is AcquisitionTier.NVME
+            ):
+                return self._execute_nvme_arriving_prefetch(
+                    dispatch=dispatch,
+                    batch=batch,
+                    wrapper=wrapper,
+                    q=q,
+                    kv_cache=kv_cache,
+                    output=output,
+                    layer=layer,
+                    stream=stream,
+                    run_options=run_options,
+                    tile_compute_ns=tile_compute_ns,
+                    dispatch_ready_profile=dispatch_ready_profile,
+                )
             return self._execute_arriving_prefetch(
                 dispatch=dispatch,
                 batch=batch,
@@ -583,6 +632,105 @@ class SglangAttentionExecutor:
                 run_options=run_options,
             )
         raise RuntimeError("host-demand attention reached the non-host executor")
+
+    def _execute_nvme_arriving_prefetch(
+        self,
+        *,
+        dispatch: AttentionDispatch,
+        batch: SglangForwardEpoch,
+        wrapper: Any,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        output: torch.Tensor,
+        layer: Any,
+        stream: torch.cuda.Stream,
+        run_options: dict[str, Any],
+        tile_compute_ns: int,
+        dispatch_ready_profile: torch.cuda.Event | None,
+    ) -> AttentionDispatchOutcome:
+        """Consume exact NVMe groups as their finite packet waves complete."""
+
+        acquisition = dispatch.acquisition
+        semantic = batch.semantic_plans.get(id(wrapper))
+        if (
+            acquisition is None
+            or acquisition.tier is not AcquisitionTier.NVME
+            or semantic is None
+        ):
+            raise RuntimeError("progressive NVMe dispatch lost its typed ownership")
+        allocation = self._materializer.require_allocation(wrapper)
+        direct_work_count = allocation.direct_work_count
+        wave_work_counts = allocation.event_wave_work_counts
+        nonempty_wave_count = sum(count > 0 for count in wave_work_counts)
+        if (
+            allocation.object_count != 0
+            or not allocation.event_partitioned
+            or not allocation.plan.has_external
+            or not 0 <= direct_work_count < semantic.schedule.work_count
+            or len(wave_work_counts) != len(acquisition.wave_events)
+            or direct_work_count + sum(wave_work_counts)
+            != semantic.schedule.work_count
+            or nonempty_wave_count <= 0
+        ):
+            raise RuntimeError("progressive NVMe consumer has an invalid event partition")
+        partition_key = (
+            id(wrapper),
+            id(allocation.plan),
+            semantic.schedule.work_count,
+            direct_work_count,
+            wave_work_counts,
+        )
+        prepare_partition = batch.arriving_partition_key != partition_key
+        self._record_barrier_arrival(acquisition.ready_event, layer, stream)
+        if dispatch_ready_profile is not None:
+            dispatch_ready_profile.record(stream)
+        acquisition.owner.consume_layer(acquisition, stream, wait_for_ready=False)
+        enqueue_event_partitioned_attention(
+            self._runtime,
+            allocation.plan,
+            self._kernels.transport_program(),
+            wrapper,
+            q,
+            kv_cache,
+            output,
+            ready_events=acquisition.wave_events,
+            direct_work_count=direct_work_count,
+            wave_work_counts=wave_work_counts,
+            prepare_partition=prepare_partition,
+            sm_scale=layer.scaling,
+            stream=stream,
+            run_options=run_options,
+        )
+        batch.arriving_partition_key = partition_key
+        self._stats[
+            "arriving_partition_preparations"
+            if prepare_partition
+            else "arriving_partition_reuses"
+        ] = self._stats.get(
+            "arriving_partition_preparations"
+            if prepare_partition
+            else "arriving_partition_reuses",
+            0,
+        ) + 1
+        self._stats["mixed_dependency_layers"] += 1
+        self._stats["request_work_completed"] += semantic.schedule.work_count
+        self._stats["request_compute_completed_ns"] += (
+            semantic.schedule.work_count * tile_compute_ns
+        )
+        self._stats["event_ordered_incremental_launches"] = self._stats.get(
+            "event_ordered_incremental_launches", 0
+        ) + 1
+        self._stats["event_ordered_wave_launches"] = self._stats.get(
+            "event_ordered_wave_launches", 0
+        ) + nonempty_wave_count
+        self._stats["nvme_progressive_launches"] = self._stats.get(
+            "nvme_progressive_launches", 0
+        ) + 1
+        return AttentionDispatchOutcome(
+            progress_rounds=nonempty_wave_count,
+            progressive_consumer=True,
+            partition_prepared=prepare_partition,
+        )
 
     def _execute_arriving_prefetch(
         self,
@@ -748,7 +896,10 @@ class SglangAttentionExecutor:
             semantic = batch.semantic_plans.get(id(wrapper))
             if (
                 semantic is None
-                or allocation.plan.has_external
+                or (
+                    allocation.plan.has_external
+                    and not allocation.event_partitioned
+                )
                 or allocation.object_count != 0
                 or allocation.plan.work_item_count != semantic.schedule.work_count
             ):

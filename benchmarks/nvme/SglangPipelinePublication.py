@@ -408,7 +408,10 @@ class _Arm:
                 semantic_plans={0: self.semantic},
                 bindings=self.bindings,
                 ordering_stream=current,
-                prepare_consumers=lambda _stream: None,
+                prepare_consumers=lambda _stream, _geometry, _frontier: None,
+                select_progressive_layers=(
+                    lambda _geometry, _frontier, _windows: frozenset()
+                ),
                 kv_cache_for_layer=self._kv_cache,
                 inter_layer_compute_ns=100_000,
             )
@@ -416,7 +419,12 @@ class _Arm:
             prepare_stop = time.perf_counter_ns()
             gpu_stop.record(self.progress_stream)
             for acquired_layer in acquisition.layers:
-                self.pipeline.wait_layer(acquisition, acquired_layer, current)
+                self.pipeline.consume_layer(
+                    acquisition,
+                    acquired_layer,
+                    current,
+                    wait_for_ready=True,
+                )
             self.pipeline.record_consumer(acquisition, current)
             torch.cuda.synchronize()
             wall_stop = time.perf_counter_ns()

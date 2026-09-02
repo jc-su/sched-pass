@@ -51,9 +51,9 @@ from nta_runtime.engines.sglang_state import (
     _SemanticWrapperPlan,
 )
 from nta_runtime.engines.sglang_topology import (
-    capacity_constrained_acquisition_groups,
     group_external_pages_by_request,
     project_acquisition_slices,
+    project_scheduled_acquisition_groups,
     request_batch_heterogeneity,
     resolve_request_acquisitions,
 )
@@ -80,7 +80,7 @@ class SglangMetadataPlanner:
         profile_cpu: bool,
         stats: dict[str, Any],
     ) -> None:
-        if object_capacity <= 0 or page_size <= 0:
+        if min(object_capacity, page_size) <= 0:
             raise ValueError("SGLang metadata planner geometry must be positive")
         if grouping not in {"request", "tile"}:
             raise ValueError("SGLang metadata grouping must be request or tile")
@@ -336,10 +336,11 @@ class SglangMetadataPlanner:
             )
             for wrapper_id, schedule in schedules.items()
         }
+        if not pending.scheduled_acquisition_groups:
+            raise RuntimeError("host-staged semantic plan has no acquisition groups")
         acquisition_groups = {
-            wrapper_id: capacity_constrained_acquisition_groups(
-                dependencies,
-                maximum_groups=self._object_capacity // 2,
+            wrapper_id: project_scheduled_acquisition_groups(
+                dependencies, pending.scheduled_acquisition_groups
             )
             for wrapper_id, dependencies in acquisition_slices.items()
         }

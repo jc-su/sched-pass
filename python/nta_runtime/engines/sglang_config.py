@@ -375,7 +375,6 @@ class SglangExecutionTuning:
         frontier_enabled = (
             tier.is_host_staged
             and overlap_enabled
-            and not bootstrap.tenant_isolation_enabled
             and bootstrap.execution.host_execution_mode
             is not HostExecutionMode.DEVICE_BULK
         )

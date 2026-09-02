@@ -167,6 +167,19 @@ def main() -> None:
         1,
         1,
     )
+    aligned_transfer = build_host_transfer_lease_plan(
+        controller,
+        sm_lease,
+        row_geometry,
+        object_id_bases=(300, 400),
+        object_version=2,
+        sm_acquisition_waves=2,
+        preferred_wave_row_ends=(1, 3),
+    )
+    assert aligned_transfer.layers[0].wave_row_ends == (1, 3)
+    assert tuple(
+        item.index_count for item in aligned_transfer.layers[0].indexed_objects
+    ) == (1, 1, 2, 2)
     copy_lease = HostMoverLeasePlan(
         3,
         "copy_engine",

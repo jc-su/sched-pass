@@ -29,9 +29,17 @@ from nta_runtime.requests import RequestBinding
 
 
 @dataclass(frozen=True, slots=True)
-class NvmeAcquisitionGroupPlan:
-    """One physical K/V object pair and its generation-bound consumers."""
+class NvmeTransferPacketPlan:
+    """One physical K/V packet shared by generation-bound consumers.
 
+    This is deliberately not an exact acquisition group.  A direct run may
+    coalesce adjacent exact demand, while a source span may additionally read
+    rows that are discarded by compaction.  ``packet_index`` is a forward-local
+    join key used by exact groups; request-generation identity is attached only
+    after the layer resource version is known.
+    """
+
+    packet_index: int
     materialization: ContiguousPairRun | NvmeSourceSpan
     source_first: int
     destination_first: int | None
@@ -40,22 +48,47 @@ class NvmeAcquisitionGroupPlan:
 
     def __post_init__(self) -> None:
         if (
-            self.source_first < 0
+            self.packet_index < 0
+            or self.source_first < 0
             or (self.destination_first is not None and self.destination_first < 0)
             or self.row_count <= 0
             or not self.consumer_indices
             or tuple(sorted(set(self.consumer_indices))) != self.consumer_indices
         ):
-            raise ValueError("NVMe acquisition group has invalid exact ownership")
+            raise ValueError("NVMe transfer packet has invalid physical ownership")
+
+
+@dataclass(frozen=True, slots=True)
+class NvmeExactAcquisitionGroupPlan:
+    """One compiler-visible exact demand segment and its physical packets."""
+
+    group_index: int
+    request_index: int
+    segment_begin: int
+    segment_count: int
+    packet_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            min(self.group_index, self.request_index, self.segment_begin) < 0
+            or self.segment_count <= 0
+            or not self.packet_indices
+            or tuple(sorted(set(self.packet_indices))) != self.packet_indices
+        ):
+            raise ValueError("NVMe exact acquisition group is invalid")
+
+    @property
+    def segment_end(self) -> int:
+        return self.segment_begin + self.segment_count
 
 
 @dataclass(frozen=True, slots=True)
 class NvmeScopedMaterializationPlan:
-    """Request-owned materialization deduplicated within one tenant scope."""
+    """Physical materialization deduplicated within one tenant scope."""
 
     tenant_id: int
     plan: NvmeRunPlan | NvmeSpanPlan
-    groups: tuple[NvmeAcquisitionGroupPlan, ...]
+    packets: tuple[NvmeTransferPacketPlan, ...]
     span_scratch_offset: int = 0
 
 
@@ -92,9 +125,11 @@ class _PagePairKey:
 
 @dataclass(frozen=True, slots=True)
 class NvmeBatchGeometry:
-    """Layer-invariant exact source/destination geometry for one forward."""
+    """Layer-invariant exact-demand and physical geometry for one forward."""
 
     scopes: tuple[NvmeScopedMaterializationPlan, ...]
+    exact_groups: tuple[NvmeExactAcquisitionGroupPlan, ...]
+    work_group_indices: tuple[tuple[int, tuple[int | None, ...]], ...]
     row_bytes: tuple[int, int]
     object_count: int
     work_item_count: int
@@ -107,6 +142,12 @@ class NvmeBatchGeometry:
     scratch_bytes_per_layer: int
     direct_predicted_ns: int | None
     selected_predicted_ns: int | None
+
+    def groups_for_wrapper(self, wrapper_id: int) -> tuple[int | None, ...]:
+        for candidate, groups in self.work_group_indices:
+            if candidate == wrapper_id:
+                return groups
+        raise KeyError("NVMe geometry has no exact groups for wrapper")
 
 
 def plan_nvme_window_layer_capacity(
@@ -187,12 +228,15 @@ def plan_nvme_batch_geometry(
         raise ValueError("NVMe request bindings repeat an engine request index")
 
     pair_consumers: dict[_PagePairKey, set[int]] = defaultdict(set)
-    for semantic in semantic_plans.values():
+    request_pairs: dict[int, dict[_PagePairKey, None]] = defaultdict(dict)
+    work_pairs: dict[int, tuple[tuple[int, _PagePairKey | None], ...]] = {}
+    for wrapper_id, semantic in semantic_plans.items():
         if getattr(semantic, "dependency_kind", None) != "physical_pages":
             raise RuntimeError("NVMe acquisition requires physical-page semantics")
         schedule = semantic.schedule
         if len(schedule.request_indices) != len(semantic.page_pairs):
             raise RuntimeError("NVMe schedule and physical-page demand disagree")
+        wrapper_pairs: list[tuple[int, _PagePairKey | None]] = []
         for request_index, pair in zip(
             schedule.request_indices, semantic.page_pairs, strict=True
         ):
@@ -201,7 +245,15 @@ def plan_nvme_batch_geometry(
             if pair[0]:
                 if len(pair[0]) != len(pair[1]):
                     raise RuntimeError("NVMe source/destination pair is malformed")
-                pair_consumers[_PagePairKey(pair)].add(int(request_index))
+                key = _PagePairKey(pair)
+                pair_consumers[key].add(int(request_index))
+                request_pairs[int(request_index)].setdefault(key, None)
+                wrapper_pairs.append((int(request_index), key))
+            else:
+                if pair[1]:
+                    raise RuntimeError("NVMe direct work has destination-only demand")
+                wrapper_pairs.append((int(request_index), None))
+        work_pairs[int(wrapper_id)] = tuple(wrapper_pairs)
     if not pair_consumers:
         raise RuntimeError("NVMe external batch contains no physical demand")
 
@@ -408,6 +460,7 @@ def plan_nvme_batch_geometry(
             "exact span materialization"
         )
     scopes: list[NvmeScopedMaterializationPlan] = []
+    packet_index = 0
     for candidate in candidates:
         if granularity is NvmeGranularity.DIRECT:
             plan = materialize_nvme_run_plan(
@@ -416,46 +469,120 @@ def plan_nvme_batch_geometry(
             run_by_geometry = dict(
                 zip(candidate.direct.unique_runs, plan.unique_runs, strict=True)
             )
-            groups = tuple(
-                NvmeAcquisitionGroupPlan(
+            packets = tuple(
+                NvmeTransferPacketPlan(
+                    packet_index + offset,
                     run_by_geometry[geometry],
                     geometry[0],
                     geometry[1],
                     geometry[2],
                     owners,
                 )
-                for geometry, owners in candidate.direct_owners
+                for offset, (geometry, owners) in enumerate(candidate.direct_owners)
             )
+            packet_index += len(packets)
             scopes.append(
-                NvmeScopedMaterializationPlan(candidate.tenant_id, plan, groups)
+                NvmeScopedMaterializationPlan(candidate.tenant_id, plan, packets)
             )
             continue
         if candidate.span is None or len(candidate.span_owners) != len(
             candidate.span.spans
         ):
             raise RuntimeError("selected NVMe span plan is incomplete")
-        groups = tuple(
-            NvmeAcquisitionGroupPlan(
+        packets = tuple(
+            NvmeTransferPacketPlan(
+                packet_index + offset,
                 span,
                 span.source_first,
                 None,
                 span.source_row_count,
                 owners,
             )
-            for span, owners in zip(
-                candidate.span.spans, candidate.span_owners, strict=True
+            for offset, (span, owners) in enumerate(
+                zip(candidate.span.spans, candidate.span_owners, strict=True)
             )
         )
+        packet_index += len(packets)
         scopes.append(
             NvmeScopedMaterializationPlan(
                 candidate.tenant_id,
                 candidate.span,
-                groups,
+                packets,
                 candidate.span_scratch_offset,
             )
         )
+
+    all_packets = tuple(packet for scope in scopes for packet in scope.packets)
+    if tuple(packet.packet_index for packet in all_packets) != tuple(
+        range(len(all_packets))
+    ):
+        raise RuntimeError("NVMe transfer packets lost dense forward-local identity")
+
+    exact_groups: list[NvmeExactAcquisitionGroupPlan] = []
+    group_by_request_pair: dict[tuple[int, _PagePairKey], int] = {}
+    for request_index in sorted(request_pairs):
+        segment_begin = 0
+        for pair_key in sorted(request_pairs[request_index], key=lambda item: item.pair):
+            pair = pair_key.pair
+            mappings = set(zip(pair[0], pair[1], strict=True))
+            packet_indices: list[int] = []
+            covered: set[tuple[int, int]] = set()
+            for packet in all_packets:
+                if request_index not in packet.consumer_indices:
+                    continue
+                packet_end = packet.source_first + packet.row_count
+                packet_mappings = {
+                    (source, destination)
+                    for source, destination in mappings
+                    if packet.source_first <= source < packet_end
+                    and (
+                        packet.destination_first is None
+                        or destination - packet.destination_first
+                        == source - packet.source_first
+                    )
+                }
+                if not packet_mappings:
+                    continue
+                packet_indices.append(packet.packet_index)
+                covered.update(packet_mappings)
+            if covered != mappings:
+                raise RuntimeError(
+                    "NVMe physical packets do not cover one exact demand group"
+                )
+            group_index = len(exact_groups)
+            exact_groups.append(
+                NvmeExactAcquisitionGroupPlan(
+                    group_index,
+                    request_index,
+                    segment_begin,
+                    len(mappings),
+                    tuple(packet_indices),
+                )
+            )
+            group_by_request_pair[(request_index, pair_key)] = group_index
+            segment_begin += len(mappings)
+
+    work_group_indices = tuple(
+        (
+            wrapper_id,
+            tuple(
+                None
+                if pair_key is None
+                else group_by_request_pair[(request_index, pair_key)]
+                for request_index, pair_key in wrapper_pairs
+            ),
+        )
+        for wrapper_id, wrapper_pairs in work_pairs.items()
+    )
+    if not exact_groups or any(
+        len(groups) != len(work_pairs[wrapper_id])
+        for wrapper_id, groups in work_group_indices
+    ):
+        raise RuntimeError("NVMe exact demand groups do not cover compiler work")
     return NvmeBatchGeometry(
         tuple(scopes),
+        tuple(exact_groups),
+        work_group_indices,
         tuple(row_bytes),
         selected_objects,
         selected_work_items,

@@ -10,12 +10,20 @@ steady-state submission path.
 from __future__ import annotations
 
 from collections.abc import Callable, MutableMapping
+from dataclasses import dataclass
+import bisect
+import time
 from typing import TYPE_CHECKING, Any
 
 from nta_runtime.acquisition_scheduler import (
+    AcquisitionGroupIdentity,
     AcquisitionServiceCurve,
     LayerAcquisition,
     LayerAcquisitionModel,
+    SharedAcquisitionJob,
+    SharedAcquisitionQueue,
+    SharedAcquisitionState,
+    TenantCreditLedger,
 )
 from nta_runtime.adapters.sglang import SglangExecutionConfig
 from nta_runtime.engines.sglang_calibration import (
@@ -24,6 +32,7 @@ from nta_runtime.engines.sglang_calibration import (
     SglangLayerServiceCalibration,
 )
 from nta_runtime.engines.sglang_hicache import PendingHostLoad
+from nta_runtime.engines.sglang_contracts import LeaseAcquisitionGroup
 from nta_runtime.engines.sglang_pipeline import SglangHostTransport
 from nta_runtime.engines.sglang_planning import (
     calibration_probe_end,
@@ -39,6 +48,26 @@ from nta_runtime.execution_protocol import ProtocolKind
 
 if TYPE_CHECKING:
     from nta_runtime.engines.sglang_state import SglangForwardEpoch
+
+
+@dataclass(slots=True)
+class _SharedHostCohort:
+    pending: PendingHostLoad
+    local_layer: int
+    identities: tuple[AcquisitionGroupIdentity, ...]
+    absolute_row_ends: tuple[int, ...]
+    consumer_ordered: bool = False
+    cancel_requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SharedHostAdmissionFeasibility:
+    """SGLang view of one global shared-link policy simulation."""
+
+    ready_prefix_layers: int
+    feasible: bool
+    first_missed_layer: int | None
+    required_initial_slack_ns: int
 
 
 class SglangHostAcquisitionCoordinator:
@@ -59,6 +88,10 @@ class SglangHostAcquisitionCoordinator:
         consumer_calibration: SglangConsumerPolicyCalibration,
         minimum_consumer_gain: float,
         transport: SglangHostTransport,
+        request_adapter: Any,
+        staging_capacity_bytes: int,
+        tenant_specs: tuple[tuple[int, int], ...],
+        max_inflight_groups: int,
         stats: MutableMapping[str, Any],
     ) -> None:
         if (
@@ -84,6 +117,24 @@ class SglangHostAcquisitionCoordinator:
         self._consumer_calibration = consumer_calibration
         self._minimum_consumer_gain = minimum_consumer_gain
         self._transport = transport
+        self._request_adapter = request_adapter
+        self._shared_queue = SharedAcquisitionQueue(
+            staging_capacity_bytes=staging_capacity_bytes,
+            tenant_credits=TenantCreditLedger(tenant_specs),
+            max_inflight_groups=max_inflight_groups,
+        )
+        # This is an irrevocable CUDA submission horizon, not a byte/shape
+        # heuristic. It is kept finite so a newly admitted earlier deadline is
+        # blocked by at most a small number of already-issued layer cohorts.
+        self._shared_layers_per_dispatch = frontier_layers_per_wave
+        self._shared_dispatch_horizon = 2
+        self._shared_cohorts: dict[
+            tuple[int, int], _SharedHostCohort
+        ] = {}
+        self._shared_identity_owner: dict[
+            AcquisitionGroupIdentity, tuple[int, int]
+        ] = {}
+        self._shared_active: list[tuple[tuple[int, int], ...]] = []
         self._stats = stats
 
     @property
@@ -94,14 +145,14 @@ class SglangHostAcquisitionCoordinator:
         scheduler-bound queue; their consumer policy differs, not their
         ownership or transport path. AUTO may select either consumer after
         calibration. DIRECT is the explicit eager diagnostic arm and may
-        submit at capture. DEVICE_BULK retains device-discovered acquisition
-        as a diagnostic and tenant isolation requires request accounting
-        before transport can reserve bytes.
+        submit at capture. DEVICE_BULK retains device-discovered acquisition as
+        a diagnostic. Scheduled Host transport binds request generations and
+        reserves tenant credits before publication, so isolation no longer
+        disables overlap.
         """
 
         return (
             self._execution_config.protocol.kind is ProtocolKind.LATE_BOUND
-            and not self._tenant_isolation_enabled
             and self._execution_config.host_execution_mode
             in {
                 HostExecutionMode.AUTO,
@@ -117,6 +168,7 @@ class SglangHostAcquisitionCoordinator:
 
         return (
             self.proactive_layer_queue_enabled
+            and not self._tenant_isolation_enabled
             and self._execution_config.host_execution_mode is HostExecutionMode.DIRECT
         )
 
@@ -128,6 +180,15 @@ class SglangHostAcquisitionCoordinator:
         layer_count = int(pending.controller.layer_num)
         if layer_count != self._model_layer_count:
             raise RuntimeError("HiCache load and model layer counts disagree")
+        groups = tuple(
+            LeaseAcquisitionGroup(request.operation_id, 0, request.row_count)
+            for request in pending.operation_requests
+        )
+        if not groups:
+            raise RuntimeError("HiCache demand lease has no exact request segments")
+        if pending.scheduled_acquisition_groups not in {(), groups}:
+            raise RuntimeError("HiCache acquisition groups changed after capture")
+        pending.scheduled_acquisition_groups = groups
         self.account_selection(pending)
         conventional = self._execution_config.protocol.kind is ProtocolKind.CONVENTIONAL
         initial_layers = 0
@@ -161,6 +222,9 @@ class SglangHostAcquisitionCoordinator:
         """Return a calibrated EDF model without synchronizing CUDA."""
 
         acquisition = pending.acquisition
+        shared_model = getattr(pending, "shared_deadline_model", None)
+        if shared_model is not None:
+            return shared_model
         if acquisition is not None and acquisition.model is not None:
             return acquisition.model
         self._movers.collect_profiles()
@@ -233,10 +297,13 @@ class SglangHostAcquisitionCoordinator:
         """Bind one calibrated EDF proof to immutable physical ownership."""
 
         acquisition = pending.acquisition
+        if getattr(pending, "shared_deadline_model", None) is not None:
+            return True
         if acquisition is not None and acquisition.model is not None:
             return True
         if acquisition is None and pending.prefetched_layers:
             return False
+        self._bind_group_identities(pending)
         shape_key = self._calibration.shape_key(batch)
         curve = self._calibration.curve_for_batch(batch)
         if shape_key is None or curve is None:
@@ -256,7 +323,7 @@ class SglangHostAcquisitionCoordinator:
             self._consumer_calibration.bind_lease(
                 pending,
                 layer_service_key=shape_key,
-                mover_kind=transfer_plan.mover.kind,
+                producer_kind=transfer_plan.mover.kind,
                 layers_per_submission=self._frontier_layers_per_wave,
                 sm_waves_per_layer=transfer_plan.sm_waves_per_layer,
                 minimum_gain=self._minimum_consumer_gain,
@@ -278,14 +345,200 @@ class SglangHostAcquisitionCoordinator:
             return False
         if acquisition.bind_model(model):
             self._add("host_acquisition_models_bound")
+        self._register_shared_acquisition(pending, model)
+        # The dynamic shared queue is now the sole lifecycle owner. Retaining a
+        # second layer queue would leave never-submitted PLANNED jobs alive at
+        # final HiCache retirement and make cancellation/accounting ambiguous.
+        pending.shared_deadline_model = model
+        pending.acquisition = None
         return True
+
+    def _bind_group_identities(self, pending: PendingHostLoad) -> None:
+        """Assign request generations before scheduler-owned transport starts."""
+
+        requests = tuple(pending.operation_requests)
+        if not requests:
+            raise RuntimeError(
+                "scheduled HiCache acquisition has no request-operation ownership"
+            )
+        operation_ids = tuple(request.operation_id for request in requests)
+        if len(set(operation_ids)) != len(operation_ids):
+            raise RuntimeError("HiCache acquisition repeats request-operation identity")
+        if pending.operation_bindings:
+            if set(pending.operation_bindings) != set(operation_ids):
+                raise RuntimeError("HiCache acquisition request bindings changed")
+            return
+        bindings = self._request_adapter.bind(
+            tuple(request.request_id for request in requests),
+            tuple(request.request_slot for request in requests),
+            tenant_ids=tuple(request.tenant_id for request in requests),
+        )
+        pending.operation_bindings = {
+            request.operation_id: binding
+            for request, binding in zip(requests, bindings, strict=True)
+        }
+        groups = pending.scheduled_acquisition_groups
+        if not groups:
+            raise RuntimeError(
+                "HiCache acquisition identities require frozen semantic groups"
+            )
+        request_by_operation = {
+            request.operation_id: request for request in requests
+        }
+        start_layer = int(getattr(self._device_pool, "start_layer", 0))
+        identities: dict[int, tuple[AcquisitionGroupIdentity, ...]] = {}
+        for local_layer in range(self._model_layer_count):
+            identities[local_layer] = tuple(
+                AcquisitionGroupIdentity(
+                    request_slot=binding.request_slot,
+                    request_generation=binding.generation,
+                    layer_id=start_layer + local_layer,
+                    segment_begin=request.logical_begin + group.row_begin,
+                    segment_count=group.row_count,
+                    resource_version=pending.lease_id,
+                )
+                for group in groups
+                for request in (request_by_operation[group.operation_id],)
+                for binding in (pending.operation_bindings[group.operation_id],)
+            )
+        pending.acquisition_group_identities = identities
+        self._add("host_acquisition_request_bindings", len(bindings))
+        self._add(
+            "host_acquisition_semantic_groups",
+            len(groups) * self._model_layer_count,
+        )
+
+    def _register_shared_acquisition(
+        self, pending: PendingHostLoad, model: LayerAcquisitionModel
+    ) -> None:
+        """Publish one dynamic shared-link job per exact request/layer group."""
+
+        if getattr(pending, "shared_acquisition_registered", False):
+            return
+        if set(pending.acquisition_group_identities) != set(
+            range(self._model_layer_count)
+        ):
+            raise RuntimeError("Host acquisition has incomplete semantic groups")
+        groups = pending.scheduled_acquisition_groups
+        total_rows = sum(group.row_count for group in groups)
+        if total_rows != int(pending.device_indices.numel()):
+            raise RuntimeError(
+                "scheduled Host groups do not cover the physical acquisition lease"
+            )
+        release_ns = time.monotonic_ns()
+        jobs: list[SharedAcquisitionJob] = []
+        cohorts: list[_SharedHostCohort] = []
+        operation_by_id = {
+            operation.operation_id: operation
+            for operation in pending.operation_ranges()
+        }
+        absolute_row_ends = tuple(
+            operation_by_id[group.operation_id].row_begin + group.row_end
+            for group in groups
+        )
+        if tuple(sorted(absolute_row_ends)) != absolute_row_ends or (
+            not absolute_row_ends
+            or absolute_row_ends[-1] != int(pending.device_indices.numel())
+        ):
+            raise RuntimeError("scheduled Host groups do not partition lease order")
+        for local_layer in range(self._model_layer_count):
+            identities = pending.acquisition_group_identities[local_layer]
+            if len(identities) != len(groups):
+                raise RuntimeError("Host acquisition group cardinality changed")
+            row_bytes = sum(pending.row_bytes_by_layer[local_layer])
+            layer_service_ns = model.transfer_service_ns[local_layer]
+            cumulative_rows = 0
+            cumulative_service_ns = 0
+            for group, identity in zip(groups, identities, strict=True):
+                cumulative_rows += group.row_count
+                target_service_ns = (
+                    layer_service_ns * cumulative_rows // total_rows
+                )
+                service_ns = max(1, target_service_ns - cumulative_service_ns)
+                cumulative_service_ns += service_ns
+                binding = pending.operation_bindings[group.operation_id]
+                payload_bytes = group.row_count * row_bytes
+                jobs.append(
+                    SharedAcquisitionJob(
+                        identity=identity,
+                        tenant_id=binding.tenant_id,
+                        payload_bytes=payload_bytes,
+                        staging_bytes=payload_bytes,
+                        release_ns=release_ns,
+                        service_ns=service_ns,
+                        deadline_ns=(
+                            release_ns
+                            + model.initial_compute_ns
+                            + local_layer * model.inter_layer_compute_ns
+                        ),
+                        priority=binding.priority,
+                    )
+                )
+            cohort = _SharedHostCohort(
+                pending, local_layer, identities, absolute_row_ends
+            )
+            key = (pending.lease_id, local_layer)
+            if key in self._shared_cohorts or any(
+                identity in self._shared_identity_owner for identity in identities
+            ):
+                raise RuntimeError("Host acquisition repeated a shared-link identity")
+            cohorts.append(cohort)
+        self._shared_queue.add(jobs)
+        for cohort in cohorts:
+            key = (pending.lease_id, cohort.local_layer)
+            self._shared_cohorts[key] = cohort
+            for identity in cohort.identities:
+                self._shared_identity_owner[identity] = key
+        pending.shared_acquisition_registered = True
+        self._add("shared_acquisition_registered_groups", len(jobs))
+        self._add("shared_acquisition_registered_cohorts", len(cohorts))
+
+    def admission_feasibility(
+        self,
+        pending: PendingHostLoad,
+        batch: Any,
+        progress: Any,
+    ) -> SharedHostAdmissionFeasibility | None:
+        """Analyze the actual cross-batch queue, including fixed submissions."""
+
+        model = self.deadline_model(pending, batch)
+        if model is None:
+            return None
+        if not getattr(pending, "shared_acquisition_registered", False):
+            local = model.analyze_admission(
+                ready_prefix_layers=progress.leading_layers
+            )
+            return SharedHostAdmissionFeasibility(
+                local.ready_prefix_layers,
+                local.feasible,
+                local.first_missed_layer,
+                local.required_initial_slack_ns,
+            )
+        self.progress_shared_acquisition()
+        schedule = self._shared_queue.analyze(now_ns=time.monotonic_ns())
+        missed = schedule.first_missed_identity
+        start_layer = int(getattr(self._device_pool, "start_layer", 0))
+        first_missed_layer = None if missed is None else missed.layer_id - start_layer
+        if first_missed_layer is not None and not (
+            0 <= first_missed_layer < self._model_layer_count
+        ):
+            raise RuntimeError("shared EDF miss lies outside the model partition")
+        return SharedHostAdmissionFeasibility(
+            ready_prefix_layers=progress.leading_layers,
+            feasible=schedule.feasible,
+            first_missed_layer=first_missed_layer,
+            required_initial_slack_ns=schedule.maximum_lateness_ns,
+        )
 
     def prepare_admission(self, pending: PendingHostLoad, batch: Any) -> bool:
         """Prepare descriptors only when admission has a usable model."""
 
         if not self.proactive_layer_queue_enabled:
             return False
-        already_prepared = pending.acquisition is not None
+        already_prepared = (
+            pending.acquisition is not None
+            or pending.shared_acquisition_registered
+        )
         ready = self.prepare_owner(pending, batch)
         if ready and not already_prepared:
             self._add("admission_acquisition_groups_prepared")
@@ -294,6 +547,25 @@ class SglangHostAcquisitionCoordinator:
     def start_admission(self, pending: PendingHostLoad, batch: Any) -> None:
         """Start the finite queue after admission has bounded its delay."""
 
+        if pending.shared_acquisition_registered:
+            if (
+                pending.transfer_plan is None
+                or pending.prefetched_layers
+                or pending.shared_deadline_model is None
+            ):
+                raise RuntimeError(
+                    "HiCache shared acquisition was not prepared exactly once"
+                )
+            before = len(pending.prefetched_layers)
+            self.progress_shared_acquisition()
+            self._pump_shared_acquisition()
+            submitted = len(pending.prefetched_layers) - before
+            if submitted <= 0:
+                raise RuntimeError(
+                    "HiCache shared acquisition could not reserve its first cohort"
+                )
+            self._add("admission_acquisition_groups_started")
+            return
         acquisition = pending.acquisition
         if (
             pending.transfer_plan is None
@@ -314,6 +586,11 @@ class SglangHostAcquisitionCoordinator:
     def submit(self, pending: PendingHostLoad) -> int:
         """Fill one lease's finite queue and publish exact layer fences."""
 
+        if getattr(pending, "shared_acquisition_registered", False):
+            before = len(pending.prefetched_layers)
+            self.progress_shared_acquisition()
+            self._pump_shared_acquisition()
+            return len(pending.prefetched_layers) - before
         acquisition = pending.acquisition
         if acquisition is None:
             raise RuntimeError("HiCache lease has no prepared acquisition owner")
@@ -331,6 +608,216 @@ class SglangHostAcquisitionCoordinator:
             self._add("host_acquisition_submission_calls", len(submission.ranges))
             self._add("host_acquisition_jobs_submitted", submission.job_count)
         return submission.job_count
+
+    def progress_shared_acquisition(self) -> None:
+        """Retire completed cohorts without synchronizing a CUDA stream."""
+
+        if not self._shared_active:
+            return
+        now_ns = time.monotonic_ns()
+        still_active: list[tuple[tuple[int, int], ...]] = []
+        for packet in self._shared_active:
+            incomplete: list[tuple[int, int]] = []
+            for key in packet:
+                cohort = self._shared_cohorts.get(key)
+                if cohort is None:
+                    raise RuntimeError("shared Host cohort lost semantic ownership")
+                publication = cohort.pending.prefetched_layers.get(cohort.local_layer)
+                if publication is None:
+                    raise RuntimeError(
+                        "shared Host cohort has no readiness publication"
+                    )
+                newly_ready = 0
+                cohort_incomplete = False
+                for identity, absolute_row_end in zip(
+                    cohort.identities, cohort.absolute_row_ends, strict=True
+                ):
+                    state = self._shared_queue.state(identity)
+                    if state is SharedAcquisitionState.FENCE_PUBLISHED:
+                        ready_event = publication.ready_event
+                        if publication.wave_events:
+                            wave = bisect.bisect_left(
+                                publication.wave_row_ends, absolute_row_end
+                            )
+                            if wave >= len(publication.wave_events):
+                                raise RuntimeError(
+                                    "shared Host group exceeds its completion waves"
+                                )
+                            ready_event = publication.wave_events[wave]
+                        if not ready_event.query():
+                            cohort_incomplete = True
+                            continue
+                        self._shared_queue.mark_ready(identity)
+                        newly_ready += 1
+                    elif state not in {
+                        SharedAcquisitionState.READY,
+                        SharedAcquisitionState.CONSUMED,
+                        SharedAcquisitionState.CANCELLED,
+                    }:
+                        raise RuntimeError(
+                            "shared Host cohort completed from an invalid lifecycle state"
+                        )
+                if newly_ready:
+                    self._add("shared_acquisition_ready_groups", newly_ready)
+                if cohort_incomplete:
+                    incomplete.append(key)
+                    continue
+                self._add("shared_acquisition_ready_cohorts")
+                if cohort.consumer_ordered or cohort.cancel_requested:
+                    self._forget_shared_cohort(key, cohort)
+            if incomplete:
+                still_active.append(tuple(incomplete))
+        self._shared_active = still_active
+        if self._shared_queue.inflight_count == 0:
+            self._shared_queue.mark_link_idle(now_ns=now_ns)
+
+    def _pump_shared_acquisition(self) -> int:
+        """Fill the finite global link horizon in dynamic EDF order."""
+
+        submitted = 0
+        while len(self._shared_active) < self._shared_dispatch_horizon:
+            now_ns = time.monotonic_ns()
+            key: tuple[int, int] | None = None
+            cohort: _SharedHostCohort | None = None
+            claimed: list[SharedAcquisitionJob] = []
+            visited: set[tuple[int, int]] = set()
+            # Choose EDF among resource-admissible packets. An exhausted
+            # tenant or a temporarily full staging reservation must not
+            # head-of-line block an unrelated tenant whose packet fits.
+            for identity in self._shared_queue.released_identities(now_ns=now_ns):
+                candidate_key = self._shared_identity_owner.get(identity)
+                if candidate_key is None or candidate_key in visited:
+                    continue
+                visited.add(candidate_key)
+                candidate = self._shared_cohorts.get(candidate_key)
+                if candidate is None:
+                    raise RuntimeError("shared EDF selected an unowned Host group")
+                candidate_claim = self._shared_queue.claim_cohort(
+                    candidate.identities, now_ns=now_ns
+                )
+                if candidate_claim:
+                    key = candidate_key
+                    cohort = candidate
+                    claimed = list(candidate_claim)
+                    break
+                self._add("shared_acquisition_resource_skipped_cohorts")
+            if key is None or cohort is None:
+                break
+            if not claimed:  # pragma: no cover - guarded above
+                self._add("shared_acquisition_resource_blocked_cohorts")
+                break
+            packet_keys = [key]
+            packet_cohorts = [cohort]
+            # Preserve the mover's occupancy-derived adjacent-layer packet only
+            # while every next layer is also the next global EDF choice. This
+            # is coalescing after scheduling, not a layer-order shortcut.
+            while len(packet_keys) < self._shared_layers_per_dispatch:
+                next_identity = self._shared_queue.next_released_identity(
+                    now_ns=now_ns
+                )
+                if next_identity is None:
+                    break
+                next_key = self._shared_identity_owner.get(next_identity)
+                next_cohort = (
+                    None if next_key is None else self._shared_cohorts.get(next_key)
+                )
+                previous = packet_cohorts[-1]
+                if (
+                    next_key is None
+                    or next_cohort is None
+                    or next_cohort.pending is not cohort.pending
+                    or next_cohort.local_layer != previous.local_layer + 1
+                ):
+                    break
+                next_claimed = self._shared_queue.claim_cohort(
+                    next_cohort.identities, now_ns=now_ns
+                )
+                if not next_claimed:
+                    break
+                claimed.extend(next_claimed)
+                packet_keys.append(next_key)
+                packet_cohorts.append(next_cohort)
+            try:
+                plan = self.transfer_plan(cohort.pending)
+                self._transport.prepare(
+                    cohort.pending,
+                    plan,
+                    first_local_layer=cohort.local_layer,
+                    last_local_layer=packet_cohorts[-1].local_layer + 1,
+                )
+                for packet_cohort in packet_cohorts:
+                    publication = packet_cohort.pending.prefetched_layers.get(
+                        packet_cohort.local_layer
+                    )
+                    if publication is None:
+                        raise RuntimeError(
+                            "shared Host transport returned without a layer fence"
+                        )
+                for group in claimed:
+                    self._shared_queue.publish_fence(group.identity)
+            except BaseException:
+                for group in claimed:
+                    state = self._shared_queue.state(group.identity)
+                    if state in {
+                        SharedAcquisitionState.SUBMITTED,
+                        SharedAcquisitionState.FENCE_PUBLISHED,
+                    }:
+                        self._shared_queue.fail(group.identity)
+                raise
+            self._shared_active.append(tuple(packet_keys))
+            submitted += len(packet_keys)
+            self._add("shared_acquisition_submitted_packets")
+            self._add("shared_acquisition_submitted_cohorts", len(packet_keys))
+            self._add("shared_acquisition_submitted_groups", len(claimed))
+        return submitted
+
+    def _forget_shared_cohort(
+        self, key: tuple[int, int], cohort: _SharedHostCohort
+    ) -> None:
+        self._shared_queue.forget_terminal(cohort.identities)
+        self._shared_cohorts.pop(key, None)
+        for identity in cohort.identities:
+            self._shared_identity_owner.pop(identity, None)
+        self._add("shared_acquisition_retired_cohorts")
+
+    def poll_and_pump_shared_acquisition(self, pending: PendingHostLoad) -> None:
+        """Bridge callback used by admission progress for every pending lease."""
+
+        if not getattr(pending, "shared_acquisition_registered", False):
+            return
+        self.progress_shared_acquisition()
+        self._pump_shared_acquisition()
+
+    def cancel_shared_acquisition(self, pending: PendingHostLoad) -> None:
+        """Stop undispatched work and fence in-flight reservations before reuse."""
+
+        if not getattr(pending, "shared_acquisition_registered", False):
+            return
+        for local_layer in range(self._model_layer_count):
+            key = (pending.lease_id, local_layer)
+            cohort = self._shared_cohorts.get(key)
+            if cohort is None:
+                continue
+            cohort.cancel_requested = True
+            for identity in cohort.identities:
+                state = self._shared_queue.state(identity)
+                if state not in {
+                    SharedAcquisitionState.CANCELLED,
+                    SharedAcquisitionState.FAILED,
+                }:
+                    self._shared_queue.cancel(identity)
+            if all(
+                self._shared_queue.state(identity)
+                in {
+                    SharedAcquisitionState.CANCELLED,
+                    SharedAcquisitionState.FAILED,
+                }
+                for identity in cohort.identities
+            ):
+                self._forget_shared_cohort(key, cohort)
+        self.progress_shared_acquisition()
+        self._pump_shared_acquisition()
+        self._add("shared_acquisition_cancelled_leases")
 
     def plan_published_consumers(
         self,
@@ -483,6 +970,7 @@ class SglangHostAcquisitionCoordinator:
             ),
             object_version=pending.lease_id,
             sm_acquisition_waves=self._sm_acquisition_waves,
+            preferred_wave_row_ends=self._preferred_wave_row_ends(pending),
         )
         layer_bytes = tuple(
             key_bytes + value_bytes for key_bytes, value_bytes in result.layer_geometry
@@ -494,6 +982,38 @@ class SglangHostAcquisitionCoordinator:
         pending.transfer_plan = result
         self._add("host_transfer_plan_builds")
         return result
+
+    def _preferred_wave_row_ends(
+        self, pending: PendingHostLoad
+    ) -> tuple[int, ...]:
+        """Align finite SM readiness waves to scheduler acquisition groups."""
+
+        groups = pending.scheduled_acquisition_groups
+        if not groups:
+            return ()
+        operation_by_id = {
+            operation.operation_id: operation
+            for operation in pending.operation_ranges()
+        }
+        exact_ends = tuple(
+            operation_by_id[group.operation_id].row_begin + group.row_end
+            for group in groups
+        )
+        maximum = self._sm_acquisition_waves
+        if len(exact_ends) <= maximum:
+            return exact_ends
+        # Keep the number of physical events bounded while cutting only between
+        # complete request operations. The ceil-index rule is deterministic and
+        # balances operation count without pretending a coalesced wave is one
+        # request's independent readiness record.
+        count = len(exact_ends)
+        ends = tuple(
+            exact_ends[min(count, (wave * count + maximum - 1) // maximum) - 1]
+            for wave in range(1, maximum + 1)
+        )
+        if len(set(ends)) != len(ends) or ends[-1] != exact_ends[-1]:
+            raise RuntimeError("Host operation waves could not be bounded exactly")
+        return ends
 
     def account_selection(self, pending: PendingHostLoad) -> None:
         """Count unique exact tier demand once per ownership lease."""
@@ -560,6 +1080,11 @@ class SglangHostAcquisitionCoordinator:
 
         if batch.pending_host_load is not pending:
             raise RuntimeError("deadline frontier lost its active HiCache lease")
+        if getattr(pending, "shared_acquisition_registered", False):
+            self.retire_layer(pending, completed_local_layer)
+            self.progress_shared_acquisition()
+            self._pump_shared_acquisition()
+            return
         acquisition = pending.acquisition
         if acquisition is not None:
             self.retire_layer(pending, completed_local_layer)
@@ -695,6 +1220,24 @@ class SglangHostAcquisitionCoordinator:
     def retire_layer(self, pending: PendingHostLoad, local_layer: int) -> None:
         """Retire transport ownership after a numerical consumer is ordered."""
 
+        if getattr(pending, "shared_acquisition_registered", False):
+            key = (pending.lease_id, local_layer)
+            cohort = self._shared_cohorts.get(key)
+            if cohort is None:
+                raise RuntimeError("shared Host layer has no acquisition cohort")
+            if cohort.consumer_ordered:
+                raise RuntimeError("shared Host layer was consumed more than once")
+            for identity in cohort.identities:
+                self._shared_queue.consume(identity)
+            cohort.consumer_ordered = True
+            if all(
+                self._shared_queue.state(identity)
+                is SharedAcquisitionState.CONSUMED
+                for identity in cohort.identities
+            ):
+                self._forget_shared_cohort(key, cohort)
+            self._add("host_acquisition_layers_consumed")
+            return
         acquisition = pending.acquisition
         if acquisition is None:
             return

@@ -110,7 +110,9 @@ int main() {
                 (nta::TierDirectAddress | nta::TierHostRegistered));
   static_assert((WorkItemSupportedFlags & WorkItemEventPartition) != 0);
   static_assert((WorkItemSupportedFlags & WorkItemBindCurrentGeneration) != 0);
-  if (Version != 43 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
+  static_assert((WorkItemSupportedFlags &
+                 WorkItemDeadlineRelativeToDiscovery) != 0);
+  if (Version != 44 || InvalidIndex != 0xffffffffU || BackendCount != 6 ||
       MaximumEventCompletionClasses != 64 ||
       !std::is_trivially_copyable_v<ObjectEntry>) {
     return 1;

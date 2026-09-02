@@ -409,6 +409,7 @@ snapshot_partitions() {
 }
 
 bind_vfio() {
+  local preserve_owner=${1:-0}
   local vmem_users vmem_target
   vmem_users=$(lsmod | awk '$1 == "vmem_sw" { print $3 }')
   if [[ -n $vmem_users && $vmem_users -ne 0 ]]; then
@@ -422,7 +423,11 @@ bind_vfio() {
   as_root modprobe vfio-pci
   local driver
   driver=$(current_driver)
-  printf '%s\n' "$driver" | as_root tee "$state" >/dev/null
+  if [[ $preserve_owner == 0 ]]; then
+    printf '%s\n' "$driver" | as_root tee "$state" >/dev/null
+  else
+    [[ -r $state ]] || die "preserved VFIO ownership state is absent"
+  fi
 
   # A custom block driver may expose a transformed or cached namespace view.
   # Such a view is not a valid byte oracle for the raw namespace that VFIO
@@ -468,8 +473,27 @@ start_session() {
       die "VFIO controller has no ownership state; restore it explicitly"
     "$0" restore >/dev/null
   fi
-  [[ $(current_driver) == nvme ]] ||
-    die "session-start requires the canonical Linux nvme driver"
+  local original_driver
+  original_driver=$(current_driver)
+  [[ $original_driver != none ]] ||
+    die "session-start requires an owned NVMe controller"
+  local committed=0
+  restore_uncommitted_session() {
+    if [[ $committed == 0 && -r $state && $(current_driver) != "$original_driver" ]]; then
+      "$0" restore >/dev/null 2>&1 || true
+    fi
+  }
+  trap restore_uncommitted_session EXIT
+  if [[ $original_driver != nvme ]]; then
+    # Preserve the deployment driver, but use Linux NVMe as the byte oracle and
+    # SMART source before entering the persistent VFIO interval.
+    require_safe_device
+    printf '%s\n' "$original_driver" | as_root tee "$state" >/dev/null
+    printf '%s' "$bdf" | as_root tee "$device/driver/unbind" >/dev/null
+    printf '%s' nvme | as_root tee "$device/driver_override" >/dev/null
+    printf '%s' "$bdf" | as_root tee /sys/bus/pci/drivers_probe >/dev/null
+    wait_for_driver nvme
+  fi
   wait_for_nvme_namespace >/dev/null
   require_safe_device
 
@@ -479,14 +503,7 @@ start_session() {
   [[ -n $serial ]] || die "cannot read NVMe controller serial"
   boot_id=$(</proc/sys/kernel/random/boot_id)
 
-  local committed=0
-  restore_uncommitted_session() {
-    if [[ $committed == 0 && $(current_driver) == vfio-pci ]]; then
-      "$0" restore >/dev/null 2>&1 || true
-    fi
-  }
-  trap restore_uncommitted_session EXIT
-  bind_vfio
+  bind_vfio "$([[ $original_driver == nvme ]] && printf 0 || printf 1)"
   temporary=$(as_root mktemp /run/.nta-vfio-session.XXXXXX)
   printf \
     'boot_id=%s\nserial=%s\nreference=%s\ndata_units_written=%s\nhost_write_commands=%s\n' \
@@ -657,14 +674,14 @@ run)
   ;;
 restore)
   require_safe_device
-  if [[ $(current_driver) == vfio-pci ]]; then
-    printf '%s' "$bdf" | as_root tee "$device/driver/unbind" >/dev/null
-  fi
   driver=nvme
   if [[ -r $state ]]; then
     driver=$(<"$state")
   fi
   [[ $driver != none && -d /sys/bus/pci/drivers/$driver ]] || driver=nvme
+  if [[ $(current_driver) != none && $(current_driver) != "$driver" ]]; then
+    printf '%s' "$bdf" | as_root tee "$device/driver/unbind" >/dev/null
+  fi
   printf '%s' "$driver" | as_root tee "$device/driver_override" >/dev/null
   printf '%s' "$bdf" | as_root tee /sys/bus/pci/drivers_probe >/dev/null
   wait_for_driver "$driver"

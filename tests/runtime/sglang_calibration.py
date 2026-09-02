@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+from collections import defaultdict
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -228,7 +229,7 @@ def main() -> None:
     key = policy.bind_lease(
         pending,
         layer_service_key=("extend", 32, 2),
-        mover_kind="sm",
+        producer_kind="sm",
         layers_per_submission=2,
         sm_waves_per_layer=1,
         minimum_gain=1.03,
@@ -238,6 +239,38 @@ def main() -> None:
     assert not pending.arrival_profile_active
     assert not pending.consumer_policy_probe
     assert not pending.planned_progressive_layers
+
+    nvme_pending = SimpleNamespace(
+        device_indices=SimpleNamespace(numel=lambda: 1),
+        layer_bytes=(1,),
+        arrival_profile_key=None,
+        arrival_profiling=False,
+        arrival_profile_active=False,
+        consumer_policy_probe=False,
+        partial_profile_recorded=False,
+        planned_progressive_layers=frozenset(),
+    )
+    nvme_policy = SglangConsumerPolicyCalibration(
+        enabled=True,
+        model_start_layer=10,
+        model_layer_count=2,
+        minimum_samples=2,
+        maximum_samples=4,
+        stats=defaultdict(int),
+    )
+    nvme_key = nvme_policy.bind_lease(
+        nvme_pending,
+        layer_service_key=("extend", 32, 2),
+        producer_kind="nvme_direct",
+        layers_per_submission=2,
+        sm_waves_per_layer=4,
+        minimum_gain=1.03,
+        transfer_rows=16,
+        transfer_bytes=131072,
+    )
+    assert nvme_key is not None
+    assert nvme_key.producer_kind == "nvme_direct"
+    assert nvme_key.sm_waves_per_layer == 4
 
     # Two ordinary stock forwards establish a conservative signed margin for
     # every layer. Layer zero is always at least 0.5 ms late; layer one is
@@ -261,9 +294,7 @@ def main() -> None:
         for forward, layer_ready in enumerate(ready_events):
             acquisition = SimpleNamespace(
                 layer=lambda layer, events=layer_ready: SimpleNamespace(
-                    partial_publication=SimpleNamespace(
-                        profile_ready_event=events[layer]
-                    )
+                    profile_ready_event=events[layer]
                 )
             )
             policy_batch = SimpleNamespace(
@@ -300,7 +331,7 @@ def main() -> None:
         rebound = policy.bind_lease(
             pending,
             layer_service_key=("extend", 32, 2),
-            mover_kind="sm",
+            producer_kind="sm",
             layers_per_submission=2,
             sm_waves_per_layer=1,
             minimum_gain=1.03,
@@ -332,7 +363,7 @@ def main() -> None:
     rebound = policy.bind_lease(
         pending,
         layer_service_key=("extend", 32, 2),
-        mover_kind="sm",
+        producer_kind="sm",
         layers_per_submission=2,
         sm_waves_per_layer=1,
         minimum_gain=1.03,
@@ -367,7 +398,7 @@ def main() -> None:
                 "batch_size_bucket": 1,
                 "transfer_rows_bucket": 3,
                 "transfer_bytes_bucket": 11,
-                "mover_kind": "sm",
+                "producer_kind": "sm",
                 "layers_per_submission": 2,
                 "sm_waves_per_layer": 1,
                 "calibrated_arrival_layers": 2,
@@ -406,7 +437,7 @@ def main() -> None:
         restored_policy.bind_lease(
             pending,
             layer_service_key=("extend", 32, 2),
-            mover_kind="sm",
+            producer_kind="sm",
             layers_per_submission=2,
             sm_waves_per_layer=1,
             minimum_gain=1.03,
@@ -433,7 +464,7 @@ def main() -> None:
         frozen_policy.bind_lease(
             pending,
             layer_service_key=("extend", 32, 2),
-            mover_kind="sm",
+            producer_kind="sm",
             layers_per_submission=2,
             sm_waves_per_layer=1,
             minimum_gain=1.03,
@@ -458,7 +489,7 @@ def main() -> None:
     unknown_key = frozen_policy.bind_lease(
         unknown,
         layer_service_key=("extend", 4096, 8),
-        mover_kind="copy_engine",
+        producer_kind="copy_engine",
         layers_per_submission=4,
         sm_waves_per_layer=1,
         minimum_gain=1.03,

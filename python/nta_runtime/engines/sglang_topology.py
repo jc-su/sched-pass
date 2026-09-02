@@ -435,6 +435,58 @@ def capacity_constrained_acquisition_groups(
     )
 
 
+def project_scheduled_acquisition_groups(
+    dependencies: Sequence[LeaseAcquisitionSlice | None],
+    groups: Sequence[LeaseAcquisitionGroup],
+) -> tuple[LeaseAcquisitionGroup | None, ...]:
+    """Project exact numerical slices onto the scheduler's frozen groups.
+
+    This is the verify→schedule→consume join: the compiler-derived work slice
+    stays exact, while its readiness dependency names the same segment that
+    owns transport, tenant credit, generation, and the producer fence.
+    """
+
+    by_operation: dict[int, list[LeaseAcquisitionGroup]] = {}
+    for group in groups:
+        by_operation.setdefault(group.operation_id, []).append(group)
+    starts: dict[int, tuple[int, ...]] = {}
+    for operation_id, operation_groups in by_operation.items():
+        operation_groups.sort(key=lambda group: group.row_begin)
+        cursor = 0
+        for group in operation_groups:
+            if group.row_begin != cursor:
+                raise RuntimeError(
+                    "scheduled acquisition groups do not partition an operation"
+                )
+            cursor = group.row_end
+        starts[operation_id] = tuple(
+            group.row_begin for group in operation_groups
+        )
+
+    projected: list[LeaseAcquisitionGroup | None] = []
+    for dependency in dependencies:
+        if dependency is None:
+            projected.append(None)
+            continue
+        operation_groups = by_operation.get(dependency.operation_id)
+        if not operation_groups:
+            raise RuntimeError(
+                "exact numerical work names an unscheduled acquisition operation"
+            )
+        index = bisect.bisect_right(
+            starts[dependency.operation_id], dependency.row_begin
+        ) - 1
+        if index < 0:
+            raise RuntimeError("exact numerical work precedes its scheduled group")
+        group = operation_groups[index]
+        if dependency.row_end > group.row_end:
+            raise RuntimeError(
+                "one exact numerical slice crosses a scheduled completion group"
+            )
+        projected.append(group)
+    return tuple(projected)
+
+
 def lease_acquisition_topology(
     acquisition_slices: tuple[LeaseAcquisitionSlice | None, ...],
     acquisition_groups: tuple[LeaseAcquisitionGroup | None, ...],

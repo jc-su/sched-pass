@@ -16,12 +16,15 @@ from nta_runtime.engines.sglang_transfer import (
     HostTransferLeasePlan,
 )
 from nta_runtime.engines.sglang_contracts import (
+    LeaseAcquisitionGroup,
     LeaseDeviceIndexMap,
     LeaseOperationRange,
+    LeaseOperationRequest,
     LeaseOperationTransfer,
 )
 from nta_runtime.acquisition_scheduler import LayerAcquisition, LayerAcquisitionModel
-from nta_runtime.engines.sglang_acquisition_contract import HostArrivalProfileKey
+from nta_runtime.acquisition_scheduler import AcquisitionGroupIdentity
+from nta_runtime.engines.sglang_acquisition_contract import AcquisitionArrivalProfileKey
 
 from nta_runtime.progress_frontier import (
     RequestFrontier,
@@ -45,6 +48,7 @@ class PendingHostLoad:
     # node. This avoids downloading and reverse-engineering the numerical page
     # table to recover request ownership.
     operation_transfers: tuple[LeaseOperationTransfer, ...]
+    operation_requests: tuple[LeaseOperationRequest, ...]
     # Only operations whose requests survived PrefillAdder's complete budget
     # checks are execution dependencies of the current forward.  SGLang can
     # still include rejected operations in the same physical load queue; those
@@ -75,7 +79,16 @@ class PendingHostLoad:
     mover_overlap_compute_start: Any = None
     selection_accounted: bool = False
     acquisition: LayerAcquisition | None = None
-    arrival_profile_key: HostArrivalProfileKey | None = None
+    operation_bindings: dict[int, Any] = field(default_factory=dict)
+    # Canonical, operation-local partition shared by the scheduler identity,
+    # physical SM completion waves, and numerical dependency projection.
+    scheduled_acquisition_groups: tuple[LeaseAcquisitionGroup, ...] = ()
+    acquisition_group_identities: dict[
+        int, tuple[AcquisitionGroupIdentity, ...]
+    ] = field(default_factory=dict)
+    shared_acquisition_registered: bool = False
+    shared_deadline_model: LayerAcquisitionModel | None = None
+    arrival_profile_key: AcquisitionArrivalProfileKey | None = None
     arrival_profiling: bool = False
     # Set only after metadata selected the ordinary stock numerical path.
     # Typed calibration/probe setup must not bias the arrival-margin sample.
@@ -251,12 +264,16 @@ class SglangHiCacheBridge:
         # operation identity so acquire_load() can form a lease containing
         # exactly the requests in the current forward.
         self._operation_admission: dict[int, bool] = {}
+        self._operation_requests: dict[int, LeaseOperationRequest] = {}
         self._next_lease_id = 1
         self._lock = threading.Lock()
         self._acquire_callback: Any = None
         self._deadline_model_callback: Any = None
         self._admission_prepare_callback: Any = None
         self._admission_start_callback: Any = None
+        self._admission_feasibility_callback: Any = None
+        self._progress_callback: Any = None
+        self._retire_callback: Any = None
         self._admission_stats: dict[str, int] = {}
         self._progress_publications: list[_ProgressPublication] = []
         self._latest_request_work: dict[tuple[int, int], RequestFrontierEntry] = {}
@@ -296,6 +313,37 @@ class SglangHiCacheBridge:
 
         self._admission_prepare_callback = prepare
         self._admission_start_callback = start
+
+    def set_acquisition_progress_callback(self, callback: Any) -> None:
+        """Install the nonblocking shared-link progress owner."""
+
+        self._progress_callback = callback
+
+    def set_admission_feasibility_callback(self, callback: Any) -> None:
+        """Install the global resource/schedule feasibility provider."""
+
+        self._admission_feasibility_callback = callback
+
+    def set_acquisition_retire_callback(self, callback: Any) -> None:
+        """Install cleanup for shared jobs when a framework lease aborts."""
+
+        self._retire_callback = callback
+
+    def admission_feasibility(
+        self, consumer_index: int, batch: Any, progress: HostLoadProgress
+    ) -> Any | None:
+        pending = self.get(consumer_index)
+        callback = self._admission_feasibility_callback
+        if pending is None or callback is None:
+            model = self.deadline_model(consumer_index, batch)
+            return (
+                None
+                if model is None
+                else model.analyze_admission(
+                    ready_prefix_layers=progress.leading_layers
+                )
+            )
+        return callback(pending, batch, progress)
 
     def prepare_admission_acquisition(self, consumer_index: int, batch: Any) -> bool:
         """Prepare immutable lease descriptors without starting transport."""
@@ -360,6 +408,7 @@ class SglangHiCacheBridge:
             self._latest_request_work.clear()
             self._latest_request_key.clear()
             self._operation_admission.clear()
+            self._operation_requests.clear()
         if first_error is not None:
             raise RuntimeError(
                 "SGLang HiCache bridge failed to retire one or more leases"
@@ -401,6 +450,19 @@ class SglangHiCacheBridge:
                 )
             self._operation_admission[operation_id] = admitted
 
+    def record_operation_request(self, request: LeaseOperationRequest) -> None:
+        """Bind one unmerged load operation to its scheduler request owner."""
+
+        if not isinstance(request, LeaseOperationRequest):
+            raise TypeError("SGLang operation ownership must use the typed contract")
+        with self._lock:
+            previous = self._operation_requests.get(request.operation_id)
+            if previous is not None and previous != request:
+                raise RuntimeError(
+                    "SGLang load operation changed request ownership before capture"
+                )
+            self._operation_requests[request.operation_id] = request
+
     def acquire_load(self, controller: Any) -> int | None:
         with self._lock:
             if self._closed:
@@ -421,6 +483,7 @@ class SglangHiCacheBridge:
         with self._lock:
             for operation_id in set(self._operation_admission) - queued_operation_ids:
                 self._operation_admission.pop(operation_id, None)
+                self._operation_requests.pop(operation_id, None)
             missing = tuple(
                 int(getattr(operation, "id", -1))
                 for operation in queued_operations
@@ -437,9 +500,47 @@ class SglangHiCacheBridge:
                 for operation in queued_operations
                 if self._operation_admission[int(operation.id)]
             )
+            missing_requests = tuple(
+                operation_id
+                for operation_id in demand_operation_ids
+                if operation_id not in self._operation_requests
+            )
+            if missing_requests:
+                raise RuntimeError(
+                    "SGLang admitted load operation omitted request ownership for "
+                    f"operation(s) {missing_requests}"
+                )
+            # Preserve CacheOperation.merge_ops() order.  Logical operation
+            # ranges, physical descriptor ranges, and request identities must
+            # describe the same partition; sorting opaque operation IDs would
+            # silently break that invariant after priority queueing.
+            operation_requests = tuple(
+                self._operation_requests[int(operation.id)]
+                for operation in queued_operations
+                if int(operation.id) in demand_operation_ids
+            )
+        # SGLang may enqueue speculative host prefetch before its budget check
+        # admits a request.  A flush can therefore contain both exact demand
+        # and unowned speculation.  Never absorb the latter into a
+        # scheduler-owned lease: doing so would transfer and reserve bytes for
+        # which no request-generation or tenant exists.  Leave it on SGLang's
+        # queue so a later request retry can claim it, or SGLang can execute it
+        # as an explicitly unowned prefetch on a subsequent start_loading().
+        leased_operations = (
+            tuple(
+                operation
+                for operation in queued_operations
+                if int(operation.id) in demand_operation_ids
+            )
+            if self._acquire_callback is not None and demand_operation_ids
+            else queued_operations
+        )
+        leased_operation_ids = frozenset(
+            int(operation.id) for operation in leased_operations
+        )
         producer_id = controller.layer_done_counter.update_producer()
         operation_transfers: list[LeaseOperationTransfer] = []
-        for queued in queued_operations:
+        for queued in leased_operations:
             if len(queued.node_ids) != 1:
                 raise RuntimeError(
                     "unmerged SGLang HiCache operation has ambiguous node ownership"
@@ -451,11 +552,16 @@ class SglangHiCacheBridge:
                     int(queued.device_indices.numel()),
                 )
             )
-        op = CacheOperation.merge_ops(list(queued_operations))
-        controller.load_queue.clear()
+        op = CacheOperation.merge_ops(list(leased_operations))
+        controller.load_queue[:] = [
+            operation
+            for operation in queued_operations
+            if int(operation.id) not in leased_operation_ids
+        ]
         with self._lock:
-            for operation_id in queued_operation_ids:
+            for operation_id in leased_operation_ids:
                 self._operation_admission.pop(operation_id, None)
+                self._operation_requests.pop(operation_id, None)
         event = controller.layer_done_counter.events[producer_id]
         from nta_runtime.connectors.sglang_storage import (
             maybe_resolve_sglang_storage_keys,
@@ -476,6 +582,7 @@ class SglangHiCacheBridge:
             controller=controller,
             node_ids=tuple(op.node_ids),
             operation_transfers=tuple(operation_transfers),
+            operation_requests=operation_requests,
             demand_operation_ids=demand_operation_ids,
             storage_keys=storage_keys,
         )
@@ -566,6 +673,8 @@ class SglangHiCacheBridge:
         pending = self.get(consumer_index)
         if pending is None or not pending.layer_bytes:
             return None
+        if self._progress_callback is not None:
+            self._progress_callback(pending)
         total_layers = len(pending.layer_bytes)
         if total_layers != int(pending.controller.layer_num):
             raise RuntimeError("HiCache progress geometry changed during a lease")
@@ -797,6 +906,8 @@ class SglangHiCacheBridge:
         acquisition = getattr(pending, "acquisition", None)
         if acquisition is not None:
             acquisition.cancel_unfinished()
+        if self._retire_callback is not None:
+            self._retire_callback(pending)
         if ack is not None and stream is not None:
             finish_event = torch.cuda.Event()
             finish_event.record(stream)

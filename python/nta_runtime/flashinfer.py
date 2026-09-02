@@ -374,7 +374,7 @@ def enqueue_event_partitioned_attention(
     deferred_work_count = sum(wave_counts)
     if (
         not plan.has_external
-        or direct_work_count <= 0
+        or direct_work_count < 0
         or deferred_work_count <= 0
         or direct_work_count + deferred_work_count != total_work
         or any(count < 0 for count in wave_counts)
@@ -383,7 +383,7 @@ def enqueue_event_partitioned_attention(
         or any(event is None for event in event_values)
         or stream is None
     ):
-        raise ValueError("event-partitioned attention requires mixed exact work")
+        raise ValueError("event-partitioned attention requires deferred exact work")
     if _stream_is_capturing():
         raise RuntimeError("event-partitioned attention cannot mutate a captured queue")
     if prepare_partition:
@@ -405,13 +405,14 @@ def enqueue_event_partitioned_attention(
         plan.dependencies_tensor,
         scale,
     )
-    wrapper.run(
-        *common,
-        direct_work_count,
-        PREACQUIRED_LAUNCH_FLAGS | RUNNABLE_WORK | SKIP_MERGE,
-        out=out,
-        **options,
-    )
+    if direct_work_count:
+        wrapper.run(
+            *common,
+            direct_work_count,
+            PREACQUIRED_LAUNCH_FLAGS | RUNNABLE_WORK | SKIP_MERGE,
+            out=out,
+            **options,
+        )
     nonempty_waves = tuple(
         wave for wave, count in enumerate(wave_counts) if count != 0
     )

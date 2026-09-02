@@ -12,6 +12,7 @@ from nta_runtime.engines.sglang_topology import (
     group_external_pages_by_request,
     lease_acquisition_topology,
     page_pairs_for_schedule,
+    project_scheduled_acquisition_groups,
     project_acquisition_slices,
     request_batch_heterogeneity,
     resolve_request_acquisitions,
@@ -159,6 +160,23 @@ def main() -> None:
         LeaseAcquisitionGroup(71, 0, 32),
         None,
         LeaseAcquisitionGroup(72, 0, 8),
+    )
+    scheduled_groups = (
+        LeaseAcquisitionGroup(71, 0, 8),
+        LeaseAcquisitionGroup(71, 8, 24),
+        LeaseAcquisitionGroup(72, 0, 8),
+    )
+    assert project_scheduled_acquisition_groups(
+        projected, scheduled_groups
+    ) == (
+        scheduled_groups[0],
+        scheduled_groups[0],
+        scheduled_groups[1],
+        scheduled_groups[1],
+        scheduled_groups[1],
+        scheduled_groups[1],
+        None,
+        scheduled_groups[2],
     )
 
     scale_dependencies = tuple(

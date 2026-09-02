@@ -32,6 +32,7 @@ from nta_runtime.runtime import (
     IndexedAcquisitionPlan,
     IndexedHostIndexBinding,
     JitPhaseProgram,
+    MAX_EVENT_COMPLETION_CLASSES,
 )
 
 
@@ -189,23 +190,41 @@ class SglangPlanMaterializer:
         schedule: Schedule,
         topology: ExactWorkTopology,
         *,
+        completion_classes: tuple[int, ...] | None = None,
         stream: torch.cuda.Stream,
     ) -> DeviceWorkPlan:
-        """Publish an exact direct plan for stream/event-ready KV.
+        """Publish exact numerical work whose transport is producer-owned.
 
-        This is physical plan ownership, not semantic scheduling: every
-        dependency is the already-resident runtime view and no tier transfer
-        is introduced.
+        Dependencies are always the resident runtime view, so the numerical
+        plan never owns a tier transfer. Optional completion classes retain the
+        compiler-verified work-to-acquisition-group mapping for a producer that
+        publishes finite readiness waves.
         """
 
         plan = self.ensure_plan(wrapper, -1, schedule)
         allocation = self._require_owned_allocation(wrapper)
+        class_values = (
+            None
+            if completion_classes is None
+            else tuple(int(value) for value in completion_classes)
+        )
+        if class_values is not None and (
+            len(class_values) != schedule.work_count
+            or any(
+                value != INVALID_INDEX
+                and not 0 <= value < MAX_EVENT_COMPLETION_CLASSES
+                for value in class_values
+            )
+            or all(value == INVALID_INDEX for value in class_values)
+        ):
+            raise ValueError("preacquired completion classes are inconsistent")
         signature = (
             "preacquired",
             schedule.request_indices,
             schedule.kv_tile_indices,
             tuple(binding.request_slot for binding in batch.bindings),
             tuple(binding.generation for binding in batch.bindings),
+            class_values,
         )
         if allocation.signature == signature:
             return plan
@@ -225,13 +244,32 @@ class SglangPlanMaterializer:
             topology,
             dependency_spans,
             dependencies,
+            completion_classes=class_values,
             stream=stream,
         )
         allocation.signature = signature
         allocation.object_count = 0
-        allocation.direct_work_count = schedule.work_count
+        allocation.direct_work_count = (
+            schedule.work_count
+            if class_values is None
+            else sum(value == INVALID_INDEX for value in class_values)
+        )
+        allocation.event_partitioned = class_values is not None
+        if class_values is None:
+            allocation.event_wave_work_counts = ()
+            allocation.external_work_mask = (False,) * schedule.work_count
+        else:
+            wave_counts = [0] * (1 + max(
+                value for value in class_values if value != INVALID_INDEX
+            ))
+            for value in class_values:
+                if value != INVALID_INDEX:
+                    wave_counts[value] += 1
+            allocation.event_wave_work_counts = tuple(wave_counts)
+            allocation.external_work_mask = tuple(
+                value != INVALID_INDEX for value in class_values
+            )
         allocation.external_object_slots = tuple(() for _ in range(schedule.work_count))
-        allocation.external_work_mask = (False,) * schedule.work_count
         return plan
 
     def close(self) -> tuple[BaseException, ...]:
@@ -370,9 +408,14 @@ class SglangPlanMaterializer:
         if local_layer < 0 or local_layer >= int(controller.layer_num):
             raise RuntimeError(f"SGLang layer {layer_id} is outside the HiCache pool")
         prefetched = pending.prefetched_layers.get(local_layer)
-        if self._tenant_isolation_enabled and prefetched is not None:
+        if (
+            self._tenant_isolation_enabled
+            and prefetched is not None
+            and not getattr(pending, "shared_acquisition_registered", False)
+        ):
             raise RuntimeError(
-                "proactive host publication cannot bypass finite tenant budgets"
+                "unaccounted proactive Host publication cannot bypass finite "
+                "tenant budgets"
             )
         if arriving_prefetch and (
             prefetched is None or prefetched.transfer_first_slot is None

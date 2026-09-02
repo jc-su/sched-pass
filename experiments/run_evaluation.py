@@ -3,7 +3,7 @@
 
 The existing qualified-trial engine owns subprocess execution, randomized
 complete blocks, raw logs, and confidence intervals.  This wrapper owns the
-OSDI-specific contract: a normalized workload, explicit arm/tier/stratum
+mechanism-study contract: a normalized workload, explicit arm/tier/stratum
 identity, exact demand semantics, and an external non-overwriting artifact.
 """
 
@@ -50,7 +50,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 QUALIFIED_RUNNER = ROOT / "scripts" / "run-qualified-trials.py"
 EVALUATION_MANIFEST = ROOT / "experiments" / "evaluation-manifest.json"
-EVALUATION_PROFILES = {"contract", "osdi-complete"}
+EVALUATION_PROFILES = {"contract", "mechanism-study"}
 CANONICAL_ARMS = set(ARMS)
 FORMAL_CONSUMER_KINDS = {"native_work_unit", "framework_reference"}
 TIER_ENVIRONMENT = {
@@ -92,17 +92,18 @@ def validate_spec(
         )
     repetitions = spec.get("repetitions")
     if not isinstance(repetitions, int) or repetitions < 5:
-        raise ValueError("OSDI evaluation requires at least five repetitions")
+        raise ValueError("paired evaluation requires at least five repetitions")
     trials = spec.get("experiments")
     if not isinstance(trials, list) or not trials:
         raise ValueError("evaluation trial spec contains no experiments")
     evaluation_profile = spec.get("evaluation_profile", "contract")
     if evaluation_profile not in EVALUATION_PROFILES:
-        raise ValueError("evaluation_profile must be contract or osdi-complete")
+        raise ValueError("evaluation_profile must be contract or mechanism-study")
     contract = json.loads(EVALUATION_MANIFEST.read_text(encoding="utf-8"))
     validate_evaluation_contract(contract)
     tiers = {tier["id"] for tier in contract["tiers"]}
-    arms = {arm["id"] for arm in contract["arms"]}
+    mechanism_contract = contract["mechanism_study"]
+    arms = {arm["id"] for arm in mechanism_contract["arms"]}
     identities: dict[tuple[str, str], dict[str, Any]] = {}
     consumer_kinds_by_arm: dict[str, set[str]] = {}
     workloads: dict[str, dict[str, Any]] = {}
@@ -119,11 +120,11 @@ def validate_spec(
             raise ValueError(f"trial uses an undeclared tier: {trial.get('tier')}")
         if trial.get("demand_semantics") != "exact":
             raise ValueError("evaluation trials must declare exact demand")
-        if evaluation_profile == "osdi-complete":
+        if evaluation_profile == "mechanism-study":
             consumer_kind = trial.get("consumer_kind")
             if consumer_kind not in FORMAL_CONSUMER_KINDS:
                 raise ValueError(
-                    "osdi-complete trials must declare a numerical consumer_kind "
+                    "mechanism-study trials must declare a numerical consumer_kind "
                     "of native_work_unit or framework_reference"
                 )
             consumer_kinds_by_arm.setdefault(trial["arm"], set()).add(consumer_kind)
@@ -151,7 +152,7 @@ def validate_spec(
                 formal_only=True
             ):
                 raise ValueError(
-                    "osdi-complete trials must declare a supported result_contract"
+                    "mechanism-study trials must declare a supported result_contract"
                 )
         elif trial.get("result_contract") is not None and trial.get(
             "result_contract"
@@ -178,11 +179,11 @@ def validate_spec(
             or not all(isinstance(metric, str) and metric for metric in metrics)
         ):
             raise ValueError("each evaluation trial needs a non-empty metric contract")
-        if evaluation_profile == "osdi-complete" and not set(
+        if evaluation_profile == "mechanism-study" and not set(
             FORMAL_SERVING_METRICS
         ).issubset(metrics):
             raise ValueError(
-                "osdi-complete trials must report TTFT, TPOT, ITL, throughput, "
+                "mechanism-study trials must report TTFT, TPOT, ITL, throughput, "
                 "admission delay, SLO goodput, and correctness"
             )
         identity = (trial["name"], trial["variant"])
@@ -253,30 +254,30 @@ def validate_spec(
                 f"causal comparison {name} references an unmeasured metric"
             )
         comparison_names.add(name)
-    if evaluation_profile == "osdi-complete":
+    if evaluation_profile == "mechanism-study":
         declared_arms = {trial["arm"] for trial in identities.values()}
         if declared_arms != CANONICAL_ARMS:
-            raise ValueError("osdi-complete evaluation must contain exactly A0-A3")
+            raise ValueError("mechanism-study evaluation must contain exactly A0-A3")
         if any(
             consumer_kinds_by_arm.get(arm, set())
             and len(consumer_kinds_by_arm[arm]) != 1
             for arm in CANONICAL_ARMS
         ):
             raise ValueError(
-                "osdi-complete arms must use one declared consumer_kind across "
+                "mechanism-study arms must use one declared consumer_kind across "
                 "all strata"
             )
         if any(
             len(consumer_kinds_by_arm.get(arm, set())) != 1 for arm in CANONICAL_ARMS
         ):
             raise ValueError(
-                "osdi-complete evaluation must declare a consumer_kind for every "
+                "mechanism-study evaluation must declare a consumer_kind for every "
                 "canonical arm"
             )
         declared_tiers = {trial["tier"] for trial in identities.values()}
         if len(declared_tiers) != 1:
             raise ValueError(
-                "osdi-complete evaluation must measure one tier per paired spec"
+                "mechanism-study evaluation must measure one tier per paired spec"
             )
 
         def stratum_key(value: Mapping[str, Any]) -> str:
@@ -291,11 +292,11 @@ def validate_spec(
             for arm in CANONICAL_ARMS
         }
         if len({frozenset(value) for value in arm_strata.values()}) != 1:
-            raise ValueError("osdi-complete arms do not cover the same strata")
+            raise ValueError("mechanism-study arms do not cover the same strata")
         stratum_keys = next(iter(arm_strata.values()))
         if len(stratum_keys) < 6:
             raise ValueError(
-                "osdi-complete evaluation needs at least six workload strata"
+                "mechanism-study evaluation needs at least six workload strata"
             )
         demand_identities = {
             str(trial["stratum"]["demand_trace_digest"])
@@ -303,7 +304,7 @@ def validate_spec(
         }
         if len(demand_identities) < 6:
             raise ValueError(
-                "osdi-complete evaluation needs at least six distinct consumed "
+                "mechanism-study evaluation needs at least six distinct consumed "
                 "workload identities"
             )
 
@@ -317,7 +318,7 @@ def validate_spec(
             ]
             if len(numerator_trials) != 1:
                 raise ValueError(
-                    "osdi-complete causal comparisons must identify one stratum"
+                    "mechanism-study causal comparisons must identify one stratum"
                 )
             actual_pairs.add(
                 (
@@ -327,15 +328,15 @@ def validate_spec(
                 )
             )
         if len(actual_pairs) != len(comparisons):
-            raise ValueError("osdi-complete causal comparisons contain duplicates")
+            raise ValueError("mechanism-study causal comparisons contain duplicates")
         expected_pairs = {
             (pair["numerator"], pair["denominator"], stratum)
-            for pair in contract["causal_pairs"]
+            for pair in mechanism_contract["causal_pairs"]
             for stratum in stratum_keys
         }
         if actual_pairs != expected_pairs:
             raise ValueError(
-                "osdi-complete causal comparisons must cover every canonical "
+                "mechanism-study causal comparisons must cover every canonical "
                 "boundary in every declared stratum"
             )
     required_qualification_tiers = _required_qualification_tiers(spec)

@@ -1,117 +1,110 @@
 {
-  "schema": 1,
+  "schema": 2,
   "classification": "nta-osdi-evaluation-contract",
-  "mechanism": "exact-late-bound-heterogeneous-work-unit",
+  "paper_thesis": "compiler-verified exact dependencies let the runtime schedule heterogeneous external KV arrival and consume ready work at execution granularity",
   "selection_semantics": "exact-demand-only",
   "approximate_attention_claim": false,
-  "tiers": [
-    {
-      "id": "hbm",
-      "role": "resident-reference",
-      "resource_kind": "hbm",
-      "steady_state_path": "gpu_hbm_load",
-      "qualification": "always",
-      "evidence": ["native_attention_correctness", "native_gpu_timing"]
-    },
-    {
-      "id": "host_mem",
-      "role": "host-staged-serving-tier",
-      "backend": "indexed-host-staged",
-      "resource_kind": "host_staged",
-      "steady_state_path": "host_indexed_copy_to_engine_hbm",
-      "qualification": "cuda_can_register_pinned_host_memory",
-      "evidence": ["native_attention_correctness", "native_gpu_timing", "serving"]
-    },
-    {
-      "id": "nvme",
-      "role": "persistent-device-initiated-tier",
-      "backend": "vfio-nvme",
-      "resource_kind": "nvme",
-      "steady_state_path": "nvme_peer_dma_to_engine_hbm",
-      "qualification": "explicit_vfio_iommu_and_read_only_contract",
-      "evidence": ["transport_qualification", "native_acquisition_correctness", "native_gpu_timing"]
-    },
-    {
-      "id": "dax",
-      "role": "cxl-devdax-tier",
-      "backend": "cxl-dax-mapped",
-      "resource_kind": "cxl_dax",
-      "steady_state_path": "cuda_visible_cxl_direct",
-      "qualification": "explicit_devdax_endpoint_cuda_visible_mapping",
-      "evidence": ["mapping_qualification", "native_attention_correctness", "native_gpu_timing"]
-    }
-  ],
-  "matched_baselines": [
-    {
-      "id": "host_mapped",
-      "resource_kind": "host_mapped",
-      "steady_state_path": "gpu_mapped_host_load",
-      "scope": "nvme_dma_destination",
-      "serving_tier": false
-    }
-  ],
+  "correctness_role": "mandatory_validity_gate_not_research_question",
   "research_questions": [
     {
-      "id": "RQ0",
-      "question": "Where do anonymized production-shaped requests expose heterogeneous exact work?",
-      "primary_artifact": "bailian-structure-replay",
-      "metrics": ["input_length", "output_length", "shared_prefix_blocks", "arrival_burstiness", "state_heterogeneity"]
-    },
-    {
       "id": "RQ1",
-      "question": "Does the mechanism improve serving goodput and tail latency under the same exact demand?",
-      "primary_artifact": "paired-serving-report",
-      "metrics": ["ttft_p50_p95_p99", "tpot_p50_p95_p99", "itl_p99", "slo_goodput", "output_correctness"]
+      "role": "end_to_end_effectiveness",
+      "question": "How does NTA compare with current hierarchical KV serving systems across models, workloads, and offered load?",
+      "primary_evidence": "multi-system load curves",
+      "metrics": ["ttft_p50_p95_p99", "tpot_p50_p95_p99", "itl_p99", "slo_goodput", "request_throughput", "output_token_throughput"]
     },
     {
       "id": "RQ2",
-      "question": "Which mechanism boundary causes the improvement?",
-      "primary_artifact": "matched-ablation-matrix",
-      "metrics": ["host_round_trips", "device_demand_discoveries", "work_unit_ready_events", "staging_high_water", "physical_bytes"]
+      "role": "mechanism_attribution",
+      "question": "Which acquisition, scheduling, and work-unit consumption boundaries cause the measured benefit?",
+      "primary_evidence": "matched causal mechanism study",
+      "metrics": ["host_round_trips", "transfer_overlap", "partial_ready_groups", "frontier_depth", "hidden_decode_steps", "tier_bandwidth", "slo_goodput"]
     },
     {
       "id": "RQ3",
-      "question": "Does the benefit survive request, tier, load, arrival, and granularity strata?",
-      "primary_artifact": "stratified-serving-report",
-      "metrics": ["goodput", "tail_latency", "queue_delay", "admission_delay", "finite_window_occupancy"]
+      "role": "opportunity_envelope",
+      "question": "Under which context, locality, heterogeneity, load, and tier regimes does the mechanism help?",
+      "primary_evidence": "predeclared regime sweeps",
+      "metrics": ["cache_distance", "cached_to_new_ratio", "external_fraction", "transfer_compute_ratio", "frontier_depth", "goodput", "tail_latency"]
     },
     {
       "id": "RQ4",
-      "question": "What is the CPU/GPU/control and memory cost of the mechanism?",
-      "primary_artifact": "profile-and-regression-bundle",
-      "metrics": ["gpu_utilization", "sm_occupancy", "cpu_time", "control_time", "tier_bandwidth", "io_depth"]
+      "role": "deployment_cost_and_isolation",
+      "question": "What CPU, GPU, memory, startup, and multi-tenant costs does NTA impose?",
+      "primary_evidence": "profiles, no-op controls, and tenant interference trials",
+      "metrics": ["cpu_time", "gpu_utilization", "copy_engine_utilization", "staging_high_water", "hbm_capacity", "startup_time", "resident_tail_latency", "tenant_slo_attainment"]
     }
   ],
-  "arms": [
-    {"id": "A0", "name": "framework-bulk", "exact_demand": true},
-    {"id": "A1", "name": "exact-preacquired-stock", "exact_demand": true},
-    {"id": "A2", "name": "scheduled-whole-layer", "exact_demand": true},
-    {"id": "A3", "name": "late-bound-work-unit", "exact_demand": true}
+  "systems": [
+    {"id": "nta-full", "role": "system_under_test", "framework": "sglang", "hierarchical_cache": true, "required": true},
+    {"id": "sglang-hicache-kernel", "role": "closest_upstream_control", "framework": "sglang", "hierarchical_cache": true, "required": true, "configuration": "current upstream recommended kernel I/O backend"},
+    {"id": "vllm-lmcache", "role": "cross_framework_competitor", "framework": "vllm", "hierarchical_cache": true, "required": true},
+    {"id": "strata", "role": "closest_published_competitor", "framework": "sglang", "hierarchical_cache": true, "required_when_publicly_executable": true},
+    {"id": "tensorrt-llm-hicache", "role": "vendor_competitor", "framework": "tensorrt-llm", "hierarchical_cache": true, "required_when_supported": true},
+    {"id": "gpu-only-reference", "role": "non_hierarchical_reference", "framework": "same_as_compared_system", "hierarchical_cache": false, "required": true}
   ],
-  "causal_pairs": [
-    {"numerator": "A1", "denominator": "A0", "role": "exact_acquisition_boundary"},
-    {"numerator": "A2", "denominator": "A1", "role": "schedule_bound_acquisition_boundary"},
-    {"numerator": "A3", "denominator": "A2", "role": "progressive_work_unit_boundary"}
+  "paper_campaign_contract": {
+    "minimum_models": 3,
+    "minimum_model_families": 2,
+    "minimum_long_context_models": 2,
+    "minimum_workload_families": 4,
+    "minimum_natural_trace_workloads": 2,
+    "require_short_context_control": true,
+    "minimum_load_points_per_headline_curve": 4,
+    "minimum_independent_requests_per_load_point": 1000,
+    "minimum_independent_requests_for_p99": 10000,
+    "minimum_repetitions": 5,
+    "preferred_repetitions": 10,
+    "confidence_interval": "paired_bootstrap_95_percent_over_trial_blocks",
+    "required_competitor_groups": [
+      {"id": "closest_upstream", "minimum": 1, "systems": ["sglang-hicache-kernel", "strata"]},
+      {"id": "cross_framework", "minimum": 1, "systems": ["vllm-lmcache"]},
+      {"id": "non_hierarchical_reference", "minimum": 1, "systems": ["gpu-only-reference"]}
+    ],
+    "required_rq_evidence": {
+      "RQ1": ["multi_system_load_curves", "warm_cache", "cold_cache"],
+      "RQ2": ["matched_mechanism_arms", "result_emitted_activation"],
+      "RQ3": ["context_sweep", "locality_sweep", "load_sweep", "tier_sweep"],
+      "RQ4": ["short_context_control", "resource_profile", "tenant_interference"]
+    }
+  },
+  "tiers": [
+    {"id": "hbm", "role": "resident-reference", "resource_kind": "hbm", "steady_state_path": "gpu_hbm_load", "qualification": "always"},
+    {"id": "host_mem", "role": "host-staged-serving-tier", "backend": "indexed-host-staged", "resource_kind": "host_staged", "steady_state_path": "host_indexed_copy_to_engine_hbm", "qualification": "cuda_can_register_pinned_host_memory"},
+    {"id": "nvme", "role": "persistent-device-initiated-tier", "backend": "vfio-nvme", "resource_kind": "nvme", "steady_state_path": "nvme_peer_dma_to_engine_hbm", "qualification": "explicit_vfio_iommu_and_read_only_contract"},
+    {"id": "dax", "role": "cxl-devdax-tier", "backend": "cxl-dax-mapped", "resource_kind": "cxl_dax", "steady_state_path": "cuda_visible_cxl_direct", "qualification": "explicit_devdax_endpoint_cuda_visible_mapping"}
   ],
-  "workload_scenario_contract": {
+  "matched_baselines": [
+    {"id": "host_mapped", "resource_kind": "host_mapped", "steady_state_path": "gpu_mapped_host_load", "scope": "nvme_dma_destination", "serving_tier": false}
+  ],
+  "mechanism_study": {
+    "profile": "mechanism-study",
+    "arms": [
+      {"id": "A0", "name": "framework-bulk", "exact_demand": true},
+      {"id": "A1", "name": "exact-preacquired-stock", "exact_demand": true},
+      {"id": "A2", "name": "scheduled-whole-layer", "exact_demand": true},
+      {"id": "A3", "name": "late-bound-work-unit", "exact_demand": true}
+    ],
+    "causal_pairs": [
+      {"numerator": "A1", "denominator": "A0", "role": "exact_acquisition_boundary"},
+      {"numerator": "A2", "denominator": "A1", "role": "schedule_bound_acquisition_boundary"},
+      {"numerator": "A3", "denominator": "A2", "role": "progressive_work_unit_boundary"}
+    ],
     "minimum_distinct_scenarios": 6,
-    "identity": ["manifest_sha256", "records_digest", "demand_trace_digest"],
-    "derived_axes": ["request_state_counts", "input_tokens", "output_tokens", "cached_prefix_tokens", "uncached_query_rows", "arrival"],
-    "free_form_stratum_labels": false,
-    "same_scenario_required_within_pair": true
+    "same_scenario_required_within_pair": true,
+    "identity": ["manifest_sha256", "records_digest", "demand_trace_digest"]
   },
   "mechanism_observations": {
-    "not_workload_labels": ["numerical_dispatch", "work_unit_granularity", "availability_skew", "staging_pressure", "transfer_compute_ratio"],
     "require_result_emitted_evidence": true,
     "ablation_or_continuous_axis_only": true,
     "orthogonal_axes": ["frontier_depth", "work_unit_granularity", "transport_engine", "tier", "batch_heterogeneity"]
   },
   "fairness": [
-    "same request records and arrival offsets per paired arm",
+    "same request records and arrival offsets within a comparison cell",
     "same exact demanded block/object IDs and page order",
-    "same output correctness contract and random seed",
-    "same model, tokenizer, CUDA graph, chunking, and scheduler bounds",
-    "tier changes transport placement/qualification, never demand semantics",
+    "same output contract and random seed",
+    "same model, tokenizer, graph, chunking, and scheduler bounds",
+    "competitors use current documented or independently tuned configurations",
     "offline trace order is never labeled production arrival"
   ],
   "statistical_protocol": {
@@ -119,14 +112,16 @@
     "randomized_paired_arm_order": true,
     "minimum_repetitions": 5,
     "preferred_repetitions": 10,
-    "confidence_interval": "paired-bootstrap-95-percent",
-    "report_per_scenario_before_aggregate": true,
+    "confidence_interval": "paired-bootstrap-95-percent-over-trial-blocks",
+    "report_per_cell_before_aggregate": true,
+    "replay_cycles_are_independent_samples": false,
     "reject_cherry_picking": true
   },
   "qualification_rules": {
+    "correctness": "mandatory_gate_not_rq",
     "dax_without_endpoint": "skip_not_pass",
     "nvme_without_vfio_iommu": "skip_not_pass",
     "synthetic_timing": "contract_evidence_only",
-    "serving_speedup_requires": ["structured_report", "exact_demand_counters", "correctness_digest", "machine_metadata"]
+    "serving_speedup_requires": ["structured_report", "exact_demand_counters", "zero_verification_failures", "machine_metadata"]
   }
 }

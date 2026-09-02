@@ -1152,7 +1152,6 @@ def main() -> None:
         destination_indices=torch.tensor([0, 2], dtype=torch.int32),
     )
     phases.call("nta_jit_reset_epoch", indexed, 1, 1)
-    indexed_output = torch.full_like(expected, math.nan)
     phases.program.discover(
         indexed.native_runtime,
         indexed.plan,
@@ -1187,7 +1186,6 @@ def main() -> None:
         queued_indexed.native_runtime, 0, 1, torch.cuda.current_stream()
     )
     phases.call("nta_jit_reset_epoch", queued_indexed, 1, 1)
-    queued_indexed_output = torch.full_like(expected, math.nan)
     phases.program.discover(
         queued_indexed.native_runtime,
         queued_indexed.plan,
@@ -1322,7 +1320,6 @@ def main() -> None:
         destination_indices=torch.tensor([0], dtype=torch.int32),
     )
     phases.call("nta_jit_reset_epoch", invalid_indexed, 1, 1)
-    invalid_output = torch.full_like(expected, math.nan)
     phases.program.discover(
         invalid_indexed.native_runtime,
         invalid_indexed.plan,
@@ -1502,15 +1499,15 @@ def main() -> None:
     # FlashInfer's canonical split-K order is independent of transport order.
     # Exercise a deliberately descending object-slot permutation so the
     # producer completion classes are non-monotone in scheduler index. The
-    # one-time typed partition must stable-bucket canonical work identities;
-    # requiring framework CTA order to match transport would reject this exact
-    # and otherwise profitable schedule.
+    # one-time typed partition must stable-bucket canonical work identities.
+    # This is also the fully cold NVMe form: no resident CTA exists before the
+    # first event wave, so directWorkCount is exactly zero.
     if split_work < 4:
         raise RuntimeError(
             f"completion-wave permutation needs at least four work items: {split_work}"
         )
-    permuted_slots = [0, *reversed(range(1, split_work))]
-    completion_waves = [slot // 2 for slot in permuted_slots[1:]]
+    permuted_slots = list(reversed(range(split_work)))
+    completion_waves = [slot // 2 for slot in permuted_slots]
     if completion_waves == sorted(completion_waves):
         raise RuntimeError("completion-wave fixture is accidentally monotone")
     permuted_staging = torch.zeros_like(split_reference_kv)
@@ -1519,13 +1516,11 @@ def main() -> None:
         split_host_kv,
         split_work,
         request_indices=list(split_schedule.request_indices),
-        direct_work_indices={0},
+        direct_work_indices=set(),
         partitioned_objects=True,
         partition_object_slots=permuted_slots,
-        event_completion_classes=[INVALID_INDEX, *completion_waves],
+        event_completion_classes=completion_waves,
     )
-    direct_rows = split_pages // split_work
-    permuted_staging[:direct_rows].copy_(split_reference_kv[:direct_rows])
     registration = torch.cuda.Event()
     registration.record()
     producer = torch.cuda.Stream(priority=0)
@@ -1535,8 +1530,6 @@ def main() -> None:
         producer.wait_event(registration)
         for wave in range(wave_count):
             for object_slot in range(2 * wave, 2 * wave + 2):
-                if object_slot == permuted_slots[0]:
-                    continue
                 phases.program.preload_host(
                     permuted.native_runtime, object_slot, 1, producer
                 )
@@ -1556,7 +1549,7 @@ def main() -> None:
         permuted_staging,
         permuted_output,
         ready_events=tuple(ready_events),
-        direct_work_count=1,
+        direct_work_count=0,
         wave_work_counts=wave_work_counts,
         prepare_partition=True,
         stream=torch.cuda.current_stream(),

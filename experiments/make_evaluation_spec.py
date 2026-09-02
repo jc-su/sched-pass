@@ -141,7 +141,7 @@ def build_spec(
     if tier not in {"hbm", "host_mem", "nvme", "dax"}:
         raise ValueError(f"unsupported evaluation tier: {tier}")
     if repetitions < 5:
-        raise ValueError("OSDI evaluation requires at least five repetitions")
+        raise ValueError("mechanism study requires at least five repetitions")
     if set(arm_commands) != set(ARMS):
         raise ValueError("complete A0--A3 arm command set is required")
     if set(result_contracts) != set(ARMS):
@@ -202,7 +202,7 @@ def build_spec(
     spec: dict[str, Any] = {
         "schema": 1,
         "classification": "nta-paired-evaluation",
-        "evaluation_profile": "osdi-complete",
+        "evaluation_profile": "mechanism-study",
         "generated_by": "experiments/make_evaluation_spec.py",
         "workload_manifests": sorted(
             {str(Path(stratum["workload_manifest"]).resolve()) for stratum in strata}

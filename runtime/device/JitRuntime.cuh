@@ -128,8 +128,12 @@ nta_discover_work(nta::abi::RuntimeView *runtime,
           : item.generation;
   std::uint64_t deadlineClock = request.deadlineClock;
   if (item.readyDeadlineOffsetNs != 0) {
+    const std::uint64_t deadlineBase =
+        (item.flags & nta::abi::WorkItemDeadlineRelativeToDiscovery) != 0
+            ? nta::device::globalTimerNs()
+            : runtime->epochStartClock;
     const std::uint64_t workDeadline = nta::device::saturatingAdd(
-        runtime->epochStartClock, item.readyDeadlineOffsetNs);
+        deadlineBase, item.readyDeadlineOffsetNs);
     if (deadlineClock == 0 || workDeadline < deadlineClock) {
       deadlineClock = workDeadline;
     }
@@ -376,8 +380,7 @@ extern "C" __global__ void nta_prepare_event_work_partition(
   __shared__ std::uint32_t chunkClasses[Threads];
   __shared__ std::uint32_t invalid;
 
-  if (workItemCount == 0 || directWorkCount == 0 ||
-      directWorkCount >= workItemCount ||
+  if (workItemCount == 0 || directWorkCount >= workItemCount ||
       workItemCount > runtime->workTicketCapacity ||
       waveCount == 0 ||
       waveCount > nta::abi::MaximumEventCompletionClasses ||
@@ -498,7 +501,6 @@ nta_jit_prepare_event_work_partition(void *runtime, const void *workItems,
                                      std::uint32_t waveCount,
                                      cudaStream_t stream) {
   if (runtime == nullptr || workItems == nullptr || workItemCount == 0 ||
-      directWorkCount == 0 ||
       directWorkCount >= workItemCount || waveCount == 0 ||
       waveCount > nta::abi::MaximumEventCompletionClasses) {
     return cudaErrorInvalidValue;

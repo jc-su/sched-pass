@@ -348,9 +348,9 @@ def _run_evaluation(
             f"evaluation specification is not reproducible: {error}"
         ) from error
     evaluation_profile = spec_document.get("evaluation_profile", "contract")
-    if evaluation_profile == "osdi-complete" and args.performance_evidence is None:
+    if evaluation_profile == "mechanism-study" and args.performance_evidence is None:
         raise RuntimeError(
-            "osdi-complete evaluation requires --performance-evidence with "
+            "mechanism-study evaluation requires --performance-evidence with "
             "successful profiler, baseline, measured report, and regression gate"
         )
     workload_replacements, copied_workload_metadata = _copy_evaluation_workloads(
@@ -416,31 +416,35 @@ def _run_evaluation(
         qualification_path=copied_qualification,
         base_dir=run.output,
     )
-    rq0_metadata: list[dict[str, object]] = []
+    opportunity_metadata: list[dict[str, object]] = []
     for index, workload_entry in enumerate(copied_workload_metadata):
         copied_workload = run.output / str(workload_entry["manifest"])
-        rq0 = run.output / "rq0" / f"{index:03d}-{workload_entry['scenario_id']}.json"
-        rq0.parent.mkdir(parents=True, exist_ok=True)
+        opportunity = (
+            run.output
+            / "opportunity"
+            / f"{index:03d}-{workload_entry['scenario_id']}.json"
+        )
+        opportunity.parent.mkdir(parents=True, exist_ok=True)
         run.command(
             [
                 sys.executable,
                 "experiments/analyze_workload.py",
                 str(copied_workload),
                 "--output",
-                str(rq0),
+                str(opportunity),
             ],
-            name=f"workload-rq0-{index:03d}",
+            name=f"workload-opportunity-{index:03d}",
             environment=environment,
         )
-        rq0_metadata.append(
+        opportunity_metadata.append(
             {
                 "scenario_id": workload_entry["scenario_id"],
-                "report": str(rq0.relative_to(run.output)),
-                "report_digest": file_digest(rq0),
+                "report": str(opportunity.relative_to(run.output)),
+                "report_digest": file_digest(opportunity),
                 "demand_trace_digest": workload_entry["demand_trace_digest"],
             }
         )
-    run.update(rq0_opportunities=rq0_metadata)
+    run.update(workload_opportunities=opportunity_metadata)
     if args.performance_evidence is not None:
         source_evidence = args.performance_evidence.resolve()
         if not source_evidence.is_dir():

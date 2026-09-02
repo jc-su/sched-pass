@@ -5,18 +5,31 @@ from __future__ import annotations
 
 import types
 
-from nta_runtime.acquisition_scheduler import LayerAcquisition, LayerAcquisitionModel
+import torch
+
+from nta_runtime.acquisition_scheduler import (
+    LayerAcquisition,
+    LayerAcquisitionModel,
+    SharedAcquisitionState,
+)
 from nta_runtime.engines.sglang_acquisition import (
     SglangHostAcquisitionCoordinator,
+)
+from nta_runtime.engines.sglang_contracts import (
+    LeaseAcquisitionGroup,
+    LeaseOperationRange,
+    LeaseOperationRequest,
 )
 from nta_runtime.engines.sglang_state import SglangForwardEpoch, SglangForwardPlan
 from nta_runtime.execution_planner import HostExecutionMode
 from nta_runtime.execution_protocol import ProtocolKind
+from nta_runtime.requests import RequestBinding
 
 
 class FakeTransport:
     def __init__(self) -> None:
         self.ranges: list[tuple[int, int]] = []
+        self.events: dict[int, types.SimpleNamespace] = {}
 
     def prepare(
         self,
@@ -29,7 +42,17 @@ class FakeTransport:
         assert transfer_plan is pending.transfer_plan
         self.ranges.append((first_local_layer, last_local_layer))
         for local_layer in range(first_local_layer, last_local_layer):
-            pending.prefetched_layers[local_layer] = object()
+            event = types.SimpleNamespace(ready=False)
+            event.query = lambda item=event: item.ready
+            self.events[local_layer] = event
+            pending.prefetched_layers[local_layer] = types.SimpleNamespace(
+                key_bytes=1,
+                value_bytes=1,
+                ready_event=event,
+                transfer_first_slot=None,
+                wave_events=(),
+                wave_row_ends=(),
+            )
 
 
 def coordinator(
@@ -41,6 +64,21 @@ def coordinator(
 ):
     pool = object()
     transport = FakeTransport()
+
+    def bind(request_ids, request_slots, *, tenant_ids, **_kwargs):
+        return tuple(
+            RequestBinding(
+                index,
+                int(slot),
+                1,
+                index + 1,
+                tenant_id=int(tenant),
+            )
+            for index, (slot, tenant) in enumerate(
+                zip(request_slots, tenant_ids, strict=True)
+            )
+        )
+
     owner = SglangHostAcquisitionCoordinator(
         device_pool=pool,
         execution_config=types.SimpleNamespace(
@@ -59,6 +97,10 @@ def coordinator(
         ),
         minimum_consumer_gain=1.03,
         transport=transport,
+        request_adapter=types.SimpleNamespace(bind=bind),
+        staging_capacity_bytes=(1 << 64) - 1,
+        tenant_specs=(),
+        max_inflight_groups=4096,
         stats={},
     )
     return owner, pool, transport
@@ -66,11 +108,18 @@ def coordinator(
 
 def pending(pool):
     return types.SimpleNamespace(
+        lease_id=1,
         controller=types.SimpleNamespace(mem_pool_device=pool, layer_num=4),
         layer_bytes=(),
         prefetched_layers={},
         transfer_plan=None,
         acquisition=None,
+        operation_requests=(LeaseOperationRequest(1, "request-1", 3, 0, 1, 0),),
+        operation_bindings={},
+        scheduled_acquisition_groups=(LeaseAcquisitionGroup(1, 0, 1),),
+        acquisition_group_identities={},
+        shared_acquisition_registered=False,
+        operation_ranges=lambda: (LeaseOperationRange(1, 0, 1),),
     )
 
 
@@ -155,6 +204,7 @@ def main() -> None:
     isolated_owner.account_selection = account
     isolated_owner.transfer_plan = freeze
     isolated_owner.capture(isolated)
+    assert isolated_owner.proactive_layer_queue_enabled
     assert isolated.acquisition is None
     assert not isolated.prefetched_layers
     assert not isolated_transport.ranges
@@ -174,6 +224,7 @@ def main() -> None:
         transfer_plan=object(),
         prefetched_layers={},
         acquisition=LayerAcquisition(model.layer_bytes),
+        shared_acquisition_registered=False,
     )
     admission.acquisition.bind_model(model)
     admission_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
@@ -213,6 +264,11 @@ def main() -> None:
     )
     structural_owner.capture(structural)
     assert not structural_owner.prepare_owner(structural, object())
+    assert structural.operation_bindings[1].request_slot == 3
+    assert structural.operation_bindings[1].generation == 1
+    assert len(structural.acquisition_group_identities) == 4
+    assert structural.acquisition_group_identities[0][0].request_slot == 3
+    assert structural.acquisition_group_identities[0][0].resource_version == 1
     assert structural.acquisition is not None
     assert structural.acquisition.model is None
     assert structural_owner._stats["host_acquisition_jobs_prepared"] == 4
@@ -223,6 +279,101 @@ def main() -> None:
         structural_owner.retire_layer(structural, layer)
     assert structural.acquisition.queue.terminal
     assert structural_owner._stats["host_acquisition_layers_consumed"] == 4
+
+    # The production shared-link path keeps complete request-generation group
+    # identity while issuing only a finite layer cohort. Completing its fence
+    # opens the next EDF slot; registration never queues the whole model.
+    shared_owner, shared_pool, shared_transport = coordinator(
+        layer_count=4, frontier_enabled=True
+    )
+    shared_owner._shared_dispatch_horizon = 1
+    shared_owner._shared_layers_per_dispatch = 1
+    shared = pending(shared_pool)
+    shared.device_indices = torch.tensor((7,), dtype=torch.int32)
+    shared.row_bytes_by_layer = ((1, 1),) * 4
+    shared.layer_bytes = (2,) * 4
+    shared.transfer_plan = object()
+    shared_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
+    shared_owner._bind_group_identities(shared)
+    shared_model = LayerAcquisitionModel(
+        layer_bytes=shared.layer_bytes,
+        transfer_service_ns=(50,) * 4,
+        initial_compute_ns=0,
+        inter_layer_compute_ns=100,
+    )
+    shared.acquisition = LayerAcquisition(shared.layer_bytes)
+    shared.acquisition.bind_model(shared_model)
+    shared_owner._register_shared_acquisition(shared, shared_model)
+    shared_owner._pump_shared_acquisition()
+    assert shared_transport.ranges == [(0, 1)]
+    assert len(shared.prefetched_layers) == 1
+    shared_transport.events[0].ready = True
+    shared_owner.progress_shared_acquisition()
+    shared_owner._pump_shared_acquisition()
+    assert shared_transport.ranges == [(0, 1), (1, 2)]
+    shared_owner.retire_layer(shared, 0)
+    assert shared_owner._stats["shared_acquisition_retired_cohorts"] == 1
+
+    # Readiness and resource lifetime are group-scoped even when one finite
+    # physical layer packet coalesces several request segments.  The first
+    # wave releases only its own tenant/staging reservation and can be
+    # consumed without waiting for the second request's wave.
+    wave_owner, wave_pool, wave_transport = coordinator(
+        layer_count=4, frontier_enabled=True
+    )
+    wave_owner._sm_acquisition_waves = 2
+    wave_owner._shared_dispatch_horizon = 1
+    wave_owner._shared_layers_per_dispatch = 1
+    wave_pending = pending(wave_pool)
+    wave_pending.device_indices = torch.tensor((7, 8), dtype=torch.int32)
+    wave_pending.operation_requests = (
+        LeaseOperationRequest(1, "wave-request-1", 3, 0, 1, 0),
+        LeaseOperationRequest(2, "wave-request-2", 4, 0, 1, 0),
+    )
+    wave_pending.scheduled_acquisition_groups = (
+        LeaseAcquisitionGroup(1, 0, 1),
+        LeaseAcquisitionGroup(2, 0, 1),
+    )
+    wave_pending.operation_ranges = lambda: (
+        LeaseOperationRange(1, 0, 1),
+        LeaseOperationRange(2, 1, 1),
+    )
+    wave_pending.row_bytes_by_layer = ((1, 1),) * 4
+    wave_pending.layer_bytes = (4,) * 4
+    wave_pending.transfer_plan = object()
+    wave_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
+    wave_owner._bind_group_identities(wave_pending)
+    wave_model = LayerAcquisitionModel(
+        layer_bytes=wave_pending.layer_bytes,
+        transfer_service_ns=(100,) * 4,
+        initial_compute_ns=0,
+        inter_layer_compute_ns=200,
+    )
+    wave_owner._register_shared_acquisition(wave_pending, wave_model)
+    wave_owner._pump_shared_acquisition()
+    first_wave = types.SimpleNamespace(ready=False)
+    first_wave.query = lambda: first_wave.ready
+    second_wave = types.SimpleNamespace(ready=False)
+    second_wave.query = lambda: second_wave.ready
+    wave_pending.prefetched_layers[0] = types.SimpleNamespace(
+        ready_event=second_wave,
+        wave_events=(first_wave, second_wave),
+        wave_row_ends=(1, 2),
+    )
+    identities = wave_pending.acquisition_group_identities[0]
+    first_wave.ready = True
+    wave_owner.progress_shared_acquisition()
+    assert wave_owner._shared_queue.state(identities[0]) is SharedAcquisitionState.READY
+    assert (
+        wave_owner._shared_queue.state(identities[1])
+        is SharedAcquisitionState.FENCE_PUBLISHED
+    )
+    assert wave_owner._shared_queue.staging_outstanding_bytes == 2
+    wave_owner.retire_layer(wave_pending, 0)
+    second_wave.ready = True
+    wave_owner.progress_shared_acquisition()
+    assert (wave_pending.lease_id, 0) not in wave_owner._shared_cohorts
+    assert wave_owner._shared_queue.staging_outstanding_bytes == 0
 
     # A progressive producer capability is not itself a partial-consumer
     # decision. Normal AUTO selection must wait for a per-layer arrival/cost

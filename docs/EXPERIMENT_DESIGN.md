@@ -17,7 +17,7 @@ the mechanism is not defined by sparse or approximate attention. Select-then-
 compute workloads are an important high-opportunity stratum, not a different
 system policy.
 
-## RQ0: map the opportunity before serving
+## Prerequisite: map the opportunity before serving
 
 Use `experiments/run_work_unit_matrix.py` to sweep the D0--D6 diagnostic
 profiles:

@@ -40,7 +40,7 @@ The machine-readable profile contract is
 Every completed bundle can be checked independently with
 `python experiments/validate_bundle.py /path/to/bundle`.
 
-An `osdi-complete` evaluation additionally requires a separately captured
+A `mechanism-study` evaluation additionally requires a separately captured
 performance evidence directory. It contains the successful `profile.json`,
 the same-machine `baseline.json`, the measured correctness report
 `measured.json`, the machine-generated `regression.json`, and digest-bound

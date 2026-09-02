@@ -241,7 +241,7 @@ def analyze(output: Path) -> dict[str, Any]:
             "evaluation specification has no defensible repetition contract"
         )
     evaluation_profile = spec.get("evaluation_profile", "contract")
-    if evaluation_profile not in {"contract", "osdi-complete"}:
+    if evaluation_profile not in {"contract", "mechanism-study"}:
         raise ValueError("unknown evaluation profile in trial specification")
     if evaluation_metadata.get("evaluation_profile", "contract") != evaluation_profile:
         raise ValueError(
@@ -302,10 +302,10 @@ def analyze(output: Path) -> dict[str, Any]:
             raise ValueError("trial artifact is missing its workload scenario")
         required_consumer_kind = (
             declaration.get("consumer_kind")
-            if evaluation_profile == "osdi-complete"
+            if evaluation_profile == "mechanism-study"
             else None
         )
-        if evaluation_profile == "osdi-complete" and required_consumer_kind not in {
+        if evaluation_profile == "mechanism-study" and required_consumer_kind not in {
             "native_work_unit",
             "framework_reference",
         }:
@@ -314,7 +314,7 @@ def analyze(output: Path) -> dict[str, Any]:
             raise ValueError(
                 f"trial result contract diverges from its declaration: {identity[:2]}"
             )
-        formal = evaluation_profile == "osdi-complete"
+        formal = evaluation_profile == "mechanism-study"
         for contract in _validate_result(
             record,
             required_consumer_kind=required_consumer_kind,

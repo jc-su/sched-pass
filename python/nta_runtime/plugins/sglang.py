@@ -692,6 +692,7 @@ def _capture_prefill_request_binding(original, adder, request, *args, **kwargs):
         )
     setattr(request, _ACQUISITION_ATTRIBUTE, acquisition)
     if acquisition.is_external:
+        from nta_runtime.engines.sglang_contracts import LeaseOperationRequest
         from nta_runtime.engines.sglang_hicache import find_bridge
 
         device_pool = getattr(controller, "mem_pool_device", None)
@@ -701,6 +702,24 @@ def _capture_prefill_request_binding(original, adder, request, *args, **kwargs):
                 candidate is request
                 for candidate in tuple(getattr(adder, "can_run_list", ()) or ())
             )
+            if admitted:
+                request_slot = getattr(request, "req_pool_idx", None)
+                if request_slot is None:
+                    raise RuntimeError(
+                        "SGLang host-load request has no allocated request-pool slot"
+                    )
+                mapper = _configured_tenant_mapper()
+                tenant_id = 0 if mapper is None else mapper(request_id)
+                bridge.record_operation_request(
+                    LeaseOperationRequest(
+                        acquisition.operation_id,
+                        request_id,
+                        int(request_slot),
+                        acquisition.logical_begin,
+                        acquisition.row_count,
+                        tenant_id,
+                    )
+                )
             bridge.record_operation_admission(acquisition.operation_id, admitted)
     return result
 

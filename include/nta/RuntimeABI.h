@@ -6,7 +6,7 @@
 
 namespace nta::abi {
 
-inline constexpr std::uint32_t Version = 43;
+inline constexpr std::uint32_t Version = 44;
 inline constexpr std::uint32_t InvalidIndex = 0xffffffffU;
 inline constexpr std::uint32_t BackendCount = 6;
 inline constexpr std::uint32_t MaximumEventCompletionClasses = 64;
@@ -377,10 +377,10 @@ struct alignas(32) WorkItem {
   std::uint32_t contributorIndex;
   std::uint32_t contributorCount;
   std::uint32_t estimatedComputeNs;
-  // Readiness deadline relative to RuntimeView::epochStartClock. Zero keeps
-  // the request-level absolute deadline. A positive value lets a producer
-  // describe transformer-layer arrival order without translating the GPU
-  // global timer into a host clock domain.
+  // Readiness deadline relative to RuntimeView::epochStartClock, or to the
+  // current discovery/release point when the corresponding flag is set. Zero
+  // keeps the request-level absolute deadline. A positive value describes
+  // transformer-layer arrival order wholly in the GPU timer domain.
   std::uint64_t readyDeadlineOffsetNs;
   // A producer-independent completion class for event-owned partial
   // consumers. InvalidIndex denotes direct work. Unlike an object slot, this
@@ -395,8 +395,13 @@ inline constexpr std::uint32_t WorkItemEventPartition = 1U << 0;
 // the producer explicitly opts into current-generation binding.  Ordinary
 // plans retain their embedded generation and therefore fail closed if stale.
 inline constexpr std::uint32_t WorkItemBindCurrentGeneration = 1U << 1;
+// Dynamic shared-link plans are appended after the service epoch starts.
+// Their layer-arrival offset is relative to this discovery/release point,
+// rather than to the epoch that may also contain older framework batches.
+inline constexpr std::uint32_t WorkItemDeadlineRelativeToDiscovery = 1U << 2;
 inline constexpr std::uint32_t WorkItemSupportedFlags =
-    WorkItemEventPartition | WorkItemBindCurrentGeneration;
+    WorkItemEventPartition | WorkItemBindCurrentGeneration |
+    WorkItemDeadlineRelativeToDiscovery;
 
 struct alignas(32) WorkTicket {
   std::uint64_t requestId;

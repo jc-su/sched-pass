@@ -484,6 +484,7 @@ class WorkItem(ctypes.Structure):
 class WorkItemFlag(enum.IntFlag):
     EVENT_PARTITION = 1 << 0
     BIND_CURRENT_GENERATION = 1 << 1
+    DEADLINE_RELATIVE_TO_DISCOVERY = 1 << 2
 
 
 class RequestRange(ctypes.Structure):
@@ -3349,6 +3350,8 @@ class DeviceWorkPlan(_Owner):
         dependency_spans: Iterable[WorkDependencySpan],
         dependencies: Iterable[AcquireRequirement],
         *,
+        work_ticket_base: int = 0,
+        deadline_relative_to_discovery: bool = False,
         completion_classes: Iterable[int] | None = None,
         stream: Any = None,
     ) -> None:
@@ -3363,6 +3366,11 @@ class DeviceWorkPlan(_Owner):
 
         if not isinstance(topology, ExactWorkTopology):
             raise TypeError("exact work-plan upload requires ExactWorkTopology")
+        work_ticket_base = _u32(work_ticket_base, "work-ticket base")
+        if work_ticket_base > INVALID_INDEX - topology.work_count:
+            raise ValueError("exact work-plan ticket range exceeds uint32")
+        if work_ticket_base > INVALID_INDEX - topology.request_count:
+            raise ValueError("exact work-plan reduction range exceeds uint32")
         spans = tuple(dependency_spans)
         if (
             isinstance(dependencies, ctypes.Array)
@@ -3431,8 +3439,8 @@ class DeviceWorkPlan(_Owner):
                     span.begin,
                     span.count,
                     span.direct_count,
-                    work_ticket,
-                    request.request_index,
+                    work_ticket_base + work_ticket,
+                    work_ticket_base + request.request_index,
                     contributor_index,
                     request.work_count,
                     topology.estimated_compute_ns[work_ticket],
@@ -3443,9 +3451,16 @@ class DeviceWorkPlan(_Owner):
                         else completion_values[work_ticket]
                     ),
                     (
-                        0
-                        if completion_values is None
-                        else int(WorkItemFlag.EVENT_PARTITION)
+                        (
+                            0
+                            if completion_values is None
+                            else int(WorkItemFlag.EVENT_PARTITION)
+                        )
+                        | (
+                            int(WorkItemFlag.DEADLINE_RELATIVE_TO_DISCOVERY)
+                            if deadline_relative_to_discovery
+                            else 0
+                        )
                     ),
                 )
         native_requests = (RequestRange * len(topology.requests))()
@@ -3857,13 +3872,13 @@ class JitPhaseProgram(_Owner):
         if runtime.device_ordinal != plan.device_ordinal:
             raise ValueError("runtime and work plan must own the same CUDA device")
         if (
-            direct_work_count <= 0
+            direct_work_count < 0
             or direct_work_count >= plan.work_item_count
             or plan.work_item_count > runtime.config.work_ticket_capacity
             or wave_count <= 0
             or wave_count > MAX_EVENT_COMPLETION_CLASSES
         ):
-            raise ValueError("event work partition requires mixed bounded waves")
+            raise ValueError("event work partition requires bounded deferred waves")
         _check(
             _phase_prepare_event_work_partition(
                 self._handle,

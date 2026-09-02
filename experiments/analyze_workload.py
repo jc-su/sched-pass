@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Produce the RQ0 opportunity report for a normalized workload."""
+"""Produce the prerequisite opportunity report for a normalized workload."""
 
 from __future__ import annotations
 
@@ -152,7 +152,7 @@ def analyze(path: Path) -> dict[str, Any]:
     block_repetition = _block_repetition_statistics(rows, block_size)
     report = {
         "schema": 2,
-        "classification": "bailian-rq0-opportunity-report",
+        "classification": "bailian-workload-opportunity-report",
         "provenance": {
             "manifest": str(path),
             "manifest_digest": hashlib.sha256(path.read_bytes()).hexdigest(),

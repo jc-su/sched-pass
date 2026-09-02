@@ -648,6 +648,8 @@ class ServingTierConfig:
     queue_depth: int = 64
     window_bytes: int = 0
     device_ordinal: int = -1
+    # Maximum commands both issued per progress round and irrevocably resident
+    # in the controller. This finite horizon bounds EDF head-of-line blocking.
     issue_budget: int = 64
     completion_budget: int = 64
     progress_rounds: int = 1

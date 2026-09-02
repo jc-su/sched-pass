@@ -608,7 +608,7 @@ def main() -> None:
             assert "line 2" in str(error)
         else:
             raise AssertionError("malformed suffix was silently ignored")
-        opportunity = root / "rq0.json"
+        opportunity = root / "opportunity.json"
         subprocess.run(
             [
                 sys.executable,
@@ -625,7 +625,9 @@ def main() -> None:
             check=True,
         )
         opportunity_report = json.loads(opportunity.read_text(encoding="utf-8"))
-        assert opportunity_report["classification"] == "bailian-rq0-opportunity-report"
+        assert opportunity_report["classification"] == (
+            "bailian-workload-opportunity-report"
+        )
         assert (
             opportunity_report["provenance"]["demand_trace_digest"]
             == cli_document["demand_trace_digest"]

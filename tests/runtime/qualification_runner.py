@@ -161,7 +161,7 @@ def main() -> None:
 
         fake_formal = {
             "schema": 1,
-            "evaluation_profile": "osdi-complete",
+            "evaluation_profile": "mechanism-study",
             "repetitions": 1,
             "seed": 11,
             "experiments": [

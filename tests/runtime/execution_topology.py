@@ -61,6 +61,25 @@ def main() -> None:
     assert tuple(item.contributor_count for item in work) == (2, 2, 1)
     assert tuple(item.estimated_compute_ns for item in work) == (100, 200, 300)
 
+    plan.upload_exact(
+        topology,
+        (
+            WorkDependencySpan(0, 1, 0),
+            WorkDependencySpan(1, 1, 0),
+            WorkDependencySpan(2, 1, 0),
+        ),
+        dependencies,
+        work_ticket_base=17,
+        deadline_relative_to_discovery=True,
+    )
+    shared_work = captured["work"]
+    assert tuple(item.work_ticket for item in shared_work) == (17, 18, 19)
+    assert tuple(item.reduction_group for item in shared_work) == (17, 17, 18)
+    assert all(
+        item.flags == int(WorkItemFlag.DEADLINE_RELATIVE_TO_DISCOVERY)
+        for item in shared_work
+    )
+
     direct_dependencies = tuple(
         AcquireRequirement(1, 0, 0, 0, 0, 0, 1, 0) for _ in range(3)
     )

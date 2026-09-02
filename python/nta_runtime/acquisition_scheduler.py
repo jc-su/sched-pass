@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
+import heapq
 from threading import Lock
 
 
@@ -165,6 +166,666 @@ class TenantCreditLedger:
                 else:
                     self._outstanding.pop(charge.tenant_id, None)
             self._leases.pop(lease.lease_id)
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class AcquisitionGroupIdentity:
+    """Stable semantic identity of one exact K/V acquisition group.
+
+    A transport submission ID is deliberately not an identity.  Slot reuse,
+    layer reuse, and tier-object replacement can all preserve the same local
+    ordinal while naming different bytes.  Every scheduler and consumer join
+    therefore carries the complete request-generation, layer, exact segment,
+    and resource-version tuple.
+    """
+
+    request_slot: int
+    request_generation: int
+    layer_id: int
+    segment_begin: int
+    segment_count: int
+    resource_version: int
+
+    def __post_init__(self) -> None:
+        fields = (
+            self.request_slot,
+            self.request_generation,
+            self.layer_id,
+            self.segment_begin,
+            self.segment_count,
+            self.resource_version,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in fields):
+            raise TypeError("acquisition-group identity fields must be integers")
+        if not 0 <= self.request_slot < 1 << 32:
+            raise ValueError("acquisition-group request slot exceeds uint32")
+        if not 0 < self.request_generation < 1 << 32:
+            raise ValueError("acquisition-group generation must be positive uint32")
+        if not 0 <= self.layer_id < 1 << 32:
+            raise ValueError("acquisition-group layer exceeds uint32")
+        if self.segment_begin < 0 or self.segment_count <= 0:
+            raise ValueError("acquisition-group segment geometry is invalid")
+        if not 0 < self.resource_version <= _UINT64_MAX:
+            raise ValueError("acquisition-group resource version is invalid")
+        if self.segment_begin + self.segment_count > _UINT64_MAX:
+            raise ValueError("acquisition-group segment exceeds uint64")
+
+    @property
+    def segment_end(self) -> int:
+        return self.segment_begin + self.segment_count
+
+
+@dataclass(frozen=True, slots=True)
+class SharedAcquisitionJob:
+    """One finite, non-preemptive group on a shared transport link.
+
+    Times are absolute values in one monotonic clock domain.  ``staging_bytes``
+    is the amount retained from dispatch until physical readiness; it can
+    differ from payload bytes for a backend that materializes compressed or
+    packed objects.  Priority is only an equal-deadline tie break: the policy
+    remains EDF and does not silently become framework priority scheduling.
+    """
+
+    identity: AcquisitionGroupIdentity
+    tenant_id: int
+    payload_bytes: int
+    staging_bytes: int
+    release_ns: int
+    service_ns: int
+    deadline_ns: int
+    priority: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, AcquisitionGroupIdentity):
+            raise TypeError("shared acquisition requires a typed group identity")
+        values = (
+            self.tenant_id,
+            self.payload_bytes,
+            self.staging_bytes,
+            self.release_ns,
+            self.service_ns,
+            self.deadline_ns,
+            self.priority,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise TypeError("shared acquisition job fields must be integers")
+        if not 0 <= self.tenant_id < 1 << 32:
+            raise ValueError("shared acquisition tenant exceeds uint32")
+        if not 0 < self.payload_bytes <= _UINT64_MAX:
+            raise ValueError("shared acquisition payload is invalid")
+        if not 0 < self.staging_bytes <= _UINT64_MAX:
+            raise ValueError("shared acquisition staging charge is invalid")
+        if self.release_ns < 0 or self.service_ns <= 0 or self.deadline_ns < 0:
+            raise ValueError("shared acquisition timing is invalid")
+        if not 0 <= self.priority <= 7:
+            raise ValueError("shared acquisition priority is outside the runtime ABI")
+
+
+@dataclass(frozen=True, slots=True)
+class SharedAcquisitionSchedule:
+    """Auditable work-conserving EDF schedule with arbitrary release times."""
+
+    ordered_identities: tuple[AcquisitionGroupIdentity, ...]
+    start_ns: tuple[int, ...]
+    completion_ns: tuple[int, ...]
+    deadlines_ns: tuple[int, ...]
+    first_missed_identity: AcquisitionGroupIdentity | None
+    maximum_lateness_ns: int
+
+    def __post_init__(self) -> None:
+        count = len(self.ordered_identities)
+        if (
+            len(set(self.ordered_identities)) != count
+            or len(self.start_ns) != count
+            or len(self.completion_ns) != count
+            or len(self.deadlines_ns) != count
+            or any(start < 0 for start in self.start_ns)
+            or any(
+                completion <= start
+                for start, completion in zip(self.start_ns, self.completion_ns, strict=True)
+            )
+            or any(deadline < 0 for deadline in self.deadlines_ns)
+            or self.maximum_lateness_ns < 0
+        ):
+            raise ValueError("shared acquisition schedule is inconsistent")
+        if self.first_missed_identity is not None and (
+            self.first_missed_identity not in self.ordered_identities
+        ):
+            raise ValueError("shared acquisition miss is outside the schedule")
+        if self.feasible != (self.maximum_lateness_ns == 0):
+            raise ValueError("shared acquisition feasibility disagrees with lateness")
+
+    @property
+    def feasible(self) -> bool:
+        return self.first_missed_identity is None
+
+
+def schedule_shared_acquisition_jobs(
+    jobs: Iterable[SharedAcquisitionJob],
+    *,
+    available_ns: int = 0,
+) -> SharedAcquisitionSchedule:
+    """Simulate the exact non-preemptive EDF policy used by the shared link.
+
+    EDF is optimal for the simultaneous-release model used by
+    :func:`schedule_acquisition_jobs`; it is not generally optimal with release
+    times.  This function intentionally makes the narrower claim needed by the
+    implementation: the returned feasibility is exact for *our work-conserving
+    non-preemptive EDF policy*.  A paper result must not relabel it as a global
+    schedulability theorem.
+    """
+
+    if isinstance(available_ns, bool) or not isinstance(available_ns, int):
+        raise TypeError("shared-link availability must be an integer")
+    if available_ns < 0:
+        raise ValueError("shared-link availability cannot be negative")
+    pending = sorted(
+        tuple(jobs), key=lambda job: (job.release_ns, job.identity)
+    )
+    if len({job.identity for job in pending}) != len(pending):
+        raise ValueError("shared acquisition jobs must have unique identities")
+
+    ready: list[tuple[int, int, AcquisitionGroupIdentity, SharedAcquisitionJob]] = []
+    cursor = 0
+    now = available_ns
+    ordered: list[AcquisitionGroupIdentity] = []
+    starts: list[int] = []
+    completions: list[int] = []
+    deadlines: list[int] = []
+    first_missed: AcquisitionGroupIdentity | None = None
+    maximum_lateness = 0
+    while cursor < len(pending) or ready:
+        if not ready and cursor < len(pending) and pending[cursor].release_ns > now:
+            now = pending[cursor].release_ns
+        while cursor < len(pending) and pending[cursor].release_ns <= now:
+            job = pending[cursor]
+            heapq.heappush(
+                ready,
+                (job.deadline_ns, -job.priority, job.identity, job),
+            )
+            cursor += 1
+        if not ready:
+            continue
+        _deadline, _priority, _identity, job = heapq.heappop(ready)
+        start = now
+        now += job.service_ns
+        lateness = now - job.deadline_ns
+        if lateness > 0:
+            maximum_lateness = max(maximum_lateness, lateness)
+            if first_missed is None:
+                first_missed = job.identity
+        ordered.append(job.identity)
+        starts.append(start)
+        completions.append(now)
+        deadlines.append(job.deadline_ns)
+    return SharedAcquisitionSchedule(
+        tuple(ordered),
+        tuple(starts),
+        tuple(completions),
+        tuple(deadlines),
+        first_missed,
+        maximum_lateness,
+    )
+
+
+class SharedAcquisitionState(str, Enum):
+    PLANNED = "planned"
+    SUBMITTED = "submitted"
+    FENCE_PUBLISHED = "fence_published"
+    READY = "ready"
+    CONSUMED = "consumed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+@dataclass(slots=True)
+class _SharedAcquisitionRecord:
+    job: SharedAcquisitionJob
+    state: SharedAcquisitionState = SharedAcquisitionState.PLANNED
+    submitted_ns: int | None = None
+    predicted_completion_ns: int | None = None
+    tenant_lease: TenantCreditLease | None = None
+    consumer_ordered: bool = False
+    cancel_requested: bool = False
+
+
+class SharedAcquisitionQueue:
+    """Dynamic multi-request queue for one serialized transport link.
+
+    The queue accepts groups from multiple framework batches.  Dispatch is
+    deliberately bounded: only ``max_inflight_groups`` finite groups may be
+    irrevocably ordered on the backend at once, so a later urgent request is
+    delayed by at most that chunk horizon rather than by an entire model.  Both
+    staging bytes and tenant credits are reserved atomically before a group is
+    returned to the backend.
+    """
+
+    def __init__(
+        self,
+        *,
+        staging_capacity_bytes: int,
+        tenant_credits: TenantCreditLedger,
+        max_inflight_groups: int = 1,
+    ) -> None:
+        if (
+            isinstance(staging_capacity_bytes, bool)
+            or not isinstance(staging_capacity_bytes, int)
+            or not 0 < staging_capacity_bytes <= _UINT64_MAX
+        ):
+            raise ValueError("shared acquisition staging capacity is invalid")
+        if (
+            isinstance(max_inflight_groups, bool)
+            or not isinstance(max_inflight_groups, int)
+            or max_inflight_groups <= 0
+        ):
+            raise ValueError("shared acquisition dispatch horizon is invalid")
+        if not isinstance(tenant_credits, TenantCreditLedger):
+            raise TypeError("shared acquisition requires a tenant credit ledger")
+        self._staging_capacity_bytes = staging_capacity_bytes
+        self._tenant_credits = tenant_credits
+        self._max_inflight_groups = max_inflight_groups
+        self._records: dict[AcquisitionGroupIdentity, _SharedAcquisitionRecord] = {}
+        self._staging_outstanding_bytes = 0
+        self._predicted_link_tail_ns = 0
+
+    @property
+    def staging_outstanding_bytes(self) -> int:
+        return self._staging_outstanding_bytes
+
+    @property
+    def group_count(self) -> int:
+        return len(self._records)
+
+    @property
+    def inflight_count(self) -> int:
+        return sum(
+            record.state
+            in {
+                SharedAcquisitionState.SUBMITTED,
+                SharedAcquisitionState.FENCE_PUBLISHED,
+            }
+            for record in self._records.values()
+        )
+
+    def state(self, identity: AcquisitionGroupIdentity) -> SharedAcquisitionState:
+        try:
+            return self._records[identity].state
+        except KeyError as error:
+            raise KeyError("unknown shared acquisition group") from error
+
+    def add(self, jobs: Iterable[SharedAcquisitionJob]) -> None:
+        values = tuple(jobs)
+        if len({job.identity for job in values}) != len(values):
+            raise ValueError("shared acquisition batch repeats a group identity")
+        duplicates = tuple(job.identity for job in values if job.identity in self._records)
+        if duplicates:
+            raise ValueError(f"shared acquisition group already exists: {duplicates[0]!r}")
+        oversized = next(
+            (job for job in values if job.staging_bytes > self._staging_capacity_bytes),
+            None,
+        )
+        if oversized is not None:
+            raise ValueError("one acquisition group exceeds the staging capacity")
+        self._records.update(
+            (job.identity, _SharedAcquisitionRecord(job)) for job in values
+        )
+
+    def analyze(self, *, now_ns: int) -> SharedAcquisitionSchedule:
+        """Analyze fixed in-flight work plus every dynamically ordered group."""
+
+        if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+            raise ValueError("shared acquisition analysis time is invalid")
+        fixed = sorted(
+            (
+                record
+                for record in self._records.values()
+                if record.state
+                in {
+                    SharedAcquisitionState.SUBMITTED,
+                    SharedAcquisitionState.FENCE_PUBLISHED,
+                }
+            ),
+            key=lambda record: (
+                record.predicted_completion_ns
+                if record.predicted_completion_ns is not None
+                else _UINT64_MAX,
+                record.job.identity,
+            ),
+        )
+        if any(
+            record.predicted_completion_ns is None or record.submitted_ns is None
+            for record in fixed
+        ):
+            raise RuntimeError("shared acquisition in-flight prediction is incomplete")
+        jobs = tuple(
+            record.job
+            for record in self._records.values()
+            if record.state is SharedAcquisitionState.PLANNED
+        )
+        dynamic = schedule_shared_acquisition_jobs(
+            jobs,
+            available_ns=max(now_ns, self._predicted_link_tail_ns),
+        )
+        fixed_identities = tuple(record.job.identity for record in fixed)
+        fixed_starts = tuple(
+            int(record.predicted_completion_ns) - record.job.service_ns
+            for record in fixed
+        )
+        fixed_completions = tuple(
+            int(record.predicted_completion_ns) for record in fixed
+        )
+        fixed_deadlines = tuple(record.job.deadline_ns for record in fixed)
+        first_missed = next(
+            (
+                record.job.identity
+                for record in fixed
+                if int(record.predicted_completion_ns) > record.job.deadline_ns
+            ),
+            dynamic.first_missed_identity,
+        )
+        maximum_lateness = max(
+            dynamic.maximum_lateness_ns,
+            max(
+                (
+                    int(record.predicted_completion_ns) - record.job.deadline_ns
+                    for record in fixed
+                ),
+                default=0,
+            ),
+            0,
+        )
+        return SharedAcquisitionSchedule(
+            fixed_identities + dynamic.ordered_identities,
+            fixed_starts + dynamic.start_ns,
+            fixed_completions + dynamic.completion_ns,
+            fixed_deadlines + dynamic.deadlines_ns,
+            first_missed,
+            maximum_lateness,
+        )
+
+    def claim(self, *, now_ns: int) -> tuple[SharedAcquisitionJob, ...]:
+        """Reserve and return every currently available dispatch slot."""
+
+        if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+            raise ValueError("shared acquisition dispatch time is invalid")
+        available_slots = self._max_inflight_groups - self.inflight_count
+        if available_slots <= 0:
+            return ()
+        candidates = sorted(
+            (
+                record.job
+                for record in self._records.values()
+                if record.state is SharedAcquisitionState.PLANNED
+                and record.job.release_ns <= now_ns
+            ),
+            key=lambda job: (
+                job.deadline_ns,
+                -job.priority,
+                job.identity,
+            ),
+        )
+        claimed: list[SharedAcquisitionJob] = []
+        for job in candidates:
+            if len(claimed) == available_slots:
+                break
+            if (
+                job.staging_bytes
+                > self._staging_capacity_bytes - self._staging_outstanding_bytes
+            ):
+                continue
+            tenant_lease = self._tenant_credits.try_reserve(
+                (TenantCreditCharge(job.tenant_id, job.staging_bytes),)
+            )
+            if tenant_lease is None:
+                continue
+            record = self._records[job.identity]
+            record.state = SharedAcquisitionState.SUBMITTED
+            record.submitted_ns = now_ns
+            predicted_start = max(now_ns, self._predicted_link_tail_ns)
+            record.predicted_completion_ns = predicted_start + job.service_ns
+            self._predicted_link_tail_ns = record.predicted_completion_ns
+            record.tenant_lease = tenant_lease
+            self._staging_outstanding_bytes += job.staging_bytes
+            claimed.append(job)
+        return tuple(claimed)
+
+    def next_released_identity(
+        self, *, now_ns: int
+    ) -> AcquisitionGroupIdentity | None:
+        """Return the next policy choice without reserving or mutating it."""
+
+        if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+            raise ValueError("shared acquisition dispatch time is invalid")
+        candidates = (
+            record.job
+            for record in self._records.values()
+            if record.state is SharedAcquisitionState.PLANNED
+            and record.job.release_ns <= now_ns
+        )
+        selected = min(
+            candidates,
+            key=lambda job: (job.deadline_ns, -job.priority, job.identity),
+            default=None,
+        )
+        return None if selected is None else selected.identity
+
+    def released_identities(
+        self, *, now_ns: int
+    ) -> tuple[AcquisitionGroupIdentity, ...]:
+        """Return resource-unfiltered policy order without mutating state."""
+
+        if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+            raise ValueError("shared acquisition dispatch time is invalid")
+        return tuple(
+            job.identity
+            for job in sorted(
+                (
+                    record.job
+                    for record in self._records.values()
+                    if record.state is SharedAcquisitionState.PLANNED
+                    and record.job.release_ns <= now_ns
+                ),
+                key=lambda job: (job.deadline_ns, -job.priority, job.identity),
+            )
+        )
+
+    def claim_cohort(
+        self,
+        identities: Iterable[AcquisitionGroupIdentity],
+        *,
+        now_ns: int,
+    ) -> tuple[SharedAcquisitionJob, ...]:
+        """Atomically reserve one backend-coalesced finite dispatch cohort.
+
+        Some engines can issue several exact request segments more efficiently
+        as one layer packet.  Coalescing is legal only after EDF chooses one
+        member: the caller supplies that member's complete physical cohort and
+        every constituent retains independent identity, credit, readiness, and
+        consumption state.
+        """
+
+        values = tuple(identities)
+        if not values or len(set(values)) != len(values):
+            raise ValueError("shared acquisition cohort must be unique and non-empty")
+        if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+            raise ValueError("shared acquisition dispatch time is invalid")
+        if len(values) > self._max_inflight_groups - self.inflight_count:
+            return ()
+        records: list[_SharedAcquisitionRecord] = []
+        for identity in values:
+            record = self._records.get(identity)
+            if (
+                record is None
+                or record.state is not SharedAcquisitionState.PLANNED
+                or record.job.release_ns > now_ns
+            ):
+                return ()
+            records.append(record)
+        staging_bytes = sum(record.job.staging_bytes for record in records)
+        if staging_bytes > self._staging_capacity_bytes - self._staging_outstanding_bytes:
+            return ()
+
+        reservations: list[tuple[_SharedAcquisitionRecord, TenantCreditLease]] = []
+        for record in records:
+            lease = self._tenant_credits.try_reserve(
+                (
+                    TenantCreditCharge(
+                        record.job.tenant_id, record.job.staging_bytes
+                    ),
+                )
+            )
+            if lease is None:
+                for _record, reserved in reversed(reservations):
+                    self._tenant_credits.release(reserved)
+                return ()
+            reservations.append((record, lease))
+
+        predicted_start = max(now_ns, self._predicted_link_tail_ns)
+        for record, lease in reservations:
+            job = record.job
+            record.state = SharedAcquisitionState.SUBMITTED
+            record.submitted_ns = now_ns
+            predicted_start += job.service_ns
+            record.predicted_completion_ns = predicted_start
+            record.tenant_lease = lease
+            self._staging_outstanding_bytes += job.staging_bytes
+        self._predicted_link_tail_ns = predicted_start
+        return tuple(record.job for record in records)
+
+    def publish_fence(self, identity: AcquisitionGroupIdentity) -> None:
+        record = self._record_in_state(identity, SharedAcquisitionState.SUBMITTED)
+        record.state = SharedAcquisitionState.FENCE_PUBLISHED
+
+    def mark_ready(self, identity: AcquisitionGroupIdentity) -> None:
+        record = self._record_in_state(
+            identity, SharedAcquisitionState.FENCE_PUBLISHED
+        )
+        self._release_reservation(record)
+        record.state = (
+            SharedAcquisitionState.CANCELLED
+            if record.cancel_requested
+            else SharedAcquisitionState.CONSUMED
+            if record.consumer_ordered
+            else SharedAcquisitionState.READY
+        )
+
+    def mark_link_idle(self, *, now_ns: int) -> None:
+        """Close conservative prediction drift after every submitted group is ready."""
+
+        if isinstance(now_ns, bool) or not isinstance(now_ns, int) or now_ns < 0:
+            raise ValueError("shared acquisition idle time is invalid")
+        if self.inflight_count:
+            raise RuntimeError("shared acquisition link is not idle")
+        self._predicted_link_tail_ns = now_ns
+
+    def consume(self, identity: AcquisitionGroupIdentity) -> None:
+        record = self._records.get(identity)
+        if record is None:
+            raise KeyError("unknown shared acquisition group")
+        if record.state is SharedAcquisitionState.FENCE_PUBLISHED:
+            if record.consumer_ordered:
+                raise RuntimeError("shared acquisition consumer was ordered twice")
+            record.consumer_ordered = True
+            return
+        if record.state is SharedAcquisitionState.READY:
+            record.state = SharedAcquisitionState.CONSUMED
+            return
+        raise RuntimeError(
+            f"shared acquisition cannot be consumed in state {record.state.value}"
+        )
+
+    def cancel_request(self, request_slot: int, generation: int) -> int:
+        cancelled = 0
+        for identity, record in self._records.items():
+            if (
+                identity.request_slot == request_slot
+                and identity.request_generation == generation
+                and record.state is SharedAcquisitionState.PLANNED
+            ):
+                record.state = SharedAcquisitionState.CANCELLED
+                cancelled += 1
+        return cancelled
+
+    def cancel(self, identity: AcquisitionGroupIdentity) -> None:
+        """Cancel planned work or defer in-flight retirement until readiness."""
+
+        record = self._records.get(identity)
+        if record is None:
+            raise KeyError("unknown shared acquisition group")
+        if record.state is SharedAcquisitionState.PLANNED:
+            record.state = SharedAcquisitionState.CANCELLED
+            return
+        if record.state in {
+            SharedAcquisitionState.SUBMITTED,
+            SharedAcquisitionState.FENCE_PUBLISHED,
+        }:
+            record.cancel_requested = True
+            return
+        if record.state is SharedAcquisitionState.READY:
+            record.state = SharedAcquisitionState.CANCELLED
+            return
+        raise RuntimeError(
+            f"shared acquisition cannot be cancelled in state {record.state.value}"
+        )
+
+    def fail(self, identity: AcquisitionGroupIdentity) -> None:
+        record = self._records.get(identity)
+        if record is None:
+            raise KeyError("unknown shared acquisition group")
+        if record.state not in {
+            SharedAcquisitionState.SUBMITTED,
+            SharedAcquisitionState.FENCE_PUBLISHED,
+        }:
+            raise RuntimeError(
+                f"shared acquisition cannot fail in state {record.state.value}"
+            )
+        self._release_reservation(record)
+        record.state = SharedAcquisitionState.FAILED
+
+    def forget_terminal(
+        self, identities: Iterable[AcquisitionGroupIdentity]
+    ) -> None:
+        """Drop completed semantic records after their framework lease retires."""
+
+        values = tuple(identities)
+        if len(set(values)) != len(values):
+            raise ValueError("shared acquisition retirement repeats an identity")
+        for identity in values:
+            record = self._records.get(identity)
+            if record is None:
+                raise KeyError("unknown shared acquisition group")
+            if record.state not in {
+                SharedAcquisitionState.CONSUMED,
+                SharedAcquisitionState.CANCELLED,
+                SharedAcquisitionState.FAILED,
+            }:
+                raise RuntimeError(
+                    "shared acquisition cannot be forgotten before retirement"
+                )
+        for identity in values:
+            self._records.pop(identity)
+
+    def _record_in_state(
+        self,
+        identity: AcquisitionGroupIdentity,
+        expected: SharedAcquisitionState,
+    ) -> _SharedAcquisitionRecord:
+        record = self._records.get(identity)
+        if record is None:
+            raise KeyError("unknown shared acquisition group")
+        if record.state is not expected:
+            raise RuntimeError(
+                f"shared acquisition is {record.state.value}, expected {expected.value}"
+            )
+        return record
+
+    def _release_reservation(self, record: _SharedAcquisitionRecord) -> None:
+        lease = record.tenant_lease
+        if lease is None or self._staging_outstanding_bytes < record.job.staging_bytes:
+            raise RuntimeError("shared acquisition reservation is incomplete")
+        self._tenant_credits.release(lease)
+        record.tenant_lease = None
+        self._staging_outstanding_bytes -= record.job.staging_bytes
 
 
 @dataclass(frozen=True, slots=True)

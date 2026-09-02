@@ -2,10 +2,13 @@
 """Exercise SGLang's proactive NVMe acquisition owner on real hardware.
 
 The fixture is intentionally numerical-kernel independent: it verifies the
-new cross-layer producer contract itself.  Four model layers are enqueued on a
-dedicated progress stream, each physical K/V run fans out to two request
-generations, one consumer is cancelled, and the remaining consumer must still
-materialize the exact namespace bytes into the framework-owned HBM cache.
+new cross-layer producer contract itself. Two framework batches remain live
+at once, each with four model layers and two request generations. Their exact
+groups occupy disjoint ranges in one service epoch without forcing the first
+numerical consumer to retire. One consumer is cancelled; every live generation
+must still materialize the exact namespace bytes into its framework-owned HBM
+cache. This lifetime test deliberately does not claim dynamic issue-order
+overtaking.
 """
 
 from __future__ import annotations
@@ -16,7 +19,10 @@ from types import SimpleNamespace
 
 import torch
 
-from nta_runtime.engines.sglang_nvme import SglangNvmeAcquisitionPipeline
+from nta_runtime.engines.sglang_nvme import (
+    NvmeSchedulingMode,
+    SglangNvmeAcquisitionPipeline,
+)
 from nta_runtime.requests import RequestBinding
 from nta_runtime.runtime import (
     JitPhaseProgram,
@@ -135,7 +141,7 @@ def main() -> None:
             raise RuntimeError("physical pipeline fixture is not NVMe materializable")
 
         storage = torch.full(
-            (2, LAYER_COUNT, ROW_COUNT, ROW_BYTES),
+            (2, 2, LAYER_COUNT, ROW_COUNT, ROW_BYTES),
             0xA5,
             dtype=torch.uint8,
             device="cuda",
@@ -143,17 +149,19 @@ def main() -> None:
         region = transport.register_hbm_region(storage.data_ptr(), storage.numel())
         runtime = Runtime(
             RuntimeConfig(
-                request_capacity=2,
-                object_capacity=2,
-                intent_capacity=4,
-                work_ticket_capacity=2,
+                request_capacity=4,
+                object_capacity=4 * LAYER_COUNT,
+                intent_capacity=4 * LAYER_COUNT,
+                work_ticket_capacity=4 * LAYER_COUNT,
                 max_dependencies_per_work_ticket=2,
             ),
             nvme=transport,
         )
-        runtime.set_tenant_budget(0, 1 << 20)
-        runtime.set_request(0, 101, 1, tenant_id=0, deadline_clock=900)
-        runtime.set_request(1, 202, 1, tenant_id=0, deadline_clock=500)
+        runtime.set_tenant_budget(0, 1 << 30)
+        runtime.set_request(0, 101, 1, tenant_id=0)
+        runtime.set_request(1, 202, 1, tenant_id=0)
+        runtime.set_request(2, 303, 1, tenant_id=0)
+        runtime.set_request(3, 404, 1, tenant_id=0)
         # Both requests consume the same physical group.  Cancelling one is the
         # regression case: the live generation must still drive the shared DMA.
         runtime.cancel_request(0, 1)
@@ -173,11 +181,12 @@ def main() -> None:
             progress_stream=progress_stream,
             layer_start=0,
             layer_count=LAYER_COUNT,
-            object_capacity=2,
-            work_ticket_capacity=2,
+            object_capacity=4 * LAYER_COUNT,
+            work_ticket_capacity=4 * LAYER_COUNT,
             tenant_isolation=False,
             regions=regions,
             stats=stats,
+            scheduling_mode=NvmeSchedulingMode.SHARED_APPEND,
         )
         pair = (tuple(range(ROW_COUNT)), tuple(range(ROW_COUNT)))
         semantic = SimpleNamespace(
@@ -186,42 +195,81 @@ def main() -> None:
             page_pairs=(pair, pair),
         )
         bindings = (
-            RequestBinding(0, 0, 1, 101, deadline_clock=900),
-            RequestBinding(1, 1, 1, 202, deadline_clock=500),
+            RequestBinding(0, 0, 1, 101),
+            RequestBinding(1, 1, 1, 202),
         )
 
-        def kv_cache(layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-            return storage[0, layer], storage[1, layer]
+        def kv_cache(batch: int, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+            return storage[batch, 0, layer], storage[batch, 1, layer]
 
         current = torch.cuda.current_stream()
         acquisition = pipeline.prepare(
             semantic_plans={0: semantic},
             bindings=bindings,
             ordering_stream=current,
-            prepare_consumers=lambda _stream: None,
-            kv_cache_for_layer=kv_cache,
+            prepare_consumers=lambda _stream, _geometry, _frontier: None,
+            select_progressive_layers=(
+                lambda _geometry, _frontier, _windows: frozenset(
+                    range(LAYER_COUNT)
+                )
+            ),
+            kv_cache_for_layer=lambda layer: kv_cache(0, layer),
             inter_layer_compute_ns=100_000,
         )
+        second_bindings = (
+            RequestBinding(0, 2, 1, 303),
+            RequestBinding(1, 3, 1, 404),
+        )
+        second = pipeline.prepare(
+            semantic_plans={0: semantic},
+            bindings=second_bindings,
+            ordering_stream=current,
+            prepare_consumers=lambda _stream, _geometry, _frontier: None,
+            select_progressive_layers=(
+                lambda _geometry, _frontier, _windows: frozenset(
+                    range(LAYER_COUNT)
+                )
+            ),
+            kv_cache_for_layer=lambda layer: kv_cache(1, layer),
+            inter_layer_compute_ns=100_000,
+        )
+        if second.layers[0].first_object_slot <= acquisition.layers[-1].first_object_slot:
+            raise RuntimeError("concurrent NVMe batches aliased directory ranges")
+        if any(
+            len(layer.wave_events) != 1 or layer.group_wave_indices != (0, 0)
+            for layer in acquisition.layers
+        ):
+            raise RuntimeError("physical NVMe exact groups lost their ready wave")
         for acquired_layer in acquisition.layers:
-            pipeline.wait_layer(acquisition, acquired_layer, current)
+            pipeline.consume_layer(
+                acquisition, acquired_layer, current, wait_for_ready=True
+            )
         pipeline.record_consumer(acquisition, current)
+        for acquired_layer in second.layers:
+            pipeline.consume_layer(second, acquired_layer, current, wait_for_ready=True)
+        pipeline.record_consumer(second, current)
         torch.cuda.synchronize()
 
-        for layer in range(LAYER_COUNT):
-            torch.testing.assert_close(
-                storage[0, layer].cpu(),
-                _reference_lane(reference, layer, "key"),
-                rtol=0,
-                atol=0,
-            )
-            torch.testing.assert_close(
-                storage[1, layer].cpu(),
-                _reference_lane(reference, layer, "value"),
-                rtol=0,
-                atol=0,
-            )
-        states = tuple(runtime.work_ticket_state(index) for index in range(2))
-        if states != (WorkTicketState.CANCELLED, WorkTicketState.DONE):
+        for batch in range(2):
+            for layer in range(LAYER_COUNT):
+                torch.testing.assert_close(
+                    storage[batch, 0, layer].cpu(),
+                    _reference_lane(reference, layer, "key"),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    storage[batch, 1, layer].cpu(),
+                    _reference_lane(reference, layer, "value"),
+                    rtol=0,
+                    atol=0,
+                )
+        states = tuple(
+            runtime.work_ticket_state(index) for index in range(4 * LAYER_COUNT)
+        )
+        if states.count(WorkTicketState.CANCELLED) != LAYER_COUNT or states.count(
+            WorkTicketState.DONE
+        ) != 3 * LAYER_COUNT:
             raise RuntimeError(f"generation fan-out retired incorrectly: {states}")
         queue = transport.stats
         sticky_failed = runtime.sticky_failed_count
@@ -238,15 +286,18 @@ def main() -> None:
                 f"sticky_failed={sticky_failed} queue={queue} states={states}"
             )
         if (
-            stats.get("nvme_pipeline_layers") != LAYER_COUNT
-            or stats.get("nvme_pipeline_groups") != LAYER_COUNT
-            or stats.get("nvme_pipeline_work_items") != 2 * LAYER_COUNT
-            or stats.get("nvme_pipeline_physical_bytes") != fixture_bytes
+            stats.get("nvme_pipeline_batches") != 2
+            or stats.get("nvme_pipeline_layers") != 2 * LAYER_COUNT
+            or stats.get("nvme_pipeline_groups") != 4 * LAYER_COUNT
+            or stats.get("nvme_pipeline_packets") != 2 * LAYER_COUNT
+            or stats.get("nvme_pipeline_work_items") != 4 * LAYER_COUNT
+            or stats.get("nvme_pipeline_physical_bytes") != 2 * fixture_bytes
+            or stats.get("nvme_epochs") != 1
         ):
             raise RuntimeError(f"proactive NVMe accounting is incomplete: {stats}")
         print(
             "sglang_nvme_physical=pass "
-            f"layers={LAYER_COUNT} submitted={queue.submitted} "
+            f"batches=2 layers={2 * LAYER_COUNT} submitted={queue.submitted} "
             f"work_items={stats['nvme_pipeline_work_items']}"
         )
     finally:

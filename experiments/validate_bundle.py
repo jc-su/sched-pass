@@ -235,41 +235,42 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
             == len(bundled_workloads),
             "evaluation workload scenarios are not unique",
         )
-        rq0_entries = metadata.get("rq0_opportunities")
+        opportunity_entries = metadata.get("workload_opportunities")
         _require(
-            isinstance(rq0_entries, list)
-            and len(rq0_entries) == len(bundled_workloads),
-            "evaluation bundle lacks one RQ0 report per workload scenario",
+            isinstance(opportunity_entries, list)
+            and len(opportunity_entries) == len(bundled_workloads),
+            "evaluation bundle lacks one opportunity report per workload scenario",
         )
-        rq0_identities: set[tuple[object, object]] = set()
-        for entry in rq0_entries:
-            _require(isinstance(entry, dict), "invalid RQ0 metadata entry")
-            rq0_name = Path(str(entry.get("report", "")))
+        opportunity_identities: set[tuple[object, object]] = set()
+        for entry in opportunity_entries:
+            _require(isinstance(entry, dict), "invalid opportunity metadata entry")
+            report_name = Path(str(entry.get("report", "")))
             _require(
-                not rq0_name.is_absolute() and ".." not in rq0_name.parts,
-                "unsafe RQ0 report path",
+                not report_name.is_absolute() and ".." not in report_name.parts,
+                "unsafe opportunity report path",
             )
-            rq0_path = bundle / rq0_name
-            _require(rq0_path.is_file(), "evaluation RQ0 report is missing")
+            report_path = bundle / report_name
+            _require(report_path.is_file(), "evaluation opportunity report is missing")
             _require(
-                file_digest(rq0_path) == entry.get("report_digest"),
-                "RQ0 opportunity report digest does not match metadata",
+                file_digest(report_path) == entry.get("report_digest"),
+                "opportunity report digest does not match metadata",
             )
-            rq0 = json.loads(rq0_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
             _require(
-                rq0.get("classification") == "bailian-rq0-opportunity-report",
-                "invalid RQ0 opportunity report",
+                report.get("classification")
+                == "bailian-workload-opportunity-report",
+                "invalid workload opportunity report",
             )
-            rq0_identities.add(
+            opportunity_identities.add(
                 (entry.get("scenario_id"), entry.get("demand_trace_digest"))
             )
         _require(
-            rq0_identities
+            opportunity_identities
             == {
                 (entry.get("scenario_id"), entry.get("demand_trace_digest"))
                 for entry in bundled_workloads
             },
-            "RQ0 reports do not cover the bundled workload scenarios",
+            "opportunity reports do not cover the bundled workload scenarios",
         )
         evaluation_output = bundle / "evaluation"
         _require(
@@ -311,10 +312,10 @@ def validate_bundle(bundle: Path) -> dict[str, Any]:
         )
         copied_spec = json.loads(spec_path.read_text(encoding="utf-8"))
         performance_name = metadata.get("performance_evidence")
-        if copied_spec.get("evaluation_profile", "contract") == "osdi-complete":
+        if copied_spec.get("evaluation_profile", "contract") == "mechanism-study":
             _require(
                 isinstance(performance_name, str) and bool(performance_name),
-                "osdi-complete evaluation bundle has no performance evidence",
+                "mechanism-study evaluation bundle has no performance evidence",
             )
         if performance_name:
             performance_relative = Path(str(performance_name))

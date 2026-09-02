@@ -9,11 +9,14 @@ whether Host DMA, an SM mover, or NVMe produced it.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import bisect
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 import torch
+
+from nta_runtime.acquisition_scheduler import AcquisitionGroupIdentity
 
 
 class AcquisitionTier(str, Enum):
@@ -29,8 +32,8 @@ class AcquisitionConsumerPlan(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
-class HostArrivalProfileKey:
-    """Stable deployment-local class for producer/attention timing policy.
+class AcquisitionArrivalProfileKey:
+    """Stable tier-neutral class for producer/attention timing policy.
 
     Exact request lengths are deliberately not part of this key.  Production
     traces rarely repeat them, which would turn an online policy into a
@@ -45,7 +48,7 @@ class HostArrivalProfileKey:
     batch_size_bucket: int
     transfer_rows_bucket: int
     transfer_bytes_bucket: int
-    mover_kind: str
+    producer_kind: str
     layers_per_submission: int
     sm_waves_per_layer: int
 
@@ -59,8 +62,14 @@ class HostArrivalProfileKey:
             self.transfer_bytes_bucket,
         ) < 0 or min(self.layers_per_submission, self.sm_waves_per_layer) <= 0:
             raise ValueError("Host arrival profile geometry must be positive")
-        if self.mover_kind not in {"sm", "copy_engine", "hybrid"}:
-            raise ValueError("Host arrival profile has an invalid mover kind")
+        if self.producer_kind not in {
+            "sm",
+            "copy_engine",
+            "hybrid",
+            "nvme_direct",
+            "nvme_span_compact",
+        }:
+            raise ValueError("arrival profile has an invalid producer kind")
 
 
 @dataclass(frozen=True)
@@ -118,6 +127,20 @@ class HostLayerPublication:
 
 
 @dataclass(frozen=True, slots=True)
+class AcquisitionGroupPublication:
+    """One exact request-generation group and its physical readiness edge."""
+
+    identity: AcquisitionGroupIdentity
+    ready_event: torch.cuda.Event
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, AcquisitionGroupIdentity):
+            raise TypeError("group publication requires a typed exact identity")
+        if self.ready_event is None:
+            raise ValueError("group publication has no readiness event")
+
+
+@dataclass(frozen=True, slots=True)
 class SglangLayerAcquisition:
     """Tier-neutral readiness record for one transformer layer."""
 
@@ -127,12 +150,24 @@ class SglangLayerAcquisition:
     ready_event: torch.cuda.Event
     tier: AcquisitionTier
     consumer_plan: AcquisitionConsumerPlan
+    groups: tuple[AcquisitionGroupPublication, ...] = ()
+    wave_events: tuple[torch.cuda.Event, ...] = ()
+    profile_ready_event: torch.cuda.Event | None = None
     partial_publication: HostLayerPublication | None = None
     backend_record: Any = None
 
     def __post_init__(self) -> None:
         if self.local_layer < 0 or self.layer_id < 0:
             raise ValueError("layer acquisition identity cannot be negative")
+        if len({group.identity for group in self.groups}) != len(self.groups) or any(
+            group.identity.layer_id != self.layer_id for group in self.groups
+        ):
+            raise ValueError("layer acquisition exact-group identity is inconsistent")
+        if self.wave_events and (
+            self.ready_event is not self.wave_events[-1]
+            or any(group.ready_event not in self.wave_events for group in self.groups)
+        ):
+            raise ValueError("layer acquisition wave frontier is inconsistent")
         if self.tier is AcquisitionTier.HOST_STAGED:
             if (
                 self.consumer_plan is not AcquisitionConsumerPlan.HOST_MATERIALIZED
@@ -149,7 +184,9 @@ class SglangLayerAcquisition:
     @property
     def progressive(self) -> bool:
         publication = self.partial_publication
-        return publication is not None and publication.transfer_first_slot is not None
+        return bool(self.wave_events) or (
+            publication is not None and publication.transfer_first_slot is not None
+        )
 
 
 class SglangForwardAcquisition(ABC):
@@ -208,14 +245,45 @@ class HostForwardAcquisition(SglangForwardAcquisition):
             return None
         if not isinstance(publication, HostLayerPublication):
             raise RuntimeError("Host acquisition published an untyped layer")
+        identities = tuple(
+            self._pending.acquisition_group_identities.get(local_layer, ())
+        )
+        group_publications: tuple[AcquisitionGroupPublication, ...] = ()
+        if identities:
+            scheduled = tuple(self._pending.scheduled_acquisition_groups)
+            operations = {
+                operation.operation_id: operation
+                for operation in self._pending.operation_ranges()
+            }
+            if len(identities) != len(scheduled):
+                raise RuntimeError("Host layer changed its exact-group cardinality")
+            values: list[AcquisitionGroupPublication] = []
+            for identity, group in zip(identities, scheduled, strict=True):
+                operation = operations.get(group.operation_id)
+                if operation is None:
+                    raise RuntimeError("Host group publication lost its operation")
+                event = publication.ready_event
+                if publication.wave_events:
+                    absolute_end = operation.row_begin + group.row_end
+                    wave = bisect.bisect_left(
+                        publication.wave_row_ends, absolute_end
+                    )
+                    if wave >= len(publication.wave_events):
+                        raise RuntimeError("Host exact group exceeds its physical waves")
+                    event = publication.wave_events[wave]
+                values.append(AcquisitionGroupPublication(identity, event))
+            group_publications = tuple(values)
         return SglangLayerAcquisition(
-            self,
-            local_layer,
-            self._start_layer + local_layer,
-            publication.ready_event,
-            AcquisitionTier.HOST_STAGED,
-            AcquisitionConsumerPlan.HOST_MATERIALIZED,
-            publication,
+            owner=self,
+            local_layer=local_layer,
+            layer_id=self._start_layer + local_layer,
+            ready_event=publication.ready_event,
+            tier=AcquisitionTier.HOST_STAGED,
+            consumer_plan=AcquisitionConsumerPlan.HOST_MATERIALIZED,
+            groups=group_publications,
+            wave_events=publication.wave_events,
+            profile_ready_event=publication.profile_ready_event,
+            partial_publication=publication,
         )
 
     def consume_layer(

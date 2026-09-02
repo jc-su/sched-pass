@@ -125,7 +125,7 @@ def main() -> None:
             == len(ARMS)
             for stratum in strata
         )
-        assert spec["evaluation_profile"] == "osdi-complete"
+        assert spec["evaluation_profile"] == "mechanism-study"
         assert {trial["arm"] for trial in spec["experiments"]} == set(ARMS)
         assert all(
             trial["demand_semantics"] == "exact" for trial in spec["experiments"]
@@ -209,7 +209,7 @@ def main() -> None:
         subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         cli_spec = json.loads(cli_output.read_text(encoding="utf-8"))
         assert len(cli_spec["comparisons"]) == len(PAIRS) * len(strata)
-        assert cli_spec["evaluation_profile"] == "osdi-complete"
+        assert cli_spec["evaluation_profile"] == "mechanism-study"
         assert cli_spec["experiments"][0]["consumer_kind"] in {
             "native_work_unit",
             "framework_reference",

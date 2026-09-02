@@ -870,6 +870,7 @@ def main() -> None:
     )
     deferred_request = types.SimpleNamespace(
         rid="deferred-external",
+        req_pool_idx=19,
         best_match_node=types.SimpleNamespace(id=51),
         last_node=types.SimpleNamespace(id=51),
         prefix_indices=torch.empty((0,), dtype=torch.int64),
@@ -950,6 +951,7 @@ def main() -> None:
         LeaseAcquisitionGroup,
         LeaseAcquisitionSlice,
         LeaseOperationRange,
+        LeaseOperationRequest,
         LeaseOperationTransfer,
     )
     from nta_runtime.engines.sglang_hicache import (
@@ -1146,7 +1148,7 @@ def main() -> None:
     capped_bridge = PreparedBridge()
     admission = AcquisitionAdmission(AdmissionConfig(True, 5), clock=lambda: clock[0])
     assert admission.consider(scheduler, batch, capped_bridge) is batch
-    assert capped_bridge.prepared and not capped_bridge.started
+    assert capped_bridge.prepared and capped_bridge.started
     assert capped_bridge.stats["admission_released_partial_slo"] == 1
 
     bridge.leading_layers = 0
@@ -1192,8 +1194,8 @@ def main() -> None:
 
     # SGLang 0.5.16's raw prefill seam returns a pair, not a ScheduleBatch.
     # The adapter must preserve the running-batch half while delaying only the
-    # newly allocated external batch, and must not call the scheduler again
-    # while that batch is staged.
+    # newly allocated external batch. A ready staged batch is released before
+    # another scheduler call.
     route_scheduler = types.SimpleNamespace(
         running_batch=types.SimpleNamespace(reqs=[])
     )
@@ -1232,6 +1234,59 @@ def main() -> None:
         )
     assert second == (route_batch, route_running)
     assert len(route_calls) == 1
+
+    # While resident decode is still useful, a bounded staging ring may capture
+    # more than one external batch. This is the framework edge that exposes
+    # multiple batch cohorts to the shared-link EDF scheduler; once the ring is
+    # full, the hook stops allocating additional framework batches.
+    bridge.leading_layers = 0
+    multi_scheduler = types.SimpleNamespace(
+        running_batch=types.SimpleNamespace(reqs=[])
+    )
+    multi_batches = [
+        types.SimpleNamespace(
+            reqs=[Request(f"external-{index}")],
+            hicache_consumer_index=3,
+            decoding_reqs=None,
+        )
+        for index in range(3)
+    ]
+    multi_calls = []
+
+    def multi_prefill(_scheduler, **_kwargs):
+        batch_index = len(multi_calls)
+        multi_calls.append(batch_index)
+        return multi_batches[batch_index], route_running
+
+    multi_admission = AcquisitionAdmission(
+        AdmissionConfig(True, 100, max_staged_batches=2),
+        clock=lambda: route_clock[0],
+    )
+    setattr(multi_scheduler, "_nta_acquisition_admission", multi_admission)
+    with patch(
+        "nta_runtime.engines.sglang_admission._bridge_for_batch",
+        return_value=bridge,
+    ):
+        assert route_prefill_admission(
+            multi_prefill,
+            multi_scheduler,
+            prefill_delayer_single_pass=None,
+            running_batch=route_running,
+        ) == (None, route_running)
+        assert route_prefill_admission(
+            multi_prefill,
+            multi_scheduler,
+            prefill_delayer_single_pass=None,
+            running_batch=route_running,
+        ) == (None, route_running)
+        assert route_prefill_admission(
+            multi_prefill,
+            multi_scheduler,
+            prefill_delayer_single_pass=None,
+            running_batch=route_running,
+        ) == (None, route_running)
+    assert multi_calls == [0, 1]
+    assert len(multi_admission._staged) == 2
 
     def malformed_prefill(_scheduler, **_kwargs):
         return route_batch
@@ -1283,6 +1338,7 @@ def main() -> None:
         controller=types.SimpleNamespace(layer_num=3),
         node_ids=(),
         operation_transfers=(LeaseOperationTransfer(70, 17, 1),),
+        operation_requests=(),
         prefetched_layers={
             0: types.SimpleNamespace(
                 key_bytes=10, value_bytes=10, ready_event=first_ready
@@ -1403,17 +1459,24 @@ def main() -> None:
     else:
         raise AssertionError("HiCache accepted an admission ownership reversal")
     partition_bridge.record_operation_admission(admitted_operation.id, True)
+    partition_bridge.record_operation_request(
+        LeaseOperationRequest(
+            admitted_operation.id, "partition-request", 3, 0, 1, 0
+        )
+    )
     partition_bridge.record_operation_admission(deferred_operation.id, False)
     assert partition_bridge.acquire_load(partition_controller) == 0
     partition_pending = partition_bridge.get(0)
     assert partition_pending is not None
     assert tuple(
         transfer.operation_id for transfer in partition_pending.operation_transfers
-    ) == (admitted_operation.id, deferred_operation.id)
+    ) == (admitted_operation.id,)
     assert partition_pending.demand_operation_ids == frozenset(
         (admitted_operation.id,)
     )
-    assert partition_controller.load_queue == []
+    assert partition_controller.load_queue == [deferred_operation]
+    assert partition_bridge._operation_admission == {deferred_operation.id: False}
+    assert partition_bridge._operation_requests == {}
 
     close_race_pool = DevicePool()
     close_race_pool._get_key_buffer = lambda *_args: None
@@ -1423,6 +1486,16 @@ def main() -> None:
     close_race_controller = lease_controller(close_race_pool)
     close_race_bridge.record_operation_admission(
         close_race_controller.load_queue[0].id, True
+    )
+    close_race_bridge.record_operation_request(
+        LeaseOperationRequest(
+            close_race_controller.load_queue[0].id,
+            "close-race-request",
+            4,
+            0,
+            1,
+            0,
+        )
     )
 
     def close_during_prepare(_pool, _indices):
@@ -1448,6 +1521,16 @@ def main() -> None:
     reused_bridge.set_acquire_callback(lambda _pending: None)
     reused_controller = lease_controller(reused_pool)
     reused_bridge.record_operation_admission(reused_controller.load_queue[0].id, True)
+    reused_bridge.record_operation_request(
+        LeaseOperationRequest(
+            reused_controller.load_queue[0].id,
+            "reused-request",
+            5,
+            0,
+            1,
+            0,
+        )
+    )
     reused_bridge._pending[0] = object()
     try:
         reused_bridge.acquire_load(reused_controller)

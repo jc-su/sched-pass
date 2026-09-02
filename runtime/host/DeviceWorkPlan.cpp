@@ -41,12 +41,15 @@ void validate(const WorkPlan &plan) {
   const std::uint32_t workTicketBase = plan.workItems.front().workTicket;
   const std::uint32_t reductionGroupBase =
       plan.workItems.front().reductionGroup;
-  // Device consumers use ready work-ticket and reduction-group identities as
-  // direct indices into this plan's compact arrays. They are plan-local ABI
-  // indices, not caller-owned global identifiers.
-  if (workTicketBase != 0 || reductionGroupBase != 0) {
-    throw std::invalid_argument(
-        "work plan indices must use zero-based plan-local identities");
+  // Work-plan storage is compact, but ticket identities index the owning
+  // RuntimeView.  The default base is zero for numerical plans; a shared
+  // acquisition service may upload several compact plans into disjoint
+  // runtime ticket ranges.  Reduction groups use the same base so no request
+  // in one concurrently live plan aliases another plan's accounting record.
+  if (workTicketBase > abi::InvalidIndex - workCount ||
+      reductionGroupBase != workTicketBase ||
+      reductionGroupBase > abi::InvalidIndex - plan.requests.size()) {
+    throw std::invalid_argument("work plan runtime index range is invalid");
   }
   std::uint32_t workCursor = 0;
   for (std::uint32_t requestIndex = 0; requestIndex < plan.requests.size();

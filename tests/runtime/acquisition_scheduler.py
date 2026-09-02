@@ -3,6 +3,7 @@
 from dataclasses import replace
 
 from nta_runtime.acquisition_scheduler import (
+    AcquisitionGroupIdentity,
     AcquisitionJob,
     AcquisitionJobState,
     AcquisitionQueue,
@@ -10,9 +11,13 @@ from nta_runtime.acquisition_scheduler import (
     AcquisitionWork,
     LayerAcquisition,
     LayerAcquisitionModel,
+    SharedAcquisitionJob,
+    SharedAcquisitionQueue,
+    SharedAcquisitionState,
     TenantCreditCharge,
     TenantCreditLedger,
     schedule_acquisition_jobs,
+    schedule_shared_acquisition_jobs,
 )
 
 
@@ -95,6 +100,119 @@ def main() -> None:
     assert generic_edf.first_missed_job_id == 2
     assert generic_edf.required_initial_slack_ns == 20
     assert schedule_acquisition_jobs(()).feasible
+
+    # Shared-link policy uses complete semantic identities and absolute release
+    # times. This example is deliberately not a simultaneous-release theorem:
+    # work-conserving non-preemptive EDF starts the only available group, so a
+    # later urgent group can miss even though an idling policy could wait for it.
+    identity_a = AcquisitionGroupIdentity(3, 7, 0, 0, 8, 41)
+    identity_b = AcquisitionGroupIdentity(9, 2, 0, 16, 4, 52)
+    shared_jobs = (
+        SharedAcquisitionJob(identity_a, 1, 8192, 8192, 0, 60, 100, 0),
+        SharedAcquisitionJob(identity_b, 2, 4096, 4096, 10, 20, 50, 7),
+    )
+    shared_policy = schedule_shared_acquisition_jobs(shared_jobs)
+    assert shared_policy.ordered_identities == (identity_a, identity_b)
+    assert shared_policy.start_ns == (0, 60)
+    assert shared_policy.completion_ns == (60, 80)
+    assert not shared_policy.feasible
+    assert shared_policy.first_missed_identity == identity_b
+    assert shared_policy.maximum_lateness_ns == 30
+    delayed_policy = schedule_shared_acquisition_jobs(
+        (replace(shared_jobs[0], release_ns=20),), available_ns=10
+    )
+    assert delayed_policy.start_ns == (20,)
+
+    # Dynamic dispatch spans requests and batches but exposes only one finite
+    # non-preemptive group at a time. Staging and tenant credits are acquired in
+    # the same claim transaction and released by physical readiness, while a
+    # consumer may already be ordered behind the published fence.
+    shared_credits = TenantCreditLedger(((1, 8192), (2, 4096)))
+    shared_queue = SharedAcquisitionQueue(
+        staging_capacity_bytes=8192,
+        tenant_credits=shared_credits,
+        max_inflight_groups=1,
+    )
+    shared_queue.add(shared_jobs)
+    assert shared_queue.group_count == 2
+    assert tuple(job.identity for job in shared_queue.claim(now_ns=0)) == (
+        identity_a,
+    )
+    assert shared_queue.staging_outstanding_bytes == 8192
+    assert shared_credits.outstanding_bytes(1) == 8192
+    assert not shared_queue.claim(now_ns=10)
+    shared_queue.publish_fence(identity_a)
+    shared_queue.consume(identity_a)
+    assert shared_queue.state(identity_a) is SharedAcquisitionState.FENCE_PUBLISHED
+    shared_queue.mark_ready(identity_a)
+    assert shared_queue.state(identity_a) is SharedAcquisitionState.CONSUMED
+    assert shared_queue.staging_outstanding_bytes == 0
+    assert shared_credits.outstanding_bytes(1) == 0
+    assert tuple(job.identity for job in shared_queue.claim(now_ns=60)) == (
+        identity_b,
+    )
+    shared_queue.publish_fence(identity_b)
+    shared_queue.mark_ready(identity_b)
+    shared_queue.consume(identity_b)
+    assert shared_queue.state(identity_b) is SharedAcquisitionState.CONSUMED
+
+    cohort_credits = TenantCreditLedger(((1, 8192), (2, 4096)))
+    cohort_queue = SharedAcquisitionQueue(
+        staging_capacity_bytes=12288,
+        tenant_credits=cohort_credits,
+        max_inflight_groups=2,
+    )
+    cohort_jobs = (
+        replace(shared_jobs[0], deadline_ns=100),
+        replace(shared_jobs[1], release_ns=0, deadline_ns=100),
+    )
+    cohort_queue.add(cohort_jobs)
+    assert cohort_queue.next_released_identity(now_ns=0) == identity_b
+    assert tuple(
+        job.identity
+        for job in cohort_queue.claim_cohort(
+            (identity_a, identity_b), now_ns=0
+        )
+    ) == (identity_a, identity_b)
+    assert cohort_queue.staging_outstanding_bytes == 12288
+    for identity in (identity_a, identity_b):
+        cohort_queue.publish_fence(identity)
+        cohort_queue.mark_ready(identity)
+        cohort_queue.consume(identity)
+    cohort_queue.forget_terminal((identity_a, identity_b))
+    assert cohort_queue.group_count == 0
+
+    cancelled_identity = AcquisitionGroupIdentity(3, 8, 1, 0, 1, 53)
+    shared_queue.add(
+        (SharedAcquisitionJob(cancelled_identity, 1, 1, 1, 0, 1, 100),)
+    )
+    assert shared_queue.cancel_request(3, 8) == 1
+    assert (
+        shared_queue.state(cancelled_identity)
+        is SharedAcquisitionState.CANCELLED
+    )
+
+    inflight_identity = AcquisitionGroupIdentity(4, 1, 2, 0, 1, 54)
+    inflight_queue = SharedAcquisitionQueue(
+        staging_capacity_bytes=1,
+        tenant_credits=TenantCreditLedger(()),
+    )
+    inflight_queue.add(
+        (SharedAcquisitionJob(inflight_identity, 0, 1, 1, 0, 1, 10),)
+    )
+    assert inflight_queue.claim(now_ns=0)
+    inflight_queue.publish_fence(inflight_identity)
+    inflight_queue.cancel(inflight_identity)
+    assert (
+        inflight_queue.state(inflight_identity)
+        is SharedAcquisitionState.FENCE_PUBLISHED
+    )
+    inflight_queue.mark_ready(inflight_identity)
+    assert (
+        inflight_queue.state(inflight_identity)
+        is SharedAcquisitionState.CANCELLED
+    )
+    inflight_queue.forget_terminal((inflight_identity,))
 
     try:
         schedule_acquisition_jobs(

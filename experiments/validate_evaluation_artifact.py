@@ -31,7 +31,7 @@ def validate(output: Path) -> dict[str, Any]:
     )
     evaluation_profile = evaluation_metadata.get("evaluation_profile", "contract")
     _require(
-        evaluation_profile in {"contract", "osdi-complete"},
+        evaluation_profile in {"contract", "mechanism-study"},
         "unknown evaluation profile",
     )
     _require(
@@ -69,7 +69,7 @@ def validate(output: Path) -> dict[str, Any]:
         try:
             validate_consumer_contract(
                 contract,
-                require_formal_execution=evaluation_profile == "osdi-complete",
+                require_formal_execution=evaluation_profile == "mechanism-study",
             )
         except ValueError as error:
             raise ValueError(
@@ -99,34 +99,34 @@ def validate(output: Path) -> dict[str, Any]:
         provenance.get("evaluation_profile", "contract") == evaluation_profile,
         "report evaluation profile diverges from evaluation metadata",
     )
-    if evaluation_profile == "osdi-complete":
+    if evaluation_profile == "mechanism-study":
         contract = json.loads(
             (output / "evaluation-contract.json").read_text(encoding="utf-8")
         )
         expected_arms = list(ARMS)
         _require(
             evaluation_metadata.get("arm_set") == expected_arms,
-            "osdi-complete artifact does not contain exactly A0-A3",
+            "mechanism-study artifact does not contain exactly A0-A3",
         )
         _require(
             isinstance(evaluation_metadata.get("tier_set"), list)
             and len(evaluation_metadata["tier_set"]) == 1,
-            "osdi-complete artifact must measure one tier per paired spec",
+            "mechanism-study artifact must measure one tier per paired spec",
         )
         _require(
             isinstance(evaluation_metadata.get("strata_count"), int)
             and evaluation_metadata["strata_count"] >= 6,
-            "osdi-complete artifact has too few workload strata",
+            "mechanism-study artifact has too few workload strata",
         )
         expected_pairs = sorted(
             {
                 f"{pair['numerator']}>{pair['denominator']}"
-                for pair in contract.get("causal_pairs", [])
+                for pair in contract.get("mechanism_study", {}).get("causal_pairs", [])
             }
         )
         _require(
             evaluation_metadata.get("causal_pairs") == expected_pairs,
-            "osdi-complete artifact is missing a canonical causal boundary",
+            "mechanism-study artifact is missing a canonical causal boundary",
         )
         consumer_kinds = evaluation_metadata.get("consumer_kinds")
         _require(
@@ -136,7 +136,7 @@ def validate(output: Path) -> dict[str, Any]:
                 kind in {"native_work_unit", "framework_reference"}
                 for kind in consumer_kinds.values()
             ),
-            "osdi-complete artifact has no complete consumer-kind declaration",
+            "mechanism-study artifact has no complete consumer-kind declaration",
         )
         observed_kinds = {
             str(entry.get("arm")): entry.get("consumer_kind")
@@ -154,7 +154,7 @@ def validate(output: Path) -> dict[str, Any]:
                 for contract in contracts
                 if isinstance(contract, dict)
             },
-            "osdi-complete artifact has no native numerical consumer evidence",
+            "mechanism-study artifact has no native numerical consumer evidence",
         )
     _require(
         workloads == evaluation_metadata.get("workloads"),

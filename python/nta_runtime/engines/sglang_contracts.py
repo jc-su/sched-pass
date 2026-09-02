@@ -29,6 +29,40 @@ class LeaseOperationTransfer:
 
 
 @dataclass(frozen=True, slots=True)
+class LeaseOperationRequest:
+    """Stable request owner captured at SGLang's unmerged operation edge.
+
+    Generation is intentionally absent here: SGLang allocates the request slot
+    before it constructs ``ForwardBatch``, while the runtime registry is the
+    sole authority allowed to assign a generation.  The acquisition owner binds
+    this record through that registry before any scheduled transfer is issued.
+    """
+
+    operation_id: int
+    request_id: str
+    request_slot: int
+    logical_begin: int
+    row_count: int
+    tenant_id: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.operation_id < 0
+            or not isinstance(self.request_id, str)
+            or not self.request_id
+            or not 0 <= self.request_slot < 1 << 32
+            or self.logical_begin < 0
+            or self.row_count <= 0
+            or not 0 <= self.tenant_id < 1 << 32
+        ):
+            raise ValueError("SGLang lease request ownership is invalid")
+
+    @property
+    def logical_end(self) -> int:
+        return self.logical_begin + self.row_count
+
+
+@dataclass(frozen=True, slots=True)
 class LeaseOperationRange:
     """One unmerged load operation's contiguous range in the merged lease."""
 

@@ -66,6 +66,7 @@ def acquired_layer(
     layer_id: int = 6,
     progressive: bool = False,
     publication=None,
+    wave_events=(),
     tier: AcquisitionTier = AcquisitionTier.HOST_STAGED,
 ):
     owner = FakeAcquisitionOwner(tier)
@@ -81,14 +82,15 @@ def acquired_layer(
         consumer_plan = AcquisitionConsumerPlan.PREACQUIRED
         backend_record = object()
     return SglangLayerAcquisition(
-        owner,
-        local_layer,
-        layer_id,
-        event,
-        tier,
-        consumer_plan,
-        publication,
-        backend_record,
+        owner=owner,
+        local_layer=local_layer,
+        layer_id=layer_id,
+        ready_event=event,
+        tier=tier,
+        consumer_plan=consumer_plan,
+        wave_events=wave_events,
+        partial_publication=publication,
+        backend_record=backend_record,
     )
 
 
@@ -168,6 +170,23 @@ def main() -> None:
     )
     assert selected.kind is AttentionDispatchKind.PRELOADED
     assert arriving_event.queries == 1
+
+    nvme_events = (ReadyEvent(False), ReadyEvent(False))
+    nvme_arriving = acquired_layer(
+        nvme_events[-1],
+        progressive=True,
+        tier=AcquisitionTier.NVME,
+        wave_events=nvme_events,
+    )
+    selected = select_attention_dispatch(
+        pending=pending(),
+        host_execution=None,
+        acquisition=nvme_arriving,
+        layer_id=6,
+        progressive_consumer_planned=True,
+    )
+    assert selected.kind is AttentionDispatchKind.ARRIVING_PREFETCH
+    assert nvme_events[-1].queries == 1
 
     # A shared producer fence already ordered on the numerical stream is
     # stronger than a racing host-side query. It must not create a second
@@ -259,6 +278,55 @@ def main() -> None:
     assert wave_executor._stats["compact_resume_cta_bound"] == 10
     assert wave_executor._stats["canonical_resume_cta_bound"] == 28
     assert wave_executor._stats["event_ordered_wave_launches"] == 4
+
+    cold_events = (object(), object())
+    cold_nvme = acquired_layer(
+        cold_events[-1],
+        local_layer=0,
+        layer_id=4,
+        tier=AcquisitionTier.NVME,
+        wave_events=cold_events,
+    )
+    cold_plan = SimpleNamespace(has_external=True)
+    cold_schedule = SimpleNamespace(work_count=4)
+    wave_executor._materializer = SimpleNamespace(
+        require_allocation=lambda _wrapper: SimpleNamespace(
+            plan=cold_plan,
+            object_count=0,
+            direct_work_count=0,
+            event_partitioned=True,
+            event_wave_work_counts=(2, 2),
+        )
+    )
+    cold_wrapper = SimpleNamespace()
+    cold_batch = SimpleNamespace(
+        semantic_plans={id(cold_wrapper): SimpleNamespace(schedule=cold_schedule)},
+        arriving_partition_key=None,
+    )
+    cold_calls = []
+    with patch(
+        "nta_runtime.engines.sglang_execution.enqueue_event_partitioned_attention",
+        lambda *args, **kwargs: cold_calls.append((args, kwargs)),
+    ):
+        outcome = wave_executor._execute_nvme_arriving_prefetch(
+            dispatch=SimpleNamespace(acquisition=cold_nvme),
+            batch=cold_batch,
+            wrapper=cold_wrapper,
+            q="query",
+            kv_cache="kv",
+            output="output",
+            layer=SimpleNamespace(layer_id=4, scaling=1.0),
+            stream="consumer-stream",
+            run_options={},
+            tile_compute_ns=11,
+            dispatch_ready_profile=None,
+        )
+    assert outcome.progressive_consumer and outcome.progress_rounds == 2
+    assert cold_calls[0][1]["direct_work_count"] == 0
+    assert cold_calls[0][1]["ready_events"] == cold_events
+    assert cold_nvme.owner.consumed == [
+        (cold_nvme, "consumer-stream", False)
+    ]
 
     # A directory-backed producer is not by itself evidence that a partial
     # consumer exists.  External-only/cache-placement forwards have no direct

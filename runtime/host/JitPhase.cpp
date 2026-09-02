@@ -295,10 +295,10 @@ void JitPhaseProgram::prepareEventWorkPartition(
     const abi::WorkItem *workItems, std::uint32_t workItemCount,
     std::uint32_t directWorkCount, std::uint32_t waveCount) const {
   if (runtime == nullptr || workItems == nullptr || workItemCount == 0 ||
-      directWorkCount == 0 || directWorkCount >= workItemCount ||
+      directWorkCount >= workItemCount ||
       waveCount == 0 || waveCount > abi::MaximumEventCompletionClasses) {
     throw std::invalid_argument(
-        "event work partition needs mixed direct/wave work");
+        "event work partition needs bounded deferred-wave work");
   }
   check(impl_->prepareEventWorkPartition(runtime, workItems, workItemCount,
                                          directWorkCount, waveCount, stream),
@@ -711,6 +711,7 @@ void JitPhaseProgram::complete(cudaStream_t stream, abi::RuntimeView *runtime,
   check(impl_->complete(runtime, workTicketCount, stream),
         "nta_jit_complete_launched");
 }
+
 
 void JitPhaseProgram::completeStreamOrdered(cudaStream_t stream,
                                             abi::RuntimeView *runtime,

@@ -83,11 +83,11 @@ must report both the source arrival provenance and this state-construction
 policy.  If a trace has no timestamps, use `batch_release` or an explicitly
 calibrated open-loop rate; never use offline row order as production arrival.
 
-Generate the RQ0 opportunity artifact separately from serving trials:
+Generate the prerequisite opportunity artifact separately from serving trials:
 
 ```bash
 python experiments/analyze_workload.py online.manifest.json \
-  --output /tmp/nta-artifacts/online-rq0.json
+  --output /tmp/nta-artifacts/online-opportunity.json
 ```
 
 This records prefix reuse, length, state heterogeneity, and arrival-burst
@@ -96,11 +96,13 @@ serving arms.
 
 ## RQs and evidence
 
-RQ0 characterizes the opportunity: prefix reuse, request-state heterogeneity,
+Before the four RQs, workload characterization reports prefix reuse,
+request-state heterogeneity,
 length distributions, burstiness, and exact candidate-block shape.  The
 anonymized trace explicitly reports compute/transfer regime as
 `trace_only_not_identifiable`; that regime is measured in native tier reports
-and serving profiles rather than inferred from prompt lengths.  RQ1 is the
+and serving profiles rather than inferred from prompt lengths. It is an input
+characterization, not a fifth research question. RQ1 is the
 paired serving result against stock SGLang HiCache under identical exact
 demand. RQ2 is the causal decomposition across framework bulk control, exact
 eager NTA preacquisition, scheduler-bound whole-layer acquisition, and
@@ -132,7 +134,7 @@ contract; A2 and A3 additionally share the same acquisition owner and differ
 only in consumer readiness.
 
 The generated trial specification is explicitly marked
-`evaluation_profile=osdi-complete`. This profile is a machine-checked gate,
+`evaluation_profile=mechanism-study`. This profile is a machine-checked causal-study gate,
 not a documentation label: it requires all A0--A3 arms, all three canonical
 causal boundaries in every declared stratum, and at least six strata. Minimal
 fixtures use `evaluation_profile=contract` and cannot be presented as the

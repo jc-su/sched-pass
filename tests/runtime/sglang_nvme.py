@@ -1,5 +1,10 @@
 from types import SimpleNamespace
 
+from nta_runtime.engines.sglang_nvme import (
+    bind_nvme_exact_group_identities,
+    plan_nvme_event_frontier,
+)
+from nta_runtime.engines.sglang_nvme_policy import plan_nvme_consumer_policy
 from nta_runtime.engines.sglang_nvme_planning import (
     plan_nvme_batch_geometry,
     plan_nvme_window_layer_capacity,
@@ -59,8 +64,13 @@ def test_request_owned_kv_never_fans_out_across_tenants() -> None:
     for scope in planned.scopes:
         expected_consumer = 0 if scope.tenant_id == 4 else 1
         assert all(
-            group.consumer_indices == (expected_consumer,) for group in scope.groups
+            packet.consumer_indices == (expected_consumer,)
+            for packet in scope.packets
         )
+    assert tuple(group.request_index for group in planned.exact_groups) == (0, 1)
+    assert tuple(group.segment_begin for group in planned.exact_groups) == (0, 0)
+    assert tuple(group.segment_count for group in planned.exact_groups) == (4, 4)
+    assert planned.groups_for_wrapper(7) == (0, 1)
 
 
 def test_budget_isolation_flag_does_not_change_object_scope() -> None:
@@ -78,9 +88,31 @@ def test_same_tenant_deduplication_is_preserved() -> None:
     assert planned.scoped_exact_transfer_bytes == planned.logical_transfer_bytes
     assert planned.unique_source_transfer_bytes == planned.logical_transfer_bytes
     assert all(
-        group.consumer_indices == (0, 1)
-        for group in planned.scopes[0].groups
+        packet.consumer_indices == (0, 1)
+        for packet in planned.scopes[0].packets
     )
+    assert len(planned.exact_groups) == 2
+    assert planned.exact_groups[0].packet_indices == planned.exact_groups[1].packet_indices
+    identities = bind_nvme_exact_group_identities(
+        planned,
+        (
+            RequestBinding(0, 3, 11, 101, tenant_id=4),
+            RequestBinding(1, 8, 17, 202, tenant_id=4),
+        ),
+        layer_id=9,
+        resource_version=31,
+    )
+    assert tuple(
+        (
+            identity.request_slot,
+            identity.request_generation,
+            identity.layer_id,
+            identity.segment_begin,
+            identity.segment_count,
+            identity.resource_version,
+        )
+        for identity in identities
+    ) == ((3, 11, 9, 0, 4, 31), (8, 17, 9, 0, 4, 31))
 
 
 def test_tenant_scoped_geometry_fails_before_partial_publication() -> None:
@@ -160,6 +192,12 @@ def test_measured_service_cost_selects_exact_span_compaction() -> None:
     assert planned.physical_transfer_bytes == 31 * 8192
     assert planned.scratch_bytes_per_layer == planned.physical_transfer_bytes
     assert planned.selected_predicted_ns < planned.direct_predicted_ns
+    assert tuple(group.segment_count for group in planned.exact_groups) == (16, 16)
+    packets = tuple(packet for scope in planned.scopes for packet in scope.packets)
+    assert len(packets) == 1 and packets[0].row_count == 31
+    assert planned.exact_groups[0].packet_indices == (0,)
+    assert planned.exact_groups[1].packet_indices == (0,)
+    assert planned.groups_for_wrapper(7) == (0, 1)
 
 
 def test_uncalibrated_geometry_never_selects_span_optimistically() -> None:
@@ -168,6 +206,31 @@ def test_uncalibrated_geometry_never_selects_span_optimistically() -> None:
     assert planned.granularity_reason == "uncalibrated"
     assert planned.scratch_bytes_per_layer == 0
     assert planned.physical_transfer_bytes >= planned.unique_source_transfer_bytes
+
+
+def test_event_frontier_preserves_edf_and_exact_group_boundaries() -> None:
+    planned = geometry(isolated=False)
+    bindings = (
+        RequestBinding(0, 3, 11, 101, deadline_clock=900, tenant_id=4),
+        RequestBinding(1, 8, 17, 202, deadline_clock=500, tenant_id=9),
+    )
+    by_request = {binding.request_index: binding for binding in bindings}
+    packet_consumers = {
+        packet: tuple(by_request[index] for index in packet.consumer_indices)
+        for scope in planned.scopes
+        for packet in scope.packets
+    }
+    frontier = plan_nvme_event_frontier(planned, packet_consumers)
+    assert frontier.wave_count == 4
+    assert tuple(packet for wave in frontier.wave_packet_indices for packet in wave) == (
+        2,
+        3,
+        0,
+        1,
+    )
+    # The earlier-deadline request becomes consumable first even though its
+    # physical packet ids were allocated after the other tenant's packets.
+    assert frontier.group_wave_indices == (3, 1)
 
 
 def test_window_planner_reaches_refill_steady_state() -> None:
@@ -212,6 +275,58 @@ def test_window_planner_reaches_refill_steady_state() -> None:
     )
 
 
+def test_closed_loop_policy_is_probe_or_profile_driven() -> None:
+    planned_geometry = geometry(isolated=False)
+    window_count = 1
+    class LayerCalibration:
+        @staticmethod
+        def shape_key(_batch):
+            return ("extend", 64, 2)
+
+    class ConsumerCalibration:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def bind_lease(self, pending, **values) -> None:
+            del pending
+            self.calls.append(values)
+
+    for probe, profiled, expected in (
+        (True, frozenset(), {0, 1}),
+        (False, frozenset({1}), {1}),
+    ):
+        pending = SimpleNamespace(
+            consumer_policy_probe=probe,
+            planned_progressive_layers=profiled,
+            arrival_profiling=False,
+            arrival_profile_active=False,
+        )
+        batch = SimpleNamespace(
+            layer_service_key=None,
+            planned_progressive_consumer_layers=set(),
+        )
+        calibration = ConsumerCalibration()
+        stats = {}
+        selected = plan_nvme_consumer_policy(
+            forward_batch=object(),
+            pending=pending,
+            batch=batch,
+            geometry=planned_geometry,
+            window_count=window_count,
+            wave_count=2,
+            layer_calibration=LayerCalibration(),
+            consumer_calibration=calibration,
+            model_layer_count=2,
+            minimum_gain=1.03,
+            stats=stats,
+        )
+        assert selected == frozenset(expected)
+        assert batch.planned_progressive_consumer_layers == expected
+        assert calibration.calls[0]["producer_kind"] == "nvme_direct"
+        assert calibration.calls[0]["sm_waves_per_layer"] == 2
+        assert stats["nvme_partial_consumer_planned_layers"] == len(expected)
+
+
 def main() -> None:
     test_request_owned_kv_never_fans_out_across_tenants()
     test_budget_isolation_flag_does_not_change_object_scope()
@@ -221,7 +336,9 @@ def main() -> None:
     test_nonphysical_semantics_fail_closed()
     test_measured_service_cost_selects_exact_span_compaction()
     test_uncalibrated_geometry_never_selects_span_optimistically()
+    test_event_frontier_preserves_edf_and_exact_group_boundaries()
     test_window_planner_reaches_refill_steady_state()
+    test_closed_loop_policy_is_probe_or_profile_driven()
     print("sglang_nvme=pass")
 
 

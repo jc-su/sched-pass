@@ -97,7 +97,7 @@
       "kind": "qualified-paired-evaluation",
       "commands": ["experiments/run_evaluation.py", "experiments/validate_evaluation_artifact.py"],
       "requires": ["external normalized workload", "paired evaluation spec", "qualified engine or native command"],
-      "outputs": ["evaluation/", "evaluation-spec.json", "workload/", "tier-qualification.json (for NVMe/DAX)", "performance/ (for osdi-complete)", "metadata.json", "logs/"]
+      "outputs": ["evaluation/", "evaluation-spec.json", "workload/", "tier-qualification.json (for NVMe/DAX)", "performance/ (for mechanism-study)", "metadata.json", "logs/"]
     },
     "hardware": {
       "kind": "read-only-capability-inventory",
