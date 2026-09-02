@@ -19,6 +19,24 @@ from nta_runtime.engines.sglang_topology import project_forward_operation_owners
 _LEASE_ID_ATTRIBUTE = "_nta_hicache_lease_id"
 
 
+def bind_batch_consumer_lease(batch: Any, bridge: Any | None) -> None:
+    """Seal the framework producer generation at the scheduler handoff.
+
+    A value of zero means the official scheduler seam observed a framework-
+    owned consumer index with no NTA lease generation.  Absence of the
+    attribute remains distinct and fail-closed: it means no trusted seam ever
+    classified the index.
+    """
+
+    consumer_index = int(getattr(batch, "hicache_consumer_index", -1))
+    if consumer_index < 0 or hasattr(batch, _LEASE_ID_ATTRIBUTE):
+        return
+    lease_id = (
+        None if bridge is None else bridge.lease_id_for_consumer(consumer_index)
+    )
+    setattr(batch, _LEASE_ID_ATTRIBUTE, 0 if lease_id is None else int(lease_id))
+
+
 def lease_forward_acquisitions(
     batch: Any,
     request_ids: tuple[str, ...],
@@ -54,8 +72,10 @@ def lease_forward_acquisitions(
     bound_lease_id = getattr(batch, _LEASE_ID_ATTRIBUTE, None)
     if bound_lease_id is not None:
         bound_lease_id = int(bound_lease_id)
-        if bound_lease_id <= 0:
+        if bound_lease_id < 0:
             raise RuntimeError("SGLang batch carries an invalid HiCache lease identity")
+        if bound_lease_id == 0:
+            return tuple(SglangAcquisitionSpan.direct() for _ in request_ids)
         # ScheduleBatch survives the external prefill and becomes the running
         # decode batch.  Its framework consumer index is not cleared when the
         # final prefill layer retires NTA's lease, and the finite producer ring

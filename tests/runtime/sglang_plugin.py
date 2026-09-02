@@ -963,6 +963,26 @@ def main() -> None:
         SglangAcquisitionSpan.direct() for _ in sidecar_requests
     )
 
+    framework_owned_batch = types.SimpleNamespace(
+        reqs=sidecar_requests,
+        hicache_consumer_index=999,
+        tree_cache=sidecar_batch.tree_cache,
+        _nta_hicache_lease_id=0,
+    )
+    framework_owned_forward = types.SimpleNamespace(
+        rids=sidecar_forward.rids,
+        req_pool_indices=sidecar_forward.req_pool_indices,
+    )
+    _attach_request_priorities(
+        framework_owned_forward,
+        object,
+        framework_owned_batch,
+        hook_runner,
+    )
+    assert framework_owned_forward._nta_forward_metadata.acquisitions == tuple(
+        SglangAcquisitionSpan.direct() for _ in sidecar_requests
+    )
+
     missing_owner_batch = types.SimpleNamespace(
         reqs=sidecar_requests,
         hicache_consumer_index=999,
@@ -1157,6 +1177,10 @@ def main() -> None:
                 leading_bytes=self.leading_layers * 64,
                 total_bytes=768,
             )
+
+        def lease_id_for_consumer(self, consumer_index: int) -> int:
+            assert consumer_index == 3
+            return 17
 
         def transfer_bytes(self, consumer_index: int) -> int:
             assert consumer_index == 3
@@ -1372,6 +1396,33 @@ def main() -> None:
         )
     assert second == (route_batch, route_running)
     assert len(route_calls) == 1
+    assert route_batch._nta_hicache_lease_id == 17
+
+    # A framework-owned/unowned speculative load may finish before the raw
+    # prefill builder returns.  The official scheduler seam records generation
+    # zero so ForwardBatch construction can classify it as direct without
+    # weakening unknown-index rejection elsewhere.
+    framework_batch = types.SimpleNamespace(
+        reqs=[external], hicache_consumer_index=19, decoding_reqs=None
+    )
+    framework_scheduler = types.SimpleNamespace(
+        running_batch=types.SimpleNamespace(reqs=[])
+    )
+
+    def framework_prefill(_scheduler, **_kwargs):
+        return framework_batch, route_running
+
+    with patch(
+        "nta_runtime.engines.sglang_admission._bridge_for_batch",
+        return_value=None,
+    ):
+        assert route_prefill_admission(
+            framework_prefill,
+            framework_scheduler,
+            prefill_delayer_single_pass=None,
+            running_batch=route_running,
+        ) == (framework_batch, route_running)
+    assert framework_batch._nta_hicache_lease_id == 0
 
     # While resident decode is still useful, a bounded staging ring may capture
     # more than one external batch. This is the framework edge that exposes

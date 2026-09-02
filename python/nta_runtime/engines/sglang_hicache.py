@@ -260,6 +260,12 @@ class SglangHiCacheBridge:
         self._allow_load_fallback = bool(allow_load_fallback)
         self._pending: dict[int, PendingHostLoad] = {}
         self._owned: dict[int, PendingHostLoad] = {}
+        # The framework exposes only a finite producer-ring index on
+        # ScheduleBatch. Retain the latest monotone lease generation for each
+        # index so the scheduler seam can bind a batch even when an unowned
+        # speculative load completed synchronously inside start_loading().
+        # The key space is bounded by the producer ring, not request count.
+        self._consumer_lease_ids: dict[int, int] = {}
         # ``PrefillAdder.add_one_req`` can enqueue a host-load operation and
         # then reject that request on a later token/chunk budget check.  The
         # framework queue therefore is not, by itself, an admission boundary.
@@ -616,6 +622,7 @@ class SglangHiCacheBridge:
             else:
                 self._pending[producer_id] = pending
                 self._owned[lease_id] = pending
+                self._consumer_lease_ids[producer_id] = lease_id
         if commit_error is not None:
             # close() snapshots ownership while holding the same lock.  A load
             # that loses the final commit race is therefore not in that
@@ -670,6 +677,14 @@ class SglangHiCacheBridge:
             return None
         with self._lock:
             return self._pending.get(consumer_index)
+
+    def lease_id_for_consumer(self, consumer_index: int) -> int | None:
+        """Return the latest monotone generation assigned to a producer slot."""
+
+        if consumer_index < 0:
+            return None
+        with self._lock:
+            return self._consumer_lease_ids.get(consumer_index)
 
     def progress(self, consumer_index: int) -> HostLoadProgress | None:
         """Query ordered layer progress without synchronizing a CUDA stream."""

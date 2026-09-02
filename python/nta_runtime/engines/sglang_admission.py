@@ -410,10 +410,17 @@ def route_prefill_admission(
     batch, next_running_batch = _split_prefill_result(
         original(scheduler, *args, **kwargs)
     )
+    bridge = _bridge_for_batch(batch)
+    if batch is not None:
+        from nta_runtime.engines.sglang_forward_ownership import (
+            bind_batch_consumer_lease,
+        )
+
+        bind_batch_consumer_lease(batch, bridge)
     admitted = state.consider(
         scheduler,
         batch,
-        _bridge_for_batch(batch),
+        bridge,
         running_batch=next_running_batch,
     )
     return admitted, next_running_batch
