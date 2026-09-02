@@ -548,6 +548,9 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
             "plan_uploads",
             "semantic_wrapper_plan_builds",
             "host_acquisition_jobs_submitted",
+            "host_acquisition_layers_consumed",
+            "shared_acquisition_registered_groups",
+            "shared_acquisition_submitted_groups",
         )
     }
     direct = counters["host_direct_batches"]
@@ -598,7 +601,13 @@ def _execution_dispatch(reports: list[dict[str, Any]]) -> dict[str, Any]:
     elif incremental and active_forms == 1:
         if native_launches:
             kind = "native_incremental"
-        elif counters["host_acquisition_jobs_submitted"] > 0 and stock_launches > 0:
+        elif (
+            counters["shared_acquisition_registered_groups"] > 0
+            and counters["shared_acquisition_registered_groups"]
+            == counters["shared_acquisition_submitted_groups"]
+            and counters["host_acquisition_layers_consumed"] >= stock_launches
+            and stock_launches > 0
+        ):
             # Deadline scheduling may complete every exact job before its
             # numerical arrival.  The optimized ready-stock consumer is then
             # the intended consume decision, not a mechanism fallback.

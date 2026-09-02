@@ -114,6 +114,8 @@ def main() -> None:
     assert "stock_scheduled_frontier_batches" in counter_fields
     assert "shared_acquisition_publication_waits" in counter_fields
     assert "shared_acquisition_publication_wait_rounds" in counter_fields
+    assert "shared_acquisition_registered_groups" in counter_fields
+    assert "shared_acquisition_submitted_groups" in counter_fields
     assert "host_device_bulk_batches" in counter_fields
     assert "forward_lifecycle_aborts" in counter_fields
     assert "host_mover_profiled_sm_gpu_ms" in counter_fields

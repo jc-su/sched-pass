@@ -1135,13 +1135,23 @@ def main() -> None:
         **direct_measured,
         "host_direct_batches": 0,
         "host_incremental_batches": 1,
-        "host_acquisition_jobs_submitted": 36,
+        "host_acquisition_jobs_submitted": 0,
+        "host_acquisition_layers_consumed": 36,
+        "shared_acquisition_registered_groups": 64,
+        "shared_acquisition_submitted_groups": 64,
         "stock_prefetched_external_attention_launches": 36,
         "transformed_direct_launches": 0,
         "ticketed_incremental_launches": 0,
     }
     dispatch = serving._execution_dispatch([scheduled])
     assert dispatch["kind"] == "scheduled_preacquired"
+    incomplete_scheduled = dict(scheduled, shared_acquisition_submitted_groups=63)
+    try:
+        serving._execution_dispatch([incomplete_scheduled])
+    except RuntimeError as error:
+        assert "neither native work nor a scheduled preacquired consumer" in str(error)
+    else:
+        raise AssertionError("incompletely submitted shared acquisition was accepted")
     scheduled_bulk = {
         **direct_measured,
         "host_direct_batches": 0,
