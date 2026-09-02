@@ -99,6 +99,8 @@ def coordinator(
     mode: HostExecutionMode = HostExecutionMode.AUTO,
     layer_count: int = 4,
     frontier_enabled: bool = True,
+    staging_capacity_bytes: int = (1 << 64) - 1,
+    tenant_specs: tuple[tuple[int, int], ...] = (),
 ):
     pool = object()
     transport = FakeTransport()
@@ -136,8 +138,8 @@ def coordinator(
         minimum_consumer_gain=1.03,
         transport=transport,
         request_adapter=types.SimpleNamespace(bind=bind),
-        staging_capacity_bytes=(1 << 64) - 1,
-        tenant_specs=(),
+        staging_capacity_bytes=staging_capacity_bytes,
+        tenant_specs=tenant_specs,
         max_inflight_groups=4096,
         stats={},
     )
@@ -597,6 +599,64 @@ def main() -> None:
     assert boundary_owner._stats["shared_acquisition_submitted_groups"] == 1
     assert boundary_owner._stats["shared_acquisition_ready_groups"] == 1
     assert boundary_owner._stats["shared_acquisition_retired_cohorts"] == 1
+
+    # SGLang admission must include the same outstanding staging reservation
+    # used by physical claim.  It sees a finite delay while the first packet
+    # owns the entire capacity and no delay after that packet's ready fence
+    # releases the reservation.
+    resource_owner, resource_pool, resource_transport = coordinator(
+        layer_count=1,
+        frontier_enabled=True,
+        staging_capacity_bytes=2,
+    )
+    resource_owner._shared_dispatch_horizon = 1
+    resource_model = LayerAcquisitionModel(
+        layer_bytes=(2,),
+        transfer_service_ns=(1_000_000_000,),
+        initial_compute_ns=2_000_000_000,
+        inter_layer_compute_ns=100,
+    )
+    resource_owner.deadline_model = lambda _item, _batch: resource_model
+
+    def resource_pending(lease_id: int, slot: int):
+        item = pending(resource_pool)
+        item.lease_id = lease_id
+        item.controller.layer_num = 1
+        item.device_indices = torch.tensor((slot,), dtype=torch.int32)
+        item.row_bytes_by_layer = ((1, 1),)
+        item.layer_bytes = (2,)
+        item.transfer_plan = types.SimpleNamespace(
+            mover=types.SimpleNamespace(row_count=1),
+            layers=(types.SimpleNamespace(wave_row_ends=()),),
+            sm_waves_per_layer=0,
+        )
+        resource_owner._bind_group_identities(
+            item,
+            types.SimpleNamespace(
+                reqs=(types.SimpleNamespace(rid="request-1", req_pool_idx=slot),)
+            ),
+        )
+        resource_owner._register_shared_acquisition(item, resource_model)
+        return item
+
+    resource_pending(1, 7)
+    resource_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
+    resource_owner._pump_shared_acquisition()
+    resource_second = resource_pending(2, 8)
+    constrained = resource_owner.admission_feasibility(
+        resource_second,
+        object(),
+        types.SimpleNamespace(leading_layers=0),
+    )
+    assert constrained is not None and constrained.resource_delay_ns > 0
+    resource_transport.events[0].ready = True
+    resource_owner.progress_shared_acquisition()
+    released = resource_owner.admission_feasibility(
+        resource_second,
+        object(),
+        types.SimpleNamespace(leading_layers=0),
+    )
+    assert released is not None and released.resource_delay_ns == 0
 
     coalesced_pending = types.SimpleNamespace(
         scheduled_acquisition_groups=tuple(
