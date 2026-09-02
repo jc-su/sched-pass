@@ -78,6 +78,9 @@ def _arm_report(arm: str) -> dict:
         "shared_acquisition_physical_waves": (36 if arm in {"A2", "A3"} else 0),
         "shared_acquisition_submitted_groups": (36 if arm in {"A2", "A3"} else 0),
         "shared_acquisition_submitted_cohorts": (36 if arm in {"A2", "A3"} else 0),
+        "shared_acquisition_ready_groups": (36 if arm in {"A2", "A3"} else 0),
+        "shared_acquisition_ready_cohorts": (36 if arm in {"A2", "A3"} else 0),
+        "shared_acquisition_retired_cohorts": (36 if arm in {"A2", "A3"} else 0),
         "initial_acquisition_layers": 36 if arm in {"A1", "A1P"} else 0,
         "schedule_bound_acquisition_batches": int(arm in {"A2", "A3"}),
         "typed_exact_dependency_groups": int(arm in {"A1P", "A3"}),
@@ -117,6 +120,22 @@ def main() -> None:
         assert "A2" in str(error)
     else:
         raise AssertionError("a partially submitted shared schedule passed as A2")
+    cross_window_lifecycle = _arm_report("A3")
+    cross_window_lifecycle["engine_stats"][0][
+        "shared_acquisition_ready_groups"
+    ] += 1
+    cross_window_lifecycle["engine_stats"][0][
+        "shared_acquisition_ready_cohorts"
+    ] += 1
+    cross_window_lifecycle["engine_stats"][0][
+        "shared_acquisition_retired_cohorts"
+    ] += 1
+    try:
+        validate_arm_result(cross_window_lifecycle, "A3")
+    except ValueError as error:
+        assert "A3" in str(error)
+    else:
+        raise AssertionError("cross-window shared lifecycle work passed as A3")
     unowned_progressive = _arm_report("A3")
     unowned_progressive["engine_stats"][0]["host_acquisition_structural_owners"] = 0
     try:

@@ -903,6 +903,27 @@ class SglangHostAcquisitionCoordinator:
         self.progress_shared_acquisition()
         self._pump_shared_acquisition()
 
+    def quiesce_observation_boundary(self) -> None:
+        """Retire synchronized packet fences before a causal stats snapshot.
+
+        The backend synchronizes CUDA before entering this method. Merely
+        collecting profiling events is insufficient: a final packet may still
+        be FENCE_PUBLISHED in the CPU lifecycle even though its CUDA event is
+        complete. Letting that transition occur after the baseline snapshot
+        leaks excluded warmup work into the timed counter delta.
+
+        This control-plane boundary never pumps new work. A benchmark may
+        snapshot only after all requests have completed, so any surviving
+        packet or semantic cohort is an ownership error rather than work that
+        the observer may silently carry across the boundary.
+        """
+
+        self.progress_shared_acquisition()
+        if self._shared_active or self._shared_cohorts or self._shared_queue.group_count:
+            raise RuntimeError(
+                "shared acquisition remained live at an observation boundary"
+            )
+
     def ensure_layer_published(
         self, pending: PendingHostLoad, local_layer: int
     ) -> None:

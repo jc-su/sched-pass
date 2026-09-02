@@ -866,6 +866,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         """
 
         torch.cuda.synchronize()
+        self._host_acquisition.quiesce_observation_boundary()
         self._collect_transfer_profiles()
         self._layer_calibration.collect()
         self._consumer_calibration.collect()

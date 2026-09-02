@@ -281,6 +281,9 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "shared_acquisition_physical_waves",
             "shared_acquisition_submitted_groups",
             "shared_acquisition_submitted_cohorts",
+            "shared_acquisition_ready_groups",
+            "shared_acquisition_ready_cohorts",
+            "shared_acquisition_retired_cohorts",
             "initial_acquisition_layers",
             "schedule_bound_acquisition_batches",
             "typed_exact_dependency_groups",
@@ -388,6 +391,10 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["shared_acquisition_registered_cohorts"] > 0
             and counters["shared_acquisition_registered_cohorts"]
             == counters["shared_acquisition_submitted_cohorts"]
+            == counters["shared_acquisition_ready_cohorts"]
+            == counters["shared_acquisition_retired_cohorts"]
+            and counters["shared_acquisition_registered_groups"]
+            == counters["shared_acquisition_ready_groups"]
             and counters["host_acquisition_layers_consumed"]
             == counters["external_launches"]
             and counters["host_acquisition_models_bound"] > 0
@@ -425,6 +432,10 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["shared_acquisition_registered_cohorts"] > 0
             and counters["shared_acquisition_registered_cohorts"]
             == counters["shared_acquisition_submitted_cohorts"]
+            == counters["shared_acquisition_ready_cohorts"]
+            == counters["shared_acquisition_retired_cohorts"]
+            and counters["shared_acquisition_registered_groups"]
+            == counters["shared_acquisition_ready_groups"]
             and counters["host_acquisition_layers_consumed"]
             == counters["external_launches"]
             and counters["host_acquisition_models_bound"] > 0

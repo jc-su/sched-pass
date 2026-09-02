@@ -561,6 +561,43 @@ def main() -> None:
     assert interleave_owner._stats["shared_acquisition_cross_lease_dispatches"] == 1
     assert interleave_owner._stats["shared_acquisition_inter_wave_lease_switches"] == 1
 
+    # A CUDA-synchronized measurement boundary must commit the final packet's
+    # CPU lifecycle before a cumulative-counter baseline is captured. This
+    # prevents excluded warmup readiness/retirement from leaking into the
+    # measured delta under a capacity-constrained link.
+    boundary_owner, boundary_pool, boundary_transport = coordinator(
+        layer_count=1, frontier_enabled=True
+    )
+    boundary_owner._shared_dispatch_horizon = 1
+    boundary = pending(boundary_pool)
+    boundary.controller.layer_num = 1
+    boundary.device_indices = torch.tensor((7,), dtype=torch.int32)
+    boundary.row_bytes_by_layer = ((1, 1),)
+    boundary.layer_bytes = (2,)
+    boundary.transfer_plan = types.SimpleNamespace(
+        mover=types.SimpleNamespace(row_count=1),
+        layers=(types.SimpleNamespace(wave_row_ends=()),),
+        sm_waves_per_layer=0,
+    )
+    boundary_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
+    boundary_owner._bind_group_identities(boundary, structural_batch)
+    boundary_model = LayerAcquisitionModel(
+        layer_bytes=boundary.layer_bytes,
+        transfer_service_ns=(50,),
+        initial_compute_ns=0,
+        inter_layer_compute_ns=100,
+    )
+    boundary_owner._register_shared_acquisition(boundary, boundary_model)
+    boundary_owner._pump_shared_acquisition()
+    boundary_owner.retire_layer(boundary, 0)
+    boundary_transport.events[0].ready = True
+    boundary_owner.quiesce_observation_boundary()
+    boundary_owner.quiesce_observation_boundary()
+    assert boundary_owner._stats["shared_acquisition_registered_groups"] == 1
+    assert boundary_owner._stats["shared_acquisition_submitted_groups"] == 1
+    assert boundary_owner._stats["shared_acquisition_ready_groups"] == 1
+    assert boundary_owner._stats["shared_acquisition_retired_cohorts"] == 1
+
     coalesced_pending = types.SimpleNamespace(
         scheduled_acquisition_groups=tuple(
             LeaseAcquisitionGroup(index, 0, 1) for index in range(1, 6)
