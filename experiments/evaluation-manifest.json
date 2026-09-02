@@ -82,11 +82,13 @@
     "arms": [
       {"id": "A0", "name": "framework-bulk", "exact_demand": true},
       {"id": "A1", "name": "exact-preacquired-stock", "exact_demand": true},
+      {"id": "A1P", "name": "eager-preacquired-work-unit", "exact_demand": true},
       {"id": "A2", "name": "scheduled-whole-layer", "exact_demand": true},
       {"id": "A3", "name": "late-bound-work-unit", "exact_demand": true}
     ],
     "causal_pairs": [
       {"numerator": "A1", "denominator": "A0", "role": "exact_acquisition_boundary"},
+      {"numerator": "A1P", "denominator": "A1", "role": "eager_progressive_consumer_boundary"},
       {"numerator": "A2", "denominator": "A1", "role": "schedule_bound_acquisition_boundary"},
       {"numerator": "A3", "denominator": "A2", "role": "progressive_work_unit_boundary"}
     ],

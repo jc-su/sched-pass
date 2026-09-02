@@ -391,16 +391,12 @@ class SglangExecutionTuning:
                 1,
             ),
         )
-        sm_acquisition_waves = (
-            requested_sm_waves
-            if overlap_enabled
-            and bootstrap.execution.host_execution_mode
-            not in {
-                HostExecutionMode.DIRECT,
-                HostExecutionMode.SCHEDULED_BULK,
-            }
-            else 1
-        )
+        # Physical wave geometry is an experimental/control axis independent
+        # of acquisition ownership and numerical consumer policy. Whole-layer
+        # forms simply wait on the final event; progressive forms may consume
+        # earlier events. Keeping the same geometry across the 2x2 causal arms
+        # avoids confounding consumer effects with transport segmentation.
+        sm_acquisition_waves = requested_sm_waves if overlap_enabled else 1
         graph_enabled, fragment_enabled, overlap_policy = demand_overlap_policy(
             host_staged=tier.is_host_staged,
             frontier_enabled=frontier_enabled,
@@ -481,13 +477,21 @@ class SglangExecutionTuning:
             bootstrap.execution.protocol.kind is not ProtocolKind.CONVENTIONAL
             and (
                 bootstrap.execution.host_execution_mode
-                in {HostExecutionMode.DEVICE_BULK, HostExecutionMode.DEPENDENCY_AWARE}
+                in {
+                    HostExecutionMode.EAGER_PROGRESSIVE,
+                    HostExecutionMode.DEVICE_BULK,
+                    HostExecutionMode.DEPENDENCY_AWARE,
+                }
                 or model.max_rounds > 1
                 or bootstrap.tenant_isolation_enabled
             )
             and (
                 bootstrap.execution.host_execution_mode
-                in {HostExecutionMode.DEVICE_BULK, HostExecutionMode.DEPENDENCY_AWARE}
+                in {
+                    HostExecutionMode.EAGER_PROGRESSIVE,
+                    HostExecutionMode.DEVICE_BULK,
+                    HostExecutionMode.DEPENDENCY_AWARE,
+                }
                 or model.incremental_setup_ns is not None
                 or probes > 0
                 or bootstrap.tenant_isolation_enabled

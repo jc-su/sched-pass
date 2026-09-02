@@ -141,6 +141,15 @@ def main() -> None:
     assert shared_queue.staging_outstanding_bytes == 8192
     assert shared_credits.outstanding_bytes(1) == 8192
     assert not shared_queue.claim(now_ns=10)
+    assert shared_queue.cohort_resource_delay_ns(
+        (identity_b,), now_ns=10
+    ) == 50
+    assert (
+        shared_queue.cohort_resource_delay_ns(
+            (identity_a, identity_b), now_ns=10
+        )
+        is None
+    )
     shared_queue.publish_fence(identity_a)
     shared_queue.consume(identity_a)
     assert shared_queue.state(identity_a) is SharedAcquisitionState.FENCE_PUBLISHED
@@ -148,6 +157,7 @@ def main() -> None:
     assert shared_queue.state(identity_a) is SharedAcquisitionState.CONSUMED
     assert shared_queue.staging_outstanding_bytes == 0
     assert shared_credits.outstanding_bytes(1) == 0
+    assert shared_queue.cohort_resource_delay_ns((identity_b,), now_ns=60) == 0
     assert tuple(job.identity for job in shared_queue.claim(now_ns=60)) == (
         identity_b,
     )

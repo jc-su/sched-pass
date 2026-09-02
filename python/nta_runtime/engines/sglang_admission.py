@@ -349,6 +349,9 @@ class AcquisitionAdmission:
             "admission_feasibility_required_slack_ns": (
                 feasibility.required_initial_slack_ns
             ),
+            "admission_feasibility_resource_delay_ns": getattr(
+                feasibility, "resource_delay_ns", 0
+            ),
         }
         if feasibility.feasible:
             increments["admission_feasibility_feasible"] = 1

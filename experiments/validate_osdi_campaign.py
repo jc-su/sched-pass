@@ -35,8 +35,8 @@ RQ1_METRICS = {
     "request_throughput",
     "output_token_throughput",
 }
-MECHANISM_ARMS = {"A0", "A1", "A2", "A3"}
-MECHANISM_PAIRS = {"A1>A0", "A2>A1", "A3>A2"}
+MECHANISM_ARMS = {"A0", "A1", "A1P", "A2", "A3"}
+MECHANISM_PAIRS = {"A1>A0", "A1P>A1", "A2>A1", "A3>A2"}
 RQ3_AXES = {"context", "locality", "load", "tier"}
 RQ4_STUDIES = {"short_context_control", "resource_profile", "tenant_interference"}
 

@@ -182,6 +182,20 @@ def main() -> None:
     )
     assert forced_direct.form is HostExecutionForm.DIRECT
     assert forced_direct.selection_reason == "forced_direct"
+    forced_eager_progressive = plan_host_execution(
+        object_count=16,
+        transfer_bytes=4 * 1024 * 1024,
+        runnable_tiles=64,
+        initial_runnable_tiles=17,
+        model=model,
+        mode=HostExecutionMode.EAGER_PROGRESSIVE,
+    )
+    assert forced_eager_progressive.form is HostExecutionForm.EAGER_PROGRESSIVE
+    assert forced_eager_progressive.uses_dependency_protocol
+    assert forced_eager_progressive.uses_progressive_consumer
+    assert not forced_eager_progressive.uses_scheduler_bound_acquisition
+    assert forced_eager_progressive.overlap_initial
+    assert forced_eager_progressive.selection_reason == "forced_eager_progressive"
     forced_scheduled_bulk = plan_host_execution(
         object_count=16,
         transfer_bytes=4 * 1024 * 1024,

@@ -151,10 +151,10 @@ def validate(document: dict[str, Any]) -> None:
     if not isinstance(mechanism, dict):
         raise ValueError("evaluation contract lacks the matched mechanism study")
     if mechanism.get("profile") != "mechanism-study":
-        raise ValueError("A0-A3 must be labeled mechanism-study, not OSDI-complete")
+        raise ValueError("causal arms must be labeled mechanism-study, not OSDI-complete")
     arms = mechanism.get("arms", [])
     if [arm.get("id") for arm in arms] != list(ARMS):
-        raise ValueError("evaluation contract must define A0-A3 in order")
+        raise ValueError("evaluation contract must define every canonical arm in order")
     if not all(arm.get("exact_demand") is True for arm in arms):
         raise ValueError("every arm must use exact demand")
     if any(

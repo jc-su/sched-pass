@@ -257,7 +257,7 @@ def validate_spec(
     if evaluation_profile == "mechanism-study":
         declared_arms = {trial["arm"] for trial in identities.values()}
         if declared_arms != CANONICAL_ARMS:
-            raise ValueError("mechanism-study evaluation must contain exactly A0-A3")
+            raise ValueError("mechanism-study evaluation must contain every canonical arm")
         if any(
             consumer_kinds_by_arm.get(arm, set())
             and len(consumer_kinds_by_arm[arm]) != 1

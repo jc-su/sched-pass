@@ -199,6 +199,7 @@ class HostExecutionForm(str, Enum):
     """Explicit control path; wave count alone cannot identify ownership."""
 
     DIRECT = "direct"
+    EAGER_PROGRESSIVE = "eager_progressive"
     SCHEDULED_BULK = "scheduled_bulk"
     DEVICE_BULK = "device_bulk"
     DEPENDENCY_AWARE = "dependency_aware"
@@ -214,6 +215,7 @@ class HostExecutionMode(str, Enum):
 
     AUTO = "auto"
     DIRECT = "direct"
+    EAGER_PROGRESSIVE = "eager_progressive"
     SCHEDULED_BULK = "scheduled_bulk"
     DEVICE_BULK = "device_bulk"
     DEPENDENCY_AWARE = "dependency_aware"
@@ -243,6 +245,7 @@ class HostExecutionPlan:
         "tenant_isolation",
         "scheduled_preacquired",
         "forced_direct",
+        "forced_eager_progressive",
         "forced_scheduled_bulk",
         "forced_device_bulk",
         "forced_dependency_aware",
@@ -277,6 +280,7 @@ class HostExecutionPlan:
     @property
     def uses_dependency_protocol(self) -> bool:
         return self.form in {
+            HostExecutionForm.EAGER_PROGRESSIVE,
             HostExecutionForm.DEVICE_BULK,
             HostExecutionForm.DEPENDENCY_AWARE,
         }
@@ -296,7 +300,10 @@ class HostExecutionPlan:
 
     @property
     def uses_progressive_consumer(self) -> bool:
-        return self.form is HostExecutionForm.DEPENDENCY_AWARE
+        return self.form in {
+            HostExecutionForm.EAGER_PROGRESSIVE,
+            HostExecutionForm.DEPENDENCY_AWARE,
+        }
 
     @property
     def predicted_gain(self) -> float:
@@ -761,7 +768,11 @@ def prove_atomic_host_execution(
         compute_ns,
         scope_units,
     )
-    if mode in {HostExecutionMode.DEVICE_BULK, HostExecutionMode.DEPENDENCY_AWARE}:
+    if mode in {
+        HostExecutionMode.EAGER_PROGRESSIVE,
+        HostExecutionMode.DEVICE_BULK,
+        HostExecutionMode.DEPENDENCY_AWARE,
+    }:
         return None
     if mode in {HostExecutionMode.DIRECT, HostExecutionMode.SCHEDULED_BULK}:
         scheduled = mode is HostExecutionMode.SCHEDULED_BULK
@@ -939,6 +950,7 @@ def plan_host_execution(
 
     selected = (
         calibration_probe
+        or mode is HostExecutionMode.EAGER_PROGRESSIVE
         or mode is HostExecutionMode.DEPENDENCY_AWARE
         or require_dependency_protocol
         or atomic_ns / best_ns >= model.minimum_predicted_gain
@@ -949,6 +961,8 @@ def plan_host_execution(
     # budget can never retire and AUTO can never become measured.
     if calibration_probe:
         reason = "calibration_probe"
+    elif mode is HostExecutionMode.EAGER_PROGRESSIVE:
+        reason = "forced_eager_progressive"
     elif mode is HostExecutionMode.DEPENDENCY_AWARE:
         reason = "forced_dependency_aware"
     elif require_dependency_protocol:
@@ -962,7 +976,11 @@ def plan_host_execution(
         predicted_atomic_ns=atomic_ns,
         predicted_incremental_ns=best_ns,
         form=(
-            HostExecutionForm.DEPENDENCY_AWARE if selected else HostExecutionForm.DIRECT
+            HostExecutionForm.EAGER_PROGRESSIVE
+            if mode is HostExecutionMode.EAGER_PROGRESSIVE
+            else HostExecutionForm.DEPENDENCY_AWARE
+            if selected
+            else HostExecutionForm.DIRECT
         ),
         overlap_initial=overlap_initial if selected else False,
         selection_reason=reason,

@@ -291,7 +291,7 @@ def analyze(output: Path) -> dict[str, Any]:
         if not isinstance(identity[2], int) or not 0 <= identity[2] < repetitions:
             raise ValueError(f"invalid repetition for {identity[:2]}")
         if record.get("arm") not in set(ARMS):
-            raise ValueError("trial has no canonical A0-A3 arm")
+            raise ValueError("trial has no canonical mechanism arm")
         if record.get("demand_semantics") != "exact":
             raise ValueError("trial artifact is not exact-demand")
         if (

@@ -127,8 +127,13 @@ def _campaign() -> dict[str, object]:
         "mechanism_studies": [
             {
                 "profile": "mechanism-study",
-                "arms": ["A0", "A1", "A2", "A3"],
-                "causal_pairs": ["A1>A0", "A2>A1", "A3>A2"],
+                "arms": ["A0", "A1", "A1P", "A2", "A3"],
+                "causal_pairs": [
+                    "A1>A0",
+                    "A1P>A1",
+                    "A2>A1",
+                    "A3>A2",
+                ],
                 "scenarios": 6,
                 "result_emitted_activation": True,
             }

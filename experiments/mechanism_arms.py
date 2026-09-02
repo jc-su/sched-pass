@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-ARMS = ("A0", "A1", "A2", "A3")
+ARMS = ("A0", "A1", "A1P", "A2", "A3")
 
 ARM_DEFINITIONS: dict[str, dict[str, Any]] = {
     "A0": {
@@ -32,6 +32,11 @@ ARM_DEFINITIONS: dict[str, dict[str, Any]] = {
         "name": "exact-preacquired-stock",
         "consumer_kind": "framework_reference",
         "role": "exact NTA acquisition with the stock numerical consumer",
+    },
+    "A1P": {
+        "name": "eager-preacquired-work-unit",
+        "consumer_kind": "native_work_unit",
+        "role": "exact eager acquisition with progressive work-unit consumption",
     },
     "A2": {
         "name": "scheduled-whole-layer",
@@ -47,6 +52,7 @@ ARM_DEFINITIONS: dict[str, dict[str, Any]] = {
 
 CAUSAL_PAIRS = (
     ("A1", "A0", "exact_acquisition_boundary"),
+    ("A1P", "A1", "eager_progressive_consumer_boundary"),
     ("A2", "A1", "schedule_bound_acquisition_boundary"),
     ("A3", "A2", "progressive_work_unit_boundary"),
 )
@@ -84,6 +90,13 @@ def arm_environment(arm: str) -> dict[str, str]:
         return {
             "NTA_EXECUTION_PROTOCOL": "late_bound",
             "NTA_EXECUTION_HOST_FORM": "direct",
+            "NTA_EXECUTION_HOST_MOVER": "sm",
+            "NTA_EXECUTION_CALIBRATION_PROBES": "0",
+        }
+    if arm == "A1P":
+        return {
+            "NTA_EXECUTION_PROTOCOL": "late_bound",
+            "NTA_EXECUTION_HOST_FORM": "eager_progressive",
             "NTA_EXECUTION_HOST_MOVER": "sm",
             "NTA_EXECUTION_CALIBRATION_PROBES": "0",
         }
@@ -289,7 +302,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
         != 0
     ):
         raise ValueError(f"{arm} timed a host-mover calibration probe")
-    if arm == "A3" and counters["verified_operator_modules"] <= 0:
+    if arm in {"A1P", "A3"} and counters["verified_operator_modules"] <= 0:
         raise ValueError(f"{arm} did not verify its compiler/operator contract")
 
     protocol = _identity(stats, "execution_protocol")
@@ -316,6 +329,33 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["schedule_bound_acquisition_batches"] == 0
         )
         execution_form = "exact_preacquired_stock"
+    elif arm == "A1P":
+        valid = (
+            host_form == "eager_progressive"
+            and counters["host_incremental_batches"] > 0
+            and counters["host_direct_batches"] == 0
+            and counters["host_scheduled_bulk_batches"] == 0
+            and counters["host_device_bulk_batches"] == 0
+            and counters["native_external_attention_launches"] > 0
+            and counters["stock_prefetched_external_attention_launches"] >= 0
+            and counters["ticketed_incremental_launches"] == 0
+            and counters["event_ordered_incremental_launches"] > 0
+            and counters["mixed_dependency_layers"] > 0
+            and counters["progressive_consumer_batch_observations"] > 0
+            and counters["progressive_consumer_batches"] > 0
+            and counters["progressive_consumer_layers"] > 0
+            and counters["lease_acquisition_groups_prepared"] > 0
+            and counters["lease_acquisition_groups_started"] > 0
+            and counters["host_acquisition_jobs_submitted"] > 0
+            and counters["initial_acquisition_layers"] > 0
+            and counters["schedule_bound_acquisition_batches"] == 0
+            and counters["shared_acquisition_registered_groups"] == 0
+            and counters["shared_acquisition_submitted_groups"] == 0
+            and counters["typed_exact_dependency_groups"] > 0
+            and counters["typed_transfer_groups"] > 0
+            and _heterogeneous_native_batch(report)
+        )
+        execution_form = "eager_heterogeneous_work_unit"
     elif arm == "A2":
         valid = (
             host_form == "scheduled_bulk"

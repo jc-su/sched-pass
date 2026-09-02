@@ -212,6 +212,16 @@ def main() -> None:
         }
     )
     assert forced_config.host_execution_mode is HostExecutionMode.DEPENDENCY_AWARE
+    eager_progressive_config = SglangExecutionConfig.from_environment(
+        {
+            "NTA_EXECUTION_PROTOCOL": "late_bound",
+            "NTA_EXECUTION_HOST_FORM": "eager_progressive",
+        }
+    )
+    assert (
+        eager_progressive_config.host_execution_mode
+        is HostExecutionMode.EAGER_PROGRESSIVE
+    )
     scheduled_bulk_config = SglangExecutionConfig.from_environment(
         {
             "NTA_EXECUTION_PROTOCOL": "late_bound",

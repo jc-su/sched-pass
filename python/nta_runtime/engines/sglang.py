@@ -1910,6 +1910,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         configured = self._execution_config.host_execution_mode
         forced_forms = {
             HostExecutionMode.DIRECT: HostExecutionForm.DIRECT,
+            HostExecutionMode.EAGER_PROGRESSIVE: HostExecutionForm.EAGER_PROGRESSIVE,
             HostExecutionMode.SCHEDULED_BULK: HostExecutionForm.SCHEDULED_BULK,
             HostExecutionMode.DEVICE_BULK: HostExecutionForm.DEVICE_BULK,
             HostExecutionMode.DEPENDENCY_AWARE: HostExecutionForm.DEPENDENCY_AWARE,

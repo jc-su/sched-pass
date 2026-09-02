@@ -57,8 +57,10 @@ if TYPE_CHECKING:
 class _SharedHostCohort:
     pending: PendingHostLoad
     local_layer: int
+    wave_index: int
+    wave_count: int
     identities: tuple[AcquisitionGroupIdentity, ...]
-    absolute_row_ends: tuple[int, ...]
+    ready_event: Any = None
     consumer_ordered: bool = False
     cancel_requested: bool = False
 
@@ -71,6 +73,7 @@ class SharedHostAdmissionFeasibility:
     feasible: bool
     first_missed_layer: int | None
     required_initial_slack_ns: int
+    resource_delay_ns: int = 0
 
 
 class SglangHostAcquisitionCoordinator:
@@ -132,12 +135,12 @@ class SglangHostAcquisitionCoordinator:
         self._shared_layers_per_dispatch = frontier_layers_per_wave
         self._shared_dispatch_horizon = 2
         self._shared_cohorts: dict[
-            tuple[int, int], _SharedHostCohort
+            tuple[int, int, int], _SharedHostCohort
         ] = {}
         self._shared_identity_owner: dict[
-            AcquisitionGroupIdentity, tuple[int, int]
+            AcquisitionGroupIdentity, tuple[int, int, int]
         ] = {}
-        self._shared_active: list[tuple[tuple[int, int], ...]] = []
+        self._shared_active: list[tuple[tuple[int, int, int], ...]] = []
         self._stats = stats
 
     @property
@@ -146,11 +149,12 @@ class SglangHostAcquisitionCoordinator:
 
         SCHEDULED_BULK and DEPENDENCY_AWARE admit the same finite,
         scheduler-bound queue; their consumer policy differs, not their
-        ownership or transport path. AUTO may select either consumer after
-        calibration. DIRECT is the explicit eager diagnostic arm and may
-        submit at capture. DEVICE_BULK retains device-discovered acquisition as
-        a diagnostic. Scheduled Host transport binds request generations and
-        reserves tenant credits before publication, so isolation no longer
+        ownership or transport path. DIRECT and EAGER_PROGRESSIVE share eager
+        acquisition ownership while selecting whole-layer and progressive
+        consumers respectively. AUTO may select either scheduled consumer
+        after calibration. DEVICE_BULK retains device-discovered acquisition
+        as a diagnostic. Scheduled Host transport binds request generations
+        and reserves tenant credits before publication, so isolation no longer
         disables overlap.
         """
 
@@ -160,6 +164,7 @@ class SglangHostAcquisitionCoordinator:
             in {
                 HostExecutionMode.AUTO,
                 HostExecutionMode.DIRECT,
+                HostExecutionMode.EAGER_PROGRESSIVE,
                 HostExecutionMode.SCHEDULED_BULK,
                 HostExecutionMode.DEPENDENCY_AWARE,
             }
@@ -172,7 +177,11 @@ class SglangHostAcquisitionCoordinator:
         return (
             self.proactive_layer_queue_enabled
             and not self._tenant_isolation_enabled
-            and self._execution_config.host_execution_mode is HostExecutionMode.DIRECT
+            and self._execution_config.host_execution_mode
+            in {
+                HostExecutionMode.DIRECT,
+                HostExecutionMode.EAGER_PROGRESSIVE,
+            }
         )
 
     def capture(self, pending: PendingHostLoad) -> None:
@@ -504,24 +513,69 @@ class SglangHostAcquisitionCoordinator:
                         priority=binding.priority,
                     )
                 )
-            cohort = _SharedHostCohort(
-                pending, local_layer, identities, absolute_row_ends
-            )
-            key = (pending.lease_id, local_layer)
-            if key in self._shared_cohorts or any(
-                identity in self._shared_identity_owner for identity in identities
-            ):
-                raise RuntimeError("Host acquisition repeated a shared-link identity")
-            cohorts.append(cohort)
+            transfer_plan = pending.transfer_plan
+            if transfer_plan is None:
+                raise RuntimeError("shared Host acquisition has no transfer plan")
+            physical_ends = transfer_plan.layers[local_layer].wave_row_ends
+            if len(physical_ends) <= 1:
+                physical_ends = (total_rows,)
+            first_group = 0
+            for wave_index, row_end in enumerate(physical_ends):
+                last_group = bisect.bisect_right(absolute_row_ends, row_end)
+                if last_group <= first_group:
+                    raise RuntimeError("Host completion wave contains no exact group")
+                wave_identities = identities[first_group:last_group]
+                if absolute_row_ends[last_group - 1] != row_end:
+                    raise RuntimeError("Host completion wave splits an exact group")
+                key = (pending.lease_id, local_layer, wave_index)
+                if key in self._shared_cohorts or any(
+                    identity in self._shared_identity_owner
+                    for identity in wave_identities
+                ):
+                    raise RuntimeError(
+                        "Host acquisition repeated a shared-link identity"
+                    )
+                cohorts.append(
+                    _SharedHostCohort(
+                        pending,
+                        local_layer,
+                        wave_index,
+                        len(physical_ends),
+                        wave_identities,
+                    )
+                )
+                first_group = last_group
+            if first_group != len(identities):
+                raise RuntimeError("Host completion waves omit exact groups")
         self._shared_queue.add(jobs)
         for cohort in cohorts:
-            key = (pending.lease_id, cohort.local_layer)
+            key = (pending.lease_id, cohort.local_layer, cohort.wave_index)
             self._shared_cohorts[key] = cohort
             for identity in cohort.identities:
                 self._shared_identity_owner[identity] = key
+            if self._shared_queue.cohort_resource_delay_ns(
+                cohort.identities, now_ns=release_ns
+            ) is None:
+                raise RuntimeError(
+                    "one exact Host group wave exceeds staging or tenant credits"
+                )
         pending.shared_acquisition_registered = True
         self._add("shared_acquisition_registered_groups", len(jobs))
         self._add("shared_acquisition_registered_cohorts", len(cohorts))
+        self._add("shared_acquisition_physical_waves", len(cohorts))
+        groups_per_wave = tuple(len(cohort.identities) for cohort in cohorts)
+        self._stats["shared_acquisition_groups_per_wave_max"] = max(
+            self._stats.get("shared_acquisition_groups_per_wave_max", 0),
+            max(groups_per_wave, default=0),
+        )
+        self._add(
+            "shared_acquisition_coalesced_group_waves",
+            sum(count > 1 for count in groups_per_wave),
+        )
+        self._add(
+            "shared_acquisition_coalesced_groups",
+            sum(max(0, count - 1) for count in groups_per_wave),
+        )
 
     def admission_feasibility(
         self,
@@ -543,9 +597,33 @@ class SglangHostAcquisitionCoordinator:
                 local.feasible,
                 local.first_missed_layer,
                 local.required_initial_slack_ns,
+                0,
             )
         self.progress_shared_acquisition()
-        schedule = self._shared_queue.analyze(now_ns=time.monotonic_ns())
+        now_ns = time.monotonic_ns()
+        resource_delays: list[tuple[int, AcquisitionGroupIdentity]] = []
+        for key, cohort in self._shared_cohorts.items():
+            if cohort.pending is not pending:
+                continue
+            delay = self._shared_queue.cohort_resource_delay_ns(
+                cohort.identities, now_ns=now_ns
+            )
+            if delay is None:
+                raise RuntimeError(
+                    "registered Host group wave no longer fits its resource contract"
+                )
+            if delay:
+                resource_delays.append((delay, cohort.identities[0]))
+        resource_delay_ns = max(
+            (delay for delay, _identity in resource_delays), default=0
+        )
+        # Resource delay is a release constraint, not itself a deadline miss.
+        # Re-run the exact shared-link policy from the first time both staging
+        # and tenant credits can admit the batch; the resulting completion
+        # times decide feasibility without double-counting an in-flight tail.
+        schedule = self._shared_queue.analyze(
+            now_ns=now_ns + resource_delay_ns
+        )
         missed = schedule.first_missed_identity
         start_layer = int(getattr(self._device_pool, "start_layer", 0))
         first_missed_layer = None if missed is None else missed.layer_id - start_layer
@@ -558,6 +636,7 @@ class SglangHostAcquisitionCoordinator:
             feasible=schedule.feasible,
             first_missed_layer=first_missed_layer,
             required_initial_slack_ns=schedule.maximum_lateness_ns,
+            resource_delay_ns=resource_delay_ns,
         )
 
     def prepare_admission(self, pending: PendingHostLoad, batch: Any) -> bool:
@@ -642,35 +721,21 @@ class SglangHostAcquisitionCoordinator:
         if not self._shared_active:
             return
         now_ns = time.monotonic_ns()
-        still_active: list[tuple[tuple[int, int], ...]] = []
+        still_active: list[tuple[tuple[int, int, int], ...]] = []
         for packet in self._shared_active:
-            incomplete: list[tuple[int, int]] = []
+            incomplete: list[tuple[int, int, int]] = []
             for key in packet:
                 cohort = self._shared_cohorts.get(key)
                 if cohort is None:
                     raise RuntimeError("shared Host cohort lost semantic ownership")
-                publication = cohort.pending.prefetched_layers.get(cohort.local_layer)
-                if publication is None:
-                    raise RuntimeError(
-                        "shared Host cohort has no readiness publication"
-                    )
+                ready_event = cohort.ready_event
+                if ready_event is None:
+                    raise RuntimeError("shared Host cohort has no readiness event")
                 newly_ready = 0
                 cohort_incomplete = False
-                for identity, absolute_row_end in zip(
-                    cohort.identities, cohort.absolute_row_ends, strict=True
-                ):
+                for identity in cohort.identities:
                     state = self._shared_queue.state(identity)
                     if state is SharedAcquisitionState.FENCE_PUBLISHED:
-                        ready_event = publication.ready_event
-                        if publication.wave_events:
-                            wave = bisect.bisect_left(
-                                publication.wave_row_ends, absolute_row_end
-                            )
-                            if wave >= len(publication.wave_events):
-                                raise RuntimeError(
-                                    "shared Host group exceeds its completion waves"
-                                )
-                            ready_event = publication.wave_events[wave]
                         if not ready_event.query():
                             cohort_incomplete = True
                             continue
@@ -704,10 +769,10 @@ class SglangHostAcquisitionCoordinator:
         submitted = 0
         while len(self._shared_active) < self._shared_dispatch_horizon:
             now_ns = time.monotonic_ns()
-            key: tuple[int, int] | None = None
+            key: tuple[int, int, int] | None = None
             cohort: _SharedHostCohort | None = None
             claimed: list[SharedAcquisitionJob] = []
-            visited: set[tuple[int, int]] = set()
+            visited: set[tuple[int, int, int]] = set()
             # Choose EDF among resource-admissible packets. An exhausted
             # tenant or a temporarily full staging reservation must not
             # head-of-line block an unrelated tenant whose packet fits.
@@ -738,7 +803,10 @@ class SglangHostAcquisitionCoordinator:
             # Preserve the mover's occupancy-derived adjacent-layer packet only
             # while every next layer is also the next global EDF choice. This
             # is coalescing after scheduling, not a layer-order shortcut.
-            while len(packet_keys) < self._shared_layers_per_dispatch:
+            while (
+                cohort.wave_count == 1
+                and len(packet_keys) < self._shared_layers_per_dispatch
+            ):
                 next_identity = self._shared_queue.next_released_identity(
                     now_ns=now_ns
                 )
@@ -752,6 +820,7 @@ class SglangHostAcquisitionCoordinator:
                 if (
                     next_key is None
                     or next_cohort is None
+                    or next_cohort.wave_count != 1
                     or next_cohort.pending is not cohort.pending
                     or next_cohort.local_layer != previous.local_layer + 1
                 ):
@@ -766,19 +835,34 @@ class SglangHostAcquisitionCoordinator:
                 packet_cohorts.append(next_cohort)
             try:
                 plan = self.transfer_plan(cohort.pending)
-                self._transport.prepare(
-                    cohort.pending,
-                    plan,
-                    first_local_layer=cohort.local_layer,
-                    last_local_layer=packet_cohorts[-1].local_layer + 1,
-                )
-                for packet_cohort in packet_cohorts:
-                    publication = packet_cohort.pending.prefetched_layers.get(
-                        packet_cohort.local_layer
+                if cohort.wave_count > 1:
+                    ready_event, _published = self._transport.prepare_sm_group_wave(
+                        cohort.pending,
+                        plan,
+                        local_layer=cohort.local_layer,
+                        wave_index=cohort.wave_index,
                     )
-                    if publication is None:
+                    cohort.ready_event = ready_event
+                else:
+                    self._transport.prepare(
+                        cohort.pending,
+                        plan,
+                        first_local_layer=cohort.local_layer,
+                        last_local_layer=packet_cohorts[-1].local_layer + 1,
+                    )
+                    for packet_cohort in packet_cohorts:
+                        publication = packet_cohort.pending.prefetched_layers.get(
+                            packet_cohort.local_layer
+                        )
+                        if publication is None:
+                            raise RuntimeError(
+                                "shared Host transport returned without a layer fence"
+                            )
+                        packet_cohort.ready_event = publication.ready_event
+                for packet_cohort in packet_cohorts:
+                    if packet_cohort.ready_event is None:
                         raise RuntimeError(
-                            "shared Host transport returned without a layer fence"
+                            "shared Host transport returned without a group fence"
                         )
                 for group in claimed:
                     self._shared_queue.publish_fence(group.identity)
@@ -799,7 +883,7 @@ class SglangHostAcquisitionCoordinator:
         return submitted
 
     def _forget_shared_cohort(
-        self, key: tuple[int, int], cohort: _SharedHostCohort
+        self, key: tuple[int, int, int], cohort: _SharedHostCohort
     ) -> None:
         self._shared_queue.forget_terminal(cohort.identities)
         self._shared_cohorts.pop(key, None)
@@ -854,10 +938,9 @@ class SglangHostAcquisitionCoordinator:
             cohort = self._shared_cohorts.get(first_packet[0])
             if cohort is None:
                 raise RuntimeError("shared EDF lost its oldest transport cohort")
-            publication = cohort.pending.prefetched_layers.get(cohort.local_layer)
-            if publication is None:
+            if cohort.ready_event is None:
                 raise RuntimeError("shared EDF oldest cohort has no published fence")
-            publication.ready_event.synchronize()
+            cohort.ready_event.synchronize()
             self._add("shared_acquisition_publication_wait_rounds")
         raise RuntimeError("shared EDF did not reach a required Host layer")
 
@@ -867,27 +950,32 @@ class SglangHostAcquisitionCoordinator:
         if not getattr(pending, "shared_acquisition_registered", False):
             return
         for local_layer in range(self._model_layer_count):
-            key = (pending.lease_id, local_layer)
-            cohort = self._shared_cohorts.get(key)
-            if cohort is None:
-                continue
-            cohort.cancel_requested = True
-            for identity in cohort.identities:
-                state = self._shared_queue.state(identity)
-                if state not in {
-                    SharedAcquisitionState.CANCELLED,
-                    SharedAcquisitionState.FAILED,
-                }:
-                    self._shared_queue.cancel(identity)
-            if all(
-                self._shared_queue.state(identity)
-                in {
-                    SharedAcquisitionState.CANCELLED,
-                    SharedAcquisitionState.FAILED,
-                }
-                for identity in cohort.identities
-            ):
-                self._forget_shared_cohort(key, cohort)
+            keys = sorted(
+                key
+                for key in self._shared_cohorts
+                if key[:2] == (pending.lease_id, local_layer)
+            )
+            for key in keys:
+                cohort = self._shared_cohorts.get(key)
+                if cohort is None:
+                    continue
+                cohort.cancel_requested = True
+                for identity in cohort.identities:
+                    state = self._shared_queue.state(identity)
+                    if state not in {
+                        SharedAcquisitionState.CANCELLED,
+                        SharedAcquisitionState.FAILED,
+                    }:
+                        self._shared_queue.cancel(identity)
+                if all(
+                    self._shared_queue.state(identity)
+                    in {
+                        SharedAcquisitionState.CANCELLED,
+                        SharedAcquisitionState.FAILED,
+                    }
+                    for identity in cohort.identities
+                ):
+                    self._forget_shared_cohort(key, cohort)
         self.progress_shared_acquisition()
         self._pump_shared_acquisition()
         self._add("shared_acquisition_cancelled_leases")
@@ -927,6 +1015,7 @@ class SglangHostAcquisitionCoordinator:
         explicit_measurement = execution.selection_reason in {
             "calibration_probe",
             "consumer_policy_probe",
+            "forced_eager_progressive",
             "forced_dependency_aware",
         }
         planned = (
@@ -973,6 +1062,7 @@ class SglangHostAcquisitionCoordinator:
         explicit_measurement = execution.selection_reason in {
             "calibration_probe",
             "consumer_policy_probe",
+            "forced_eager_progressive",
             "forced_dependency_aware",
         }
         if not explicit_measurement and local_layer not in pending.planned_progressive_layers:
@@ -1338,21 +1428,28 @@ class SglangHostAcquisitionCoordinator:
         """Retire transport ownership after a numerical consumer is ordered."""
 
         if getattr(pending, "shared_acquisition_registered", False):
-            key = (pending.lease_id, local_layer)
-            cohort = self._shared_cohorts.get(key)
-            if cohort is None:
+            keys = sorted(
+                key
+                for key in self._shared_cohorts
+                if key[:2] == (pending.lease_id, local_layer)
+            )
+            if not keys:
                 raise RuntimeError("shared Host layer has no acquisition cohort")
-            if cohort.consumer_ordered:
-                raise RuntimeError("shared Host layer was consumed more than once")
-            for identity in cohort.identities:
-                self._shared_queue.consume(identity)
-            cohort.consumer_ordered = True
-            if all(
-                self._shared_queue.state(identity)
-                is SharedAcquisitionState.CONSUMED
-                for identity in cohort.identities
-            ):
-                self._forget_shared_cohort(key, cohort)
+            for key in keys:
+                cohort = self._shared_cohorts.get(key)
+                if cohort is None:
+                    continue
+                if cohort.consumer_ordered:
+                    raise RuntimeError("shared Host layer was consumed more than once")
+                for identity in cohort.identities:
+                    self._shared_queue.consume(identity)
+                cohort.consumer_ordered = True
+                if all(
+                    self._shared_queue.state(identity)
+                    is SharedAcquisitionState.CONSUMED
+                    for identity in cohort.identities
+                ):
+                    self._forget_shared_cohort(key, cohort)
             self._add("host_acquisition_layers_consumed")
             return
         acquisition = pending.acquisition

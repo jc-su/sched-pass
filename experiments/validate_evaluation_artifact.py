@@ -106,7 +106,7 @@ def validate(output: Path) -> dict[str, Any]:
         expected_arms = list(ARMS)
         _require(
             evaluation_metadata.get("arm_set") == expected_arms,
-            "mechanism-study artifact does not contain exactly A0-A3",
+            "mechanism-study artifact does not contain every canonical arm",
         )
         _require(
             isinstance(evaluation_metadata.get("tier_set"), list)

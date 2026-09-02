@@ -99,6 +99,11 @@ class SglangHostTransport:
         self._ready_events: tuple[
             tuple[tuple[torch.cuda.Event, ...], ...], ...
         ] = ()
+        # Scheduler-owned pure-SM layers may be submitted one exact completion
+        # wave at a time.  The state exists only between the first and final
+        # irrevocable wave submission; numerical publication remains atomic at
+        # the layer descriptor boundary and exposes every recorded wave event.
+        self._submitted_sm_waves: dict[tuple[int, int, int], set[int]] = {}
 
     @property
     def stream(self) -> torch.cuda.Stream:
@@ -402,6 +407,113 @@ class SglangHostTransport:
             self._stats["pipeline_cpu_ns"] = self._stats.get(
                 "pipeline_cpu_ns", 0
             ) + (time.perf_counter_ns() - pipeline_started)
+
+    def prepare_sm_group_wave(
+        self,
+        pending: PendingHostLoad,
+        transfer_plan: HostTransferLeasePlan,
+        *,
+        local_layer: int,
+        wave_index: int,
+    ) -> tuple[torch.cuda.Event, bool]:
+        """Submit one pure-SM exact-group wave and return its readiness edge.
+
+        This is the shared-link scheduler's finite preemption boundary.  A
+        complete layer publication is installed after every physical wave has
+        been submitted, so attention can wait on already-recorded events while
+        EDF may interleave another lease between submissions.
+        """
+
+        if transfer_plan is not pending.transfer_plan:
+            raise RuntimeError("host transport received an unfrozen lease plan")
+        mover = transfer_plan.mover
+        if mover.copy_runs or mover.sm_row_count != mover.row_count:
+            raise RuntimeError("group-wave scheduling requires a pure SM mover")
+        wave_count = transfer_plan.sm_waves_per_layer
+        layer_count = int(pending.controller.layer_num)
+        if (
+            wave_count <= 1
+            or not 0 <= local_layer < layer_count
+            or not 0 <= wave_index < wave_count
+        ):
+            raise RuntimeError("scheduled Host group wave is outside its plan")
+        if local_layer in pending.prefetched_layers:
+            raise RuntimeError("scheduled Host group wave overlaps a published layer")
+
+        key = (pending.consumer_index, pending.lease_id, local_layer)
+        submitted = self._submitted_sm_waves.setdefault(key, set())
+        if wave_index in submitted:
+            raise RuntimeError("scheduled Host group wave was submitted twice")
+        layer = transfer_plan.layers[local_layer]
+        objects = layer.indexed_objects[2 * wave_index : 2 * wave_index + 2]
+        if len(objects) != 2:
+            raise RuntimeError("scheduled Host group wave has no K/V pair")
+        transfer_first_slot = self._transfer_first_slot(
+            pending.consumer_index, layer_count, self._sm_acquisition_waves
+        )
+        first_slot = (
+            transfer_first_slot
+            + transfer_plan.objects_per_layer * local_layer
+            + 2 * wave_index
+        )
+        events = self._events_for(pending, layer_count, wave_count)
+        ready_event = events[local_layer][wave_index]
+        producer_stream = torch.cuda.current_stream()
+        self._runtime.register_indexed_host_objects(
+            first_slot, objects, stream=producer_stream
+        )
+        phase_start = torch.cuda.Event()
+        phase_start.record(producer_stream)
+        pending.transfer_events += (phase_start,)
+        phase_program = self._transport_program()
+        with torch.cuda.stream(self._prefetch_stream):
+            phase_start.wait(self._prefetch_stream)
+            if transfer_plan.paired_indexed_copy:
+                phase_program.preload_host_pairs(
+                    self._runtime, first_slot, 1, self._prefetch_stream
+                )
+            else:
+                phase_program.preload_host(
+                    self._runtime, first_slot, 2, self._prefetch_stream
+                )
+            ready_event.record(self._prefetch_stream)
+
+        submitted.add(wave_index)
+        wave_bytes = sum(obj.index_count * obj.element_bytes for obj in objects)
+        self._stats["sm_mover_bytes"] += wave_bytes
+        self._stats["sm_acquisition_wave_submissions"] = self._stats.get(
+            "sm_acquisition_wave_submissions", 0
+        ) + 1
+        self._stats["sm_mover_worker_ctas"] += 2
+        self._stats["prefetched_host_bytes"] += wave_bytes
+        layer_published = len(submitted) == wave_count
+        if layer_published:
+            if submitted != set(range(wave_count)):
+                raise RuntimeError("scheduled Host layer has a sparse wave frontier")
+            pending.prefetched_layers[local_layer] = HostLayerPublication(
+                key_bytes=layer.key_bytes,
+                value_bytes=layer.value_bytes,
+                ready_event=events[local_layer][-1],
+                transfer_first_slot=(
+                    transfer_first_slot
+                    + transfer_plan.objects_per_layer * local_layer
+                ),
+                transfer_object_id_base=layer.indexed_objects[0].object_id,
+                transfer_object_version=layer.indexed_objects[0].version,
+                wave_events=events[local_layer],
+                wave_row_ends=layer.wave_row_ends,
+            )
+            self._submitted_sm_waves.pop(key)
+            self._stats["prefetched_layers"] += 1
+            self._stats["lookahead_acquisition_layers"] += 1
+            self._stats["lookahead_acquisition_objects"] += len(
+                layer.indexed_objects
+            )
+            if transfer_plan.paired_indexed_copy:
+                self._stats["paired_lookahead_layers"] = self._stats.get(
+                    "paired_lookahead_layers", 0
+                ) + 1
+        return ready_event, layer_published
 
     def _events_for(
         self,

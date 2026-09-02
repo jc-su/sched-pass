@@ -30,6 +30,8 @@ class FakeTransport:
     def __init__(self) -> None:
         self.ranges: list[tuple[int, int]] = []
         self.events: dict[int, types.SimpleNamespace] = {}
+        self.wave_events: dict[tuple[int, int], types.SimpleNamespace] = {}
+        self.submitted_waves: dict[tuple[int, int], set[int]] = {}
 
     def prepare(
         self,
@@ -54,6 +56,44 @@ class FakeTransport:
                 wave_events=(),
                 wave_row_ends=(),
             )
+
+    def prepare_sm_group_wave(
+        self, pending, transfer_plan, *, local_layer: int, wave_index: int
+    ):
+        assert transfer_plan is pending.transfer_plan
+        event = types.SimpleNamespace(ready=False)
+        event.query = lambda item=event: item.ready
+        event.synchronize = lambda item=event: setattr(item, "ready", True)
+        self.wave_events[(local_layer, wave_index)] = event
+        key = (pending.lease_id, local_layer)
+        submitted = self.submitted_waves.setdefault(key, set())
+        submitted.add(wave_index)
+        wave_ends = transfer_plan.layers[local_layer].wave_row_ends
+        published = len(submitted) == len(wave_ends)
+        if published:
+            events = tuple(
+                self.wave_events[(local_layer, wave)]
+                for wave in range(len(wave_ends))
+            )
+            pending.prefetched_layers[local_layer] = types.SimpleNamespace(
+                key_bytes=1,
+                value_bytes=1,
+                ready_event=events[-1],
+                transfer_first_slot=0,
+                wave_events=events,
+                wave_row_ends=wave_ends,
+            )
+        return event, published
+
+
+def fake_plan(*, row_count: int, wave_ends: tuple[int, ...] = ()):
+    return types.SimpleNamespace(
+        mover=types.SimpleNamespace(row_count=row_count),
+        layers=tuple(
+            types.SimpleNamespace(wave_row_ends=wave_ends) for _ in range(4)
+        ),
+        sm_waves_per_layer=len(wave_ends),
+    )
 
 
 def coordinator(
@@ -166,6 +206,22 @@ def main() -> None:
     assert direct_owner._stats["initial_acquisition_layers"] == 4
     assert direct_owner._stats["initial_typed_gap_layers"] == 0
     assert direct_owner._stats["lease_acquisition_groups_started"] == 1
+
+    # A1P owns the same eager producer as A1 while exposing the typed partial
+    # consumer. Acquisition timing and consumer release are independent axes.
+    eager_typed_owner, eager_typed_pool, eager_typed_transport = coordinator(
+        mode=HostExecutionMode.EAGER_PROGRESSIVE
+    )
+    eager_typed = pending(eager_typed_pool)
+    eager_typed_owner.account_selection = account
+    eager_typed_owner.transfer_plan = freeze
+    eager_typed_owner.capture(eager_typed)
+    assert eager_typed_transport.ranges == [(0, 4)]
+    assert eager_typed.acquisition.started
+    assert eager_typed.acquisition.fully_published
+    assert eager_typed_owner.eager_capture_enabled
+    assert eager_typed_owner._stats["initial_acquisition_layers"] == 4
+    assert eager_typed_owner._stats.get("schedule_bound_acquisition_batches", 0) == 0
 
     # A2 and A3 share the scheduler-bound producer queue. Neither freezes the
     # transfer plan at lease capture; their only causal difference is whether
@@ -297,7 +353,7 @@ def main() -> None:
     shared.device_indices = torch.tensor((7,), dtype=torch.int32)
     shared.row_bytes_by_layer = ((1, 1),) * 4
     shared.layer_bytes = (2,) * 4
-    shared.transfer_plan = object()
+    shared.transfer_plan = fake_plan(row_count=1)
     shared_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
     shared_owner._bind_group_identities(shared, structural_batch)
     shared_model = LayerAcquisitionModel(
@@ -328,7 +384,7 @@ def main() -> None:
     blocked.device_indices = torch.tensor((9,), dtype=torch.int32)
     blocked.row_bytes_by_layer = ((1, 1),) * 4
     blocked.layer_bytes = (2,) * 4
-    blocked.transfer_plan = object()
+    blocked.transfer_plan = fake_plan(row_count=1)
     shared_owner._bind_group_identities(blocked, structural_batch)
     shared_owner._register_shared_acquisition(blocked, shared_model)
     assert 0 not in blocked.prefetched_layers
@@ -365,7 +421,7 @@ def main() -> None:
     shared_owner.retire_layer(blocked, 0)
     blocked.prefetched_layers[0].ready_event.synchronize()
     shared_owner.progress_shared_acquisition()
-    assert (blocked.lease_id, 0) not in shared_owner._shared_cohorts
+    assert not any(key[:2] == (blocked.lease_id, 0) for key in shared_owner._shared_cohorts)
 
     # Readiness and resource lifetime are group-scoped even when one finite
     # physical layer packet coalesces several request segments.  The first
@@ -393,7 +449,7 @@ def main() -> None:
     )
     wave_pending.row_bytes_by_layer = ((1, 1),) * 4
     wave_pending.layer_bytes = (4,) * 4
-    wave_pending.transfer_plan = object()
+    wave_pending.transfer_plan = fake_plan(row_count=2, wave_ends=(1, 2))
     wave_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
     wave_owner._bind_group_identities(
         wave_pending,
@@ -412,19 +468,19 @@ def main() -> None:
     )
     wave_owner._register_shared_acquisition(wave_pending, wave_model)
     wave_owner._pump_shared_acquisition()
-    first_wave = types.SimpleNamespace(ready=False)
-    first_wave.query = lambda: first_wave.ready
-    second_wave = types.SimpleNamespace(ready=False)
-    second_wave.query = lambda: second_wave.ready
-    wave_pending.prefetched_layers[0] = types.SimpleNamespace(
-        ready_event=second_wave,
-        wave_events=(first_wave, second_wave),
-        wave_row_ends=(1, 2),
-    )
+    first_wave = wave_transport.wave_events[(0, 0)]
     identities = wave_pending.acquisition_group_identities[0]
     first_wave.ready = True
     wave_owner.progress_shared_acquisition()
     assert wave_owner._shared_queue.state(identities[0]) is SharedAcquisitionState.READY
+    assert (
+        wave_owner._shared_queue.state(identities[1])
+        is SharedAcquisitionState.PLANNED
+    )
+    assert wave_owner._shared_queue.staging_outstanding_bytes == 0
+    wave_owner._pump_shared_acquisition()
+    second_wave = wave_transport.wave_events[(0, 1)]
+    assert 0 in wave_pending.prefetched_layers
     assert (
         wave_owner._shared_queue.state(identities[1])
         is SharedAcquisitionState.FENCE_PUBLISHED

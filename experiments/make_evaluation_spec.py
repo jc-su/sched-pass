@@ -143,9 +143,9 @@ def build_spec(
     if repetitions < 5:
         raise ValueError("mechanism study requires at least five repetitions")
     if set(arm_commands) != set(ARMS):
-        raise ValueError("complete A0--A3 arm command set is required")
+        raise ValueError("complete canonical arm command set is required")
     if set(result_contracts) != set(ARMS):
-        raise ValueError("complete A0--A3 result contract set is required")
+        raise ValueError("complete canonical arm result contract set is required")
     if tier in {"nvme", "dax"} and tier_qualification is None:
         raise ValueError("NVMe/DAX spec requires --tier-qualification")
     experiments: list[dict[str, Any]] = []

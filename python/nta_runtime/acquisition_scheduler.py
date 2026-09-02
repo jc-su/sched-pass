@@ -105,6 +105,13 @@ class TenantCreditLedger:
         with self._lock:
             return self._outstanding.get(tenant_id, 0)
 
+    def budget_bytes(self, tenant_id: int) -> int:
+        """Return the immutable byte budget used by admission and claim."""
+
+        if tenant_id < 0 or tenant_id >= 1 << 32:
+            raise ValueError("tenant ID is outside the runtime ABI")
+        return self._budgets.get(tenant_id, _UINT64_MAX)
+
     @staticmethod
     def _canonical_charges(
         charges: Iterable[TenantCreditCharge],
@@ -469,6 +476,102 @@ class SharedAcquisitionQueue:
         self._records.update(
             (job.identity, _SharedAcquisitionRecord(job)) for job in values
         )
+
+    def cohort_resource_delay_ns(
+        self,
+        identities: Iterable[AcquisitionGroupIdentity],
+        *,
+        now_ns: int,
+    ) -> int | None:
+        """Return when one packet can reserve staging and tenant credits.
+
+        ``None`` means the packet can never fit the configured resources.  A
+        finite value includes currently outstanding reservations and their
+        predicted completion times, using the same byte charges as
+        :meth:`claim_cohort`.  Admission and dispatch therefore cannot disagree
+        merely because one reasoned about deadlines while the other discovered
+        resource pressure later.
+        """
+
+        values = tuple(identities)
+        if (
+            not values
+            or len(set(values)) != len(values)
+            or isinstance(now_ns, bool)
+            or not isinstance(now_ns, int)
+            or now_ns < 0
+        ):
+            raise ValueError("shared acquisition resource query is invalid")
+        records: list[_SharedAcquisitionRecord] = []
+        for identity in values:
+            record = self._records.get(identity)
+            if record is None:
+                raise KeyError("unknown shared acquisition group")
+            records.append(record)
+        staging_required = sum(record.job.staging_bytes for record in records)
+        tenant_required: dict[int, int] = {}
+        for record in records:
+            tenant = record.job.tenant_id
+            tenant_required[tenant] = (
+                tenant_required.get(tenant, 0) + record.job.staging_bytes
+            )
+        if staging_required > self._staging_capacity_bytes or any(
+            required > self._tenant_credits.budget_bytes(tenant)
+            for tenant, required in tenant_required.items()
+        ):
+            return None
+
+        staging_outstanding = self._staging_outstanding_bytes
+        tenant_outstanding = {
+            tenant: self._tenant_credits.outstanding_bytes(tenant)
+            for tenant in tenant_required
+        }
+
+        def fits() -> bool:
+            return (
+                staging_required
+                <= self._staging_capacity_bytes - staging_outstanding
+                and all(
+                    required
+                    <= self._tenant_credits.budget_bytes(tenant)
+                    - tenant_outstanding[tenant]
+                    for tenant, required in tenant_required.items()
+                )
+            )
+
+        if fits():
+            return 0
+        inflight = sorted(
+            (
+                record
+                for record in self._records.values()
+                if record.state
+                in {
+                    SharedAcquisitionState.SUBMITTED,
+                    SharedAcquisitionState.FENCE_PUBLISHED,
+                }
+            ),
+            key=lambda record: (
+                record.predicted_completion_ns
+                if record.predicted_completion_ns is not None
+                else _UINT64_MAX,
+                record.job.identity,
+            ),
+        )
+        for record in inflight:
+            if record.predicted_completion_ns is None:
+                raise RuntimeError("in-flight resource release has no prediction")
+            staging_outstanding -= record.job.staging_bytes
+            tenant = record.job.tenant_id
+            if tenant in tenant_outstanding:
+                tenant_outstanding[tenant] -= record.job.staging_bytes
+            if staging_outstanding < 0 or any(
+                value < 0 for value in tenant_outstanding.values()
+            ):
+                raise RuntimeError("shared acquisition resource model underflow")
+            if fits():
+                return max(0, record.predicted_completion_ns - now_ns)
+        return None
 
     def analyze(self, *, now_ns: int) -> SharedAcquisitionSchedule:
         """Analyze fixed in-flight work plus every dynamically ordered group."""
