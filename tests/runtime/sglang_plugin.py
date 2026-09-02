@@ -2507,6 +2507,9 @@ def main() -> None:
     boundary_backend._barrier_profiles = [object()]
     boundary_calls = []
     boundary_layer_profiles = [object()]
+    boundary_backend._host_acquisition = types.SimpleNamespace(
+        quiesce_observation_boundary=lambda: boundary_calls.append("acquisition")
+    )
 
     def retire_transfer_profiles() -> None:
         boundary_calls.append("transfer")
@@ -2531,7 +2534,7 @@ def main() -> None:
     boundary_backend._collect_barrier_profiles = retire_barrier_profiles
     with patch("torch.cuda.synchronize", lambda: boundary_calls.append("sync")):
         boundary_backend._quiesce_observation_boundary()
-    assert boundary_calls == ["sync", "transfer", "layer", "barrier"]
+    assert boundary_calls == ["sync", "acquisition", "transfer", "layer", "barrier"]
 
     class CompletedProfileEvent:
         def query(self) -> bool:
@@ -2586,6 +2589,9 @@ def main() -> None:
     stale_boundary._transfer_profiles = []
     stale_boundary._operator_profiles = []
     stale_boundary._barrier_profiles = []
+    stale_boundary._host_acquisition = types.SimpleNamespace(
+        quiesce_observation_boundary=lambda: None
+    )
     stale_boundary._collect_transfer_profiles = lambda: None
     stale_boundary._layer_calibration = PendingLayerProfiles([], lambda: None)
     stale_boundary._consumer_calibration = PendingLayerProfiles([], lambda: None)
