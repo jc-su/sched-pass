@@ -8,7 +8,9 @@ the minimum causal decomposition needed to distinguish framework control,
 exact eager preacquisition, scheduler-bound whole-layer acquisition, and
 progressive work-unit consumption. Device-side demand discovery remains a
 separate diagnostic because the serving fast path and the progressive path
-must not be forced to execute two mutually exclusive acquisition owners.
+must not be forced to execute two mutually exclusive acquisition owners.  A0
+is the framework control; A1/A1P/A2/A3 form the eager-vs-scheduled by
+whole-layer-vs-progressive causal design.
 
 An arm name is never accepted as evidence.  :func:`validate_arm_result`
 reconstructs the executed form from the timed report and its engine counters.
@@ -228,9 +230,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
         not isinstance(entry, Mapping) for entry in raw_stats
     ):
         raise ValueError("mechanism report has invalid engine statistics")
-    stats = [
-        entry for entry in raw_stats if entry.get("backend") == "nta_flashinfer"
-    ]
+    stats = [entry for entry in raw_stats if entry.get("backend") == "nta_flashinfer"]
     if arm == "A0":
         if stats:
             raise ValueError("A0 framework control contains NTA engine statistics")
@@ -261,6 +261,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "stock_prefetched_external_attention_launches",
             "ticketed_incremental_launches",
             "event_ordered_incremental_launches",
+            "event_ordered_wave_launches",
             "mixed_dependency_layers",
             "progressive_consumer_batch_observations",
             "progressive_consumer_batches",
@@ -276,6 +277,8 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             "host_acquisition_models_bound",
             "shared_acquisition_registered_groups",
             "shared_acquisition_registered_cohorts",
+            "shared_acquisition_registered_leases",
+            "shared_acquisition_physical_waves",
             "shared_acquisition_submitted_groups",
             "shared_acquisition_submitted_cohorts",
             "initial_acquisition_layers",
@@ -307,6 +310,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
 
     protocol = _identity(stats, "execution_protocol")
     host_form = _identity(stats, "host_execution_mode")
+    packet_scheduler = _identity(stats, "layer_scheduler")
     if protocol != "late_bound":
         raise ValueError(f"{arm} did not use the canonical exact protocol")
 
@@ -340,6 +344,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["stock_prefetched_external_attention_launches"] >= 0
             and counters["ticketed_incremental_launches"] == 0
             and counters["event_ordered_incremental_launches"] > 0
+            and counters["event_ordered_wave_launches"] > 0
             and counters["mixed_dependency_layers"] > 0
             and counters["progressive_consumer_batch_observations"] > 0
             and counters["progressive_consumer_batches"] > 0
@@ -376,6 +381,8 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["host_acquisition_jobs_submitted"] == 0
             and counters["stock_scheduled_frontier_batches"] > 0
             and counters["shared_acquisition_registered_groups"] > 0
+            and counters["shared_acquisition_registered_leases"] > 0
+            and counters["shared_acquisition_physical_waves"] > 0
             and counters["shared_acquisition_registered_groups"]
             == counters["shared_acquisition_submitted_groups"]
             and counters["shared_acquisition_registered_cohorts"] > 0
@@ -386,6 +393,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["host_acquisition_models_bound"] > 0
             and counters["initial_acquisition_layers"] == 0
             and counters["schedule_bound_acquisition_batches"] > 0
+            and packet_scheduler == "dynamic_nonpreemptive_edf_physical_packets"
         )
         execution_form = "scheduled_whole_layer"
     else:
@@ -399,6 +407,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["ticketed_incremental_launches"] == 0
             and counters["request_acquisition_groups"] == 0
             and counters["event_ordered_incremental_launches"] > 0
+            and counters["event_ordered_wave_launches"] > 0
             and counters["mixed_dependency_layers"] > 0
             and counters["progressive_consumer_batch_observations"] > 0
             and counters["progressive_consumer_batches"] > 0
@@ -409,6 +418,8 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["host_acquisition_jobs_submitted"] == 0
             and counters["stock_scheduled_frontier_batches"] == 0
             and counters["shared_acquisition_registered_groups"] > 0
+            and counters["shared_acquisition_registered_leases"] > 0
+            and counters["shared_acquisition_physical_waves"] > 0
             and counters["shared_acquisition_registered_groups"]
             == counters["shared_acquisition_submitted_groups"]
             and counters["shared_acquisition_registered_cohorts"] > 0
@@ -421,6 +432,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
             and counters["schedule_bound_acquisition_batches"] > 0
             and counters["typed_exact_dependency_groups"] > 0
             and counters["typed_transfer_groups"] > 0
+            and packet_scheduler == "dynamic_nonpreemptive_edf_physical_packets"
             and _heterogeneous_native_batch(report)
         )
         execution_form = "late_bound_heterogeneous_work_unit"
@@ -437,6 +449,7 @@ def validate_arm_result(report: Mapping[str, Any], arm: str) -> dict[str, Any]:
         "consumer_kind": observed_consumer,
         "execution_protocol": protocol,
         "host_execution_mode": host_form,
+        "packet_scheduler": packet_scheduler,
         "execution_form": execution_form,
         "external_requests": _external_request_count(report),
         "counters": counters,

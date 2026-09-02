@@ -28,8 +28,8 @@ def _arm_report(arm: str) -> dict:
         "records": [{"kind": "external", "host_cached_tokens": 8}],
         "engine_stats": [],
         "batch_heterogeneity": {
-            "proven": arm == "A3",
-            "native_mixed_consumer_proven": arm == "A3",
+            "proven": arm in {"A1P", "A3"},
+            "native_mixed_consumer_proven": arm in {"A1P", "A3"},
         },
     }
     if framework:
@@ -39,60 +39,59 @@ def _arm_report(arm: str) -> dict:
         "execution_protocol": "late_bound",
         "host_execution_mode": {
             "A1": "direct",
+            "A1P": "eager_progressive",
             "A2": "scheduled_bulk",
             "A3": "dependency_aware",
         }[arm],
+        "layer_scheduler": "dynamic_nonpreemptive_edf_physical_packets",
         "hicache_fallback_batches": 0,
         "hicache_external_batches": 1,
         "host_direct_batches": int(arm == "A1"),
         "host_scheduled_bulk_batches": int(arm == "A2"),
         "stock_scheduled_frontier_batches": int(arm == "A2"),
         "host_device_bulk_batches": 0,
-        "host_incremental_batches": int(arm == "A3"),
+        "host_incremental_batches": int(arm in {"A1P", "A3"}),
         "external_launches": 36,
-        "native_external_attention_launches": (1 if arm == "A3" else 0),
-        "stock_prefetched_external_attention_launches": (35 if arm == "A3" else 36),
+        "native_external_attention_launches": (1 if arm in {"A1P", "A3"} else 0),
+        "stock_prefetched_external_attention_launches": (
+            35 if arm in {"A1P", "A3"} else 36
+        ),
         "ticketed_incremental_launches": 0,
-        "event_ordered_incremental_launches": 1 if arm == "A3" else 0,
+        "event_ordered_incremental_launches": (1 if arm in {"A1P", "A3"} else 0),
+        "event_ordered_wave_launches": 2 if arm in {"A1P", "A3"} else 0,
         "request_acquisition_groups": 0,
-        "mixed_dependency_layers": 1 if arm == "A3" else 0,
+        "mixed_dependency_layers": 1 if arm in {"A1P", "A3"} else 0,
         "progressive_consumer_batch_observations": 1,
-        "progressive_consumer_batches": 1 if arm == "A3" else 0,
-        "progressive_consumer_layers": 1 if arm == "A3" else 0,
+        "progressive_consumer_batches": 1 if arm in {"A1P", "A3"} else 0,
+        "progressive_consumer_layers": 1 if arm in {"A1P", "A3"} else 0,
         "admission_acquisition_groups_prepared": int(arm in {"A2", "A3"}),
         "admission_acquisition_groups_started": int(arm in {"A2", "A3"}),
-        "lease_acquisition_groups_prepared": int(arm == "A1"),
-        "lease_acquisition_groups_started": int(arm == "A1"),
+        "lease_acquisition_groups_prepared": int(arm in {"A1", "A1P"}),
+        "lease_acquisition_groups_started": int(arm in {"A1", "A1P"}),
         "host_acquisition_structural_owners": int(arm in {"A2", "A3"}),
-        "host_acquisition_jobs_submitted": 36 if arm == "A1" else 0,
+        "host_acquisition_jobs_submitted": 36 if arm in {"A1", "A1P"} else 0,
         "host_acquisition_layers_consumed": 36 if arm in {"A2", "A3"} else 0,
         "host_acquisition_models_bound": int(arm in {"A2", "A3"}),
-        "shared_acquisition_registered_groups": (
-            36 if arm in {"A2", "A3"} else 0
-        ),
-        "shared_acquisition_registered_cohorts": (
-            36 if arm in {"A2", "A3"} else 0
-        ),
-        "shared_acquisition_submitted_groups": (
-            36 if arm in {"A2", "A3"} else 0
-        ),
-        "shared_acquisition_submitted_cohorts": (
-            36 if arm in {"A2", "A3"} else 0
-        ),
-        "initial_acquisition_layers": 36 if arm == "A1" else 0,
+        "shared_acquisition_registered_groups": (36 if arm in {"A2", "A3"} else 0),
+        "shared_acquisition_registered_cohorts": (36 if arm in {"A2", "A3"} else 0),
+        "shared_acquisition_registered_leases": int(arm in {"A2", "A3"}),
+        "shared_acquisition_physical_waves": (36 if arm in {"A2", "A3"} else 0),
+        "shared_acquisition_submitted_groups": (36 if arm in {"A2", "A3"} else 0),
+        "shared_acquisition_submitted_cohorts": (36 if arm in {"A2", "A3"} else 0),
+        "initial_acquisition_layers": 36 if arm in {"A1", "A1P"} else 0,
         "schedule_bound_acquisition_batches": int(arm in {"A2", "A3"}),
-        "typed_exact_dependency_groups": int(arm == "A3"),
-        "typed_transfer_groups": int(arm == "A3"),
+        "typed_exact_dependency_groups": int(arm in {"A1P", "A3"}),
+        "typed_transfer_groups": int(arm in {"A1P", "A3"}),
         "prefetch_mover_plan_calibration_probe_sm_leases": 0,
         "prefetch_mover_plan_calibration_probe_copy_leases": 0,
-        "verified_operator_modules": 2 if arm == "A3" else 0,
+        "verified_operator_modules": 2 if arm in {"A1P", "A3"} else 0,
     }
     report["engine_stats"] = [counters]
     return report
 
 
 def main() -> None:
-    for arm in ("A0", "A1", "A2", "A3"):
+    for arm in ("A0", "A1", "A1P", "A2", "A3"):
         proof = validate_arm_result(_arm_report(arm), arm)
         assert proof["arm"] == arm
     mislabeled = _arm_report("A3")

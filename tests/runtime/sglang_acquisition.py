@@ -72,8 +72,7 @@ class FakeTransport:
         published = len(submitted) == len(wave_ends)
         if published:
             events = tuple(
-                self.wave_events[(local_layer, wave)]
-                for wave in range(len(wave_ends))
+                self.wave_events[(local_layer, wave)] for wave in range(len(wave_ends))
             )
             pending.prefetched_layers[local_layer] = types.SimpleNamespace(
                 key_bytes=1,
@@ -89,9 +88,7 @@ class FakeTransport:
 def fake_plan(*, row_count: int, wave_ends: tuple[int, ...] = ()):
     return types.SimpleNamespace(
         mover=types.SimpleNamespace(row_count=row_count),
-        layers=tuple(
-            types.SimpleNamespace(wave_row_ends=wave_ends) for _ in range(4)
-        ),
+        layers=tuple(types.SimpleNamespace(wave_row_ends=wave_ends) for _ in range(4)),
         sm_waves_per_layer=len(wave_ends),
     )
 
@@ -348,7 +345,6 @@ def main() -> None:
         layer_count=4, frontier_enabled=True
     )
     shared_owner._shared_dispatch_horizon = 1
-    shared_owner._shared_layers_per_dispatch = 1
     shared = pending(shared_pool)
     shared.device_indices = torch.tensor((7,), dtype=torch.int32)
     shared.row_bytes_by_layer = ((1, 1),) * 4
@@ -403,15 +399,11 @@ def main() -> None:
         modeled_ready_by_attention_layers=set(),
         planned_progressive_consumer_layers=set(),
     )
-    assert shared_owner.plan_published_consumer_layer(
-        blocked, progressive_batch, 0
-    )
+    assert shared_owner.plan_published_consumer_layer(blocked, progressive_batch, 0)
     assert progressive_batch.planned_progressive_consumer_layers == {0}
     # Re-observing the same late publication is idempotent and cannot inflate
     # activation evidence.
-    assert shared_owner.plan_published_consumer_layer(
-        blocked, progressive_batch, 0
-    )
+    assert shared_owner.plan_published_consumer_layer(blocked, progressive_batch, 0)
     assert shared_owner._stats["partial_consumer_planned_layers"] == 1
     blocked_identity = blocked.acquisition_group_identities[0][0]
     assert (
@@ -421,7 +413,9 @@ def main() -> None:
     shared_owner.retire_layer(blocked, 0)
     blocked.prefetched_layers[0].ready_event.synchronize()
     shared_owner.progress_shared_acquisition()
-    assert not any(key[:2] == (blocked.lease_id, 0) for key in shared_owner._shared_cohorts)
+    assert not any(
+        key[:2] == (blocked.lease_id, 0) for key in shared_owner._shared_cohorts
+    )
 
     # Readiness and resource lifetime are group-scoped even when one finite
     # physical layer packet coalesces several request segments.  The first
@@ -432,7 +426,6 @@ def main() -> None:
     )
     wave_owner._sm_acquisition_waves = 2
     wave_owner._shared_dispatch_horizon = 1
-    wave_owner._shared_layers_per_dispatch = 1
     wave_pending = pending(wave_pool)
     wave_pending.device_indices = torch.tensor((7, 8), dtype=torch.int32)
     wave_pending.operation_demands = (
@@ -474,8 +467,7 @@ def main() -> None:
     wave_owner.progress_shared_acquisition()
     assert wave_owner._shared_queue.state(identities[0]) is SharedAcquisitionState.READY
     assert (
-        wave_owner._shared_queue.state(identities[1])
-        is SharedAcquisitionState.PLANNED
+        wave_owner._shared_queue.state(identities[1]) is SharedAcquisitionState.PLANNED
     )
     assert wave_owner._shared_queue.staging_outstanding_bytes == 0
     wave_owner._pump_shared_acquisition()
@@ -489,8 +481,96 @@ def main() -> None:
     wave_owner.retire_layer(wave_pending, 0)
     second_wave.ready = True
     wave_owner.progress_shared_acquisition()
-    assert (wave_pending.lease_id, 0) not in wave_owner._shared_cohorts
+    assert not any(
+        key[:2] == (wave_pending.lease_id, 0) for key in wave_owner._shared_cohorts
+    )
     assert wave_owner._shared_queue.staging_outstanding_bytes == 0
+
+    # A later urgent lease can be inserted between two physical waves of an
+    # older layer. The first wave is non-preemptive; the second is still
+    # PLANNED, so the finite boundary gives dynamic EDF a real choice rather
+    # than merely relabeling structural layer order.
+    interleave_owner, interleave_pool, interleave_transport = coordinator(
+        layer_count=4, frontier_enabled=True
+    )
+    interleave_owner._sm_acquisition_waves = 2
+    interleave_owner._shared_dispatch_horizon = 1
+    older = pending(interleave_pool)
+    older.device_indices = torch.tensor((7, 8), dtype=torch.int32)
+    older.operation_demands = (
+        LeaseOperationDemand(1, "older-request-1", 0, 1, 0),
+        LeaseOperationDemand(2, "older-request-2", 0, 1, 0),
+    )
+    older.scheduled_acquisition_groups = (
+        LeaseAcquisitionGroup(1, 0, 1),
+        LeaseAcquisitionGroup(2, 0, 1),
+    )
+    older.operation_ranges = lambda: (
+        LeaseOperationRange(1, 0, 1),
+        LeaseOperationRange(2, 1, 1),
+    )
+    older.row_bytes_by_layer = ((1, 1),) * 4
+    older.layer_bytes = (4,) * 4
+    older.transfer_plan = fake_plan(row_count=2, wave_ends=(1, 2))
+    interleave_owner.transfer_plan = lambda item, **_kwargs: item.transfer_plan
+    interleave_owner._bind_group_identities(
+        older,
+        types.SimpleNamespace(
+            reqs=(
+                types.SimpleNamespace(rid="older-request-1", req_pool_idx=3),
+                types.SimpleNamespace(rid="older-request-2", req_pool_idx=4),
+            )
+        ),
+    )
+    older_model = LayerAcquisitionModel(
+        layer_bytes=older.layer_bytes,
+        transfer_service_ns=(100,) * 4,
+        initial_compute_ns=1_000_000_000,
+        inter_layer_compute_ns=200,
+    )
+    interleave_owner._register_shared_acquisition(older, older_model)
+    interleave_owner._pump_shared_acquisition()
+    assert (0, 0) in interleave_transport.wave_events
+
+    urgent = pending(interleave_pool)
+    urgent.lease_id = 2
+    urgent.device_indices = torch.tensor((9,), dtype=torch.int32)
+    urgent.row_bytes_by_layer = ((1, 1),) * 4
+    urgent.layer_bytes = (2,) * 4
+    urgent.transfer_plan = fake_plan(row_count=1)
+    interleave_owner._bind_group_identities(
+        urgent,
+        types.SimpleNamespace(
+            reqs=(types.SimpleNamespace(rid="request-1", req_pool_idx=5),)
+        ),
+    )
+    urgent_model = LayerAcquisitionModel(
+        layer_bytes=urgent.layer_bytes,
+        transfer_service_ns=(50,) * 4,
+        initial_compute_ns=0,
+        inter_layer_compute_ns=100,
+    )
+    interleave_owner._register_shared_acquisition(urgent, urgent_model)
+    assert interleave_owner._stats["shared_acquisition_active_leases_max"] == 2
+    interleave_transport.wave_events[(0, 0)].ready = True
+    interleave_owner.progress_shared_acquisition()
+    interleave_owner._pump_shared_acquisition()
+    assert interleave_transport.ranges[-1] == (0, 1)
+    assert interleave_owner._shared_last_dispatched_key[0] == urgent.lease_id
+    assert interleave_owner._stats["shared_acquisition_multi_lease_edf_choices"] == 1
+    assert interleave_owner._stats["shared_acquisition_cross_lease_dispatches"] == 1
+    assert interleave_owner._stats["shared_acquisition_inter_wave_lease_switches"] == 1
+
+    coalesced_pending = types.SimpleNamespace(
+        scheduled_acquisition_groups=tuple(
+            LeaseAcquisitionGroup(index, 0, 1) for index in range(1, 6)
+        ),
+        operation_ranges=lambda: tuple(
+            LeaseOperationRange(index, index - 1, 1) for index in range(1, 6)
+        ),
+    )
+    interleave_owner._sm_acquisition_waves = 2
+    assert interleave_owner._preferred_wave_row_ends(coalesced_pending) == (3, 5)
 
     # A progressive producer capability is not itself a partial-consumer
     # decision. Normal AUTO selection must wait for a per-layer arrival/cost

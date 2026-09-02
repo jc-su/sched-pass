@@ -159,10 +159,15 @@ _ZERO_COUNTERS = (
     "stock_scheduled_frontier_batches",
     "shared_acquisition_registered_groups",
     "shared_acquisition_registered_cohorts",
+    "shared_acquisition_registered_leases",
     "shared_acquisition_physical_waves",
     "shared_acquisition_groups_per_wave_max",
+    "shared_acquisition_active_leases_max",
     "shared_acquisition_coalesced_group_waves",
     "shared_acquisition_coalesced_groups",
+    "shared_acquisition_multi_lease_edf_choices",
+    "shared_acquisition_cross_lease_dispatches",
+    "shared_acquisition_inter_wave_lease_switches",
     "shared_acquisition_ready_groups",
     "shared_acquisition_ready_cohorts",
     "shared_acquisition_resource_skipped_cohorts",
@@ -438,6 +443,8 @@ _ENGINE_GAUGE_FIELDS = frozenset(
         "layer_service_calibrated_shapes",
         "layer_service_conservative_ns",
         "verified_operator_modules",
+        "shared_acquisition_groups_per_wave_max",
+        "shared_acquisition_active_leases_max",
     }
 )
 
@@ -484,11 +491,12 @@ def initial_engine_stats(
         "host_execution_selection": "measured_direct_or_incremental",
         "overlap_enabled": config.overlap_enabled,
         "frontier_enabled": config.frontier_enabled,
-        # Layer deadlines are strictly ordered by transformer execution, so
-        # EDF proves feasibility but does not create a different layer order.
-        # Fine-grained request/group arbitration lives in the typed runtime.
-        "layer_scheduler": "structural_layer_order",
-        "layer_feasibility_test": "simultaneous_release_edf",
+        # Exact groups retain semantic ownership while the backend advertises
+        # finite physical packets. Dynamic EDF arbitrates those packets across
+        # leases; admission simulates the same release, packet, link-tail, and
+        # resource contract used by dispatch.
+        "layer_scheduler": "dynamic_nonpreemptive_edf_physical_packets",
+        "layer_feasibility_test": "release_link_tail_staging_credit_packet_edf",
         "fragment_enabled": config.fragment_enabled,
         "demand_overlap_policy": config.demand_overlap_policy,
         "stream_ordered_retirement_enabled": config.stream_ordered_retirement_enabled,

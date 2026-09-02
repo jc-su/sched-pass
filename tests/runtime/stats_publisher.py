@@ -116,6 +116,11 @@ def main() -> None:
     assert "shared_acquisition_publication_wait_rounds" in counter_fields
     assert "shared_acquisition_registered_groups" in counter_fields
     assert "shared_acquisition_submitted_groups" in counter_fields
+    assert "shared_acquisition_registered_leases" in counter_fields
+    assert "shared_acquisition_multi_lease_edf_choices" in counter_fields
+    assert "shared_acquisition_inter_wave_lease_switches" in counter_fields
+    assert "shared_acquisition_groups_per_wave_max" not in counter_fields
+    assert "shared_acquisition_active_leases_max" not in counter_fields
     assert "host_device_bulk_batches" in counter_fields
     assert "forward_lifecycle_aborts" in counter_fields
     assert "host_mover_profiled_sm_gpu_ms" in counter_fields
