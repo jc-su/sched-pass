@@ -2495,3 +2495,91 @@ add_custom_target(
   USES_TERMINAL
   COMMAND_EXPAND_LISTS
 )
+
+# Keep the test suite parallel without allowing independent CUDA/framework
+# processes to oversubscribe the one accelerator.  Several of these tests are
+# deliberately small, but importing Torch/FlashInfer can create a CUDA context
+# and reserve allocator state before the test body runs.  CTest previously
+# launched those imports beside native CUDA workloads, which made `ctest -j`
+# fail nondeterministically with host MemoryError or CUDA OOM.  The NVMe lock
+# continues to protect controller ownership; this second lock protects the GPU
+# and framework process stack.  CPU-only tests remain fully parallel.
+set(_NTA_ACCELERATOR_TESTS
+    nta-vllm-report
+    nta-indexed-row-count-seam
+    nta-sglang-plugin
+    nta-sglang-lifecycle
+    nta-sglang-storage-connector
+    nta-bounded-staging
+    nta-vllm-lifecycle
+    nta-transport-program-load
+    nta-transport-program-standalone-load
+    nta-hbm-compaction-gpu
+    nta-hbm-compaction-calibration-gpu
+    nta-ready-object-gate-gpu
+    nta-ordered-host-preload-gpu
+    nta-engine-environment
+    nta-flashinfer-jit-compile
+    nta-flashinfer-hooked-decode
+    nta-sglang-nvme-physical
+    nta-sglang-nvme-publication-performance
+    nta-sglang-nvme-granularity-sparse-performance
+    nta-sglang-nvme-granularity-dense-no-regression
+    nta-flashinfer-nvme-numerical
+    nta-vllm-native
+    nta-nvme-external-hbm-offset-gpu
+    nta-vfio-nvme-probe
+    nta-runtime
+    nta-indexed-intent-lifecycle
+    nta-dependency-arrival-race
+    nta-multi-gpu
+    nta-cta-nvme-try-issue
+    nta-kv-gpu
+    nta-kv-registered-host-direct-gpu
+    nta-kv-registered-host-staged-gpu
+    nta-kv-dependency-set-gpu
+    nta-kv-object-version-fault-gpu
+    nta-kv-pending-index-scale-gpu
+    nta-kv-lifecycle-stress-gpu
+    nta-kv-lifecycle-object-fault-gpu
+    nta-moe-mixed-tier-gpu
+    nta-moe-cpu-sync-gpu
+    nta-moe-overfetch-gpu
+    nta-moe-direct-gpu
+    nta-kv-direct-baseline-gpu
+    nta-paged-attention-gpu
+    nta-paged-attention-sparse-partial-acquire-gpu
+    nta-paged-attention-sparse-whole-acquire-gpu
+    nta-paged-attention-sparse-selected-gather-gpu
+    nta-paged-attention-sparse-selected-partial-gpu
+    nta-paged-attention-sparse-overfetch-gpu
+    nta-paged-attention-tma-gpu
+    nta-paged-attention-rejects-underprovisioned-progress
+    nta-paged-attention-dax-gpu
+    nta-paged-attention-nvme-gpu
+    nta-flashinfer-differential-gpu
+    nta-flashinfer-tier-streaming-gpu
+    nta-flashinfer-tier-streaming-compiler-gpu
+    nta-flashinfer-tier-streaming-gpu-initiated-host-gpu)
+foreach(_test IN LISTS _NTA_ACCELERATOR_TESTS)
+  if(TEST ${_test})
+    set_property(TEST ${_test} APPEND PROPERTY RESOURCE_LOCK nta_accelerator)
+  endif()
+endforeach()
+
+# Numerical Python dependencies otherwise derive their thread count from the
+# 86-core host.  One framework import can consequently create dozens of BLAS
+# workers even when the test performs no matrix multiplication.  Pinning the
+# library pools makes memory use and scheduling noise bounded while preserving
+# CTest's process-level parallelism.
+get_property(_NTA_ALL_TESTS DIRECTORY PROPERTY TESTS)
+foreach(_test IN LISTS _NTA_ALL_TESTS)
+  set_property(
+    TEST ${_test} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+    "OMP_NUM_THREADS=set:1"
+    "OPENBLAS_NUM_THREADS=set:1"
+    "MKL_NUM_THREADS=set:1"
+    "BLIS_NUM_THREADS=set:1"
+    "NUMEXPR_NUM_THREADS=set:1"
+  )
+endforeach()
