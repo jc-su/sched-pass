@@ -278,6 +278,76 @@ def main() -> None:
     assert not prepublished.arrival_profiling
     assert skip_stats["consumer_policy_prepublication_skipped_leases"] == 1
 
+    # A scheduler-bound layer may reach attention before the shared producer
+    # has published its fence. Record the arrival before any wait, then pair it
+    # with the real producer marker; the resulting signed lateness is evidence,
+    # not an error or a reason to manufacture a zero-lateness timestamp.
+    deferred_stats = defaultdict(int)
+    deferred_policy = SglangConsumerPolicyCalibration(
+        enabled=True,
+        model_start_layer=10,
+        model_layer_count=1,
+        minimum_samples=1,
+        maximum_samples=2,
+        stats=deferred_stats,
+    )
+    deferred_pending = SimpleNamespace(
+        device_indices=SimpleNamespace(numel=lambda: 8),
+        layer_bytes=(1024,),
+        arrival_profile_key=None,
+        arrival_profiling=False,
+        arrival_profile_active=False,
+        consumer_policy_probe=False,
+        partial_profile_recorded=False,
+        planned_progressive_layers=frozenset(),
+        prefetched_layers={},
+    )
+    deferred_key = deferred_policy.bind_lease(
+        deferred_pending,
+        layer_service_key=("extend", 32, 2),
+        producer_kind="sm",
+        layers_per_submission=1,
+        sm_waves_per_layer=1,
+        minimum_gain=1.03,
+    )
+    assert deferred_key is not None
+    deferred_pending.arrival_profile_active = True
+    deferred_acquisition = SimpleNamespace(layer=lambda _layer: None)
+    deferred_batch = SimpleNamespace(
+        pending_host_load=deferred_pending,
+        bindings=(object(), object()),
+        acquisition=deferred_acquisition,
+    )
+    with (
+        patch(
+            "nta_runtime.engines.sglang_calibration.torch.cuda.Event",
+            return_value=Event(1.0),
+        ),
+        patch(
+            "nta_runtime.engines.sglang_calibration.torch.cuda.current_stream",
+            return_value="compute-stream",
+        ),
+    ):
+        deferred_policy.record_arrival(
+            batch=deferred_batch,
+            phase="extend",
+            query=SimpleNamespace(shape=(32,)),
+            global_layer=10,
+        )
+    assert deferred_policy.pending_count == 1
+    assert deferred_stats["consumer_policy_deferred_arrival_markers"] == 1
+    ready = Event(1.5)
+    deferred_pending.prefetched_layers[0] = SimpleNamespace(profile_ready_event=ready)
+    deferred_acquisition.layer = lambda _layer: SimpleNamespace(
+        profile_ready_event=ready
+    )
+    deferred_policy.bind_arrival_ready(batch=deferred_batch, global_layer=10)
+    assert deferred_stats["consumer_policy_deferred_arrivals_bound"] == 1
+    deferred_policy.collect()
+    assert deferred_policy.pending_count == 0
+    deferred_report = deferred_policy.report()
+    assert deferred_report["shapes"][0]["maximum_conservative_lateness_ns"] == 500000
+
     nvme_pending = SimpleNamespace(
         device_indices=SimpleNamespace(numel=lambda: 1),
         layer_bytes=(1,),

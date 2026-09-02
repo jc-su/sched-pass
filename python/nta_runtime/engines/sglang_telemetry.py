@@ -289,6 +289,8 @@ _ZERO_COUNTERS = (
     "partial_consumer_planned_layers",
     "consumer_policy_profiled_leases",
     "consumer_policy_prepublication_skipped_leases",
+    "consumer_policy_deferred_arrival_markers",
+    "consumer_policy_deferred_arrivals_bound",
     "consumer_policy_probe_leases",
     "consumer_policy_frozen_profile_leases",
     "consumer_policy_frozen_conservative_leases",

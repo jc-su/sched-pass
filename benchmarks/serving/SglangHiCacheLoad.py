@@ -69,6 +69,8 @@ _TIMED_AUTO_CALIBRATION_COUNTERS = (
     "host_selection_consumer_policy_probe_batches",
     "consumer_policy_profiled_leases",
     "consumer_policy_probe_leases",
+    "consumer_policy_deferred_arrival_markers",
+    "consumer_policy_deferred_arrivals_bound",
     "consumer_policy_arrival_samples",
     "consumer_policy_stock_samples",
     "consumer_policy_partial_samples",

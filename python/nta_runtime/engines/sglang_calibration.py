@@ -27,16 +27,12 @@ _CALIBRATION_STATE_SCHEMA = 1
 
 
 def _state_mapping(value: Any, owner: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping) or any(
-        not isinstance(key, str) for key in value
-    ):
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{owner} calibration state must be a string-keyed object")
     return value
 
 
-def _state_keys(
-    value: Mapping[str, Any], expected: frozenset[str], owner: str
-) -> None:
+def _state_keys(value: Mapping[str, Any], expected: frozenset[str], owner: str) -> None:
     actual = frozenset(value)
     if actual != expected:
         raise ValueError(
@@ -70,9 +66,7 @@ def _state_samples(
     if not isinstance(value, list) or len(value) > maximum_samples:
         raise ValueError(f"{owner} calibration samples exceed their bound")
     minimum = -(1 << 63) + 1 if signed else 0 if allow_zero else 1
-    return tuple(
-        _state_int(sample, owner, minimum=minimum) for sample in value
-    )
+    return tuple(_state_int(sample, owner, minimum=minimum) for sample in value)
 
 
 def _state_list(value: Any, owner: str, *, maximum_items: int) -> list[Any]:
@@ -115,12 +109,8 @@ def _arrival_key_from_state(value: Any) -> AcquisitionArrivalProfileKey:
         raise ValueError("consumer-policy key strings are invalid")
     return AcquisitionArrivalProfileKey(
         phase=phase,
-        query_rows_bucket=_state_int(
-            state["query_rows_bucket"], "query-row bucket"
-        ),
-        batch_size_bucket=_state_int(
-            state["batch_size_bucket"], "batch-size bucket"
-        ),
+        query_rows_bucket=_state_int(state["query_rows_bucket"], "query-row bucket"),
+        batch_size_bucket=_state_int(state["batch_size_bucket"], "batch-size bucket"),
         transfer_rows_bucket=_state_int(
             state["transfer_rows_bucket"], "transfer-row bucket"
         ),
@@ -396,9 +386,7 @@ class SglangLayerServiceCalibration:
             row = _state_mapping(raw, "layer-service curve")
             _state_keys(
                 row,
-                frozenset(
-                    {"phase", "query_rows", "batch_size", "samples_ns"}
-                ),
+                frozenset({"phase", "query_rows", "batch_size", "samples_ns"}),
                 "layer-service curve",
             )
             phase = row["phase"]
@@ -463,6 +451,15 @@ class _BoundedTimingCurve:
 class _LayerArrivalProfile:
     arrival: torch.cuda.Event
     ready: torch.cuda.Event
+    key: AcquisitionArrivalProfileKey
+    local_layer: int
+
+
+@dataclass(frozen=True, slots=True)
+class _UnboundLayerArrivalProfile:
+    """Attention arrival recorded before the shared producer publishes a fence."""
+
+    arrival: torch.cuda.Event
     key: AcquisitionArrivalProfileKey
     local_layer: int
 
@@ -543,11 +540,14 @@ class SglangConsumerPolicyCalibration:
             tuple[AcquisitionArrivalProfileKey, bool], _BoundedTimingCurve
         ] = {}
         self._arrival_profiles: list[_LayerArrivalProfile] = []
+        self._unbound_arrivals: dict[tuple[int, int], _UnboundLayerArrivalProfile] = {}
         self._stock_profiles: list[_StockConsumerProfile] = []
         self._partial_profiles: list[_PartialConsumerProfile] = []
         self._arrival_inflight: dict[tuple[AcquisitionArrivalProfileKey, int], int] = {}
         self._stock_inflight: dict[tuple[AcquisitionArrivalProfileKey, int], int] = {}
-        self._partial_inflight: dict[tuple[AcquisitionArrivalProfileKey, bool], int] = {}
+        self._partial_inflight: dict[
+            tuple[AcquisitionArrivalProfileKey, bool], int
+        ] = {}
         self._probe_misses: dict[AcquisitionArrivalProfileKey, int] = {}
         self._probe_attempts: dict[AcquisitionArrivalProfileKey, int] = {}
         self._minimum_gain_by_key: dict[AcquisitionArrivalProfileKey, float] = {}
@@ -557,6 +557,7 @@ class SglangConsumerPolicyCalibration:
     def pending_count(self) -> int:
         return (
             len(self._arrival_profiles)
+            + len(self._unbound_arrivals)
             + len(self._stock_profiles)
             + len(self._partial_profiles)
         )
@@ -653,18 +654,12 @@ class SglangConsumerPolicyCalibration:
         ):
             pending.arrival_profiling = False
             self._stats["consumer_policy_prepublication_skipped_leases"] = (
-                self._stats.get(
-                    "consumer_policy_prepublication_skipped_leases", 0
-                )
-                + 1
+                self._stats.get("consumer_policy_prepublication_skipped_leases", 0) + 1
             )
-        potentially_late = (
-            not pending.arrival_profiling
-            and any(
-                curve.calibrated and min(curve.samples_ns) > 0
-                for (curve_key, _layer), curve in self._arrival_curves.items()
-                if curve_key == key
-            )
+        potentially_late = not pending.arrival_profiling and any(
+            curve.calibrated and min(curve.samples_ns) > 0
+            for (curve_key, _layer), curve in self._arrival_curves.items()
+            if curve_key == key
         )
         cold_samples = self._sample_count(
             self._partial_total_curves, self._partial_inflight, (key, True)
@@ -686,9 +681,7 @@ class SglangConsumerPolicyCalibration:
             self._probe_attempts[key] = self._probe_attempts.get(key, 0) + 1
         planned = self.profitable_layers(key, minimum_gain=minimum_gain)
         pending.planned_progressive_layers = planned
-        self._stats["consumer_policy_profiled_leases"] += int(
-            pending.arrival_profiling
-        )
+        self._stats["consumer_policy_profiled_leases"] += int(pending.arrival_profiling)
         self._stats["consumer_policy_probe_leases"] += int(
             pending.consumer_policy_probe
         )
@@ -728,19 +721,75 @@ class SglangConsumerPolicyCalibration:
             >= self._minimum_samples
         ):
             return
+        arrival = torch.cuda.Event(enable_timing=True)
+        arrival.record(torch.cuda.current_stream())
+        acquisition = (
+            None if batch.acquisition is None else batch.acquisition.layer(local_layer)
+        )
+        if acquisition is None:
+            # This is the ordering the policy needs to measure: attention has
+            # reached a group whose finite shared-link job has not published a
+            # producer fence yet. Preserve the arrival timestamp now and bind
+            # it after EDF submission; forcing publication first would erase
+            # the true producer lateness from the sample.
+            pending_key = (id(pending), local_layer)
+            if pending_key in self._unbound_arrivals:
+                raise RuntimeError(
+                    "consumer-policy recorded one layer arrival more than once"
+                )
+            self._unbound_arrivals[pending_key] = _UnboundLayerArrivalProfile(
+                arrival, key, local_layer
+            )
+            self._stats["consumer_policy_deferred_arrival_markers"] = (
+                self._stats.get("consumer_policy_deferred_arrival_markers", 0) + 1
+            )
+        else:
+            ready = acquisition.profile_ready_event
+            if ready is None:
+                raise RuntimeError(
+                    "profiled published acquisition omitted its timing marker"
+                )
+            self._arrival_profiles.append(
+                _LayerArrivalProfile(arrival, ready, key, local_layer)
+            )
+        self._arrival_inflight[curve_key] = self._arrival_inflight.get(curve_key, 0) + 1
+
+    def bind_arrival_ready(
+        self,
+        *,
+        batch: SglangForwardEpoch | None,
+        global_layer: int,
+    ) -> None:
+        """Pair a pre-wait attention timestamp with a newly published fence."""
+
+        if not self._enabled or batch is None or batch.pending_host_load is None:
+            return
+        pending = batch.pending_host_load
+        local_layer = int(global_layer) - self._model_start_layer
+        pending_key = (id(pending), local_layer)
+        profile = self._unbound_arrivals.get(pending_key)
+        if profile is None:
+            return
+        if not 0 <= local_layer < self._model_layer_count:
+            raise RuntimeError("consumer-policy ready binding is outside the model")
+        if pending.arrival_profile_key != profile.key:
+            raise RuntimeError("consumer-policy arrival key changed before publication")
         acquisition = (
             None if batch.acquisition is None else batch.acquisition.layer(local_layer)
         )
         ready = None if acquisition is None else acquisition.profile_ready_event
         if ready is None:
-            raise RuntimeError("profiled acquisition omitted its timing marker")
-        arrival = torch.cuda.Event(enable_timing=True)
-        arrival.record(torch.cuda.current_stream())
+            published = tuple(sorted(getattr(pending, "prefetched_layers", {}).keys()))
+            raise RuntimeError(
+                "profiled acquisition still has no timing marker after publication "
+                f"(layer={local_layer}, published_layers={published})"
+            )
+        self._unbound_arrivals.pop(pending_key)
         self._arrival_profiles.append(
-            _LayerArrivalProfile(arrival, ready, key, local_layer)
+            _LayerArrivalProfile(profile.arrival, ready, profile.key, local_layer)
         )
-        self._arrival_inflight[curve_key] = (
-            self._arrival_inflight.get(curve_key, 0) + 1
+        self._stats["consumer_policy_deferred_arrivals_bound"] = (
+            self._stats.get("consumer_policy_deferred_arrivals_bound", 0) + 1
         )
 
     def record_stock_profile(
@@ -780,11 +829,7 @@ class SglangConsumerPolicyCalibration:
         partition_prepared: bool,
     ) -> None:
         key = pending.arrival_profile_key
-        if (
-            not self._enabled
-            or key is None
-            or not pending.consumer_policy_probe
-        ):
+        if not self._enabled or key is None or not pending.consumer_policy_probe:
             return
         curve_key = (key, bool(partition_prepared))
         if (
@@ -805,9 +850,7 @@ class SglangConsumerPolicyCalibration:
                 bool(partition_prepared),
             )
         )
-        self._partial_inflight[curve_key] = (
-            self._partial_inflight.get(curve_key, 0) + 1
-        )
+        self._partial_inflight[curve_key] = self._partial_inflight.get(curve_key, 0) + 1
         pending.partial_profile_recorded = True
 
     def retire_lease(self, pending: Any, *, probe_executed: bool) -> None:
@@ -821,6 +864,16 @@ class SglangConsumerPolicyCalibration:
         independently.
         """
 
+        unbound_layers = tuple(
+            sorted(
+                layer for owner, layer in self._unbound_arrivals if owner == id(pending)
+            )
+        )
+        if unbound_layers:
+            raise RuntimeError(
+                "consumer-policy lease retired before arrival markers were bound "
+                f"(layers={unbound_layers})"
+            )
         key = pending.arrival_profile_key
         if (
             not self._enabled
@@ -900,8 +953,7 @@ class SglangConsumerPolicyCalibration:
                 dispatch_ns = max(
                     0,
                     round(
-                        profile.start.elapsed_time(profile.dispatch_ready)
-                        * 1_000_000.0
+                        profile.start.elapsed_time(profile.dispatch_ready) * 1_000_000.0
                     ),
                 )
                 device_ns = max(
@@ -1051,7 +1103,7 @@ class SglangConsumerPolicyCalibration:
             )
 
         def layer_rows(
-            curves: dict[tuple[AcquisitionArrivalProfileKey, int], _BoundedTimingCurve]
+            curves: dict[tuple[AcquisitionArrivalProfileKey, int], _BoundedTimingCurve],
         ) -> list[dict[str, Any]]:
             return [
                 {
@@ -1066,7 +1118,9 @@ class SglangConsumerPolicyCalibration:
             ]
 
         def partial_rows(
-            curves: dict[tuple[AcquisitionArrivalProfileKey, bool], _BoundedTimingCurve]
+            curves: dict[
+                tuple[AcquisitionArrivalProfileKey, bool], _BoundedTimingCurve
+            ],
         ) -> list[dict[str, Any]]:
             return [
                 {
@@ -1080,10 +1134,14 @@ class SglangConsumerPolicyCalibration:
                 )
             ]
 
-        def counter_rows(values: dict[AcquisitionArrivalProfileKey, int]) -> list[dict[str, Any]]:
+        def counter_rows(
+            values: dict[AcquisitionArrivalProfileKey, int],
+        ) -> list[dict[str, Any]]:
             return [
                 {"key": _arrival_key_state(key), "value": count}
-                for key, count in sorted(values.items(), key=lambda item: self._key_order(item[0]))
+                for key, count in sorted(
+                    values.items(), key=lambda item: self._key_order(item[0])
+                )
             ]
 
         return {
@@ -1172,14 +1230,12 @@ class SglangConsumerPolicyCalibration:
         def parse_layer_curves(
             raw_rows: Any, owner: str, *, signed: bool
         ) -> dict[tuple[AcquisitionArrivalProfileKey, int], _BoundedTimingCurve]:
-            result: dict[tuple[AcquisitionArrivalProfileKey, int], _BoundedTimingCurve] = {}
-            for raw in _state_list(
-                raw_rows, owner, maximum_items=maximum_layer_rows
-            ):
+            result: dict[
+                tuple[AcquisitionArrivalProfileKey, int], _BoundedTimingCurve
+            ] = {}
+            for raw in _state_list(raw_rows, owner, maximum_items=maximum_layer_rows):
                 row = _state_mapping(raw, owner)
-                _state_keys(
-                    row, frozenset({"key", "layer", "samples_ns"}), owner
-                )
+                _state_keys(row, frozenset({"key", "layer", "samples_ns"}), owner)
                 key = _arrival_key_from_state(row["key"])
                 layer = _state_int(
                     row["layer"],
@@ -1204,7 +1260,9 @@ class SglangConsumerPolicyCalibration:
         def parse_partial_curves(
             raw_rows: Any, owner: str, *, allow_zero: bool = False
         ) -> dict[tuple[AcquisitionArrivalProfileKey, bool], _BoundedTimingCurve]:
-            result: dict[tuple[AcquisitionArrivalProfileKey, bool], _BoundedTimingCurve] = {}
+            result: dict[
+                tuple[AcquisitionArrivalProfileKey, bool], _BoundedTimingCurve
+            ] = {}
             for raw in _state_list(raw_rows, owner, maximum_items=8192):
                 row = _state_mapping(raw, owner)
                 _state_keys(
@@ -1240,9 +1298,7 @@ class SglangConsumerPolicyCalibration:
                 key = _arrival_key_from_state(row["key"])
                 if key in result:
                     raise ValueError(f"{owner} repeats a shape")
-                result[key] = _state_int(
-                    row["value"], owner, maximum=maximum
-                )
+                result[key] = _state_int(row["value"], owner, maximum=maximum)
             return result
 
         arrival_curves = parse_layer_curves(
@@ -1263,9 +1319,7 @@ class SglangConsumerPolicyCalibration:
             state["partial_device_curves"], "partial-device curve"
         )
         if not (
-            partial_total.keys()
-            == partial_dispatch.keys()
-            == partial_device.keys()
+            partial_total.keys() == partial_dispatch.keys() == partial_device.keys()
         ) or any(
             not (
                 len(partial_total[key].samples_ns)
@@ -1331,7 +1385,9 @@ class SglangConsumerPolicyCalibration:
         calibrated_arrivals = sum(
             curve.calibrated for curve in self._arrival_curves.values()
         )
-        calibrated_stock = sum(curve.calibrated for curve in self._stock_curves.values())
+        calibrated_stock = sum(
+            curve.calibrated for curve in self._stock_curves.values()
+        )
         keys = sorted(
             {
                 *self._minimum_gain_by_key,
@@ -1490,13 +1546,18 @@ class SglangConsumerPolicyCalibration:
         )
 
     @staticmethod
-    def _sample_count(curves: dict[Any, Any], inflight: dict[Any, int], key: Any) -> int:
+    def _sample_count(
+        curves: dict[Any, Any], inflight: dict[Any, int], key: Any
+    ) -> int:
         curve = curves.get(key)
         return (0 if curve is None else len(curve.samples_ns)) + inflight.get(key, 0)
 
     def _rebuild_inflight(self) -> None:
         arrivals: dict[tuple[AcquisitionArrivalProfileKey, int], int] = {}
         for profile in self._arrival_profiles:
+            key = (profile.key, profile.local_layer)
+            arrivals[key] = arrivals.get(key, 0) + 1
+        for profile in self._unbound_arrivals.values():
             key = (profile.key, profile.local_layer)
             arrivals[key] = arrivals.get(key, 0) + 1
         stocks: dict[tuple[AcquisitionArrivalProfileKey, int], int] = {}

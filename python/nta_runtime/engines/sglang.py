@@ -603,9 +603,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     "incremental_setup_calibrated": (
                         self._host_cost_model.incremental_setup_ns is not None
                     ),
-                    "incremental_service_samples": (
-                        self._incremental_service_samples
-                    ),
+                    "incremental_service_samples": (self._incremental_service_samples),
                     "incremental_service_scale": (
                         self._host_cost_model.incremental_service_scale
                     ),
@@ -904,9 +902,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             ),
             incremental_setup_samples=self._incremental_setup_samples,
             incremental_service_samples=self._incremental_service_samples,
-            cost_model_transfer_samples=int(
-                self._stats["cost_model_transfer_samples"]
-            ),
+            cost_model_transfer_samples=int(self._stats["cost_model_transfer_samples"]),
         )
 
     def _checkpoint_calibration_profile(self) -> None:
@@ -1080,8 +1076,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             for target, source in zip(targets, sources, strict=True)
         }
         target_to_source = {
-            id(target): source
-            for target, source in zip(targets, sources, strict=True)
+            id(target): source for target, source in zip(targets, sources, strict=True)
         }
         self._forward_lifecycle.adopt_wrapper_aliases(
             batch,
@@ -1245,10 +1240,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         # identity can be replaced. Event-owned layers need only the final
         # lease edge. The physical-plan owner records exactly that lifetime.
         acquisition = self._forward_lifecycle.active.acquisition
-        if (
-            acquisition is not None
-            and acquisition.tier is AcquisitionTier.HOST_STAGED
-        ):
+        if acquisition is not None and acquisition.tier is AcquisitionTier.HOST_STAGED:
             self._require_materializer().record_host_consumer(
                 torch.cuda.current_stream(),
                 indexed_objects=indexed_object_count != 0,
@@ -1491,9 +1483,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
             ) + int(getattr(forward_batch, "batch_size", 0) or 0)
             self._stats["graph_captures"] += 1
             return
-        bindings = self._bind_forward_requests(
-            forward_batch, allow_capture_ids=False
-        )
+        bindings = self._bind_forward_requests(forward_batch, allow_capture_ids=False)
         if pending is None:
             self._forward_lifecycle.activate(
                 SglangForwardEpoch(
@@ -1649,13 +1639,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         if pending is not None:
             self.use_paged = True
         try:
-            stock_metadata_started = (
-                time.perf_counter_ns() if self._profile_cpu else 0
-            )
+            stock_metadata_started = time.perf_counter_ns() if self._profile_cpu else 0
             super().init_forward_metadata(forward_batch)
-            stock_metadata_finished = (
-                time.perf_counter_ns() if self._profile_cpu else 0
-            )
+            stock_metadata_finished = time.perf_counter_ns() if self._profile_cpu else 0
             if pending is None:
                 # A resident stock forward has no acquisition identity,
                 # resource lifetime, or native work to attribute.  Publish
@@ -1681,9 +1667,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._stats["resident_reference_metadata_calls"] += 1
                     self._stats["resident_reference_metadata_cpu_ns"] += total_ns
                     self._stats["resident_reference_metadata_stock_cpu_ns"] += stock_ns
-                    self._stats[
-                        "resident_reference_metadata_overhead_cpu_ns"
-                    ] += max(0, total_ns - stock_ns)
+                    self._stats["resident_reference_metadata_overhead_cpu_ns"] += max(
+                        0, total_ns - stock_ns
+                    )
                 return
             bind_started = time.perf_counter_ns() if self._profile_cpu else 0
             bindings = self._bind_forward_requests(
@@ -1706,8 +1692,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 if (
                     pending.shared_deadline_model is None
                     and (
-                        pending.acquisition is None
-                        or pending.acquisition.model is None
+                        pending.acquisition is None or pending.acquisition.model is None
                     )
                     and selected.uses_scheduler_bound_acquisition
                     and self._host_acquisition.proactive_layer_queue_enabled
@@ -1720,12 +1705,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._stats["metadata_acquisition_groups_prepared"] = (
                         self._stats.get("metadata_acquisition_groups_prepared", 0) + 1
                     )
-                if (
-                    pending.shared_acquisition_registered
-                    or (
-                        pending.acquisition is not None
-                        and not pending.acquisition.fully_published
-                    )
+                if pending.shared_acquisition_registered or (
+                    pending.acquisition is not None
+                    and not pending.acquisition.fully_published
                 ):
                     self._host_acquisition.submit(pending)
                 prefetch_fully_published = len(pending.prefetched_layers) == (
@@ -1808,7 +1790,9 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     forward_batch, stock_metadata
                 )
                 adoption_ns = time.perf_counter_ns() - adoption_started
-                if self._forward_lifecycle.active is None:  # pragma: no cover - set above
+                if (
+                    self._forward_lifecycle.active is None
+                ):  # pragma: no cover - set above
                     raise RuntimeError("incremental host batch lost its metadata")
                 # Wrapper identity is part of the immutable semantic plan.
                 # Publish the mutable per-layer consumer decision only after
@@ -1877,9 +1861,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 typed_wrappers = self._adopt_typed_forward_metadata(
                     forward_batch, stock_metadata
                 )
-                def select_nvme_progressive_layers(
-                    geometry, frontier, window_count
-                ):
+
+                def select_nvme_progressive_layers(geometry, frontier, window_count):
                     return plan_nvme_consumer_policy(
                         forward_batch=forward_batch,
                         pending=pending,
@@ -2209,6 +2192,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         acquisition = (
             None if batch.acquisition is None else batch.acquisition.layer(local_layer)
         )
+        self._consumer_calibration.bind_arrival_ready(
+            batch=batch,
+            global_layer=int(layer.layer_id),
+        )
         prefetch_event_ordered = (
             acquisition is not None
             and id(acquisition.ready_event) in batch.ordered_prefetch_event_ids
@@ -2246,29 +2233,19 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                     self._stats.get("stream_ordered_prefetch_events", 0) + 1
                 )
         typed_observation_required = (
-            (
-                batch.host_execution is not None
-                and batch.host_execution.selection_reason == "calibration_probe"
-                and not batch.incremental_setup_observed
-            )
-            or (
-                pending is not None
-                and pending.arrival_profile_active
-            )
-        )
+            batch.host_execution is not None
+            and batch.host_execution.selection_reason == "calibration_probe"
+            and not batch.incremental_setup_observed
+        ) or (pending is not None and pending.arrival_profile_active)
         verify_attention = self._verification.attention
         if verify_attention and self._verification.attention_mixed_only:
             verify_attention = len(batch.bindings) > 1
         if verify_attention and self._verification.attention_layer is not None:
-            verify_attention = (
-                int(layer.layer_id) == self._verification.attention_layer
-            )
+            verify_attention = int(layer.layer_id) == self._verification.attention_layer
         if verify_attention and self._verification.attention_first_partial:
             verify_attention = (
                 dispatch.kind is AttentionDispatchKind.ARRIVING_PREFETCH
-                and self._stats.get(
-                    "attention_first_partial_verification_attempts", 0
-                )
+                and self._stats.get("attention_first_partial_verification_attempts", 0)
                 == 0
             )
             if verify_attention:
@@ -2279,9 +2256,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
         verify_execution = verify_attention or self._verification.execution
         verify_transfer = self._verification.transfer
         if verify_transfer and self._verification.transfer_layer is not None:
-            verify_transfer = (
-                int(layer.layer_id) == self._verification.transfer_layer
-            )
+            verify_transfer = int(layer.layer_id) == self._verification.transfer_layer
         # The typed wrapper may alias a stock numerical wrapper after adopting
         # the same validated FlashInfer plan.  Use that zero-overhead alias only
         # after the transport event is complete.  An ARRIVING_PREFETCH owns an
@@ -2491,8 +2466,7 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 )
                 service_prediction_ns = max(
                     1,
-                    execution.predicted_incremental_per_unit_ns
-                    - setup_per_unit_ns,
+                    execution.predicted_incremental_per_unit_ns - setup_per_unit_ns,
                 )
                 service_prediction_scale = execution.incremental_service_scale
             self._operator_profiles.append(
@@ -2657,6 +2631,10 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 "stock external attention reached a layer without an exact "
                 f"prefetch event: {layer.layer_id}"
             )
+        self._consumer_calibration.bind_arrival_ready(
+            batch=batch,
+            global_layer=int(layer.layer_id),
+        )
         stream = torch.cuda.current_stream()
         if self._profile_barrier:
             arrive = torch.cuda.Event(enable_timing=True)
@@ -3086,9 +3064,8 @@ class NtaFlashInferAttnBackend(FlashInferAttnBackend):
                 pending_operators.append(profile)
                 continue
             milliseconds = profile.start.elapsed_time(profile.finish)
-            if (
-                profile.service_prediction_ns is not None
-                and not getattr(self, "_calibration_frozen", False)
+            if profile.service_prediction_ns is not None and not getattr(
+                self, "_calibration_frozen", False
             ):
                 elapsed_ns = max(1, round(milliseconds * 1_000_000.0))
                 first_sample = self._incremental_service_samples == 0
